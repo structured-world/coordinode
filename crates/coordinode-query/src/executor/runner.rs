@@ -1039,6 +1039,22 @@ impl<'a> ExecutionContext<'a> {
     /// [`Self::mvcc_put`] (for atomic flush + RYOW visibility). Replaces
     /// `encode_node_key + record.to_msgpack + mvcc_put` triples scattered
     /// across CREATE / SET / UPDATE executors.
+    /// Stage the planner-statistics counter deltas for a node row created
+    /// with `record`'s labels (total +1, each label +1). Called at every
+    /// site that also counts `write_stats.nodes_created`, so the counters
+    /// commit atomically with the write they describe.
+    pub fn stat_node_created(&mut self, record: &NodeRecord) {
+        use coordinode_modality::{LocalStatsStore, StatsStore as _};
+        LocalStatsStore.node_created(&mut self.txn, record.labels.iter().map(String::as_str));
+    }
+
+    /// Counterpart of [`Self::stat_node_created`] for a deleted node row
+    /// (total -1, each label -1); paired with `write_stats.nodes_deleted`.
+    pub fn stat_node_deleted(&mut self, record: &NodeRecord) {
+        use coordinode_modality::{LocalStatsStore, StatsStore as _};
+        LocalStatsStore.node_deleted(&mut self.txn, record.labels.iter().map(String::as_str));
+    }
+
     pub fn mvcc_put_node(
         &mut self,
         shard_id: u16,
@@ -8125,6 +8141,7 @@ fn execute_upsert(
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                         ctx.write_stats.nodes_created += 1;
+                        ctx.stat_node_created(&record);
 
                         // Fire BEFORE COMMIT CREATE triggers on the new
                         // node's label. UPSERT's ON CREATE branch is
@@ -8319,6 +8336,11 @@ fn execute_create_from_pattern(
             }
 
             ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
+            // MERGE-created nodes count like CREATE-created ones: the write
+            // stats callers surface and the statistics counters both see the
+            // new row (previously this creation went unreported).
+            ctx.write_stats.nodes_created += 1;
+            ctx.stat_node_created(&record);
 
             // Fire BEFORE COMMIT CREATE triggers registered on the new
             // node's label. This path is reached from MERGE (create branch)
@@ -8738,6 +8760,7 @@ fn execute_create_node(
             ctx.mvcc_put_node_either(ctx.shard_id, node_id, valid_from_for_key, &record)?;
         }
         ctx.write_stats.nodes_created += 1;
+        ctx.stat_node_created(&record);
         ctx.write_stats.properties_set += properties.len() as u64;
 
         // Buffer HNSW writes so they hit the index once per batch
@@ -9333,6 +9356,10 @@ fn execute_update(
                 // Step 4: write open-new (at fresh per-version key for NOW).
                 ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
                 ctx.write_stats.nodes_created += 1;
+                // One new version ROW: the statistics counters track stored
+                // rows (what a partition scan would count), so a temporal
+                // version bump increments the label counts like a create.
+                ctx.stat_node_created(&new_record);
 
                 // Reflect the new version's prop columns in the output row.
                 out_row.insert(format!("{var}.valid_from"), Value::Int(new_valid_from));
@@ -10207,8 +10234,15 @@ fn execute_update(
                     };
 
                     if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                        let newly_added = !record.has_label(label);
                         record.add_label(label.clone());
                         ctx.write_stats.labels_added += 1;
+                        // Statistics counters: only a label the node did not
+                        // already carry changes its cardinality.
+                        if newly_added {
+                            use coordinode_modality::{LocalStatsStore, StatsStore as _};
+                            LocalStatsStore.label_added(&mut ctx.txn, label);
+                        }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
@@ -10499,6 +10533,9 @@ fn execute_remove(
                 )?;
 
                 ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
+                // One new version ROW (row-count semantics, same as the SET
+                // close-current + open-new path).
+                ctx.stat_node_created(&new_record);
 
                 // Surface the new version's valid_from on out_row so any
                 // downstream RETURN sees the latest version, symmetric with
@@ -10625,8 +10662,14 @@ fn execute_remove(
                     };
 
                     if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                        record.remove_label(label);
+                        let was_present = record.remove_label(label);
                         ctx.write_stats.labels_removed += 1;
+                        // Statistics counters: only an actually-removed label
+                        // changes its cardinality.
+                        if was_present {
+                            use coordinode_modality::{LocalStatsStore, StatsStore as _};
+                            LocalStatsStore.label_removed(&mut ctx.txn, label);
+                        }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
@@ -10801,6 +10844,10 @@ fn execute_delete(
             tombstone.set(its_fid, Value::Int(now_us));
             ctx.mvcc_put_node_temporal(ctx.shard_id, *node_id, new_valid_from, &tombstone)?;
             ctx.write_stats.nodes_deleted += 1;
+            // The statistics counters track stored ROWS (scan cost), and a
+            // temporal delete ADDS a tombstone row carrying the labels, so
+            // the label counts go up by one row here, not down.
+            ctx.stat_node_created(&tombstone);
 
             tombstoned_temporal_rows.insert((*row_idx, var.clone()));
         }
@@ -11072,6 +11119,12 @@ fn execute_delete(
             }
             ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
             ctx.write_stats.nodes_deleted += 1;
+            // Statistics counters: decrement by the pre-delete labels. A
+            // delete of an absent node removes no row, so no decrement.
+            if let Some((labels, _)) = &pre_snapshot {
+                use coordinode_modality::{LocalStatsStore, StatsStore as _};
+                LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+            }
 
             // Fire BEFORE COMMIT DELETE triggers on each of the deleted
             // node's labels. The probe runs AFTER mvcc_delete so the
@@ -12375,6 +12428,12 @@ fn detach_delete_node(
     // Drop the primary node record.
     ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
     ctx.write_stats.nodes_deleted += 1;
+    // Statistics counters: decrement by the pre-delete labels (no row
+    // removed when the node was already absent).
+    if let Some((labels, _)) = &node_pre_snapshot {
+        use coordinode_modality::{LocalStatsStore, StatsStore as _};
+        LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+    }
 
     // Fire BEFORE COMMIT DELETE triggers on the deleted node's labels —
     // mirrors `execute_delete` / `cascade_delete_source_node`. Probe runs
@@ -13584,6 +13643,12 @@ fn cascade_delete_source_node(
     }
     ctx.mvcc_delete_node(ctx.shard_id, source_id)?;
     ctx.write_stats.nodes_deleted += 1;
+    // Statistics counters: decrement by the pre-delete labels (no row
+    // removed when the node was already absent).
+    if let Some((labels, _)) = &pre_snapshot {
+        use coordinode_modality::{LocalStatsStore, StatsStore as _};
+        LocalStatsStore.node_deleted(&mut ctx.txn, labels.iter().map(String::as_str));
+    }
 
     // Fire BEFORE COMMIT DELETE triggers on the source node's labels —
     // mirrors the DETACH DELETE behaviour in `execute_delete`. Probe runs

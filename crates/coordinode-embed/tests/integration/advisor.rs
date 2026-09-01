@@ -1295,6 +1295,11 @@ fn stats_cache_ttl_zero_always_recomputes() {
             LocalNodeStore
                 .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
+            // A low-level writer stages the statistics counters itself
+            // (the executor does this for Cypher writes): cardinalities
+            // are counter-maintained, not derived by scanning.
+            use coordinode_modality::{LocalStatsStore, StatsStore as _};
+            LocalStatsStore.node_created(&mut txn, rec.labels.iter().map(String::as_str));
         }
         let wc = WriteConcern::majority();
         let ctx = CommitContext {
@@ -1357,6 +1362,10 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
             LocalNodeStore
                 .put(&mut txn, 1, NodeId::from_raw(raw_id), &rec)
                 .expect("direct write");
+            // A low-level writer stages the statistics counters itself
+            // (the executor does this for Cypher writes).
+            use coordinode_modality::{LocalStatsStore, StatsStore as _};
+            LocalStatsStore.node_created(&mut txn, rec.labels.iter().map(String::as_str));
         }
         let wc = WriteConcern::majority();
         let ctx = CommitContext {
@@ -1487,4 +1496,60 @@ fn explain_suggest_partial_coverage() {
         "should suggest CreateIndex for User.email (not indexed). Suggestions: {:?}",
         result.suggestions
     );
+}
+
+/// End-to-end incremental statistics: cardinalities come from the counters
+/// staged by the write executors, so they follow CREATE / DELETE / label
+/// changes without any node-partition scan, and a rolled-back create leaves
+/// no trace.
+#[test]
+fn statistics_counters_follow_writes_end_to_end() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute_cypher("CREATE (a:User {name: 'a'})").unwrap();
+    db.execute_cypher("CREATE (b:User {name: 'b'})").unwrap();
+    db.execute_cypher("CREATE (p:Post {t: 1})").unwrap();
+    db.invalidate_stats_cache();
+    {
+        use coordinode_core::graph::stats::StorageStats;
+        let stats = db.compute_stats().expect("stats");
+        assert_eq!(stats.total_node_count(), 3);
+        assert_eq!(stats.node_count_for_label("User"), Some(2));
+        assert_eq!(stats.node_count_for_label("Post"), Some(1));
+    }
+
+    // SET adds a label; REMOVE takes one away; DELETE removes rows.
+    db.execute_cypher("MATCH (b:User {name: 'b'}) SET b:Admin")
+        .unwrap();
+    db.execute_cypher("MATCH (p:Post) DELETE p").unwrap();
+    db.invalidate_stats_cache();
+    {
+        use coordinode_core::graph::stats::StorageStats;
+        let stats = db.compute_stats().expect("stats");
+        assert_eq!(stats.total_node_count(), 2);
+        assert_eq!(stats.node_count_for_label("Admin"), Some(1));
+        assert_eq!(
+            stats.node_count_for_label("Post"),
+            None,
+            "a label whose rows are all deleted reports absent, not zero"
+        );
+    }
+
+    // A failed / aborted statement stages nothing: force an error mid-write.
+    let before = {
+        use coordinode_core::graph::stats::StorageStats;
+        db.invalidate_stats_cache();
+        db.compute_stats().expect("stats").total_node_count()
+    };
+    let _ = db.execute_cypher("CREATE (x:Ghost {v: 1/0})");
+    db.invalidate_stats_cache();
+    {
+        use coordinode_core::graph::stats::StorageStats;
+        let stats = db.compute_stats().expect("stats");
+        assert_eq!(
+            stats.total_node_count(),
+            before,
+            "an aborted statement must leave the counters untouched"
+        );
+        assert_eq!(stats.node_count_for_label("Ghost"), None);
+    }
 }

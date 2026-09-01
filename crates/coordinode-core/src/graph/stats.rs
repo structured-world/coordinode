@@ -1,9 +1,34 @@
 //! Storage statistics for query cost estimation.
 //!
 //! The `StorageStats` trait provides an interface for the query planner
-//! to access real storage statistics instead of hardcoded defaults.
-//! Implementations should cache results and refresh periodically,
-//! as computing exact statistics requires storage scans.
+//! to access real storage statistics instead of hardcoded defaults. Node
+//! and label cardinalities are maintained INCREMENTALLY in the counter
+//! partition (every node create / delete / label change stages commutative
+//! counter deltas on the same transaction), so a statistics refresh reads a
+//! handful of counters instead of scanning the node partition; fan-out
+//! remains a bounded sample over the adjacency partition.
+
+/// The counter key for the total stored-node-row count.
+pub const NODES_TOTAL_KEY: &[u8] = b"stat:nodes:total";
+
+/// The counter-key prefix for per-label row counts; the label follows.
+pub const LABEL_KEY_PREFIX: &[u8] = b"stat:label:";
+
+/// Build the counter key for one label's row count.
+#[must_use]
+pub fn label_count_key(label: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(LABEL_KEY_PREFIX.len() + label.len());
+    k.extend_from_slice(LABEL_KEY_PREFIX);
+    k.extend_from_slice(label.as_bytes());
+    k
+}
+
+/// Encode a signed counter delta as the counter partition's merge operand
+/// (i64 little-endian).
+#[must_use]
+pub fn counter_delta_operand(delta: i64) -> Vec<u8> {
+    delta.to_le_bytes().to_vec()
+}
 
 /// Storage statistics interface for query cost estimation.
 ///

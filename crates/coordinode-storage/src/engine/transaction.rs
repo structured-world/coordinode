@@ -37,7 +37,7 @@ use crate::cache::write_buffer::NvmeWriteBuffer;
 use crate::engine::StorageSnapshot;
 use crate::engine::coordinator::{MultiModalCoordinator, OccScope};
 use crate::engine::core::StorageEngine;
-use crate::engine::merge::{encode_add_batch, encode_remove};
+use crate::engine::merge::{encode_add_batch, encode_counter_delta, encode_remove};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
@@ -173,6 +173,11 @@ pub struct Transaction<'a> {
     /// -write document deltas (SET nested path) materialise these against the
     /// node record before a read; drained at commit.
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Buffered counter merge deltas: `(counter key, signed delta)`.
+    /// Commutative increments on the `counter:` partition (statistics
+    /// counters, degree caches); bypass OCC like the other merge buffers.
+    /// Drained at commit as `CounterMerge` operands.
+    merge_counter_deltas: Vec<(Vec<u8>, i64)>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -191,6 +196,7 @@ pub struct TransactionState {
     merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
     merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
+    merge_counter_deltas: Vec<(Vec<u8>, i64)>,
 }
 
 impl TransactionState {
@@ -251,6 +257,7 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: HashMap::new(),
             merge_adj_removes: HashMap::new(),
             merge_node_deltas: Vec::new(),
+            merge_counter_deltas: Vec::new(),
         }
     }
 
@@ -274,6 +281,7 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: self.merge_adj_adds,
             merge_adj_removes: self.merge_adj_removes,
             merge_node_deltas: self.merge_node_deltas,
+            merge_counter_deltas: self.merge_counter_deltas,
         }
     }
 
@@ -294,6 +302,7 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: std::mem::take(&mut self.merge_adj_adds),
             merge_adj_removes: std::mem::take(&mut self.merge_adj_removes),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
+            merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
         }
     }
 
@@ -318,6 +327,7 @@ impl<'a> Transaction<'a> {
             merge_adj_adds: state.merge_adj_adds,
             merge_adj_removes: state.merge_adj_removes,
             merge_node_deltas: state.merge_node_deltas,
+            merge_counter_deltas: state.merge_counter_deltas,
         }
     }
 
@@ -612,12 +622,22 @@ impl<'a> Transaction<'a> {
         self.merge_node_deltas.push((node_key, operand));
     }
 
-    /// Whether any merge operand (adjacency or node delta) is buffered. Used by
-    /// the commit path's read-only fast exit.
+    /// Buffer a commutative counter increment at `counter_key` (statistics
+    /// counters, degree caches). Applied at commit as a `CounterMerge`
+    /// operand; not OCC-tracked. A zero delta is dropped.
+    pub fn push_counter_delta(&mut self, counter_key: Vec<u8>, delta: i64) {
+        if delta != 0 {
+            self.merge_counter_deltas.push((counter_key, delta));
+        }
+    }
+
+    /// Whether any merge operand (adjacency, node delta, or counter delta) is
+    /// buffered. Used by the commit path's read-only fast exit.
     pub fn has_pending_merges(&self) -> bool {
         !self.merge_adj_adds.is_empty()
             || !self.merge_adj_removes.is_empty()
             || !self.merge_node_deltas.is_empty()
+            || !self.merge_counter_deltas.is_empty()
     }
 
     /// Borrow buffered adjacency adds (read-your-own-writes overlay on the
@@ -664,6 +684,7 @@ impl<'a> Transaction<'a> {
         self.merge_adj_adds.clear();
         self.merge_adj_removes.clear();
         self.merge_node_deltas.clear();
+        self.merge_counter_deltas.clear();
     }
 
     /// Drop any buffered adjacency adds/removes for `adj_key`. Used when a
@@ -728,10 +749,7 @@ impl<'a> Transaction<'a> {
         // relaxed atomic load; read-only commits are exempt (nothing to
         // admit), and the Raft apply path never goes through here, so
         // committed entries are never gated.
-        let has_writes = !self.write_buffer.is_empty()
-            || !self.merge_adj_adds.is_empty()
-            || !self.merge_adj_removes.is_empty()
-            || !self.merge_node_deltas.is_empty();
+        let has_writes = !self.write_buffer.is_empty() || self.has_pending_merges();
         if has_writes
             && matches!(
                 self.engine.write_pressure(),
@@ -757,6 +775,10 @@ impl<'a> Transaction<'a> {
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
             }
+            for (key, delta) in self.merge_counter_deltas.drain(..) {
+                self.engine
+                    .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
+            }
             // Legacy mode — writes already applied.
             return Ok(CommitOutcome {
                 commit_ts: None,
@@ -774,9 +796,7 @@ impl<'a> Transaction<'a> {
             }
         };
 
-        let has_merge_ops = !self.merge_adj_adds.is_empty()
-            || !self.merge_adj_removes.is_empty()
-            || !self.merge_node_deltas.is_empty();
+        let has_merge_ops = self.has_pending_merges();
         if self.write_buffer.is_empty() && !has_merge_ops {
             // Read-only — no commit needed.
             return Ok(CommitOutcome {
@@ -853,6 +873,10 @@ impl<'a> Transaction<'a> {
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
             }
+            for (key, delta) in self.merge_counter_deltas.drain(..) {
+                self.engine
+                    .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
+            }
             return Ok(CommitOutcome {
                 commit_ts: Some(commit_ts),
                 applied_index: None,
@@ -886,6 +910,10 @@ impl<'a> Transaction<'a> {
             }
             for (key, operand) in &self.merge_node_deltas {
                 self.engine.merge(Partition::Node, key, operand)?;
+            }
+            for (key, delta) in &self.merge_counter_deltas {
+                self.engine
+                    .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
             }
 
             // Step 2: Buffer for drain (if drain buffer is available).
@@ -928,6 +956,13 @@ impl<'a> Transaction<'a> {
                         operand,
                     });
                 }
+                for (key, delta) in self.merge_counter_deltas.drain(..) {
+                    mutations.push(Mutation::Merge {
+                        partition: PartitionId::Counter,
+                        key,
+                        operand: encode_counter_delta(delta),
+                    });
+                }
 
                 let entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
 
@@ -950,6 +985,7 @@ impl<'a> Transaction<'a> {
                 self.merge_adj_adds.clear();
                 self.merge_adj_removes.clear();
                 self.merge_node_deltas.clear();
+                self.merge_counter_deltas.clear();
             }
 
             return Ok(CommitOutcome {
@@ -1007,6 +1043,13 @@ impl<'a> Transaction<'a> {
                     partition: PartitionId::Node,
                     key,
                     operand,
+                });
+            }
+            for (key, delta) in self.merge_counter_deltas.drain(..) {
+                mutations.push(Mutation::Merge {
+                    partition: PartitionId::Counter,
+                    key,
+                    operand: encode_counter_delta(delta),
                 });
             }
 
@@ -1073,6 +1116,10 @@ impl<'a> Transaction<'a> {
             }
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
+            }
+            for (key, delta) in self.merge_counter_deltas.drain(..) {
+                self.engine
+                    .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
             }
         }
 

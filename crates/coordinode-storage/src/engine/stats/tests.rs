@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
-use coordinode_core::graph::node::{NodeId, encode_node_key};
+use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::stats::{NODES_TOTAL_KEY, counter_delta_operand, label_count_key};
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -11,6 +12,27 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
         Tier::Warm,
     )]);
     StorageEngine::open(&config).expect("open engine")
+}
+
+/// Seed the incremental statistics counters the way a committed node write
+/// does (total +1, each label +1) — the reader consumes counters, not rows.
+fn seed_node_counters(engine: &StorageEngine, labels: &[&str]) {
+    engine
+        .merge(
+            Partition::Counter,
+            NODES_TOTAL_KEY,
+            &counter_delta_operand(1),
+        )
+        .unwrap();
+    for label in labels {
+        engine
+            .merge(
+                Partition::Counter,
+                &label_count_key(label),
+                &counter_delta_operand(1),
+            )
+            .unwrap();
+    }
 }
 
 #[test]
@@ -31,20 +53,12 @@ fn node_count_per_label() {
     let dir = tempfile::tempdir().unwrap();
     let engine = test_engine(dir.path());
 
-    // Insert 3 User nodes and 2 Post nodes
-    for i in 0..3u64 {
-        let key = encode_node_key(0, NodeId::from_raw(i));
-        let rec = NodeRecord::new("User");
-        engine
-            .put(Partition::Node, &key, &rec.to_msgpack().unwrap())
-            .unwrap();
+    // 3 User nodes and 2 Post nodes, as their committed writes would count.
+    for _ in 0..3 {
+        seed_node_counters(&engine, &["User"]);
     }
-    for i in 3..5u64 {
-        let key = encode_node_key(0, NodeId::from_raw(i));
-        let rec = NodeRecord::new("Post");
-        engine
-            .put(Partition::Node, &key, &rec.to_msgpack().unwrap())
-            .unwrap();
+    for _ in 0..2 {
+        seed_node_counters(&engine, &["Post"]);
     }
 
     let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
@@ -106,19 +120,10 @@ fn multi_label_nodes_counted_per_label() {
     let dir = tempfile::tempdir().unwrap();
     let engine = test_engine(dir.path());
 
-    // Node with labels [User, Admin]
-    let key = encode_node_key(0, NodeId::from_raw(0));
-    let rec = NodeRecord::with_labels(vec!["User".into(), "Admin".into()]);
-    engine
-        .put(Partition::Node, &key, &rec.to_msgpack().unwrap())
-        .unwrap();
-
-    // Node with label [User]
-    let key2 = encode_node_key(0, NodeId::from_raw(1));
-    let rec2 = NodeRecord::new("User");
-    engine
-        .put(Partition::Node, &key2, &rec2.to_msgpack().unwrap())
-        .unwrap();
+    // One node with labels [User, Admin], one with [User]: a multi-label
+    // node contributes one row to the total and one to EACH label count.
+    seed_node_counters(&engine, &["User", "Admin"]);
+    seed_node_counters(&engine, &["User"]);
 
     let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
 

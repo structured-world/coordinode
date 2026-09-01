@@ -76,6 +76,7 @@ pub mod index_def;
 pub mod node;
 pub mod schema;
 pub mod spatial;
+pub mod stats;
 pub mod timeseries;
 pub mod trigger;
 pub mod vector;
@@ -95,6 +96,7 @@ pub use index_def::{
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
 pub use spatial::{Bbox, Crs, LocalSpatialStore, Point, SpatialStore, distance};
+pub use stats::{LocalStatsStore, StatsStore};
 pub use timeseries::{
     Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
     TimeSeriesStore,

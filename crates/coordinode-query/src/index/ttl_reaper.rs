@@ -319,6 +319,23 @@ fn reap_label(
                     match collect_node_deletion_mutations(engine, nid_raw, key, edge_types) {
                         Ok(mutations) => {
                             pending.extend(mutations);
+                            // Statistics counters ride the same proposal as
+                            // the deletion: total -1, each label -1.
+                            {
+                                use coordinode_modality::stats as stat_keys;
+                                pending.push(Mutation::Merge {
+                                    partition: PartitionId::Counter,
+                                    key: stat_keys::NODES_TOTAL_KEY.to_vec(),
+                                    operand: stat_keys::counter_delta_operand(-1),
+                                });
+                                for label in &record.labels {
+                                    pending.push(Mutation::Merge {
+                                        partition: PartitionId::Counter,
+                                        key: stat_keys::label_count_key(label),
+                                        operand: stat_keys::counter_delta_operand(-1),
+                                    });
+                                }
+                            }
                             result.nodes_deleted += 1;
                         }
                         Err(e) => result.errors.push(format!(

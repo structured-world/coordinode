@@ -2,13 +2,17 @@
 //!
 //! Provides real node counts, label cardinality, and edge fan-out
 //! statistics for the query cost estimator, replacing hardcoded defaults.
+//! Node and label cardinalities are read from the incrementally-maintained
+//! counters in the counter partition (staged by the write executors on the
+//! same transaction as the data writes); fan-out remains a bounded sample
+//! over the adjacency partition. A refresh therefore costs a handful of
+//! counter reads plus the sample, not a node-partition scan.
 
 use std::collections::HashMap;
 
 use lsm_tree::Guard;
 
 use coordinode_core::graph::edge::PostingList;
-use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::stats::StorageStats;
 
 use crate::engine::core::StorageEngine;
@@ -17,7 +21,8 @@ use crate::error::StorageResult;
 
 /// Pre-computed storage statistics snapshot.
 ///
-/// Computed by scanning the `node:` and `adj:` partitions. The caller
+/// Node/label cardinalities come from the counter partition's incremental
+/// statistics counters; fan-out from a bounded adjacency sample. The caller
 /// is responsible for caching and refreshing (e.g., on a timer or after
 /// a configurable number of writes).
 #[derive(Clone)]
@@ -73,23 +78,37 @@ impl StorageStatsComputer {
         })
     }
 
-    /// Count nodes per label by scanning the `node:` partition.
-    fn count_nodes(engine: &StorageEngine) -> StorageResult<(u64, HashMap<String, u64>)> {
-        let mut total: u64 = 0;
-        let mut label_counts: HashMap<String, u64> = HashMap::new();
+    /// Decode a counter value (i64 little-endian; anything else reads 0).
+    fn decode_counter(bytes: &[u8]) -> i64 {
+        bytes.try_into().map(i64::from_le_bytes).unwrap_or_default()
+    }
 
-        let iter = engine.prefix_scan(Partition::Node, b"node:")?;
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
+    /// Read the incrementally-maintained node/label counters (latest state).
+    ///
+    /// One point read for the total plus one tiny prefix walk over the
+    /// per-label counters (one row per distinct label) replaces the former
+    /// full scan + decode of the node partition. A counter that folded to
+    /// zero or below (all rows deleted) is omitted, matching the scan
+    /// behaviour of never reporting an absent label.
+    fn count_nodes(engine: &StorageEngine) -> StorageResult<(u64, HashMap<String, u64>)> {
+        use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY};
+
+        let total = engine
+            .get(Partition::Counter, NODES_TOTAL_KEY)?
+            .map(|v| Self::decode_counter(&v).max(0) as u64)
+            .unwrap_or(0);
+
+        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        for guard in engine.prefix_scan(Partition::Counter, LABEL_KEY_PREFIX)? {
+            let Ok((key, value)) = guard.into_inner() else {
                 continue;
             };
-            total += 1;
-
-            // Decode NodeRecord to extract labels
-            if let Ok(record) = NodeRecord::from_msgpack(&value) {
-                for label in &record.labels {
-                    *label_counts.entry(label.clone()).or_insert(0) += 1;
-                }
+            let count = Self::decode_counter(&value);
+            if count <= 0 {
+                continue;
+            }
+            if let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) {
+                label_counts.insert(label.to_string(), count as u64);
             }
         }
 
@@ -172,21 +191,29 @@ impl StorageStatsComputer {
         Ok((type_fan_outs, overall))
     }
 
-    /// Count nodes per label using snapshot-based scan (ADR-016: native seqno MVCC).
+    /// Snapshot-pinned counterpart of [`Self::count_nodes`] (ADR-016 MVCC):
+    /// the same counter reads, resolved at the given snapshot.
     fn count_nodes_snapshot(
         engine: &StorageEngine,
         snapshot: &lsm_tree::SeqNo,
     ) -> StorageResult<(u64, HashMap<String, u64>)> {
-        let mut total: u64 = 0;
-        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY};
 
-        let entries = engine.snapshot_prefix_scan(snapshot, Partition::Node, b"node:")?;
-        for (_key, value) in entries {
-            total += 1;
-            if let Ok(record) = NodeRecord::from_msgpack(&value) {
-                for label in &record.labels {
-                    *label_counts.entry(label.clone()).or_insert(0) += 1;
-                }
+        let total = engine
+            .snapshot_get(snapshot, Partition::Counter, NODES_TOTAL_KEY)?
+            .map(|v| Self::decode_counter(&v).max(0) as u64)
+            .unwrap_or(0);
+
+        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        for (key, value) in
+            engine.snapshot_prefix_scan(snapshot, Partition::Counter, LABEL_KEY_PREFIX)?
+        {
+            let count = Self::decode_counter(&value);
+            if count <= 0 {
+                continue;
+            }
+            if let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) {
+                label_counts.insert(label.to_string(), count as u64);
             }
         }
 
