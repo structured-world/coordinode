@@ -62,6 +62,10 @@ pub enum Reason {
     /// A schema rule refused the write: an undeclared property on a strict
     /// label, or an attempt to set a computed one.
     SchemaViolation,
+    /// Storage is over its compaction-debt stop threshold and is shedding
+    /// new writes until compaction catches up. Nothing was applied; retry
+    /// after the advised delay.
+    WriteBackpressure,
 }
 
 impl Reason {
@@ -78,17 +82,27 @@ impl Reason {
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
+            Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
         }
     }
 
-    /// Whether repeating the same request unchanged could succeed.
+    /// The retry advice for a retryable reason, `None` for a terminal one.
     ///
-    /// This is the server's own judgement, published so that a client does not
-    /// have to encode a table of ours. A conflict is the one reason here worth
-    /// retrying: everything else fails the same way every time until either
-    /// the request or the data changes.
-    pub const fn is_retryable(self) -> bool {
-        matches!(self, Reason::TransactionConflict)
+    /// This is the server's own judgement, published (as `RetryInfo`) so that
+    /// a client does not have to encode a table of ours.
+    ///
+    /// A conflict says "retry now": it is resolved by re-running the
+    /// transaction, not by waiting, and the explicit zero delay is what stops
+    /// a client from inventing a backoff for a condition backing off does not
+    /// help. Backpressure says the opposite: the server is shedding writes
+    /// until compaction catches up, so an immediate retry would bounce off
+    /// the same verdict; the delay is a floor for the client's backoff.
+    pub const fn retry_delay(self) -> Option<std::time::Duration> {
+        match self {
+            Reason::TransactionConflict => Some(std::time::Duration::ZERO),
+            Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
+            _ => None,
+        }
     }
 }
 
@@ -107,12 +121,8 @@ pub fn status_with_reason(
         .map(|(k, v)| (k.to_string(), v))
         .collect();
     let mut details = ErrorDetails::with_error_info(reason.as_str(), ERROR_DOMAIN, metadata);
-    if reason.is_retryable() {
-        // Zero delay: a conflict is resolved by re-running the transaction,
-        // not by waiting for the server to recover. Saying "retry now"
-        // explicitly is what stops a client from inventing a backoff for a
-        // condition that backing off does not help.
-        details.set_retry_info(Some(std::time::Duration::ZERO));
+    if let Some(delay) = reason.retry_delay() {
+        details.set_retry_info(Some(delay));
     }
     Status::with_error_details(code, message, details)
 }

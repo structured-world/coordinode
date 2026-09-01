@@ -550,6 +550,15 @@ pub enum DatabaseError {
         limit: usize,
     },
 
+    /// The storage engine is over its compaction-debt stop threshold and
+    /// rejected the commit's writes. Nothing was applied; retrying after a
+    /// short delay succeeds once compaction catches up.
+    #[error(
+        "write rejected: storage is over its compaction-debt stop threshold; \
+         retry after compaction catches up"
+    )]
+    WriteBackpressure,
+
     #[error("{0}")]
     Other(String),
 }
@@ -1651,6 +1660,9 @@ impl Database {
             CommitError::Serialization(detail) => {
                 DatabaseError::Other(format!("commit failed: {detail}"))
             }
+            // Retryable like a conflict, but with a delay: the engine sheds
+            // writes until compaction drains its debt.
+            CommitError::Backpressure => DatabaseError::WriteBackpressure,
         })?;
         Ok(outcome.applied_index.unwrap_or(0))
     }

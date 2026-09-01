@@ -76,6 +76,8 @@ impl CompactionScheduler {
         num_workers: usize,
         l0_urgent_threshold: usize,
         poll_interval_ms: u64,
+        debt_urgent_bytes: u64,
+        write_pressure: Arc<std::sync::atomic::AtomicU8>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -112,6 +114,8 @@ impl CompactionScheduler {
                     gc_watermark,
                     l0_urgent_threshold,
                     poll_interval_ms,
+                    debt_urgent_bytes,
+                    write_pressure,
                     shutdown_m,
                 );
             })
@@ -139,15 +143,24 @@ impl Drop for CompactionScheduler {
     }
 }
 
-/// Assign a [`CompactionPriority`] to a partition based on its current L0 state.
+/// Assign a [`CompactionPriority`] to a partition based on its current L0
+/// state and pending-compaction byte debt.
+///
+/// Either urgency axis alone is sufficient: a tall L0 spikes read
+/// amplification even with little total debt, and a large byte debt starves
+/// the size targets even when L0 itself is short (heavy overwrite workloads
+/// accumulate debt in the mid levels).
 ///
 /// Exposed for unit testing. Used by the monitor thread each poll cycle.
 pub(crate) fn compaction_priority(
     partition: Partition,
     l0_run_count: usize,
     urgent_threshold: usize,
+    debt_bytes: u64,
+    debt_urgent_bytes: u64,
 ) -> CompactionPriority {
-    if l0_run_count > urgent_threshold {
+    if l0_run_count > urgent_threshold || (debt_urgent_bytes > 0 && debt_bytes >= debt_urgent_bytes)
+    {
         return CompactionPriority::Urgent;
     }
     match partition {
@@ -157,24 +170,66 @@ pub(crate) fn compaction_priority(
     }
 }
 
-/// Monitor loop: polls all partition trees, assigns priorities, submits requests.
+/// Monitor loop: polls all partition trees, assigns priorities, submits
+/// requests, and latches the worst per-partition backpressure verdict into
+/// `write_pressure` (0/1/2 = none/slowdown/stop) for the commit-path check.
+#[allow(clippy::too_many_arguments)]
 fn compaction_monitor_loop(
     trees: Vec<(Partition, lsm_tree::AnyTree)>,
     sender: flume::Sender<CompactionRequest>,
     gc_watermark: Arc<AtomicU64>,
     l0_urgent_threshold: usize,
     poll_interval_ms: u64,
+    debt_urgent_bytes: u64,
+    write_pressure: Arc<std::sync::atomic::AtomicU8>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let strategy = lsm_tree::compaction::Leveled::default();
     while !shutdown.load(Ordering::Relaxed) {
         let watermark = gc_watermark.load(Ordering::Relaxed);
 
         // Build requests sorted by priority: Urgent (0) first, Low (3) last.
+        // Along the way, compute the worst backpressure tier across trees.
+        let mut worst_tier: u8 = 0;
         let mut requests: Vec<CompactionRequest> = trees
             .iter()
             .map(|(partition, tree)| {
                 let l0 = tree.l0_run_count();
-                let priority = compaction_priority(*partition, l0, l0_urgent_threshold);
+                let debt = tree.compaction_debt(&strategy);
+                let priority = compaction_priority(
+                    *partition,
+                    l0,
+                    l0_urgent_threshold,
+                    debt,
+                    debt_urgent_bytes,
+                );
+                let tier = match tree.write_backpressure(&strategy) {
+                    lsm_tree::Backpressure::None => 0u8,
+                    lsm_tree::Backpressure::Slowdown { .. } => 1,
+                    lsm_tree::Backpressure::Stop => 2,
+                };
+                if tier == 2 {
+                    // An operator seeing WRITE_BACKPRESSURE rejections needs
+                    // to know which partition tripped it and on which axis.
+                    tracing::warn!(
+                        partition = partition.name(),
+                        l0_run_count = l0,
+                        compaction_debt_bytes = debt,
+                        "write-backpressure STOP: shedding client writes until \
+                         compaction catches up"
+                    );
+                }
+                worst_tier = worst_tier.max(tier);
+                metrics::gauge!(
+                    "coordinode_storage_backpressure_tier",
+                    "partition" => partition.name()
+                )
+                .set(f64::from(tier));
+                metrics::gauge!(
+                    "coordinode_storage_compaction_debt_bytes",
+                    "partition" => partition.name()
+                )
+                .set(debt as f64);
                 CompactionRequest {
                     tree: tree.clone(),
                     partition: *partition,
@@ -183,6 +238,7 @@ fn compaction_monitor_loop(
                 }
             })
             .collect();
+        write_pressure.store(worst_tier, Ordering::Relaxed);
 
         requests.sort_by_key(|r| r.priority);
 
@@ -192,7 +248,14 @@ fn compaction_monitor_loop(
             let _ = sender.try_send(req);
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+        // Sleep in short ticks so engine shutdown (which joins this thread)
+        // stays responsive regardless of the configured poll interval.
+        let mut slept = 0u64;
+        while slept < poll_interval_ms && !shutdown.load(Ordering::Relaxed) {
+            let tick = (poll_interval_ms - slept).min(100);
+            std::thread::sleep(std::time::Duration::from_millis(tick));
+            slept += tick;
+        }
     }
 }
 

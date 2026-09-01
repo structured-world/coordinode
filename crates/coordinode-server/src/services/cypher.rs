@@ -277,6 +277,21 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
+        // Both spellings of the same condition: an interactive commit fails
+        // with the typed variant, an auto-commit statement carries it inside
+        // the execution error. Retryable with a delay (RetryInfo), unlike a
+        // conflict: the server is shedding writes until compaction catches up.
+        DatabaseError::WriteBackpressure
+        | DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::Backpressure,
+        ) => {
+            return status_with_reason(
+                Code::ResourceExhausted,
+                rendered,
+                Reason::WriteBackpressure,
+                [],
+            );
+        }
         _ => {}
     }
     // Capacity exhaustion arrives wrapped in either a Storage or an Execution

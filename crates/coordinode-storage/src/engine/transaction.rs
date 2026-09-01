@@ -63,6 +63,7 @@ pub struct CommitContext<'b> {
 }
 
 /// Result of a successful [`Transaction::commit`].
+#[derive(Debug)]
 pub struct CommitOutcome {
     /// Commit timestamp assigned by the oracle, or `None` for a read-only
     /// transaction / legacy mode (writes already applied).
@@ -87,6 +88,14 @@ pub enum CommitError {
     /// Encoding / replication-pipeline failure.
     #[error("{0}")]
     Serialization(String),
+    /// The engine is over its compaction-debt stop threshold: new client
+    /// writes are rejected until compaction catches up. Nothing was applied;
+    /// retry after a short delay.
+    #[error(
+        "write rejected: storage is over its compaction-debt stop threshold; \
+         retry after compaction catches up"
+    )]
+    Backpressure,
 }
 
 /// Map a storage [`Partition`] to its wire [`PartitionId`] for Raft proposals.
@@ -713,6 +722,25 @@ impl<'a> Transaction<'a> {
     /// Returns the commit timestamp used (or `None` for a read-only / legacy
     /// transaction) plus the committed Raft index on the pipeline path.
     pub fn commit(&mut self, ctx: &CommitContext<'_>) -> Result<CommitOutcome, CommitError> {
+        // Write-admission gate: under Stop pressure (storage over its
+        // compaction-debt stop threshold) a commit carrying writes is
+        // rejected BEFORE anything is applied, as a retryable error. One
+        // relaxed atomic load; read-only commits are exempt (nothing to
+        // admit), and the Raft apply path never goes through here, so
+        // committed entries are never gated.
+        let has_writes = !self.write_buffer.is_empty()
+            || !self.merge_adj_adds.is_empty()
+            || !self.merge_adj_removes.is_empty()
+            || !self.merge_node_deltas.is_empty();
+        if has_writes
+            && matches!(
+                self.engine.write_pressure(),
+                crate::engine::core::WritePressure::Stop
+            )
+        {
+            return Err(CommitError::Backpressure);
+        }
+
         // Flush adj merge buffers even in legacy (no MVCC) mode.
         // Legacy puts write directly to engine, but merge adds are buffered.
         if self.oracle.is_none() {

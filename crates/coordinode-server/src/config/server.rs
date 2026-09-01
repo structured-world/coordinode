@@ -47,6 +47,13 @@ pub struct StorageTopology {
     /// Explicit endpoint list. Empty = derive a single durable HDD warm-tier
     /// endpoint rooted at [`ServerConfig::data_dir`].
     pub endpoints: Vec<EndpointConfig>,
+    /// Write-backpressure thresholds (L0 height and pending-compaction byte
+    /// debt, each with a slowdown and a stop level). Slowdown raises
+    /// compaction priority and metrics only; Stop rejects new client writes
+    /// at commit with a retryable error until compaction catches up. Nothing
+    /// ever sleeps on the verdict.
+    #[serde(default)]
+    pub backpressure: coordinode_storage::engine::config::BackpressureLimits,
 }
 
 /// Errors from loading the YAML config file.
@@ -412,7 +419,9 @@ impl ServerConfig {
     /// subcommand that opens the engine routes through it.
     #[must_use]
     pub fn resolve_storage_config(&self) -> StorageConfig {
-        StorageConfig::with_endpoints(self.storage_endpoints())
+        let mut cfg = StorageConfig::with_endpoints(self.storage_endpoints());
+        cfg.backpressure = self.storage.backpressure;
+        cfg
     }
 
     /// Whether any configured endpoint's effective ECC policy is "on".

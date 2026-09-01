@@ -28,9 +28,11 @@ fn compaction_scheduler_starts_and_stops() {
     let sched = CompactionScheduler::start(
         &trees,
         Arc::clone(&gc_watermark),
-        1,  // 1 worker
-        8,  // l0_urgent_threshold
-        50, // poll interval ms
+        1,                       // 1 worker
+        8,                       // l0_urgent_threshold
+        50,                      // poll interval ms
+        64 * 1024 * 1024 * 1024, // debt_urgent_bytes
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
     )
     .expect("start CompactionScheduler");
 
@@ -40,37 +42,55 @@ fn compaction_scheduler_starts_and_stops() {
 
 #[test]
 fn compaction_priority_rules() {
+    const GIB: u64 = 1024 * 1024 * 1024;
     // Adj is High by default.
     assert_eq!(
-        compaction_priority(Partition::Adj, 0, 8),
+        compaction_priority(Partition::Adj, 0, 8, 0, 64 * GIB),
         CompactionPriority::High,
     );
     // Blob is Low by default.
     assert_eq!(
-        compaction_priority(Partition::Blob, 0, 8),
+        compaction_priority(Partition::Blob, 0, 8, 0, 64 * GIB),
         CompactionPriority::Low,
     );
     // Node is Normal by default.
     assert_eq!(
-        compaction_priority(Partition::Node, 0, 8),
+        compaction_priority(Partition::Node, 0, 8, 0, 64 * GIB),
         CompactionPriority::Normal,
     );
     // L0 above threshold → Urgent, regardless of partition.
     assert_eq!(
-        compaction_priority(Partition::Node, 9, 8),
+        compaction_priority(Partition::Node, 9, 8, 0, 64 * GIB),
         CompactionPriority::Urgent,
     );
     assert_eq!(
-        compaction_priority(Partition::Adj, 9, 8),
+        compaction_priority(Partition::Adj, 9, 8, 0, 64 * GIB),
         CompactionPriority::Urgent,
     );
     assert_eq!(
-        compaction_priority(Partition::Blob, 9, 8),
+        compaction_priority(Partition::Blob, 9, 8, 0, 64 * GIB),
         CompactionPriority::Urgent,
     );
     // L0 exactly at threshold → not Urgent.
     assert_eq!(
-        compaction_priority(Partition::Node, 8, 8),
+        compaction_priority(Partition::Node, 8, 8, 0, 64 * GIB),
+        CompactionPriority::Normal,
+    );
+    // Pending-compaction byte debt at or above the urgent level → Urgent,
+    // even with a short L0 (heavy-overwrite workloads accumulate debt in
+    // the mid levels without a tall L0).
+    assert_eq!(
+        compaction_priority(Partition::Node, 0, 8, 64 * GIB, 64 * GIB),
+        CompactionPriority::Urgent,
+    );
+    // Just below the debt level → the partition's default priority.
+    assert_eq!(
+        compaction_priority(Partition::Node, 0, 8, 64 * GIB - 1, 64 * GIB),
+        CompactionPriority::Normal,
+    );
+    // A zero debt threshold disables the debt axis entirely.
+    assert_eq!(
+        compaction_priority(Partition::Node, 0, 8, u64::MAX, 0),
         CompactionPriority::Normal,
     );
 }
@@ -110,6 +130,8 @@ fn compaction_scheduler_no_panic_with_l0_data() {
         1,
         8,
         20, // fast poll for test
+        64 * 1024 * 1024 * 1024,
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
     )
     .expect("start CompactionScheduler");
 
@@ -128,6 +150,8 @@ fn compaction_scheduler_multiple_workers_no_panic() {
         4, // 4 workers
         8,
         10, // fast poll
+        64 * 1024 * 1024 * 1024,
+        Arc::new(std::sync::atomic::AtomicU8::new(0)),
     )
     .expect("start CompactionScheduler");
 

@@ -146,6 +146,7 @@ fn cli_data_flag_overrides_file_topology() {
                 EndpointConfig::new("a", "/mnt/a", Media::Nvme, Durability::Durable, Tier::Hot),
                 EndpointConfig::new("b", "/mnt/b", Media::Hdd, Durability::Durable, Tier::Cold),
             ],
+            ..StorageTopology::default()
         },
         ..ServerConfig::default()
     };
@@ -197,6 +198,7 @@ fn page_ecc_requested_tracks_endpoint_policy() {
                 Durability::Durable,
                 Tier::Warm,
             )],
+            ..StorageTopology::default()
         },
         ..ServerConfig::default()
     };
@@ -212,6 +214,7 @@ fn page_ecc_requested_tracks_endpoint_policy() {
                 Durability::Degraded,
                 Tier::Warm,
             )],
+            ..StorageTopology::default()
         },
         ..ServerConfig::default()
     };
@@ -241,6 +244,7 @@ fn resolve_storage_config_carries_endpoints() {
                 EndpointConfig::new("a", "/mnt/a", Media::Nvme, Durability::Durable, Tier::Hot),
                 EndpointConfig::new("b", "/mnt/b", Media::Hdd, Durability::Durable, Tier::Cold),
             ],
+            ..StorageTopology::default()
         },
         ..ServerConfig::default()
     };
@@ -318,4 +322,32 @@ fn extension_settings_survive_the_unknown_key_check() {
     let stray = dir.path().join("stray.yaml");
     std::fs::write(&stray, "pitr:\n  enabled: true\n").unwrap();
     assert!(ServerConfig::load(Some(stray.to_str().unwrap())).is_err());
+}
+
+#[test]
+fn backpressure_thresholds_parse_and_reach_the_storage_config() {
+    // Partial override: only the set keys change, the rest keep defaults,
+    // and the resolved StorageConfig carries the merged limits.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "storage:\n  backpressure:\n    l0_stop: 12\n    bytes_stop: 1024\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    let sc = c.resolve_storage_config();
+    assert_eq!(sc.backpressure.l0_stop, 12);
+    assert_eq!(sc.backpressure.bytes_stop, 1024);
+    // Unset keys stay at their defaults.
+    let defaults = coordinode_storage::engine::config::BackpressureLimits::default();
+    assert_eq!(sc.backpressure.l0_slowdown, defaults.l0_slowdown);
+    assert_eq!(sc.backpressure.bytes_slowdown, defaults.bytes_slowdown);
+
+    // An unknown key inside the section is a config error, not a silent no-op.
+    std::fs::write(&path, "storage:\n  backpressure:\n    l0_sotp: 12\n").unwrap();
+    assert!(
+        ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+        "a typoed backpressure key must be rejected"
+    );
 }

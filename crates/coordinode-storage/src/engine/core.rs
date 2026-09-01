@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use coordinode_core::txn::proposal::Mutation;
@@ -152,12 +152,46 @@ pub struct StorageEngine {
     /// [`replay_scope`](OpenRepair::replay_scope) means the partition owes a
     /// checkpoint + oplog rebuild even though its tree now opens cleanly.
     open_repairs: Vec<OpenRepair>,
+    /// Cached write-pressure tier (0/1/2 = None/Slowdown/Stop), latched by
+    /// the compaction monitor each poll cycle so the commit-path check is a
+    /// single relaxed atomic load.
+    write_pressure: Arc<AtomicU8>,
 }
 
 /// An inclusive `[min, max]` user-key range, as reported by a lossy open
 /// repair ([`OpenRepair::scoped_ranges`]) and consumed by the range-scoped
 /// rebuild ([`StorageEngine::repair_partition_ranges_from_checkpoint`]).
 pub type KeyRange = (Vec<u8>, Vec<u8>);
+
+/// The engine's cached write-pressure verdict, refreshed by the compaction
+/// monitor each poll cycle from the worst per-partition backpressure signal
+/// (L0 height, pending-compaction byte debt).
+///
+/// Nothing in the engine sleeps on this: `Slowdown` raises compaction
+/// priority and is exported to metrics, and `Stop` is consulted once per
+/// commit ([`crate::engine::transaction::Transaction::commit`]) to reject
+/// new client writes with a retryable error until compaction catches up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritePressure {
+    /// Every partition is within its target shape.
+    None,
+    /// Some partition crossed a slowdown threshold: compaction is being
+    /// prioritised; writes still proceed at full rate.
+    Slowdown,
+    /// Some partition crossed a stop threshold: new client writes should be
+    /// rejected (retryable) until the debt drains.
+    Stop,
+}
+
+impl WritePressure {
+    pub(crate) fn from_u8(tier: u8) -> Self {
+        match tier {
+            0 => Self::None,
+            1 => Self::Slowdown,
+            _ => Self::Stop,
+        }
+    }
+}
 
 /// One partition tree repaired during engine open.
 ///
@@ -528,13 +562,30 @@ impl StorageEngine {
             config.max_memtable_age_secs,
         )?;
 
-        // Start background compaction scheduler.
+        // Feed the backpressure thresholds to every partition tree so the
+        // monitor's per-tree verdict has something to compute against
+        // (thresholds default to OFF inside lsm-tree).
+        let thresholds = config.backpressure.to_thresholds();
+        for tree in trees.values() {
+            let inner = match tree {
+                lsm_tree::AnyTree::Standard(t) => t,
+                lsm_tree::AnyTree::Blob(bt) => &bt.index,
+            };
+            inner.update_runtime_config(|cfg| cfg.backpressure = thresholds)?;
+        }
+
+        // Start background compaction scheduler. It latches the worst
+        // per-partition backpressure verdict into `write_pressure` each poll
+        // cycle; the commit path reads it as a single atomic load.
+        let write_pressure = Arc::new(AtomicU8::new(0));
         let compaction_scheduler = CompactionScheduler::start(
             &trees,
             Arc::clone(&gc_watermark),
             config.compaction_workers,
             config.compaction_l0_urgent_threshold,
             config.compaction_poll_interval_ms,
+            config.backpressure.bytes_slowdown,
+            Arc::clone(&write_pressure),
         )?;
 
         info!(
@@ -667,7 +718,28 @@ impl StorageEngine {
             #[cfg(feature = "columnar")]
             columnar_tables,
             open_repairs,
+            write_pressure,
         })
+    }
+
+    /// The cached write-pressure verdict (one relaxed atomic load), latched
+    /// by the compaction monitor from the worst per-partition backpressure
+    /// signal. `Stop` means new client writes should be rejected (retryable)
+    /// until compaction drains the debt; nothing in the engine sleeps on it.
+    #[must_use]
+    pub fn write_pressure(&self) -> WritePressure {
+        WritePressure::from_u8(
+            self.write_pressure
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Test-only override of the cached pressure tier (the production value
+    /// is latched by the compaction monitor, which is timing-dependent).
+    #[cfg(test)]
+    pub(crate) fn force_write_pressure(&self, tier: u8) {
+        self.write_pressure
+            .store(tier, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Partition trees that were structurally repaired during this open, with

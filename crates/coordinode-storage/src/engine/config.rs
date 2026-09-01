@@ -463,6 +463,62 @@ impl CompressionConfig {
     }
 }
 
+/// Write-backpressure thresholds, per partition tree.
+///
+/// Two axes, each with a slowdown and a stop level: the L0 run count (a tall
+/// L0 is what spikes read amplification) and the pending-compaction byte
+/// debt the leveled strategy reports. Crossing a slowdown level raises the
+/// partition's compaction priority and shows up in metrics; crossing a stop
+/// level makes the engine's cached verdict `Stop`, which the commit path
+/// consults to reject new client writes (retryable) until compaction
+/// catches up. Defaults follow the RocksDB family of stall levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BackpressureLimits {
+    /// L0 run count at or above which the verdict is at least slowdown.
+    /// Default: 40.
+    pub l0_slowdown: usize,
+    /// L0 run count at or above which the verdict is stop. Default: 200 — a
+    /// deliberately high wall: a DDL burst legitimately creates dozens of
+    /// tiny L0 tables between two compaction passes (schema flushes per
+    /// statement), and the byte-debt axis carries the real ceiling; the L0
+    /// wall exists for pathological runaway only.
+    pub l0_stop: usize,
+    /// Pending-compaction bytes at or above which the verdict is at least
+    /// slowdown (also the debt level that raises compaction priority to
+    /// Urgent). Default: 64 GiB.
+    pub bytes_slowdown: u64,
+    /// Pending-compaction bytes at or above which the verdict is stop.
+    /// Default: 256 GiB.
+    pub bytes_stop: u64,
+}
+
+impl Default for BackpressureLimits {
+    fn default() -> Self {
+        Self {
+            l0_slowdown: 40,
+            l0_stop: 200,
+            bytes_slowdown: 64 * 1024 * 1024 * 1024,
+            bytes_stop: 256 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl BackpressureLimits {
+    /// The lsm-tree threshold set this configuration maps to. The slowdown
+    /// delay cap is informational only (nothing in CoordiNode sleeps on it).
+    #[must_use]
+    pub fn to_thresholds(&self) -> lsm_tree::BackpressureThresholds {
+        lsm_tree::BackpressureThresholds {
+            l0_slowdown: Some(self.l0_slowdown),
+            l0_stop: Some(self.l0_stop),
+            bytes_slowdown: Some(self.bytes_slowdown),
+            bytes_stop: Some(self.bytes_stop),
+            max_slowdown: Some(core::time::Duration::from_millis(10)),
+        }
+    }
+}
+
 /// Configuration for the CoordiNode storage engine.
 #[derive(Clone)]
 pub struct StorageConfig {
@@ -535,6 +591,14 @@ pub struct StorageConfig {
 
     /// Compaction monitor polling interval in milliseconds. Default: 200ms.
     pub compaction_poll_interval_ms: u64,
+
+    /// Write-backpressure thresholds fed to every partition tree. The
+    /// engine never sleeps on the resulting verdict: the slowdown tier
+    /// drives compaction priority and metrics only, and the stop tier is
+    /// consulted once per commit to reject new client writes while
+    /// compaction catches up (a retryable condition, surfaced with a retry
+    /// delay). Raft apply and internal writes are never gated.
+    pub backpressure: BackpressureLimits,
 
     /// Maximum entry bytes per oplog segment before rotation. Default: 64 MB.
     pub oplog_segment_max_bytes: u64,
@@ -708,6 +772,7 @@ impl StorageConfig {
             compaction_workers: 2,
             compaction_l0_urgent_threshold: 8,
             compaction_poll_interval_ms: 200,
+            backpressure: BackpressureLimits::default(),
             oplog_segment_max_bytes: 64 * 1024 * 1024,
             oplog_segment_max_entries: 50_000,
             oplog_retention_secs: 7 * 24 * 3600,

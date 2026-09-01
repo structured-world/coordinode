@@ -244,3 +244,67 @@ fn prefix_scan_paged_exact_limit_reports_exhausted() {
     assert!(page.exhausted);
     assert_eq!(page.last_key, Some(b"p:b".to_vec()));
 }
+
+/// The write-admission gate at the single commit locus: when the engine's
+/// cached write pressure is `Stop`, a commit CARRYING WRITES is rejected
+/// with a retryable backpressure error and nothing is applied; a read-only
+/// commit passes untouched (there is nothing to admit).
+#[test]
+fn commit_rejects_writes_under_stop_pressure() {
+    // The compaction monitor overwrites the cached tier every poll cycle
+    // with the real (healthy) verdict, so the forced tier below must not
+    // race with it: give the monitor an hour-long poll interval and let its
+    // single startup tick land before forcing.
+    let dir = tempfile::tempdir().unwrap();
+    let config = {
+        let mut c = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path().to_string_lossy().as_ref(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        c.compaction_poll_interval_ms = 3_600_000;
+        c
+    };
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    engine.force_write_pressure(2); // Stop
+
+    // Read-only transaction: commits fine under Stop.
+    let mut ro = mvcc_txn(&engine, &oracle);
+    ro.get(Partition::Node, b"r").unwrap();
+    ro.commit(&ctx).expect("read-only commit passes");
+
+    // Write transaction: rejected, and the write must not be visible.
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"bp:k", b"v").unwrap();
+    let err = txn
+        .commit(&ctx)
+        .expect_err("write commit under Stop must be rejected");
+    assert!(
+        matches!(err, CommitError::Backpressure),
+        "expected Backpressure, got {err:?}"
+    );
+    assert_eq!(engine.get(Partition::Node, b"bp:k").unwrap(), None);
+
+    // Pressure clears: the same write commits.
+    engine.force_write_pressure(0);
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"bp:k", b"v").unwrap();
+    txn.commit(&ctx).expect("commit after drain");
+    assert_eq!(
+        engine.get(Partition::Node, b"bp:k").unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+}

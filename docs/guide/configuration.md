@@ -355,6 +355,37 @@ with a measured reason.
 - `write_buffer_mb` sets the in-memory write buffer (memtable). Larger buffers
   flush to disk less often, trading memory for fewer, larger flushes.
 
+### Write backpressure
+
+Sustained write bursts can outrun background compaction; the engine tracks
+that debt on two axes per partition tree — the L0 run count (a tall L0
+inflates read amplification) and the pending-compaction byte debt — and turns
+them into a verdict against four thresholds under `storage.backpressure`:
+
+```yaml
+storage:
+  backpressure:
+    l0_slowdown: 40               # default
+    l0_stop: 200                  # default
+    bytes_slowdown: 68719476736   # 64 GiB, default
+    bytes_stop: 274877906944      # 256 GiB, default
+```
+
+The L0 stop level is a deliberately high wall: a DDL burst legitimately
+creates dozens of tiny L0 tables between two compaction passes, and the
+byte-debt axis carries the real ceiling.
+
+Crossing a *slowdown* level raises that partition's compaction priority to
+urgent and is visible in metrics (`coordinode_storage_backpressure_tier`,
+`coordinode_storage_compaction_debt_bytes`); writes still proceed at full
+rate. Crossing a *stop* level makes commits carrying writes fail with a
+retryable `WRITE_BACKPRESSURE` error (gRPC `RESOURCE_EXHAUSTED` with
+`RetryInfo`) until compaction drains the debt below the threshold; official
+drivers back off and retry on it automatically. The server never sleeps
+inside the write path on either tier, read-only traffic is unaffected, and
+replicated (Raft) entry application is never gated. Changing the thresholds
+requires a restart.
+
 ## Storage topology
 
 By default a node uses a single storage endpoint: a durable HDD warm-tier

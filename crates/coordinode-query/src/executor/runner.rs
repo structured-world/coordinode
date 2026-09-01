@@ -72,6 +72,15 @@ pub enum ExecutionError {
     #[error("write conflict: {0}")]
     Conflict(String),
 
+    /// The engine rejected the commit's writes because storage is over its
+    /// compaction-debt stop threshold. Nothing was applied; retryable after
+    /// a short delay.
+    #[error(
+        "write rejected: storage is over its compaction-debt stop threshold; \
+         retry after compaction catches up"
+    )]
+    Backpressure,
+
     /// Schema mode violation: STRICT label rejected an undeclared property, or
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
@@ -15657,6 +15666,7 @@ fn commit_err_to_execution(
         CommitError::Conflict(msg) => ExecutionError::Conflict(msg),
         CommitError::Storage(e) => ExecutionError::Storage(e),
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
+        CommitError::Backpressure => ExecutionError::Backpressure,
     }
 }
 

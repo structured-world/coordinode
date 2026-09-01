@@ -48,6 +48,22 @@ fn a_retryable_reason_says_so_and_the_rest_do_not() {
         syntax.get_error_details().retry_info().is_none(),
         "a syntax error fails identically every time"
     );
+
+    // Backpressure is retryable too, but with a NON-zero delay: an immediate
+    // retry bounces off the same shedding verdict, so the advice is a floor
+    // for the client's backoff (a conflict advises zero, retry-now).
+    let shed = status_with_reason(
+        Code::ResourceExhausted,
+        "shedding",
+        Reason::WriteBackpressure,
+        [],
+    );
+    let details = shed.get_error_details();
+    let retry = details.retry_info().expect("backpressure is retryable");
+    assert!(
+        retry.retry_delay.unwrap_or_default() > std::time::Duration::ZERO,
+        "backpressure must advise waiting, not retry-now"
+    );
 }
 
 #[test]
@@ -65,6 +81,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::TransactionTooLarge,
         Reason::CapacityExhausted,
         Reason::SchemaViolation,
+        Reason::WriteBackpressure,
     ];
     let mut seen = std::collections::BTreeSet::new();
     for reason in all {
