@@ -25,4 +25,4 @@ pub use ops::{
 };
 pub use registry::{IndexRegistry, UniqueViolation};
 pub use text_registry::TextIndexRegistry;
-pub use vector_registry::VectorIndexRegistry;
+pub use vector_registry::{BuildToken, VectorIndexRegistry};

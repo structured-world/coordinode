@@ -1762,6 +1762,16 @@ impl StorageEngine {
         self.oplog.is_some()
     }
 
+    /// Approximate live item count in a partition.
+    ///
+    /// Read straight off the LSM metadata, so it costs no scan — but it counts
+    /// every version and tombstone the levels still hold, and knows nothing of
+    /// labels or shards. It is an upper bound suitable for progress bars and
+    /// ETAs, never for an answer a caller might present as a row count.
+    pub fn approximate_len(&self, part: Partition) -> StorageResult<usize> {
+        Ok(self.tree(part)?.approximate_len())
+    }
+
     /// Get approximate disk space used by the engine in bytes.
     pub fn disk_space(&self) -> StorageResult<u64> {
         Ok(self

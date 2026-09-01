@@ -5,7 +5,8 @@
 //! maintained incrementally on node create/update/delete.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use coordinode_cluster::VectorShardRouter;
 use coordinode_core::graph::node::NodeId;
@@ -80,6 +81,42 @@ pub struct VectorIndexRegistry {
     /// caller (executor, Database) so we never re-enter the same
     /// `parking_lot` RwLock from inside an active write transaction.
     tier_backend: Option<Arc<dyn VectorTierStorage>>,
+    /// Backfills running right now, keyed by index name.
+    ///
+    /// A build is a task the index owns, not a detached thread: DROP, a
+    /// replacing CREATE, and database shutdown all cancel and join it here
+    /// before touching the index. Without that ownership the build outlives
+    /// the index it belongs to and keeps writing under whatever comes next.
+    builds: Mutex<HashMap<String, BuildHandle>>,
+}
+
+/// A running backfill: the flag that stops it and the thread to join.
+///
+/// Carries what it is building rather than looking it up: a build outlives the
+/// registry entry for its index by exactly the window this type exists to
+/// close, and a progress surface that went silent in that window would report
+/// "no builds running" while one still holds the index.
+struct BuildHandle {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+    label: String,
+    property: String,
+}
+
+/// Handed to a backfill so it can tell whether it should still be running.
+///
+/// The build checks this between batches; a cancelled build stops scanning
+/// and, critically, writes nothing further — neither its terminal state nor
+/// its progress — so the index it was building is free to be dropped or
+/// replaced the moment the cancel returns.
+#[derive(Clone)]
+pub struct BuildToken(Arc<AtomicBool>);
+
+impl BuildToken {
+    /// True once someone has asked this build to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl VectorIndexRegistry {
@@ -91,6 +128,7 @@ impl VectorIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: None,
+            builds: Mutex::new(HashMap::new()),
         }
     }
 
@@ -111,6 +149,7 @@ impl VectorIndexRegistry {
             definitions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             tier_backend: Some(backend),
+            builds: Mutex::new(HashMap::new()),
         }
     }
 
@@ -482,6 +521,112 @@ impl VectorIndexRegistry {
         if let Some(h) = self.health_handle(label, property) {
             h.report_rebuild_progress(progress, eta_ms);
         }
+    }
+
+    /// Mint a cancellation token for a build that is about to start.
+    ///
+    /// The caller spawns the build with this token, then hands the thread to
+    /// [`Self::register_build`]; the pair is what makes the build cancellable.
+    pub fn new_build_token(&self) -> BuildToken {
+        BuildToken(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Adopt a running backfill so the index owns it.
+    ///
+    /// A build already registered under `name` is cancelled and joined first:
+    /// two builds for one index would race each other's inserts into the same
+    /// graph, and only the survivor's progress would mean anything.
+    pub fn register_build(
+        &self,
+        name: &str,
+        label: &str,
+        property: &str,
+        token: &BuildToken,
+        thread: std::thread::JoinHandle<()>,
+    ) {
+        self.cancel_build(name);
+        let handle = BuildHandle {
+            stop: Arc::clone(&token.0),
+            thread,
+            label: label.to_string(),
+            property: property.to_string(),
+        };
+        self.builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), handle);
+    }
+
+    /// Stop the backfill for `name` and wait for it to finish.
+    ///
+    /// Returns whether a build was running. On return the build has stopped
+    /// touching the index AND its persisted definition, which is what lets a
+    /// caller drop or replace the index immediately afterwards without racing
+    /// a write it cannot see.
+    pub fn cancel_build(&self, name: &str) -> bool {
+        let handle = self
+            .builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        let Some(handle) = handle else {
+            return false;
+        };
+        handle.stop.store(true, Ordering::Relaxed);
+        // A panicked build is still a stopped build: the join error carries no
+        // obligation here, the thread is gone either way.
+        let _ = handle.thread.join();
+        true
+    }
+
+    /// Stop and join every running backfill. Used on shutdown, where a build
+    /// left running would keep writing into an engine that is closing.
+    pub fn cancel_all_builds(&self) {
+        let handles: Vec<BuildHandle> = self
+            .builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        for handle in handles {
+            handle.stop.store(true, Ordering::Relaxed);
+            let _ = handle.thread.join();
+        }
+    }
+
+    /// Names of the backfills running right now.
+    pub fn running_builds(&self) -> Vec<String> {
+        self.builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Every backfill running right now, with the live progress of the index
+    /// it is building.
+    ///
+    /// One node's answer: an index partitioned across nodes reports a build
+    /// per node, and it is the coordinator that aggregates them into the
+    /// cluster-wide picture. The progress comes from the same atomic signal
+    /// the search path reads, so asking costs no lock on the build.
+    pub fn build_progress(&self) -> Vec<(String, String, String, Option<IndexHealthState>)> {
+        let running: Vec<(String, String, String)> = self
+            .builds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, h)| (name.clone(), h.label.clone(), h.property.clone()))
+            .collect();
+        running
+            .into_iter()
+            .map(|(name, label, property)| {
+                let state = self.health_snapshot(&label, &property);
+                (name, label, property, state)
+            })
+            .collect()
     }
 
     /// Mark a single index `Offline` with a reason. No-op when unknown.

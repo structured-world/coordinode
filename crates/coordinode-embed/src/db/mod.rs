@@ -581,6 +581,17 @@ impl From<coordinode_query::frontend::FrontendError> for DatabaseError {
     }
 }
 
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Index builds are the one background task a Database can leave
+        // behind: each holds an `Arc` on the engine and would go on inserting
+        // into an index nobody can reach any more, against storage that is
+        // closing under it. Cancel and join them here, as the oplog worker
+        // does through its own Drop.
+        self.vector_index_registry.cancel_all_builds();
+    }
+}
+
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -1702,6 +1713,40 @@ impl Database {
 
     /// Default max buffered bytes per interactive transaction (256 MiB, ADR-042).
     pub const DEFAULT_MAX_INTERACTIVE_TXN_BYTES: usize = 256 * 1024 * 1024;
+
+    /// Vector-index builds running on this node right now, with live progress.
+    ///
+    /// Each entry is `(index, label, property, health)`, where `health` is the
+    /// same `Rebuilding { progress, eta_ms, indexed_hlc }` the search path and
+    /// the metrics exporter read. An empty result means no build is in flight,
+    /// which after a [`Self::cancel_index_build`] or a `DROP VECTOR INDEX` is
+    /// a guarantee, not a sample: both join the build before returning.
+    ///
+    /// This is one node's view. An index partitioned across nodes is built per
+    /// node, and the cluster-wide picture is the coordinator's aggregation of
+    /// these per-node answers.
+    pub fn index_builds(
+        &self,
+    ) -> Vec<(
+        String,
+        String,
+        String,
+        Option<coordinode_vector::health::IndexHealthState>,
+    )> {
+        self.vector_index_registry.build_progress()
+    }
+
+    /// Stop the vector-index build named `index`, waiting for it to finish.
+    ///
+    /// Returns whether a build was actually running. The index keeps whatever
+    /// the build had already inserted: HNSW insert is an upsert, so a later
+    /// build re-covers the same nodes without duplicating them, and writes
+    /// that arrive meanwhile go into the graph through the normal write path.
+    /// What a cancelled build does NOT do is write its state afterwards — the
+    /// index is free the moment this returns.
+    pub fn cancel_index_build(&self, index: &str) -> bool {
+        self.vector_index_registry.cancel_build(index)
+    }
 
     /// Set the interactive-transaction idle timeout (server config wiring).
     pub fn set_interactive_idle_timeout(&mut self, timeout: Duration) {
