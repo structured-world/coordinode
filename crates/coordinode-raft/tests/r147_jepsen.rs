@@ -175,6 +175,47 @@ fn write(
 
 /// Poll until a surviving node reports an elected leader within `survivors`
 /// (and not `excluded`). Returns the new leader's node id.
+/// Commit a write on whichever survivor leads, retrying while the term settles.
+///
+/// "The majority side can commit" is an eventual property, not an instantaneous
+/// one: a node that reports itself leader can lose the term before its proposal
+/// lands, and the moment after an election there may be no leader at all. A
+/// single attempt therefore measures how quickly the election settled, which on
+/// a loaded machine is a coin flip, rather than whether the majority can commit.
+/// Retrying against the current leader tests the property itself; the write
+/// still has to succeed within the bound or the test fails.
+async fn commit_on_majority(
+    survivors: &[&TestNode],
+    excluded: u64,
+    id_gen: &ProposalIdGenerator,
+    commit_ts: u64,
+    key: &str,
+    value: &str,
+) -> u64 {
+    let mut last: Option<ProposalError> = None;
+    for _ in 0..150 {
+        let leader = survivors.iter().find_map(|n| {
+            n.node
+                .current_leader()
+                .filter(|l| *l != excluded && survivors.iter().any(|s| s.node.node_id() == *l))
+        });
+        if let Some(leader_id) = leader {
+            match write(
+                node_ref(survivors, leader_id),
+                id_gen,
+                commit_ts,
+                key,
+                value,
+            ) {
+                Ok(idx) => return idx,
+                Err(e) => last = Some(e),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("majority never committed under partition (last error: {last:?})");
+}
+
 async fn await_new_leader(survivors: &[&TestNode], excluded: u64) -> u64 {
     for _ in 0..150 {
         for n in survivors {
@@ -191,14 +232,26 @@ async fn await_new_leader(survivors: &[&TestNode], excluded: u64) -> u64 {
 
 /// Read `key` from a node's applied engine state, retrying to absorb apply lag.
 /// `Some(value)` once the key is visible, `None` if it never appears.
-async fn await_value(engine: &StorageEngine, key: &str) -> Option<Vec<u8>> {
+/// Read `key` until it holds `expected`, returning what it settled on.
+///
+/// Waiting for the key to merely EXIST is not enough wherever it is written
+/// more than once: on a lagging replica that samples an intermediate value and
+/// the comparison then fails on the sampling rather than on convergence.
+/// Returning the last value seen keeps the caller's assertion (and its failure
+/// message) intact.
+async fn await_value_eq(engine: &StorageEngine, key: &str, expected: &[u8]) -> Option<Vec<u8>> {
+    let mut last = None;
     for _ in 0..80 {
         if let Ok(Some(v)) = engine.get(Partition::Node, key.as_bytes()) {
-            return Some(v.to_vec());
+            let v = v.to_vec();
+            if v == expected {
+                return Some(v);
+            }
+            last = Some(v);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    None
+    last
 }
 
 fn node_ref<'a>(nodes: &[&'a TestNode], id: u64) -> &'a TestNode {
@@ -243,7 +296,7 @@ async fn no_data_loss_on_leader_crash() {
 
         // No data loss: every acked write is present on the new leader.
         for (i, k) in keys.iter().enumerate() {
-            let v = await_value(&leader.engine, k).await;
+            let v = await_value_eq(&leader.engine, k, format!("v{i}").as_bytes()).await;
             assert_eq!(
                 v.as_deref(),
                 Some(format!("v{i}").as_bytes()),
@@ -294,7 +347,7 @@ async fn read_your_writes_after_failover() {
         let leader = node_ref(&survivors, new_leader);
 
         // The client reads its own write from the new leader — it is there.
-        let v = await_value(&leader.engine, "node:1:ryw").await;
+        let v = await_value_eq(&leader.engine, "node:1:ryw", b"my-write").await;
         assert_eq!(
             v.as_deref(),
             Some(b"my-write".as_slice()),
@@ -335,10 +388,8 @@ async fn partition_minority_cannot_commit_majority_can() {
         // Majority side elects a new leader and commits a write under partition.
         let survivors = [&n2, &n3];
         let new_leader = await_new_leader(&survivors, 1).await;
-        let leader = node_ref(&survivors, new_leader);
         let id_gen_maj = ProposalIdGenerator::with_base(new_leader << 48);
-        write(leader, &id_gen_maj, 200, "node:1:p-maj", "majority")
-            .expect("majority must commit under partition");
+        commit_on_majority(&survivors, 1, &id_gen_maj, 200, "node:1:p-maj", "majority").await;
 
         // Minority side: the isolated old leader cannot commit. Bound the
         // (blocking) propose so a never-committing write can't hang the test.
@@ -370,7 +421,7 @@ async fn partition_minority_cannot_commit_majority_can() {
         nemesis::heal();
 
         // Convergence: the old minority leader catches up to the majority write.
-        let v = await_value(&n1.engine, "node:1:p-maj").await;
+        let v = await_value_eq(&n1.engine, "node:1:p-maj", b"majority").await;
         assert_eq!(
             v.as_deref(),
             Some(b"majority".as_slice()),
@@ -381,7 +432,7 @@ async fn partition_minority_cannot_commit_majority_can() {
         // leader (it was never committed; openraft truncates the uncommitted
         // suffix on rejoin).
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let leaked = leader
+        let leaked = node_ref(&survivors, new_leader)
             .engine
             .get(Partition::Node, b"node:1:p-mino")
             .expect("read");
@@ -669,7 +720,22 @@ async fn linearizability_workload(
                 let invoke = start.elapsed().as_nanos() as u64;
                 // block_in_place runs on a worker thread here (tokio::spawn), so
                 // the proposal actually commits.
-                let ok = pipeline.propose_and_wait(&proposal).is_ok();
+                //
+                // Retried while the term settles: under CPU starvation a
+                // heartbeat slips, the leader steps down, and a single attempt
+                // comes back NotLeader. Dropping the value there would leave a
+                // history with no writes in it, failing the test for a reason
+                // that has nothing to do with linearizability. The proposal id
+                // is unchanged across attempts, so a retry that races a commit
+                // is deduplicated rather than applied twice.
+                let mut ok = false;
+                for _ in 0..25 {
+                    if pipeline.propose_and_wait(&proposal).is_ok() {
+                        ok = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
                 let complete = start.elapsed().as_nanos() as u64;
                 if ok {
                     hist.lock().unwrap().push(HistEvent {
@@ -800,7 +866,7 @@ async fn linearizable_despite_clock_skew() {
 
         // The skewed follower converged to the final write (gossip kept it in
         // step despite its fast clock).
-        let v = await_value(&n2.engine, key).await;
+        let v = await_value_eq(&n2.engine, key, b"4").await;
         assert_eq!(
             v.as_deref(),
             Some(b"4".as_slice()),
