@@ -162,7 +162,8 @@ async fn cluster_3_node_bootstrap() {
         assert_eq!(val1.as_deref(), Some(b"replicated!".as_slice()));
 
         // Wait for replication to followers
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        await_replicated(&n2.engine, b"node:1:cluster-test", b"replicated!").await;
+        await_replicated(&n3.engine, b"node:1:cluster-test", b"replicated!").await;
 
         // Verify data replicated to node 2
         let val2 = n2
@@ -201,6 +202,53 @@ async fn cluster_3_node_bootstrap() {
 }
 
 /// Helper: bootstrap a 3-node cluster and return the nodes + ports.
+/// Block until this node reports itself leader.
+///
+/// Sleeping a fixed interval and then asserting leadership is what makes this
+/// suite flaky: on a loaded machine the election takes longer than any constant
+/// short enough to keep the suite fast. What follows then fails for a reason
+/// that has nothing to do with what the test is checking, and often not by
+/// failing an assertion but by hanging until the test's own timeout, which
+/// reads as a hung product rather than a slow election.
+///
+/// The bound is generous on purpose: a test that waits three seconds on a
+/// loaded machine and none on an idle one costs nothing, while a test that
+/// gives up at 800ms costs a false failure every time the machine is busy.
+async fn await_leadership(node: &RaftNode) {
+    for _ in 0..150 {
+        if node.is_leader().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        node.is_leader().await,
+        "node {} never became leader",
+        node.node_id()
+    );
+}
+
+/// Block until this node's applied state holds `expected` under `key`.
+///
+/// Replication is asynchronous, so a fixed sleep before reading a replicated
+/// write is a bet on how long a machine takes. Losing that bet fails the test
+/// for lag rather than for anything it checks, and winning it wastes the
+/// remainder of the sleep on every run. Waiting for the value costs neither.
+///
+/// Returns whether it arrived, so the caller's own assertion still says what
+/// it always said, against a state that has settled.
+async fn await_replicated(engine: &StorageEngine, key: &[u8], expected: &[u8]) -> bool {
+    for _ in 0..150 {
+        if let Ok(Some(v)) = engine.get(Partition::Node, key) {
+            if v.as_ref() == expected {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode, u16, u16, u16) {
     let p1 = alloc_port();
     let p2 = alloc_port();
@@ -210,7 +258,8 @@ async fn bootstrap_3_node() -> (TestNode, TestNode, TestNode, u16, u16, u16) {
     let n2 = create_follower(2, p2).await;
     let n3 = create_follower(3, p3).await;
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Membership changes go through the leader, so there has to be one first.
+    await_leadership(&n1.node).await;
 
     n1.node
         .add_node(2, format!("http://127.0.0.1:{p2}"))
@@ -328,7 +377,11 @@ async fn cluster_committed_index_advances_and_replicates() {
         // Deterministic replay: every follower applies the identical write-set.
         // Reaching the leader's committed index on a follower is exactly what
         // makes a causal read with that afterClusterTime token satisfiable.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // The last write is the one that settles last, so waiting for it on
+        // every node makes the ones before it settled too.
+        for engine in [&n1.engine, &n2.engine, &n3.engine] {
+            await_replicated(engine, b"node:1:xrepl-3", b"v3").await;
+        }
         for (label, engine) in [("n1", &n1.engine), ("n2", &n2.engine), ("n3", &n3.engine)] {
             for i in 1..=3u64 {
                 let val = engine
@@ -383,7 +436,10 @@ async fn cluster_multiple_proposals_replicate() {
         }
 
         // Wait for replication
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // The tenth write settles last; once it is here the earlier nine are.
+        for engine in [&n1.engine, &n2.engine, &n3.engine] {
+            await_replicated(engine, b"node:1:multi-10", b"v10").await;
+        }
 
         // Verify on all 3 nodes
         for (label, engine) in [("n1", &n1.engine), ("n2", &n2.engine), ("n3", &n3.engine)] {
@@ -455,7 +511,7 @@ async fn cluster_voter_learner_transitions() {
             .pipeline()
             .propose_and_wait(&proposal)
             .expect("propose after demote");
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        await_replicated(&n3.engine, b"node:1:after-demote", b"committed").await;
         assert_eq!(
             n3.engine
                 .get(Partition::Node, b"node:1:after-demote")
@@ -535,7 +591,8 @@ async fn cluster_remove_node() {
             .expect("propose after removal");
 
         // Verify on remaining nodes
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        await_replicated(&n1.engine, b"node:1:after-remove", b"still-works").await;
+        await_replicated(&n2.engine, b"node:1:after-remove", b"still-works").await;
 
         assert_eq!(
             n1.engine
@@ -651,8 +708,12 @@ async fn cluster_leader_failover() {
         );
 
         // Verify both old and new data on a follower
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Both writes are checked below, so both are waited for: the one from
+        // before the crash, which must have survived it, and the one from
+        // after, which must have reached this follower under the new leader.
         let follower = if n2_is_leader { &n3 } else { &n2 };
+        await_replicated(&follower.engine, b"node:1:before-failover", b"pre-failover").await;
+        await_replicated(&follower.engine, b"node:1:after-failover", b"post-failover").await;
 
         let old = follower
             .engine
@@ -758,8 +819,10 @@ async fn cluster_crash_recovery() {
             .await
             .expect("n3");
 
-            tokio::time::sleep(Duration::from_millis(800)).await;
-
+            // A membership change is a write, so it needs a leader to accept it.
+            // Calling it before one exists blocks until the test's own timeout,
+            // which reads as a hang rather than as an election that took a moment.
+            await_leadership(&n1).await;
             n1.add_node(2, format!("http://127.0.0.1:{p2}"))
                 .await
                 .expect("add 2");
@@ -1359,8 +1422,7 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         .await
         .expect("leader");
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.is_leader().await, "n1 should be leader");
+        await_leadership(&n1).await;
 
         // Write data
         let pipeline = n1.pipeline();
@@ -1422,6 +1484,10 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         .expect("joining node");
 
         // Add new node to cluster
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add node 2");
@@ -1504,8 +1570,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         .await
         .expect("leader");
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.is_leader().await, "n1 should be leader");
+        await_leadership(&n1).await;
 
         // Write enough data to produce >4MB snapshot (multiple chunks).
         // Each value is 4KB, 1200 entries ≈ 4.8MB of node data.
@@ -1590,6 +1655,10 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         .await
         .expect("joining node");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add node 2");
@@ -1706,7 +1775,10 @@ async fn cluster_follower_restart_reconnection() {
         .await
         .expect("n3");
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add2");
@@ -1942,14 +2014,17 @@ async fn cluster_incremental_snapshot_cross_engine() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
         n1.add_node(3, format!("http://127.0.0.1:{p3}"))
             .await
             .expect("add n3");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(n1.is_leader().await, "n1 should be leader");
+        await_leadership(&n1).await;
 
         let pipeline = n1.pipeline();
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
@@ -2135,6 +2210,10 @@ async fn cluster_graceful_leader_transfer() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -2305,6 +2384,10 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -2314,8 +2397,7 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
         n1.change_membership(vec![1, 2, 3])
             .await
             .expect("membership");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(n1.is_leader().await, "n1 should be leader");
+        await_leadership(&n1).await;
 
         // ── Graceful shutdown of leader (should auto-transfer) ──
         n1.shutdown().await.expect("graceful shutdown n1");
@@ -2381,8 +2463,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         )
         .await
         .expect("leader");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.is_leader().await);
+        await_leadership(&n1).await;
 
         let pipeline = n1.pipeline();
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
@@ -2452,6 +2533,10 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         .await
         .expect("joining");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -2574,6 +2659,10 @@ async fn cluster_replication_status_tracking() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -2583,8 +2672,7 @@ async fn cluster_replication_status_tracking() {
         n1.change_membership(vec![1, 2, 3])
             .await
             .expect("membership");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(n1.is_leader().await, "n1 should be leader");
+        await_leadership(&n1).await;
 
         // Write some data to create replication activity
         let pipeline = n1.pipeline();
@@ -2753,6 +2841,10 @@ async fn cluster_read_concern_levels() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -2908,6 +3000,10 @@ async fn cluster_write_concern_w0_vs_majority() {
         .await
         .expect("n3");
 
+        // A membership change is a write, so it needs a leader to accept it.
+        // Calling it before one exists blocks until the test's own timeout,
+        // which reads as a hang rather than as an election that took a moment.
+        await_leadership(&n1).await;
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
@@ -3013,8 +3109,7 @@ async fn cluster_join_monitor_and_promote() {
         let n2 = create_follower(2, p2).await;
 
         // Wait for leader election
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         // Step 1: add node 2 as Learner
         n1.node
@@ -3114,8 +3209,7 @@ async fn decommission_quorum_gate_blocks_2_node_cluster() {
         let n1 = create_leader(1, p1).await;
         let n2 = create_follower(2, p2).await;
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         // Add node 2 as voter.
         n1.node
@@ -3175,8 +3269,7 @@ async fn decommission_follower_succeeds_in_3_node_cluster() {
         let n2 = create_follower(2, p2).await;
         let n3 = create_follower(3, p3).await;
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         // Build 3-node cluster.
         n1.node
@@ -3248,8 +3341,7 @@ async fn decommission_non_voter_fails() {
         let n2 = create_follower(2, p2).await;
         let n3 = create_follower(3, p3).await;
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         n1.node
             .add_node(2, format!("http://127.0.0.1:{p2}"))
@@ -3306,8 +3398,7 @@ async fn decommission_force_skips_quorum_gate() {
         let n1 = create_leader(1, p1).await;
         let n2 = create_follower(2, p2).await;
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         n1.node
             .add_node(2, format!("http://127.0.0.1:{p2}"))
@@ -3374,8 +3465,7 @@ async fn decommission_pruning_flag_sets_operator_cleanup_required() {
         let n2 = create_follower(2, p2).await;
         let n3 = create_follower(3, p3).await;
 
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(n1.node.is_leader().await, "n1 must be leader");
+        await_leadership(&n1.node).await;
 
         n1.node
             .add_node(2, format!("http://127.0.0.1:{p2}"))
