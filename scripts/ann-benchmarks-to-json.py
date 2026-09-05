@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2026 Structured World Foundation.
+# Copyright 2026 Dmitry Prudnikov.
 # Licensed under the Apache License, Version 2.0.
 """Flatten ann-benchmarks HDF5 results into the canonical bench-results JSON.
 

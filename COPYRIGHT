@@ -1,0 +1,29 @@
+CoordiNode
+Copyright (C) 2026 Dmitry Prudnikov <mail@polaz.com>
+
+Ownership
+---------
+
+The original source code in this repository is the work of Dmitry Prudnikov
+and of contributors who have signed the Contributor License Agreement
+(CLA.md). Copyright in each contribution remains with its author; the CLA
+grants the copyright holder named above the right to distribute the combined
+work under the terms of his choosing, and passes to any successor to whom the
+copyright in the project is assigned.
+
+Editions
+--------
+
+Community Edition: licensed to everyone under the GNU Affero General Public
+License, version 3 only (LICENSE). Complete, not a reduced core.
+
+Enterprise Edition: the same code base, plus enterprise features, under a
+separate commercial licence from the copyright holder. It does not change the
+terms under which the Community Edition is published.
+
+Third parties
+-------------
+
+Third-party components keep their own licences; see NOTICES and each
+dependency's licence text. The set of licences accepted for dependencies is
+declared in deny.toml.

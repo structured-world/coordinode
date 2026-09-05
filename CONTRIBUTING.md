@@ -26,7 +26,7 @@ cargo test --workspace
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Requires Rust 1.82+.
+Requires Rust 1.90+ (see `rust-toolchain.toml` for the pinned toolchain).
 
 ## Pull Request Process
 
@@ -49,9 +49,23 @@ Requires Rust 1.82+.
 
 ## Contributor License Agreement (CLA)
 
-By submitting a pull request, you agree that your contributions are licensed under the same license as the project (AGPL-3.0-only). You retain copyright of your contributions.
+CoordiNode is dual-licensed. The Community Edition is AGPL-3.0-only, and the same code base is also distributed under a commercial licence as the Enterprise Edition. For that to stay possible, a contribution has to arrive with more than "the same licence as the project": the copyright holder needs the right to distribute it under both.
 
-We use a lightweight CLA to ensure all contributions can be distributed under the project license. The CLA bot will guide you through signing on your first PR.
+Before a first pull request can be merged, you sign the [Contributor License Agreement](CLA.md). Signing happens in the pull request itself: a bot posts the request, you reply with the sentence it asks for, and the signature is recorded in `signatures/` in this repository. It is a one-time step per GitHub account.
+
+In short, the CLA says:
+
+- You keep the copyright in your contribution.
+- You grant the project's copyright holder (and any successor the copyright is assigned to) a perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to use, modify, distribute and sublicense your contribution under any terms, including AGPL-3.0-only and the commercial Enterprise Edition licence.
+- You grant a patent licence covering your contribution to the same extent.
+- You confirm you are entitled to make the grant: the work is yours, or your employer has authorised it.
+
+And the project promises in return:
+
+- Your contribution stays available under AGPL-3.0-only in the Community Edition. It is never withdrawn into a proprietary-only edition.
+- You remain free to use, license and redistribute your own contribution however you like.
+
+If your employer owns what you write, ask them to confirm they permit the contribution before you sign.
 
 ## Code of Conduct
 

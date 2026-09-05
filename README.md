@@ -239,24 +239,25 @@ Source: [structured-world/coordinode-python](https://github.com/structured-world
 
 ## License
 
-AGPL-3.0-only — genuine open source with SaaS protection.
+Copyright (C) 2026 Dmitry Prudnikov.
 
-Enterprise Edition (EE) for horizontal sharding, multi-tenancy, CRUSH placement, and geo-distribution. Contact: enterprise@sw.foundation
+CoordiNode Community Edition is licensed under **AGPL-3.0-only**: genuine open source with SaaS protection. See [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
+
+The same code base is also available under a commercial licence as the Enterprise Edition (horizontal sharding, multi-tenancy, CRUSH placement, geo-distribution), for deployments that cannot meet the AGPL terms. Contact: enterprise@sw.foundation. The commercial licence never narrows the Community Edition: everything published here stays under AGPL-3.0-only, in full.
+
+Contributions are accepted under the [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Support the Project
 
-CoordiNode is built by the [Structured World Foundation](https://sw.foundation) — a small team building the infrastructure layer for AI-native applications.
+CoordiNode is developed by [Dmitry Prudnikov](https://github.com/polaz) and contributors. Donations go directly to the maintainer and fund development time.
 
-If you believe graph + vector + text should live in one engine under a genuine open-source license, consider sponsoring:
-
-- [GitHub Sponsors](https://github.com/sponsors/structured-world)
-- [Open Collective](https://opencollective.com/structured-world)
+If you believe graph + vector + text should live in one engine under a genuine open-source license, you can support the work:
 
 <div align="center">
 
 ![USDT TRC-20 Donation QR Code](assets/usdt-qr.svg)
 
-USDT (TRC-20): `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
+USDT (TRC-20), maintainer's personal wallet: `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA`
 
 </div>
 

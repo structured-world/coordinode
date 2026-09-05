@@ -1,7 +1,7 @@
 Source: coordinode
 Section: database
 Priority: optional
-Maintainer: Structured World Foundation <oss@sw.foundation>
+Maintainer: Dmitry Prudnikov <mail@polaz.com>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 Homepage: https://github.com/structured-world/coordinode

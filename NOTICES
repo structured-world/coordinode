@@ -1,42 +1,31 @@
 CoordiNode Third-Party Notices
 ================================
 
-This file lists third-party code consumed into CoordiNode with attribution
-as required by their respective licenses.
+CoordiNode is published under AGPL-3.0-only (see LICENSE and COPYRIGHT).
+This file records what in the tree comes from elsewhere, and under which
+terms.
 
 
-## fjall-rs (Apache-2.0)
+## Dependencies
 
-CoordiNode includes code derived from fjall-rs, consumed per ADR-019.
+Every crate this workspace depends on keeps its own licence. The licences
+accepted for dependencies are declared in `deny.toml` and checked in CI with
+`cargo deny`. Binary packages (RPM, DEB, container images) combine those
+crates into one AGPL-3.0-only program; the full text of each dependency's
+licence is available from its crates.io page and from the `cargo about`
+report that accompanies a release.
 
-- Original repository: https://github.com/fjall-rs/fjall
-- Fork repository: https://github.com/structured-world/coordinode-fjall (archived)
-- Original authors: fjall-rs contributors
-- License: Apache-2.0 (full text in fjall-rs repository)
-- Consumption date: 2026-03-24
+The storage engine is `coordinode-lsm-tree` (Apache-2.0), consumed from
+crates.io. It is a maintained fork of `fjall-rs/lsm-tree`; the attribution to
+the original authors is carried in that crate's own repository and source
+headers, not here.
 
-### Location in CoordiNode:
 
-All consumed code resides in `crates/coordinode-storage/src/kv/` as native
-coordinode modules under AGPL-3.0-only, with per-file Apache-2.0 attribution.
+## Provenance
 
-Keeper modules (remain in coordinode-storage long-term):
-  flush/{manager,task,worker}, worker_pool, snapshot_tracker, snapshot,
-  snapshot_nonce, readable, iter, guard, write_buffer_manager, poison_dart,
-  file utils, locked_file, version, error
-
-Temporary modules (will be replaced by TreeManager/Raft oplog):
-  db, db_config, builder, keyspace/*, journal/*, tx/*, batch/*,
-  compaction/*, meta_keyspace, backup, recovery, ingestion, stats,
-  supervisor, path, write_group
-
-### Modifications:
-  - All modules integrated as native coordinode-storage code
-  - Module paths: coordinode_storage::kv::*
-  - AGPL-3.0-only license with Apache-2.0 attribution per file
-  - unsafe blocks replaced with safe alternatives (workspace forbids unsafe)
-  - Integrated with coordinode-lsm-tree (permanent Apache-2.0 fork, ADR-018)
-
-### Patent grant:
-  Apache-2.0 patent grant (§3) carries forward to all downstream users.
-  No additional patent action required.
+During private development, before the first public release (April 2026),
+CoordiNode consumed a set of storage modules derived from `fjall-rs/fjall`
+(Apache-2.0). Those modules were replaced by `coordinode-lsm-tree` before the
+public tree was created: no fjall-derived source is present in this
+repository, and none was present in its published history. This paragraph is
+kept as a record of that lineage.

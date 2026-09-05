@@ -35,7 +35,7 @@ edition = "2021"
 rust-version = "1.90"
 license = "AGPL-3.0-only"
 repository = "https://github.com/structured-world/coordinode"
-authors = ["structured.world <dev@structured.world>"]
+authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 publish = false
 
 [workspace.dependencies]
