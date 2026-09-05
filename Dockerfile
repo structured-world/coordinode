@@ -60,7 +60,8 @@ FROM scratch
 # Labels
 LABEL org.opencontainers.image.title="CoordiNode"
 LABEL org.opencontainers.image.description="Distributed graph+vector database"
-LABEL org.opencontainers.image.vendor="structured.world"
+LABEL org.opencontainers.image.vendor="Dmitry Prudnikov"
+LABEL org.opencontainers.image.authors="Dmitry Prudnikov <mail@polaz.com>"
 LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 LABEL org.opencontainers.image.source="https://github.com/structured-world/coordinode"
 
