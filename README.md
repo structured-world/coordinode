@@ -1,27 +1,52 @@
-# CoordiNode
+# CoordiNode: graph, vector and full-text database in one engine
 
 [![CI](https://github.com/structured-world/coordinode/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/coordinode/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/structured-world/coordinode?label=release)](https://github.com/structured-world/coordinode/releases/latest)
+[![PyPI](https://img.shields.io/pypi/v/coordinode?label=pypi)](https://pypi.org/project/coordinode/)
+[![Docker](https://img.shields.io/badge/ghcr.io-coordinode-blue)](https://github.com/structured-world/coordinode/pkgs/container/coordinode)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
-**The graph-native hybrid retrieval engine for AI and GraphRAG.**
+**The graph-native hybrid retrieval engine for AI and GraphRAG.** A graph database, a vector database and a full-text search engine, running as one transactional engine with one query language.
 
-Graph + Vector + Full-Text retrieval in a single transactional engine.
+Built in Rust. Zero GC. Single binary. OpenCypher-compatible. Clustering included in the open-source edition.
 
-Built in Rust. Zero GC. Single binary. OpenCypher-compatible.
+- **One query** mixes graph traversal, vector similarity and BM25 text relevance, planned and executed as one pipeline.
+- **One snapshot**: MVCC snapshot isolation across edges, embeddings and the text index, so a retrieval never reads a half-applied write.
+- **One binary**: no JVM, no C dependencies, no separate router. The same executable runs standalone or as a Raft-replicated cluster.
 
 ---
 
-## The Problem
+## Quick start
 
-Relationship-aware AI usually ends up spread across systems: a graph database for traversal, a vector store for embeddings, a search cluster for text. Each is good at its own job, and the cost lands between them: sync pipelines, duplicated identifiers, drift between stores, and no single transaction that covers a write touching all three. Retrieval quality then depends on how fresh the least-fresh copy happens to be.
+Run the latest release from the container registry:
 
-## The Solution: One Engine, One Query
+```bash
+docker run -d --name coordinode \
+  -p 7080:7080 -p 7081:7081 -p 7084:7084 \
+  -v coordinode-data:/data \
+  ghcr.io/structured-world/coordinode:latest
+curl http://localhost:7084/health
+```
 
-CoordiNode unifies graph traversal, vector similarity search, and full-text retrieval in one engine with one query language (OpenCypher-compatible) and one transaction model (MVCC, Snapshot Isolation).
+Or install a package from the [latest release](https://github.com/structured-world/coordinode/releases/latest): RPMs for Fedora 42 to 44, DEBs for Debian and Ubuntu, and static binaries for linux-amd64 and linux-arm64.
 
-### The Magic Moment
+From source (Rust 1.90+; the toolchain is pinned in `rust-toolchain.toml`):
 
-Traverse a knowledge graph, filter by semantic similarity, rank by text match — one query, one transaction:
+```bash
+git clone https://github.com/structured-world/coordinode.git
+cd coordinode
+cargo build --release
+./target/release/coordinode serve --addr [::]:7080
+
+# Optional CJK full-text analyzers
+cargo build --release --features cjk-zh,cjk-ja,cjk-ko
+```
+
+Ports: 7080 gRPC, 7081 REST/JSON, 7084 metrics and health. The [Quick Start guide](https://docs.coordinode.com/QUICKSTART) goes from an empty database to a hybrid query in five minutes.
+
+## One query, three modalities
+
+Traverse a knowledge graph, filter by semantic similarity, rank by text match, all inside one transaction:
 
 ```cypher
 MATCH (topic:Concept {name: "machine learning"})-[:RELATED_TO*1..3]->(related)
@@ -34,40 +59,29 @@ RETURN doc.title,
 ORDER BY relevance LIMIT 10
 ```
 
-Across a split stack this is three round trips and a join in application code. Here it is one query, planned and executed as one pipeline, inside one snapshot.
+Across a split stack (graph database, vector store, search cluster) this is three round trips and a join in application code, with retrieval quality bounded by the least-fresh copy. Here it is one query, planned and costed as a whole, inside one snapshot.
 
----
+## Who it is for, and where it stops
 
-## Is CoordiNode Right for You? (v0.5.x)
+**Use CoordiNode today for**
 
-### Use this today if:
+- **GraphRAG and knowledge retrieval**: traverse a knowledge graph, filter by embedding similarity, rank by text relevance, in one statement.
+- **Fraud detection and threat intelligence**: shared-device graphs with behavioural embedding similarity; attack patterns correlated across MITRE ATT&CK with vector and text search over indicators.
+- **Recommendations and social discovery**: social-graph traversal plus semantic similarity to user preferences, with edge properties (ratings, timestamps) filterable in the same query.
+- **Replacing a multi-database stack** (graph + vector + search) with a single binary and a single transaction model.
 
-- You are building **GraphRAG**, knowledge retrieval, or relationship-heavy AI apps
-- You need **graph + vector + text** queries in a single transaction (no glue code)
-- You want to replace a fragile multi-database stack with a single binary
-- You want these in one engine: native vector search over both nodes and relationships, integrated with graph traversal and transactional query execution; spatial predicates; encrypted equality search; time-travel and bitemporal edges; a query advisor that reads plans back to you
+**Not yet, if you need**
 
-### Do not use this yet if:
-
-- You need a 100% drop-in replacement for a mature Neo4j Enterprise deployment
-- Your application relies on APOC procedures, Neo4j Browser/Bloom, or GDS
-- You need native Bolt protocol for existing Neo4j drivers (planned; gRPC and REST available now, GraphQL planned)
-- You need a cluster with years of production mileage behind it. Raft replication, follower reads and mTLS between nodes ship today and are covered by a fault-injection suite, but the deployment history is short
-
----
-
-## Who This Is For
-
-**GraphRAG and enterprise knowledge retrieval** — traverse knowledge graphs, filter by semantic similarity, rank by text relevance. One engine replaces Neo4j + vector DB + search engine.
-
-**Fraud detection and threat intelligence** — detect fraud rings through shared-device graphs with behavioral embedding similarity. Correlate attack patterns across MITRE ATT&CK with vector + text search on indicators.
-
-**Recommendations and social discovery** — traverse social graphs, find items semantically similar to user preferences. Edge properties (ratings, timestamps) filterable in the same query.
+- A drop-in replacement for a mature Neo4j Enterprise deployment, or APOC procedures, Neo4j Browser/Bloom, GDS.
+- The Bolt protocol for existing Neo4j drivers. gRPC and REST are available now; Bolt and GraphQL are planned.
+- A cluster with years of production mileage. Raft replication, follower reads and mTLS ship today and are covered by a fault-injection suite, but the deployment history is short.
+- Vector indexes larger than memory. At 1M vectors of 384 dimensions that is roughly 1.5 GB before compression; SQ8 and RaBitQ bring it down substantially in exchange for a rerank pass.
+- Horizontal sharding. The Community Edition replicates the full dataset to every node, which is the right shape until a dataset outgrows one machine; sharding is an Enterprise feature.
 
 <details>
-<summary>See example queries for each use case</summary>
+<summary>Example queries for each use case</summary>
 
-### Fraud Ring Detection
+### Fraud ring detection
 
 ```cypher
 MATCH (suspect:Account {flagged: true})-[:SHARES_DEVICE*1..3]-(connected:Account)
@@ -78,7 +92,7 @@ RETURN connected.id, connected.holder_name,
 ORDER BY similarity LIMIT 50
 ```
 
-### Semantic Recommendation
+### Semantic recommendation
 
 ```cypher
 MATCH (me:User {id: $userId})-[:FOLLOWS*1..2]->(friend)
@@ -90,7 +104,7 @@ RETURN DISTINCT item.name, item.category,
 ORDER BY match_score LIMIT 20
 ```
 
-### Threat Intelligence
+### Threat intelligence
 
 ```cypher
 MATCH (malware:Indicator {hash: $sample_hash})-[:USES]->(technique:AttackTechnique)
@@ -104,99 +118,74 @@ ORDER BY similarity LIMIT 25
 
 </details>
 
----
-
-## What Works Today (v0.5.x)
+## Feature status
 
 | Capability | Status | Details |
 |-----------|--------|---------|
 | OpenCypher read + write | **Stable** | MATCH, CREATE, MERGE, DELETE, SET, REMOVE, WITH, UNWIND |
-| MVCC transactions | **Stable** | Snapshot Isolation, write conflict detection (OCC) |
-| HNSW vector search | **Stable** | Up to 65536 dims, cosine/L2/dot/L1, on node and relationship properties alike |
+| MVCC transactions | **Stable** | Snapshot isolation, write conflict detection (OCC) |
+| HNSW vector search | **Stable** | Up to 65536 dims; cosine, L2, dot, L1; on node and relationship properties alike |
 | Vector compression | **Stable** | SQ8 scalar quantization and RaBitQ binary codes with exact rerank |
-| Late-interaction scoring | **Beta** | `maxsim_score()` for ColBERT-style multi-vector relevance, brute force over candidates in this release |
-| Full-text search | **Stable** | BM25, fuzzy, phrase, 23+ languages, CJK via feature flags |
-| Hybrid graph+vector+text | **Stable** | Compound WHERE predicates split into optimized pipeline; `hybrid_score(node, query [,weights])` opinionated blend helper (default 0.65·vector + 0.35·text) |
+| Late-interaction scoring | **Beta** | `maxsim_score()` for ColBERT-style multi-vector relevance, brute force over candidates |
+| Full-text search | **Stable** | BM25, fuzzy, phrase; 20 languages via Snowball stemming, CJK via feature flags, per-field analyzers with language auto-detection |
+| Hybrid graph + vector + text | **Stable** | Compound WHERE split into one optimised pipeline; `hybrid_score(node, query [, weights])` blend helper |
 | B-tree indexes | **Stable** | Single, compound, unique, partial, TTL, sparse |
 | Edge properties | **Stable** | CREATE with props, WHERE filter, inline pattern filter |
-| gRPC API | **Stable** | Port 7080, tonic-based, all services |
-| Operational HTTP | **Stable** | Port 7084: /metrics, /health, /ready |
-| Encrypted search (SSE) | **Stable** | AES-256-GCM + HMAC-SHA256 equality search over encrypted fields, via `CREATE ENCRYPTED INDEX` and `encrypted_match()` |
+| Encrypted search (SSE) | **Stable** | AES-256-GCM + HMAC-SHA256 equality search over encrypted fields: `CREATE ENCRYPTED INDEX`, `encrypted_match()` |
 | Time-travel queries | **Stable** | AS OF TIMESTAMP, 7-day retention |
+| Bitemporal edges | **Stable** | `CREATE EDGE TYPE ... TEMPORAL`: versioned `(valid_from, valid_to)` intervals, `temporal_active_at()`, `temporal_overlaps()` |
 | Query advisor | **Stable** | EXPLAIN SUGGEST with 5 detectors, N+1 detection |
 | Spatial queries | **Stable** | `point()`, `point.distance()` (Haversine), WHERE filter |
 | Document properties | **Stable** | Nested DOCUMENT type, dot-notation access, 3 schema modes |
-| Document ↔ graph transformations | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node + edge atomically; `ATTACH DOCUMENT` demotes a node back into a nested DOCUMENT property; optional `TRANSFER EDGES`, `ON CONFLICT REPLACE`, `ON REMAINING FAIL` |
-| Native entity-resolution | **Stable** | `MERGE NODES (a, b) INTO a` collapses two matched nodes in a single MVCC transaction — property merge (`KEEP FIRST` / `KEEP LAST` / `COALESCE` / `SET <exprs>`), edge re-pointing with `TRANSFER EDGES`, and duplicate-edge handling (`KEEP BOTH` / `MERGE PROPERTIES` / `KEEP TARGET`). Replaces Neo4j's APOC `mergeNodes()` with cluster-safe semantics |
-| Trigger DDL | **Stable** (front-end) | `CREATE / DROP / SHOW / ALTER TRIGGER` — replicated through Raft, schema-partition storage, index keyed by `(label_or_edge_type, event)` for O(matching) lookup at 1M-trigger scale. Per-trigger `CASCADE_LIMIT` / `CASCADE_FANOUT` overrides and `ON ERROR { PROPAGATE \| RETRY n WITH BACKOFF ms \| DEAD_LETTER }`. Native first-class clause, not a plugin — replaces Neo4j APOC triggers which break in clusters. BEFORE / AFTER COMMIT firing lands in a follow-up release |
-| Bitemporal edges | **Stable** | `CREATE EDGE TYPE … TEMPORAL` declares an edge type whose instances carry a `(valid_from, valid_to)` interval. Multiple versions coexist per `(src, tgt)` pair. Helpers: `temporal_active_at(r, t)`, `temporal_overlaps(r, t0, t1)`. Planner pushes time-slice predicates into a bounded prefix scan |
-| REST API | **Stable** | HTTP/JSON on port 7081 via gRPC-to-REST transcoding |
+| Document to graph and back | **Stable** | `DETACH DOCUMENT` promotes a nested property to a node and edge; `ATTACH DOCUMENT` demotes it back; atomic |
+| Native entity resolution | **Stable** | `MERGE NODES (a, b) INTO a` in one transaction, with property and edge merge policies; replaces APOC `mergeNodes()` |
+| Triggers | **Stable** (DDL) | `CREATE / DROP / SHOW / ALTER TRIGGER`, replicated through Raft, cascade limits and error policies; BEFORE / AFTER COMMIT firing lands in a follow-up release |
+| gRPC API | **Stable** | Port 7080, all services |
+| REST API | **Stable** | Port 7081, HTTP/JSON via gRPC-to-REST transcoding |
+| Operational HTTP | **Stable** | Port 7084: /metrics, /health, /ready |
 | Read/write concerns | **Stable** | local, majority, linearizable, causal sessions |
-| Raft replication | **Stable** | Multi-node replicated writes, leader election, snapshot transfer, log compaction. Included in CE with no per-node licensing |
+| Raft replication | **Stable** | Multi-node writes, leader election, snapshot transfer, log compaction; in the Community Edition, no per-node licensing |
 | Follower reads | **Stable** | Reads served from replicas under the requested consistency level |
-| Inter-node TLS and mTLS | **Stable** | Pure-Rust rustls stack, no OpenSSL and no C dependency |
+| Inter-node TLS and mTLS | **Stable** | Pure-Rust rustls stack, no OpenSSL |
 | Inter-node compression | **Stable** | zstd on the replication transport, level configurable |
 | Consistency test suite | **Stable** | In-process fault injection: partition matrix, crash and clock skew, linearizability checking over a live workload |
 | Scrub and repair | **Stable** | Background checksum verification, damaged segments rebuilt from a healthy replica |
-| Embedded engine | **Stable** | `coordinode-embed` runs the full engine in-process, no server; also exposed to Python as `coordinode-embedded` |
+| Embedded engine | **Stable** | `coordinode-embed` runs the full engine in-process; exposed to Python as `coordinode-embedded` |
 
 | Planned | Notes |
 |---------|-------|
-| GraphQL API | Auto-generated schema, SDL generation already in tree |
 | Bolt protocol | Neo4j drivers connect without code changes |
+| GraphQL API | Auto-generated schema; SDL generation already in tree |
 | SQL over the same engine | PostgreSQL wire protocol against the shared query IR |
 
-## What Makes CoordiNode Different
+Syntax for every extension above is in the [Cypher extensions reference](https://docs.coordinode.com/cypher/extensions).
 
-Other engines combine some of these. What we optimise for is the combination holding under one transaction, one planner and one storage engine:
+## What makes CoordiNode different
 
-- **One planner over all three modalities.** A compound `WHERE` mixing traversal, vector distance and text match is split into one pipeline and costed as a whole, rather than executed as three lookups joined by your application.
-- **One snapshot.** Graph edges, embeddings and the text index move together under MVCC snapshot isolation, so a retrieval never reads a half-applied write.
+Other engines combine some of these. What CoordiNode optimises for is the combination holding under one transaction, one planner and one storage engine:
+
+- **One planner over all three modalities.** A compound `WHERE` mixing traversal, vector distance and text match is split into one pipeline and costed as a whole, not executed as three lookups joined by your application.
+- **One snapshot.** Graph edges, embeddings and the text index move together under MVCC snapshot isolation.
 - **Vector search over relationships as well as nodes**, integrated with traversal and transactional execution.
 - **Rust with no garbage collector.** Tail latency is a design constraint, not a tuning exercise: no JVM pauses, no stop-the-world.
 - **Pure Rust with no FFI.** `cargo build` produces the whole engine, compression and TLS included. No OpenSSL, no C storage engine, nothing to reconcile with your base image.
 - **AGPL-3.0 with clustering included.** Replication is not held back for a paid tier.
-- **Operations answered in-engine:** entity resolution (`MERGE NODES`), document promotion and demotion (`DETACH` / `ATTACH DOCUMENT`) and triggers are native clauses, not plugins that break once you cluster.
+- **Operations answered in-engine:** entity resolution, document promotion and demotion, and triggers are native clauses, not plugins that break once you cluster.
 
-For measured comparisons rather than claims, see the [benchmarks](https://docs.coordinode.com/benchmarks/): CoordiNode and the systems we compare against run on the same host, results are JSON-recorded with a hardware fingerprint and commit SHA, and CoordiNode's numbers are regenerated by CI on every push.
+For measured comparisons rather than claims, see the [benchmarks](https://docs.coordinode.com/benchmarks/): CoordiNode and the systems it is compared against run on the same host, results are JSON-recorded with a hardware fingerprint and commit SHA, and CoordiNode's numbers are regenerated by CI on every push.
 
-Coming from Neo4j? [docs/cypher/compatibility.md](docs/cypher/compatibility.md) lists clause by clause what carries over, what is spelled differently, and what is missing.
-
-## Full-Text Search: 23+ Languages
-
-Built-in stemming for: Arabic, Armenian, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil, Turkish, Ukrainian (20 languages via Snowball).
-
-CJK (Chinese, Japanese, Korean) via feature flags: `cjk-zh`, `cjk-ja`, `cjk-ko`.
-
-Auto-detection of document language with per-field analyzer configuration.
-
-## Quick Start
-
-```bash
-# Option 1: Docker
-git clone https://github.com/structured-world/coordinode.git
-cd coordinode
-docker compose up -d
-curl http://localhost:7084/health
-
-# Option 2: Build from source
-cargo build --release
-./target/release/coordinode serve --addr [::]:7080
-curl http://localhost:7084/health
-```
-
-See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a complete 5-minute tutorial with sample data.
+**Coming from Neo4j?** The [compatibility matrix](https://docs.coordinode.com/cypher/compatibility) lists clause by clause what carries over, what is spelled differently, and what is missing.
 
 ## Python SDK
 
 ```bash
-pip install coordinode                               # core gRPC client
+pip install coordinode                               # gRPC client
 pip install coordinode-embedded                      # in-process engine, no server
 pip install langchain-coordinode                     # LangChain GraphStore
 pip install llama-index-graph-stores-coordinode      # LlamaIndex PropertyGraphStore
 ```
 
-Source: [structured-world/coordinode-python](https://github.com/structured-world/coordinode-python)
+Source: [structured-world/coordinode-python](https://github.com/structured-world/coordinode-python).
 
 ## Architecture
 
@@ -218,24 +207,21 @@ Source: [structured-world/coordinode-python](https://github.com/structured-world
                     └─────────────────────────────────────────┘
 ```
 
-20 Rust crates, ~232K lines of code. A multi-node deployment runs the same binary on every node: replication and routing are built in, with no separate router or coordinator process to operate.
+20 Rust crates, about 232K lines of code. A multi-node deployment runs the same binary on every node: replication and routing are built in, with no separate router or coordinator process to operate.
 
 ## Documentation
 
-- [Quick Start](docs/QUICKSTART.md): from zero to a hybrid query in 5 minutes
-- [Cypher Extensions](docs/cypher/extensions.md): vector, full-text, spatial, time-travel and encrypted-search syntax
-- [Neo4j compatibility](docs/cypher/compatibility.md): clause-by-clause matrix, including what has no equivalent here
-- [Configuration](docs/guide/configuration.md): every tunable, its default, and whether it needs a restart
+- [Quick Start](https://docs.coordinode.com/QUICKSTART): from zero to a hybrid query in five minutes
+- [Guide](https://docs.coordinode.com/guide/): concepts, deployment, operations
+- [Cypher extensions](https://docs.coordinode.com/cypher/extensions): vector, full-text, spatial, time-travel and encrypted-search syntax
+- [Neo4j compatibility](https://docs.coordinode.com/cypher/compatibility): clause-by-clause matrix
+- [Configuration](https://docs.coordinode.com/guide/configuration): every tunable, its default, and whether it needs a restart
+- [Embedded mode](https://docs.coordinode.com/guide/embedded): the engine as a library, with no server process
 - [Benchmarks](https://docs.coordinode.com/benchmarks/): per-modality results, reproducible, same hardware for every system
-- [Embedded mode](docs/guide/embedded.md): the engine as a library, with no server process
 
-## Known Limitations
+## Contributing
 
-- **No Bolt protocol.** Use gRPC or REST. Bolt is planned, so existing Neo4j drivers do not connect yet.
-- **No APOC or GDS.** Common Cypher works, and the operations people reach APOC for most often (entity resolution, triggers) are native clauses here. Neo4j-specific procedure libraries are not supported.
-- **Vector indexes are held in memory.** At 1M vectors of 384 dimensions that is roughly 1.5 GB before compression; SQ8 and RaBitQ bring it down substantially in exchange for a rerank pass.
-- **The cluster is young.** Replication, follower reads and mTLS are covered by an automated fault-injection suite, but nothing substitutes for production years. Treat multi-node deployments accordingly.
-- **Horizontal sharding is an Enterprise feature.** CE replicates the full dataset to every node, which is the right shape until a dataset outgrows one machine.
+Bug reports, features and documentation are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the [Contributor License Agreement](CLA.md). Security issues go to the address in [SECURITY.md](SECURITY.md).
 
 ## License
 
@@ -245,9 +231,7 @@ CoordiNode Community Edition is licensed under **AGPL-3.0-only**: genuine open s
 
 The same code base is also available under a commercial licence as the Enterprise Edition (horizontal sharding, multi-tenancy, CRUSH placement, geo-distribution), for deployments that cannot meet the AGPL terms. Contact: enterprise@sw.foundation. The commercial licence never narrows the Community Edition: everything published here stays under AGPL-3.0-only, in full.
 
-Contributions are accepted under the [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Support the Project
+## Support the project
 
 CoordiNode is developed by [Dmitry Prudnikov](https://github.com/polaz) and contributors. Donations go directly to the maintainer and fund development time.
 
@@ -262,17 +246,3 @@ USDT (TRC-20), maintainer's personal wallet: `TFDsezHa1cBkoeZT5q2T49Wp66K8t2DmdA
 </div>
 
 Sponsorship accelerates: the Bolt protocol so existing Neo4j drivers connect unchanged, SQL over the same engine, and hardening the cluster path that shipped in this release.
-
-## Building from Source
-
-```bash
-git clone https://github.com/structured-world/coordinode.git
-cd coordinode
-cargo build --release
-cargo test --workspace
-
-# With CJK full-text support
-cargo build --release --features cjk-zh,cjk-ja,cjk-ko
-```
-
-Requires Rust 1.90+.
