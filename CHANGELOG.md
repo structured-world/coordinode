@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.5.8 - 2026-09-05
+
+### coordinode-raft 0.5.8
+
+#### Testing
+
+- *(cluster)* stop handing two nodes the same port
+
+### coordinode-server 0.5.8
+
+#### Testing
+
+- *(cluster)* stop handing two nodes the same port
+
+### coordinode-test-fixtures 0.5.8
+
+#### Testing
+
+- *(cluster)* stop handing two nodes the same port
+
+---
+
 ## v0.5.7 - 2026-09-01
 
 ### coordinode-embed 0.5.7
