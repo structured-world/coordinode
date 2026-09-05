@@ -15,11 +15,14 @@ Editions
 --------
 
 Community Edition: licensed to everyone under the GNU Affero General Public
-License, version 3 only (LICENSE). Complete, not a reduced core.
+License, version 3 only (LICENSE).
 
 Enterprise Edition: the same code base, plus enterprise features, under a
-separate commercial licence from the copyright holder. It does not change the
-terms under which the Community Edition is published.
+separate commercial licence from the copyright holder.
+
+The Community Edition is never narrowed to create the Enterprise Edition:
+nothing published here is later withheld, and the commercial licence does not
+change the terms under which the Community Edition is published.
 
 Third parties
 -------------
