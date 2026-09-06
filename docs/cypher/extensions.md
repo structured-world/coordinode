@@ -328,7 +328,7 @@ AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
 The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp.
 
-**Retention:** 7 days by default. Queries beyond the retention window return an error.
+**Retention:** 7 days by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
 
 ---
 

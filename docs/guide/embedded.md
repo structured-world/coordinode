@@ -60,9 +60,16 @@ let tx = db.begin_transaction();
 db.execute_in_transaction(tx, "CREATE (n:Person {name: 'Bob'})", None)?;
 let receipt = db.commit_transaction(tx)?;
 let as_of = receipt.commit_ts.as_raw();
+
+// Time travel is bounded by the MVCC retention window (default seven days,
+// `StorageConfig::retention_window_secs` via `Database::open_with_config`).
+// Tune it at runtime; a read older than `oldest_readable_timestamp()` fails
+// with `OutsideRetention` instead of answering from collected history.
+db.set_retention_window(std::time::Duration::from_secs(24 * 3600));
+let horizon = db.oldest_readable_timestamp();
 ```
 
-See [Transactions](./transactions) for the full interactive-transaction contract.
+See [Transactions](./transactions) for the full interactive-transaction contract and what the retention window costs in storage.
 
 ## What Is and Isn't Available
 

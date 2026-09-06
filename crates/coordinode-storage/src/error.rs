@@ -50,6 +50,16 @@ pub enum StorageError {
         used_bytes: u64,
         hard_limit_bytes: u64,
     },
+
+    /// A snapshot read below the MVCC GC watermark. History at that seqno may
+    /// already be collected, so the read is refused instead of answering from
+    /// whatever survived. Raise `retention_window_secs` or read at or above
+    /// the watermark.
+    #[error(
+        "snapshot {snapshot} is below the MVCC retention horizon {watermark}: \
+         history that old may already be collected"
+    )]
+    SnapshotOutsideRetention { snapshot: u64, watermark: u64 },
 }
 
 /// Result type alias for storage operations.

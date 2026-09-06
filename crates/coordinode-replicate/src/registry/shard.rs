@@ -77,12 +77,6 @@ impl Default for BackgroundConfig {
     }
 }
 
-/// Default MVCC time-travel retention window: 7 days, in microseconds.
-/// Matches the documented MVCC retention window (default 7 days).
-/// Our `commit_ts`/seqno is an HLC in wall-clock microseconds (ADR-007), so
-/// `now_seqno - this` is the window floor directly in seqno space.
-const DEFAULT_RETENTION_WINDOW_US: u64 = 7 * 24 * 3_600 * 1_000_000;
-
 /// Shared registry state — held by the facade and the background tasks.
 struct RegistryCore {
     engine: Arc<StorageEngine>,
@@ -91,19 +85,15 @@ struct RegistryCore {
     clock: Arc<dyn Clock>,
     /// Cached `min(checkpoint_seqno)` over **MVCC-seqno-space** consumers
     /// (`LsmStateDelta` / `MvccSnapshotPin` / `Ephemeral`); `u64::MAX` when
-    /// none. Drives the LSM GC watermark (feed a) combined with the
-    /// time-travel window.
+    /// none. Published to the engine as the consumer retention floor (feed
+    /// a); the engine combines it by `min` with its own time-travel window
+    /// and live snapshot pins, so a consumer can only ever extend retention.
     floor: Arc<AtomicU64>,
     /// Cached `min(checkpoint)` over **oplog-index-space** consumers
     /// (`OplogEvents`, whose `ResumeToken` is a Raft log index); `u64::MAX`
     /// when none. Drives oplog segment retention (feed b): a segment is kept
     /// iff `last_index >= this` OR it is within the time window.
     oplog_index_floor: Arc<AtomicU64>,
-    /// MVCC time-travel retention window in microseconds. The engine GC
-    /// watermark is held back to at least `now_seqno - retention_window_us`
-    /// so `AS OF TIMESTAMP` within the window always resolves, independent of
-    /// consumers (bitemporal system axis, ADR-027).
-    retention_window_us: u64,
     /// Whether `dc` / `rack` scopes are accepted (EE multi-DC topologies).
     allow_topology_scopes: bool,
     /// `true` once a background service is running: `heartbeat` then buffers
@@ -204,18 +194,13 @@ impl RegistryCore {
         metrics::gauge!("registry_shard_floor_seqno").set(seqno_floor as f64);
         metrics::gauge!("registry_oplog_floor_index").set(oplog_floor as f64);
 
-        // Feed (a): GC watermark = min(seqno_floor, time-travel window).
-        // No seqno consumers → seqno_floor == u64::MAX → the window dominates,
-        // so the engine keeps `AS OF TIMESTAMP` history for the whole window
-        // and never collapses to "GC everything". A consumer lagging beyond
-        // the window lowers the floor below it, extending retention for that
-        // consumer (CockroachDB protected-timestamp / TiDB service-safe-point).
-        let time_window_floor = self
-            .engine
-            .snapshot()
-            .saturating_sub(self.retention_window_us);
-        self.engine
-            .set_consumer_retention_floor(seqno_floor.min(time_window_floor));
+        // Feed (a): the consumer floor. The engine combines it by `min` with
+        // its own time-travel window (`retention_window_secs`) and live
+        // snapshot pins, so no consumers (`u64::MAX`) leaves the window in
+        // force and a consumer lagging beyond the window lowers the
+        // watermark below it, extending retention for that consumer
+        // (CockroachDB protected-timestamp / TiDB service-safe-point).
+        self.engine.set_consumer_retention_floor(seqno_floor);
         Ok(seqno_floor)
     }
 
@@ -289,10 +274,9 @@ impl RegistryCore {
             self.propose(to_evict)?;
             metrics::counter!("registry_evictions_total").increment(count as u64);
         }
-        // Always refresh the floor — even with no eviction the time-travel
-        // window floor (`now_seqno - retention_window`) advances with the wall
-        // clock, so the published GC watermark must move forward each sweep
-        // (otherwise it freezes at its construction-time value).
+        // Always refresh the floor: an expired registration that another
+        // node evicted, or a checkpoint advanced through a different handle,
+        // must reach the engine even when this sweep evicted nothing.
         self.recompute_floor()?;
         Ok(count)
     }
@@ -325,7 +309,6 @@ impl ShardConsumerRegistry {
             clock,
             floor: Arc::new(AtomicU64::new(u64::MAX)),
             oplog_index_floor: Arc::new(AtomicU64::new(u64::MAX)),
-            retention_window_us: DEFAULT_RETENTION_WINDOW_US,
             allow_topology_scopes: false,
             batching_on: AtomicBool::new(false),
             pending_hb: Mutex::new(HashMap::new()),
@@ -343,17 +326,6 @@ impl ShardConsumerRegistry {
     pub fn with_topology_scopes(mut self) -> Self {
         if let Some(core) = Arc::get_mut(&mut self.core) {
             core.allow_topology_scopes = true;
-        }
-        self
-    }
-
-    /// Override the MVCC time-travel retention window (default 7 days). Mainly
-    /// for tests + deployments tuning the `AS OF TIMESTAMP` horizon. Must be
-    /// called before the registry is cloned / a background task is spawned.
-    pub fn with_retention_window_us(mut self, window_us: u64) -> Self {
-        if let Some(core) = Arc::get_mut(&mut self.core) {
-            core.retention_window_us = window_us;
-            let _ = core.recompute_floor();
         }
         self
     }
@@ -437,7 +409,11 @@ impl ShardConsumerRegistry {
             // Final flush so no buffered heartbeat is lost on graceful stop.
             let _ = core.flush_pending_heartbeats();
         });
-        RegistryBackground { shutdown, handle }
+        RegistryBackground {
+            shutdown,
+            handle,
+            config: cfg,
+        }
     }
 }
 
@@ -446,9 +422,15 @@ impl ShardConsumerRegistry {
 pub struct RegistryBackground {
     shutdown: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<()>,
+    config: BackgroundConfig,
 }
 
 impl RegistryBackground {
+    /// The cadences this service runs with.
+    pub fn config(&self) -> BackgroundConfig {
+        self.config
+    }
+
     /// Stop the service after a final heartbeat flush, awaiting the task.
     pub async fn shutdown(self) {
         self.shutdown.notify_one();

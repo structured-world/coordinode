@@ -572,6 +572,22 @@ pub enum DatabaseError {
         leader_id: Option<u64>,
     },
 
+    /// A snapshot read (`ReadConcern.at_timestamp`) older than the MVCC
+    /// retention horizon. History that old may already be collected, so the
+    /// read is refused; the same read succeeds at any timestamp from
+    /// `oldest_readable` on. The horizon moves with the clock and
+    /// `retention_window_secs` (`Database::set_retention_window`).
+    #[error(
+        "snapshot timestamp {requested} is older than the MVCC retention horizon: \
+         history is readable from timestamp {oldest_readable} on"
+    )]
+    OutsideRetention {
+        /// The timestamp the read asked for.
+        requested: u64,
+        /// The oldest timestamp still readable when the read ran.
+        oldest_readable: u64,
+    },
+
     #[error("{0}")]
     Other(String),
 }
@@ -1794,6 +1810,30 @@ impl Database {
         self.max_interactive_txn_bytes = bytes;
     }
 
+    /// Set the MVCC time-travel retention window at runtime: how far back
+    /// `AS OF TIMESTAMP` / `at_timestamp` reads stay answerable. The GC
+    /// watermark moves with the next commit or compaction; narrowing the
+    /// window releases history and the storage that held it, widening it
+    /// cannot bring back history an earlier compaction already released.
+    /// Configured at open via `StorageConfig::retention_window_secs`
+    /// (default seven days).
+    pub fn set_retention_window(&self, window: Duration) {
+        self.engine.set_retention_window(window);
+    }
+
+    /// The configured MVCC time-travel retention window.
+    pub fn retention_window(&self) -> Duration {
+        self.engine.retention_window()
+    }
+
+    /// The oldest timestamp a time-travel read can currently ask for. Moves
+    /// forward with the clock; a read older than this is refused with
+    /// [`DatabaseError::OutsideRetention`] (or its executor counterpart for
+    /// `AS OF TIMESTAMP`).
+    pub fn oldest_readable_timestamp(&self) -> Timestamp {
+        Timestamp::from_raw(self.engine.gc_watermark().saturating_sub(1))
+    }
+
     /// Set session-level vector consistency mode.
     ///
     /// Equivalent to `SET vector_consistency = 'snapshot'` in Cypher.
@@ -2154,6 +2194,9 @@ impl Database {
         //   and Linearizable use Raft commit_index / lease check.
         // - Snapshot with at_timestamp: pin to explicit MVCC timestamp.
         use coordinode_core::txn::read_concern::ReadConcernLevel;
+        // GC-watermark pin for an explicit historical snapshot, held for the
+        // statement so compaction cannot collect the history it reads.
+        let mut retention_pin = None;
         let read_ts = match &txn_mode {
             // Interactive transaction: every statement reuses the pinned
             // start_ts so all reads resolve against the same snapshot
@@ -2171,13 +2214,25 @@ impl Database {
                     // Saturating by design: at u64::MAX there is nothing above
                     // to include, so the top snapshot is the right bound, not
                     // an overflow.
-                    Timestamp::from_raw(ts.saturating_add(1))
+                    let seqno = ts.saturating_add(1);
+                    // Refused when the seqno is already below the GC
+                    // watermark: that history may be collected, and a read
+                    // there would answer from whatever survived.
+                    let Some(pin) = self.engine.pin_snapshot_at(seqno) else {
+                        return Err(DatabaseError::OutsideRetention {
+                            requested: ts,
+                            oldest_readable: self.engine.gc_watermark().saturating_sub(1),
+                        });
+                    };
+                    retention_pin = Some(pin);
+                    Timestamp::from_raw(seqno)
                 } else {
                     self.oracle.next()
                 }
             }
             TxnMode::AutoCommit => self.oracle.next(),
         };
+        let _retention_pin = retention_pin.take();
         // Build the transaction up front: a fresh one for auto-commit, or
         // the resumed parked state for an interactive statement. `interactive`
         // drives the no-commit execution + state extraction below.
@@ -2221,7 +2276,7 @@ impl Database {
             adaptive: self.adaptive_config.clone(),
             dedup_varlen_targets: false,
             snapshot_ts: None,
-            retention_window_us: 7 * 24 * 3600 * 1_000_000,
+            snapshot_pin: None,
             warnings: Vec::new(),
             write_stats: WriteStats::default(),
             text_index: None,

@@ -41,7 +41,7 @@ fn make_test_ctx<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
-        retention_window_us: 7 * 24 * 3600 * 1_000_000,
+        snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
         text_index: None,

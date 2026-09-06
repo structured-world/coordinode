@@ -491,24 +491,24 @@ async fn ee_topology_scopes_accept_dc_and_rack() {
     node.shutdown().await.expect("shutdown");
 }
 
-/// `with_retention_window_us` actually narrows the GC window: with a tiny
-/// window and no consumers, the engine watermark sits just below the
-/// current seqno (not 7 days back as the default would put it).
+/// The time-travel window belongs to the engine, and the registry never
+/// widens the watermark past it: with a tiny engine window and no
+/// consumers, the watermark sits exactly `window` below the current seqno
+/// after the registry republishes its (empty) consumer floor.
 #[tokio::test(flavor = "multi_thread")]
-async fn custom_retention_window_narrows_gc_watermark() {
+async fn engine_window_governs_when_no_consumer_is_registered() {
     let clock = Arc::new(ManualClock::new(0));
     let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-    // 1 ms window (in µs). No consumers → watermark = snapshot - 1_000.
-    let reg = reg.with_retention_window_us(1_000);
-    let _ = reg.shard_floor(); // keep `reg` alive past the builder
-    let snap = engine.snapshot();
-    let wm = engine.gc_watermark();
-    let behind = snap.saturating_sub(wm);
-    assert!(
-        behind < DEFAULT_RETENTION_WINDOW_US / 2,
-        "tiny window must keep the watermark near `now` ({behind} µs behind), \
-         not the default 7-day span"
-    );
+    // 1 ms window. A consumer at 0 pins the watermark there; once it leaves,
+    // the registry republishes an empty floor (`u64::MAX`) and the engine's
+    // window is what remains: watermark = snapshot - 1_000 µs.
+    engine.set_retention_window(Duration::from_millis(1));
+    let h = reg
+        .register(registration("probe", TopologyScope::Cluster, 0))
+        .expect("register");
+    assert_eq!(engine.gc_watermark(), 0);
+    reg.unregister(h).expect("unregister");
+    assert_eq!(engine.gc_watermark(), engine.snapshot() - 1_000);
     node.shutdown().await.expect("shutdown");
 }
 

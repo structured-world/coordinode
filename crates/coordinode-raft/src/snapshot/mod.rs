@@ -233,8 +233,17 @@ pub fn build_incremental_snapshot(
 
     // Pin the GC watermark at `old_seqno` for the duration of the build so a
     // concurrent compaction cannot collect version history the `scan_since`
-    // pass still needs. Released when `_pin` drops at function end.
-    let _pin = engine.pin_snapshot_at(old_seqno);
+    // pass still needs. Released when `_pin` drops at function end. A base
+    // already below the watermark cannot be pinned: the delta would be
+    // computed against collected history, so the caller must send a full
+    // snapshot instead.
+    let Some(_pin) = engine.pin_snapshot_at(old_seqno) else {
+        return Err(io::Error::other(format!(
+            "incremental snapshot base {old_seqno} is below the MVCC retention \
+             horizon {}; a full snapshot is required",
+            engine.gc_watermark()
+        )));
+    };
 
     for part in partitions {
         let tag = partition_tag(part);

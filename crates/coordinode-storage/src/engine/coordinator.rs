@@ -444,18 +444,32 @@ pub struct GcWatermarkController {
     /// `min(oldest_pin_or_current, external_floor)` — a CDC / backup consumer
     /// or the time-travel window holds retention back exactly like a
     /// CockroachDB protected timestamp / TiDB service safe point. `u64::MAX`
-    /// (the default) imposes no extra constraint, so embedded engines with no
-    /// registry behave as before (watermark tracks live pins / current seqno).
+    /// (the default) imposes no extra constraint.
     external_floor: AtomicU64,
+    /// MVCC time-travel retention window in seqno units (HLC microseconds):
+    /// the watermark is held back to at least `current_seqno - window` so every
+    /// `AS OF TIMESTAMP` inside the window resolves, registry or not. Applied
+    /// only when `seqno_is_clock` (the seqno generator is the timestamp
+    /// oracle); `u64::MAX` disables it.
+    retention_window_us: AtomicU64,
+    /// Whether seqnos are HLC timestamps (oracle-backed engine). A plain
+    /// counter is not a clock, so a time window has no meaning there.
+    seqno_is_clock: bool,
 }
 
 impl GcWatermarkController {
-    fn new(gc_watermark: Arc<AtomicU64>, seqno: lsm_tree::SharedSequenceNumberGenerator) -> Self {
+    fn new(
+        gc_watermark: Arc<AtomicU64>,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        seqno_is_clock: bool,
+    ) -> Self {
         let controller = Self {
             pins: Mutex::new(BTreeMap::new()),
             gc_watermark,
             seqno,
             external_floor: AtomicU64::new(u64::MAX),
+            retention_window_us: AtomicU64::new(u64::MAX),
+            seqno_is_clock,
         };
         if let Ok(pins) = controller.pins.lock() {
             controller.recompute(&pins);
@@ -463,17 +477,35 @@ impl GcWatermarkController {
         controller
     }
 
-    /// Recompute and publish the watermark: the lesser of (the oldest pinned
-    /// seqno, or the current seqno when nothing is pinned) and the external
-    /// retention floor. Caller holds the `pins` lock.
+    /// Recompute and publish the watermark: the least of (the oldest pinned
+    /// seqno, or the current seqno when nothing is pinned), the external
+    /// retention floor, and the time-travel window floor. Caller holds the
+    /// `pins` lock.
     fn recompute(&self, pins: &BTreeMap<u64, usize>) {
-        let pin_floor = pins
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or_else(|| self.seqno.get());
-        let watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
+        let current = self.seqno.get();
+        let pin_floor = pins.keys().next().copied().unwrap_or(current);
+        let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
+        let window = self.retention_window_us.load(Ordering::Acquire);
+        if self.seqno_is_clock && window != u64::MAX {
+            // saturating_sub is the business rule here: a window reaching
+            // past the first timestamp means "retain everything", i.e. a
+            // floor of 0, not a wrapped seqno.
+            watermark = watermark.min(current.saturating_sub(window));
+        }
         self.gc_watermark.store(watermark, Ordering::Release);
+    }
+
+    /// Set the time-travel retention window (seqno units) and republish.
+    pub fn set_retention_window_us(&self, window_us: u64) {
+        self.retention_window_us.store(window_us, Ordering::Release);
+        if let Ok(pins) = self.pins.lock() {
+            self.recompute(&pins);
+        }
+    }
+
+    /// The configured time-travel retention window (seqno units).
+    pub fn retention_window_us(&self) -> u64 {
+        self.retention_window_us.load(Ordering::Acquire)
     }
 
     /// Publish the external retention floor (consumer registry) and recompute.
@@ -491,22 +523,38 @@ impl GcWatermarkController {
     /// until the returned guard drops. Returns the pinned seqno.
     pub fn pin(self: &Arc<Self>) -> (u64, SnapshotPin) {
         let seqno = self.seqno.get();
-        (seqno, self.pin_at(seqno))
+        // The current seqno is never below the watermark, so the pin is
+        // always granted; the fallback exists only to keep the type honest.
+        // Built lazily: an eagerly built guard would drop at once and release
+        // the pin just registered.
+        let pin = self.pin_at(seqno).unwrap_or_else(|| SnapshotPin {
+            controller: Arc::clone(self),
+            seqno,
+        });
+        (seqno, pin)
     }
 
     /// Pin an explicit seqno — for a reader that already holds a snapshot at a
-    /// possibly-older point in time (a statement reading at its allocated
-    /// `read_ts`, or a long-lived backup / CDC consumer). The watermark will
-    /// not advance past `seqno` until the returned guard drops.
-    pub fn pin_at(self: &Arc<Self>, seqno: u64) -> SnapshotPin {
-        if let Ok(mut pins) = self.pins.lock() {
-            *pins.entry(seqno).or_insert(0) += 1;
-            self.recompute(&pins);
+    /// possibly-older point in time (a time-travel statement, a long-lived
+    /// backup / CDC consumer). The watermark will not advance past `seqno`
+    /// until the returned guard drops.
+    ///
+    /// Returns `None` when `seqno` is already below the watermark: history
+    /// there may be collected, and a pin cannot bring it back. Refusing under
+    /// the same lock that publishes the watermark closes the race between
+    /// "check the watermark" and "pin": a granted pin always protects live
+    /// history.
+    pub fn pin_at(self: &Arc<Self>, seqno: u64) -> Option<SnapshotPin> {
+        let mut pins = self.pins.lock().ok()?;
+        if seqno < self.gc_watermark.load(Ordering::Acquire) {
+            return None;
         }
-        SnapshotPin {
+        *pins.entry(seqno).or_insert(0) += 1;
+        self.recompute(&pins);
+        Some(SnapshotPin {
             controller: Arc::clone(self),
             seqno,
-        }
+        })
     }
 
     /// Advance the watermark toward the current seqno. A no-op while any
@@ -598,10 +646,12 @@ impl LocalMultiModalCoordinator {
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
+        seqno_is_clock: bool,
     ) -> Self {
         let gc_controller = Arc::new(GcWatermarkController::new(
             Arc::clone(&gc_watermark),
             seqno.clone(),
+            seqno_is_clock,
         ));
         Self {
             trees,
@@ -623,7 +673,7 @@ impl LocalMultiModalCoordinator {
     /// Pin a read snapshot at an explicit (possibly older) seqno — for a reader
     /// that already allocated its `read_ts`, or a long-lived backup / CDC
     /// consumer.
-    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> SnapshotPin {
+    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<SnapshotPin> {
         self.gc_controller.pin_at(seqno)
     }
 
@@ -642,6 +692,17 @@ impl LocalMultiModalCoordinator {
     /// clears the constraint (no registry).
     pub fn set_consumer_retention_floor(&self, floor: u64) {
         self.gc_controller.set_external_floor(floor);
+    }
+
+    /// Set the MVCC time-travel retention window (seqno units, HLC
+    /// microseconds on an oracle-backed engine) and republish the watermark.
+    pub fn set_retention_window_us(&self, window_us: u64) {
+        self.gc_controller.set_retention_window_us(window_us);
+    }
+
+    /// The configured MVCC time-travel retention window (seqno units).
+    pub fn retention_window_us(&self) -> u64 {
+        self.gc_controller.retention_window_us()
     }
 
     /// The current GC watermark value (the seqno below which compaction may

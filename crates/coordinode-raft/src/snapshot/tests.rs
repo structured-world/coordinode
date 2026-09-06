@@ -352,9 +352,12 @@ fn test_incremental_checksum_validation() {
     let dir = tempdir().unwrap();
     let engine = open_engine(dir.path());
 
+    // The snapshot taken before the write is the incremental base: the
+    // write lands above it and is captured as a change. (A base below the
+    // GC watermark, such as 0, is refused: that history may be collected.)
+    let since = engine.snapshot();
     engine.put(Partition::Node, b"node:0:1", b"data").unwrap();
-    // since_ts=0 ensures the write is captured as a change
-    let mut data = build_incremental_snapshot(&engine, Timestamp::from_raw(0))
+    let mut data = build_incremental_snapshot(&engine, Timestamp::from_raw(since))
         .unwrap()
         .expect("should have data");
 

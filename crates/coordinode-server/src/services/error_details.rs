@@ -70,6 +70,12 @@ pub enum Reason {
     /// Metadata carries `leader_id` when the cluster has named one, so the
     /// caller can retry at the right node instead of guessing.
     NotLeader,
+    /// A time-travel read (`AS OF TIMESTAMP`, `ReadConcern.at_timestamp`)
+    /// older than the MVCC retention horizon; that history may be collected.
+    /// Metadata carries `oldest_readable_ts`, the earliest timestamp the same
+    /// read succeeds at. Terminal for that timestamp: the horizon only moves
+    /// forward.
+    OutsideRetention,
 }
 
 impl Reason {
@@ -88,6 +94,7 @@ impl Reason {
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::NotLeader => "NOT_LEADER",
+            Reason::OutsideRetention => "OUTSIDE_RETENTION",
         }
     }
 

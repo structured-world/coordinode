@@ -1291,10 +1291,14 @@ async fn grpc_at_timestamp_rejected_without_snapshot_level() {
 }
 
 /// SNAPSHOT read with `at_timestamp = 1` (an HLC value far in the past,
-/// before any writes happened) sees an empty database — proves the pin
-/// actually reaches the executor and constrains the snapshot.
+/// below the MVCC retention horizon) is refused with OUT_OF_RANGE and names
+/// the oldest readable timestamp: history that old may be collected, so an
+/// empty answer would be a guess. Proves the pin reaches the executor and is
+/// checked against the horizon.
 #[tokio::test]
-async fn grpc_at_timestamp_snapshot_pins_to_past_returns_empty() {
+async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
+    use tonic_types::StatusExt;
+
     let (svc, _dir) = test_service();
 
     // Write something.
@@ -1302,8 +1306,8 @@ async fn grpc_at_timestamp_snapshot_pins_to_past_returns_empty() {
         .await
         .expect("create");
 
-    // Read pinned to ts=1 (epoch + 1µs, before any HLC stamps).
-    let result = svc
+    // Read pinned to ts=1 (epoch + 1µs, far below `now - 7d`).
+    let status = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "MATCH (n:Past) RETURN n.id".to_string(),
             parameters: std::collections::HashMap::new(),
@@ -1317,13 +1321,103 @@ async fn grpc_at_timestamp_snapshot_pins_to_past_returns_empty() {
             transaction_id: 0,
         }))
         .await
-        .expect("snapshot read should succeed");
-    let resp = result.into_inner();
+        .expect_err("a read below the retention horizon is refused");
+    assert_eq!(status.code(), tonic::Code::OutOfRange, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "OUTSIDE_RETENTION");
+    let oldest: u64 = info
+        .metadata
+        .get("oldest_readable_ts")
+        .expect("oldest_readable_ts metadata")
+        .parse()
+        .expect("numeric");
+    assert!(oldest > 1, "the horizon is a real timestamp, got {oldest}");
+
+    // The same read just above the horizon succeeds (empty: seven days ago
+    // predates the write), and at the top of time sees the write. A second
+    // past the horizon keeps clear of the wall clock moving it forward
+    // between the two calls.
+    let oldest = oldest + 1_000_000;
+    let at = |ts: u64| {
+        Request::new(query::ExecuteCypherRequest {
+            query: "MATCH (n:Past) RETURN n.id".to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 4,
+                after_index: 0,
+                at_timestamp: ts,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+        })
+    };
+    let at_horizon = svc
+        .execute_cypher(at(oldest))
+        .await
+        .expect("a read above the horizon is served")
+        .into_inner();
     assert!(
-        resp.rows.is_empty(),
-        "snapshot at ts=1 (pre-history) must return empty, got {} rows",
-        resp.rows.len()
+        at_horizon.rows.is_empty(),
+        "seven days ago predates the write"
     );
+    let latest = svc
+        .execute_cypher(at(u64::MAX))
+        .await
+        .expect("latest")
+        .into_inner();
+    assert_eq!(latest.rows.len(), 1);
+}
+
+/// The executor's own `AS OF TIMESTAMP` refusal and the engine's snapshot
+/// guard map to the same OUT_OF_RANGE / OUTSIDE_RETENTION status, each
+/// naming the oldest readable timestamp so a caller can clamp.
+#[test]
+fn outside_retention_maps_to_out_of_range_with_horizon() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_storage::error::StorageError;
+    use tonic_types::StatusExt;
+
+    let cases = [
+        (
+            db_error_to_status(DatabaseError::OutsideRetention {
+                requested: 5,
+                oldest_readable: 99,
+            }),
+            "99",
+        ),
+        (
+            db_error_to_status(DatabaseError::Execution(ExecutionError::OutsideRetention {
+                requested: 5,
+                oldest_readable: 99,
+            })),
+            "99",
+        ),
+        (
+            db_error_to_status(DatabaseError::Storage(
+                StorageError::SnapshotOutsideRetention {
+                    snapshot: 5,
+                    watermark: 100,
+                },
+            )),
+            "99",
+        ),
+    ];
+    for (status, oldest) in cases {
+        assert_eq!(status.code(), tonic::Code::OutOfRange, "{status:?}");
+        let details = status.get_error_details();
+        let info = details.error_info().expect("ErrorInfo expected");
+        assert_eq!(info.reason, "OUTSIDE_RETENTION");
+        assert_eq!(
+            info.metadata.get("oldest_readable_ts").map(String::as_str),
+            Some(oldest)
+        );
+        assert!(
+            details.retry_info().is_none(),
+            "terminal for this timestamp: no retry advice"
+        );
+    }
 }
 
 /// SNAPSHOT read pinned at `u64::MAX` sees everything ever committed: the

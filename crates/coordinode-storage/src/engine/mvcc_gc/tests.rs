@@ -1,6 +1,15 @@
 use super::*;
 
-/// Factory produces filters with correct name.
+/// `Verdict` carries no `PartialEq`; compare by variant.
+fn keeps(verdict: &Verdict) -> bool {
+    matches!(verdict, Verdict::Keep)
+}
+
+fn removes(verdict: &Verdict) -> bool {
+    matches!(verdict, Verdict::Remove)
+}
+
+/// Factory produces filters with the registered name.
 #[test]
 fn factory_name() {
     let watermark = Arc::new(AtomicU64::new(0));
@@ -8,59 +17,62 @@ fn factory_name() {
     assert_eq!(factory.name(), "coordinode.seqno_retention");
 }
 
-/// Shared watermark is readable via Arc.
+/// Every version above the watermark is kept, whatever the key's history.
 #[test]
-fn shared_watermark_updates() {
-    let watermark = Arc::new(AtomicU64::new(0));
-    let factory_watermark = Arc::clone(&watermark);
-
-    // Initial value
-    assert_eq!(factory_watermark.load(Ordering::Acquire), 0);
-
-    // External update visible to factory
-    watermark.store(42, Ordering::Release);
-    assert_eq!(factory_watermark.load(Ordering::Acquire), 42);
+fn keeps_every_version_inside_the_window() {
+    let mut filter = SeqnoRetentionFilter::new(100);
+    assert!(keeps(&filter.decide(b"k", 300)));
+    assert!(keeps(&filter.decide(b"k", 200)));
+    assert!(keeps(&filter.decide(b"k", 101)));
 }
 
-/// Retention filter logic: items above watermark are kept.
+/// Expired versions shadowed by a kept (live) version are removed: reads
+/// that reach this output are all above its install seqno and see the live
+/// version; older history is served by the retained earlier tree versions.
 #[test]
-fn filter_keeps_items_above_watermark() {
-    let filter = SeqnoRetentionFilter {
-        watermark: 100,
-        last_key: Vec::new(),
-        has_live_version: false,
-    };
-
-    // seqno 200 > watermark 100 → within retention
-    assert!(filter.watermark < 200);
-    // seqno 50 <= watermark 100 → eligible for GC
-    assert!(filter.watermark >= 50);
+fn removes_expired_versions_under_a_live_one() {
+    let mut filter = SeqnoRetentionFilter::new(100);
+    assert!(keeps(&filter.decide(b"k", 300)), "live");
+    assert!(removes(&filter.decide(b"k", 90)));
+    assert!(removes(&filter.decide(b"k", 50)));
 }
 
-/// Retention filter preserves newest expired version per key.
+/// A version exactly at the watermark is expired.
 #[test]
-fn filter_preserves_newest_expired_version() {
-    let filter = SeqnoRetentionFilter {
-        watermark: 100,
-        last_key: Vec::new(),
-        has_live_version: false,
-    };
-
-    // When has_live_version is false and item is below watermark,
-    // the filter should keep it (first expired = newest version).
-    assert!(!filter.has_live_version);
+fn version_at_the_watermark_is_expired() {
+    let mut filter = SeqnoRetentionFilter::new(100);
+    assert!(keeps(&filter.decide(b"k", 101)));
+    assert!(removes(&filter.decide(b"k", 100)));
 }
 
-/// Retention filter destroys older expired versions.
+/// A key not written since the window opened keeps its newest version
+/// only (no data loss for cold keys).
 #[test]
-fn filter_destroys_older_expired() {
-    let filter = SeqnoRetentionFilter {
-        watermark: 100,
-        last_key: b"key1".to_vec(),
-        has_live_version: true,
-    };
+fn cold_key_keeps_its_newest_version() {
+    let mut filter = SeqnoRetentionFilter::new(100);
+    assert!(keeps(&filter.decide(b"cold", 40)));
+    assert!(removes(&filter.decide(b"cold", 30)));
+}
 
-    // When has_live_version is true and item is below watermark,
-    // the filter should destroy it (older expired version).
-    assert!(filter.has_live_version);
+/// Per-key state resets at every key boundary: the second key's expired
+/// version is its own newest, not "shadowed" by the first key's.
+#[test]
+fn state_resets_per_key() {
+    let mut filter = SeqnoRetentionFilter::new(100);
+    assert!(keeps(&filter.decide(b"a", 50)));
+    assert!(removes(&filter.decide(b"a", 40)));
+    assert!(keeps(&filter.decide(b"b", 50)));
+    assert!(removes(&filter.decide(b"b", 40)));
+    assert!(keeps(&filter.decide(b"c", 500)));
+    assert!(removes(&filter.decide(b"c", 50)));
+}
+
+/// Watermark 0 (engine still opening) keeps everything: no seqno is `<= 0`
+/// except a zeroed bottommost one, which is then the newest kept.
+#[test]
+fn zero_watermark_keeps_everything() {
+    let mut filter = SeqnoRetentionFilter::new(0);
+    assert!(keeps(&filter.decide(b"k", 3)));
+    assert!(keeps(&filter.decide(b"k", 2)));
+    assert!(keeps(&filter.decide(b"k", 1)));
 }

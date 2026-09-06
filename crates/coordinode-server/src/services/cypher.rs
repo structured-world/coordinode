@@ -198,6 +198,7 @@ fn db_error_to_status(err: DatabaseError) -> Status {
     use crate::services::error_details::{Reason, status_with_reason};
     use coordinode_query::executor::eval::EvalError;
     use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_storage::error::StorageError;
     use tonic::Code;
 
     let rendered = err.to_string();
@@ -310,6 +311,39 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 rendered,
                 Reason::NotLeader,
                 metadata,
+            );
+        }
+        // A time-travel read older than the retention horizon. OUT_OF_RANGE
+        // rather than FAILED_PRECONDITION: the same read is valid at a later
+        // timestamp, and the metadata says from which one, so a caller can
+        // clamp instead of guessing.
+        DatabaseError::OutsideRetention {
+            oldest_readable, ..
+        }
+        | DatabaseError::Execution(ExecutionError::OutsideRetention {
+            oldest_readable, ..
+        }) => {
+            return status_with_reason(
+                Code::OutOfRange,
+                rendered,
+                Reason::OutsideRetention,
+                [("oldest_readable_ts", oldest_readable.to_string())],
+            );
+        }
+        // The engine's own guard on a snapshot read below the watermark:
+        // the same condition reached through a storage-level read.
+        DatabaseError::Storage(StorageError::SnapshotOutsideRetention { watermark, .. })
+        | DatabaseError::Execution(ExecutionError::Storage(
+            StorageError::SnapshotOutsideRetention { watermark, .. },
+        )) => {
+            return status_with_reason(
+                Code::OutOfRange,
+                rendered,
+                Reason::OutsideRetention,
+                [(
+                    "oldest_readable_ts",
+                    watermark.saturating_sub(1).to_string(),
+                )],
             );
         }
         _ => {}

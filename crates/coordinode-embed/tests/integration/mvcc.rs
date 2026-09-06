@@ -120,8 +120,14 @@ fn executor_mvcc_delete_via_buffer() {
         .put(Partition::Node, b"node:0:1", b"data")
         .expect("put");
 
-    // Snapshot after initial write — used both for OCC baseline and historical verification
+    // Snapshot after initial write — used both for OCC baseline and historical
+    // verification. Pinned: without a live pin the watermark follows the
+    // current seqno on a counter-backed engine and a read at the old snapshot
+    // is refused as possibly collected.
     let snap_before_delete = engine.snapshot();
+    let _hold = engine
+        .pin_snapshot_at(snap_before_delete)
+        .expect("snapshot is current, pin granted");
 
     let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(coordinode_core::graph::node::NodeId::from_raw(0));

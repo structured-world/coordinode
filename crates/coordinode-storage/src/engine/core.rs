@@ -39,6 +39,13 @@ pub struct OracleSeqnoGenerator(
     pub std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
 );
 
+/// A retention window in seqno units. Seqnos are HLC microseconds, so the
+/// conversion is exact up to `u64::MAX` µs (~584,942 years); anything larger
+/// saturates to "retain forever", the only sensible reading of such a window.
+fn retention_window_to_us(window: std::time::Duration) -> u64 {
+    u64::try_from(window.as_micros()).unwrap_or(u64::MAX)
+}
+
 impl lsm_tree::SequenceNumberGenerator for OracleSeqnoGenerator {
     fn next(&self) -> lsm_tree::SeqNo {
         self.0.next().as_raw()
@@ -709,8 +716,16 @@ impl StorageEngine {
             }
         }
 
-        let coordinator =
-            LocalMultiModalCoordinator::new(trees, Arc::clone(&seqno), cache, gc_watermark);
+        let coordinator = LocalMultiModalCoordinator::new(
+            trees,
+            Arc::clone(&seqno),
+            cache,
+            gc_watermark,
+            oracle.is_some(),
+        );
+        coordinator.set_retention_window_us(retention_window_to_us(
+            std::time::Duration::from_secs(config.retention_window_secs),
+        ));
         Ok(Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
@@ -1344,11 +1359,28 @@ impl StorageEngine {
         self.coordinator.pin_snapshot()
     }
 
-    /// Pin a read snapshot at an explicit seqno (a statement reading at its
-    /// allocated `read_ts`, or a long-lived backup / CDC consumer). Holds the
-    /// GC watermark at or below `seqno` until the guard drops.
-    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> SnapshotPin {
+    /// Pin a read snapshot at an explicit seqno (a time-travel statement, a
+    /// long-lived backup / CDC consumer). Holds the GC watermark at or below
+    /// `seqno` until the guard drops. `None` when `seqno` is already below the
+    /// watermark: that history may be collected and no pin can protect it;
+    /// read at or above [`Self::gc_watermark`] instead.
+    pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<SnapshotPin> {
         self.coordinator.pin_snapshot_at(seqno)
+    }
+
+    /// Refuse a snapshot read below the GC watermark. Version history there
+    /// may already be collected; answering from what survived would return a
+    /// wrong (newer or missing) version, and the tree has no retained version
+    /// to serve it from at all once the history is pruned.
+    fn check_snapshot_retained(&self, snapshot: lsm_tree::SeqNo) -> StorageResult<()> {
+        let watermark = self.coordinator.gc_watermark_value();
+        if snapshot < watermark {
+            return Err(StorageError::SnapshotOutsideRetention {
+                snapshot,
+                watermark,
+            });
+        }
+        Ok(())
     }
 
     /// Advance the GC watermark toward the current seqno when no read snapshot
@@ -1369,9 +1401,26 @@ impl StorageEngine {
         self.coordinator.set_consumer_retention_floor(floor);
     }
 
-    /// The current GC watermark value. Observability + test hook.
+    /// The current GC watermark value: the seqno below which a time-travel
+    /// read may already find its versions collected. `AS OF TIMESTAMP T` is
+    /// exact for every `T >= watermark` (the version current at the watermark
+    /// survives compaction as the base) and refused below it.
     pub fn gc_watermark(&self) -> u64 {
         self.coordinator.gc_watermark_value()
+    }
+
+    /// Set the MVCC time-travel retention window at runtime and republish the
+    /// GC watermark. Takes effect for the next compaction; widening the window
+    /// cannot bring back versions an earlier compaction already collected.
+    /// Inert on an engine opened without an oracle (seqnos are not a clock).
+    pub fn set_retention_window(&self, window: std::time::Duration) {
+        self.coordinator
+            .set_retention_window_us(retention_window_to_us(window));
+    }
+
+    /// The configured MVCC time-travel retention window.
+    pub fn retention_window(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.coordinator.retention_window_us())
     }
 
     /// Read a value by key from the given partition.
@@ -1678,6 +1727,11 @@ impl StorageEngine {
         batch.commit_at(seqno)?;
         if let Some(oracle) = &self.oracle {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(seqno));
+            // The commit path is the retention window's clock tick: with the
+            // oracle moved past this commit the window floor moves too, so a
+            // compaction that follows sees the current horizon without a
+            // background timer. One uncontended lock per proposal.
+            self.coordinator.advance_gc_watermark();
         }
         Ok(())
     }
@@ -2066,6 +2120,7 @@ impl StorageEngine {
         prefix: &[u8],
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter> {
+        self.check_snapshot_retained(seqno)?;
         let tree = self.tree(part)?;
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
@@ -2109,6 +2164,7 @@ impl StorageEngine {
         end: &[u8],
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<SeekableStorageIter> {
+        self.check_snapshot_retained(seqno)?;
         self.coordinator.range_seekable(part, start, end, seqno)
     }
 
@@ -2138,8 +2194,10 @@ impl StorageEngine {
     /// Creates a point-in-time snapshot at a specific sequence number.
     ///
     /// Returns `Some(seqno)` always — lsm-tree handles future seqnos by
-    /// returning the latest visible version of each key. Keep snapshots
-    /// short-lived to avoid blocking compaction.
+    /// returning the latest visible version of each key. Reads through a
+    /// snapshot below [`Self::gc_watermark`] fail with
+    /// [`StorageError::SnapshotOutsideRetention`]; pin the seqno first
+    /// ([`Self::pin_snapshot_at`]) to hold the watermark for a longer read.
     pub fn snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<lsm_tree::SeqNo> {
         Some(seqno)
     }
@@ -2154,6 +2212,7 @@ impl StorageEngine {
         part: Partition,
         key: &[u8],
     ) -> StorageResult<Option<bytes::Bytes>> {
+        self.check_snapshot_retained(*snapshot)?;
         let tree = self.tree(part)?;
         let value = tree.get(key, *snapshot)?;
         Ok(value.map(|v| bytes::Bytes::copy_from_slice(&v)))
@@ -2171,6 +2230,7 @@ impl StorageEngine {
         part: Partition,
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
+        self.check_snapshot_retained(*snapshot)?;
         let tree = self.tree(part)?;
         let values = tree.multi_get(keys.iter().copied(), *snapshot)?;
         Ok(values
@@ -2188,6 +2248,7 @@ impl StorageEngine {
         part: Partition,
         prefix: &[u8],
     ) -> StorageResult<Vec<(Vec<u8>, bytes::Bytes)>> {
+        self.check_snapshot_retained(*snapshot)?;
         let tree = self.tree(part)?;
         let mut results = Vec::new();
         for guard in tree.prefix(prefix, *snapshot, None) {
@@ -2596,6 +2657,10 @@ mod oplog_journal_recovery_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod merge_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod retention_tests;
 
 #[cfg(all(test, feature = "columnar"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

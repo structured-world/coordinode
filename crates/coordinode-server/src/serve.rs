@@ -132,7 +132,8 @@ pub(crate) async fn serve(
         http2_keepalive_secs,
         cache_size_mb,
         write_buffer_mb,
-        retention_window_secs,
+        // Applied to the engine through resolve_storage_config above.
+        retention_window_secs: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
         cdc_consumer_ttl_secs,
@@ -622,24 +623,21 @@ pub(crate) async fn serve(
         });
     }
 
-    // Per-shard consumer-retention registry (ADR-028). Constructing it
-    // makes the registry the source of the MVCC GC watermark: it
-    // activates the documented retention window (`now - 7d`, so
-    // `AS OF TIMESTAMP` history is retained) and, once CDC / backup
-    // consumers register, holds older versions / oplog segments back
-    // for them. The background service runs batched heartbeats + TTL
-    // eviction and advances the window with the wall clock. Both
+    // Per-shard consumer-retention registry (ADR-028). Once CDC / backup
+    // consumers register, it holds older MVCC versions / oplog segments
+    // back for them, on top of the engine's own time-travel window (which
+    // the engine enforces by itself from `retention_window_secs`). The
+    // background service runs batched heartbeats + TTL eviction. Both
     // standalone and cluster modes drive it through the same Raft
     // pipeline. Held for the process lifetime.
-    // Operator overrides for the retention window + background
-    // cadences arrive as `coordinode serve` flags; `None` keeps the
-    // built-in defaults (7-day window, 100 ms heartbeat, 1 s eviction).
+    // Operator overrides for the background cadences arrive from the
+    // config file; `None` keeps the built-in defaults (100 ms heartbeat,
+    // 1 s eviction).
     let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
         Arc::clone(&engine),
         Arc::clone(&pipeline),
         node_id,
         registry::RegistryTuning {
-            retention_window_secs,
             heartbeat_window_ms: registry_heartbeat_ms,
             eviction_interval_ms: registry_eviction_ms,
         },

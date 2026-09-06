@@ -88,7 +88,7 @@ the key is unset.
 | `http2_keepalive_secs` | (none) | restart | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
 | `cache_size_mb` | engine default | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
 | `write_buffer_mb` | engine default | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
-| `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds. The GC watermark is held back to at least `now - this`, so history within the window stays queryable and CDC / backup consumers keep their checkpoint readable. |
+| `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds, enforced by the storage engine itself (embedded databases honour it too via `StorageConfig`). The GC watermark is held back to at least `now - this`, so history within the window stays queryable; a registered CDC / backup consumer can hold it back further, never less. A read older than the horizon is refused with `OUT_OF_RANGE` / `OUTSIDE_RETENTION`. Storage held by the window scales with the write and compaction volume of the window (every compaction's inputs are kept until the horizon passes it). |
 | `registry_heartbeat_ms` | `100` | restart | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
 | `registry_eviction_ms` | `1000` | restart | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
 | `cdc_consumer_ttl_secs` | `30` | restart | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every poll and are never evicted. |
@@ -481,10 +481,19 @@ reclaims versions older than the retention window; the window is therefore the
 horizon for both time-travel reads and lagging-consumer recovery.
 
 - `retention_window_secs` sets that horizon, in seconds (default seven days).
-  Shorter windows reclaim space sooner but shrink the time-travel range and the
-  grace period a slow consumer has before its checkpoint is collected. A
-  registered consumer lagging beyond the window holds the floor back for itself
-  rather than losing data silently.
+  The storage engine enforces it directly, so it applies identically to a
+  server node and to an embedded database (`StorageConfig::retention_window_secs`,
+  runtime-tunable with `Database::set_retention_window`). Shorter windows
+  reclaim space sooner but shrink the time-travel range and the grace period a
+  slow consumer has before its checkpoint is collected. A registered consumer
+  lagging beyond the window holds the floor back for itself rather than losing
+  data silently. Reads older than the horizon are refused (`OUT_OF_RANGE`,
+  reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) instead of being
+  answered from partially collected history.
+- The window is paid for in storage: history inside it is served from the
+  tree versions that were current at each point, so every table a compaction
+  consumed stays on disk until the horizon passes that compaction. Budget disk
+  for the write and compaction volume of the window, not for the data size.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: how often buffered consumer
   heartbeats are flushed as a coalesced proposal, and how often expired

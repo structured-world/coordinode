@@ -35,7 +35,7 @@ use lsm_tree::Guard;
 
 use crate::cache::write_buffer::NvmeWriteBuffer;
 use crate::engine::StorageSnapshot;
-use crate::engine::coordinator::{MultiModalCoordinator, OccScope};
+use crate::engine::coordinator::{MultiModalCoordinator, OccScope, SnapshotPin};
 use crate::engine::core::StorageEngine;
 use crate::engine::merge::{encode_add_batch, encode_counter_delta, encode_remove};
 use crate::engine::partition::Partition;
@@ -199,6 +199,12 @@ pub struct Transaction<'a> {
     /// Drained at commit as `CounterMerge` operands; a sum that folded to
     /// zero is skipped at drain (nothing to apply).
     merge_counter_deltas: HashMap<Vec<u8>, i64>,
+    /// GC-watermark pin at `snapshot`, held for the transaction's life (and
+    /// parked with its state between interactive statements) so compaction
+    /// never collects the history this transaction reads. `None` in legacy
+    /// mode, or when the snapshot was already below the watermark when set
+    /// (reads then fail with `SnapshotOutsideRetention` instead of guessing).
+    snapshot_pin: Option<SnapshotPin>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -218,6 +224,7 @@ pub struct TransactionState {
     merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
     merge_counter_deltas: HashMap<Vec<u8>, i64>,
+    snapshot_pin: Option<SnapshotPin>,
 }
 
 impl TransactionState {
@@ -279,6 +286,7 @@ impl<'a> Transaction<'a> {
             merge_adj_removes: HashMap::new(),
             merge_node_deltas: Vec::new(),
             merge_counter_deltas: HashMap::new(),
+            snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
         }
     }
 
@@ -303,6 +311,7 @@ impl<'a> Transaction<'a> {
             merge_adj_removes: self.merge_adj_removes,
             merge_node_deltas: self.merge_node_deltas,
             merge_counter_deltas: self.merge_counter_deltas,
+            snapshot_pin: self.snapshot_pin,
         }
     }
 
@@ -324,6 +333,7 @@ impl<'a> Transaction<'a> {
             merge_adj_removes: std::mem::take(&mut self.merge_adj_removes),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
+            snapshot_pin: self.snapshot_pin.take(),
         }
     }
 
@@ -349,6 +359,7 @@ impl<'a> Transaction<'a> {
             merge_adj_removes: state.merge_adj_removes,
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
+            snapshot_pin: state.snapshot_pin,
         }
     }
 
@@ -596,9 +607,12 @@ impl<'a> Transaction<'a> {
     }
 
     /// Set (or clear) the MVCC read snapshot. Transitional: the executor opens
-    /// the snapshot after building the context and syncs it here.
+    /// the snapshot after building the context and syncs it here. The pin
+    /// follows the snapshot: history at the new seqno is protected for the
+    /// rest of the transaction, the old pin is released.
     pub fn set_snapshot(&mut self, snapshot: Option<StorageSnapshot>) {
         self.snapshot = snapshot;
+        self.snapshot_pin = snapshot.and_then(|s| self.engine.pin_snapshot_at(s));
     }
 
     /// The adjacency time-travel snapshot, if any. Adjacency base reads go

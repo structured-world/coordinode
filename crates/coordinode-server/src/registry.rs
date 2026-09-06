@@ -1,10 +1,14 @@
 //! Consumer-retention registry construction from operator config.
 //!
-//! `coordinode serve` exposes the registry's MVCC retention window and
-//! background cadences as CLI flags. This module is the single place that
-//! turns those parsed values into a live [`ShardConsumerRegistry`] plus its
-//! background service. `main.rs` and the server-level test both go through
-//! here, so the wiring production runs is the wiring that gets tested.
+//! `coordinode serve` exposes the registry's background cadences as config
+//! keys. This module is the single place that turns those parsed values into
+//! a live [`ShardConsumerRegistry`] plus its background service. `main.rs`
+//! and the server-level test both go through here, so the wiring production
+//! runs is the wiring that gets tested.
+//!
+//! The MVCC time-travel window is not a registry setting: the engine
+//! enforces it from `StorageConfig::retention_window_secs`, and the registry
+//! only ever lowers the GC watermark further for a lagging consumer.
 
 use std::sync::Arc;
 
@@ -14,23 +18,16 @@ use coordinode_replicate::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 
-/// Microseconds per second. The retention window is operator-facing in
-/// seconds; the registry stores it in HLC microseconds (ADR-007).
-const US_PER_SEC: u64 = 1_000_000;
-
-/// Operator-supplied registry tuning, parsed from `coordinode serve` flags.
+/// Operator-supplied registry tuning, parsed from the config file.
 ///
 /// Every field is `Option`: `None` means "keep the registry's built-in
 /// default", so an operator overrides only what they explicitly set.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RegistryTuning {
-    /// MVCC time-travel / retention window in seconds (`--retention-window-secs`).
-    /// `None` keeps the default 7-day window.
-    pub retention_window_secs: Option<u64>,
-    /// Heartbeat coalescing window in milliseconds (`--registry-heartbeat-ms`).
+    /// Heartbeat coalescing window in milliseconds (`registry_heartbeat_ms`).
     /// `None` keeps the default 100 ms.
     pub heartbeat_window_ms: Option<u64>,
-    /// TTL-eviction sweep interval in milliseconds (`--registry-eviction-ms`).
+    /// TTL-eviction sweep interval in milliseconds (`registry_eviction_ms`).
     /// `None` keeps the default 1000 ms.
     pub eviction_interval_ms: Option<u64>,
 }
@@ -42,27 +39,18 @@ pub(crate) struct RegistryTuning {
 /// so producers like the change-stream service register through it) and its
 /// [`RegistryBackground`] handle, which must be held for the process lifetime:
 /// dropping it shuts the background service down (with a final heartbeat flush).
-/// The registry publishes the MVCC GC watermark to the engine synchronously
-/// during construction, so the engine's retention floor already reflects the
-/// configured window by the time this returns.
 pub(crate) fn build_consumer_registry(
     engine: Arc<StorageEngine>,
     pipeline: Arc<dyn ProposalPipeline>,
     node_id: u64,
     tuning: RegistryTuning,
 ) -> (ShardConsumerRegistry, RegistryBackground) {
-    let mut registry = ShardConsumerRegistry::new(
+    let registry = ShardConsumerRegistry::new(
         engine,
         pipeline,
         Arc::new(ProposalIdGenerator::with_base(node_id << 48)),
         Arc::new(SystemClock),
     );
-    if let Some(secs) = tuning.retention_window_secs {
-        // saturating_mul: a window so large it overflows u64 microseconds
-        // (~584942 years) clamps to "retain forever", which is the intended
-        // reading of an absurdly large operator window, not a bug to surface.
-        registry = registry.with_retention_window_us(secs.saturating_mul(US_PER_SEC));
-    }
     let mut bg_cfg = BackgroundConfig::default();
     if let Some(ms) = tuning.heartbeat_window_ms {
         bg_cfg.heartbeat_window_ms = ms;

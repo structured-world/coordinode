@@ -212,7 +212,7 @@ fn make_ctx<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
-        retention_window_us: 7 * 24 * 3600 * 1_000_000, // 7 days in micros
+        snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
         text_index: None,
@@ -1882,9 +1882,26 @@ fn as_of_timestamp_sets_snapshot() {
     assert_eq!(ctx.snapshot_ts, Some(recent_ts));
 }
 
+/// An `AS OF TIMESTAMP` below the engine's retention horizon is refused with
+/// `OutsideRetention` naming the oldest readable timestamp. The horizon only
+/// exists on a clock-backed (oracle) engine, where seqnos are HLC
+/// microseconds and the window is `now - retention_window_secs`.
 #[test]
 fn as_of_timestamp_rejects_expired() {
-    let (_dir, engine, mut interner) = setup_test_graph();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = std::sync::Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(
+        &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]),
+        oracle,
+    )
+    .expect("open with oracle");
+    let mut interner = FieldInterner::new();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
@@ -1914,9 +1931,25 @@ fn as_of_timestamp_rejects_expired() {
     };
 
     let result = execute(&plan, &mut ctx);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err.to_string().contains("retention window"));
+    let horizon = engine.gc_watermark().saturating_sub(1);
+    match result {
+        Err(ExecutionError::OutsideRetention {
+            requested,
+            oldest_readable,
+        }) => {
+            assert_eq!(requested, old_ts);
+            assert_eq!(oldest_readable, horizon);
+            assert!(
+                u64::try_from(old_ts).expect("positive") < horizon,
+                "30 days ago lies below a 7-day horizon"
+            );
+        }
+        other => panic!("expected OutsideRetention, got {other:?}"),
+    }
+    assert!(
+        ctx.snapshot_pin.is_none(),
+        "a refused read leaves no pin behind"
+    );
 }
 
 #[test]

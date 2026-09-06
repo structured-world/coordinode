@@ -35,6 +35,7 @@ mod integration {
     mod r158_per_level_routing;
     mod r159_page_checksum;
     mod r161_capacity_tracking;
+    mod retention;
     mod schema;
     mod shared_engine;
     mod text_index;

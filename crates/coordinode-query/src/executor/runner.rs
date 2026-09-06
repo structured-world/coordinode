@@ -93,6 +93,23 @@ pub enum ExecutionError {
         leader_id: Option<u64>,
     },
 
+    /// An `AS OF TIMESTAMP` older than the MVCC retention horizon. History
+    /// that old may already be collected, so the read is refused instead of
+    /// answering from whatever survived. The horizon moves with the clock
+    /// and `retention_window_secs`; the same query succeeds at any timestamp
+    /// from `oldest_readable` on.
+    #[error(
+        "AS OF TIMESTAMP {requested} is older than the MVCC retention horizon: \
+         history is readable from timestamp {oldest_readable} on \
+         (retention_window_secs)"
+    )]
+    OutsideRetention {
+        /// The timestamp the query asked for.
+        requested: i64,
+        /// The oldest timestamp still readable when the query ran.
+        oldest_readable: u64,
+    },
+
     /// Schema mode violation: STRICT label rejected an undeclared property, or
     /// a write attempted to SET a COMPUTED (read-only) property.
     #[error("schema violation: {0}")]
@@ -374,8 +391,10 @@ pub struct ExecutionContext<'a> {
     /// Snapshot timestamp for AS OF TIMESTAMP queries (microseconds since epoch).
     /// When set, reads return data as of this point in time.
     pub snapshot_ts: Option<i64>,
-    /// MVCC retention window in microseconds (default: 7 days).
-    pub retention_window_us: i64,
+    /// GC-watermark pin for an `AS OF TIMESTAMP` read, held for the
+    /// statement so compaction cannot collect the history it reads. `None`
+    /// for reads at the current snapshot (never below the watermark).
+    pub snapshot_pin: Option<coordinode_storage::engine::coordinator::SnapshotPin>,
     /// Warnings collected during execution (e.g., fan-out capping).
     pub warnings: Vec<String>,
     /// Write statistics accumulated during this statement.
@@ -2016,22 +2035,7 @@ pub fn execute_no_commit(
     if let Some(ref ts_expr) = plan.snapshot_ts {
         let ts_val = eval_neutral(ts_expr, &Row::new())?;
         let resolved_ts: Option<i64> = match ts_val {
-            Value::Timestamp(ts) => {
-                // Validate within retention window
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as i64)
-                    .unwrap_or(0);
-                let cutoff = now_us - ctx.retention_window_us;
-                if ts < cutoff {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "AS OF TIMESTAMP {} is outside retention window \
-                         (oldest allowed: {})",
-                        ts, cutoff
-                    )));
-                }
-                Some(ts)
-            }
+            Value::Timestamp(ts) => Some(ts),
             Value::String(ref s) => {
                 ctx.warnings.push(format!(
                     "AS OF TIMESTAMP '{s}': string timestamps parsed as current \
@@ -2062,6 +2066,19 @@ pub fn execute_no_commit(
             let seqno = (ts as u64).checked_add(1).ok_or_else(|| {
                 ExecutionError::Unsupported("AS OF TIMESTAMP value out of range".into())
             })?;
+            // Pin the snapshot for the statement. The pin is refused when the
+            // seqno is already below the GC watermark: that history may be
+            // collected, and a read there would answer from whatever survived
+            // (a newer version, or nothing). Refusing under the watermark's
+            // own lock means a granted pin always protects live history.
+            let Some(pin) = ctx.engine.pin_snapshot_at(seqno) else {
+                return Err(ExecutionError::OutsideRetention {
+                    requested: ts,
+                    // A read at T needs snapshot T + 1 >= watermark.
+                    oldest_readable: ctx.engine.gc_watermark().saturating_sub(1),
+                });
+            };
+            ctx.snapshot_pin = Some(pin);
             if let Some(snap) = ctx.engine.snapshot_at(seqno) {
                 ctx.mvcc_snapshot = Some(snap);
                 ctx.txn.set_adj_snapshot(Some(snap));

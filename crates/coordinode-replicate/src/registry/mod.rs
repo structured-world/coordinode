@@ -11,10 +11,11 @@
 //! Public surface (types + trait) plus the Raft-backed
 //! [`ShardConsumerRegistry`] implementation: eager register / checkpoint /
 //! unregister proposals, batched heartbeats + TTL eviction
-//! ([`RegistryBackground`]), and the retention feeds — the MVCC GC watermark
-//! (feed a, `min(seqno_floor, time-travel window)`) and the oplog retention
-//! floor (feed b). Floors are split by consumer space (MVCC seqno vs oplog
-//! Raft index); see [`ConsumerKind::is_seqno_space`].
+//! ([`RegistryBackground`]), and the retention feeds — the consumer floor
+//! published to the engine GC watermark (feed a; the engine combines it by
+//! `min` with its own time-travel window and live snapshot pins) and the
+//! oplog retention floor (feed b). Floors are split by consumer space (MVCC
+//! seqno vs oplog Raft index); see [`ConsumerKind::is_seqno_space`].
 
 mod entry;
 mod shard;

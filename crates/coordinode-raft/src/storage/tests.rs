@@ -677,8 +677,12 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
     let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    // Opening re-anchored the oracle to the wall clock; the leader's commit
+    // timestamps below are real HLC values inside the retention window (a
+    // contrived tiny timestamp would sit below the horizon and be refused).
+    let base = oracle.current().as_raw() + 1_000;
 
-    // Apply at commit_ts=500
+    // Apply at commit_ts=base+500
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
         mutations: vec![Mutation::Put {
@@ -686,13 +690,13 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
             key: b"node:1:1".to_vec(),
             value: b"first".to_vec(),
         }],
-        commit_ts: Timestamp::from_raw(500),
-        start_ts: Timestamp::from_raw(499),
+        commit_ts: Timestamp::from_raw(base + 500),
+        start_ts: Timestamp::from_raw(base + 499),
         bypass_rate_limiter: false,
     };
     sm.apply_proposal(&proposal).unwrap();
 
-    // Apply at commit_ts=700
+    // Apply at commit_ts=base+700
     let proposal2 = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(2),
         mutations: vec![Mutation::Put {
@@ -700,20 +704,20 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
             key: b"node:1:1".to_vec(),
             value: b"second".to_vec(),
         }],
-        commit_ts: Timestamp::from_raw(700),
-        start_ts: Timestamp::from_raw(699),
+        commit_ts: Timestamp::from_raw(base + 700),
+        start_ts: Timestamp::from_raw(base + 699),
         bypass_rate_limiter: false,
     };
     sm.apply_proposal(&proposal2).unwrap();
 
     // Each entry is applied at exactly its commit_ts, so time travel by
-    // commit_ts is exact in both directions: at 500 the first write is
-    // there, at 499 nothing is, at 700 the second supersedes it and at 699
-    // the first is still the visible version. A storage snapshot at S sees
-    // seqnos strictly below S, so "as of commit_ts T" reads at T + 1.
-    let at = |commit_ts: u64| {
+    // commit_ts is exact in both directions: at +500 the first write is
+    // there, at +499 nothing is, at +700 the second supersedes it and at
+    // +699 the first is still the visible version. A storage snapshot at S
+    // sees seqnos strictly below S, so "as of commit_ts T" reads at T + 1.
+    let at = |offset: u64| {
         engine
-            .snapshot_get(&(commit_ts + 1), Partition::Node, b"node:1:1")
+            .snapshot_get(&(base + offset + 1), Partition::Node, b"node:1:1")
             .unwrap()
     };
     assert_eq!(at(499), None, "nothing visible before the first commit_ts");
@@ -730,11 +734,12 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
         "current snapshot should see last write"
     );
 
-    // Verify oracle advanced past 700
+    // Verify oracle advanced past the last applied commit_ts
     let final_ts = oracle.next();
     assert!(
-        final_ts.as_raw() > 700,
-        "oracle should be past 700, got {}",
+        final_ts.as_raw() > base + 700,
+        "oracle should be past {}, got {}",
+        base + 700,
         final_ts.as_raw()
     );
 }
@@ -762,6 +767,9 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
     let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    // A real HLC commit timestamp inside the retention window (see
+    // `apply_seqnos_match_commit_ts_with_oracle`).
+    let commit_ts = oracle.current().as_raw() + 1_500;
 
     let keys: Vec<Vec<u8>> = (1..=5u64)
         .map(|i| format!("node:1:{i}").into_bytes())
@@ -776,24 +784,27 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
                 value: b"v".to_vec(),
             })
             .collect(),
-        commit_ts: Timestamp::from_raw(500),
-        start_ts: Timestamp::from_raw(499),
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
         bypass_rate_limiter: false,
     };
     let applied = sm.apply_proposal(&proposal).unwrap();
     assert_eq!(applied.mutations_applied, 5);
 
-    // A storage snapshot at S sees seqnos strictly below S: "as of 499" is a
-    // snapshot at 500, "as of 500" a snapshot at 501.
+    // A storage snapshot at S sees seqnos strictly below S: "as of
+    // commit_ts - 1" is a snapshot at commit_ts, "as of commit_ts" a snapshot
+    // at commit_ts + 1.
     for key in &keys {
         assert_eq!(
-            engine.snapshot_get(&500, Partition::Node, key).unwrap(),
+            engine
+                .snapshot_get(&commit_ts, Partition::Node, key)
+                .unwrap(),
             None,
             "no key of the entry is visible before its commit_ts"
         );
         assert_eq!(
             engine
-                .snapshot_get(&501, Partition::Node, key)
+                .snapshot_get(&(commit_ts + 1), Partition::Node, key)
                 .unwrap()
                 .as_deref(),
             Some(b"v".as_ref()),
@@ -801,7 +812,7 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
         );
     }
     // The oracle hands out strictly newer timestamps after the apply.
-    assert!(oracle.next().as_raw() > 500);
+    assert!(oracle.next().as_raw() > commit_ts);
 }
 
 // ── Regression: unclean shutdown restart ─────────────────────────────────

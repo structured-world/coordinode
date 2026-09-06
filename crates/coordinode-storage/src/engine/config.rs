@@ -610,6 +610,16 @@ pub struct StorageConfig {
     /// `now - oplog_retention_secs` are eligible for purge. Default: 7 days.
     pub oplog_retention_secs: u64,
 
+    /// MVCC time-travel retention window in seconds. On an engine whose seqno
+    /// is the HLC commit timestamp (every oracle-backed open) the GC watermark
+    /// is held back to at least `now - retention_window_secs`, so `AS OF
+    /// TIMESTAMP` inside the window always resolves. Live snapshot pins and a
+    /// lagging registered consumer can hold it back further, never less.
+    /// Runtime-tunable via `StorageEngine::set_retention_window`. Inert on a
+    /// counter-seqno engine (no oracle): its seqnos are not a clock.
+    /// Default: 7 days.
+    pub retention_window_secs: u64,
+
     /// Background drain thread polling interval in milliseconds.
     /// Controls how frequently volatile writes (w:memory/w:cache) are
     /// batched into Raft proposals. Lower = less data at risk.
@@ -776,6 +786,7 @@ impl StorageConfig {
             oplog_segment_max_bytes: 64 * 1024 * 1024,
             oplog_segment_max_entries: 50_000,
             oplog_retention_secs: 7 * 24 * 3600,
+            retention_window_secs: 7 * 24 * 3600,
             drain_interval_ms: 100,
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,

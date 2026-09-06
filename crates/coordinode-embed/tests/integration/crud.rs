@@ -372,7 +372,9 @@ fn map_projection_with_computed_field() {
 /// ignoring writes that happened after that timestamp.
 #[test]
 fn read_concern_snapshot_pins_to_timestamp() {
+    use coordinode_core::graph::types::Value;
     use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
+    use coordinode_embed::DatabaseError;
 
     let mut db = open_db();
 
@@ -380,10 +382,9 @@ fn read_concern_snapshot_pins_to_timestamp() {
     db.execute_cypher("CREATE (u:User {name: 'alice', version: 1})")
         .expect("create v1");
 
-    // Capture the current oracle timestamp (approx) for snapshot
-    // The oracle advances on each execute_cypher call.
-    // We'll use a timestamp between v1 and v2 writes.
-    let snapshot_ts = 5; // Low timestamp — before most MVCC versions
+    // A timestamp between v1 and v2: the engine's current seqno is one past
+    // the last commit, so a snapshot pinned here sees v1 and nothing later.
+    let snapshot_ts = db.engine().snapshot();
 
     // Write v2 (update)
     db.execute_cypher("MATCH (u:User {name: 'alice'}) SET u.version = 2")
@@ -393,23 +394,33 @@ fn read_concern_snapshot_pins_to_timestamp() {
     let rows = db
         .execute_cypher("MATCH (u:User {name: 'alice'}) RETURN u.version")
         .expect("local read");
-    assert!(!rows.is_empty(), "local read should find alice");
+    assert_eq!(rows.len(), 1, "local read should find alice");
+    assert_eq!(rows[0].get("u.version"), Some(&Value::Int(2)));
 
-    // Snapshot read at early timestamp — tests that at_timestamp is used
-    // instead of oracle.next(). Even if the exact data visibility varies
-    // (depends on MVCC commit_ts assignment), the read_concern path is exercised.
+    // Snapshot read between the two writes sees exactly v1: at_timestamp is
+    // used instead of oracle.next().
     let rc = ReadConcern::snapshot_at(snapshot_ts);
     let snap_rows = db
         .execute_cypher_with_read_concern("MATCH (u:User {name: 'alice'}) RETURN u.version", rc)
         .expect("snapshot read");
+    assert_eq!(snap_rows.len(), 1, "alice exists at the pinned snapshot");
+    assert_eq!(
+        snap_rows[0].get("u.version"),
+        Some(&Value::Int(1)),
+        "the snapshot between the writes sees v1, not v2"
+    );
 
-    // At very early timestamp (5), alice may not exist yet (MVCC versions
-    // are at higher timestamps). This verifies snapshot read returns
-    // different results than local read.
-    // The key assertion: snapshot read at ts=5 returns FEWER rows than local read.
+    // A timestamp below the MVCC retention horizon is refused rather than
+    // answered from history that may already be collected.
+    let err = db
+        .execute_cypher_with_read_concern(
+            "MATCH (u:User {name: 'alice'}) RETURN u.version",
+            ReadConcern::snapshot_at(5),
+        )
+        .expect_err("a snapshot below the retention horizon is refused");
     assert!(
-        snap_rows.len() <= rows.len(),
-        "snapshot at early ts should return <= rows than local"
+        matches!(err, DatabaseError::OutsideRetention { requested: 5, .. }),
+        "unexpected error: {err:?}"
     );
 
     // Snapshot read at high timestamp — should see everything

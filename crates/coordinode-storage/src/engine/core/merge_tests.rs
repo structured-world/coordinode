@@ -1035,12 +1035,20 @@ fn has_write_after_nonexistent_key_returns_false() {
     )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
+    // "Since now": a seqno inside the retention window. A seqno below the
+    // window (such as 0 on a clock-backed engine) is refused instead, since
+    // the history needed to answer may already be collected.
+    let since = engine.snapshot();
     assert!(
         !engine
-            .has_write_after(Partition::Node, b"nonexistent", 0)
+            .has_write_after(Partition::Node, b"nonexistent", since)
             .expect("check"),
         "nonexistent key should return false"
     );
+    assert!(matches!(
+        engine.has_write_after(Partition::Node, b"nonexistent", 0),
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
 }
 
 #[test]
@@ -1090,15 +1098,22 @@ fn has_write_after_different_partitions_independent() {
     )]);
     let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
 
+    let before = engine.snapshot();
     engine
         .put(Partition::Node, b"node:1:1", b"data")
         .expect("put");
 
     assert!(
         !engine
-            .has_write_after(Partition::Schema, b"node:1:1", 0)
+            .has_write_after(Partition::Schema, b"node:1:1", before)
             .expect("check"),
         "write in Node partition should not affect Schema partition"
+    );
+    assert!(
+        engine
+            .has_write_after(Partition::Node, b"node:1:1", before)
+            .expect("check"),
+        "the Node partition does see its own write"
     );
 }
 
@@ -1753,7 +1768,9 @@ fn apply_proposal_at_follower_timestamp_advances_the_oracle() {
     )]);
     let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
 
-    let leader_ts = 5_000_000u64;
+    // Opening the engine re-anchored the oracle to the wall clock, so "ahead
+    // of its own oracle" means ahead of the wall clock.
+    let leader_ts = oracle.current().as_raw() + 5_000_000;
     engine
         .apply_proposal_at(
             &[Mutation::Put {

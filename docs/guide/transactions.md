@@ -71,7 +71,7 @@ Over gRPC the same receipt is `CommitTransactionResponse { applied_index, commit
 
 ## Time-Travel Queries
 
-MVCC retains older versions of data for the configured retention window (default: 1 hour). You can query historical snapshots in two ways.
+MVCC retains older versions of data for the configured retention window (`retention_window_secs`, default seven days, in every deployment mode including embedded). You can query historical snapshots in two ways.
 
 **Cypher in-line syntax** for ad-hoc queries:
 
@@ -98,9 +98,13 @@ Constraints:
 
 - `at_timestamp` is only valid with `level = SNAPSHOT`. Combining it with `MAJORITY` / `LOCAL` / `LINEARIZABLE` returns `FAILED_PRECONDITION`.
 - `at_timestamp` and `after_index` are mutually exclusive — pinning to a specific HLC and waiting for a Raft index are contradictory. The server returns `InvalidArgument` if both are non-zero.
-- Reads beyond the MVCC retention window (older than `retention_window_us`, default 1 hour) return `UNAVAILABLE`.
+- Reads older than the MVCC retention horizon return `OUT_OF_RANGE` with `ErrorInfo.reason = OUTSIDE_RETENTION` and `oldest_readable_ts` in the metadata: the earliest timestamp the same read succeeds at. The horizon is `now - retention_window_secs` (default seven days), held further back only while a live snapshot pin or a registered CDC / backup consumer still needs older history. The refusal is deliberate: history below the horizon may already be collected, and a read there could otherwise answer with a newer version or nothing. The same applies to `AS OF TIMESTAMP` in Cypher.
 
 Typical use: auditing, debugging, time-aligned analytics across multiple queries that must observe the same database state.
+
+In the embedded API the window is `StorageConfig::retention_window_secs` at open (`Database::open` uses the default), tunable at runtime with `Database::set_retention_window`; `Database::oldest_readable_timestamp` reports the current horizon, and a read below it fails with `DatabaseError::OutsideRetention` (`ReadConcern.at_timestamp`) or `ExecutionError::OutsideRetention` (`AS OF TIMESTAMP`).
+
+What the window costs: the engine keeps every table a compaction consumed until the horizon passes the compaction, so history inside the window is served from the tree versions that were current at each point. Storage held by the window is therefore proportional to the write and compaction volume of the window, not to the number of rewritten keys. Size the window to the time travel you actually need.
 
 ## Conflict Semantics
 

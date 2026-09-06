@@ -421,6 +421,11 @@ impl ServerConfig {
     pub fn resolve_storage_config(&self) -> StorageConfig {
         let mut cfg = StorageConfig::with_endpoints(self.storage_endpoints());
         cfg.backpressure = self.storage.backpressure;
+        // The MVCC time-travel window is an engine setting: the engine holds
+        // its GC watermark back by it on every node, registry or not.
+        if let Some(secs) = self.retention_window_secs {
+            cfg.retention_window_secs = secs;
+        }
         cfg
     }
 
