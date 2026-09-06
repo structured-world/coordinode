@@ -286,7 +286,7 @@ export default defineConfig({
 
     footer: {
       message: "Released under the <a href='https://github.com/structured-world/coordinode/blob/main/LICENSE'>AGPL-3.0 License</a>.",
-      copyright: "Copyright © 2026 sw.foundation",
+      copyright: "Copyright © 2026 Dmitry Prudnikov",
     },
 
     editLink: {
