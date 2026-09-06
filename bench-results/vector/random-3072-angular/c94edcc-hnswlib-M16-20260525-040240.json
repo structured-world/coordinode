@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "timestamp": "2026-05-25T04:02:40.630656Z",
+  "git": {
+    "sha": "c94edcc",
+    "sha_short": "c94edcc",
+    "branch": "main",
+    "dirty": false,
+    "commit_date": "2026-05-24T00:10:55+03:00"
+  },
+  "hardware": {
+    "arch": "x86_64",
+    "cpu_brand": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_cores": 8,
+    "cpu_threads": 16,
+    "ram_gb": 63,
+    "os_name": "Fedora Linux",
+    "os_version": "44"
+  },
+  "modality": "vector",
+  "benchmark": "ann-benchmarks",
+  "dataset": "random-3072-angular",
+  "subject": "hnswlib",
+  "codec": "none",
+  "version": "donor",
+  "metrics": {
+    "build_secs": 21513.024747133255,
+    "dataset_dim": null,
+    "dataset_n_test": null,
+    "dataset_n_train": null,
+    "hnsw_ef_construction": 500,
+    "hnsw_m": 16,
+    "k": 10,
+    "qps_at_recall_peak": 552.96,
+    "recall_at_k_peak": 0.00252,
+    "sweep": [
+      {
+        "ef_search": 10,
+        "qps": 1728.74,
+        "recall_at_k": 0.00077,
+        "latency_us_mean": 578.45,
+        "latency_us_p50": 289.68,
+        "latency_us_p95": 3289.95,
+        "latency_us_p99": 3385.54
+      },
+      {
+        "ef_search": 20,
+        "qps": 992.39,
+        "recall_at_k": 0.00141,
+        "latency_us_mean": 1007.67,
+        "latency_us_p50": 505.21,
+        "latency_us_p95": 3553.15,
+        "latency_us_p99": 3671.41
+      },
+      {
+        "ef_search": 40,
+        "qps": 552.96,
+        "recall_at_k": 0.00252,
+        "latency_us_mean": 1808.44,
+        "latency_us_p50": 948.55,
+        "latency_us_p95": 4035.95,
+        "latency_us_p99": 4176.14
+      }
+    ]
+  }
+}
