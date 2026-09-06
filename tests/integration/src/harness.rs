@@ -124,31 +124,19 @@ impl CoordinodeProcess {
     /// (StorageEngine::Drop is called during graceful shutdown). Falls back to
     /// SIGKILL after 10 s if the process does not exit on its own.
     pub async fn restart(mut self) -> Self {
-        // Send SIGTERM for graceful shutdown (allows StorageEngine::Drop to flush
-        // memtables to SST files).  We shell out to the system `kill` utility so
-        // we don't need the `nix` crate or any unsafe code.
-        let pid = self.child.id();
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "TERM", &pid.to_string()])
-            .status();
-
-        // Wait up to 10 s for graceful shutdown (memtable flush + file sync).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break, // exited cleanly — memtables flushed
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        // Graceful shutdown timed out — force kill.
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(_) => break,
-            }
+        // Graceful shutdown (SIGTERM lets StorageEngine::Drop flush memtables to
+        // SST files), 10 s grace for the flush + file sync, then SIGKILL. The
+        // wait MUST be async: the server drains open client connections before
+        // it exits, and the tonic channels this test dropped only close when
+        // the runtime gets to poll them. A blocking sleep here starves the
+        // current-thread runtime, the connections never close, the grace
+        // period expires and SIGKILL loses the unflushed memtable.
+        send_sigterm(&self.child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !has_exited(&mut self.child) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        force_reap(&mut self.child);
 
         // Take the TempDir out of self before self is dropped.
         // This means the Drop impl for this struct won't delete the directory.
@@ -269,37 +257,51 @@ impl CoordinodeProcess {
 
 impl Drop for CoordinodeProcess {
     fn drop(&mut self) {
-        // If the process already exited (e.g. after restart()), nothing to do.
-        if let Ok(Some(_)) = self.child.try_wait() {
-            return;
+        // Graceful shutdown first (SIGTERM so StorageEngine::Drop can flush
+        // memtables), SIGKILL after a 5 s grace. This is a synchronous
+        // destructor, so the poll blocks; the child is reaped on every path
+        // (see `force_reap`), so no coordinode process can outlive the test
+        // that spawned it.
+        if has_exited(&mut self.child) {
+            return; // restart() / restart_unclean() already reaped it
         }
-
-        // Best-effort graceful shutdown: send SIGTERM so StorageEngine::Drop
-        // can flush memtables.  We are in a synchronous destructor so we
-        // poll try_wait() instead of doing an async wait.
-        let pid = self.child.id();
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "TERM", &pid.to_string()])
-            .status();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(_) => break,
-            }
+        send_sigterm(&self.child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !has_exited(&mut self.child) {
+            std::thread::sleep(Duration::from_millis(50));
         }
+        force_reap(&mut self.child);
         // data_dir: Option<TempDir> is dropped here.
         // In the restart() path it's already None — no cleanup happens.
         // In the normal path it's Some — directory is cleaned up.
     }
+}
+
+/// SIGTERM via the system `kill` utility: no `nix` crate, no unsafe.
+fn send_sigterm(child: &Child) {
+    let _ = Command::new("kill")
+        .args(["-s", "TERM", &child.id().to_string()])
+        .status();
+}
+
+/// Non-blocking "has the child exited?" probe. A `try_wait` error (a transient
+/// `waitpid` failure) reads as "still running": the caller keeps polling and
+/// ends in [`force_reap`], so an error can never abandon a live process.
+fn has_exited(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)))
+}
+
+/// Make sure `child` is dead and reaped. A no-op for an already-exited child
+/// (`kill` on a reaped child is an error we ignore, `wait` returns the cached
+/// status); for a live one it is SIGKILL + `wait()`.
+///
+/// The child inherits the test's stdout/stderr, and nextest marks a test LEAKY
+/// when those pipes are still held open after the test exits, which is exactly
+/// what a coordinode process left alive would do. Every shutdown path in this
+/// harness therefore ends here, never in an early return with the child alive.
+fn force_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -361,16 +363,15 @@ fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
             std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
         );
 
-    // Place the child in its own process group (Unix only).
+    // Place the child in its own process group (Unix only), so a Ctrl-C /
+    // SIGINT delivered to the test runner's group is not fanned out to the
+    // server mid-flush; the harness owns the child's lifetime through
+    // `terminate_and_reap` (kill by PID, group-independent).
     //
-    // nextest marks a test LEAKY when processes in the test's process group
-    // are still alive after the test exits.  Under parallel test execution the
-    // coordinode shutdown window (SIGTERM → WAL flush → exit) can exceed the
-    // 5-second Drop deadline, leaving the process alive and triggering LEAKY.
-    //
-    // `process_group(0)` makes the spawned process the leader of a NEW group,
-    // so nextest's group-tracking never sees it.  The Drop impl kills it by PID
-    // directly, which is group-independent and still works correctly.
+    // Note this does NOT hide the child from nextest's leak detection, which
+    // is based on the inherited stdout/stderr pipes, not on process groups:
+    // the only thing that prevents a LEAKY verdict is actually reaping the
+    // child before the test exits, which the Drop impl guarantees.
     #[cfg(unix)]
     cmd.process_group(0);
 
