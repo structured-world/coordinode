@@ -1645,3 +1645,364 @@ fn apply_mutation_dispatches_to_partition() {
             .is_none()
     );
 }
+
+#[test]
+fn apply_proposal_at_stamps_every_mutation_with_the_commit_ts() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use std::sync::Arc;
+
+    // Oracle-backed engine: the commit timestamp IS the seqno. The whole
+    // proposal is visible at a snapshot one past commit_ts and absent one
+    // snapshot earlier, and the generator moves past commit_ts afterwards.
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1_000)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    let commit_ts = oracle.next().as_raw();
+
+    engine
+        .apply_proposal_at(
+            &[
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:0:1".to_vec(),
+                    value: b"alice".to_vec(),
+                },
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: b"adj:R:out:1".to_vec(),
+                    operand: crate::engine::merge::encode_add(2),
+                },
+                Mutation::Put {
+                    partition: PartitionId::Schema,
+                    key: b"schema:label:X".to_vec(),
+                    value: b"{}".to_vec(),
+                },
+            ],
+            commit_ts,
+        )
+        .expect("apply");
+
+    assert_eq!(
+        engine
+            .snapshot_get(&commit_ts, Partition::Node, b"node:0:1")
+            .expect("get"),
+        None,
+        "invisible one snapshot before commit_ts"
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&commit_ts, Partition::Adj, b"adj:R:out:1")
+            .expect("get"),
+        None
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&(commit_ts + 1), Partition::Node, b"node:0:1")
+            .expect("get")
+            .as_deref(),
+        Some(b"alice".as_ref())
+    );
+    assert!(
+        engine
+            .snapshot_get(&(commit_ts + 1), Partition::Adj, b"adj:R:out:1")
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        engine
+            .snapshot_get(&(commit_ts + 1), Partition::Schema, b"schema:label:X")
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        engine.current_seqno() > commit_ts,
+        "the generator is past the applied commit_ts"
+    );
+    assert!(
+        oracle.next().as_raw() > commit_ts,
+        "the oracle never re-issues an applied timestamp"
+    );
+}
+
+#[test]
+fn apply_proposal_at_follower_timestamp_advances_the_oracle() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use std::sync::Arc;
+
+    // A follower applies a leader's commit_ts that is ahead of its own oracle:
+    // the write lands at exactly that timestamp and the local oracle jumps
+    // past it, so this node cannot later allocate a timestamp that sorts
+    // below a version it already holds.
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(10)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+
+    let leader_ts = 5_000_000u64;
+    engine
+        .apply_proposal_at(
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:0:7".to_vec(),
+                value: b"from-leader".to_vec(),
+            }],
+            leader_ts,
+        )
+        .expect("apply");
+
+    assert_eq!(
+        engine
+            .snapshot_get(&leader_ts, Partition::Node, b"node:0:7")
+            .expect("get"),
+        None
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&(leader_ts + 1), Partition::Node, b"node:0:7")
+            .expect("get")
+            .as_deref(),
+        Some(b"from-leader".as_ref())
+    );
+    assert!(oracle.current().as_raw() >= leader_ts);
+}
+
+#[test]
+fn apply_proposal_at_without_oracle_allocates_a_fresh_seqno() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+
+    // An engine opened without an oracle has no relation between its seqnos
+    // and the caller's timestamps, so the proposal lands at a freshly
+    // allocated seqno (never below an existing version) and stays readable.
+    let (engine, _dir) = test_engine();
+    engine
+        .put(Partition::Node, b"node:0:3", b"older")
+        .expect("seed");
+    let stale_ts = 1u64;
+    engine
+        .apply_proposal_at(
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:0:3".to_vec(),
+                value: b"newer".to_vec(),
+            }],
+            stale_ts,
+        )
+        .expect("apply");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:3")
+            .expect("get")
+            .as_deref(),
+        Some(b"newer".as_ref()),
+        "a stale caller timestamp must not sort the write below the existing version"
+    );
+}
+
+#[test]
+fn apply_proposal_at_empty_proposal_is_a_no_op() {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use std::sync::Arc;
+
+    // Nothing to write: no seqno consumed, the oracle stays where it was, and
+    // the call succeeds (a read-only commit takes this path).
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(500)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    let before = oracle.current().as_raw();
+    engine
+        .apply_proposal_at(&[], 9_000_000)
+        .expect("empty proposal");
+    assert_eq!(oracle.current().as_raw(), before, "no timestamp consumed");
+}
+
+#[test]
+fn apply_proposal_at_out_of_order_commit_ts_land_at_their_own_seqnos() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use std::sync::Arc;
+
+    // Two concurrent commits allocate timestamps in one order and reach the
+    // engine in the other (T2 applied before T1 on different keys). Each
+    // write must still sit at exactly its own commit_ts: T1's key is invisible
+    // "as of T1 - 1" and visible "as of T1" even though T2 was already there.
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1_000)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+    let t1 = oracle.next().as_raw();
+    let t2 = oracle.next().as_raw();
+    assert!(t2 > t1);
+
+    let put = |key: &[u8]| Mutation::Put {
+        partition: PartitionId::Node,
+        key: key.to_vec(),
+        value: b"v".to_vec(),
+    };
+    engine
+        .apply_proposal_at(&[put(b"node:0:t2")], t2)
+        .expect("apply t2 first");
+    engine
+        .apply_proposal_at(&[put(b"node:0:t1")], t1)
+        .expect("apply t1 second");
+
+    // Snapshot at S sees seqnos strictly below S.
+    assert_eq!(
+        engine
+            .snapshot_get(&t1, Partition::Node, b"node:0:t1")
+            .expect("get"),
+        None
+    );
+    assert!(
+        engine
+            .snapshot_get(&(t1 + 1), Partition::Node, b"node:0:t1")
+            .expect("get")
+            .is_some(),
+        "t1's write sits at t1 although it was applied after t2"
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&(t1 + 1), Partition::Node, b"node:0:t2")
+            .expect("get"),
+        None,
+        "as of t1, t2's write does not exist yet"
+    );
+    assert!(
+        engine
+            .snapshot_get(&(t2 + 1), Partition::Node, b"node:0:t2")
+            .expect("get")
+            .is_some()
+    );
+}
+
+#[test]
+fn apply_proposal_at_range_delete_lands_at_the_commit_ts() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use std::sync::Arc;
+
+    // A coalesced bulk delete arrives as one RemoveRange mutation. It must be
+    // an MVCC range tombstone at exactly commit_ts: the keys are still there
+    // "as of commit_ts - 1" and gone "as of commit_ts", and a key outside the
+    // half-open range survives.
+    let dir = TempDir::new().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1_000)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+
+    let seed_ts = oracle.next().as_raw();
+    let puts: Vec<Mutation> = [
+        b"edgeprop:E:a",
+        b"edgeprop:E:b",
+        b"edgeprop:E:c",
+        b"edgeprop:E:d",
+    ]
+    .iter()
+    .map(|k| Mutation::Put {
+        partition: PartitionId::EdgeProp,
+        key: k.to_vec(),
+        value: b"p".to_vec(),
+    })
+    .collect();
+    engine.apply_proposal_at(&puts, seed_ts).expect("seed");
+
+    let del_ts = oracle.next().as_raw();
+    engine
+        .apply_proposal_at(
+            &[Mutation::RemoveRange {
+                partition: PartitionId::EdgeProp,
+                start: b"edgeprop:E:a".to_vec(),
+                end: b"edgeprop:E:d".to_vec(), // half-open: `d` survives
+            }],
+            del_ts,
+        )
+        .expect("range delete");
+
+    for k in [b"edgeprop:E:a".as_ref(), b"edgeprop:E:b", b"edgeprop:E:c"] {
+        assert!(
+            engine
+                .snapshot_get(&del_ts, Partition::EdgeProp, k)
+                .expect("get")
+                .is_some(),
+            "still present as of del_ts - 1"
+        );
+        assert_eq!(
+            engine
+                .snapshot_get(&(del_ts + 1), Partition::EdgeProp, k)
+                .expect("get"),
+            None,
+            "gone as of del_ts"
+        );
+    }
+    assert!(
+        engine
+            .snapshot_get(&(del_ts + 1), Partition::EdgeProp, b"edgeprop:E:d")
+            .expect("get")
+            .is_some(),
+        "the exclusive end of the range survives"
+    );
+}
+
+#[test]
+fn apply_proposal_at_rejects_mixed_operations_on_one_key() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+
+    // The transaction layer canonicalises each key to one final operation;
+    // a proposal that still carries two kinds on one key is an upstream bug
+    // and must fail loudly rather than pick an order.
+    let (engine, _dir) = test_engine();
+    let err = engine
+        .apply_proposal_at(
+            &[
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:0:5".to_vec(),
+                    value: b"x".to_vec(),
+                },
+                Mutation::Delete {
+                    partition: PartitionId::Node,
+                    key: b"node:0:5".to_vec(),
+                },
+            ],
+            0,
+        )
+        .expect_err("mixed kinds on one key");
+    assert!(matches!(
+        err,
+        crate::error::StorageError::Engine(lsm_tree::Error::MixedOperationBatch)
+    ));
+    assert_eq!(engine.get(Partition::Node, b"node:0:5").expect("get"), None);
+}

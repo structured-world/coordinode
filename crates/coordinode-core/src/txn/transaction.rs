@@ -50,6 +50,30 @@ pub struct WriteStats {
     pub labels_removed: u64,
 }
 
+/// What a successful commit of an interactive transaction hands back to the
+/// caller: the two anchors a host needs after the write is durable.
+///
+/// `commit_ts` is the HLC commit timestamp every mutation of the transaction
+/// was applied at (one seqno for the whole proposal). Because commit
+/// timestamps ARE storage sequence numbers, it is directly usable as a
+/// snapshot anchor (`AS OF TIMESTAMP commit_ts` sees this commit and nothing
+/// later) and as a change-stream position: a changed-keys scan from
+/// `commit_ts` includes this commit, a consumer that has processed it resumes
+/// from `commit_ts + 1`. A read-only transaction reports its pinned read
+/// timestamp: nothing was written, so "as of this point" is the only honest
+/// answer.
+///
+/// `applied_index` is the committed Raft log index in cluster mode, the causal
+/// `operationTime` token a client passes as `after_index` on later reads;
+/// `None` in embedded / single-node mode, where there is no Raft log to index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitReceipt {
+    /// HLC commit timestamp of the write, equal to its storage seqno.
+    pub commit_ts: Timestamp,
+    /// Committed Raft index (cluster mode) or `None` (embedded, no Raft log).
+    pub applied_index: Option<u64>,
+}
+
 /// A statement-level transaction that buffers writes for atomic commit.
 ///
 /// All mutations within a single OpenCypher statement are accumulated

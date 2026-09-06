@@ -257,14 +257,19 @@ fn parallel_commit_all_writes_visible() {
     let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
 
     let mut batch = WriteBatch::new(&engine);
-    // Spread 8 keys across Node and Schema (2 distinct partitions) to
-    // guarantee the parallel threshold of 16 total mutations is reached.
-    for i in 0..8u8 {
-        batch.put(Partition::Node, format!("node:{i}").into_bytes(), vec![i]);
+    // Spread the keys across Node and Schema (2 distinct partitions) so the
+    // parallel threshold is reached whatever its value.
+    let per_partition = PARALLEL_THRESHOLD / 2;
+    for i in 0..per_partition {
+        batch.put(
+            Partition::Node,
+            format!("node:{i}").into_bytes(),
+            i.to_le_bytes().to_vec(),
+        );
         batch.put(
             Partition::Schema,
             format!("schema:{i}").into_bytes(),
-            vec![i + 100],
+            (i + 100).to_le_bytes().to_vec(),
         );
     }
     assert!(
@@ -274,18 +279,18 @@ fn parallel_commit_all_writes_visible() {
     batch.commit().expect("parallel commit failed");
 
     // Verify every key is visible with the correct value.
-    for i in 0..8u8 {
+    for i in 0..per_partition {
         let v = engine
             .get(Partition::Node, format!("node:{i}").as_bytes())
             .expect("get node")
             .expect("node should exist");
-        assert_eq!(&*v, &[i], "wrong value for node:{i}");
+        assert_eq!(&*v, &i.to_le_bytes(), "wrong value for node:{i}");
 
         let v = engine
             .get(Partition::Schema, format!("schema:{i}").as_bytes())
             .expect("get schema")
             .expect("schema should exist");
-        assert_eq!(&*v, &[i + 100], "wrong value for schema:{i}");
+        assert_eq!(&*v, &(i + 100).to_le_bytes(), "wrong value for schema:{i}");
     }
 }
 
@@ -300,20 +305,21 @@ fn parallel_commit_delete_and_merge() {
     let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
 
     // Pre-populate keys that will be deleted/merged via the parallel path.
-    for i in 0..8u8 {
+    let per_partition = PARALLEL_THRESHOLD / 2;
+    for i in 0..per_partition {
         engine
             .put(Partition::Node, format!("del:{i}").as_bytes(), b"old")
             .expect("pre-put");
     }
 
     let mut batch = WriteBatch::new(&engine);
-    // 8 Deletes on Node + 8 Merges on Adj = 16 mutations, 2 partitions → parallel path.
-    for i in 0..8u8 {
+    // Deletes on Node + Merges on Adj, 2 partitions, at the threshold → parallel path.
+    for i in 0..per_partition {
         batch.delete(Partition::Node, format!("del:{i}").into_bytes());
         batch.merge(
             Partition::Adj,
             format!("adj:{i}").into_bytes(),
-            encode_add(u64::from(i)),
+            encode_add(i as u64),
         );
     }
     assert!(
@@ -323,7 +329,7 @@ fn parallel_commit_delete_and_merge() {
     batch.commit().expect("parallel delete+merge failed");
 
     // All deleted keys must be gone.
-    for i in 0..8u8 {
+    for i in 0..per_partition {
         assert!(
             engine
                 .get(Partition::Node, format!("del:{i}").as_bytes())
@@ -334,36 +340,41 @@ fn parallel_commit_delete_and_merge() {
     }
 
     // All adj merge results must be visible.
-    for i in 0..8u8 {
+    for i in 0..per_partition {
         let data = engine
             .get(Partition::Adj, format!("adj:{i}").as_bytes())
             .expect("get adj")
             .expect("adj should exist");
         let plist = PostingList::from_bytes(&data).expect("decode posting list");
-        assert_eq!(plist.as_slice(), &[u64::from(i)]);
+        assert_eq!(plist.as_slice(), &[i as u64]);
     }
 }
 
-/// 16 mutations but all on one partition → serial path (no parallel benefit).
-/// Ensures the single-partition gate works and results are still correct.
+/// PARALLEL_THRESHOLD mutations but all on one partition → serial path (no
+/// parallel benefit). Ensures the single-partition gate works and results are
+/// still correct.
 #[test]
 fn single_partition_large_batch_uses_serial_path() {
     let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
 
     let mut batch = WriteBatch::new(&engine);
-    for i in 0..16u8 {
-        batch.put(Partition::Node, format!("k:{i}").into_bytes(), vec![i]);
+    for i in 0..PARALLEL_THRESHOLD {
+        batch.put(
+            Partition::Node,
+            format!("k:{i}").into_bytes(),
+            i.to_le_bytes().to_vec(),
+        );
     }
     // Same batch size as PARALLEL_THRESHOLD but only one partition.
     assert_eq!(batch.len(), PARALLEL_THRESHOLD);
     batch.commit().expect("large single-partition batch failed");
 
-    for i in 0..16u8 {
+    for i in 0..PARALLEL_THRESHOLD {
         let v = engine
             .get(Partition::Node, format!("k:{i}").as_bytes())
             .expect("get")
             .expect("should exist");
-        assert_eq!(&*v, &[i]);
+        assert_eq!(&*v, &i.to_le_bytes());
     }
 }
 
@@ -445,4 +456,191 @@ fn batch_merge_mixed_put_and_merge() {
         .expect("should exist");
     let plist = PostingList::from_bytes(&data).expect("decode");
     assert_eq!(plist.as_slice(), &[50, 60]);
+}
+
+#[test]
+fn commit_at_lands_every_mutation_at_the_given_seqno() {
+    // Every mutation of the batch is visible at a snapshot one past the
+    // batch seqno and none of them one snapshot earlier: the batch is
+    // atomic for MVCC readers. (A storage snapshot at S sees seqnos < S.)
+    use crate::engine::merge::encode_add;
+    use coordinode_core::graph::edge::PostingList;
+
+    let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+    engine
+        .put(Partition::Node, b"node:0:9", b"old")
+        .expect("seed");
+    let seqno = engine.next_seqno();
+
+    let mut batch = WriteBatch::new(&engine);
+    batch.put(Partition::Node, b"node:0:1", b"a".to_vec());
+    batch.put(Partition::Schema, b"schema:x", b"b".to_vec());
+    batch.delete(Partition::Node, b"node:0:9".to_vec());
+    batch.merge(Partition::Adj, b"adj:R:out:1".to_vec(), encode_add(7));
+    batch.commit_at(seqno).expect("commit_at");
+
+    let before = seqno;
+    let after = seqno + 1;
+    assert_eq!(
+        engine
+            .snapshot_get(&before, Partition::Node, b"node:0:1")
+            .expect("get"),
+        None
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&before, Partition::Schema, b"schema:x")
+            .expect("get"),
+        None
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&before, Partition::Node, b"node:0:9")
+            .expect("get")
+            .as_deref(),
+        Some(b"old".as_slice()),
+        "the delete is not visible before the batch seqno"
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&after, Partition::Node, b"node:0:1")
+            .expect("get")
+            .as_deref(),
+        Some(b"a".as_slice())
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&after, Partition::Schema, b"schema:x")
+            .expect("get")
+            .as_deref(),
+        Some(b"b".as_slice())
+    );
+    assert_eq!(
+        engine
+            .snapshot_get(&after, Partition::Node, b"node:0:9")
+            .expect("get"),
+        None,
+        "the delete is visible at the batch seqno"
+    );
+    let adj = engine
+        .snapshot_get(&after, Partition::Adj, b"adj:R:out:1")
+        .expect("get")
+        .expect("posting list");
+    assert_eq!(
+        PostingList::from_bytes(&adj).expect("decode").as_slice(),
+        &[7]
+    );
+}
+
+#[test]
+fn commit_at_parallel_path_is_atomic_at_the_seqno() {
+    // Above PARALLEL_THRESHOLD across several partitions the groups are
+    // applied on rayon threads; the batch must still be one seqno for every
+    // partition: nothing visible one snapshot early, everything visible one
+    // snapshot late, on every partition. Guards the parallel branch now that
+    // the threshold is high enough that small tests never reach it.
+    let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+    let parts = [
+        Partition::Node,
+        Partition::Adj,
+        Partition::Schema,
+        Partition::Idx,
+    ];
+    let per_partition = PARALLEL_THRESHOLD / parts.len() + 1;
+    let seqno = engine.next_seqno();
+
+    let mut batch = WriteBatch::new(&engine);
+    for (p, part) in parts.iter().enumerate() {
+        for i in 0..per_partition {
+            batch.put(*part, format!("{p}:{i}").into_bytes(), b"v".to_vec());
+        }
+    }
+    assert!(
+        batch.len() >= PARALLEL_THRESHOLD,
+        "must take the rayon path"
+    );
+    batch.commit_at(seqno).expect("commit_at");
+
+    for (p, part) in parts.iter().enumerate() {
+        for i in [0, per_partition / 2, per_partition - 1] {
+            let key = format!("{p}:{i}").into_bytes();
+            assert_eq!(
+                engine.snapshot_get(&seqno, *part, &key).expect("get"),
+                None,
+                "{}:{i} invisible before the batch seqno",
+                part.name()
+            );
+            assert!(
+                engine
+                    .snapshot_get(&(seqno + 1), *part, &key)
+                    .expect("get")
+                    .is_some(),
+                "{}:{i} visible at the batch seqno",
+                part.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn commit_at_rejects_two_operation_kinds_on_one_key() {
+    // A put and a delete of the same key at one seqno have no defined order;
+    // the tree refuses the batch instead of picking one silently, and nothing
+    // from the batch lands.
+    let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+    let seqno = engine.next_seqno();
+
+    let mut batch = WriteBatch::new(&engine);
+    batch.put(Partition::Node, b"node:0:1", b"a".to_vec());
+    batch.put(Partition::Node, b"node:0:2", b"b".to_vec());
+    batch.delete(Partition::Node, b"node:0:2".to_vec());
+    let err = batch
+        .commit_at(seqno)
+        .expect_err("mixed operation kinds on one key must be rejected");
+    assert!(
+        matches!(
+            err,
+            crate::error::StorageError::Engine(lsm_tree::Error::MixedOperationBatch)
+        ),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        engine.get(Partition::Node, b"node:0:1").expect("get"),
+        None,
+        "a rejected batch lands nothing"
+    );
+}
+
+#[test]
+fn commit_at_repeated_merges_on_one_key_all_resolve() {
+    // Several merge operands on the same key inside one batch are the normal
+    // shape of an adjacency write (one operand per removed uid); all of them
+    // resolve at the batch seqno.
+    use crate::engine::merge::{encode_add, encode_add_batch, encode_remove};
+    use coordinode_core::graph::edge::PostingList;
+
+    let (engine, _dir) = test_engine_with_policy(FlushPolicy::Manual);
+    engine
+        .merge(
+            Partition::Adj,
+            b"adj:R:out:1",
+            &encode_add_batch(&[1, 2, 3, 4]),
+        )
+        .expect("seed");
+    let seqno = engine.next_seqno();
+
+    let mut batch = WriteBatch::new(&engine);
+    batch.merge(Partition::Adj, b"adj:R:out:1".to_vec(), encode_remove(2));
+    batch.merge(Partition::Adj, b"adj:R:out:1".to_vec(), encode_remove(4));
+    batch.merge(Partition::Adj, b"adj:R:out:1".to_vec(), encode_add(9));
+    batch.commit_at(seqno).expect("commit_at");
+
+    let adj = engine
+        .snapshot_get(&(seqno + 1), Partition::Adj, b"adj:R:out:1")
+        .expect("get")
+        .expect("posting list");
+    assert_eq!(
+        PostingList::from_bytes(&adj).expect("decode").as_slice(),
+        &[1, 3, 9]
+    );
 }

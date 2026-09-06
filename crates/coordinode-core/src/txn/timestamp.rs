@@ -64,7 +64,7 @@ impl Timestamp {
     pub const MAX: Self = Self(u64::MAX);
 
     /// Create a timestamp from a raw u64 value.
-    pub fn from_raw(raw: u64) -> Self {
+    pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 

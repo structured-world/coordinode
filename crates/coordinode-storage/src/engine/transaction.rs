@@ -1033,8 +1033,9 @@ impl<'a> Transaction<'a> {
         //
         // When no pipeline is configured (legacy/test mode), mutations are
         // written directly to the engine.
-        let mut applied_index: Option<u64> = None;
-        if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
+        // One mutation list for both application paths below: proposed
+        // through the pipeline, or applied directly at commit_ts.
+        let mutations: Vec<Mutation> = {
             let mut mutations: Vec<Mutation> = wb
                 .drain()
                 .map(|((part, key), value)| match value {
@@ -1086,11 +1087,14 @@ impl<'a> Transaction<'a> {
             // proposing (G096): a bulk delete ("delete all relationships between
             // these nodes", DROP) replicates + PITR-logs as a few range ops
             // instead of N point tombstones. Non-deletes / short runs untouched.
-            let mutations = coordinode_core::txn::coalesce::coalesce_delete_mutations(
+            coordinode_core::txn::coalesce::coalesce_delete_mutations(
                 mutations,
                 coordinode_core::txn::coalesce::DEFAULT_MIN_RUN,
-            );
+            )
+        };
 
+        let mut applied_index: Option<u64> = None;
+        if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
             let proposal = RaftProposal {
                 id: id_gen.next(),
                 mutations,
@@ -1124,32 +1128,10 @@ impl<'a> Transaction<'a> {
             // local/embedded mode (no Raft log).
             applied_index = outcome.applied_index;
         } else {
-            // Legacy direct-write path (no pipeline configured).
-            // ADR-016: plain engine.put()/delete() — oracle auto-stamps seqno.
-            for ((part, key), value) in wb.drain() {
-                match value {
-                    Some(v) => self.engine.put(part, &key, &v)?,
-                    None => self.engine.delete(part, &key)?,
-                }
-            }
-            // Apply adj merge operands directly to StorageEngine (raw keys).
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))?;
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                self.engine.merge(Partition::Node, &key, &operand)?;
-            }
-            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
-                self.engine
-                    .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
-            }
+            // Direct-write path (no pipeline configured): the same single-seqno
+            // apply the pipelines perform, at this transaction's commit_ts.
+            self.engine
+                .apply_proposal_at(&mutations, commit_ts.as_raw())?;
         }
 
         // Journal gate (j:true): force WAL fsync after commit.

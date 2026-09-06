@@ -441,6 +441,8 @@ RETURN u.name, u.balance
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 ```
 
+The bound is inclusive: `AS OF TIMESTAMP T` sees every transaction with `commit_ts <= T` and nothing committed later. Every mutation of a transaction is applied at its single commit timestamp, so a read never observes a partially applied transaction. The `commit_ts` returned by an interactive transaction's commit receipt (embedded `CommitReceipt`, gRPC `CommitTransactionResponse`) is therefore the exact anchor for its own write: `AS OF TIMESTAMP <commit_ts>` sees it, `<commit_ts> - 1` does not. An integer literal is the raw HLC value in microseconds; negative literals are rejected.
+
 ---
 
 ### Query Advisor

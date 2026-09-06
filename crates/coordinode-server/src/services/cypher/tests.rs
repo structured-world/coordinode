@@ -149,11 +149,15 @@ async fn grpc_interactive_transaction_commit() {
         .into_inner();
     assert_eq!(before.rows.len(), 0, "uncommitted write invisible");
 
-    svc.commit_transaction(Request::new(query::CommitTransactionRequest {
-        transaction_id: tx,
-    }))
-    .await
-    .expect("commit");
+    let receipt = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+        }))
+        .await
+        .expect("commit")
+        .into_inner();
+    assert_eq!(receipt.applied_index, 0, "no Raft log in the test service");
+    assert!(receipt.commit_ts > 0, "commit_ts is a real HLC value");
 
     let after = svc
         .execute_cypher(cypher_request("MATCH (n:TxNode) RETURN n"))
@@ -161,6 +165,43 @@ async fn grpc_interactive_transaction_commit() {
         .expect("read after")
         .into_inner();
     assert_eq!(after.rows.len(), 1, "committed write visible");
+
+    // The receipt's commit_ts is the exact snapshot anchor of the write over
+    // the wire too: a SNAPSHOT read pinned AT commit_ts sees it, one pinned
+    // one tick earlier does not.
+    let pinned = |at_timestamp: u64| {
+        Request::new(query::ExecuteCypherRequest {
+            query: "MATCH (n:TxNode) RETURN n".to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 4, // SNAPSHOT
+                after_index: 0,
+                at_timestamp,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+        })
+    };
+    let at_commit = svc
+        .execute_cypher(pinned(receipt.commit_ts))
+        .await
+        .expect("snapshot read at commit_ts")
+        .into_inner();
+    assert_eq!(
+        at_commit.rows.len(),
+        1,
+        "at_timestamp = commit_ts sees the commit"
+    );
+    let before_commit = svc
+        .execute_cypher(pinned(receipt.commit_ts - 1))
+        .await
+        .expect("snapshot read before commit_ts")
+        .into_inner();
+    assert!(
+        before_commit.rows.is_empty(),
+        "at_timestamp = commit_ts - 1 does not see the commit"
+    );
 }
 
 /// gRPC interactive transaction rollback discards the buffered write and
@@ -1283,6 +1324,34 @@ async fn grpc_at_timestamp_snapshot_pins_to_past_returns_empty() {
         "snapshot at ts=1 (pre-history) must return empty, got {} rows",
         resp.rows.len()
     );
+}
+
+/// SNAPSHOT read pinned at `u64::MAX` sees everything ever committed: the
+/// inclusive pin saturates at the top instead of wrapping to an empty past.
+#[tokio::test]
+async fn grpc_at_timestamp_max_sees_latest() {
+    let (svc, _dir) = test_service();
+    svc.execute_cypher(cypher_request("CREATE (n:Top {id: 1})"))
+        .await
+        .expect("create");
+
+    let resp = svc
+        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            query: "MATCH (n:Top) RETURN n.id".to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 4, // SNAPSHOT
+                after_index: 0,
+                at_timestamp: u64::MAX,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+        }))
+        .await
+        .expect("snapshot read at u64::MAX")
+        .into_inner();
+    assert_eq!(resp.rows.len(), 1, "the top snapshot sees the latest write");
 }
 
 /// SNAPSHOT read without `at_timestamp` (omitted / 0) falls back to the

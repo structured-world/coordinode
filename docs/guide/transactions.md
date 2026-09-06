@@ -41,17 +41,33 @@ The retry is transparent for single-statement writes via the REST/gRPC API.
 
 Multi-statement explicit transactions are available via the **embedded API** (`coordinode-embed`) and via **gRPC** (native clients). A dedicated REST transaction endpoint is not yet implemented.
 
+Every statement reads the snapshot pinned when the transaction began (repeatable read), sees its own uncommitted writes, and buffers them until commit. Commit validates the write set against concurrent committers (first committer wins), assigns one commit timestamp, and applies every buffered mutation as a single atomic proposal at exactly that timestamp: a snapshot read at the commit timestamp sees the whole transaction, a read one tick earlier sees none of it, in embedded and cluster mode alike. Rollback discards the buffer; nothing was durable, so there is nothing to undo.
+
 For the embedded API:
 
 ```rust
-// Each execute_cypher call runs in its own auto-committed transaction.
-// For multi-statement atomicity, use the batch Cypher approach:
-db.execute_cypher("
-  CREATE (alice:Person {name: 'Alice'})
-  CREATE (bob:Person {name: 'Bob'})
-  CREATE (alice)-[:KNOWS]->(bob)
-")?;
+let tx = db.begin_transaction();
+db.execute_in_transaction(tx, "CREATE (alice:Person {name: 'Alice'})", None)?;
+db.execute_in_transaction(tx, "CREATE (bob:Person {name: 'Bob'})", None)?;
+db.execute_in_transaction(
+    tx,
+    "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    None,
+)?;
+let receipt = db.commit_transaction(tx)?;
+// receipt.commit_ts: the HLC commit timestamp every write of this
+// transaction landed at. Because commit timestamps are storage sequence
+// numbers, it is the snapshot anchor for `AS OF TIMESTAMP <commit_ts>` (sees
+// this commit and nothing later) and a change-stream position: a changed-keys
+// scan from `commit_ts` includes this commit, a consumer that has processed
+// it resumes from `commit_ts + 1`.
+// receipt.applied_index: the committed Raft index in cluster mode, `None`
+// embedded (there is no Raft log to index).
 ```
+
+A statement error aborts the transaction; later statements and the commit fail with an unknown-transaction error, and the client restarts from `begin_transaction`. Idle transactions are rolled back after `interactive_idle_timeout` (default 30 s) and buffered writes are capped by `max_interactive_txn_bytes` (default 256 MiB) because an open transaction pins an MVCC snapshot and leader memory.
+
+Over gRPC the same receipt is `CommitTransactionResponse { applied_index, commit_ts }`, and the multiplexed session stream acknowledges a commit with `Committed { applied_index, commit_ts }`. Pass `commit_ts` as `ReadConcern.at_timestamp` (level `SNAPSHOT`) to read exactly the state this commit produced.
 
 ## Time-Travel Queries
 

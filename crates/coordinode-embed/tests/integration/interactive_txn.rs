@@ -279,3 +279,183 @@ fn reading_what_another_transaction_writes_is_not_a_conflict() {
         .expect("read back");
     assert_eq!(rows.len(), 1);
 }
+
+/// Count the `Anchor` nodes visible at snapshot `ts` (`AS OF TIMESTAMP` takes
+/// the raw HLC value directly: commit timestamps are storage seqnos).
+fn anchors_as_of(db: &mut Database, ts: u64) -> usize {
+    db.execute_cypher(&format!("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP {ts}"))
+        .expect("as-of read")
+        .len()
+}
+
+#[test]
+fn commit_receipt_is_the_snapshot_boundary_of_the_write() {
+    // The receipt's commit_ts must be exactly the seqno the mutations landed
+    // at: a snapshot AT commit_ts sees the write, a snapshot ONE TICK BEFORE
+    // does not. Both directions are asserted so an off-by-one in either the
+    // receipt or the snapshot inclusivity fails loudly instead of passing as
+    // "some timestamp near the commit".
+    let mut db = open_db();
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 1})", None)
+        .expect("create");
+    let receipt = db.commit_transaction(tx).expect("commit");
+    let ts = receipt.commit_ts.as_raw();
+
+    assert!(ts > 0, "commit_ts is a real HLC value, never zero");
+    assert_eq!(
+        anchors_as_of(&mut db, ts),
+        1,
+        "snapshot AT commit_ts sees the write"
+    );
+    assert_eq!(
+        anchors_as_of(&mut db, ts - 1),
+        0,
+        "snapshot one tick before commit_ts does not see the write"
+    );
+}
+
+#[test]
+fn as_of_timestamp_rejects_a_negative_literal() {
+    // The snapshot seqno is unsigned; a negative literal would wrap to a huge
+    // value and silently read "everything". It must be rejected as an error,
+    // and the rejection must not disturb committed data.
+    let mut db = open_db();
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 11})", None)
+        .expect("create");
+    db.commit_transaction(tx).expect("commit");
+
+    let err = db
+        .execute_cypher("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP -1")
+        .expect_err("a negative AS OF TIMESTAMP is out of range");
+    assert!(
+        err.to_string().contains("out of range"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        db.execute_cypher("MATCH (n:Anchor) RETURN n")
+            .expect("read")
+            .len(),
+        1,
+        "the rejected read leaves committed data untouched"
+    );
+}
+
+#[test]
+fn commit_receipt_has_no_raft_index_in_embedded_mode() {
+    // Embedded mode has no Raft log, so the receipt says so with `None`
+    // rather than a fake 0 the host could mistake for a real index.
+    let db = open_db();
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 2})", None)
+        .expect("create");
+    let receipt = db.commit_transaction(tx).expect("commit");
+    assert_eq!(receipt.applied_index, None);
+}
+
+#[test]
+fn commit_receipt_anchors_a_changed_keys_cursor() {
+    use coordinode_storage::engine::partition::Partition;
+
+    // A change consumer positions itself with the receipt: a changed-keys
+    // scan from commit_ts includes this commit (the scan is inclusive, pairing
+    // with snapshots that see strictly below their seqno), and a consumer
+    // that has processed it resumes from commit_ts + 1, which yields nothing.
+    // This is the contract a polling CDC dispatcher builds on.
+    let db = open_db();
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 3})", None)
+        .expect("create");
+    let receipt = db.commit_transaction(tx).expect("commit");
+    let ts = receipt.commit_ts.as_raw();
+
+    let including = db
+        .engine()
+        .changed_keys_since(Partition::Node, ts)
+        .expect("scan from commit_ts");
+    assert!(
+        !including.is_empty(),
+        "a scan from commit_ts replays the committed node"
+    );
+    let after = db
+        .engine()
+        .changed_keys_since(Partition::Node, ts + 1)
+        .expect("scan after");
+    assert!(
+        after.is_empty(),
+        "nothing in the node partition changed after the commit"
+    );
+}
+
+#[test]
+fn commit_receipts_are_monotonic_across_commits() {
+    // Two sequential commits get strictly increasing commit timestamps: a
+    // cursor built from the later receipt never replays the earlier commit.
+    let mut db = open_db();
+    let first = db.begin_transaction();
+    db.execute_in_transaction(first, "CREATE (n:Anchor {id: 4})", None)
+        .expect("create 1");
+    let r1 = db.commit_transaction(first).expect("commit 1");
+
+    let second = db.begin_transaction();
+    db.execute_in_transaction(second, "CREATE (n:Anchor {id: 5})", None)
+        .expect("create 2");
+    let r2 = db.commit_transaction(second).expect("commit 2");
+
+    assert!(r2.commit_ts > r1.commit_ts, "later commit, later timestamp");
+    assert_eq!(anchors_as_of(&mut db, r1.commit_ts.as_raw()), 1);
+    assert_eq!(anchors_as_of(&mut db, r2.commit_ts.as_raw()), 2);
+}
+
+#[test]
+fn read_only_commit_reports_its_pinned_snapshot() {
+    // A transaction that wrote nothing still returns a receipt: its pinned
+    // read timestamp, so a host can use it as an "as of this point" anchor.
+    // It must not be later than the engine's current seqno (it was allocated
+    // at begin) and must not be zero.
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Anchor {id: 6})")
+        .expect("seed");
+    let tx = db.begin_transaction();
+    let rows = db
+        .execute_in_transaction(tx, "MATCH (n:Anchor) RETURN n", None)
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+    let receipt = db.commit_transaction(tx).expect("read-only commit");
+    let ts = receipt.commit_ts.as_raw();
+    assert!(ts > 0);
+    assert!(
+        ts <= db.engine().current_seqno(),
+        "pinned at begin, never in the future"
+    );
+    assert_eq!(receipt.applied_index, None, "nothing was proposed");
+}
+
+#[test]
+fn rollback_yields_no_receipt_and_no_change_to_scan_from() {
+    // Rollback returns unit, not a receipt: there is no timestamp to anchor
+    // on because nothing became durable. A cursor taken before the rolled-back
+    // transaction stays empty for the node partition.
+    use coordinode_storage::engine::partition::Partition;
+
+    let db = open_db();
+    let before = db.engine().current_seqno();
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Anchor {id: 7})", None)
+        .expect("create");
+    db.rollback_transaction(tx).expect("rollback");
+
+    let changed = db
+        .engine()
+        .changed_keys_since(Partition::Node, before)
+        .expect("scan");
+    assert!(
+        changed.is_empty(),
+        "a rolled-back write never reaches storage"
+    );
+    assert!(
+        db.commit_transaction(tx).is_err(),
+        "handle consumed by rollback"
+    );
+}

@@ -24,7 +24,7 @@ use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
 use crate::engine::flush::FlushManager;
 use crate::engine::oplog_journal::{
-    EmbeddedOplog, OplogJournalConfig, apply_oplog_op, op_partition,
+    EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
 };
 use crate::engine::partition::Partition;
 use crate::engine::routing::PartitionRouting;
@@ -476,6 +476,13 @@ impl StorageEngine {
                     let entries = journal.read_all()?;
                     let mut replayed = 0usize;
                     for entry in &entries {
+                        // Group the entry's data ops per partition so each
+                        // partition receives them as ONE batch at the entry's
+                        // ts: the watermark test below is per partition, and
+                        // the batch apply cannot straddle a memtable rotation,
+                        // so a partition either holds the whole entry or none
+                        // of it (the invariant `is_durable` relies on).
+                        let mut per_partition: HashMap<Partition, Vec<&OplogOp>> = HashMap::new();
                         for op in &entry.ops {
                             #[cfg(feature = "columnar")]
                             if let OplogOp::ColumnarInsert {
@@ -495,14 +502,17 @@ impl StorageEngine {
                             let Some(part) = op_partition(op) else {
                                 continue;
                             };
+                            per_partition.entry(part).or_default().push(op);
+                        }
+                        for (part, ops) in per_partition {
                             let tree = trees.get(&part).ok_or_else(|| {
                                 StorageError::PartitionNotFound {
                                     name: part.name().to_string(),
                                 }
                             })?;
                             if entry.ts > tree.get_highest_seqno().unwrap_or(0) {
-                                apply_oplog_op(tree, op, entry.ts);
-                                replayed += 1;
+                                apply_oplog_ops_at(tree, &ops, entry.ts)?;
+                                replayed += ops.len();
                             }
                         }
                     }
@@ -1610,6 +1620,68 @@ impl StorageEngine {
         }
     }
 
+    /// Apply every mutation of one committed proposal at a single seqno: its
+    /// commit timestamp (ADR-016, `seqno == commit_ts`). This is the one write
+    /// path for a transaction's commit in every deployment mode: the embedded
+    /// pipeline, the Raft state machine applying a replicated entry, and the
+    /// direct no-pipeline commit all land here, so a snapshot read at
+    /// `commit_ts` sees the whole transaction and a read at `commit_ts - 1`
+    /// sees none of it.
+    ///
+    /// `commit_ts` is honoured verbatim on an oracle-backed engine
+    /// ([`StorageEngine::open_with_oracle`] and the embedded variants): its
+    /// seqno generator IS the oracle the timestamp was allocated from, and the
+    /// generator is advanced to `commit_ts` afterwards so a follower applying
+    /// a leader's timestamp never hands out an older one. An engine opened
+    /// without an oracle has no relation between its seqnos and the caller's
+    /// timestamps, so it allocates a fresh seqno for the batch instead; the
+    /// zero timestamp (the "no timestamp" sentinel) does the same.
+    ///
+    /// # Errors
+    ///
+    /// A full endpoint rejects the whole proposal before any mutation lands.
+    /// Two different operation kinds on one key inside a single proposal are
+    /// rejected by the tree (`MixedOperationBatch`): the transaction layer
+    /// canonicalises each key to one final operation, so this marks an
+    /// upstream bug rather than silently ordering the pair.
+    pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::with_capacity(self, mutations.len());
+        for mutation in mutations {
+            match mutation {
+                Mutation::Put {
+                    partition,
+                    key,
+                    value,
+                } => batch.put(Partition::from(*partition), key.clone(), value.clone()),
+                Mutation::Delete { partition, key } => {
+                    batch.delete(Partition::from(*partition), key.clone());
+                }
+                Mutation::Merge {
+                    partition,
+                    key,
+                    operand,
+                } => batch.merge(Partition::from(*partition), key.clone(), operand.clone()),
+                Mutation::RemoveRange {
+                    partition,
+                    start,
+                    end,
+                } => batch.remove_range(Partition::from(*partition), start.clone(), end.clone()),
+            }
+        }
+        let seqno = match (&self.oracle, commit_ts) {
+            (Some(_), ts) if ts > 0 => ts,
+            _ => self.next_seqno(),
+        };
+        batch.commit_at(seqno)?;
+        if let Some(oracle) = &self.oracle {
+            oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(seqno));
+        }
+        Ok(())
+    }
+
     /// Bulk-delete all keys in a range by dropping entire LSM tables.
     ///
     /// This is a table-level operation — far more efficient than individual
@@ -1918,10 +1990,14 @@ impl StorageEngine {
         Ok(Box::new(tree.prefix(prefix, seqno, None).rev()))
     }
 
-    /// Keys touched (written, merged, or deleted) strictly after
-    /// `since_seqno`, deduplicated and sorted. The O(delta) basis for
-    /// incremental snapshots: the lsm-tree surfaces only the keys whose
-    /// version history advanced past `since_seqno`, instead of scanning the
+    /// Keys touched (written, merged, or deleted) at or after `since_seqno`
+    /// (inclusive), deduplicated and sorted. Inclusive pairs with the snapshot
+    /// convention (a snapshot at `S` sees versions strictly below `S`): the
+    /// seqno a snapshot or cursor was taken at is exactly the first one it has
+    /// not seen, so resuming from it misses nothing; a consumer that has
+    /// processed a commit landed at `T` resumes from `T + 1`. The O(delta)
+    /// basis for incremental snapshots: the lsm-tree surfaces only the keys
+    /// whose version history reached `since_seqno`, instead of scanning the
     /// whole partition twice and diffing.
     ///
     /// Values are intentionally NOT returned — the caller re-reads the merged

@@ -1,6 +1,6 @@
 use super::*;
 use crate::cluster::RaftNode;
-use coordinode_core::txn::proposal::ProposalIdGenerator;
+use coordinode_core::txn::proposal::{Mutation, ProposalIdGenerator};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use tempfile::TempDir;

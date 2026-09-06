@@ -1640,12 +1640,19 @@ impl Database {
     }
 
     /// Commit an interactive transaction (ADR-042): validate the accumulated
-    /// OCC read-set, assign `commit_ts`, and persist every buffered mutation
-    /// in a single proposal. The handle is consumed (removed from the
-    /// registry) whether commit succeeds or fails; on `ErrConflict` the client
-    /// retries the whole transaction from `begin`. Returns the committed Raft
-    /// index (the causal `operationTime` token; 0 in embedded mode).
-    pub fn commit_transaction(&self, txn_id: u64) -> Result<u64, DatabaseError> {
+    /// write set, assign `commit_ts`, and persist every buffered mutation in a
+    /// single proposal. The handle is consumed (removed from the registry)
+    /// whether commit succeeds or fails; on a write conflict the client
+    /// retries the whole transaction from `begin`. Returns the
+    /// [`CommitReceipt`](coordinode_core::txn::transaction::CommitReceipt):
+    /// `commit_ts` (the HLC commit timestamp every mutation landed at: the
+    /// `AS OF TIMESTAMP` anchor for this write, and a changed-keys scan from it
+    /// includes this commit) plus the committed Raft index in cluster mode
+    /// (`None` in embedded mode, where there is no Raft log).
+    pub fn commit_transaction(
+        &self,
+        txn_id: u64,
+    ) -> Result<coordinode_core::txn::transaction::CommitReceipt, DatabaseError> {
         let state = self
             .interactive_txns
             .lock()
@@ -1690,7 +1697,20 @@ impl Database {
             // Retryable at a different address: the leader.
             CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
         })?;
-        Ok(outcome.applied_index.unwrap_or(0))
+        // An interactive transaction is always opened against the oracle
+        // (`begin_transaction`), so the storage commit is never on the legacy
+        // no-oracle path and always carries a commit timestamp. A missing one
+        // is an engine invariant violation, surfaced as an error rather than
+        // a made-up timestamp the host would then trust as a cursor.
+        let commit_ts = outcome.commit_ts.ok_or_else(|| {
+            DatabaseError::Other(format!(
+                "transaction {txn_id} committed without a commit timestamp"
+            ))
+        })?;
+        Ok(coordinode_core::txn::transaction::CommitReceipt {
+            commit_ts,
+            applied_index: outcome.applied_index,
+        })
     }
 
     /// Roll back an interactive transaction (ADR-042): discard all buffered
@@ -2144,7 +2164,14 @@ impl Database {
                 // session (Database.snapshot_read_ts was taken when
                 // the session was built).
                 if let Some(ts) = session.snapshot_read_ts {
-                    Timestamp::from_raw(ts)
+                    // `at_timestamp = T` is inclusive, like `AS OF TIMESTAMP
+                    // T`: it sees every commit with commit_ts <= T, so a
+                    // commit receipt's commit_ts pins its own write. A storage
+                    // snapshot at S sees seqnos strictly below S, hence T + 1.
+                    // Saturating by design: at u64::MAX there is nothing above
+                    // to include, so the top snapshot is the right bound, not
+                    // an overflow.
+                    Timestamp::from_raw(ts.saturating_add(1))
                 } else {
                     self.oracle.next()
                 }

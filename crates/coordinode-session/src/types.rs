@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::transaction::CommitReceipt;
 
 /// Per-transaction statement ordering, fixed when the transaction begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,8 +162,9 @@ pub enum SessionEvent {
     Rows { rows: Vec<Vec<Value>> },
     /// Closes a result cursor with final statistics.
     CursorEnd { stats: SessionStats },
-    /// Acknowledges `Commit`, carrying the causal applied-index token.
-    Committed { applied_index: u64 },
+    /// Acknowledges `Commit`, carrying the commit receipt: the HLC commit
+    /// timestamp and the causal applied-index token.
+    Committed { receipt: CommitReceipt },
     /// Reports a request failure; terminates the request's cursor.
     Error { code: ErrorCode, message: String },
     /// The state of the connection and the settings in effect on it.

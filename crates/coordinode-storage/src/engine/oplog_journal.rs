@@ -198,28 +198,40 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
     partition_from_wire_tag(tag)
 }
 
-/// Apply one data op to its partition tree at the given LSM seqno (the entry's
-/// commit_ts). Non-data ops are no-ops.
-pub(crate) fn apply_oplog_op(tree: &AnyTree, op: &OplogOp, seqno: u64) {
-    match op {
-        OplogOp::Insert { key, value, .. } => {
-            tree.insert(key, value, seqno);
+/// Apply one entry's data ops for a single partition tree at the entry's
+/// commit_ts, as ONE tree batch: every op lands at the same seqno and the
+/// batch cannot straddle a memtable rotation, so the partition holds either
+/// the whole entry or none of it. Range tombstones follow at the same seqno.
+/// Non-data ops are no-ops.
+pub(crate) fn apply_oplog_ops_at(
+    tree: &AnyTree,
+    ops: &[&OplogOp],
+    seqno: u64,
+) -> StorageResult<()> {
+    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            OplogOp::Insert { key, value, .. } => batch.insert(key.as_slice(), value.as_slice()),
+            OplogOp::Delete { key, .. } => batch.remove(key.as_slice()),
+            OplogOp::Merge { key, operand, .. } => {
+                batch.merge(key.as_slice(), operand.as_slice());
+            }
+            // Range tombstones are applied after the point batch below.
+            // Non-partition ops: Raft framing/heartbeats are not data, and
+            // ColumnarInsert targets a columnar table tree (not a partition
+            // tree), so it is replayed in a separate pass with the registry.
+            OplogOp::RemoveRange { .. }
+            | OplogOp::Noop
+            | OplogOp::RaftEntry { .. }
+            | OplogOp::RaftTruncation { .. }
+            | OplogOp::ColumnarInsert { .. } => {}
         }
-        OplogOp::Delete { key, .. } => {
-            tree.remove(key, seqno);
-        }
-        OplogOp::Merge { key, operand, .. } => {
-            tree.merge(key, operand, seqno);
-        }
-        OplogOp::RemoveRange { start, end, .. } => {
+    }
+    tree.apply_batch(batch, seqno)?;
+    for op in ops {
+        if let OplogOp::RemoveRange { start, end, .. } = op {
             tree.remove_range(start.clone(), end.clone(), seqno);
         }
-        // Non-partition ops: Raft framing/heartbeats are not data, and
-        // ColumnarInsert targets a columnar table tree (not a partition tree),
-        // so it is replayed in a separate pass that has the registry handle.
-        OplogOp::Noop
-        | OplogOp::RaftEntry { .. }
-        | OplogOp::RaftTruncation { .. }
-        | OplogOp::ColumnarInsert { .. } => {}
     }
+    Ok(())
 }

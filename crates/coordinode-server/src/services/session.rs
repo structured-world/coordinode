@@ -261,7 +261,12 @@ fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
         SessionEvent::CursorEnd { stats } => Event::CursorEnd(CursorEnd {
             stats: Some(stats_to_proto(stats)),
         }),
-        SessionEvent::Committed { applied_index } => Event::Committed(Committed { applied_index }),
+        // `applied_index` 0 = no Raft log (embedded); `commit_ts` is present
+        // in every mode.
+        SessionEvent::Committed { receipt } => Event::Committed(Committed {
+            applied_index: receipt.applied_index.unwrap_or(0),
+            commit_ts: receipt.commit_ts.as_raw(),
+        }),
         SessionEvent::Error { code, message } => Event::Error(SessionError {
             code: error_code(code) as u32,
             message,

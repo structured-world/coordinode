@@ -706,13 +706,20 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
     };
     sm.apply_proposal(&proposal2).unwrap();
 
-    // Take a snapshot between the two proposals (after first apply).
-    // We can't use snapshot_at(500) directly because the snapshot tracker
-    // may not have registered that seqno yet (memtable not sealed).
-    // Instead, verify via snapshot taken at the right point.
-    //
-    // Since we can't go back in time, verify that current snapshot sees
-    // "second" and that oracle advanced monotonically through both entries.
+    // Each entry is applied at exactly its commit_ts, so time travel by
+    // commit_ts is exact in both directions: at 500 the first write is
+    // there, at 499 nothing is, at 700 the second supersedes it and at 699
+    // the first is still the visible version. A storage snapshot at S sees
+    // seqnos strictly below S, so "as of commit_ts T" reads at T + 1.
+    let at = |commit_ts: u64| {
+        engine
+            .snapshot_get(&(commit_ts + 1), Partition::Node, b"node:1:1")
+            .unwrap()
+    };
+    assert_eq!(at(499), None, "nothing visible before the first commit_ts");
+    assert_eq!(at(500).as_deref(), Some(b"first".as_ref()));
+    assert_eq!(at(699).as_deref(), Some(b"first".as_ref()));
+    assert_eq!(at(700).as_deref(), Some(b"second".as_ref()));
     let current_snap = engine.snapshot();
     let val_current = engine
         .snapshot_get(&current_snap, Partition::Node, b"node:1:1")
@@ -730,6 +737,71 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
         "oracle should be past 700, got {}",
         final_ts.as_raw()
     );
+}
+
+#[test]
+fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    // A proposal carrying several mutations must be visible as a whole at its
+    // commit_ts and invisible as a whole one tick earlier. Applying the
+    // mutations at commit_ts, commit_ts + 1, ... (one seqno per op) passed
+    // the single-mutation tests above while exposing a torn transaction to
+    // any snapshot reader inside the range.
+    let dir = tempfile::TempDir::new().unwrap();
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+
+    let keys: Vec<Vec<u8>> = (1..=5u64)
+        .map(|i| format!("node:1:{i}").into_bytes())
+        .collect();
+    let proposal = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
+        mutations: keys
+            .iter()
+            .map(|k| Mutation::Put {
+                partition: PartitionId::Node,
+                key: k.clone(),
+                value: b"v".to_vec(),
+            })
+            .collect(),
+        commit_ts: Timestamp::from_raw(500),
+        start_ts: Timestamp::from_raw(499),
+        bypass_rate_limiter: false,
+    };
+    let applied = sm.apply_proposal(&proposal).unwrap();
+    assert_eq!(applied.mutations_applied, 5);
+
+    // A storage snapshot at S sees seqnos strictly below S: "as of 499" is a
+    // snapshot at 500, "as of 500" a snapshot at 501.
+    for key in &keys {
+        assert_eq!(
+            engine.snapshot_get(&500, Partition::Node, key).unwrap(),
+            None,
+            "no key of the entry is visible before its commit_ts"
+        );
+        assert_eq!(
+            engine
+                .snapshot_get(&501, Partition::Node, key)
+                .unwrap()
+                .as_deref(),
+            Some(b"v".as_ref()),
+            "every key of the entry is visible at its commit_ts"
+        );
+    }
+    // The oracle hands out strictly newer timestamps after the apply.
+    assert!(oracle.next().as_raw() > 500);
 }
 
 // ── Regression: unclean shutdown restart ─────────────────────────────────

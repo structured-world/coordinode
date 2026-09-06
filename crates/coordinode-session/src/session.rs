@@ -660,9 +660,9 @@ async fn commit(
 ) {
     let engine = Arc::clone(engine);
     match tokio::task::spawn_blocking(move || engine.commit_transaction(txid)).await {
-        Ok(Ok(applied_index)) => {
+        Ok(Ok(receipt)) => {
             let _ = out
-                .send((request_id, SessionEvent::Committed { applied_index }))
+                .send((request_id, SessionEvent::Committed { receipt }))
                 .await;
         }
         Ok(Err(e)) => send_error(out, request_id, e.0).await,

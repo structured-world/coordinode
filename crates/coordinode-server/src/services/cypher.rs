@@ -905,13 +905,16 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
-        let applied_index = self
+        let receipt = self
             .database
             .read()
             .commit_transaction(request.into_inner().transaction_id)
             .map_err(db_error_to_status)?;
+        // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`
+        // is present in every mode.
         Ok(Response::new(query::CommitTransactionResponse {
-            applied_index,
+            applied_index: receipt.applied_index.unwrap_or(0),
+            commit_ts: receipt.commit_ts.as_raw(),
         }))
     }
 

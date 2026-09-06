@@ -44,8 +44,6 @@ use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
-use crate::proposal::to_partition;
-
 /// Maximum age for dedup entries before GC (10 minutes).
 /// Matches Dgraph's `maxAge` in processApplyCh (draft.go:942).
 const DEDUP_MAX_AGE_SECS: u64 = 600;
@@ -750,13 +748,14 @@ struct DedupEntry {
 /// and snapshot trigger decisions.
 pub struct CoordinodeStateMachine {
     engine: Arc<StorageEngine>,
-    /// Timestamp oracle for seqno advancement during Raft replay (R068, ADR-016).
+    /// Timestamp oracle advanced during Raft apply (R068, ADR-016).
     ///
-    /// Before applying each entry's mutations, we call `oracle.advance_to(commit_ts)`
-    /// so all writes in that entry receive the correct seqno. This ensures:
+    /// Every entry is applied at its `commit_ts` as one batch (the engine
+    /// stamps the seqno; see `StorageEngine::apply_proposal_at`), and the
+    /// oracle is advanced to that `commit_ts` afterwards. This ensures:
     /// - Raft replay produces identical seqnos as original application
-    /// - snapshot_at(commit_ts) works correctly for time-travel reads
-    /// - OCC conflict detection sees the right seqnos
+    /// - snapshot_at(commit_ts) sees the whole entry, snapshot_at(commit_ts - 1) none of it
+    /// - a follower promoted to leader never allocates a timestamp it already applied
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
     /// Last applied log id, cached in memory for fast access.
     last_applied: Mutex<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>>,
@@ -799,7 +798,7 @@ impl CoordinodeStateMachine {
     /// Create with a timestamp oracle for seqno advancement (R068, ADR-016).
     ///
     /// When oracle is set, `apply_proposal()` calls `oracle.advance_to(commit_ts)`
-    /// before writing mutations, ensuring each entry's writes get the correct seqno.
+    /// after applying the entry at `commit_ts`, so later allocations are newer.
     pub fn with_oracle(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
@@ -958,61 +957,19 @@ impl CoordinodeStateMachine {
             }
         }
 
-        // R068: Advance oracle so next seqno = commit_ts.
-        //
-        // advance_to(N) sets counter to N, then next() returns N+1.
-        // So advance_to(commit_ts - 1) makes the first write get commit_ts.
-        // For proposals with multiple mutations, subsequent writes get
-        // commit_ts+1, commit_ts+2, etc. — all within this entry's range.
+        // Apply the whole entry at ONE seqno, its commit_ts (ADR-016): a
+        // snapshot at commit_ts sees every mutation of the entry, a snapshot
+        // one tick earlier sees none, on the leader and on every follower
+        // alike. The engine advances its own generator past commit_ts; the
+        // state machine's oracle is advanced too so a follower promoted to
+        // leader never allocates a timestamp at or below what it applied.
+        self.engine
+            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let count = proposal.mutations.len();
         if let Some(ref oracle) = self.oracle {
             if proposal.commit_ts.as_raw() > 0 {
-                oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(
-                    proposal.commit_ts.as_raw() - 1,
-                ));
-            }
-        }
-
-        // Apply mutations (ADR-016: plain keys, oracle auto-stamps seqno)
-        let mut count = 0;
-
-        for mutation in &proposal.mutations {
-            match mutation {
-                Mutation::Put {
-                    partition,
-                    key,
-                    value,
-                } => {
-                    self.engine
-                        .put(to_partition(*partition), key, value)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    count += 1;
-                }
-                Mutation::Delete { partition, key } => {
-                    self.engine
-                        .delete(to_partition(*partition), key)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    count += 1;
-                }
-                Mutation::Merge {
-                    partition,
-                    key,
-                    operand,
-                } => {
-                    self.engine
-                        .merge(to_partition(*partition), key, operand)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    count += 1;
-                }
-                Mutation::RemoveRange {
-                    partition,
-                    start,
-                    end,
-                } => {
-                    self.engine
-                        .remove_range(to_partition(*partition), start, end)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    count += 1;
-                }
+                oracle.advance_to(proposal.commit_ts);
             }
         }
 

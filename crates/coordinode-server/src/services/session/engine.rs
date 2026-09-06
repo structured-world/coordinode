@@ -18,6 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::Database;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
@@ -88,7 +89,7 @@ impl CursorEngine for DatabaseCursorEngine {
         Ok(self.database.read().begin_transaction())
     }
 
-    fn commit_transaction(&self, txid: u64) -> Result<u64, EngineError> {
+    fn commit_transaction(&self, txid: u64) -> Result<CommitReceipt, EngineError> {
         self.database
             .read()
             .commit_transaction(txid)

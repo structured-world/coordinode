@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_core::txn::transaction::CommitReceipt;
 use tokio::sync::mpsc;
 
 use super::*;
@@ -29,6 +31,13 @@ impl QueryCursor for MockCursor {
         SessionStats::default()
     }
 }
+
+/// The receipt the mock engine hands back on commit. Distinctive values so a
+/// test can tell a pass-through from a default.
+const MOCK_RECEIPT: CommitReceipt = CommitReceipt {
+    commit_ts: Timestamp::from_raw(4242),
+    applied_index: Some(7),
+};
 
 /// An engine returning a fixed result, or a fixed error.
 struct MockEngine {
@@ -66,8 +75,8 @@ impl CursorEngine for MockEngine {
         Ok(self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1)
     }
 
-    fn commit_transaction(&self, _txid: u64) -> Result<u64, EngineError> {
-        Ok(0)
+    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+        Ok(MOCK_RECEIPT)
     }
 
     fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
@@ -224,9 +233,11 @@ async fn begin_then_commit_acknowledges_and_rollback_cancel_are_silent() {
         by_id[&1].as_slice(),
         [SessionEvent::Begun { txid: 1 }]
     ));
+    // The engine's receipt reaches the binding untouched: commit timestamp and
+    // causal token are the engine's, not something the core re-derives.
     assert!(matches!(
         by_id[&2].as_slice(),
-        [SessionEvent::Committed { .. }]
+        [SessionEvent::Committed { receipt }] if *receipt == MOCK_RECEIPT
     ));
     // Rollback of the now-resolved txn and Cancel produce no events.
     assert!(!by_id.contains_key(&3));

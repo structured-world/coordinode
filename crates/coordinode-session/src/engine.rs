@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use coordinode_core::graph::types::Value;
+use coordinode_core::txn::transaction::CommitReceipt;
 
 use crate::types::SessionStats;
 
@@ -44,9 +45,9 @@ pub trait CursorEngine: Send + Sync {
     fn begin_transaction(&self) -> Result<u64, EngineError>;
 
     /// Commit an interactive transaction, flushing its buffered writes in one
-    /// proposal and returning the applied Raft index (the causal token; zero in
-    /// embedded mode).
-    fn commit_transaction(&self, txid: u64) -> Result<u64, EngineError>;
+    /// proposal and returning the commit receipt: the HLC commit timestamp plus
+    /// the applied Raft index (the causal token; `None` in embedded mode).
+    fn commit_transaction(&self, txid: u64) -> Result<CommitReceipt, EngineError>;
 
     /// Roll back an interactive transaction, discarding its buffered writes. No
     /// proposal is emitted (nothing was durable).

@@ -6,10 +6,11 @@
 //!
 //! They mimic `OwnedLocalProposalPipeline`: a commit_ts is drawn from the
 //! oracle, the mutations are journalled at that ts, then applied to the
-//! memtable (which re-stamps via the oracle — exactly as `engine.put` does in
-//! the real pipeline). The recovery rule under test is `entry.ts >
+//! memtables as ONE batch at exactly that ts (`apply_proposal_at`, the same
+//! call the real pipeline makes). The recovery rule under test is `entry.ts >
 //! partition.highest_persisted_seqno`, which must replay only the entries that
-//! did not reach an SST.
+//! did not reach an SST; it is sound only because every op of an entry
+//! carries the entry's ts.
 
 use std::sync::Arc;
 
@@ -32,49 +33,22 @@ fn durable_cfg(dir: &TempDir) -> StorageConfig {
 }
 
 /// Write a batch the way the embedded pipeline does: draw a commit_ts from the
-/// oracle, journal the mutations at that ts, then apply each to the memtable.
-fn write_batch(engine: &StorageEngine, oracle: &Arc<TimestampOracle>, mutations: &[Mutation]) {
+/// oracle, journal the mutations at that ts, then apply them all at that ts.
+/// Returns the commit_ts.
+fn write_batch(
+    engine: &StorageEngine,
+    oracle: &Arc<TimestampOracle>,
+    mutations: &[Mutation],
+) -> u64 {
     let commit_ts = oracle.next().as_raw();
     engine
         .oplog_append(mutations, commit_ts)
         .expect("oplog_append")
         .expect("journal active");
-    for m in mutations {
-        match m {
-            Mutation::Put {
-                partition,
-                key,
-                value,
-            } => {
-                engine
-                    .put(Partition::from(*partition), key, value)
-                    .expect("put");
-            }
-            Mutation::Delete { partition, key } => {
-                engine
-                    .delete(Partition::from(*partition), key)
-                    .expect("delete");
-            }
-            Mutation::Merge {
-                partition,
-                key,
-                operand,
-            } => {
-                engine
-                    .merge(Partition::from(*partition), key, operand)
-                    .expect("merge");
-            }
-            Mutation::RemoveRange {
-                partition,
-                start,
-                end,
-            } => {
-                engine
-                    .remove_range(Partition::from(*partition), start, end)
-                    .expect("remove_range");
-            }
-        }
-    }
+    engine
+        .apply_proposal_at(mutations, commit_ts)
+        .expect("apply_proposal_at");
+    commit_ts
 }
 
 #[test]
@@ -118,6 +92,74 @@ fn put_survives_crash_via_journal_replay() {
             val.as_deref(),
             Some(b"survives".as_slice()),
             "journal replay must restore an un-flushed Put"
+        );
+    }
+}
+
+#[test]
+fn multi_partition_entry_replays_as_one_batch_at_its_ts() {
+    // One journal entry spanning three partitions and a merge operand must
+    // come back from replay exactly as it was committed: every op visible at a
+    // snapshot one past the entry's ts, none of them at the ts itself, on
+    // every partition. This pins the single-seqno contract across a crash,
+    // which the recovery watermark (`entry.ts > highest persisted seqno`)
+    // relies on to never skip a partially replayed entry.
+    let dir = TempDir::new().expect("temp dir");
+    let mutations = [
+        Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:00:0007".to_vec(),
+            value: b"n".to_vec(),
+        },
+        Mutation::Put {
+            partition: PartitionId::Schema,
+            key: b"schema:label:Anchor".to_vec(),
+            value: b"{}".to_vec(),
+        },
+        Mutation::Merge {
+            partition: PartitionId::Adj,
+            key: b"adj:R:out:7".to_vec(),
+            operand: crate::engine::merge::encode_add(9),
+        },
+        Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:00:0008".to_vec(),
+            value: b"m".to_vec(),
+        },
+    ];
+
+    let commit_ts = {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        write_batch(&engine, &oracle, &mutations)
+        // Drop without persist(): only the oplog holds the entry.
+    };
+
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle).expect("reopen");
+    let probes: [(Partition, &[u8]); 4] = [
+        (Partition::Node, b"node:00:0007"),
+        (Partition::Schema, b"schema:label:Anchor"),
+        (Partition::Adj, b"adj:R:out:7"),
+        (Partition::Node, b"node:00:0008"),
+    ];
+    for (part, key) in probes {
+        assert_eq!(
+            engine.snapshot_get(&commit_ts, part, key).expect("get"),
+            None,
+            "{}:{}: nothing of the entry is visible before its ts",
+            part.name(),
+            String::from_utf8_lossy(key)
+        );
+        assert!(
+            engine
+                .snapshot_get(&(commit_ts + 1), part, key)
+                .expect("get")
+                .is_some(),
+            "{}:{}: every op of the entry is visible at its ts after replay",
+            part.name(),
+            String::from_utf8_lossy(key)
         );
     }
 }

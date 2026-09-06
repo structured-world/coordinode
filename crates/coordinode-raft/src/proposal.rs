@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
+    PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
 use coordinode_storage::engine::config::FlushPolicy;
 use coordinode_storage::engine::core::StorageEngine;
@@ -122,55 +122,15 @@ impl<'a> LocalProposalPipeline<'a> {
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
-
-    /// Apply a single mutation to StorageEngine (ADR-016: native seqno MVCC).
-    ///
-    /// Put/Delete write plain keys — OracleSeqnoGenerator auto-stamps seqno.
-    /// Merge writes raw merge operand directly to the partition.
-    fn apply_mutation(&self, mutation: &Mutation) -> Result<(), ProposalError> {
-        match mutation {
-            Mutation::Put {
-                partition,
-                key,
-                value,
-            } => {
-                self.engine
-                    .put(to_partition(*partition), key, value)
-                    .map_err(storage_to_proposal_err)?;
-            }
-            Mutation::Delete { partition, key } => {
-                self.engine
-                    .delete(to_partition(*partition), key)
-                    .map_err(storage_to_proposal_err)?;
-            }
-            Mutation::Merge {
-                partition,
-                key,
-                operand,
-            } => {
-                self.engine
-                    .merge(to_partition(*partition), key, operand)
-                    .map_err(storage_to_proposal_err)?;
-            }
-            Mutation::RemoveRange {
-                partition,
-                start,
-                end,
-            } => {
-                self.engine
-                    .remove_range(to_partition(*partition), start, end)
-                    .map_err(storage_to_proposal_err)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl ProposalPipeline for LocalProposalPipeline<'_> {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        for mutation in &proposal.mutations {
-            self.apply_mutation(mutation)?;
-        }
+        // The whole proposal lands at one seqno, its commit_ts (ADR-016), so a
+        // snapshot at commit_ts sees all of it and one tick earlier none.
+        self.engine
+            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
+            .map_err(storage_to_proposal_err)?;
 
         tracing::debug!(
             proposal_id = %proposal.id,
@@ -238,43 +198,14 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 .map_err(|e| ProposalError::Storage(format!("oplog append: {e}")))?;
         }
 
-        // Apply mutations to the memtable (same logic as LocalProposalPipeline).
-        for mutation in &proposal.mutations {
-            match mutation {
-                Mutation::Put {
-                    partition,
-                    key,
-                    value,
-                } => {
-                    self.engine
-                        .put(to_partition(*partition), key, value)
-                        .map_err(storage_to_proposal_err)?;
-                }
-                Mutation::Delete { partition, key } => {
-                    self.engine
-                        .delete(to_partition(*partition), key)
-                        .map_err(storage_to_proposal_err)?;
-                }
-                Mutation::Merge {
-                    partition,
-                    key,
-                    operand,
-                } => {
-                    self.engine
-                        .merge(to_partition(*partition), key, operand)
-                        .map_err(storage_to_proposal_err)?;
-                }
-                Mutation::RemoveRange {
-                    partition,
-                    start,
-                    end,
-                } => {
-                    self.engine
-                        .remove_range(to_partition(*partition), start, end)
-                        .map_err(storage_to_proposal_err)?;
-                }
-            }
-        }
+        // Apply the whole proposal to the memtables at one seqno, its
+        // commit_ts, matching the oplog entry stamped above: the journal's
+        // "an entry is durable in a partition iff the partition's highest
+        // persisted seqno is at least the entry ts" recovery rule holds only
+        // if every op of the entry carries exactly that seqno.
+        self.engine
+            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
+            .map_err(storage_to_proposal_err)?;
 
         // ── Legacy durability path (no WAL) ──────────────────────────────────
         // Without a WAL the only way to guarantee crash safety is a full SST

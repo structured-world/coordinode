@@ -2052,8 +2052,16 @@ pub fn execute_no_commit(
 
             // Override MVCC and adj snapshots to the requested timestamp.
             // This enables time-travel for BOTH node reads and edge traversal.
+            //
+            // `AS OF TIMESTAMP T` is inclusive: it sees every commit with
+            // `commit_ts <= T`, so a commit receipt's `commit_ts` is a valid
+            // anchor for its own write. A storage snapshot at seqno S sees
+            // versions with seqno STRICTLY below S, and a commit lands at
+            // exactly its commit_ts (one seqno per proposal), hence T + 1.
             #[allow(clippy::cast_sign_loss)]
-            let seqno = ts as u64;
+            let seqno = (ts as u64).checked_add(1).ok_or_else(|| {
+                ExecutionError::Unsupported("AS OF TIMESTAMP value out of range".into())
+            })?;
             if let Some(snap) = ctx.engine.snapshot_at(seqno) {
                 ctx.mvcc_snapshot = Some(snap);
                 ctx.txn.set_adj_snapshot(Some(snap));

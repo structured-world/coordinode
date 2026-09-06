@@ -50,7 +50,19 @@ let rows = db.execute_cypher_with_params(
     "MATCH (n:Person {name: $name}) RETURN n",
     params,
 )?;
+
+// Interactive multi-statement transaction: every statement reads the
+// snapshot pinned at begin; commit applies all writes atomically and
+// returns a CommitReceipt (commit_ts = the seqno every write landed at:
+// the `AS OF TIMESTAMP` anchor, and a change scan from it includes this
+// commit; applied_index = None in embedded mode).
+let tx = db.begin_transaction();
+db.execute_in_transaction(tx, "CREATE (n:Person {name: 'Bob'})", None)?;
+let receipt = db.commit_transaction(tx)?;
+let as_of = receipt.commit_ts.as_raw();
 ```
+
+See [Transactions](./transactions) for the full interactive-transaction contract.
 
 ## What Is and Isn't Available
 
