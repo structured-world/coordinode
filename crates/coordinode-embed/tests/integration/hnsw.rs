@@ -2231,3 +2231,139 @@ fn threshold_vector_filter_returns_same_rows_with_and_without_index() {
          data must return the same rows whether or not an HNSW index exists"
     );
 }
+
+/// The `<` direction is the same predicate with the comparison flipped, so it
+/// must be exact for the same reason. Distance ranks the other way round: the
+/// decoys crowd the head of the index with small distances, every target sits
+/// far behind them, and the filter keeps everything under a loose bound.
+#[test]
+fn threshold_vector_filter_is_exact_for_distance_below_bound() {
+    const DECOYS: usize = 200;
+    const TARGETS: usize = 10;
+
+    let query = |db: &mut Database| -> Vec<String> {
+        let rows = db
+            .execute_cypher(
+                "MATCH (u:User)-[:LIKES]->(d:Doc) \
+                 WHERE vector_distance(d.embedding, [1.0, 0.0, 0.0]) < 100.0 \
+                 RETURN d.name",
+            )
+            .expect("distance threshold query");
+        let mut names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("d.name"))
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let plain_dir = tempfile::tempdir().expect("tempdir");
+    let mut plain = threshold_filter_fixture(plain_dir.path(), false, DECOYS, TARGETS);
+    let without_index = query(&mut plain);
+    assert_eq!(
+        without_index.len(),
+        TARGETS,
+        "every target is under the bound"
+    );
+
+    let indexed_dir = tempfile::tempdir().expect("tempdir");
+    let mut indexed = threshold_filter_fixture(indexed_dir.path(), true, DECOYS, TARGETS);
+    let with_index = query(&mut indexed);
+
+    assert_eq!(
+        with_index, without_index,
+        "`<` threshold must be exact too: the comparison direction does not \
+         change that the predicate defines a set"
+    );
+}
+
+/// An empty candidate set stays empty and does not error: the traversal binds
+/// nothing, so the predicate has nothing to score. Guards the branch the old
+/// index path returned early from.
+#[test]
+fn threshold_vector_filter_on_empty_candidate_set_is_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Decoys only: they are indexed and near the probe, but no edge binds them,
+    // so the traversal produces no candidate row.
+    let mut db = threshold_filter_fixture(dir.path(), true, 20, 0);
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (u:User)-[:LIKES]->(d:Doc) \
+             WHERE vector_similarity(d.embedding, [1.0, 0.0, 0.0]) > 0.5 \
+             RETURN d.name",
+        )
+        .expect("query over an empty candidate set");
+    assert!(
+        rows.is_empty(),
+        "no candidate rows means no result rows, got {}",
+        rows.len()
+    );
+}
+
+/// A decay-weighted threshold (`similarity * decay > τ`) is still a threshold,
+/// so it is exact as well. The old index path special-cased decay by doubling
+/// its candidate window, an acknowledgement that a fixed window could not
+/// bound the predicate; scoring every candidate removes the question.
+#[test]
+fn decay_weighted_threshold_is_exact_with_an_index() {
+    use coordinode_query::index::VectorIndexConfig;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.create_vector_index(
+        "note_embed_idx",
+        "Note",
+        "embedding",
+        VectorIndexConfig {
+            dimensions: 3,
+            metric: VectorMetric::Cosine,
+            ..VectorIndexConfig::default()
+        },
+    );
+
+    // 150 decoys at similarity 1.0 crowd the index head; two scored notes sit
+    // behind them. Both pass the bare similarity threshold, so any difference
+    // in the result comes from the decay factor, not from the index.
+    for i in 0..150 {
+        let eps = 0.01 + (i as f32) * 0.001;
+        db.execute_cypher(&format!(
+            "CREATE (:Note {{name: 'decoy{i}', weight: 1.0, embedding: [1.0, {eps}, 0.0]}})"
+        ))
+        .expect("create decoy");
+    }
+    db.execute_cypher("CREATE (u:User {name: 'reader'})")
+        .expect("create user");
+    // similarity ≈ 0.8 for both; weight scales it to 0.8 and 0.24.
+    for (name, weight) in [("kept", 1.0_f32), ("faded", 0.3_f32)] {
+        db.execute_cypher(&format!(
+            "CREATE (:Note {{name: '{name}', weight: {weight}, embedding: [0.8, 0.6, 0.0]}})"
+        ))
+        .expect("create note");
+        db.execute_cypher(&format!(
+            "MATCH (u:User {{name: 'reader'}}), (n:Note {{name: '{name}'}}) \
+             CREATE (u)-[:WROTE]->(n)"
+        ))
+        .expect("link note");
+    }
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (u:User)-[:WROTE]->(n:Note) \
+             WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) * n.weight > 0.5 \
+             RETURN n.name",
+        )
+        .expect("decay-weighted threshold query");
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("n.name"))
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["kept".to_string()],
+        "the weighted score decides membership: 0.8 passes, 0.8 x 0.3 does not"
+    );
+}

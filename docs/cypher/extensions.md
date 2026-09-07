@@ -147,6 +147,15 @@ MATCH (n:Point)
 RETURN vector_manhattan(n.coords, $target) AS l1_dist
 ```
 
+#### Threshold filters are exact; top-k is approximate
+
+The two shapes above answer different questions, and only one of them is served by the approximate index:
+
+- **`ORDER BY vector_distance(...) LIMIT k`** asks for a ranking. It uses the HNSW index, and "the nearest k" may vary within the index's recall. That is the trade an approximate index exists to make.
+- **`WHERE vector_similarity(...) > 0.7`** asks for a set: every row that passes the threshold. It is evaluated exactly against each candidate row, so the result never depends on whether a vector index exists, and no row that passes the threshold is ever missing.
+
+The practical consequence is about cost, not correctness: a threshold filter scores every row the pattern produces, so narrow the pattern first (a label, a traversal, another predicate) rather than expecting the vector index to shrink it. When a threshold query really must be index-bound, express it as a top-k query and filter the result.
+
 ### Vector Consistency Hint 🔷
 
 Override the consistency mode for a single query:
