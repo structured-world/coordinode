@@ -2625,7 +2625,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             less_than,
             threshold,
             decay_field,
-            push_down: _,
+            push_down,
         } => {
             let rows = execute_op(input, ctx)?;
             let mode = ctx.vector_consistency;
@@ -2637,15 +2637,33 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 decay_field: decay_field.as_ref(),
             };
 
-            // Try HNSW-accelerated path when vector index registry is available.
-            let result = if let Some(hnsw_result) =
-                try_hnsw_vector_filter(&rows, vector_expr, query_vector, &score_params, ctx)?
-            {
-                hnsw_result
-            } else {
-                // Fallback to brute-force distance computation per row.
-                execute_vector_filter(&rows, vector_expr, query_vector, &score_params)?
-            };
+            // A threshold predicate defines a SET ("every row whose score
+            // passes τ"), not a ranking, so it is evaluated exactly over the
+            // materialised candidate set. An ANN index cannot serve it: HNSW
+            // answers top-k, and any k-bounded pre-filter drops candidates
+            // that pass τ but rank below k globally — a different answer, not
+            // a lower recall. That is also what `query-engine.md` § Graph
+            // Predicate Push-Down forbids ("never materialise `C` and then run
+            // an unfiltered HNSW scan ignoring `C`").
+            //
+            // Nothing is lost by evaluating exactly: each surviving row's
+            // score is recomputed from the row's own vector anyway, so the
+            // index never saved a distance computation here — it only skipped
+            // rows, and for a candidate set smaller than the index the graph
+            // search costs more than the distances it skips. Index-accelerated
+            // vector access lives in the top-k operators (`VectorTopK`,
+            // `HnswScan`), where approximation is part of the contract.
+            //
+            // The planner's push-down decision is carried for EXPLAIN and
+            // recorded here; it selects among physical strategies for top-k
+            // access, and `graph_first` (exact scoring over `C`) is the only
+            // one that preserves threshold semantics.
+            tracing::trace!(
+                strategy = push_down.as_ref().map(|d| d.strategy.as_wire_str()),
+                candidates = rows.len(),
+                "vector_filter: exact evaluation over the materialised candidate set"
+            );
+            let result = execute_vector_filter(&rows, vector_expr, query_vector, &score_params)?;
             // In snapshot/exact mode, apply MVCC visibility post-filter.
             // For brute-force path, rows are already MVCC-consistent from
             // upstream operators (NodeScan reads via mvcc_get). This check
@@ -4615,136 +4633,12 @@ fn execute_varlen_traverse(
     Ok(results)
 }
 
-/// Try to use HNSW index for vector filtering instead of brute-force.
-///
-/// Returns `Ok(Some(rows))` if an HNSW index was used successfully,
-/// `Ok(None)` if no applicable index exists (caller should fall back to brute-force),
-/// or `Err` on execution failure.
-///
-/// Strategy: extract (label, property) from the vector expression, look up
-/// the VectorIndexRegistry, use HNSW search to get candidate node IDs,
-/// then intersect with input rows and apply threshold filter on HNSW scores.
 /// Parameters for vector score filtering (threshold comparison + optional decay).
 struct VectorScoreParams<'a> {
     function: &'a str,
     less_than: bool,
     threshold: f64,
     decay_field: Option<&'a crate::plan::expr::Expr>,
-}
-
-fn try_hnsw_vector_filter(
-    rows: &[Row],
-    vector_expr: &crate::plan::expr::Expr,
-    query_vector_expr: &crate::plan::expr::Expr,
-    params: &VectorScoreParams<'_>,
-    ctx: &ExecutionContext<'_>,
-) -> Result<Option<Vec<Row>>, ExecutionError> {
-    // Need a vector index registry to attempt HNSW path.
-    let registry = match ctx.vector_index_registry {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-
-    // Extract variable name and property from vector_expr (e.g. n.embedding).
-    let (variable, property) = match vector_expr {
-        crate::plan::expr::Expr::Property { base, key } => match base.as_ref() {
-            crate::plan::expr::Expr::Variable(var) => (var.as_str(), key.as_str()),
-            _ => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-
-    if rows.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-
-    // Determine the label from the first row's __label__ field.
-    let label_key = format!("{variable}.__label__");
-    let label = match rows[0].get(&label_key) {
-        Some(Value::String(l)) => l.as_str(),
-        _ => return Ok(None), // no label info → can't look up index
-    };
-
-    // Check if an HNSW index exists for this (label, property).
-    if !registry.has_index(label, property) {
-        return Ok(None);
-    }
-
-    // Evaluate the query vector (constant across all rows).
-    let query_val = eval_neutral(query_vector_expr, &rows[0])?;
-    let query_vec = match coerce_value_to_vec(&query_val) {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    // Determine K for HNSW search: fetch enough candidates to cover threshold.
-    // When decay is present, overfetch by 2x since decay reduces scores,
-    // requiring more candidates to find enough passing the combined threshold.
-    let base_k = rows.len().clamp(100, 10_000);
-    let k = if params.decay_field.is_some() {
-        (base_k * 2).min(10_000)
-    } else {
-        base_k
-    };
-
-    gate_vector_index_read(ctx.engine, registry, label, property)?;
-    let results =
-        match registry.search_with_loader(label, property, &query_vec, k, ctx.vector_loader) {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-    // Build a set of candidate node IDs from HNSW results for fast membership check.
-    let candidate_set: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
-
-    let mut filtered = Vec::new();
-    for row in rows {
-        // Extract node ID from the row. NodeScan stores it as row[variable] = Int(id).
-        let node_id = match row.get(variable) {
-            Some(Value::Int(id)) => *id as u64,
-            _ => continue,
-        };
-
-        // Only consider rows whose node_id is in the HNSW candidate set.
-        if !candidate_set.contains(&node_id) {
-            continue;
-        }
-
-        // Re-compute exact score for threshold comparison.
-        let vec_val = eval_neutral(vector_expr, row)?;
-        let a = match coerce_value_to_vec(&vec_val) {
-            Some(v) if v.len() == query_vec.len() => v,
-            _ => continue,
-        };
-
-        let raw_score = match params.function {
-            "vector_distance" => {
-                coordinode_vector::metrics::euclidean_distance(&a, &query_vec) as f64
-            }
-            "vector_similarity" => {
-                coordinode_vector::metrics::cosine_similarity(&a, &query_vec) as f64
-            }
-            "vector_dot" => coordinode_vector::metrics::dot_product(&a, &query_vec) as f64,
-            "vector_manhattan" => {
-                coordinode_vector::metrics::manhattan_distance(&a, &query_vec) as f64
-            }
-            _ => continue,
-        };
-
-        let score = apply_decay_multiplier(raw_score, params.decay_field, row)?;
-
-        let passes = if params.less_than {
-            score < params.threshold
-        } else {
-            score > params.threshold
-        };
-
-        if passes {
-            filtered.push(row.clone());
-        }
-    }
-
-    Ok(Some(filtered))
 }
 
 /// Threshold below which brute-force top-K is used regardless of HNSW availability.

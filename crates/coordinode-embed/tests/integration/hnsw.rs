@@ -2002,9 +2002,11 @@ fn g009_forced_offload_search_through_registry() {
     }
 }
 
-/// G009 E2E: Force offload, then run Cypher query with vector_distance in WHERE.
-/// Exercises: executor → try_hnsw_vector_filter → registry.search_with_loader
-/// → HnswIndex.search_with_loader → StorageVectorLoader.load_vectors.
+/// G009 E2E: Force offload, then run Cypher query with vector_distance in WHERE
+/// plus ORDER BY / LIMIT, so the top-k path drives the offloaded loader:
+/// executor → registry.search_with_loader → HnswIndex.search_with_loader →
+/// StorageVectorLoader.load_vectors. The threshold half of the predicate is
+/// evaluated exactly over the candidate rows (see the `VectorFilter` arm).
 #[test]
 fn g009_forced_offload_cypher_e2e() {
     use coordinode_query::index::VectorIndexConfig;
@@ -2071,5 +2073,161 @@ fn g009_forced_offload_cypher_e2e() {
         first,
         &coordinode_core::graph::types::Value::String("p0".to_string()),
         "nearest to [0,1,0.5] should be p0 with emb=[0.0, 1.0, 0.5]"
+    );
+}
+
+// ── Threshold VectorFilter: index presence must not change the row set ──
+
+/// Probe vector every fixture below is queried with.
+const THRESHOLD_PROBE: [f32; 3] = [1.0, 0.0, 0.0];
+
+/// Build the fixture: one `User` linked to `n_targets` `Doc` nodes at cosine
+/// similarity ≈ 0.8 to the probe, plus `n_decoys` unlinked `Doc` nodes at
+/// similarity ≥ 0.97. When `with_index` is set the HNSW index is created
+/// first, so every CREATE auto-inserts into it.
+///
+/// The decoys exist only to crowd the head of the index: each is nearer the
+/// probe than every target, so a global top-k over the whole index contains
+/// no target. Every vector is distinct — duplicate vectors collapse HNSW
+/// navigation and would make the fixture measure the wrong thing.
+fn threshold_filter_fixture(
+    dir: &std::path::Path,
+    with_index: bool,
+    n_decoys: usize,
+    n_targets: usize,
+) -> Database {
+    use coordinode_query::index::VectorIndexConfig;
+
+    let mut db = Database::open(dir).expect("open");
+    if with_index {
+        db.create_vector_index(
+            "doc_embed_idx",
+            "Doc",
+            "embedding",
+            VectorIndexConfig {
+                dimensions: 3,
+                metric: VectorMetric::Cosine,
+                ..VectorIndexConfig::default()
+            },
+        );
+    }
+
+    db.execute_cypher("CREATE (u:User {name: 'reader'})")
+        .expect("create user");
+    for i in 0..n_decoys {
+        // similarity 1/sqrt(1 + eps²), eps ∈ [0.01, 0.21) → ≥ 0.978
+        let eps = 0.01 + (i as f32) * 0.001;
+        db.execute_cypher(&format!(
+            "CREATE (:Doc {{name: 'decoy{i}', embedding: [1.0, {eps}, 0.0]}})"
+        ))
+        .expect("create decoy");
+    }
+    for i in 0..n_targets {
+        // similarity ≈ 0.8: passes the 0.5 threshold, ranks below every decoy
+        let z = (i as f32) * 0.001;
+        db.execute_cypher(&format!(
+            "CREATE (:Doc {{name: 'target{i}', embedding: [0.8, 0.6, {z}]}})"
+        ))
+        .expect("create target");
+        db.execute_cypher(&format!(
+            "MATCH (u:User {{name: 'reader'}}), (d:Doc {{name: 'target{i}'}}) \
+             CREATE (u)-[:LIKES]->(d)"
+        ))
+        .expect("link target");
+    }
+    db
+}
+
+/// Node ids of the `Doc` nodes the traversal binds — the candidate set the
+/// vector predicate is applied to.
+fn threshold_candidate_ids(db: &mut Database) -> std::collections::HashSet<u64> {
+    db.execute_cypher("MATCH (u:User)-[:LIKES]->(d:Doc) RETURN d")
+        .expect("candidate traversal")
+        .iter()
+        .filter_map(|r| r.get("d"))
+        .filter_map(|v| v.as_int())
+        .map(|id| id as u64)
+        .collect()
+}
+
+/// Names returned by the threshold query, sorted for comparison.
+fn threshold_query_names(db: &mut Database) -> Vec<String> {
+    let rows = db
+        .execute_cypher(
+            "MATCH (u:User)-[:LIKES]->(d:Doc) \
+             WHERE vector_similarity(d.embedding, [1.0, 0.0, 0.0]) > 0.5 \
+             RETURN d.name",
+        )
+        .expect("threshold query");
+    let mut names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("d.name"))
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A THRESHOLD vector predicate defines a set, not a ranking, so its result
+/// may not depend on whether an HNSW index exists.
+///
+/// Approximation is legitimate for a top-k query: "the nearest k" may vary
+/// within the index's declared recall. It is not legitimate here. "Every row
+/// whose similarity exceeds 0.5" is a set, and applying the threshold after a
+/// global top-k drops members of that set — a different answer, not a lower
+/// recall.
+///
+/// The shape under test is the one `arch/core/query-engine.md` § Graph
+/// Predicate Push-Down governs: a traversal produces the candidate set, a
+/// vector predicate filters it. The invariant there reads "It may never
+/// materialise `C` and then run an unfiltered HNSW scan ignoring `C`", which
+/// is what the executor used to do: every target ranks below 200 decoys
+/// globally, so none survived the intersection although all of them pass the
+/// threshold.
+#[test]
+fn threshold_vector_filter_returns_same_rows_with_and_without_index() {
+    const DECOYS: usize = 200;
+    const TARGETS: usize = 10;
+    // What the executor derives for a 10-row candidate set: rows.len() clamped
+    // up to 100. The fixture is built so this window holds decoys only.
+    const EXECUTOR_K: usize = 100;
+
+    let plain_dir = tempfile::tempdir().expect("tempdir");
+    let mut plain = threshold_filter_fixture(plain_dir.path(), false, DECOYS, TARGETS);
+    let without_index = threshold_query_names(&mut plain);
+
+    // The fixture is only meaningful if the brute-force path returns every
+    // target: all of them pass the threshold by construction (0.8 > 0.5).
+    assert_eq!(
+        without_index.len(),
+        TARGETS,
+        "brute-force path must return every target that passes the threshold"
+    );
+
+    let indexed_dir = tempfile::tempdir().expect("tempdir");
+    let mut indexed = threshold_filter_fixture(indexed_dir.path(), true, DECOYS, TARGETS);
+    let candidates = threshold_candidate_ids(&mut indexed);
+    assert_eq!(candidates.len(), TARGETS, "traversal binds every target");
+
+    // Precondition that makes a global top-k pre-filter lossy: not one
+    // candidate appears in the window the executor would intersect against.
+    let top_k: std::collections::HashSet<u64> = indexed
+        .vector_index_registry()
+        .search("Doc", "embedding", &THRESHOLD_PROBE, EXECUTOR_K)
+        .expect("index search")
+        .iter()
+        .map(|hit| hit.id)
+        .collect();
+    assert!(
+        top_k.is_disjoint(&candidates),
+        "fixture must place every candidate outside the executor's top-k window"
+    );
+
+    let with_index = threshold_query_names(&mut indexed);
+
+    assert_eq!(
+        with_index, without_index,
+        "a threshold predicate defines a set: the same query over the same \
+         data must return the same rows whether or not an HNSW index exists"
     );
 }
