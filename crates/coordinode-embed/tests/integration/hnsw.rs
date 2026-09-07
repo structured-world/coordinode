@@ -2002,11 +2002,27 @@ fn g009_forced_offload_search_through_registry() {
     }
 }
 
-/// G009 E2E: Force offload, then run Cypher query with vector_distance in WHERE
-/// plus ORDER BY / LIMIT, so the top-k path drives the offloaded loader:
-/// executor → registry.search_with_loader → HnswIndex.search_with_loader →
-/// StorageVectorLoader.load_vectors. The threshold half of the predicate is
-/// evaluated exactly over the candidate rows (see the `VectorFilter` arm).
+/// G009 E2E: force offload, then query through Cypher and check the answer is
+/// still right.
+///
+/// What this covers today: an offloaded index (f32 vectors evicted from RAM)
+/// does not break a Cypher vector query end to end. It does NOT drive
+/// `search_with_loader` any more — 15 rows is below the top-k brute-force
+/// threshold, so the executor scores them directly, and the threshold half of
+/// the predicate is exact by construction (see the `VectorFilter` arm). The
+/// loader itself is covered by `offload_search_with_loader_returns_correct_results`
+/// (unit) and `g009_forced_offload_search_through_registry` (registry level,
+/// real `StorageVectorLoader`).
+///
+/// The executor's `ctx.vector_loader` argument has no end-to-end test, and an
+/// attempt to add one was dropped deliberately: reaching it needs more than a
+/// thousand candidate rows plus a predicate (to keep `VectorTopK` rather than
+/// a bare `HnswScan`), and at that point no assertion separates "loader wired"
+/// from "loader missing" — both return finite distances, because the returned
+/// column is recomputed from the node record, and the only difference is ANN
+/// result quality, which cannot be asserted without pinning approximate
+/// ranking. A sharp test needs an observable counter on the loader, which
+/// belongs with `EXPLAIN ANALYZE` (R945).
 #[test]
 fn g009_forced_offload_cypher_e2e() {
     use coordinode_query::index::VectorIndexConfig;
