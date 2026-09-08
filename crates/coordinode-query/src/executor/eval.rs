@@ -154,8 +154,13 @@ fn checked(result: Option<i64>) -> Result<i64, EvalError> {
     result.ok_or(EvalError::LongOverflow)
 }
 
-/// A time argument in epoch milliseconds, accepting either representation.
-fn epoch_ms(v: Option<&Value>) -> Option<i64> {
+/// A time argument as a raw epoch integer, accepting either representation.
+///
+/// Converts nothing: the caller's scale is the compared scale. Valid-time
+/// values are epoch microseconds throughout (the unit `Value::Timestamp` is
+/// declared in and the one `now()` returns), so a millisecond value from
+/// `timestamp()` will not compare against them.
+fn epoch_time(v: Option<&Value>) -> Option<i64> {
     match v {
         Some(Value::Int(t)) | Some(Value::Timestamp(t)) => Some(*t),
         _ => None,
@@ -170,7 +175,7 @@ fn epoch_ms(v: Option<&Value>) -> Option<i64> {
 /// a row without the metadata is simply not a temporal edge.
 fn temporal_bounds(var: Option<&str>, row: &Row) -> Option<(i64, Option<i64>)> {
     let var = var?;
-    let valid_from = epoch_ms(row.get(&format!("{var}.valid_from")))?;
+    let valid_from = epoch_time(row.get(&format!("{var}.valid_from")))?;
     let valid_to = match row.get(&format!("{var}.valid_to")) {
         Some(Value::Int(v)) | Some(Value::Timestamp(v)) => Some(*v),
         Some(Value::Null) | None => None,
@@ -622,12 +627,13 @@ pub(crate) fn dispatch_scalar_function(
         // valueType(v) → the Cypher type name of the value.
         "valueType" => Value::String(cypher_value_type(evaluated.first())),
         // temporal_active_at(r, t) → bool
-        // True iff the temporal edge `r` was active at time `t` (epoch ms),
-        // i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR r.valid_to > t)`.
+        // True iff the temporal edge `r` was active at time `t` (epoch
+        // microseconds), i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR
+        // r.valid_to > t)`.
         "temporal_active_at" => Value::Bool(
             match (
                 temporal_bounds(first_arg_var, row),
-                epoch_ms(evaluated.get(1)),
+                epoch_time(evaluated.get(1)),
             ) {
                 (Some((vf, vt)), Some(t)) => vf <= t && vt.is_none_or(|to| to > t),
                 _ => false,
@@ -639,8 +645,8 @@ pub(crate) fn dispatch_scalar_function(
         "temporal_overlaps" => Value::Bool(
             match (
                 temporal_bounds(first_arg_var, row),
-                epoch_ms(evaluated.get(1)),
-                epoch_ms(evaluated.get(2)),
+                epoch_time(evaluated.get(1)),
+                epoch_time(evaluated.get(2)),
             ) {
                 (Some((vf, vt)), Some(t_start), Some(t_end)) => {
                     vf < t_end && vt.is_none_or(|to| to > t_start)

@@ -8627,7 +8627,9 @@ fn execute_create_node(
                         other => {
                             return Err(ExecutionError::Unsupported(format!(
                                 "label '{tlabel}' is TEMPORAL: valid_from must be INT or \
-                                 TIMESTAMP (epoch milliseconds), got {other:?}"
+                                 TIMESTAMP (epoch microseconds, as `now()` returns; \
+                                 `timestamp()` is milliseconds and will not compare \
+                                 against engine-assigned versions), got {other:?}"
                             )));
                         }
                     };
@@ -8882,12 +8884,14 @@ fn execute_create_edge(
                 let field_id = ctx.interner.intern(prop_name);
                 let value = eval_neutral(expr, row)?.map_to_document();
                 if is_temporal && prop_name == "valid_from" {
-                    // Accept both Int (epoch ms) and Timestamp (engine native).
+                    // Accept both Int and Timestamp, both read as epoch
+                    // microseconds: the value goes into the key unconverted, so
+                    // the caller's scale is the stored scale.
                     // Reject Null (explicit null violates the temporal contract)
                     // and any other type.
                     valid_from_value = match &value {
-                        Value::Int(ms) => Some(*ms),
-                        Value::Timestamp(ms) => Some(*ms),
+                        Value::Int(us) => Some(*us),
+                        Value::Timestamp(us) => Some(*us),
                         Value::Null => {
                             return Err(ExecutionError::Unsupported(format!(
                                 "temporal edge '{edge_type}': valid_from must not be NULL"
@@ -8896,7 +8900,9 @@ fn execute_create_edge(
                         other => {
                             return Err(ExecutionError::Unsupported(format!(
                                 "temporal edge '{edge_type}': valid_from must be INT or \
-                                 TIMESTAMP (epoch milliseconds), got {other:?}"
+                                 TIMESTAMP (epoch microseconds, as `now()` returns; \
+                                 `timestamp()` is milliseconds and will not compare \
+                                 against microsecond versions), got {other:?}"
                             )));
                         }
                     };
@@ -11444,19 +11450,22 @@ fn execute_clone_node(
             _ => continue,
         };
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        // Epoch microseconds from the same HLC every other engine-assigned
+        // valid_from comes from. A wall-clock read in milliseconds here would
+        // put a clone's first version three orders of magnitude below every
+        // version any other write path produces, and out of scale with the
+        // valid-time predicates.
+        let now_us = current_hlc_us() as i64;
         // `AS OF <ts>` selects the source's valid-version active at that
         // valid-time instant; default is the current version (active now).
-        let as_of_ms: Option<i64> = match as_of {
+        let as_of_us: Option<i64> = match as_of {
             Some(expr) => match eval_neutral(expr, row)? {
-                Value::Int(ms) => Some(ms),
-                Value::Timestamp(ms) => Some(ms),
+                Value::Int(us) => Some(us),
+                Value::Timestamp(us) => Some(us),
                 other => {
                     return Err(ExecutionError::Unsupported(format!(
-                        "CLONE NODE AS OF requires an INT or TIMESTAMP (epoch ms), got {other:?}"
+                        "CLONE NODE AS OF requires an INT or TIMESTAMP (epoch \
+                         microseconds), got {other:?}"
                     )));
                 }
             },
@@ -11466,11 +11475,11 @@ fn execute_clone_node(
         // point key (per-version layout), so read the valid-version active at the
         // requested instant (the current version when there is no AS OF).
         let source_rec = match ctx.mvcc_get_node(ctx.shard_id, a_id)? {
-            Some(r) if as_of_ms.is_none() => r,
+            Some(r) if as_of_us.is_none() => r,
             _ => ctx
-                .mvcc_get_node_at(ctx.shard_id, a_id, as_of_ms.unwrap_or(now_ms))?
+                .mvcc_get_node_at(ctx.shard_id, a_id, as_of_us.unwrap_or(now_us))?
                 .ok_or_else(|| {
-                    let suffix = as_of_ms
+                    let suffix = as_of_us
                         .map(|t| format!(" as of valid-time {t}"))
                         .unwrap_or_default();
                     ExecutionError::Unsupported(format!(
@@ -11532,7 +11541,7 @@ fn execute_clone_node(
         if is_temporal {
             properties.push((
                 "valid_from".to_string(),
-                crate::plan::expr::Expr::Literal(Value::Int(now_ms)),
+                crate::plan::expr::Expr::Literal(Value::Int(now_us)),
             ));
         }
 

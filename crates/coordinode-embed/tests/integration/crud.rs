@@ -2527,7 +2527,8 @@ fn clone_node_temporal_clones_current_version_at_now() {
         "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
     )
     .expect("temporal type");
-    // Source is business-valid from a fixed past instant (epoch ms = 1000).
+    // Source is business-valid from a fixed past instant (epoch microseconds
+    // = 1000, i.e. just after the epoch — the value only has to be in the past).
     db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000})")
         .expect("seed temporal node");
 
@@ -2558,8 +2559,8 @@ fn clone_node_temporal_clones_current_version_at_now() {
         "original keeps its valid_from = 1000: {vfs:?}"
     );
     assert!(
-        vfs.iter().any(|&v| v > 1_600_000_000_000),
-        "clone's first version is valid from NOW (epoch ms in 2020+): {vfs:?}"
+        vfs.iter().any(|&v| v > 1_600_000_000_000_000),
+        "clone's first version is valid from NOW (epoch microseconds, 2020+): {vfs:?}"
     );
 }
 
@@ -7233,4 +7234,82 @@ fn r172c_set_non_temporal_unaffected() {
         .expect("MATCH");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("name"), Some(&Value::String("Y".into())));
+}
+
+/// Valid-time values are epoch MICROSECONDS on both sides of the contract: the
+/// `valid_from` a user supplies on a temporal CREATE and the one the engine
+/// assigns when a mutation opens a new version. Nothing converts between the
+/// two, so a caller writing another scale writes versions that cannot be
+/// compared with engine-written ones.
+///
+/// Microseconds is also the unit of the system axis (the HLC drives both the
+/// commit seqno and an assigned `valid_from`), which is what lets a valid-time
+/// predicate be evaluated inside a system-time snapshot without conversion.
+///
+/// The guard measures the GAP rather than the magnitude. A bare magnitude bound
+/// passes for either unit, so it would not notice a side of the contract moving
+/// to milliseconds; a version created one hour before the mutation must read
+/// back one hour apart.
+#[test]
+fn temporal_valid_from_is_microseconds_on_both_sides() {
+    use coordinode_core::graph::types::Value;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const ONE_HOUR_US: i64 = 3_600_000_000;
+    // Slack for a slow test host, in the same unit under test.
+    const SLACK_US: i64 = 600_000_000;
+
+    let now_us = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_micros(),
+    )
+    .expect("epoch microseconds fit i64");
+    let user_vf = now_us - ONE_HOUR_US;
+
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    db.execute_cypher(&format!(
+        "CREATE (a:Emp {{name: 'Alice', valid_from: {user_vf}}})"
+    ))
+    .expect("seed temporal node");
+
+    // The mutation closes the current version and opens a new one at the
+    // engine's own clock, which is the value under test.
+    db.execute_cypher("MATCH (a:Emp) WHERE a.valid_to IS NULL SET a.name = 'Alicia'")
+        .expect("mutate temporal node");
+
+    let rows = db
+        .execute_cypher("MATCH (n:Emp) RETURN n.valid_from AS vf")
+        .expect("scan versions");
+    let mut vfs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get("vf") {
+            Some(Value::Int(v) | Value::Timestamp(v)) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    vfs.sort_unstable();
+
+    assert_eq!(
+        vfs.len(),
+        2,
+        "the mutation opened a second version: {vfs:?}"
+    );
+    assert_eq!(
+        vfs[0], user_vf,
+        "the supplied valid_from round-trips unscaled: {vfs:?}"
+    );
+
+    let gap = vfs[1] - vfs[0];
+    assert!(
+        (ONE_HOUR_US..ONE_HOUR_US + SLACK_US).contains(&gap),
+        "an engine-assigned valid_from sits about one hour after one supplied \
+         one hour ago, both in microseconds; a gap of {gap} means one side of \
+         the contract is on another scale: {vfs:?}"
+    );
 }

@@ -163,7 +163,7 @@ pub fn decode_edgeprop_key(key: &[u8]) -> Option<(String, NodeId, NodeId)> {
 // chronological order, and a bounded range scan with `valid_from_upper_bound_key`
 // answers "active at time T" queries in O(log versions).
 
-/// Encode `valid_from` (Unix epoch milliseconds, signed) as 8 bytes sorted
+/// Encode `valid_from` (Unix epoch microseconds, signed) as 8 bytes sorted
 /// lexicographically ascending by numeric value. Negative values use sign-flip
 /// so timestamps before the epoch sort before positive ones; the result is a
 /// total order matching `i64` comparison.
