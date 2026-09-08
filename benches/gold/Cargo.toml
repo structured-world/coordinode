@@ -19,14 +19,29 @@ path = "src/ycsb/main.rs"
 name = "gold-report"
 path = "src/report/main.rs"
 
+[[bin]]
+name = "gold-retention"
+path = "src/retention/main.rs"
+
 [dependencies]
 coordinode-storage = { path = "../../crates/coordinode-storage" }
 coordinode-modality = { path = "../../crates/coordinode-modality" }
 coordinode-core = { path = "../../crates/coordinode-core" }
+# Same engine the storage crate binds to: the retention harness drives the
+# tree's own Leveled compaction, as the engine's background worker does.
+lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 tempfile = "3"
+
+# A standalone workspace does not inherit the production workspace's lint
+# table, so the one entry that matters here is repeated: the repo-wide
+# clippy.toml lists the storage partition enum as a disallowed type for the
+# query layer (ADR-041), and this harness drives the storage engine's KV path
+# directly, where naming a partition is the point.
+[lints.clippy]
+disallowed_types = "allow"
 
 # Match the production workspace release profile: one codegen unit for
 # stable, maximally optimized benchmark binaries (run-to-run comparability).

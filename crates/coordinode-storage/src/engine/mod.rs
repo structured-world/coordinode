@@ -11,6 +11,7 @@ pub mod merge;
 pub(crate) mod mvcc_gc;
 pub mod oplog_journal;
 pub mod partition;
+pub mod retention_stats;
 pub mod routing;
 pub mod stats;
 pub mod transaction;

@@ -143,8 +143,8 @@ fn percentile_ns(sorted: &[u64], p: f64) -> u64 {
 /// so the test exercises the engine's hot-path caches the way the
 /// YCSB paper measured Redis.
 pub fn run_workload(engine: &StorageEngine, workload: Workload, preset: Preset) -> WorkloadResult {
-    use rand::prelude::*;
     use rand::SeedableRng;
+    use rand::prelude::*;
 
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0xC0DE_C0DE);
 

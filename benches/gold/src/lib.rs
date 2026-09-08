@@ -22,4 +22,5 @@
 
 pub mod baselines;
 pub mod report;
+pub mod retention;
 pub mod ycsb;

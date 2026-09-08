@@ -1486,6 +1486,29 @@ impl StorageEngine {
         self.coordinator.gc_watermark_value()
     }
 
+    /// What the retention window holds on disk for `part` beyond its live
+    /// version: the tables compactions inside the window consumed, kept for
+    /// the snapshots that still see them. See
+    /// [`crate::engine::retention_stats`].
+    pub fn retained_history(
+        &self,
+        part: Partition,
+    ) -> StorageResult<crate::engine::retention_stats::RetainedHistory> {
+        crate::engine::retention_stats::retained_history(self.tree(part)?)
+    }
+
+    /// [`Self::retained_history`] for every partition, in `Partition::all()`
+    /// order.
+    pub fn retained_history_all(
+        &self,
+    ) -> StorageResult<Vec<(Partition, crate::engine::retention_stats::RetainedHistory)>> {
+        let mut out = Vec::with_capacity(Partition::all().len());
+        for &part in Partition::all() {
+            out.push((part, self.retained_history(part)?));
+        }
+        Ok(out)
+    }
+
     /// Set the MVCC time-travel retention window at runtime and republish the
     /// GC watermark. Takes effect for the next compaction; widening the window
     /// cannot bring back versions an earlier compaction already collected.
@@ -2494,6 +2517,27 @@ fn run_capacity_refresh<F>(
         .map(|p| p.name())
         .collect();
     capacity.refresh(&endpoint_paths, &partition_names);
+
+    // What the retention window costs, per partition: the live version's
+    // footprint next to the tables only retained history still holds. Same
+    // cadence as the capacity scan, since both are a folder walk and the
+    // operator sizes the window from this pair.
+    for (part, tree) in trees {
+        match crate::engine::retention_stats::retained_history(tree) {
+            Ok(history) => {
+                metrics::gauge!("coordinode_storage_live_bytes", "partition" => part.name())
+                    .set(history.live_bytes as f64);
+                metrics::gauge!(
+                    "coordinode_storage_retained_history_bytes",
+                    "partition" => part.name()
+                )
+                .set(history.retained_bytes as f64);
+            }
+            Err(e) => {
+                tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
+            }
+        }
+    }
 
     // Persist used_bytes snapshots to Schema for warm-load on the
     // next engine open. Each snapshot is a tiny u64 (MessagePack

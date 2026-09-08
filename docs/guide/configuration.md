@@ -494,6 +494,14 @@ horizon for both time-travel reads and lagging-consumer recovery.
   tree versions that were current at each point, so every table a compaction
   consumed stays on disk until the horizon passes that compaction. Budget disk
   for the write and compaction volume of the window, not for the data size.
+  The price is visible per partition as `coordinode_storage_retained_history_bytes`
+  (bytes held only by retained history) next to `coordinode_storage_live_bytes`
+  (the current version's own footprint); both refresh on the capacity-scan
+  cadence. An append-only workload with ascending keys pays nothing, since
+  its compactions move tables without rewriting them; updates and randomly
+  keyed inserts pay roughly the bytes their compactions rewrote inside the
+  window, on top of one extra version's inputs that stays until the next
+  compaction below the horizon replaces it.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: how often buffered consumer
   heartbeats are flushed as a coalesced proposal, and how often expired

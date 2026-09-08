@@ -191,6 +191,392 @@ fn history_below_the_watermark_is_released_and_refused() {
     );
 }
 
+/// The window's disk cost is observable per partition: inside the window a
+/// compaction's consumed inputs stay on disk as retained history next to
+/// the live output; once the watermark passes the compaction and the next
+/// install prunes the versions, the consumed inputs are released and what
+/// remains retained is exactly the newest version below the watermark (the
+/// previous live version), kept so a read at the watermark has a version
+/// to be served from. A partition never written reports zero on both sides.
+#[test]
+fn retained_history_follows_the_window() {
+    let base = future_base();
+    let (engine, oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(1));
+    let key = b"node:00:00000001";
+
+    let untouched = engine.retained_history(Partition::Adj).expect("stats");
+    assert_eq!(untouched.live_bytes, 0);
+    assert_eq!(untouched.retained_bytes, 0);
+    assert_eq!(untouched.retained_ratio(), 0.0);
+
+    put_at(&engine, key, &[b'a'; 4096], base + 1_000);
+    flush(&engine);
+    put_at(&engine, key, &[b'b'; 4096], base + 3_000);
+    flush(&engine);
+    engine.force_compaction(Partition::Node).expect("compact");
+
+    let inside = engine.retained_history(Partition::Node).expect("stats");
+    assert!(inside.live_bytes > 0, "the compacted output is live");
+    assert!(
+        inside.retained_bytes > 0,
+        "the two consumed input tables are retained inside the window"
+    );
+    assert!(inside.retained_ratio() > 0.0);
+    // Live agrees with the tree's own live accounting.
+    let tree = engine.tree(Partition::Node).expect("tree");
+    assert_eq!(
+        inside.live_bytes,
+        lsm_tree::AbstractTree::storage_stats(tree)
+            .expect("storage_stats")
+            .used_bytes
+    );
+    // The whole-engine view carries the same figure for this partition.
+    let all = engine.retained_history_all().expect("all");
+    let (_, from_all) = all
+        .iter()
+        .find(|(p, _)| *p == Partition::Node)
+        .expect("Node present");
+    assert_eq!(from_all.live_bytes, inside.live_bytes);
+
+    oracle.advance_to(Timestamp::from_raw(base + 10_000_000));
+    engine.advance_gc_watermark();
+    engine.force_compaction(Partition::Node).expect("compact");
+
+    let released = engine.retained_history(Partition::Node).expect("stats");
+    assert!(released.live_bytes > 0);
+    // The version history keeps the newest version below the watermark so a
+    // read at exactly the watermark is served from the version current at
+    // it: what remains retained is that one version's tables, which is the
+    // previous live version (the first compaction's output) and nothing
+    // older. The two consumed inputs are gone.
+    assert_eq!(
+        released.retained_bytes, inside.live_bytes,
+        "only the newest version below the watermark is still held"
+    );
+    assert!(
+        released.retained_bytes < inside.retained_bytes + inside.live_bytes,
+        "the inputs consumed inside the window were released"
+    );
+}
+
+/// Sum of the regular files directly under `dir`, `0` when the directory
+/// does not exist: the test-side mirror of what `retained_history` scans,
+/// computed independently through `std::fs`.
+fn files_in(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Physical bytes of a partition across every endpoint root it may have
+/// been routed to: `<root>/<partition>/tables` on each plus `blobs` on the
+/// primary.
+fn partition_bytes(roots: &[&std::path::Path], part: Partition) -> u64 {
+    let mut total = 0;
+    for root in roots {
+        total += files_in(&root.join(part.name()).join("tables"));
+    }
+    total + files_in(&roots[0].join(part.name()).join("blobs"))
+}
+
+/// With per-level routing the partition's tables live under several
+/// endpoint roots; the scan must cover every routed folder, or a bottom
+/// level on the cold endpoint would be invisible and history there would
+/// pass as free. Checked against an independent `std::fs` walk of all
+/// three roots: live plus retained is exactly what is on disk.
+#[test]
+fn retained_history_spans_level_routed_endpoints() {
+    let hot = TempDir::new().expect("hot");
+    let warm = TempDir::new().expect("warm");
+    let cold = TempDir::new().expect("cold");
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "ep-hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "ep-warm",
+            warm.path(),
+            Media::Ssd,
+            Durability::Durable,
+            Tier::Warm,
+        ),
+        EndpointConfig::new(
+            "ep-cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+    for i in 0..2000u32 {
+        let key = format!("node:0:{i:010}");
+        engine
+            .put(Partition::Node, key.as_bytes(), b"payload")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+    engine
+        .major_compact(Partition::Node)
+        .expect("major compact");
+
+    let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
+    assert!(
+        files_in(&cold_tables) > 0,
+        "precondition: the bottom level landed on the cold endpoint"
+    );
+
+    let history = engine.retained_history(Partition::Node).expect("stats");
+    let tree = engine.tree(Partition::Node).expect("tree");
+    assert_eq!(
+        history.live_bytes,
+        lsm_tree::AbstractTree::storage_stats(tree)
+            .expect("storage_stats")
+            .used_bytes
+    );
+    assert_eq!(
+        history.live_bytes + history.retained_bytes,
+        partition_bytes(&[hot.path(), warm.path(), cold.path()], Partition::Node),
+        "the scan covers the primary and every routed tables folder"
+    );
+    // Only the hot root would miss the cold level entirely.
+    assert!(
+        partition_bytes(&[hot.path()], Partition::Node) < history.live_bytes,
+        "the primary folder alone does not hold the live version"
+    );
+}
+
+/// A KV-separated partition keeps its values in blob files next to the
+/// tables; the scan counts both, so live plus retained is what the two
+/// folders hold, and the blob folder is where most of the bytes are.
+#[test]
+fn retained_history_of_a_blob_partition_counts_blob_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    // Values above the KV-separation threshold go to blob files.
+    let value = vec![0x5Au8; 16 * 1024];
+    for i in 0..64u32 {
+        let key = format!("blob:{i:08}");
+        engine
+            .put(Partition::Blob, key.as_bytes(), &value)
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+
+    let blobs = dir.path().join(Partition::Blob.name()).join("blobs");
+    assert!(
+        files_in(&blobs) > 0,
+        "precondition: blob files were written"
+    );
+
+    let history = engine.retained_history(Partition::Blob).expect("stats");
+    let tree = engine.tree(Partition::Blob).expect("tree");
+    assert_eq!(
+        history.live_bytes,
+        lsm_tree::AbstractTree::storage_stats(tree)
+            .expect("storage_stats")
+            .used_bytes
+    );
+    assert_eq!(
+        history.live_bytes + history.retained_bytes,
+        partition_bytes(&[dir.path()], Partition::Blob)
+    );
+    assert!(
+        history.live_bytes > files_in(&dir.path().join(Partition::Blob.name()).join("tables")),
+        "the live figure includes the blob files, not the index tables alone"
+    );
+}
+
+/// An in-memory engine has no folders until something is flushed: the scan
+/// reports zero rather than failing on the missing directories, and after a
+/// flush the `MemFs` listing is read like a real one.
+#[test]
+fn retained_history_on_a_memory_engine_reads_memfs_folders() {
+    let config = StorageConfig::with_endpoints_no_persistence(vec![EndpointConfig::new(
+        "memfs",
+        "/memfs/retention",
+        Media::Ram,
+        Durability::Volatile,
+        Tier::Memory,
+    )])
+    .with_fs(Arc::new(lsm_tree::fs::MemFs::new()));
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let empty = engine.retained_history(Partition::Node).expect("stats");
+    assert_eq!(
+        empty,
+        crate::engine::retention_stats::RetainedHistory::default()
+    );
+
+    engine
+        .put(Partition::Node, b"node:00:00000001", b"v")
+        .expect("put");
+    flush(&engine);
+    let flushed = engine.retained_history(Partition::Node).expect("stats");
+    assert!(
+        flushed.live_bytes > 0,
+        "the flushed table is visible through MemFs"
+    );
+    assert_eq!(flushed.retained_bytes, 0);
+}
+
+/// A tables folder the process cannot list is an error, not a zero: a zero
+/// would read as "no history" on an endpoint whose history is simply
+/// unreadable, and the capacity refresh would publish it as such.
+#[cfg(unix)]
+#[test]
+fn retained_history_reports_an_unreadable_tables_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores the folder's permissions on drop, so a failed assertion
+    /// does not leave an unreadable directory behind in the tempdir.
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    engine
+        .put(Partition::Node, b"node:00:00000001", b"v")
+        .expect("put");
+    flush(&engine);
+
+    let tables = dir.path().join(Partition::Node.name()).join("tables");
+    let _restore = Restore(tables.clone());
+    std::fs::set_permissions(&tables, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let err = engine
+        .retained_history(Partition::Node)
+        .expect_err("an unlistable tables folder must surface as an error");
+    assert!(
+        matches!(err, StorageError::Engine(_) | StorageError::Io(_)),
+        "unexpected error kind: {err:?}"
+    );
+}
+
+/// The capacity refresh publishes the two gauges per partition with the
+/// values `retained_history` reports, under the `partition` label.
+#[test]
+fn capacity_refresh_publishes_retained_history_gauges() {
+    use metrics::{Gauge, GaugeFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+    use std::sync::Mutex;
+
+    /// One observed gauge `set`: metric name, labels, value.
+    type Observed = (String, Vec<(String, String)>, f64);
+    /// Records every gauge `set` with its key and labels.
+    struct Capture(Arc<Mutex<Vec<Observed>>>);
+    struct Handle {
+        key: Key,
+        sink: Arc<Mutex<Vec<Observed>>>,
+    }
+    impl GaugeFn for Handle {
+        fn increment(&self, _: f64) {}
+        fn decrement(&self, _: f64) {}
+        fn set(&self, value: f64) {
+            let labels = self
+                .key
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            self.sink
+                .lock()
+                .expect("sink")
+                .push((self.key.name().to_owned(), labels, value));
+        }
+    }
+    impl Recorder for Capture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+            Gauge::from_arc(Arc::new(Handle {
+                key: key.clone(),
+                sink: Arc::clone(&self.0),
+            }))
+        }
+        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    engine
+        .put(Partition::Node, b"node:00:00000001", b"v")
+        .expect("put");
+    flush(&engine);
+    let expected = engine.retained_history(Partition::Node).expect("stats");
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Capture(Arc::clone(&sink));
+    metrics::with_local_recorder(&recorder, || engine.refresh_capacity());
+
+    let seen = sink.lock().expect("sink");
+    let find = |name: &str| {
+        seen.iter()
+            .find(|(n, labels, _)| {
+                n == name
+                    && labels
+                        .iter()
+                        .any(|(k, v)| k == "partition" && v == Partition::Node.name())
+            })
+            .map(|(_, _, value)| *value)
+    };
+    assert_eq!(
+        find("coordinode_storage_live_bytes"),
+        Some(expected.live_bytes as f64)
+    );
+    assert_eq!(
+        find("coordinode_storage_retained_history_bytes"),
+        Some(expected.retained_bytes as f64)
+    );
+    assert!(
+        seen.iter()
+            .filter(|(n, _, _)| n == "coordinode_storage_live_bytes")
+            .count()
+            >= Partition::all().len() - 1,
+        "every user-data partition is published"
+    );
+}
+
 /// The configured window becomes a GC floor on an oracle-backed engine:
 /// `watermark == now_seqno - window`, refreshed as the clock advances and
 /// on every runtime change of the window.

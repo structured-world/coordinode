@@ -6,7 +6,7 @@
 
 use coordinode_gold_bench::baselines::Baselines;
 use coordinode_gold_bench::report;
-use coordinode_gold_bench::ycsb::{run_workload, Preset, Workload, WorkloadResult};
+use coordinode_gold_bench::ycsb::{Preset, Workload, WorkloadResult, run_workload};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use tempfile::TempDir;

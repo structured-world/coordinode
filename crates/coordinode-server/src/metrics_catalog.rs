@@ -22,6 +22,14 @@ fn register_storage_metrics() {
     // LSM tree
     metrics::describe_gauge!("coordinode_storage_lsm_levels", "Number of LSM levels");
     metrics::describe_gauge!("coordinode_storage_lsm_bytes", "Bytes per LSM level");
+    metrics::describe_gauge!(
+        "coordinode_storage_live_bytes",
+        "On-disk bytes referenced by the current version, per partition"
+    );
+    metrics::describe_gauge!(
+        "coordinode_storage_retained_history_bytes",
+        "On-disk bytes held only by MVCC retention history (tables consumed by compactions inside the retention window), per partition"
+    );
     metrics::describe_counter!(
         "coordinode_storage_compaction_total",
         "Compactions completed"
