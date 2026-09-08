@@ -1427,17 +1427,19 @@ impl StorageEngine {
         for part in Partition::all() {
             if let Ok(tree) = self.tree(*part) {
                 // A tree serves strictly above its oldest retained version, so
-                // the first readable seqno is one past it. Checked rather than
-                // clamped: `SeqNo::MAX` is the read-latest sentinel, never a
-                // real install seqno, so this arm is unreachable — but if it
-                // were ever reached, refusing every historical read is the safe
-                // answer, and a silent wrap to 0 would admit every read
-                // instead, which is the failure this whole guard exists to
-                // prevent.
-                let Some(first_servable) = tree.oldest_retained_seqno().checked_add(1) else {
-                    return lsm_tree::SeqNo::MAX;
-                };
-                horizon = horizon.max(first_servable);
+                // the first readable seqno is one past it. Plain arithmetic:
+                // the value is a retained version's install seqno, which comes
+                // from the seqno generator (HLC microseconds or a counter) and
+                // is never `SeqNo::MAX` — that is the read-latest sentinel a
+                // caller passes to a read, not a seqno anything is installed
+                // at. The `debug_assert` fails loudly if that ever stops
+                // holding, which is where it would need fixing.
+                let oldest_retained = tree.oldest_retained_seqno();
+                debug_assert!(
+                    oldest_retained < lsm_tree::SeqNo::MAX,
+                    "retained version installed at the read-latest sentinel"
+                );
+                horizon = horizon.max(oldest_retained + 1);
             }
         }
         horizon

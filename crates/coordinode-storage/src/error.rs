@@ -85,18 +85,24 @@ impl From<lsm_tree::Error> for StorageError {
             lsm_tree::Error::SnapshotBelowRetention {
                 requested,
                 oldest_retained,
-            } => Self::SnapshotOutsideRetention {
-                snapshot: requested,
-                // Saturating deliberately, and in the safe direction: the
-                // clamp is the business rule, not an overflow shrug. A
-                // version installed at `SeqNo::MAX` is not a real state (that
-                // value is the read-latest sentinel), and if one ever appeared
-                // the honest report is "nothing is readable" — which is what
-                // saturating to MAX says, where a wrap to 0 would claim the
-                // opposite and admit exactly the reads this error exists to
-                // refuse.
-                watermark: oldest_retained.saturating_add(1),
-            },
+            } => {
+                // `oldest_retained` is a retained version's install seqno, and
+                // an install takes its seqno from the generator: HLC
+                // microseconds or a counter, both far below the top of the
+                // range. `SeqNo::MAX` is the read-latest sentinel a caller
+                // passes to a read, never a value a version is installed at,
+                // so the increment cannot overflow.
+                debug_assert!(
+                    oldest_retained < u64::MAX,
+                    "retained version installed at the read-latest sentinel"
+                );
+                Self::SnapshotOutsideRetention {
+                    snapshot: requested,
+                    // A snapshot is servable strictly above the oldest retained
+                    // version, so the first readable seqno is one past it.
+                    watermark: oldest_retained + 1,
+                }
+            }
             other => Self::Engine(other),
         }
     }
