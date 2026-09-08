@@ -2074,8 +2074,12 @@ pub fn execute_no_commit(
             let Some(pin) = ctx.engine.pin_snapshot_at(seqno) else {
                 return Err(ExecutionError::OutsideRetention {
                     requested: ts,
-                    // A read at T needs snapshot T + 1 >= watermark.
-                    oldest_readable: ctx.engine.gc_watermark().saturating_sub(1),
+                    // A read at T is served from snapshot T + 1, so the oldest
+                    // readable timestamp is one below the first readable seqno.
+                    // The clamp is the bottom of the timestamp domain, not an
+                    // overflow guard: a horizon of zero means nothing has been
+                    // collected and there is no timestamp below zero to name.
+                    oldest_readable: ctx.engine.oldest_readable_seqno().saturating_sub(1),
                 });
             };
             ctx.snapshot_pin = Some(pin);

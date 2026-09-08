@@ -1931,7 +1931,7 @@ fn as_of_timestamp_rejects_expired() {
     };
 
     let result = execute(&plan, &mut ctx);
-    let horizon = engine.gc_watermark().saturating_sub(1);
+    let horizon = engine.oldest_readable_seqno().saturating_sub(1);
     match result {
         Err(ExecutionError::OutsideRetention {
             requested,

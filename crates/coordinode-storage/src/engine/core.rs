@@ -324,6 +324,16 @@ impl StorageEngine {
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         journal_config: Option<OplogJournalConfig>,
     ) -> StorageResult<Self> {
+        // Built here rather than inside the coordinator: the capacity scanner
+        // is spawned below, before the coordinator exists, and its cascade
+        // eviction compacts — so it needs to publish and read the same
+        // watermark.
+        let gc_controller = LocalMultiModalCoordinator::build_gc_controller(
+            Arc::clone(&gc_watermark),
+            seqno.clone(),
+            oracle.is_some(),
+        );
+
         // When built with `--features io-uring` on Linux and no explicit
         // filesystem backend was configured, default every partition tree to a
         // single shared io_uring ring. Falls back to StdFs if the running
@@ -555,6 +565,30 @@ impl StorageEngine {
             seqno.fetch_max(max + 1);
         }
 
+        // The data's highest seqno is not the whole story. A compaction that
+        // collected history records a retention floor and zeroes the seqnos of
+        // the rows it settled, so the highest seqno left in the tables can sit
+        // far below that floor. Reads at or below the floor are refused
+        // (`lsm_tree::Error::SnapshotBelowRetention`), so a counter seeded only
+        // from the data would reopen the engine unable to read itself. Seed
+        // above the floor as well.
+        let max_floor = trees
+            .values()
+            .map(|t| {
+                use lsm_tree::AbstractTree;
+                t.retention_floor()
+            })
+            .max();
+        if let Some(floor) = max_floor {
+            // Checked, not clamped: `SeqNo::MAX` is the read-latest sentinel
+            // and never a real floor, but if it ever appeared there would be
+            // no servable seqno to seed and silently wrapping to 0 would seed
+            // the one value guaranteed to be refused.
+            if let Some(first_servable) = floor.checked_add(1) {
+                seqno.fetch_max(first_servable);
+            }
+        }
+
         // Open tiered cache if configured.
         let tiered_cache = if config.cache.is_enabled() {
             match TieredCache::open(&config.cache) {
@@ -649,11 +683,18 @@ impl StorageEngine {
             let endpoints_c = config.endpoints.clone();
             let trees_c = trees.clone();
             let seqno_c = Arc::clone(&seqno);
+            let gc_controller_c = Arc::clone(&gc_controller);
             let interval = std::time::Duration::from_secs(5);
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
                     run_capacity_refresh(&tracker_c, &endpoints_c, &trees_c, &seqno_c, |id| {
-                        run_cascade_evict(&endpoints_c, &trees_c, &seqno_c, id)
+                        run_cascade_evict(
+                            &endpoints_c,
+                            &trees_c,
+                            &seqno_c,
+                            gc_controller_c.maintenance_compaction_threshold(),
+                            id,
+                        )
                     });
                 })
                 .map_err(|e| StorageError::InvalidConfig(format!("spawn capacity scanner: {e}")))?,
@@ -721,7 +762,7 @@ impl StorageEngine {
             Arc::clone(&seqno),
             cache,
             gc_watermark,
-            oracle.is_some(),
+            gc_controller,
         );
         coordinator.set_retention_window_us(retention_window_to_us(
             std::time::Duration::from_secs(config.retention_window_secs),
@@ -1368,12 +1409,46 @@ impl StorageEngine {
         self.coordinator.pin_snapshot_at(seqno)
     }
 
-    /// Refuse a snapshot read below the GC watermark. Version history there
-    /// may already be collected; answering from what survived would return a
-    /// wrong (newer or missing) version, and the tree has no retained version
-    /// to serve it from at all once the history is pruned.
+    /// The oldest seqno a time-travel read can still be served at.
+    ///
+    /// Two boundaries, and the horizon is the later of them:
+    ///
+    /// - **Policy** — the GC watermark, which the configured time-travel
+    ///   window, the consumer floor and live snapshot pins drive together.
+    /// - **Physical** — the oldest version each partition tree still retains.
+    ///   A `drop_range`, a `clear` or a filtering compaction prunes history
+    ///   independently of the window, so this can sit above the watermark; a
+    ///   read below it is refused by the tree itself
+    ///   (`lsm_tree::Error::SnapshotBelowRetention`). A tree is servable
+    ///   strictly above `oldest_retained_seqno`, hence the `+ 1`.
+    pub fn oldest_readable_seqno(&self) -> lsm_tree::SeqNo {
+        use lsm_tree::AbstractTree as _;
+        let mut horizon = self.coordinator.gc_watermark_value();
+        for part in Partition::all() {
+            if let Ok(tree) = self.tree(*part) {
+                // A tree serves strictly above its oldest retained version, so
+                // the first readable seqno is one past it. Checked rather than
+                // clamped: `SeqNo::MAX` is the read-latest sentinel, never a
+                // real install seqno, so this arm is unreachable — but if it
+                // were ever reached, refusing every historical read is the safe
+                // answer, and a silent wrap to 0 would admit every read
+                // instead, which is the failure this whole guard exists to
+                // prevent.
+                let Some(first_servable) = tree.oldest_retained_seqno().checked_add(1) else {
+                    return lsm_tree::SeqNo::MAX;
+                };
+                horizon = horizon.max(first_servable);
+            }
+        }
+        horizon
+    }
+
+    /// Refuse a snapshot read below the retention horizon. Version history
+    /// there may already be collected; answering from what survived would
+    /// return a wrong (newer or missing) version, and once the history is
+    /// pruned the tree has no retained version to serve it from at all.
     fn check_snapshot_retained(&self, snapshot: lsm_tree::SeqNo) -> StorageResult<()> {
-        let watermark = self.coordinator.gc_watermark_value();
+        let watermark = self.oldest_readable_seqno();
         if snapshot < watermark {
             return Err(StorageError::SnapshotOutsideRetention {
                 snapshot,
@@ -1803,9 +1878,21 @@ impl StorageEngine {
         // Target table size of 64 MiB is the lsm-tree default — picked
         // here explicitly so the major compaction's output SST size is
         // independent of any per-partition tuning we may layer on later.
-        // `seqno_threshold = SeqNo::MAX` means "drop nothing for
-        // retention" — major compaction here is for placement, not GC.
-        tree.major_compact(64 * 1024 * 1024, lsm_tree::SeqNo::MAX)
+        //
+        // `seqno_threshold` is the GC watermark: everything BELOW it may be
+        // folded, collected and have its seqno zeroed. Passing `SeqNo::MAX`
+        // here (as this did until 2026-09-08) reads as "keep everything" but
+        // means the opposite — it collects every superseded version whatever
+        // the retention policy says, zeroes the bottommost seqnos, and, since
+        // coordinode-lsm-tree 5.8.6, records a retention floor at the
+        // compaction's install seqno that refuses every snapshot at or below
+        // it after a reopen.
+        //
+        // What "as much as is legitimate" means depends on whether the engine
+        // owes anyone a time-travel contract; see
+        // `GcWatermarkController::maintenance_compaction_threshold`.
+        let threshold = self.coordinator.maintenance_compaction_threshold();
+        tree.major_compact(64 * 1024 * 1024, threshold)
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         Ok(())
     }
@@ -1837,6 +1924,7 @@ impl StorageEngine {
             &self.endpoints,
             self.coordinator.trees(),
             self.coordinator.seqno_generator(),
+            self.coordinator.maintenance_compaction_threshold(),
             endpoint_id,
         )
     }
@@ -2315,6 +2403,7 @@ fn run_cascade_evict(
     endpoints: &[crate::engine::config::EndpointConfig],
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
+    gc_watermark: u64,
     endpoint_id: &str,
 ) -> StorageResult<CascadeReport> {
     use lsm_tree::AbstractTree;
@@ -2361,7 +2450,11 @@ fn run_cascade_evict(
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })?;
-        tree.major_compact(64 * 1024 * 1024, lsm_tree::SeqNo::MAX)
+        // The engine's GC watermark, not `SeqNo::MAX`: eviction moves data
+        // between endpoints and must not collect history the retention policy
+        // still holds. See `StorageEngine::major_compact` for what the
+        // threshold means.
+        tree.major_compact(64 * 1024 * 1024, gc_watermark)
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         compacted_partitions += 1;
     }

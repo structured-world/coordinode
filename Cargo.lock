@@ -1033,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "5.8.5"
+version = "5.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "396488bc8a668c6c62a5d24874a3e6b5ee7e530388fac7bab67e2def15eae39c"
+checksum = "d99663c0155e71ff754e338a9ea2bce37156a0def45b0efd57abc1b79dccccbd"
 dependencies = [
  "aes-gcm 0.11.1",
  "arc-swap",
@@ -1056,7 +1056,7 @@ dependencies = [
  "rustc-hash",
  "self_cell",
  "spin 0.12.3",
- "structured-zstd",
+ "structured-zstd 0.0.51",
  "tempfile",
  "varint-rs",
  "xxhash-rust",
@@ -1307,7 +1307,7 @@ name = "coordinode-swarm"
 version = "0.5.8"
 dependencies = [
  "lz4_flex 0.14.0",
- "structured-zstd",
+ "structured-zstd 0.0.49",
  "thiserror 2.0.20",
  "xxhash-rust",
 ]
@@ -1364,7 +1364,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-rustcrypto",
- "structured-zstd",
+ "structured-zstd 0.0.49",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
@@ -2045,7 +2045,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3510,7 +3510,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4605,7 +4605,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5156,7 +5156,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5215,7 +5215,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5775,6 +5775,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "structured-zstd"
+version = "0.0.51"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcff9aeace665b0d1f5131c42370631562fbf8085c37b4c44791d32885476465"
+dependencies = [
+ "fastrand",
+ "twox-hash",
+]
+
+[[package]]
 name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6040,10 +6050,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6975,7 +6985,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

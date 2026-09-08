@@ -1830,8 +1830,15 @@ impl Database {
     /// forward with the clock; a read older than this is refused with
     /// [`DatabaseError::OutsideRetention`] (or its executor counterpart for
     /// `AS OF TIMESTAMP`).
+    ///
+    /// A read at timestamp `T` is served from the snapshot at `T + 1`
+    /// (inclusive `AS OF`), so `T` is readable exactly when `T + 1` reaches the
+    /// engine's first readable seqno — one below it. The clamp at zero is the
+    /// bottom of the timestamp domain, not an overflow guard: a horizon of zero
+    /// means nothing has been collected, and no timestamp sits below zero to
+    /// report.
     pub fn oldest_readable_timestamp(&self) -> Timestamp {
-        Timestamp::from_raw(self.engine.gc_watermark().saturating_sub(1))
+        Timestamp::from_raw(self.engine.oldest_readable_seqno().saturating_sub(1))
     }
 
     /// Set session-level vector consistency mode.
@@ -2221,7 +2228,11 @@ impl Database {
                     let Some(pin) = self.engine.pin_snapshot_at(seqno) else {
                         return Err(DatabaseError::OutsideRetention {
                             requested: ts,
-                            oldest_readable: self.engine.gc_watermark().saturating_sub(1),
+                            // One below the first readable seqno, since a read
+                            // at T is served from snapshot T + 1. Clamped at
+                            // the bottom of the timestamp domain, not against
+                            // overflow: horizon zero means nothing collected.
+                            oldest_readable: self.engine.oldest_readable_seqno().saturating_sub(1),
                         });
                     };
                     retention_pin = Some(pin);

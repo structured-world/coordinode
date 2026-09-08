@@ -508,6 +508,38 @@ impl GcWatermarkController {
         self.retention_window_us.load(Ordering::Acquire)
     }
 
+    /// The currently published watermark. For callers that hold the controller
+    /// directly (background services spawned before the coordinator exists).
+    pub fn watermark(&self) -> u64 {
+        self.gc_watermark.load(Ordering::Acquire)
+    }
+
+    /// The threshold a maintenance compaction should pass to reclaim space.
+    ///
+    /// A compaction releases the tables it consumed only once the watermark
+    /// moves strictly past its own install seqno, so passing the current
+    /// watermark reclaims nothing on a quiescent engine — the freshly
+    /// installed version is itself the newest one below the watermark, and the
+    /// history behind it is retained.
+    ///
+    /// Which threshold is right therefore depends on whether the engine owes
+    /// anyone a time-travel contract:
+    ///
+    /// - **Clock-backed** (seqno is the HLC commit timestamp): the retention
+    ///   window is live, so the watermark is the answer even when that means
+    ///   reclaiming nothing. Space is not worth a silently broken `AS OF`.
+    /// - **Counter-backed**: the window is inert by construction (a counter is
+    ///   not a clock, see `set_retention_window_us`), so there is no history to
+    ///   protect and maintenance may reclaim everything.
+    pub fn maintenance_compaction_threshold(&self) -> u64 {
+        self.tick();
+        if self.seqno_is_clock {
+            self.watermark()
+        } else {
+            u64::MAX
+        }
+    }
+
     /// Publish the external retention floor (consumer registry) and recompute.
     /// The watermark can only be held *back* by this, never pushed past the
     /// oldest live snapshot pin — a registered consumer never causes a live
@@ -641,18 +673,31 @@ impl LocalMultiModalCoordinator {
     /// Build a coordinator from the bootstrap state — invoked once
     /// from `StorageEngine::finish_open` after the per-partition
     /// trees have been opened with their routing configuration.
+    /// Build the shared GC-watermark controller.
+    ///
+    /// Separate from [`Self::new`] because background services that compact
+    /// (the capacity scanner's cascade eviction) are spawned before the
+    /// coordinator exists and must publish the same watermark; they take an
+    /// `Arc` of the controller built here and hand it to `new` afterwards.
+    pub(crate) fn build_gc_controller(
+        gc_watermark: Arc<AtomicU64>,
+        seqno: lsm_tree::SharedSequenceNumberGenerator,
+        seqno_is_clock: bool,
+    ) -> Arc<GcWatermarkController> {
+        Arc::new(GcWatermarkController::new(
+            gc_watermark,
+            seqno,
+            seqno_is_clock,
+        ))
+    }
+
     pub(crate) fn new(
         trees: HashMap<Partition, lsm_tree::AnyTree>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
-        seqno_is_clock: bool,
+        gc_controller: Arc<GcWatermarkController>,
     ) -> Self {
-        let gc_controller = Arc::new(GcWatermarkController::new(
-            Arc::clone(&gc_watermark),
-            seqno.clone(),
-            seqno_is_clock,
-        ));
         Self {
             trees,
             seqno,
@@ -698,6 +743,12 @@ impl LocalMultiModalCoordinator {
     /// microseconds on an oracle-backed engine) and republish the watermark.
     pub fn set_retention_window_us(&self, window_us: u64) {
         self.gc_controller.set_retention_window_us(window_us);
+    }
+
+    /// The threshold a maintenance compaction should pass. See
+    /// [`GcWatermarkController::maintenance_compaction_threshold`].
+    pub fn maintenance_compaction_threshold(&self) -> u64 {
+        self.gc_controller.maintenance_compaction_threshold()
     }
 
     /// The configured MVCC time-travel retention window (seqno units).

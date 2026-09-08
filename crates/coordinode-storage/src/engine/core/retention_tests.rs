@@ -341,3 +341,60 @@ fn default_retention_window_is_seven_days() {
     )]);
     assert_eq!(config.retention_window_secs, 7 * 24 * 3600);
 }
+
+/// The engine's own guard is a policy boundary; the tree keeps a physical one
+/// and prunes history for reasons the window knows nothing about. `drop_range`
+/// is one: it raises the tree's retention floor to its own install seqno, so a
+/// snapshot the window still permits can become unservable.
+///
+/// The read must then be refused with the same typed error the policy guard
+/// raises — before the fix in coordinode-lsm-tree 5.8.6 the tree panicked, and
+/// without the `From` mapping it would surface as an opaque engine error that
+/// gRPC reports as INTERNAL instead of OUT_OF_RANGE.
+#[test]
+fn read_below_the_physical_floor_is_refused_not_panicked() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = oracle_engine(base);
+    // A window wide enough that policy alone would permit every read below.
+    engine.set_retention_window(Duration::from_secs(7 * 24 * 3600));
+
+    let key = b"node:00:00000001";
+    put_at(&engine, key, b"v1", base + 1_000);
+    flush(&engine);
+    put_at(&engine, key, b"v2", base + 3_000);
+    flush(&engine);
+
+    let old_snapshot = base + 1_500;
+    assert_eq!(
+        read_at(&engine, key, old_snapshot).expect("readable before the reset"),
+        Some(b"v1".to_vec())
+    );
+    assert!(
+        engine.oldest_readable_seqno() <= old_snapshot,
+        "policy horizon must still permit the snapshot before the reset"
+    );
+
+    // `clear_partition` installs a fresh empty version and drops the history
+    // behind it — the repair path does this before reinstalling a known-good
+    // base. The window knows nothing about it.
+    engine
+        .clear_partition(Partition::Node)
+        .expect("clear partition");
+
+    let horizon = engine.oldest_readable_seqno();
+    assert!(
+        horizon > old_snapshot,
+        "clearing a partition must raise the horizon past the old snapshot \
+         (horizon {horizon}, snapshot {old_snapshot})"
+    );
+
+    match read_at(&engine, key, old_snapshot) {
+        Err(StorageError::SnapshotOutsideRetention { snapshot, .. }) => {
+            assert_eq!(snapshot, old_snapshot);
+        }
+        other => panic!("expected SnapshotOutsideRetention, got {other:?}"),
+    }
+    // At and above the horizon the read is served — the partition is empty now,
+    // so the answer is "no such key", which is a result and not an error.
+    assert_eq!(read_at(&engine, key, horizon).expect("served"), None);
+}
