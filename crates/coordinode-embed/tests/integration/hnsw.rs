@@ -1122,10 +1122,16 @@ fn hnsw_search_with_visibility_integration() {
 
 // ── HNSW Index Integration with VectorFilter (G009) ──────────────
 
-/// End-to-end test: create vector index via Database API, insert nodes,
-/// verify that vector_similarity queries use HNSW index (via registry).
+/// End-to-end test: create a vector index via the Database API, insert nodes,
+/// and check a threshold query still answers correctly with the index present.
+///
+/// The name used to say "accelerates". It does not: a threshold predicate is
+/// evaluated exactly over the candidate rows whether or not an index exists
+/// (see `threshold_vector_filter_returns_same_rows_with_and_without_index`),
+/// so what this guards is that registering an index does not disturb the
+/// answer. Acceleration belongs to the top-k operators.
 #[test]
-fn hnsw_index_accelerates_vector_query() {
+fn vector_threshold_query_is_unaffected_by_index_presence() {
     use coordinode_core::graph::node::NodeId;
     use coordinode_query::index::VectorIndexConfig;
 
@@ -1185,9 +1191,8 @@ fn hnsw_index_accelerates_vector_query() {
         .expect("HNSW search");
     assert_eq!(hnsw_results.len(), 3, "HNSW should have 3 vectors");
 
-    // Run vector similarity query through full Cypher pipeline.
-    // With HNSW index, the VectorFilter should route through HNSW
-    // instead of brute-force.
+    // Run the threshold query through the full Cypher pipeline. The index is
+    // registered and populated, and the answer must be the exact one anyway.
     let results = db
         .execute_cypher(
             "MATCH (m:Movie) \
