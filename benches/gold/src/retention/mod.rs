@@ -107,7 +107,17 @@ pub struct RunResult {
     /// Bytes handed to the engine (keys plus values), for the
     /// retained-per-written figure.
     pub bytes_written: u64,
+    /// Measured once the engine's file deletions have drained: what the
+    /// window holds, as opposed to what the last install has not unlinked
+    /// yet.
     pub history: RetainedHistory,
+    /// Retained bytes sampled right after the last compaction, before the
+    /// background deleter ran: the transient a capacity scan can catch.
+    pub retained_at_install: u64,
+    /// Live bytes after a major compaction at the same watermark: what the
+    /// window requires, as opposed to what Leveled has not folded yet because
+    /// no compaction has touched those levels since the watermark passed them.
+    pub live_after_major: u64,
 }
 
 impl RunResult {
@@ -180,13 +190,52 @@ pub fn run(pattern: Pattern, shape: Shape, window_rounds: u64, dir: &Path) -> Ru
         settle(&engine);
     }
 
+    let retained_at_install = engine
+        .retained_history(Partition::Node)
+        .expect("stats")
+        .retained_bytes;
+    let history = drained_history(&engine);
+    let tree = engine.tree(Partition::Node).expect("tree");
+    tree.major_compact(u64::MAX, engine.gc_watermark())
+        .expect("major compaction");
+    let live_after_major = drained_history(&engine).live_bytes;
     RunResult {
         pattern,
         shape,
         window_rounds,
         bytes_written,
-        history: engine.retained_history(Partition::Node).expect("stats"),
+        history,
+        retained_at_install,
+        live_after_major,
     }
+}
+
+/// Samples the Node partition until it has been quiet for two seconds, so
+/// neither files the engine has released but not yet unlinked nor the output
+/// of a background compaction still being written pass for history. Gives up
+/// after a minute and reports the last sample: a figure still moving by then
+/// is worth seeing as it is.
+fn drained_history(engine: &StorageEngine) -> RetainedHistory {
+    const QUIET_SAMPLES: u32 = 20;
+    let mut last = engine.retained_history(Partition::Node).expect("stats");
+    let mut quiet = 0;
+    for _ in 0..600 {
+        if last.retained_bytes == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let next = engine.retained_history(Partition::Node).expect("stats");
+        if next == last {
+            quiet += 1;
+            if quiet == QUIET_SAMPLES {
+                break;
+            }
+        } else {
+            quiet = 0;
+            last = next;
+        }
+    }
+    last
 }
 
 /// Flushes the Node partition and runs its Leveled compaction until the
@@ -252,11 +301,12 @@ mod tests {
         value_bytes: 64,
     };
 
-    /// With every round inside the window an overwrite run holds history;
-    /// with the window empty it holds at most the newest install's inputs,
-    /// and the live version is the folded one, smaller than the unfolded.
+    /// The window is paid for in key versions inside the live tables, never
+    /// in tables held beside them: whatever the window, nothing is retained
+    /// once deletions drain, and an empty window folds the superseded
+    /// versions so the live figure is the smaller one.
     #[test]
-    fn overwrite_history_shrinks_with_the_window() {
+    fn overwrite_pays_for_the_window_in_live_versions_only() {
         let all = run(
             Pattern::Overwrite,
             SMALL,
@@ -265,16 +315,21 @@ mod tests {
         );
         let none = run(Pattern::Overwrite, SMALL, 0, TempDir::new().unwrap().path());
         assert_eq!(all.bytes_written, 4 * 2_000 * (13 + 64));
-        assert!(all.history.retained_bytes > 0);
-        assert!(none.history.retained_bytes < all.history.retained_bytes);
+        assert_eq!(all.history.retained_bytes, 0);
+        assert_eq!(none.history.retained_bytes, 0);
         assert!(none.history.live_bytes < all.history.live_bytes);
         assert!(none.history.live_bytes > 0);
+        // A major compaction folds everything the watermark allows, so it
+        // never leaves more than Leveled had and it preserves the ordering.
+        assert!(all.live_after_major <= all.history.live_bytes);
+        assert!(none.live_after_major <= none.history.live_bytes);
+        assert!(none.live_after_major < all.live_after_major);
     }
 
-    /// Ascending append-only never overlaps between rounds, so a whole-run
-    /// window costs no more than the most recent install's inputs.
+    /// Ascending append-only never overlaps between rounds and supersedes
+    /// nothing, so the window changes neither figure.
     #[test]
-    fn ascending_append_only_retains_at_most_the_last_install() {
+    fn ascending_append_only_is_indifferent_to_the_window() {
         let all = run(
             Pattern::AppendOnly,
             SMALL,
@@ -288,7 +343,8 @@ mod tests {
             TempDir::new().unwrap().path(),
         );
         assert_eq!(all.bytes_written, 4 * 2_000 * (13 + 64));
-        assert!(all.history.retained_bytes <= none.history.retained_bytes + all.history.live_bytes);
+        assert_eq!(all.history.retained_bytes, 0);
+        assert_eq!(none.history.retained_bytes, 0);
         assert!(
             (all.history.live_bytes as f64 - none.history.live_bytes as f64).abs()
                 < all.history.live_bytes as f64 * 0.05,

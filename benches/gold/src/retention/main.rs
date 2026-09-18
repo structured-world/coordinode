@@ -40,18 +40,26 @@ fn print_pattern(results: &[RunResult]) {
         mib(first.bytes_written),
     );
     println!(
-        "  {:>14}  {:>12}  {:>14}  {:>10}  {:>16}",
-        "window rounds", "live MiB", "retained MiB", "ret/live", "ret/written"
+        "  {:>14}  {:>12}  {:>14}  {:>10}  {:>16}  {:>16}  {:>16}",
+        "window rounds",
+        "live MiB",
+        "retained MiB",
+        "ret/live",
+        "ret/written",
+        "at install MiB",
+        "live major MiB"
     );
     for r in results {
         let h = r.history;
         println!(
-            "  {:>14}  {:>12.2}  {:>14.2}  {:>10.2}  {:>16.2}",
+            "  {:>14}  {:>12.2}  {:>14.2}  {:>10.2}  {:>16.2}  {:>16.2}  {:>16.2}",
             r.window_rounds,
             mib(h.live_bytes),
             mib(h.retained_bytes),
             h.retained_ratio(),
             r.retained_per_written(),
+            mib(r.retained_at_install),
+            mib(r.live_after_major),
         );
     }
 }
