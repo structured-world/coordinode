@@ -6,6 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use coordinode_core::graph::types::Value;
 use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_embed::{Database, DatabaseError};
@@ -245,4 +246,105 @@ fn open_transaction_snapshot_survives_window_narrowing() {
         1
     );
     db.rollback_transaction(tx).expect("rollback");
+}
+
+fn commit(db: &mut Database, cypher: &str) -> u64 {
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, cypher, None)
+        .expect("statement");
+    db.commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw()
+}
+
+/// The `w` property of every `LINK` edge matched as of `ts`, one entry per
+/// row, so "no edge at that snapshot" and "an edge without the property"
+/// read differently.
+fn link_weight_as_of(db: &mut Database, ts: u64) -> Result<Vec<Option<Value>>, DatabaseError> {
+    db.execute_cypher(&format!(
+        "MATCH (:Anchor {{id: 1}})-[r:LINK]->(:Anchor {{id: 2}}) \
+         RETURN r.w AS w AS OF TIMESTAMP {ts}"
+    ))
+    .map(|rows| rows.iter().map(|row| row.get("w").cloned()).collect())
+}
+
+/// An edge property rewritten on both sides of the horizon keeps the version
+/// a snapshot inside the window resolves to, across a compaction of every
+/// partition and across a restart: the read is neither refused nor answered
+/// with the newer value or with nothing. Edge properties live in a partition
+/// compacted without a merge operator, the path node reads do not take.
+#[test]
+fn edge_property_history_survives_compaction_and_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (probe, newest) = {
+        let mut db = open_db(dir.path());
+        db.set_retention_window(Duration::from_secs(2));
+
+        commit(
+            &mut db,
+            "CREATE (a:Anchor {id: 1})-[:LINK {w: 1}]->(b:Anchor {id: 2})",
+        );
+        let second = commit(
+            &mut db,
+            "MATCH (:Anchor {id: 1})-[r:LINK]->(:Anchor {id: 2}) SET r.w = 2",
+        );
+        advance_clock(&db, Duration::from_secs(10));
+        let newest = commit(
+            &mut db,
+            "MATCH (:Anchor {id: 1})-[r:LINK]->(:Anchor {id: 2}) SET r.w = 3",
+        );
+        // Both old versions sit below the horizon and the newest above it; a
+        // snapshot just above the horizon resolves to the newer of the two.
+        // Every statement nudges the horizon forward by a few microseconds,
+        // so probe a millisecond past it.
+        let horizon = db.oldest_readable_timestamp().as_raw();
+        assert!(second < horizon && horizon < newest);
+        let probe = horizon + 1_000;
+        assert!(probe < newest);
+        assert_eq!(
+            link_weight_as_of(&mut db, probe).expect("before compaction"),
+            vec![Some(Value::Int(2))]
+        );
+        assert_eq!(
+            link_weight_as_of(&mut db, newest).expect("before compaction"),
+            vec![Some(Value::Int(3))]
+        );
+
+        for part in Partition::all() {
+            if *part != Partition::Raft {
+                db.engine().force_compaction(*part).expect("compact");
+            }
+        }
+        assert_eq!(
+            link_weight_as_of(&mut db, probe).expect("inside the window"),
+            vec![Some(Value::Int(2))]
+        );
+        assert!(
+            matches!(
+                link_weight_as_of(&mut db, second - 1),
+                Err(DatabaseError::Execution(
+                    ExecutionError::OutsideRetention { .. }
+                ))
+            ),
+            "the collected version is refused, not answered"
+        );
+        (probe, newest)
+    };
+
+    // A fresh process. The default window puts the policy horizon far in the
+    // past, so what bounds the read is the floor the compaction recorded.
+    let mut db = open_db(dir.path());
+    assert!(
+        db.oldest_readable_timestamp().as_raw() <= probe,
+        "the recorded floor still admits a snapshot the window covered"
+    );
+    assert_eq!(
+        link_weight_as_of(&mut db, probe).expect("inside the window after a reopen"),
+        vec![Some(Value::Int(2))]
+    );
+    assert_eq!(
+        link_weight_as_of(&mut db, newest).expect("newest"),
+        vec![Some(Value::Int(3))]
+    );
 }

@@ -382,10 +382,9 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     });
     assert!(found_v3, "before GC: snapshot_at(v3) should see val=v3");
 
-    // Set GC watermark between v2 and v3, then compact.
-    // SeqnoRetentionFilter will mark versions with seqno <= watermark
-    // as tombstones (LSM Verdict::Remove → tombstone). The latest version
-    // (v3, above watermark) survives as-is.
+    // Set GC watermark between v2 and v3, then compact. Compaction folds the
+    // versions below the watermark down to the newest one per key; v3, above
+    // the watermark, survives as-is.
     db.engine().set_gc_watermark(seqno_v2);
     db.engine().persist().expect("persist before GC");
     db.engine()

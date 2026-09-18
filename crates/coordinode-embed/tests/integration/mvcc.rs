@@ -9,6 +9,7 @@ use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::error::StorageError;
 
 /// TimestampOracle produces monotonic, unique timestamps.
 #[test]
@@ -458,12 +459,9 @@ fn prefix_scan_of_concurrently_written_key_commits() {
     );
 }
 
-/// Seqno-based retention compaction filter: old versions below GC watermark
-/// are removed. Latest version per key always survives.
-///
-/// Strategy: write 3 versions of a key (seqno 1, 2, 3), set watermark=2,
-/// force compaction, verify seqno 3 (live) survives, seqno 1 (expired, not
-/// newest per key) is destroyed.
+/// Compaction collects versions below the GC watermark: a snapshot at the
+/// watermark is served exactly, a snapshot below it is refused rather than
+/// answered from what survived, and the latest version is untouched.
 #[test]
 fn mvcc_gc_compaction_removes_old_versions() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -476,47 +474,57 @@ fn mvcc_gc_compaction_removes_old_versions() {
     )]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Write 3 versions of the same key. Each put gets an auto-incremented
-    // seqno (1, 2, 3). The LSM engine keeps all versions until compaction.
+    // Three versions of one key, with the snapshot that sees each.
     engine
         .put(Partition::Node, b"node:0:1", b"v1")
         .expect("put v1");
+    let saw_v1 = engine.snapshot();
     engine
         .put(Partition::Node, b"node:0:1", b"v2")
         .expect("put v2");
+    let saw_v2 = engine.snapshot();
     engine
         .put(Partition::Node, b"node:0:1", b"v3")
         .expect("put v3");
 
-    // Before compaction: latest version is visible.
-    let current = engine.get(Partition::Node, b"node:0:1").expect("get");
-    assert_eq!(
-        current.as_deref(),
-        Some(b"v3".as_slice()),
-        "v3 should be visible before compaction"
-    );
+    // Before compaction every version is readable at its own snapshot.
+    let read = |snapshot: u64| {
+        engine
+            .snapshot_get(&snapshot, Partition::Node, b"node:0:1")
+            .map(|v| v.map(|b| b.to_vec()))
+    };
+    assert_eq!(read(saw_v1).expect("read"), Some(b"v1".to_vec()));
+    assert_eq!(read(saw_v2).expect("read"), Some(b"v2".to_vec()));
 
-    // Set GC watermark: seqno <= 2 eligible for removal.
-    engine.set_gc_watermark(2);
-
-    // Force compaction — rotates memtable to SST then runs retention filter.
+    // The watermark sits at the snapshot that sees v2: v2 is the version a
+    // read there resolves to and stays, v1 under it is collectable.
+    engine.set_gc_watermark(saw_v2);
     engine.persist().expect("persist");
     engine.force_compaction(Partition::Node).expect("compact");
 
-    // After compaction: latest version (seqno=3) must survive.
     let after = engine.get(Partition::Node, b"node:0:1").expect("get");
     assert_eq!(
         after.as_deref(),
         Some(b"v3".as_slice()),
         "latest version must survive compaction"
     );
+    assert_eq!(
+        read(saw_v2).expect("read at the watermark"),
+        Some(b"v2".to_vec()),
+        "a snapshot at the watermark is served exactly"
+    );
+    assert!(
+        matches!(
+            read(saw_v1),
+            Err(StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "a snapshot below the watermark is refused, not answered with a newer version"
+    );
 }
 
-/// Seqno-based retention filter preserves the newest version per key even
-/// when ALL versions are below the GC watermark.
-///
-/// If watermark is set above all writes, the filter still keeps the newest
-/// version per key to prevent total data loss.
+/// A key whose every version is below the GC watermark keeps its newest one:
+/// collecting history never loses the current value, and the collected
+/// version is refused rather than served.
 #[test]
 fn mvcc_gc_preserves_newest_expired_version() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -529,36 +537,51 @@ fn mvcc_gc_preserves_newest_expired_version() {
     )]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Write 2 versions (seqno 1, 2). Both will be below watermark.
     engine
         .put(Partition::Node, b"node:0:99", b"old_v1")
         .expect("put v1");
+    let saw_v1 = engine.snapshot();
     engine
         .put(Partition::Node, b"node:0:99", b"less_old_v2")
         .expect("put v2");
 
-    // Set watermark above all writes — both versions "expired".
-    engine.set_gc_watermark(100);
+    // One past the snapshot that sees the last write: both versions are
+    // below the watermark.
+    let watermark = engine.snapshot() + 1;
+    engine.set_gc_watermark(watermark);
 
-    // Flush memtable to SST files, then force compaction.
     engine.persist().expect("persist");
     engine.force_compaction(Partition::Node).expect("compact");
 
-    // Newest version per key should survive (prevents data loss).
     let newest = engine.get(Partition::Node, b"node:0:99").expect("get");
     assert_eq!(
         newest.as_deref(),
         Some(b"less_old_v2".as_slice()),
         "newest expired version should survive GC to prevent data loss"
     );
+    assert_eq!(
+        engine
+            .snapshot_get(&watermark, Partition::Node, b"node:0:99")
+            .expect("read at the watermark")
+            .as_deref(),
+        Some(b"less_old_v2".as_slice()),
+        "the newest version below the watermark serves a snapshot at it"
+    );
+    assert!(
+        matches!(
+            engine.snapshot_get(&saw_v1, Partition::Node, b"node:0:99"),
+            Err(StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "the collected version is refused"
+    );
 }
 
-/// Seqno retention filter: watermark=0 keeps everything (safe default).
-///
-/// When no one calls set_gc_watermark(), all writes have seqno > 0,
-/// so nothing is eligible for GC.
+/// On a counter-backed engine the watermark follows the current seqno, so a
+/// pin is what holds history: while it lives, a compaction keeps the
+/// superseded version readable at the pinned snapshot; once it drops, the
+/// next compaction collects it and the read is refused.
 #[test]
-fn mvcc_gc_watermark_zero_keeps_everything() {
+fn mvcc_gc_pinned_snapshot_survives_compaction() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -569,30 +592,54 @@ fn mvcc_gc_watermark_zero_keeps_everything() {
     )]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Write two versions. gc_watermark stays at default 0.
     engine
         .put(Partition::Node, b"node:0:50", b"first")
         .expect("put v1");
+    let saw_first = engine.snapshot();
+    let pin = engine
+        .pin_snapshot_at(saw_first)
+        .expect("snapshot is current, pin granted");
     engine
         .put(Partition::Node, b"node:0:50", b"second")
         .expect("put v2");
 
+    engine.advance_gc_watermark();
+    assert!(
+        engine.gc_watermark() <= saw_first,
+        "the pin holds the watermark at or below its snapshot"
+    );
     engine.persist().expect("persist");
     engine.force_compaction(Partition::Node).expect("compact");
 
-    // Latest version survives (compaction doesn't GC anything).
     let val = engine.get(Partition::Node, b"node:0:50").expect("get");
+    assert_eq!(val.as_deref(), Some(b"second".as_slice()));
     assert_eq!(
-        val.as_deref(),
-        Some(b"second".as_slice()),
-        "watermark=0 must keep everything"
+        engine
+            .snapshot_get(&saw_first, Partition::Node, b"node:0:50")
+            .expect("read the superseded version")
+            .as_deref(),
+        Some(b"first".as_slice()),
+        "the pinned snapshot still reads its version after compaction"
     );
+
+    drop(pin);
+    engine.advance_gc_watermark();
+    assert!(engine.gc_watermark() > saw_first);
+    engine.force_compaction(Partition::Node).expect("compact");
+
+    assert!(
+        matches!(
+            engine.snapshot_get(&saw_first, Partition::Node, b"node:0:50"),
+            Err(StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "with the pin gone the superseded version is collected and refused"
+    );
+    let val = engine.get(Partition::Node, b"node:0:50").expect("get");
+    assert_eq!(val.as_deref(), Some(b"second".as_slice()));
 }
 
-/// Seqno retention filter: multiple independent keys compacted together.
-///
-/// Key A has live + expired versions, key B is fully expired.
-/// Both newest versions should survive.
+/// Keys compacted together are collected independently: key A loses its
+/// superseded version, key B's only version is its newest and stays.
 #[test]
 fn mvcc_gc_multiple_keys_independent() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -605,47 +652,51 @@ fn mvcc_gc_multiple_keys_independent() {
     )]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Key A: 2 versions (seqno ~1, ~2)
     engine
         .put(Partition::Node, b"node:0:A", b"A_old")
         .expect("put A1");
+    let saw_a_old = engine.snapshot();
     engine
         .put(Partition::Node, b"node:0:A", b"A_new")
         .expect("put A2");
-
-    // Key B: 1 version (seqno ~3)
     engine
         .put(Partition::Node, b"node:0:B", b"B_only")
         .expect("put B1");
 
-    // Set watermark high enough to expire all versions.
-    engine.set_gc_watermark(100);
+    // One past the snapshot that sees the last write: every version of both
+    // keys is below the watermark.
+    let watermark = engine.snapshot() + 1;
+    engine.set_gc_watermark(watermark);
 
     engine.persist().expect("persist");
     engine.force_compaction(Partition::Node).expect("compact");
 
-    // Both keys retain their newest version.
-    let a = engine.get(Partition::Node, b"node:0:A").expect("get A");
+    let read = |key: &[u8], snapshot: u64| {
+        engine
+            .snapshot_get(&snapshot, Partition::Node, key)
+            .map(|v| v.map(|b| b.to_vec()))
+    };
     assert_eq!(
-        a.as_deref(),
-        Some(b"A_new".as_slice()),
+        read(b"node:0:A", watermark).expect("read A"),
+        Some(b"A_new".to_vec()),
         "key A newest version must survive"
     );
-
-    let b = engine.get(Partition::Node, b"node:0:B").expect("get B");
     assert_eq!(
-        b.as_deref(),
-        Some(b"B_only".as_slice()),
+        read(b"node:0:B", watermark).expect("read B"),
+        Some(b"B_only".to_vec()),
         "key B sole version must survive (newest per key rule)"
+    );
+    assert!(
+        matches!(
+            read(b"node:0:A", saw_a_old),
+            Err(StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "key A's superseded version is refused"
     );
 }
 
-// NOTE: oracle + snapshot_at + compaction GC interaction test deferred to
-// R069 (MVCC integration tests) — requires understanding of snapshot_at
-// visibility semantics with oracle-driven seqno (off-by-one between
-// oracle.current() and snapshot boundary). The 4 tests above cover the
-// retention filter's core behavior: watermark=0 safety, live version
-// preservation, newest-expired-per-key rule, multi-key independence.
+// The oracle-driven side of the same contract (window, reopen, deletes) is
+// covered next to the engine, in the storage crate's retention tests.
 
 // ==========================================
 // Proposal Pipeline Integration Tests
