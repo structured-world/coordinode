@@ -5,8 +5,8 @@
 //!
 //! Wire format: `[12-byte nonce][ciphertext + 16-byte GCM tag]`
 
-use aes_gcm::aead::{Aead, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::{Aead, Generate, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit};
 
 use super::keys::FieldKey;
 
@@ -44,10 +44,11 @@ impl EncryptedField {
 /// essential for IND-CPA security.
 ///
 /// # Errors
-/// Returns error if encryption fails (should not happen with valid key).
+/// Returns error if the system random source fails or encryption fails
+/// (the latter should not happen with a valid key).
 pub fn encrypt_field(plaintext: &[u8], key: &FieldKey) -> Result<EncryptedField, SseError> {
     let cipher = Aes256Gcm::new(key.as_bytes().into());
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::try_generate().map_err(|_| SseError::EncryptionFailed)?;
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -74,12 +75,13 @@ pub fn decrypt_field(encrypted: &EncryptedField, key: &FieldKey) -> Result<Vec<u
         return Err(SseError::DecryptionFailed);
     }
 
-    let nonce = Nonce::from_slice(&data[..12]);
+    let nonce =
+        Nonce::<Aes256Gcm>::try_from(&data[..12]).map_err(|_| SseError::DecryptionFailed)?;
     let ciphertext = &data[12..];
 
     let cipher = Aes256Gcm::new(key.as_bytes().into());
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| SseError::DecryptionFailed)
 }
 

@@ -90,13 +90,11 @@ fn lower_statement(statement: &Statement) -> Result<LogicalOp, FrontendError> {
     match statement {
         Statement::Query(query) => lower_select(query),
         Statement::Insert(insert) => lower_insert(insert),
-        Statement::Update {
-            table,
-            assignments,
-            from: _,
-            selection,
-            ..
-        } => lower_update(table, assignments, selection.as_ref()),
+        Statement::Update(update) => lower_update(
+            &update.table,
+            &update.assignments,
+            update.selection.as_ref(),
+        ),
         Statement::Delete(delete) => lower_delete(delete),
         Statement::CreateTable(create) => lower_create_table(create),
         Statement::Drop {
@@ -138,16 +136,13 @@ fn lower_create_table(create: &SqlCreateTable) -> Result<LogicalOp, FrontendErro
         for opt in &col.options {
             match &opt.option {
                 ColumnOption::NotNull => not_null = true,
-                ColumnOption::Unique { is_primary, .. } => {
-                    if *is_primary {
-                        not_null = true;
-                        if !primary_key.contains(&col_name) {
-                            primary_key.push(col_name.clone());
-                        }
-                    } else {
-                        unique = true;
+                ColumnOption::PrimaryKey(_) => {
+                    not_null = true;
+                    if !primary_key.contains(&col_name) {
+                        primary_key.push(col_name.clone());
                     }
                 }
+                ColumnOption::Unique(_) => unique = true,
                 _ => {}
             }
         }
@@ -159,8 +154,13 @@ fn lower_create_table(create: &SqlCreateTable) -> Result<LogicalOp, FrontendErro
         });
     }
     for constraint in &create.constraints {
-        if let TableConstraint::PrimaryKey { columns: pk, .. } = constraint {
-            for ident in pk {
+        if let TableConstraint::PrimaryKey(pk) = constraint {
+            for index_column in &pk.columns {
+                // The parser models a key column as an ordered expression; a
+                // primary key here names plain columns only.
+                let SqlExpr::Identifier(ident) = &index_column.column.expr else {
+                    return Err(unsupported("PRIMARY KEY over an expression"));
+                };
                 if !primary_key.contains(&ident.value) {
                     primary_key.push(ident.value.clone());
                 }
@@ -284,8 +284,9 @@ fn assignment_column(target: &sqlparser::ast::AssignmentTarget) -> Result<String
         sqlparser::ast::AssignmentTarget::ColumnName(name) => name
             .0
             .last()
-            .map(|i| i.value.clone())
-            .ok_or_else(|| unsupported("empty assignment target")),
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.clone())
+            .ok_or_else(|| unsupported("assignment target is not a column name")),
         other => Err(unsupported(&format!("assignment target `{other}`"))),
     }
 }
@@ -358,6 +359,9 @@ fn lower_projection(items: &[SelectItem], var: &str) -> Result<Vec<ProjectItem>,
             SelectItem::QualifiedWildcard(..) => {
                 return Err(unsupported("qualified wildcard in SELECT"));
             }
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(unsupported("several aliases for one SELECT expression"));
+            }
         }
     }
     Ok(out)
@@ -365,8 +369,23 @@ fn lower_projection(items: &[SelectItem], var: &str) -> Result<Vec<ProjectItem>,
 
 /// `INSERT INTO <table> (<cols>) VALUES (...)` -> CreateNode per row.
 fn lower_insert(insert: &Insert) -> Result<LogicalOp, FrontendError> {
-    let label = object_name_string(&insert.table_name);
-    let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+    let sqlparser::ast::TableObject::TableName(table_name) = &insert.table else {
+        return Err(unsupported("INSERT into a table function"));
+    };
+    let label = object_name_string(table_name);
+    // A column is a (possibly qualified) name; the property is its last part.
+    let columns: Vec<String> = insert
+        .columns
+        .iter()
+        .map(|column| {
+            column
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.clone())
+                .ok_or_else(|| unsupported("INSERT column is not a plain name"))
+        })
+        .collect::<Result<_, _>>()?;
     if columns.is_empty() {
         return Err(unsupported("INSERT requires an explicit column list"));
     }
@@ -501,7 +520,13 @@ fn default_alias(expr: &SqlExpr) -> Option<String> {
 fn object_name_string(name: &sqlparser::ast::ObjectName) -> String {
     name.0
         .iter()
-        .map(|i| i.value.clone())
+        // A part is an identifier in every dialect we parse; the function form
+        // (`IDENTIFIER('x')`) belongs to dialects we do not, and renders as
+        // written so it names nothing rather than something else.
+        .map(|part| {
+            part.as_ident()
+                .map_or_else(|| part.to_string(), |ident| ident.value.clone())
+        })
         .collect::<Vec<_>>()
         .join(".")
 }

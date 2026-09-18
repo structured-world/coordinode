@@ -69,7 +69,7 @@ sha2 = { workspace = true }
 hex = "0.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { workspace = true }
-pgwire = "0.40.4"
+pgwire = "0.41"
 async-trait = "0.1.89"
 futures = "0.3.32"
 

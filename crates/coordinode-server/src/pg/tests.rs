@@ -154,8 +154,11 @@ async fn introspection_probes_are_answered() {
 async fn invalid_sql_returns_error_not_disconnect() {
     let (client, _dir) = connect().await;
     // A parse error must come back as a Postgres ErrorResponse, and the
-    // connection must stay usable for the next query.
-    let err = client.simple_query("SELECT FROM WHERE bogus").await;
+    // connection must stay usable for the next query. The statement is broken
+    // in every dialect (an unclosed parenthesis): the parser's generic dialect
+    // reads keywords as names, so `SELECT FROM WHERE bogus` is a valid scan of
+    // a table called WHERE to it.
+    let err = client.simple_query("SELECT * FROM (").await;
     assert!(err.is_err(), "invalid SQL must surface as an error");
     // Connection still alive: a valid statement succeeds afterwards.
     client

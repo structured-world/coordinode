@@ -100,8 +100,8 @@ impl Tokenizer for JiebaTokenizer {
 pub struct JiebaTokenStream<'a> {
     jieba: Arc<jieba_rs::Jieba>,
     text: &'a str,
-    /// Pre-computed (byte_start, byte_end) pairs from segmentation.
-    tokens: Vec<(usize, usize)>,
+    /// Pre-computed (byte_start, byte_end, char_start) triples from segmentation.
+    tokens: Vec<(usize, usize, usize)>,
     index: usize,
     current_token: Token,
     initialized: bool,
@@ -120,10 +120,14 @@ impl<'a> TokenStream for JiebaTokenStream<'a> {
             return false;
         }
 
-        let (start, end) = self.tokens[self.index];
+        let (start, end, char_start) = self.tokens[self.index];
         self.current_token.offset_from = start;
         self.current_token.offset_to = end;
-        self.current_token.position = self.index;
+        // Search mode emits overlapping segments: a compound and the words
+        // inside it. A position that is the segment's place in the text, not
+        // its place in the list, lets the same word sit at the same position
+        // in a document and in a query, which a phrase match depends on.
+        self.current_token.position = char_start;
         self.current_token.position_length = 1;
         self.current_token.text.clear();
         self.current_token.text.push_str(&self.text[start..end]);
@@ -147,26 +151,18 @@ impl<'a> TokenStream for JiebaTokenStream<'a> {
 /// better for search indexing (e.g., "中华人民共和国" → "中华", "华人",
 /// "人民", "共和", "共和国", "中华人民共和国").
 #[cfg(feature = "cjk-zh")]
-fn segment_with_offsets(jieba: &jieba_rs::Jieba, text: &str) -> Vec<(usize, usize)> {
-    let words = jieba.cut_for_search(text, true);
-    let mut offsets = Vec::with_capacity(words.len());
-    let mut byte_pos = 0;
-
-    for word in words {
-        // Find the word in the remaining text, starting from byte_pos.
-        // jieba returns words in order, so we scan forward.
-        if let Some(rel_start) = text[byte_pos..].find(word) {
-            let abs_start = byte_pos + rel_start;
-            let abs_end = abs_start + word.len();
-            // Skip empty/whitespace-only tokens
-            if !word.trim().is_empty() {
-                offsets.push((abs_start, abs_end));
-            }
-            byte_pos = abs_end;
-        }
-    }
-
-    offsets
+fn segment_with_offsets(jieba: &jieba_rs::Jieba, text: &str) -> Vec<(usize, usize, usize)> {
+    // jieba reports each token's byte range and character start in `text`.
+    // Search mode emits overlapping segments (a compound and the words inside
+    // it), so the ranges are taken as reported rather than recovered by
+    // scanning forward, which dropped every segment that overlapped the last.
+    jieba
+        .cut_for_search(text, true)
+        .into_iter()
+        // Skip empty/whitespace-only tokens
+        .filter(|token| !token.word.trim().is_empty())
+        .map(|token| (token.byte_start, token.byte_end, token.start))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +175,12 @@ fn segment_with_offsets(jieba: &jieba_rs::Jieba, text: &str) -> Vec<(usize, usiz
 /// - Japanese: IPAdic dictionary (MeCab-compatible, `cjk-ja` feature)
 /// - Korean: KO-dic dictionary (`cjk-ko` feature)
 ///
-/// The lindera `Tokenizer` is wrapped in `Arc` because it holds the
+/// The lindera `Segmenter` is wrapped in `Arc` because it holds the
 /// entire dictionary in memory (~20MB for IPAdic, ~15MB for KO-dic).
 #[cfg(any(feature = "cjk-ja", feature = "cjk-ko"))]
 #[derive(Clone)]
 pub struct LinderaTokenizer {
-    tokenizer: Arc<lindera::tokenizer::Tokenizer>,
+    segmenter: Arc<lindera::segmenter::Segmenter>,
 }
 
 #[cfg(any(feature = "cjk-ja", feature = "cjk-ko"))]
@@ -227,10 +223,9 @@ impl LinderaTokenizer {
 
         let segmenter =
             lindera::segmenter::Segmenter::new(lindera::mode::Mode::Normal, dictionary, None);
-        let tokenizer = lindera::tokenizer::Tokenizer::new(segmenter);
 
         Ok(Self {
-            tokenizer: Arc::new(tokenizer),
+            segmenter: Arc::new(segmenter),
         })
     }
 }
@@ -241,7 +236,7 @@ impl Tokenizer for LinderaTokenizer {
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         LinderaTokenStream {
-            tokenizer: Arc::clone(&self.tokenizer),
+            segmenter: Arc::clone(&self.segmenter),
             text,
             tokens: Vec::new(),
             index: 0,
@@ -257,7 +252,7 @@ impl Tokenizer for LinderaTokenizer {
 /// morphological analyzer, then yields tokens one at a time.
 #[cfg(any(feature = "cjk-ja", feature = "cjk-ko"))]
 pub struct LinderaTokenStream<'a> {
-    tokenizer: Arc<lindera::tokenizer::Tokenizer>,
+    segmenter: Arc<lindera::segmenter::Segmenter>,
     text: &'a str,
     /// Pre-computed (byte_start, byte_end, surface) triples.
     tokens: Vec<(usize, usize, String)>,
@@ -271,7 +266,7 @@ impl<'a> TokenStream for LinderaTokenStream<'a> {
     fn advance(&mut self) -> bool {
         if !self.initialized {
             self.initialized = true;
-            self.tokens = lindera_segment(self.tokenizer.as_ref(), self.text);
+            self.tokens = lindera_segment(self.segmenter.as_ref(), self.text);
             self.index = 0;
         }
 
@@ -306,10 +301,10 @@ impl<'a> TokenStream for LinderaTokenStream<'a> {
 /// cleaner search index entries.
 #[cfg(any(feature = "cjk-ja", feature = "cjk-ko"))]
 fn lindera_segment(
-    tokenizer: &lindera::tokenizer::Tokenizer,
+    segmenter: &lindera::segmenter::Segmenter,
     text: &str,
 ) -> Vec<(usize, usize, String)> {
-    let lindera_tokens = match tokenizer.tokenize(text) {
+    let lindera_tokens = match segmenter.segment(std::borrow::Cow::Borrowed(text)) {
         Ok(tokens) => tokens,
         Err(e) => {
             tracing::warn!("lindera tokenization failed: {e}");

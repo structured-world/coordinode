@@ -13,7 +13,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Per-piece transfer compression. Pure-Rust LZ4 (hot) + zstd (cold); the project
 # never links C zstd.
 lz4_flex = "0.14"
-structured-zstd = "0.0.49"
+# `^0` on purpose: the crate is ours and still on 0.0.x, where a plain
+# requirement pins one exact version and `cargo update` never moves it.
+structured-zstd = "^0"
 
 [lints]
 workspace = true

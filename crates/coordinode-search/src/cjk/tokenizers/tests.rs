@@ -50,6 +50,49 @@ fn jieba_byte_offsets_correct() {
     }
 }
 
+/// Search mode yields a compound next to the words inside it. Each segment
+/// keeps its own byte range, and its position is where it starts in the text,
+/// so the compound and its first word share a position. A query for the
+/// compound tokenizes the same way and lines up with the document.
+#[cfg(feature = "cjk-zh")]
+#[test]
+fn jieba_overlapping_segments_keep_their_place_in_the_text() {
+    let mut tok = JiebaTokenizer::new();
+    let text = "数据库系统设计";
+    let mut stream = tok.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        let t = stream.token();
+        assert_eq!(&text[t.offset_from..t.offset_to], t.text);
+        tokens.push((t.text.clone(), t.position));
+    }
+    let position_of = |word: &str| {
+        tokens
+            .iter()
+            .find(|(text, _)| text == word)
+            .map(|(_, position)| *position)
+    };
+    assert_eq!(
+        position_of("数据库"),
+        Some(0),
+        "the compound is indexed: {tokens:?}"
+    );
+    assert_eq!(position_of("数据"), Some(0), "{tokens:?}");
+    assert_eq!(position_of("系统"), Some(3), "{tokens:?}");
+    assert_eq!(position_of("设计"), Some(5), "{tokens:?}");
+
+    // The same word alone sits at the same relative positions.
+    let mut stream = tok.token_stream("数据库");
+    let mut query = Vec::new();
+    while stream.advance() {
+        let t = stream.token();
+        query.push((t.text.clone(), t.position));
+    }
+    for (word, position) in &query {
+        assert_eq!(position_of(word), Some(*position), "{word}: {tokens:?}");
+    }
+}
+
 #[cfg(feature = "cjk-zh")]
 #[test]
 fn jieba_empty_input() {

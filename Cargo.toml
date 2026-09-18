@@ -60,8 +60,8 @@ rust-stemmers = { git = "https://github.com/structured-world/rust-stemmers.git",
 whatlang = "0.18"
 
 # CJK tokenization (optional, per-language feature flags)
-lindera = { version = "3", default-features = false }
-jieba-rs = "0.8"
+lindera = { version = "6", default-features = false }
+jieba-rs = "0.11"
 
 # gRPC
 tonic = "0.14"
@@ -95,14 +95,14 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 pest = "2"
 pest_derive = "2"
 # SQL parser for the SQL QueryFrontend, pure Rust, Apache-2.0.
-sqlparser = "0.52"
+sqlparser = "0.63"
 
 # Error handling
 thiserror = "2"
 
 # Crypto
 sha2 = "0.11"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hmac = "0.13"
 rand = "0.10"
 
