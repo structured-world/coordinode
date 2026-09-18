@@ -274,6 +274,65 @@ fn history_below_the_watermark(s: Subject) {
     );
 }
 
+/// A restart with the clock behind the last compaction's watermark (a host
+/// that boots before its clock is synchronised, a restore onto a machine
+/// running slow) still opens and reads itself. The schema partition is the
+/// sharp case: its newest write is as old as the database while its floor is
+/// as recent as the last compaction, and the routing read that precedes
+/// every other partition's open goes through it.
+#[test]
+fn reopen_with_the_clock_behind_the_floor_still_opens() {
+    let base = future_base();
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let s = SUBJECTS[0];
+
+    let floor = {
+        let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(base)));
+        let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
+        engine.set_retention_window(Duration::from_secs(1));
+        put_in(&engine, s.pid, s.key, b"v", base + 10_000_000);
+        for part in Partition::all() {
+            if *part != Partition::Raft {
+                engine.force_compaction(*part).expect("compact");
+            }
+        }
+        engine.persist().expect("persist");
+        let floor = engine.oldest_readable_seqno();
+        assert!(
+            floor > base,
+            "the compactions recorded a floor in the future"
+        );
+        floor
+    };
+
+    // A fresh oracle reads the wall clock, which `future_base` put far
+    // behind every timestamp above.
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle))
+        .expect("reopen with the clock behind the floor");
+    assert!(
+        engine.snapshot() >= floor,
+        "the clock resumes above everything the previous session recorded"
+    );
+    assert_eq!(
+        engine.get(s.part, s.key).expect("get").map(|b| b.to_vec()),
+        Some(b"v".to_vec())
+    );
+    // New commits land above the old ones, not under them.
+    put_in(&engine, s.pid, s.key, b"after", oracle.next().as_raw());
+    assert_eq!(
+        engine.get(s.part, s.key).expect("get").map(|b| b.to_vec()),
+        Some(b"after".to_vec())
+    );
+}
+
 /// A delete is a version like any other. Inside the window a snapshot before
 /// it still reads the value and one after it reads nothing; once the
 /// tombstone is the newest version below the watermark, the fold must not

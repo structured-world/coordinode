@@ -416,11 +416,19 @@ impl StorageEngine {
 
         // Restore seqno from Schema BEFORE reading routing — the routing
         // get() needs a fresh seqno bound so it observes prior persisted
-        // writes.
+        // writes, and one above the tree's retention floor so it is served at
+        // all. The two differ most here: schema rows are as old as the
+        // database while the floor is as recent as the last compaction, so a
+        // clock that restarts behind that compaction would otherwise read
+        // below the floor and fail the open. Same seeding as the whole-engine
+        // restore below, for the one tree read before it.
         {
             use lsm_tree::AbstractTree;
             if let Some(max) = schema_tree.get_highest_seqno() {
                 seqno.fetch_max(max + 1);
+            }
+            if let Some(first_servable) = schema_tree.retention_floor().checked_add(1) {
+                seqno.fetch_max(first_servable);
             }
         }
 
