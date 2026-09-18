@@ -98,6 +98,25 @@ fn flush_in(engine: &StorageEngine, part: Partition) {
         .expect("flush");
 }
 
+/// Tables an install replaced are unlinked in the background, so a figure read
+/// right after a compaction can still count them. Polls until nothing is held
+/// beside the live version; if that never happens it returns the last sample,
+/// so the caller's assertion reports the number rather than a timeout.
+fn drained_history(
+    engine: &StorageEngine,
+    part: Partition,
+) -> crate::engine::retention_stats::RetainedHistory {
+    let mut last = engine.retained_history(part).expect("stats");
+    for _ in 0..200 {
+        if last.retained_bytes == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        last = engine.retained_history(part).expect("stats");
+    }
+    last
+}
+
 fn put_at(engine: &StorageEngine, key: &[u8], value: &[u8], commit_ts: u64) {
     put_in(engine, PartitionId::Node, key, value, commit_ts);
 }
@@ -193,10 +212,7 @@ fn history_below_the_watermark(s: Subject) {
     // compaction consumed are released at its install, and the older version
     // is still readable because the output kept it.
     assert_eq!(
-        engine
-            .retained_history(s.part)
-            .expect("stats")
-            .retained_bytes,
+        drained_history(&engine, s.part).retained_bytes,
         0,
         "{s:?}: no table is held only for history"
     );
@@ -448,7 +464,7 @@ fn retained_history_follows_the_window() {
     flush(&engine);
     engine.force_compaction(Partition::Node).expect("compact");
 
-    let inside = engine.retained_history(Partition::Node).expect("stats");
+    let inside = drained_history(&engine, Partition::Node);
     assert!(inside.live_bytes > 0, "the compacted output is live");
     assert_eq!(
         inside.retained_bytes, 0,
@@ -480,7 +496,7 @@ fn retained_history_follows_the_window() {
     engine.advance_gc_watermark();
     engine.force_compaction(Partition::Node).expect("compact");
 
-    let released = engine.retained_history(Partition::Node).expect("stats");
+    let released = drained_history(&engine, Partition::Node);
     assert!(released.live_bytes > 0);
     assert_eq!(released.retained_bytes, 0);
     // The window's cost was the superseded version inside the output; folding
@@ -665,7 +681,11 @@ fn retained_history_spans_level_routed_endpoints() {
         "precondition: the bottom level landed on the cold endpoint"
     );
 
-    let history = engine.retained_history(Partition::Node).expect("stats");
+    // Measured once the tables the compaction moved off the hot endpoint are
+    // unlinked: until then they sit in the primary folder and the comparison
+    // against it below says nothing.
+    let history = drained_history(&engine, Partition::Node);
+    assert_eq!(history.retained_bytes, 0, "the moved tables are released");
     let tree = engine.tree(Partition::Node).expect("tree");
     assert_eq!(
         history.live_bytes,
