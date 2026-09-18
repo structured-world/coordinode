@@ -1,7 +1,8 @@
 # Changelog
 
-All notable changes to this crate are documented in this file.
-This file is auto-generated from the workspace CHANGELOG.md by scripts/split-changelog.py.
+Changes to this crate up to v0.5.8. The server is the shipped binary, so its
+later releases are recorded in the repository's root
+[CHANGELOG.md](../../CHANGELOG.md), together with every crate it is built from.
 
 ## 0.5.8 - 2026-09-05
 

@@ -33,22 +33,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-plz-fork
+          key: release-plz-0.3.168
 
-      # We build release-plz from our own fork which patches the git_only cargo
-      # package fallback bug (upstream issue #2595). Upstream v0.3.157 runs
-      # `cargo package --workspace` against the baseline tag checkout and fails
-      # when `[workspace.dependencies]` path entries don't have a version field
-      # at that commit. Our fork falls back to a source-directory comparator.
-      #
-      # When upstream release-plz ships a proper fix, this step should be
-      # replaced with `uses: release-plz/action@v0.5` again.
-      - name: Install forked release-plz
-        run: |
-          cargo install --git https://github.com/structured-world/release-plz.git \
-            --branch 'feat/#2791-workspace-changelog' \
-            --locked \
-            release-plz
+      # Pinned: a release tool that changes behaviour between two runs of the
+      # same commit is not something to find out about from a release PR. Bump
+      # the version here (and the cache key above) after reproducing both
+      # commands' effect on a throwaway clone.
+      - name: Install release-plz
+        run: cargo install release-plz --version 0.3.168 --locked
 
       - name: Run release-plz release
         # Runs first so the git tag exists before release-pr computes the next
@@ -77,24 +69,5 @@ jobs:
             --git-token "${GITHUB_TOKEN}" \
             --config .release-plz.toml \
             --verbose
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
-      - name: Split workspace changelog into per-crate files
-        # Regenerates crates/*/CHANGELOG.md from the workspace CHANGELOG.md.
-        # release-plz writes only the aggregate file when workspace_changelog is
-        # set, so the per-crate ones are derived here and committed to main.
-        # The commit is typed "chore(changelog)" so the parsers skip it: it
-        # touches all twenty crate directories, and any other type would file it
-        # as a change in every one of them.
-        # No-op on non-release pushes (git diff --quiet exits 0, step skipped).
-        run: |
-          python3 scripts/split-changelog.py
-          git diff --quiet && exit 0
-          git config user.name "sw-release-bot[bot]"
-          git config user.email "255865126+sw-release-bot[bot]@users.noreply.github.com"
-          git add crates/*/CHANGELOG.md scripts/split-changelog.py
-          git commit -m "chore(changelog): regenerate per-crate changelogs from workspace"
-          git push
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
