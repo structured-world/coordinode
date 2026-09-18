@@ -649,11 +649,7 @@ All notable changes to this crate are documented in this file.
 - *(query)* add regression tests for text_match hard-fail on missing FT-index
 - *(query)* cover rrf_score edge cases missed in the initial PR
 
----
-
-## Unreleased
-
-#### Added
+#### Notes
 
 - *(query)* `rrf_score([method_exprs…], {vector: …, text: …})` - Reciprocal Rank Fusion Cypher function. N-method rank fusion with competition ranks, `k=60` (IR standard, non-tunable), per-method direction from HNSW metric config. Supports node vectors, edge vectors (brute-force), and BM25 text methods.
 

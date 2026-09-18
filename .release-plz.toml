@@ -23,12 +23,29 @@ git_tag_name = "v{{ version }}"
 # real change lands.
 release_commits = "^(feat|fix|perf|refactor|docs|test)"
 
+# Every crate shares one version and the server's changelog already folds in
+# the commits of all of them, so the release PR shows that one changelog. The
+# default body lists every crate separately, and for a crate that only got the
+# version bump it prints the previous entry of its changelog as if it were new.
+pr_body = """
+## New release
+
+{% for release in releases %}{% if release.package == "coordinode-server" %}
+`coordinode` {{ release.previous_version }} -> {{ release.next_version }} (all {{ releases | length }} workspace crates share this version)
+
+{% if release.changelog %}{{ release.changelog }}{% endif %}
+{% endif %}{% endfor %}
+---
+This PR was generated with [release-plz](https://github.com/release-plz/release-plz/).
+"""
+
 [changelog]
-# The upstream default body with two changes: the version header is
+# The upstream default body with one change: the version header is
 # `## v<version> - <date>`, the shape the release workflow extracts the GitHub
-# release notes by, and each release ends with the `---` rule the earlier
-# entries are separated by (the same workflow stops the notes at it).
+# release notes by. The blank first line is part of the layout: it separates
+# the entry from what precedes it in the file.
 body = """
+
 ## v{{ version }} - {{ timestamp | date(format="%Y-%m-%d") }}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
@@ -40,12 +57,7 @@ body = """
 - {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
 {% endif -%}
 {% endfor -%}
-{% endfor %}
----
-"""
-# Untrimmed, so the rule keeps the newline that separates it from the entry
-# below; release-plz adds the blank line between the two itself.
-trim = false
+{% endfor %}"""
 commit_parsers = [
     { message = "^chore", skip = true },
     { message = "^ci", skip = true },
