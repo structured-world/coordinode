@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
 /// Logic-test fixture — uses in-memory MemFs backing. The 9 CRUD
@@ -67,6 +68,114 @@ fn create_relationship() {
     let result =
         db.execute_cypher("CREATE (a:User {name: 'Alice'})-[:KNOWS]->(b:User {name: 'Bob'})");
     assert!(result.is_ok(), "relationship creation should not error");
+}
+
+/// `(source id, target id)` of every edge of `edge_type`, sorted.
+fn edge_endpoints(db: &mut Database, edge_type: &str) -> Vec<(Option<Value>, Option<Value>)> {
+    let mut pairs: Vec<_> = db
+        .execute_cypher(&format!(
+            "MATCH (s)-[:{edge_type}]->(t) RETURN s.id AS s, t.id AS t"
+        ))
+        .expect("match edges")
+        .iter()
+        .map(|row| (row.get("s").cloned(), row.get("t").cloned()))
+        .collect();
+    pairs.sort_by_key(|pair| format!("{pair:?}"));
+    pairs
+}
+
+/// A path whose nodes carry no variable still gets its relationship: the
+/// nodes and the edge between them are one CREATE, not nodes alone.
+#[test]
+fn create_path_with_anonymous_nodes_creates_the_edge() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (:Anon {id: 1})-[:BOTH {w: 7}]->(:Anon {id: 2})")
+        .expect("create");
+    assert_eq!(
+        edge_endpoints(&mut db, "BOTH"),
+        vec![(Some(Value::Int(1)), Some(Value::Int(2)))]
+    );
+    let rows = db
+        .execute_cypher("MATCH (:Anon)-[r:BOTH]->(:Anon) RETURN r.w AS w")
+        .expect("match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("w"), Some(&Value::Int(7)));
+}
+
+/// One anonymous end on either side, and an incoming arrow between two
+/// anonymous nodes: the edge runs from the node the arrow leaves.
+#[test]
+fn create_path_with_one_anonymous_end_creates_the_edge() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (:Anon {id: 1})-[:LEFT_ANON]->(b:Anon {id: 2})")
+        .expect("create");
+    db.execute_cypher("CREATE (a:Anon {id: 3})-[:RIGHT_ANON]->(:Anon {id: 4})")
+        .expect("create");
+    db.execute_cypher("CREATE (:Anon {id: 5})<-[:INCOMING]-(:Anon {id: 6})")
+        .expect("create");
+    assert_eq!(
+        edge_endpoints(&mut db, "LEFT_ANON"),
+        vec![(Some(Value::Int(1)), Some(Value::Int(2)))]
+    );
+    assert_eq!(
+        edge_endpoints(&mut db, "RIGHT_ANON"),
+        vec![(Some(Value::Int(3)), Some(Value::Int(4)))]
+    );
+    assert_eq!(
+        edge_endpoints(&mut db, "INCOMING"),
+        vec![(Some(Value::Int(6)), Some(Value::Int(5)))]
+    );
+}
+
+/// Anonymous nodes in one path are distinct nodes: a chain wires each edge to
+/// its own neighbours, not every edge to the last node created.
+#[test]
+fn create_chain_of_anonymous_nodes_wires_each_edge_to_its_neighbours() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (:Anon {id: 1})-[:CHAIN]->(:Anon {id: 2})-[:CHAIN]->(:Anon {id: 3})")
+        .expect("create");
+    assert_eq!(
+        edge_endpoints(&mut db, "CHAIN"),
+        vec![
+            (Some(Value::Int(1)), Some(Value::Int(2))),
+            (Some(Value::Int(2)), Some(Value::Int(3))),
+        ]
+    );
+}
+
+/// An anonymous path node with no labels or properties cannot refer to
+/// anything bound, so it is a new, empty node and the edge reaches it.
+#[test]
+fn create_path_to_an_empty_anonymous_node_creates_it() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:Anon {id: 1})-[:TO_EMPTY]->()")
+        .expect("create");
+    assert_eq!(
+        edge_endpoints(&mut db, "TO_EMPTY"),
+        vec![(Some(Value::Int(1)), Some(Value::Null))],
+        "one edge, from the labelled node to a node without an id property"
+    );
+}
+
+/// A relationship whose end was never bound is an error, not a statement that
+/// succeeds with the nodes written and the edge missing.
+#[test]
+fn create_relationship_to_an_unbound_end_is_not_silently_dropped() {
+    let mut db = open_db();
+    let result = db.execute_cypher("CREATE (a:Anon {id: 1})-[:DANGLING]->(b)");
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains('b'),
+            "the error names the unbound end: {e}"
+        ),
+        Ok(_) => assert_eq!(
+            db.execute_cypher("MATCH (:Anon)-[r:DANGLING]->() RETURN r")
+                .expect("match")
+                .len(),
+            1,
+            "a statement that succeeds must have created its relationship"
+        ),
+    }
 }
 
 // ── MATCH ───────────────────────────────────────────────────────────

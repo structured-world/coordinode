@@ -3649,21 +3649,37 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
 fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<LogicalOp, PlanError> {
     let mut result = current.unwrap_or(LogicalOp::Empty);
 
-    for pattern in &cc.patterns {
+    for (pattern_idx, pattern) in cc.patterns.iter().enumerate() {
         let elements = &pattern.elements;
+        let is_path = elements.len() > 1;
+
+        // The row column a pattern node's id lives under. A path node written
+        // without a variable still has to be addressable by the relationships
+        // beside it, and distinctly from the other anonymous nodes of the same
+        // path, so it gets a name no identifier can spell. A lone anonymous
+        // node has nobody referring to it and keeps the executor's default.
+        let node_column = |elem_idx: usize, np: &NodePattern| -> Option<String> {
+            match &np.variable {
+                Some(v) => Some(v.clone()),
+                None if is_path => Some(format!("_#{pattern_idx}_{elem_idx}")),
+                None => None,
+            }
+        };
 
         // Two-pass: first create all nodes, then all edges.
         // This ensures that both source and target nodes exist in the row
         // before CreateEdge tries to read their IDs.
 
-        // Pass 1: create nodes
-        for element in elements {
+        // Pass 1: create nodes. A variable with no labels or properties refers
+        // to a node bound earlier and creates nothing; an anonymous path node
+        // cannot refer to anything, so it is always a new node.
+        for (elem_idx, element) in elements.iter().enumerate() {
             if let PatternElement::Node(np) = element {
                 let has_content = !np.labels.is_empty() || !np.properties.is_empty();
-                if has_content {
+                if has_content || (is_path && np.variable.is_none()) {
                     result = LogicalOp::CreateNode {
                         input: Some(Box::new(result)),
-                        variable: np.variable.clone(),
+                        variable: node_column(elem_idx, np),
                         labels: np.labels.clone(),
                         properties: lower_property_filters(&np.properties)?,
                     };
@@ -3676,7 +3692,7 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
             if let PatternElement::Relationship(rp) = element {
                 let source_var = if i > 0 {
                     match &elements[i - 1] {
-                        PatternElement::Node(np) => np.variable.clone().unwrap_or_default(),
+                        PatternElement::Node(np) => node_column(i - 1, np).unwrap_or_default(),
                         _ => String::new(),
                     }
                 } else {
@@ -3685,7 +3701,7 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
 
                 let target_var = if i + 1 < elements.len() {
                     match &elements[i + 1] {
-                        PatternElement::Node(np) => np.variable.clone().unwrap_or_default(),
+                        PatternElement::Node(np) => node_column(i + 1, np).unwrap_or_default(),
                         _ => String::new(),
                     }
                 } else {

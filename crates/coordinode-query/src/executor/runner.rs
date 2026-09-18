@@ -1199,13 +1199,13 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// MVCC-aware typed delete of a temporal node version (tombstone
-    /// at the specific 25-byte temporal key). Reserved for a future
-    /// GDPR erasure path that hard-deletes individual versions; the
-    /// standard bitemporal delete path uses close-current +
-    /// tombstone-version inserts via [`Self::mvcc_put_node_temporal`]
-    /// instead. No production caller in coordinode-query yet — added
-    /// alongside the read/write pair so the typed surface stays
-    /// symmetric.
+    /// at the specific 25-byte temporal key). Reserved for the
+    /// privileged erase operation that removes individual versions
+    /// physically; the standard bitemporal delete path uses
+    /// close-current + tombstone-version inserts via
+    /// [`Self::mvcc_put_node_temporal`] instead. No production caller
+    /// in coordinode-query yet — added alongside the read/write pair so
+    /// the typed surface stays symmetric.
     pub fn mvcc_delete_node_temporal(
         &mut self,
         shard_id: u16,
@@ -8840,15 +8840,28 @@ fn execute_create_edge(
         }
     }
 
+    // An end that names no column was never bound by this statement: nothing
+    // upstream matched or created it. Skipping the row would report success
+    // with the nodes written and the relationship missing.
+    let unbound = |end: &str| {
+        ExecutionError::Unsupported(format!(
+            "CREATE relationship of type '{edge_type}': end '{end}' is not bound to a node; \
+             bind it with MATCH, or give it a label or properties so CREATE makes it"
+        ))
+    };
+
     for row in input_rows {
-        // Get source and target node IDs from the row
+        // Get source and target node IDs from the row. A bound end holding no
+        // node (an OPTIONAL MATCH that found nothing) adds no edge for the row.
         let source_id = match row.get(source) {
             Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
-            _ => continue,
+            Some(_) => continue,
+            None => return Err(unbound(source)),
         };
         let target_id = match row.get(target) {
             Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
-            _ => continue,
+            Some(_) => continue,
+            None => return Err(unbound(target)),
         };
 
         // Forward + reverse posting lists (commutative merge) via the store.
@@ -10708,10 +10721,9 @@ fn execute_delete(
     //     ─── valid_from = 100, valid_to = NOW ──── (was alive)
     //     ─── valid_from = NOW, __deleted__ = true ── (tombstone)
     //
-    // Hard erasure across ALL versions (GDPR right-to-erase) requires
-    // an explicit `WITH GDPR_ERASURE` modifier on DELETE — parser
-    // support lands in R172c Phase 3b. Until then a tombstone is the
-    // only DELETE mode on temporal labels.
+    // Hard erasure across ALL versions is a separate privileged erase
+    // operation, never a modifier on DELETE: a tombstone is the only
+    // DELETE mode on temporal labels.
     //
     // Pre-scan: collect temporal-label node deletions for this DELETE
     // clause; edge variables (Value::String) take the normal path.
@@ -13364,7 +13376,7 @@ fn emit_attach_set_path(
 /// Temporal: `DELETE r` is a hard delete of the logical edge — every version
 /// of the pair is removed, then adj-posting is cleared. The "soft-close one
 /// version" workflow is `SET r.valid_to = <now>`, not DELETE. Hard deletes are
-/// rare (GDPR erase, mistaken insert) but must be supported.
+/// rare (a mistaken insert, a privileged erase) but must be supported.
 fn delete_single_edge(
     src: NodeId,
     tgt: NodeId,
