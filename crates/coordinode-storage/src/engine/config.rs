@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use lsm_tree::CompressionType;
 use serde::{Deserialize, Serialize};
@@ -924,8 +923,11 @@ impl StorageConfig {
     ///
     /// Each partition opens its own `AnyTree` in `data_dir/<partition_name>/`.
     /// - Shared `seqno` generator (oracle or counter) for cross-tree MVCC ordering.
-    /// - Seqno-based retention compaction filter on all partitions except `Adj`
-    ///   (Adj + Node use merge operators; GC filter would destroy pending operands).
+    /// - No compaction filter on any partition: MVCC retention is the merge
+    ///   stream's own fold at the watermark each compaction is handed, and a
+    ///   user filter that removed rows would mark every install as dropping
+    ///   data, raising the read floor to the install and refusing every
+    ///   snapshot inside the retention window.
     /// - `PostingListMerge` merge operator on `Adj`.
     /// - `DocumentMerge` merge operator on `Node` (ADR-015).
     /// - KV separation (BlobTree) for the `Blob` partition.
@@ -933,9 +935,8 @@ impl StorageConfig {
         &self,
         part: Partition,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
-        gc_watermark: &Arc<AtomicU64>,
     ) -> lsm_tree::Config {
-        self.to_tree_config_with_routing(part, seqno, gc_watermark, None)
+        self.to_tree_config_with_routing(part, seqno, None)
     }
 
     /// As [`Self::to_tree_config`] but with explicit per-LSM-level
@@ -950,7 +951,6 @@ impl StorageConfig {
         &self,
         part: Partition,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
-        gc_watermark: &Arc<AtomicU64>,
         routing: Option<&crate::engine::routing::PartitionRouting>,
     ) -> lsm_tree::Config {
         // Build compression policy — partition-level override or global.
@@ -1004,23 +1004,18 @@ impl StorageConfig {
             }
         }
 
-        // Partitions with merge operators: no retention filter
-        // (merge operands must survive compaction for the merge function to combine them).
+        // Merge operators, per partition:
         //
         // - Adj: PostingListMerge — conflict-free edge writes via Add/Remove deltas.
         // - Node: DocumentMerge — path-targeted partial document updates (ADR-015).
         //   Handles both full NodeRecords (0x00 prefix) and DocDelta operands (0x01).
-        // - Counter: CounterMerge — atomic i64 increment/decrement (R163b).
+        // - Counter: CounterMerge — atomic i64 increment/decrement.
         if part == Partition::Adj {
             config = config.with_merge_operator(Some(Arc::new(PostingListMerge)));
         } else if part == Partition::Node {
             config = config.with_merge_operator(Some(Arc::new(DocumentMerge)));
         } else if part == Partition::Counter {
             config = config.with_merge_operator(Some(Arc::new(CounterMerge)));
-        } else {
-            // All other partitions: seqno-based MVCC retention filter.
-            let gc_factory = super::mvcc_gc::seqno_retention_factory(Arc::clone(gc_watermark));
-            config = config.with_compaction_filter_factory(Some(gc_factory));
         }
 
         // Blob partition: key-value separation for large blobs (>= 4KB default).

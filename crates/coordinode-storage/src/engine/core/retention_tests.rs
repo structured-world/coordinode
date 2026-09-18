@@ -23,11 +23,40 @@ fn oracle_engine(base: u64) -> (StorageEngine, Arc<TimestampOracle>, TempDir) {
     (engine, oracle, dir)
 }
 
-fn put_at(engine: &StorageEngine, key: &[u8], value: &[u8], commit_ts: u64) {
+/// A partition under test with keys of its own shape.
+#[derive(Debug, Clone, Copy)]
+struct Subject {
+    part: Partition,
+    pid: PartitionId,
+    key: &'static [u8],
+    other_key: &'static [u8],
+    prefix: &'static [u8],
+}
+
+/// `Node` carries a merge operator and `EdgeProp` does not: the two run
+/// different compaction configurations and owe the same retention contract.
+const SUBJECTS: [Subject; 2] = [
+    Subject {
+        part: Partition::Node,
+        pid: PartitionId::Node,
+        key: b"node:00:00000001",
+        other_key: b"node:00:00000002",
+        prefix: b"node:",
+    },
+    Subject {
+        part: Partition::EdgeProp,
+        pid: PartitionId::EdgeProp,
+        key: b"edgeprop:T:00000001:00000002",
+        other_key: b"edgeprop:T:00000001:00000003",
+        prefix: b"edgeprop:",
+    },
+];
+
+fn put_in(engine: &StorageEngine, pid: PartitionId, key: &[u8], value: &[u8], commit_ts: u64) {
     engine
         .apply_proposal_at(
             &[Mutation::Put {
-                partition: PartitionId::Node,
+                partition: pid,
                 key: key.to_vec(),
                 value: value.to_vec(),
             }],
@@ -36,20 +65,49 @@ fn put_at(engine: &StorageEngine, key: &[u8], value: &[u8], commit_ts: u64) {
         .expect("apply");
 }
 
-fn read_at(engine: &StorageEngine, key: &[u8], snapshot: u64) -> StorageResult<Option<Vec<u8>>> {
+fn delete_in(engine: &StorageEngine, pid: PartitionId, key: &[u8], commit_ts: u64) {
     engine
-        .snapshot_get(&snapshot, Partition::Node, key)
+        .apply_proposal_at(
+            &[Mutation::Delete {
+                partition: pid,
+                key: key.to_vec(),
+            }],
+            commit_ts,
+        )
+        .expect("apply");
+}
+
+fn read_in(
+    engine: &StorageEngine,
+    part: Partition,
+    key: &[u8],
+    snapshot: u64,
+) -> StorageResult<Option<Vec<u8>>> {
+    engine
+        .snapshot_get(&snapshot, part, key)
         .map(|v| v.map(|b| b.to_vec()))
 }
 
 /// Seal the current memtable into its own table so the next compaction has
 /// several tables to merge (a lone table is never rewritten).
-fn flush(engine: &StorageEngine) {
+fn flush_in(engine: &StorageEngine, part: Partition) {
     engine
-        .tree(Partition::Node)
+        .tree(part)
         .expect("tree")
         .flush_active_memtable(0)
         .expect("flush");
+}
+
+fn put_at(engine: &StorageEngine, key: &[u8], value: &[u8], commit_ts: u64) {
+    put_in(engine, PartitionId::Node, key, value, commit_ts);
+}
+
+fn read_at(engine: &StorageEngine, key: &[u8], snapshot: u64) -> StorageResult<Option<Vec<u8>>> {
+    read_in(engine, Partition::Node, key, snapshot)
+}
+
+fn flush(engine: &StorageEngine) {
+    flush_in(engine, Partition::Node);
 }
 
 /// Wall-clock microseconds now plus a wide margin: opening an engine
@@ -63,19 +121,6 @@ fn future_base() -> u64 {
     u64::try_from(now).expect("fits") + 1_000_000_000_000
 }
 
-fn count_files(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    for entry in std::fs::read_dir(dir).expect("read_dir") {
-        let entry = entry.expect("entry");
-        if entry.path().is_dir() {
-            n += count_files(&entry.path());
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
-
 /// Inside the window, time travel is exact across compaction: a key written
 /// before a point and rewritten after it still reads its older version at
 /// that point, a key never rewritten keeps its value, and the live version
@@ -83,76 +128,94 @@ fn count_files(dir: &std::path::Path) -> usize {
 /// tree serves each one from the version that was current at it.
 #[test]
 fn time_travel_inside_the_window_survives_compaction() {
-    let base = future_base();
-    let (engine, _oracle, _dir) = oracle_engine(base);
-    engine.set_retention_window(Duration::from_secs(3_600));
-    let key = b"node:00:00000001";
+    for s in SUBJECTS {
+        let base = future_base();
+        let (engine, _oracle, _dir) = oracle_engine(base);
+        engine.set_retention_window(Duration::from_secs(3_600));
 
-    put_at(&engine, key, b"v1", base + 1_000);
-    flush(&engine);
-    put_at(&engine, key, b"v2", base + 3_000);
-    flush(&engine);
-    put_at(&engine, b"node:00:00000002", b"lonely", base + 1_500);
+        put_in(&engine, s.pid, s.key, b"v1", base + 1_000);
+        flush_in(&engine, s.part);
+        put_in(&engine, s.pid, s.key, b"v2", base + 3_000);
+        flush_in(&engine, s.part);
+        put_in(&engine, s.pid, s.other_key, b"lonely", base + 1_500);
 
-    engine.force_compaction(Partition::Node).expect("compact");
+        engine.force_compaction(s.part).expect("compact");
 
-    assert_eq!(
-        read_at(&engine, key, base + 4_000).expect("read"),
-        Some(b"v2".to_vec())
-    );
-    assert_eq!(
-        read_at(&engine, key, base + 2_500).expect("read"),
-        Some(b"v1".to_vec()),
-        "the version current between the two writes is readable after compaction"
-    );
-    assert_eq!(
-        read_at(&engine, b"node:00:00000002", base + 4_000).expect("read"),
-        Some(b"lonely".to_vec())
-    );
-    assert_eq!(
-        read_at(&engine, b"node:00:00000002", base + 1_200).expect("read"),
-        None,
-        "a snapshot before the write does not see it"
-    );
+        assert_eq!(
+            read_in(&engine, s.part, s.key, base + 4_000).expect("read"),
+            Some(b"v2".to_vec()),
+            "{s:?}"
+        );
+        assert_eq!(
+            read_in(&engine, s.part, s.key, base + 2_500).expect("read"),
+            Some(b"v1".to_vec()),
+            "{s:?}: the version current between the two writes is readable after compaction"
+        );
+        assert_eq!(
+            read_in(&engine, s.part, s.other_key, base + 4_000).expect("read"),
+            Some(b"lonely".to_vec()),
+            "{s:?}"
+        );
+        assert_eq!(
+            read_in(&engine, s.part, s.other_key, base + 1_200).expect("read"),
+            None,
+            "{s:?}: a snapshot before the write does not see it"
+        );
+    }
 }
 
-/// Once the clock moves the watermark past a compaction, the history below
-/// it is released (the retained tree versions and their tables go) and a
-/// read there is refused rather than answered from what survived.
+/// Inside the window the superseded key version survives in the compaction
+/// output, so the old snapshot is served from the latest tables while the
+/// consumed inputs are already gone. Once the clock moves the watermark past
+/// it, a compaction folds the version away and a read there is refused
+/// rather than answered from what survived.
 #[test]
 fn history_below_the_watermark_is_released_and_refused() {
-    let base = future_base();
-    let (engine, oracle, dir) = oracle_engine(base);
-    engine.set_retention_window(Duration::from_secs(1));
-    let key = b"node:00:00000001";
+    for s in SUBJECTS {
+        history_below_the_watermark(s);
+    }
+}
 
-    put_at(&engine, key, b"v1", base + 1_000);
-    flush(&engine);
-    put_at(&engine, key, b"v2", base + 3_000);
-    flush(&engine);
-    engine.force_compaction(Partition::Node).expect("compact");
-    // The compaction inputs stay on disk: the watermark (1 s behind the
-    // clock) is still below the versions that reference them.
-    let retained = count_files(dir.path());
+fn history_below_the_watermark(s: Subject) {
+    let base = future_base();
+    let (engine, oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(1));
+
+    put_in(&engine, s.pid, s.key, b"v1", base + 1_000);
+    // A key written once and never again: the fold below must leave it alone
+    // while it collects the rewritten key's history beside it.
+    put_in(&engine, s.pid, s.other_key, b"cold", base + 1_500);
+    flush_in(&engine, s.part);
+    put_in(&engine, s.pid, s.key, b"v2", base + 3_000);
+    flush_in(&engine, s.part);
+    engine.force_compaction(s.part).expect("compact");
+    // The window is paid for in key versions, not in tables: the inputs the
+    // compaction consumed are released at its install, and the older version
+    // is still readable because the output kept it.
     assert_eq!(
-        read_at(&engine, key, base + 2_500).expect("read"),
-        Some(b"v1".to_vec())
+        engine
+            .retained_history(s.part)
+            .expect("stats")
+            .retained_bytes,
+        0,
+        "{s:?}: no table is held only for history"
+    );
+    assert_eq!(
+        read_in(&engine, s.part, s.key, base + 2_500).expect("read"),
+        Some(b"v1".to_vec()),
+        "{s:?}"
     );
 
-    // Ten seconds pass; the next compaction lets the tree prune the versions
-    // below the new watermark and delete the tables only they referenced.
+    // Ten seconds pass; the next compaction folds what sits below the new
+    // watermark.
     oracle.advance_to(Timestamp::from_raw(base + 10_000_000));
     engine.advance_gc_watermark();
     let watermark = engine.gc_watermark();
     assert_eq!(watermark, base + 10_000_001 - 1_000_000);
-    engine.force_compaction(Partition::Node).expect("compact");
-    assert!(
-        count_files(dir.path()) < retained,
-        "tables referenced only by pruned versions are released"
-    );
+    engine.force_compaction(s.part).expect("compact");
 
     // Below the watermark: refused, never a panic or a wrong answer.
-    match read_at(&engine, key, base + 2_500) {
+    match read_in(&engine, s.part, s.key, base + 2_500) {
         Err(StorageError::SnapshotOutsideRetention {
             snapshot,
             watermark: w,
@@ -160,44 +223,154 @@ fn history_below_the_watermark_is_released_and_refused() {
             assert_eq!(snapshot, base + 2_500);
             assert_eq!(w, watermark);
         }
-        other => panic!("expected SnapshotOutsideRetention, got {other:?}"),
+        other => panic!("{s:?}: expected SnapshotOutsideRetention, got {other:?}"),
     }
     assert!(
         engine.pin_snapshot_at(base + 2_500).is_none(),
-        "a pin cannot protect history that is already collected"
+        "{s:?}: a pin cannot protect history that is already collected"
     );
     let err = engine
-        .snapshot_prefix_scan(&(base + 2_500), Partition::Node, b"node:")
+        .snapshot_prefix_scan(&(base + 2_500), s.part, s.prefix)
         .expect_err("scan below the watermark is refused");
     assert!(matches!(err, StorageError::SnapshotOutsideRetention { .. }));
     let err = engine
-        .prefix_scan_at(Partition::Node, b"node:", base + 2_500)
+        .prefix_scan_at(s.part, s.prefix, base + 2_500)
         .err()
         .expect("prefix_scan_at below the watermark is refused");
     assert!(matches!(err, StorageError::SnapshotOutsideRetention { .. }));
 
-    // At the watermark and above: served, and exact.
+    // At the watermark and above: served, and exact. Both keys have every
+    // version below the watermark, and each keeps its own newest one.
     assert_eq!(
-        read_at(&engine, key, watermark).expect("read"),
-        Some(b"v2".to_vec())
+        read_in(&engine, s.part, s.key, watermark).expect("read"),
+        Some(b"v2".to_vec()),
+        "{s:?}"
+    );
+    assert_eq!(
+        read_in(&engine, s.part, s.other_key, watermark).expect("read"),
+        Some(b"cold".to_vec()),
+        "{s:?}: a key's only version is its newest and survives the fold"
     );
     let pin = engine
         .pin_snapshot_at(watermark)
         .expect("a pin at the watermark is granted");
     assert_eq!(pin.seqno(), watermark);
+    drop(pin);
+
+    // A write after the fold: the folded key now straddles the watermark
+    // again, and the next compaction keeps both sides of it.
+    put_in(&engine, s.pid, s.key, b"v3", base + 10_000_500);
+    flush_in(&engine, s.part);
+    engine.force_compaction(s.part).expect("compact");
     assert_eq!(
-        read_at(&engine, key, base + 20_000_000).expect("read"),
-        Some(b"v2".to_vec())
+        read_in(&engine, s.part, s.key, base + 10_000_400).expect("read"),
+        Some(b"v2".to_vec()),
+        "{s:?}: the newest version below the watermark serves a snapshot above it"
+    );
+    assert_eq!(
+        read_in(&engine, s.part, s.key, base + 20_000_000).expect("read"),
+        Some(b"v3".to_vec()),
+        "{s:?}"
     );
 }
 
-/// The window's disk cost is observable per partition: inside the window a
-/// compaction's consumed inputs stay on disk as retained history next to
-/// the live output; once the watermark passes the compaction and the next
-/// install prunes the versions, the consumed inputs are released and what
-/// remains retained is exactly the newest version below the watermark (the
-/// previous live version), kept so a read at the watermark has a version
-/// to be served from. A partition never written reports zero on both sides.
+/// A delete is a version like any other. Inside the window a snapshot before
+/// it still reads the value and one after it reads nothing; once the
+/// tombstone is the newest version below the watermark, the fold must not
+/// bring the value under it back, in this process or after a reopen.
+#[test]
+fn a_delete_below_the_watermark_does_not_resurrect_the_value() {
+    for s in SUBJECTS {
+        delete_does_not_resurrect(s);
+    }
+}
+
+fn delete_does_not_resurrect(s: Subject) {
+    let base = future_base();
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+
+    {
+        let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(base)));
+        let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+        engine.set_retention_window(Duration::from_secs(1));
+
+        put_in(&engine, s.pid, s.key, b"v1", base + 1_000);
+        put_in(&engine, s.pid, s.other_key, b"kept", base + 1_200);
+        flush_in(&engine, s.part);
+        delete_in(&engine, s.pid, s.key, base + 2_000);
+        flush_in(&engine, s.part);
+        engine.force_compaction(s.part).expect("compact");
+
+        assert_eq!(
+            read_in(&engine, s.part, s.key, base + 1_500).expect("read"),
+            Some(b"v1".to_vec()),
+            "{s:?}: a snapshot before the delete still reads the value"
+        );
+        assert_eq!(
+            read_in(&engine, s.part, s.key, base + 2_500).expect("read"),
+            None,
+            "{s:?}: a snapshot after the delete reads nothing"
+        );
+
+        oracle.advance_to(Timestamp::from_raw(base + 10_000_000));
+        engine.advance_gc_watermark();
+        let watermark = engine.gc_watermark();
+        engine.force_compaction(s.part).expect("compact");
+
+        assert_eq!(
+            read_in(&engine, s.part, s.key, watermark).expect("read"),
+            None,
+            "{s:?}: the tombstone is the newest version below the watermark"
+        );
+        assert_eq!(engine.get(s.part, s.key).expect("get"), None, "{s:?}");
+        assert!(
+            matches!(
+                read_in(&engine, s.part, s.key, base + 1_500),
+                Err(StorageError::SnapshotOutsideRetention { .. })
+            ),
+            "{s:?}: the value under the tombstone is refused, not served"
+        );
+        assert_eq!(
+            read_in(&engine, s.part, s.other_key, watermark).expect("read"),
+            Some(b"kept".to_vec()),
+            "{s:?}: the neighbouring key is untouched by the delete"
+        );
+        engine.persist().expect("persist");
+    }
+
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(
+        base + 10_000_500,
+    )));
+    let engine = StorageEngine::open_with_oracle(&config, oracle).expect("reopen");
+    engine.set_retention_window(Duration::from_secs(1));
+    assert_eq!(
+        engine.get(s.part, s.key).expect("get"),
+        None,
+        "{s:?}: still deleted after a reopen"
+    );
+    assert_eq!(
+        engine
+            .get(s.part, s.other_key)
+            .expect("get")
+            .map(|b| b.to_vec()),
+        Some(b"kept".to_vec()),
+        "{s:?}"
+    );
+}
+
+/// The window's disk cost is observable per partition, and it is paid in key
+/// versions, not in tables: inside the window the compaction output carries
+/// both versions of the key (so it is larger than one version) and nothing
+/// is held beside it; once the watermark passes, the next compaction folds
+/// the superseded version and the live figure shrinks. A partition never
+/// written reports zero on both sides.
 #[test]
 fn retained_history_follows_the_window() {
     let base = future_base();
@@ -218,11 +391,16 @@ fn retained_history_follows_the_window() {
 
     let inside = engine.retained_history(Partition::Node).expect("stats");
     assert!(inside.live_bytes > 0, "the compacted output is live");
-    assert!(
-        inside.retained_bytes > 0,
-        "the two consumed input tables are retained inside the window"
+    assert_eq!(
+        inside.retained_bytes, 0,
+        "the consumed inputs are released at install, not held for the window"
     );
-    assert!(inside.retained_ratio() > 0.0);
+    assert_eq!(inside.retained_ratio(), 0.0);
+    assert_eq!(
+        read_at(&engine, key, base + 2_500).expect("read"),
+        Some(vec![b'a'; 4096]),
+        "the superseded version is served from the latest tables"
+    );
     // Live agrees with the tree's own live accounting.
     let tree = engine.tree(Partition::Node).expect("tree");
     assert_eq!(
@@ -245,19 +423,110 @@ fn retained_history_follows_the_window() {
 
     let released = engine.retained_history(Partition::Node).expect("stats");
     assert!(released.live_bytes > 0);
-    // The version history keeps the newest version below the watermark so a
-    // read at exactly the watermark is served from the version current at
-    // it: what remains retained is that one version's tables, which is the
-    // previous live version (the first compaction's output) and nothing
-    // older. The two consumed inputs are gone.
-    assert_eq!(
-        released.retained_bytes, inside.live_bytes,
-        "only the newest version below the watermark is still held"
-    );
+    assert_eq!(released.retained_bytes, 0);
+    // The window's cost was the superseded version inside the output; folding
+    // it is what shrinks the partition (by less than its 4 KiB, since a run
+    // of one byte compresses to almost nothing).
     assert!(
-        released.retained_bytes < inside.retained_bytes + inside.live_bytes,
-        "the inputs consumed inside the window were released"
+        released.live_bytes < inside.live_bytes,
+        "the superseded version left the live tables: {} -> {}",
+        inside.live_bytes,
+        released.live_bytes
     );
+}
+
+/// The read boundary a process sees must be the one it sees after a restart:
+/// compact inside the window, reopen, and every snapshot the window still
+/// covers is served with the value it had, while a snapshot below the
+/// horizon is refused on both sides of the reopen. A compaction that dropped
+/// the newest version below its threshold used to turn the first half into
+/// "absent" after a reopen, and a filtering install used to turn it into a
+/// refusal.
+#[test]
+fn a_reopen_serves_the_same_window_the_process_served() {
+    for s in SUBJECTS {
+        reopen_serves_the_window(s);
+    }
+}
+
+fn reopen_serves_the_window(s: Subject) {
+    let part = s.part;
+    let put = |engine: &StorageEngine, value: &[u8], commit_ts: u64| {
+        put_in(engine, s.pid, s.key, value, commit_ts);
+    };
+    let read = |engine: &StorageEngine, snapshot: u64| read_in(engine, s.part, s.key, snapshot);
+    let seal = |engine: &StorageEngine| flush_in(engine, s.part);
+    let base = future_base();
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    // A snapshot inside the window, after the two old versions and before the
+    // newest one: it resolves to `v1`, the newest version below the watermark.
+    let inside = base + 500_000;
+
+    let watermark = {
+        let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(base)));
+        let engine = StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open");
+        engine.set_retention_window(Duration::from_secs(1));
+
+        // Versions straddling the watermark: v0 and v1 end up below it, v2
+        // above. The fold has to collect v0, keep v1 (a snapshot at or above
+        // the watermark can still resolve to it) and leave v2 alone.
+        put(&engine, b"v0", base + 1_000);
+        seal(&engine);
+        put(&engine, b"v1", base + 2_000);
+        seal(&engine);
+        put(&engine, b"v2", base + 1_003_000);
+        seal(&engine);
+        let watermark = engine.gc_watermark();
+        assert_eq!(watermark, base + 1_003_001 - 1_000_000);
+        assert!(watermark <= inside && inside < base + 1_003_000);
+
+        engine.force_compaction(part).expect("compact");
+        assert_eq!(
+            read(&engine, inside).expect("read before the reopen"),
+            Some(b"v1".to_vec()),
+            "{part:?}"
+        );
+        engine.persist().expect("persist");
+        watermark
+    };
+
+    // A fresh process: nothing in memory, only what the manifest recorded.
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(
+        base + 1_003_500,
+    )));
+    let engine = StorageEngine::open_with_oracle(&config, oracle).expect("reopen");
+    engine.set_retention_window(Duration::from_secs(1));
+
+    assert!(
+        engine.oldest_readable_seqno() <= inside,
+        "{part:?}: the recorded floor ({}) must still admit a snapshot the window covers \
+         ({inside}); the compaction ran at watermark {watermark}",
+        engine.oldest_readable_seqno()
+    );
+    assert_eq!(
+        read(&engine, inside).expect("read inside the window after the reopen"),
+        Some(b"v1".to_vec()),
+        "{part:?}: the newest version below the watermark survives compaction and reopen"
+    );
+    assert_eq!(
+        read(&engine, base + 1_003_200).expect("read"),
+        Some(b"v2".to_vec())
+    );
+    // Below the horizon the collected version is refused, not answered with
+    // whatever survived.
+    match read(&engine, base + 1_500) {
+        Err(StorageError::SnapshotOutsideRetention { snapshot, .. }) => {
+            assert_eq!(snapshot, base + 1_500);
+        }
+        other => panic!("expected SnapshotOutsideRetention below the horizon, got {other:?}"),
+    }
 }
 
 /// Sum of the regular files directly under `dir`, `0` when the directory

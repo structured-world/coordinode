@@ -77,9 +77,8 @@ fn to_tree_config_builds_for_each_partition() {
     let config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let gc_watermark = Arc::new(AtomicU64::new(0));
     for &part in Partition::all() {
-        let tree_config = config.to_tree_config(part, Arc::clone(&seqno), &gc_watermark);
+        let tree_config = config.to_tree_config(part, Arc::clone(&seqno));
         let _ = tree_config;
     }
 }
@@ -687,10 +686,9 @@ fn to_tree_config_uses_first_endpoint_path() {
     ]);
     let seqno: lsm_tree::SharedSequenceNumberGenerator =
         Arc::new(lsm_tree::SequenceNumberCounter::default());
-    let gc_watermark = Arc::new(AtomicU64::new(0));
     // Without explicit per-level routing every partition uses the
     // first endpoint. This test pins the single-tier fallback path.
-    let _ = config.to_tree_config(Partition::Node, Arc::clone(&seqno), &gc_watermark);
+    let _ = config.to_tree_config(Partition::Node, Arc::clone(&seqno));
     // Verify the first endpoint's path is the one we picked.
     assert!(dir1.path().exists(), "first endpoint dir is the active one");
 }

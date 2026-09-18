@@ -1,10 +1,12 @@
-//! What the MVCC retention window holds on disk beyond the live version.
+//! On-disk footprint of a partition: the live version against everything
+//! else its folders hold.
 //!
-//! A snapshot read inside the window is served by the tree version that was
-//! current at that seqno, and every retained version keeps every table it
-//! references alive. The bytes those tables occupy over and above the live
-//! version's own files are the price of the window; this module measures it
-//! per partition so the price can be sized and watched rather than assumed.
+//! The retention window is paid for per key, inside the live tables:
+//! compaction keeps the versions a snapshot in the window can still see and
+//! folds the rest, and the tables it replaced are released at install. What
+//! sits on disk beside the live version is therefore transient, and this
+//! module measures both figures per partition so that stays watched rather
+//! than assumed.
 
 use lsm_tree::AbstractTree;
 use lsm_tree::file::BLOBS_FOLDER;
@@ -14,21 +16,17 @@ use std::path::Path;
 use crate::error::StorageResult;
 
 /// On-disk footprint of one partition split into what the live version
-/// references and what only retained history still holds.
+/// references and what is on disk beside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedHistory {
     /// Physical bytes of every table and blob file the current version
-    /// references: what the partition would occupy with no history at all.
+    /// references, in-window key versions included.
     pub live_bytes: u64,
     /// Physical bytes of table and blob files present in the partition's
-    /// folders but not referenced by the current version: the tables every
-    /// compaction inside the window consumed, kept for the snapshots that
-    /// still see them. Never reaches zero on a partition that has been
-    /// compacted: the history also keeps the newest version below the
-    /// watermark, so a read at exactly the watermark has a version to be
-    /// served from, and that version's tables stay until the next install
-    /// below the watermark replaces it. Transiently also counts an
-    /// in-flight compaction's output before it is installed.
+    /// folders but not referenced by the current version: tables a
+    /// compaction replaced that are not unlinked yet, and an in-flight
+    /// compaction's output before it is installed. Drains to zero on its
+    /// own; a figure that stays high means replaced tables are being held.
     pub retained_bytes: u64,
 }
 

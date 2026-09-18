@@ -395,7 +395,7 @@ impl StorageEngine {
 
         // Pass 1: Schema partition (single-tier, no routing).
         let schema_config = config
-            .to_tree_config(Partition::Schema, Arc::clone(&seqno), &gc_watermark)
+            .to_tree_config(Partition::Schema, Arc::clone(&seqno))
             .use_cache(Arc::clone(&cache));
         let (schema_tree, schema_repair) = schema_config.open_or_repair(repair_policy)?;
         if let Some(report) = schema_repair {
@@ -443,12 +443,7 @@ impl StorageEngine {
                 .unwrap_or_else(|| primary_endpoint_id.clone());
             partition_l0_endpoint.insert(part, l0_endpoint);
             let tree_config = config
-                .to_tree_config_with_routing(
-                    part,
-                    Arc::clone(&seqno),
-                    &gc_watermark,
-                    Some(&routing),
-                )
+                .to_tree_config_with_routing(part, Arc::clone(&seqno), Some(&routing))
                 .use_cache(Arc::clone(&cache));
             let (tree, repair) = tree_config.open_or_repair(repair_policy)?;
             if let Some(report) = repair {
@@ -1415,29 +1410,28 @@ impl StorageEngine {
     ///
     /// - **Policy** — the GC watermark, which the configured time-travel
     ///   window, the consumer floor and live snapshot pins drive together.
-    /// - **Physical** — the oldest version each partition tree still retains.
-    ///   A `drop_range`, a `clear` or a filtering compaction prunes history
-    ///   independently of the window, so this can sit above the watermark; a
-    ///   read below it is refused by the tree itself
-    ///   (`lsm_tree::Error::SnapshotBelowRetention`). A tree is servable
-    ///   strictly above `oldest_retained_seqno`, hence the `+ 1`.
+    /// - **Physical** — each partition tree's persisted retention floor. A
+    ///   compaction that collected below watermark `w` records `w - 1`; a
+    ///   `drop_range` or a `clear` records its own install seqno, which prunes
+    ///   history independently of the window, so this can sit above the
+    ///   watermark. A read at or below the floor is refused by the tree itself
+    ///   (`lsm_tree::Error::SnapshotBelowRetention`), hence the `+ 1`.
     pub fn oldest_readable_seqno(&self) -> lsm_tree::SeqNo {
         use lsm_tree::AbstractTree as _;
         let mut horizon = self.coordinator.gc_watermark_value();
         for part in Partition::all() {
             if let Ok(tree) = self.tree(*part) {
-                // A tree serves strictly above its oldest retained version, so
-                // the first readable seqno is one past it. Plain arithmetic:
-                // the value is a retained version's install seqno, which comes
-                // from the seqno generator (HLC microseconds or a counter) and
-                // is never `SeqNo::MAX` — that is the read-latest sentinel a
-                // caller passes to a read, not a seqno anything is installed
-                // at. The `debug_assert` fails loudly if that ever stops
+                // A tree serves strictly above its floor, so the first
+                // readable seqno is one past it. Plain arithmetic: the floor
+                // is a watermark or an install seqno, both from the seqno
+                // generator (HLC microseconds or a counter), and is never
+                // `SeqNo::MAX`, the read-latest sentinel a caller passes to a
+                // read. The `debug_assert` fails loudly if that ever stops
                 // holding, which is where it would need fixing.
                 let oldest_retained = tree.oldest_retained_seqno();
                 debug_assert!(
                     oldest_retained < lsm_tree::SeqNo::MAX,
-                    "retained version installed at the read-latest sentinel"
+                    "retention floor at the read-latest sentinel"
                 );
                 horizon = horizon.max(oldest_retained + 1);
             }
@@ -2084,8 +2078,8 @@ impl StorageEngine {
 
     /// Force a major compaction on a specific partition.
     ///
-    /// Flushes the memtable to SST first (compaction filters only run on SST
-    /// data), then triggers major compaction which invokes the MVCC GC filter.
+    /// Flushes the memtable to SST first (compaction only sees SST data), then
+    /// runs a major compaction that folds versions below the GC watermark.
     ///
     /// In production, compaction runs automatically in the background.
     /// This method is primarily for testing and manual maintenance.
@@ -2518,10 +2512,10 @@ fn run_capacity_refresh<F>(
         .collect();
     capacity.refresh(&endpoint_paths, &partition_names);
 
-    // What the retention window costs, per partition: the live version's
-    // footprint next to the tables only retained history still holds. Same
-    // cadence as the capacity scan, since both are a folder walk and the
-    // operator sizes the window from this pair.
+    // Per-partition footprint: the live version (in-window key versions
+    // included, so this is where the retention window shows) next to what is
+    // on disk beside it. Same cadence as the capacity scan, since both are a
+    // folder walk.
     for (part, tree) in trees {
         match crate::engine::retention_stats::retained_history(tree) {
             Ok(history) => {

@@ -88,7 +88,7 @@ the key is unset.
 | `http2_keepalive_secs` | (none) | restart | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
 | `cache_size_mb` | engine default | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
 | `write_buffer_mb` | engine default | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
-| `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds, enforced by the storage engine itself (embedded databases honour it too via `StorageConfig`). The GC watermark is held back to at least `now - this`, so history within the window stays queryable; a registered CDC / backup consumer can hold it back further, never less. A read older than the horizon is refused with `OUT_OF_RANGE` / `OUTSIDE_RETENTION`. Storage held by the window scales with the write and compaction volume of the window (every compaction's inputs are kept until the horizon passes it). |
+| `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds, enforced by the storage engine itself (embedded databases honour it too via `StorageConfig`). The GC watermark is held back to at least `now - this`, so history within the window stays queryable; a registered CDC / backup consumer can hold it back further, never less. A read older than the horizon is refused with `OUT_OF_RANGE` / `OUTSIDE_RETENTION`. Storage held by the window scales with the updates inside it: every version of a key written within the window is kept, plus the newest one below it. |
 | `registry_heartbeat_ms` | `100` | restart | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
 | `registry_eviction_ms` | `1000` | restart | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
 | `cdc_consumer_ttl_secs` | `30` | restart | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every poll and are never evicted. |
@@ -490,18 +490,23 @@ horizon for both time-travel reads and lagging-consumer recovery.
   data silently. Reads older than the horizon are refused (`OUT_OF_RANGE`,
   reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) instead of being
   answered from partially collected history.
-- The window is paid for in storage: history inside it is served from the
-  tree versions that were current at each point, so every table a compaction
-  consumed stays on disk until the horizon passes that compaction. Budget disk
-  for the write and compaction volume of the window, not for the data size.
-  The price is visible per partition as `coordinode_storage_retained_history_bytes`
-  (bytes held only by retained history) next to `coordinode_storage_live_bytes`
-  (the current version's own footprint); both refresh on the capacity-scan
-  cadence. An append-only workload with ascending keys pays nothing, since
-  its compactions move tables without rewriting them; updates and randomly
-  keyed inserts pay roughly the bytes their compactions rewrote inside the
-  window, on top of one extra version's inputs that stays until the next
-  compaction below the horizon replaces it.
+- The window is paid for in storage, per key: compaction keeps every version
+  of a key written inside the window plus the newest one below it, and folds
+  the rest. Budget disk for the data size plus one stored version per update
+  that lands inside the window. Inserts pay nothing extra whatever their key
+  order, since a key written once has a single version; a working set
+  rewritten N times inside the window holds N versions of it until the
+  horizon passes them. Versions the horizon has passed leave the disk when a
+  compaction next rewrites the tables holding them, not at the moment the
+  horizon moves, so a partition under steady updates sits above that figure
+  by whatever its deeper levels have not merged yet. The price is part of
+  `coordinode_storage_live_bytes`
+  (per partition, the current tree's footprint, in-window versions included).
+  `coordinode_storage_retained_history_bytes` reports what is on disk beside
+  it: tables a compaction has replaced and that are still waiting to be
+  unlinked. It rises by up to a compaction's input size right after an
+  install and drains to zero by itself; a figure that stays high is worth
+  investigating. Both refresh on the capacity-scan cadence.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: how often buffered consumer
   heartbeats are flushed as a coalesced proposal, and how often expired

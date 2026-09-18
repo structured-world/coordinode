@@ -28,7 +28,7 @@ fn register_storage_metrics() {
     );
     metrics::describe_gauge!(
         "coordinode_storage_retained_history_bytes",
-        "On-disk bytes held only by MVCC retention history (tables consumed by compactions inside the retention window), per partition"
+        "On-disk bytes beside the live version (tables a compaction replaced and not yet unlinked, in-flight compaction output), per partition; drains to zero"
     );
     metrics::describe_counter!(
         "coordinode_storage_compaction_total",
