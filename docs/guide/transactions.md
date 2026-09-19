@@ -121,8 +121,8 @@ A write is durable once the Raft leader has written it to the level requested by
 | `W0` | no acknowledgement is promised (fire-and-forget) | what any committed write survives; the caller is simply not told whether it committed | non-critical metrics |
 | `MEMORY` | RAM-only write (~1µs) | nothing before drain | hot counters, session state |
 | `CACHE` | RAM + NVMe cache (~100µs) | process crash, not power loss before drain | analytics events, throughput-sensitive non-critical data |
-| `W1` (default) | leader WAL fsync | leader crash if pre-replication | typical reads-mostly workloads |
-| `MAJORITY` | Raft quorum (`RF/2 + 1` replicas) | single-replica failure | source-of-truth data, production writes |
+| `W1` | leader WAL fsync | leader crash if pre-replication | throughput-sensitive writes that can be lost with their leader |
+| `MAJORITY` (default) | Raft quorum (`RF/2 + 1` replicas) | single-replica failure | source-of-truth data, production writes |
 
 A write concern decides when the caller is answered, never whether the write is replicated. Every write, `W0` included, goes through the Raft log and is applied on every replica in the same order; no level writes to one node only.
 
@@ -130,7 +130,7 @@ A write concern decides when the caller is answered, never whether the write is 
 
 The orthogonal `journal: true` flag forces a WAL fsync regardless of level (with `W0` it silently upgrades to `W1`). Use when you want fsync durability but cannot wait for replication — e.g., a single-node embedded deployment.
 
-The default `WriteConcern` is `W1` (leader-only acknowledgement). Choose `MAJORITY` explicitly for writes that must survive a single-replica failure.
+The default `WriteConcern` is `MAJORITY`, in the embedded library and over every protocol alike: an acknowledged write survives the loss of one replica. Choose a weaker level explicitly, per request, for writes you can afford to lose.
 
 Replication factor (`RF`) is a deployment-time choice, independent of `WriteConcern`. The relationship between the two:
 

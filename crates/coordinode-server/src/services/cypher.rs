@@ -372,8 +372,9 @@ fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
 }
 
 /// Translate the proto `WriteConcernLevel` integer to the executor enum.
-/// Unspecified maps to W1 (single-node leader-acknowledged) — matches the
-/// previous silent default before write_concern propagation landed.
+/// Unspecified (and any level this build does not know) is majority, the same
+/// default the embedded library uses: an acknowledged write survives the loss
+/// of one replica unless the caller explicitly asked for less.
 fn write_concern_level_to_executor(level: i32) -> WriteConcernLevel {
     match replication::WriteConcernLevel::try_from(level)
         .unwrap_or(replication::WriteConcernLevel::Unspecified)
@@ -381,9 +382,9 @@ fn write_concern_level_to_executor(level: i32) -> WriteConcernLevel {
         replication::WriteConcernLevel::W0 => WriteConcernLevel::W0,
         replication::WriteConcernLevel::Memory => WriteConcernLevel::Memory,
         replication::WriteConcernLevel::Cache => WriteConcernLevel::Cache,
-        replication::WriteConcernLevel::Majority => WriteConcernLevel::Majority,
-        // W1 and Unspecified both map to W1 — the silent default.
-        _ => WriteConcernLevel::W1,
+        replication::WriteConcernLevel::W1 => WriteConcernLevel::W1,
+        replication::WriteConcernLevel::Majority
+        | replication::WriteConcernLevel::Unspecified => WriteConcernLevel::Majority,
     }
 }
 
@@ -655,7 +656,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                         .as_ref()
                         .map(|wc| wc.level)
                         .unwrap_or(replication::WriteConcernLevel::Unspecified as i32);
-                    let is_majority = level == replication::WriteConcernLevel::Majority as i32;
+                    // The effective level: a request that names none gets the
+                    // majority default and is as safe here as one that asks for it.
+                    let is_majority =
+                        write_concern_level_to_executor(level) == WriteConcernLevel::Majority;
                     if !is_majority {
                         return Err(Status::failed_precondition(
                             "Causal sessions require writeConcern=MAJORITY for write \

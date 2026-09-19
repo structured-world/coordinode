@@ -424,7 +424,7 @@ impl CoordinodeClient {
             .execute_request(
                 query, params, 0,    // read_preference = PRIMARY
                 None, // read_concern = LOCAL (default)
-                None, // write_concern = W1 (default)
+                None, // write_concern = MAJORITY (default)
                 location,
             )
             .await?;

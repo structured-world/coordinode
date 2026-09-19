@@ -470,6 +470,37 @@ async fn grpc_execute_records_timing() {
 }
 
 /// db_error_to_status maps error types correctly.
+/// A client that names no write concern level gets majority, the same default
+/// the embedded library uses: a write that was acknowledged survives the loss of
+/// one replica unless the caller asked for less.
+#[test]
+fn an_unspecified_write_concern_level_is_majority() {
+    use replication::WriteConcernLevel as Wire;
+
+    assert_eq!(
+        write_concern_level_to_executor(Wire::Unspecified as i32),
+        WriteConcernLevel::Majority
+    );
+    assert_eq!(
+        write_concern_level_to_executor(9999),
+        WriteConcernLevel::Majority,
+        "an unknown level falls back to the default, never to something weaker"
+    );
+    // What the caller names explicitly is what it gets.
+    assert_eq!(
+        write_concern_level_to_executor(Wire::W1 as i32),
+        WriteConcernLevel::W1
+    );
+    assert_eq!(
+        write_concern_level_to_executor(Wire::W0 as i32),
+        WriteConcernLevel::W0
+    );
+    assert_eq!(
+        write_concern_level_to_executor(Wire::Majority as i32),
+        WriteConcernLevel::Majority
+    );
+}
+
 #[test]
 fn error_to_status_mapping() {
     let parse_err = db_error_to_status(DatabaseError::Semantic("bad query".into()));
@@ -974,13 +1005,12 @@ async fn causal_after_index_zero_always_valid() {
 
 // ── G088: write-concern validation in causal sessions ─────────────────────
 
-/// Causal write without write_concern is rejected with FailedPrecondition.
-///
-/// after_index > 0 signals a causal session. A write statement without an
-/// explicit MAJORITY write_concern risks producing a dangling applied_index
-/// that no follower can ever satisfy. The server must hard-reject it.
+/// A causal write that names no write concern is accepted: the default is
+/// majority, which is exactly what a causal session needs. `after_index > 0`
+/// signals the causal session; only a write that explicitly asks for less than
+/// majority can leave a dangling applied index, and that case is rejected below.
 #[tokio::test]
-async fn causal_write_without_concern_rejected() {
+async fn causal_write_without_concern_uses_the_majority_default() {
     let (svc, _dir) = test_service();
 
     let result = svc
@@ -993,19 +1023,15 @@ async fn causal_write_without_concern_rejected() {
                 after_index: 1,
                 at_timestamp: 0,
             }),
-            write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
+            write_concern: None, // omitted → the majority default
             transaction_id: 0,
         }))
         .await;
 
     assert!(
-        result.is_err(),
-        "causal write without write_concern must be rejected"
-    );
-    assert_eq!(
-        result.unwrap_err().code(),
-        tonic::Code::FailedPrecondition,
-        "must be FailedPrecondition"
+        result.is_ok(),
+        "a causal write at the default write concern must be accepted: {:?}",
+        result.err()
     );
 }
 
