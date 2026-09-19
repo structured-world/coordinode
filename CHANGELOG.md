@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(storage)* measure retained MVCC history per partition
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- *(license)* apache-2.0 for driver and proto
+- *(test)* stop the vector-filter test claiming an acceleration it lost
+- *(test)* correct what the forced-offload end-to-end test covers
+
+### Fixed
+
+- *(search)* index compound words in chinese text
+- *(storage)* adopt per-key mvcc retention
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(query)* create the edge of a path with anonymous nodes
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+- *(raft)* publish own address before adding a peer
+- *(storage)* commit w:0 writes through the log
+- *(storage)* stop compaction losing merged writes
+- *(storage)* open when the clock restarts behind the floor
+
+### Refactored
+
+- *(storage)* drop a saturating add the invariant makes unnecessary
+
+### Testing
+
+- *(integration)* reap the server on every shutdown path
+- *(embed)* assert the retention contract, not survival
+- *(query)* cover the threshold vector predicate beyond the happy path
+- *(storage)* wait for replaced tables to be unlinked
+
 ## v0.5.8 - 2026-09-05
 
 ### coordinode-raft 0.5.8

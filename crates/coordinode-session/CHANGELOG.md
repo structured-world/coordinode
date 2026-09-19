@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

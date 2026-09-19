@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Documentation
+
+- *(license)* apache-2.0 for driver and proto
+
 ## 0.5.3 - 2026-08-30
 
 #### Fixed

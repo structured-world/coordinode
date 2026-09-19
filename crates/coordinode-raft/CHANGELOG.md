@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Fixed
+
+- *(raft)* publish own address before adding a peer
+- *(storage)* commit w:0 writes through the log
+
 ## 0.5.8 - 2026-09-05
 
 #### Testing
