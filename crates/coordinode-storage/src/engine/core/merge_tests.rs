@@ -455,6 +455,216 @@ fn merge_double_compaction_partial_re_merge() {
     assert_eq!(plist.as_slice(), &[10, 15, 20]);
 }
 
+/// An edge removal must survive a compaction that does not reach the level its
+/// posting list lives on. The list sits at the bottom; the removal arrives in a
+/// fresh table and an ordinary leveled compaction of the upper levels folds it
+/// without ever seeing the list it is aimed at.
+#[test]
+fn edge_removal_survives_a_compaction_that_does_not_see_the_list() {
+    use lsm_tree::AbstractTree;
+    use lsm_tree::compaction::{CompactionAction, Leveled};
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    let key = b"adj:FOLLOWS:out:hub";
+    let neighbours = |engine: &StorageEngine| {
+        let data = engine
+            .get(Partition::Adj, key)
+            .expect("get")
+            .expect("should exist");
+        PostingList::from_bytes(&data)
+            .expect("decode")
+            .as_slice()
+            .to_vec()
+    };
+
+    let tree = engine.tree(Partition::Adj).expect("tree");
+    let move_down = |from: u8, to: u8| {
+        tree.compact(
+            Arc::new(lsm_tree::compaction::MoveDown(from, to)),
+            engine.gc_watermark(),
+        )
+        .expect("move down");
+    };
+    // Every table below spans the same key range (a key under and a key over
+    // the hub), so a compaction has to rewrite them; tables with disjoint
+    // ranges would only be moved and nothing would be folded.
+    let span = |engine: &StorageEngine, round: u8| {
+        for edge in [b"adj:FOLLOWS:out:a".as_slice(), b"adj:FOLLOWS:out:z"] {
+            engine
+                .merge(Partition::Adj, edge, &encode_add(u64::from(round) + 100))
+                .expect("unrelated");
+        }
+    };
+
+    // The list itself, at the bottom level.
+    let list = PostingList::from_sorted(vec![1, 2, 3])
+        .to_bytes()
+        .expect("encode");
+    engine
+        .put(Partition::Adj, key, &list)
+        .expect("put the list");
+    tree.flush_active_memtable(0).expect("flush");
+    move_down(0, 6);
+    // A table in level 1 that covers the hub's range without holding the hub,
+    // so level 0 compacts into level 1 and stops there.
+    span(&engine, 9);
+    tree.flush_active_memtable(0).expect("flush");
+    move_down(0, 1);
+    assert_eq!(neighbours(&engine), vec![1, 2, 3]);
+    engine
+        .merge(Partition::Adj, key, &encode_remove(2))
+        .expect("remove");
+    span(&engine, 0);
+    tree.flush_active_memtable(0).expect("flush");
+    for round in 1..4u8 {
+        span(&engine, round);
+        tree.flush_active_memtable(0).expect("flush");
+    }
+    assert_eq!(neighbours(&engine), vec![1, 3], "before the compaction");
+
+    engine.advance_gc_watermark();
+    let compacted = tree
+        .compact(Arc::new(Leveled::default()), engine.gc_watermark())
+        .expect("leveled compaction");
+    assert_ne!(
+        compacted.action,
+        CompactionAction::Nothing,
+        "precondition: the upper levels were actually compacted"
+    );
+
+    assert_eq!(
+        neighbours(&engine),
+        vec![1, 3],
+        "the removed edge must stay removed after the compaction"
+    );
+}
+
+/// A nested SET sitting in the upper levels must survive a compaction that does
+/// not see the node record (it lies at the bottom level): the node keeps its
+/// label and its other properties, and gains the nested value. A compaction
+/// that folded the delta without the record used to build a record out of the
+/// delta alone, which then replaced the real one.
+#[test]
+fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_NODE_RECORD, PathTarget};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::graph::types::Value;
+    use lsm_tree::AbstractTree;
+    use lsm_tree::compaction::{CompactionAction, Leveled};
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x05";
+
+    let record_bytes = |label: &str, serial: &str| {
+        let mut rec = NodeRecord::new(label);
+        rec.set_extra("serial", Value::String(serial.into()));
+        rec.set_extra("config", Value::Document(rmpv::Value::Map(vec![])));
+        let mut bytes = vec![PREFIX_NODE_RECORD];
+        bytes.extend_from_slice(&rec.to_msgpack().expect("encode"));
+        bytes
+    };
+
+    let tree = engine.tree(Partition::Node).expect("tree");
+    let move_down = |from: u8, to: u8| {
+        tree.compact(
+            Arc::new(lsm_tree::compaction::MoveDown(from, to)),
+            engine.gc_watermark(),
+        )
+        .expect("move down");
+    };
+    // Every table spans the same key range (a node under and a node over the
+    // one under test), so a compaction has to rewrite them rather than move them.
+    let span = |engine: &StorageEngine, round: u8| {
+        for other in [
+            b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01".as_slice(),
+            b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x09",
+        ] {
+            engine
+                .put(
+                    Partition::Node,
+                    other,
+                    &record_bytes("Other", &format!("SN-{round}")),
+                )
+                .expect("unrelated");
+        }
+    };
+
+    // The record itself, at the bottom level.
+    engine
+        .put(Partition::Node, key, &record_bytes("Device", "SN-1"))
+        .expect("put the record");
+    tree.flush_active_memtable(0).expect("flush");
+    move_down(0, 6);
+    // A table in level 1 that covers the record's range without holding it, so
+    // level 0 compacts into level 1 and stops there.
+    span(&engine, 9);
+    tree.flush_active_memtable(0).expect("flush");
+    move_down(0, 1);
+
+    let delta = DocDelta::SetPath {
+        target: PathTarget::Extra,
+        path: vec!["config".into(), "ssid".into()],
+        value: rmpv::Value::String("home".into()),
+    }
+    .encode()
+    .expect("encode delta");
+    engine
+        .merge(Partition::Node, key, &delta)
+        .expect("nested set");
+    span(&engine, 0);
+    tree.flush_active_memtable(0).expect("flush");
+    for round in 1..4u8 {
+        span(&engine, round);
+        tree.flush_active_memtable(0).expect("flush");
+    }
+
+    engine.advance_gc_watermark();
+    let compacted = tree
+        .compact(Arc::new(Leveled::default()), engine.gc_watermark())
+        .expect("leveled compaction");
+    assert_ne!(
+        compacted.action,
+        CompactionAction::Nothing,
+        "precondition: the upper levels were actually compacted"
+    );
+
+    let merged = engine
+        .get(Partition::Node, key)
+        .expect("get")
+        .expect("the node exists");
+    assert_eq!(merged[0], PREFIX_NODE_RECORD);
+    let node = NodeRecord::from_msgpack(&merged[1..]).expect("decode");
+    assert!(node.has_label("Device"), "the label survives: {node:?}");
+    assert_eq!(
+        node.get_extra("serial"),
+        Some(&Value::String("SN-1".into())),
+        "a property the delta never touched survives"
+    );
+    let Some(Value::Document(config)) = node.get_extra("config") else {
+        panic!("config is a document: {node:?}");
+    };
+    assert_eq!(
+        coordinode_core::graph::document::extract_at_path(config, &["ssid"]),
+        rmpv::Value::String("home".into())
+    );
+}
+
 // ================================================================
 // R010d: Merge operator stress + time-travel tests
 // ================================================================

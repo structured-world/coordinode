@@ -153,6 +153,24 @@ fn merge_pre_merged_with_base_and_new_operands() {
     assert_eq!(plist.as_slice(), &[1, 3, 5, 10]);
 }
 
+/// The storage engine passes `None` only where no base exists: a read resolves
+/// over every level first, and a compaction that cannot prove absence keeps the
+/// operands instead of asking. So a removal with no base removes from nothing,
+/// and the result is the list of what was added. That a removal aimed at a base
+/// in a lower level survives a compaction is an engine-level property, asserted
+/// in `edge_removal_survives_a_compaction_that_does_not_see_the_list`.
+#[test]
+fn a_removal_with_no_base_removes_from_an_empty_list() {
+    let op = PostingListMerge;
+    let remove2 = encode_remove(2);
+    let add4 = encode_add(4);
+    let result = op
+        .merge(b"k", None, &[&remove2, &add4])
+        .expect("merge with no base");
+    let plist = PostingList::from_bytes(&result).expect("decode");
+    assert_eq!(plist.as_slice(), &[4]);
+}
+
 #[test]
 fn merge_output_is_valid_uidpack() {
     // Verify merge output is UidPack format, not raw Vec<u64> msgpack.
