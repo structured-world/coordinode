@@ -8,8 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["lz4", "columnar"]
+default = ["lz4", "zstd", "columnar"]
 lz4 = ["lsm-tree/lz4", "dep:lz4_flex"]
+# Pure-Rust zstd (no C library). On by default: the cold LSM levels compress
+# with it unless the configuration says otherwise.
 zstd = ["lsm-tree/zstd"]
 encryption = ["lsm-tree/encryption"]
 # Native columnar SST block type for the relational TABLE modality

@@ -15,10 +15,33 @@ fn compression_codec_to_lsm_tree_mapping() {
         CompressionCodec::Lz4.to_lsm_tree(),
         CompressionType::Lz4
     ));
+    #[cfg(feature = "zstd")]
+    assert!(matches!(
+        CompressionCodec::Zstd(9).to_lsm_tree(),
+        CompressionType::Zstd(9)
+    ));
 }
 
+/// Hot levels on lz4, cold levels on zstd: the default policy hands the LSM
+/// engine lz4 for levels 0-3 and zstd from level 4 down.
+#[cfg(feature = "zstd")]
 #[test]
 fn compression_config_defaults() {
+    let config = CompressionConfig::default();
+    assert_eq!(config.hot_codec, CompressionCodec::Lz4);
+    assert_eq!(config.cold_codec, CompressionCodec::Zstd(3));
+    assert_eq!(config.cold_level_threshold, 4);
+
+    let policy = config.to_compression_policy();
+    assert!(matches!(policy.get(3), Some(CompressionType::Lz4)));
+    assert!(matches!(policy.get(4), Some(CompressionType::Zstd(3))));
+    assert!(matches!(policy.get(6), Some(CompressionType::Zstd(3))));
+}
+
+/// A build without zstd keeps lz4 on every level.
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn compression_config_defaults_without_zstd() {
     let config = CompressionConfig::default();
     assert_eq!(config.hot_codec, CompressionCodec::Lz4);
     assert_eq!(config.cold_codec, CompressionCodec::Lz4);

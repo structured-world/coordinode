@@ -693,6 +693,77 @@ fn engine_with_partition_compression_overrides() {
     );
 }
 
+/// The default build carries zstd and uses it where the architecture puts it:
+/// lz4 on the hot levels, zstd from the cold threshold down.
+#[cfg(feature = "zstd")]
+#[test]
+fn default_compression_is_lz4_hot_and_zstd_cold() {
+    use crate::engine::config::{CompressionCodec, CompressionConfig};
+
+    let config = CompressionConfig::default();
+    assert_eq!(config.hot_codec, CompressionCodec::Lz4);
+    assert_eq!(config.cold_codec, CompressionCodec::Zstd(3));
+    assert_eq!(config.cold_level_threshold, 4);
+}
+
+/// A partition compressed with zstd alone is written, flushed to a table and
+/// read back after a reopen, so the codec is really linked and really used.
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_compressed_data_survives_flush_and_reopen() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.partition_compression = Some(vec![(
+        Partition::Node,
+        crate::engine::config::CompressionCodec::Zstd(9),
+    )]);
+    let value = |i: u32| format!("value_{i:06}_payload_with_some_extra_data_for_compression");
+
+    {
+        let engine = StorageEngine::open(&config).expect("open");
+        for i in 0..200u32 {
+            engine
+                .put(
+                    Partition::Node,
+                    format!("key_{i:06}").as_bytes(),
+                    value(i).as_bytes(),
+                )
+                .expect("put");
+        }
+        engine
+            .tree(Partition::Node)
+            .expect("tree")
+            .flush_active_memtable(0)
+            .expect("flush to a table");
+        engine.persist().expect("persist");
+    }
+
+    let engine = StorageEngine::open(&config).expect("reopen");
+    for i in 0..200u32 {
+        let got = engine
+            .get(Partition::Node, format!("key_{i:06}").as_bytes())
+            .expect("get");
+        assert_eq!(got.as_deref(), Some(value(i).as_bytes()), "key {i}");
+    }
+}
+
+/// A zstd level outside what the table format can store is refused when the
+/// configuration is built, not when the first block is written.
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_level_out_of_range_is_rejected() {
+    use crate::engine::config::CompressionCodec;
+
+    assert!(CompressionCodec::zstd(22).is_ok());
+    assert!(CompressionCodec::zstd(23).is_err());
+}
+
 #[test]
 fn engine_compressed_data_survives_reopen() {
     let dir = TempDir::new().expect("failed to create temp dir");

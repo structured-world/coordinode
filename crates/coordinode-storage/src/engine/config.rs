@@ -400,14 +400,38 @@ pub enum CompressionCodec {
     /// Recommended for hot data. Uses `lz4_flex` internally.
     #[default]
     Lz4,
+
+    /// Zstd compression at the given level: a markedly better ratio than LZ4
+    /// for a slower decode, so it belongs on the cold levels. Pure Rust, no C
+    /// library is linked. Build the value with [`CompressionCodec::zstd`],
+    /// which checks the level.
+    #[cfg(feature = "zstd")]
+    Zstd(i32),
 }
 
 impl CompressionCodec {
+    /// Zstd at `level`, refused unless the table format can store the level
+    /// (`-128..=22`: the negative fast levels, 0 for the library default, 1-22).
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] when `level` is outside that range.
+    ///
+    /// [`StorageError::InvalidConfig`]: crate::error::StorageError::InvalidConfig
+    #[cfg(feature = "zstd")]
+    pub fn zstd(level: i32) -> Result<Self, crate::error::StorageError> {
+        CompressionType::zstd(level)
+            .map(|_| Self::Zstd(level))
+            .map_err(|e| crate::error::StorageError::InvalidConfig(e.to_string()))
+    }
+
     /// Map to the lsm-tree `CompressionType`.
     pub(crate) fn to_lsm_tree(self) -> CompressionType {
         match self {
             Self::None => CompressionType::None,
             Self::Lz4 => CompressionType::Lz4,
+            #[cfg(feature = "zstd")]
+            Self::Zstd(level) => CompressionType::Zstd(level),
         }
     }
 }
@@ -422,21 +446,28 @@ pub struct CompressionConfig {
     /// Codec for hot levels (L0 to cold_level_threshold - 1). Default: Lz4.
     pub hot_codec: CompressionCodec,
 
-    /// Codec for cold levels (cold_level_threshold and above). Default: Lz4.
-    ///
-    /// Architecture specifies zstd here. lsm-tree's `zstd` feature now provides
-    /// zstd via pure-Rust `structured-zstd` (no C FFI); wiring a
-    /// `CompressionCodec::Zstd(3)` variant over it is the follow-up.
+    /// Codec for cold levels (cold_level_threshold and above). Default: zstd at
+    /// level 3, or Lz4 in a build without the `zstd` feature. Cold data is read
+    /// rarely and is most of the bytes on disk, so the ratio wins there; the hot
+    /// levels stay on lz4, where decode speed is what a read pays for.
     pub cold_codec: CompressionCodec,
 
     /// LSM level at which to switch from hot_codec to cold_codec. Default: 4.
     pub cold_level_threshold: u8,
 }
 
+/// Zstd level for the cold levels by default: the library's own default, the
+/// knee of its ratio/speed curve.
+#[cfg(feature = "zstd")]
+const DEFAULT_COLD_ZSTD_LEVEL: i32 = 3;
+
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             hot_codec: CompressionCodec::Lz4,
+            #[cfg(feature = "zstd")]
+            cold_codec: CompressionCodec::Zstd(DEFAULT_COLD_ZSTD_LEVEL),
+            #[cfg(not(feature = "zstd"))]
             cold_codec: CompressionCodec::Lz4,
             cold_level_threshold: 4,
         }
@@ -542,7 +573,8 @@ pub struct StorageConfig {
     /// WAL flush policy. Default: SyncPerBatch.
     pub flush_policy: FlushPolicy,
 
-    /// Per-level compression configuration. Default: lz4 everywhere.
+    /// Per-level compression configuration. Default: lz4 on the hot levels,
+    /// zstd from the cold threshold down.
     pub compression: CompressionConfig,
 
     /// Block cache size in bytes. Default: 64MB.
