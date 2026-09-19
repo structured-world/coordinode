@@ -2,6 +2,30 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(storage)* measure retained MVCC history per partition
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Fixed
+
+- *(storage)* stop compaction losing merged writes
+- *(storage)* commit w:0 writes through the log
+- *(storage)* open when the clock restarts behind the floor
+- *(storage)* adopt per-key mvcc retention
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+
+### Refactored
+
+- *(storage)* drop a saturating add the invariant makes unnecessary
+
+### Testing
+
+- *(storage)* wait for replaced tables to be unlinked
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

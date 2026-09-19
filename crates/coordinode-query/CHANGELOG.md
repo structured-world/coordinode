@@ -2,6 +2,21 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Fixed
+
+- *(search)* index compound words in chinese text
+- *(query)* create the edge of a path with anonymous nodes
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

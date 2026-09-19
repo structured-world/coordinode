@@ -2,6 +2,30 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-19
+
+### Added
+
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- *(test)* stop the vector-filter test claiming an acceleration it lost
+- *(test)* correct what the forced-offload end-to-end test covers
+
+### Fixed
+
+- *(query)* create the edge of a path with anonymous nodes
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+
+### Testing
+
+- *(embed)* assert the retention contract, not survival
+- *(query)* cover the threshold vector predicate beyond the happy path
+
 ## 0.5.7 - 2026-09-01
 
 #### Added
