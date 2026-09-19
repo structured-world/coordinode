@@ -1,5 +1,5 @@
 ---
-description: "CoordiNode's transaction model: MVCC snapshot isolation, optimistic conflict detection, write concerns from W0 to majority, read concerns, causal sessions and how replication factor relates to each."
+description: "CoordiNode's transaction model: MVCC snapshot isolation, optimistic conflict detection, write concerns as two axes (how many members, how durably each), read concerns, causal sessions and how replication factor relates to each."
 ---
 
 # MVCC Transactions
@@ -114,31 +114,42 @@ Posting-list operations (adding/removing edges on a node) use **merge operators*
 
 ## Durability
 
-A write is durable once the Raft leader has written it to the level requested by the client's `WriteConcern.level`. The full ladder, ordered from least to most durable:
+A write concern is two independent parameters, as in MongoDB. `w` says how many members of the replica group must hold the write before the caller is answered; `journal` says what state each of those members holds it in.
 
-| Level | ACK after | Survives | Use for |
-|-------|-----------|----------|---------|
-| `W0` | no acknowledgement is promised (fire-and-forget) | what any committed write survives; the caller is simply not told whether it committed | non-critical metrics |
-| `MEMORY` | RAM-only write (~1µs) | nothing before drain | hot counters, session state |
-| `CACHE` | RAM + NVMe cache (~100µs) | process crash, not power loss before drain | analytics events, throughput-sensitive non-critical data |
-| `W1` | leader WAL fsync | leader crash if pre-replication | throughput-sensitive writes that can be lost with their leader |
-| `MAJORITY` (default) | Raft quorum (`RF/2 + 1` replicas) | single-replica failure | source-of-truth data, production writes |
+**`w`: how many members**
 
-A write concern decides when the caller is answered, never whether the write is replicated. Every write, `W0` included, goes through the Raft log and is applied on every replica in the same order; no level writes to one node only.
+| `w` | ACK after | Survives | Use for |
+|-----|-----------|----------|---------|
+| `acks: 0` | nothing is awaited (fire-and-forget) | what any committed write survives; the caller is simply not told whether it committed | non-critical metrics |
+| `acks: 1` | the leader holds the write | leader crash only if the write was replicated in time | throughput-sensitive writes that can be lost with their leader |
+| `acks: N` | `N` members hold the write, the leader included | the loss of `N - 1` members | a fixed guarantee that does not move with the group size |
+| `mode: MAJORITY` (default) | `⌊RF / 2⌋ + 1` members hold the write | the loss of a minority | source-of-truth data, production writes |
 
-`MEMORY` and `CACHE` use a background drain thread that batches volatile writes into Raft proposals asynchronously. The trade-off: ~1000× lower latency in exchange for losing in-flight writes on a leader crash before the drain completes. **Never select `MEMORY` or `CACHE` for data that you cannot reconstruct or afford to lose.**
+A number is always a count of members and never a mode, so `acks: 3` means three members in a group of any size. Asking for more members than the group has is rejected with `INVALID_ARGUMENT`.
 
-The orthogonal `journal: true` flag forces a WAL fsync regardless of level (with `W0` it silently upgrades to `W1`). Use when you want fsync durability but cannot wait for replication — e.g., a single-node embedded deployment.
+**`journal`: what state each counted member holds the write in**
 
-The default `WriteConcern` is `MAJORITY`, in the embedded library and over every protocol alike: an acknowledged write survives the loss of one replica. Choose a weaker level explicitly, per request, for writes you can afford to lose.
+| `journal` | The member counts once the write is | Survives | Latency |
+|-----------|-------------------------------------|----------|---------|
+| `JOURNAL` (default) | fsynced in its Raft log | process crash and power failure | the fsync |
+| `CACHE` | in RAM plus its NVMe write cache, drained to the log later | process crash, not power loss before the drain | ~100µs |
+| `MEMORY` | in RAM, drained to the log later | nothing before the drain | ~1µs |
 
-Replication factor (`RF`) is a deployment-time choice, independent of `WriteConcern`. The relationship between the two:
+A write concern decides when the caller is answered, never whether the write is replicated. Every write, `acks: 0` included, goes through the Raft log and is applied on every replica in the same order; no concern writes to one node only.
+
+`CACHE` and `MEMORY` use a background drain thread that batches volatile writes into Raft proposals asynchronously. The trade-off: ~1000× lower latency in exchange for losing in-flight writes on a leader crash before the drain completes. **Never select `CACHE` or `MEMORY` for data that you cannot reconstruct or afford to lose.** A volatile state cannot be confirmed across members, so these two are accepted only with `acks: 0` or `acks: 1`; combining them with a larger `w` is rejected with `INVALID_ARGUMENT`.
+
+Neither axis is ever silently changed to satisfy the other. `acks: 0` is answered at once whatever `journal` says, and a `journal` the server cannot honour for the requested `w` is refused rather than rewritten.
+
+The default is `w: MAJORITY, journal: JOURNAL`, in the embedded library and over every protocol alike: an acknowledged write survives the loss of a minority. Choose a weaker concern explicitly, per request, for writes you can afford to lose.
+
+Replication factor (`RF`) is a deployment-time choice, independent of the write concern. The relationship between the two:
 
 - **`RF` is the total number of replicas** holding a copy of each shard's log.
 - **`MAJORITY` waits for `⌊RF / 2⌋ + 1` replicas** to acknowledge the entry before responding to the client.
-- Raft tolerates `⌊RF / 2⌋` failed replicas while preserving liveness. So `RF=3` tolerates 1 failure (majority = 2 of 3), `RF=5` tolerates 2 failures, `RF=2` tolerates **zero** failures (majority = 2, cannot lose any) — which makes `RF=2` strictly worse than `RF=1` for cluster mode.
+- Raft tolerates `⌊RF / 2⌋` failed replicas while preserving liveness. So `RF=3` tolerates 1 failure (majority = 2 of 3), `RF=5` tolerates 2 failures, `RF=2` tolerates **zero** failures (majority = 2, cannot lose any), which makes `RF=2` strictly worse than `RF=1` for cluster mode.
 
-A single-node deployment runs at `RF=1`, where `MAJORITY` is functionally equivalent to `W1` because there is only one replica to hear from. Multi-node deployments choose `RF=3` as the smallest quorum-tolerant size, and that is where the distinction between `W1` and `MAJORITY` starts to matter: `W1` acknowledges once the leader has the write durably, `MAJORITY` waits for the write to survive the loss of the leader.
+A single-node deployment runs at `RF=1`, where `MAJORITY` is functionally equivalent to `acks: 1` because there is only one replica to hear from. Multi-node deployments choose `RF=3` as the smallest quorum-tolerant size, and that is where the distinction between `acks: 1` and `MAJORITY` starts to matter: `acks: 1` acknowledges once the leader has the write, `MAJORITY` waits for the write to survive the loss of the leader.
 
 ## Next Step
 

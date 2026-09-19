@@ -107,7 +107,7 @@ fn cypher_request(q: &str) -> Request<query::ExecuteCypherRequest> {
         parameters: std::collections::HashMap::new(),
         read_preference: 0,  // UNSPECIFIED → Primary
         read_concern: None,  // UNSPECIFIED → Local
-        write_concern: None, // UNSPECIFIED → W1
+        write_concern: None, // omitted → the majority default
         transaction_id: 0,   // auto-commit
     })
 }
@@ -469,36 +469,113 @@ async fn grpc_execute_records_timing() {
     assert!(stats.execution_time_ms >= 0);
 }
 
-/// db_error_to_status maps error types correctly.
-/// A client that names no write concern level gets majority, the same default
-/// the embedded library uses: a write that was acknowledged survives the loss of
-/// one replica unless the caller asked for less.
+/// A client that leaves `w` or `journal` unset gets majority with the write
+/// journaled, the same default the embedded library uses; what it names
+/// explicitly on either axis is what it gets, with no rewriting between them.
 #[test]
-fn an_unspecified_write_concern_level_is_majority() {
-    use replication::WriteConcernLevel as Wire;
+fn write_concern_defaults_and_explicit_axes() {
+    use replication::write_concern::W;
+
+    let wire = |w: Option<W>, journal: i32| replication::WriteConcern {
+        w,
+        journal,
+        timeout_ms: 0,
+    };
 
     assert_eq!(
-        write_concern_level_to_executor(Wire::Unspecified as i32),
-        WriteConcernLevel::Majority
+        write_concern_from_proto(&wire(None, 0)).expect("defaults"),
+        WriteConcern::majority()
     );
     assert_eq!(
-        write_concern_level_to_executor(9999),
-        WriteConcernLevel::Majority,
-        "an unknown level falls back to the default, never to something weaker"
-    );
-    // What the caller names explicitly is what it gets.
-    assert_eq!(
-        write_concern_level_to_executor(Wire::W1 as i32),
-        WriteConcernLevel::W1
+        write_concern_from_proto(&wire(
+            Some(W::Mode(replication::WriteConcernMode::Majority as i32)),
+            replication::Journal::Journal as i32
+        ))
+        .expect("explicit majority"),
+        WriteConcern::majority()
     );
     assert_eq!(
-        write_concern_level_to_executor(Wire::W0 as i32),
-        WriteConcernLevel::W0
+        write_concern_from_proto(&wire(Some(W::Acks(1)), 0)).expect("w:1"),
+        WriteConcern::w1()
     );
     assert_eq!(
-        write_concern_level_to_executor(Wire::Majority as i32),
-        WriteConcernLevel::Majority
+        write_concern_from_proto(&wire(Some(W::Acks(0)), 0)).expect("w:0"),
+        WriteConcern::w0()
     );
+    assert_eq!(
+        write_concern_from_proto(&wire(Some(W::Acks(3)), 0)).expect("w:3"),
+        WriteConcern::acks(3)
+    );
+    assert_eq!(
+        write_concern_from_proto(&wire(Some(W::Acks(1)), replication::Journal::Memory as i32))
+            .expect("w:1,j:memory"),
+        WriteConcern::memory()
+    );
+    assert_eq!(
+        write_concern_from_proto(&wire(Some(W::Acks(1)), replication::Journal::Cache as i32))
+            .expect("w:1,j:cache"),
+        WriteConcern::cache()
+    );
+    // A concern round-trips through its wire form.
+    let with_timeout = WriteConcern::majority_with_timeout(250);
+    assert_eq!(
+        write_concern_from_proto(&write_concern_to_proto(&with_timeout)).expect("round trip"),
+        with_timeout
+    );
+}
+
+/// A write concern the server cannot honour is refused with INVALID_ARGUMENT
+/// and the INVALID_WRITE_CONCERN reason, never mapped to something weaker or
+/// stronger than what was asked: an unknown mode or journal value, and a
+/// volatile journal level with more than one acknowledging member.
+#[test]
+fn unsupported_write_concerns_are_refused_with_a_reason() {
+    use replication::write_concern::W;
+    use tonic_types::StatusExt;
+
+    let wire = |w: Option<W>, journal: i32| replication::WriteConcern {
+        w,
+        journal,
+        timeout_ms: 0,
+    };
+
+    for (concern, needle) in [
+        (
+            wire(
+                Some(W::Mode(replication::WriteConcernMode::Unspecified as i32)),
+                0,
+            ),
+            "write_concern.mode",
+        ),
+        (wire(Some(W::Mode(9999)), 0), "write_concern.mode"),
+        (wire(None, 9999), "write_concern.journal"),
+        (
+            wire(None, replication::Journal::Memory as i32),
+            "w:majority,j:memory",
+        ),
+        (
+            wire(Some(W::Acks(2)), replication::Journal::Cache as i32),
+            "w:2,j:cache",
+        ),
+    ] {
+        let status = write_concern_from_proto(&concern).expect_err("must be refused");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "{needle}: got {:?}",
+            status.code()
+        );
+        assert!(
+            status.message().contains(needle),
+            "message must name the offending part, got {:?}",
+            status.message()
+        );
+        let details = status.get_error_details();
+        let info = details
+            .error_info()
+            .unwrap_or_else(|| panic!("{needle} must carry ErrorInfo"));
+        assert_eq!(info.reason, "INVALID_WRITE_CONCERN");
+    }
 }
 
 #[test]
@@ -1035,11 +1112,11 @@ async fn causal_write_without_concern_uses_the_majority_default() {
     );
 }
 
-/// Causal write with WriteConcern=W1 is rejected with FailedPrecondition.
+/// Causal write with `w: 1` is rejected with FailedPrecondition.
 ///
-/// W1 (leader-acknowledged) is insufficient for causal sessions: the leader
-/// may crash before the write is replicated, making the applied_index a
-/// dangling dependency that followers can never satisfy.
+/// The leader alone is insufficient for causal sessions: the leader may
+/// crash before the write is replicated, making the applied_index a dangling
+/// dependency that followers can never satisfy.
 #[tokio::test]
 async fn causal_write_with_w1_rejected() {
     let (svc, _dir) = test_service();
@@ -1055,15 +1132,15 @@ async fn causal_write_with_w1_rejected() {
                 at_timestamp: 0,
             }),
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: crate::proto::replication::WriteConcernLevel::W1 as i32,
+                w: Some(replication::write_concern::W::Acks(1)),
+                journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
-                journal: false,
             }),
             transaction_id: 0,
         }))
         .await;
 
-    assert!(result.is_err(), "causal write with W1 must be rejected");
+    assert!(result.is_err(), "causal write with w:1 must be rejected");
     assert_eq!(
         result.unwrap_err().code(),
         tonic::Code::FailedPrecondition,
@@ -1090,9 +1167,11 @@ async fn causal_write_with_majority_accepted() {
                 at_timestamp: 0,
             }),
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: crate::proto::replication::WriteConcernLevel::Majority as i32,
+                w: Some(replication::write_concern::W::Mode(
+                    replication::WriteConcernMode::Majority as i32,
+                )),
+                journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
-                journal: false,
             }),
             transaction_id: 0,
         }))
@@ -1188,10 +1267,9 @@ async fn grpc_query_stats_reports_property_set_count() {
 
 /// Regression: client-supplied write_concern is not silently ignored.
 /// Previously the handler validated write_concern only for causal sessions
-/// but never propagated it to the executor — every MAJORITY write was
-/// downgraded to W1. With propagation, MAJORITY in standalone mode (no
-/// Raft) is accepted: WriteConcern::effective_level() downgrades to W1
-/// internally, but no error surfaces to the client.
+/// but never propagated it to the executor, so every MAJORITY write was
+/// committed as w:1. With propagation, an explicit MAJORITY in standalone
+/// mode (no Raft) is accepted: the local pipeline is the whole group.
 #[tokio::test]
 async fn grpc_write_concern_majority_accepted_in_standalone() {
     let (svc, _dir) = test_service();
@@ -1203,8 +1281,10 @@ async fn grpc_write_concern_majority_accepted_in_standalone() {
             read_preference: 0,
             read_concern: None,
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: 3, // MAJORITY
-                journal: false,
+                w: Some(replication::write_concern::W::Mode(
+                    replication::WriteConcernMode::Majority as i32,
+                )),
+                journal: replication::Journal::Journal as i32,
                 timeout_ms: 0,
             }),
             transaction_id: 0,
@@ -1506,11 +1586,10 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
     );
 }
 
-/// WriteConcernLevel::MEMORY (proto = 4) reaches the executor without
-/// silent downgrade. In standalone mode the volatile drain path falls
-/// back to W1 internally (effective_level), so the operation succeeds —
-/// but the proto value must NOT be coerced to W1 on entry, otherwise
-/// MEMORY-specific drain behaviour would never engage in cluster mode.
+/// `w:1, j:memory` reaches the executor without silent rewriting: the
+/// volatile overlay path engages and the operation succeeds. The journal
+/// value must NOT be coerced to JOURNAL on entry, otherwise the drain
+/// behaviour would never engage in cluster mode.
 #[tokio::test]
 async fn grpc_write_concern_memory_accepted() {
     let (svc, _dir) = test_service();
@@ -1521,8 +1600,8 @@ async fn grpc_write_concern_memory_accepted() {
             read_preference: 0,
             read_concern: None,
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: 4, // MEMORY
-                journal: false,
+                w: Some(replication::write_concern::W::Acks(1)),
+                journal: replication::Journal::Memory as i32,
                 timeout_ms: 0,
             }),
             transaction_id: 0,
@@ -1564,13 +1643,11 @@ async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
     );
 }
 
-/// WriteConcern.journal flag (separate from level) reaches the executor.
-/// The flag forces WAL fsync regardless of level; in standalone single-
-/// node mode that converges with W1 behaviour, but the field must NOT be
-/// dropped at the boundary — otherwise cluster deployments would silently
-/// lose durability when callers set `journal: true`.
+/// An explicit `w:1, j:journal` with a timeout reaches the executor: the
+/// journal axis forces the fsync before acknowledgement, and the timeout is
+/// carried rather than dropped at the boundary.
 #[tokio::test]
-async fn grpc_write_concern_journal_flag_accepted() {
+async fn grpc_write_concern_journal_with_timeout_accepted() {
     let (svc, _dir) = test_service();
     let resp = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
@@ -1579,8 +1656,8 @@ async fn grpc_write_concern_journal_flag_accepted() {
             read_preference: 0,
             read_concern: None,
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: 2, // W1 with journal forces fsync
-                journal: true,
+                w: Some(replication::write_concern::W::Acks(1)),
+                journal: replication::Journal::Journal as i32,
                 timeout_ms: 5_000,
             }),
             transaction_id: 0,
@@ -1591,7 +1668,7 @@ async fn grpc_write_concern_journal_flag_accepted() {
     assert_eq!(stats.nodes_created, 1);
 }
 
-/// WriteConcernLevel::CACHE (proto = 5) — same wire-through invariant.
+/// `w:1, j:cache`: the same wire-through invariant as the memory level.
 #[tokio::test]
 async fn grpc_write_concern_cache_accepted() {
     let (svc, _dir) = test_service();
@@ -1602,8 +1679,8 @@ async fn grpc_write_concern_cache_accepted() {
             read_preference: 0,
             read_concern: None,
             write_concern: Some(crate::proto::replication::WriteConcern {
-                level: 5, // CACHE
-                journal: false,
+                w: Some(replication::write_concern::W::Acks(1)),
+                journal: replication::Journal::Cache as i32,
                 timeout_ms: 0,
             }),
             transaction_id: 0,

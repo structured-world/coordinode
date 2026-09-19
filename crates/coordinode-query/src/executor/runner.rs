@@ -1600,7 +1600,7 @@ impl<'a> ExecutionContext<'a> {
         // locus (ADR-041): OCC validation, commit_ts assignment, write-concern
         // fan-out, and the Raft proposal pipeline all live in `Transaction`.
         self.sync_txn_state();
-        let write_concern = self.write_concern.clone();
+        let write_concern = self.write_concern;
         let ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &write_concern,
             pipeline: self.proposal_pipeline,

@@ -13,7 +13,7 @@ fn to_op_maps_execute_with_handles() {
         })),
     };
     match to_op(frame) {
-        Some(SessionOp::Execute {
+        Ok(SessionOp::Execute {
             query, txid, nonce, ..
         }) => {
             assert_eq!(query, "RETURN 1");
@@ -34,7 +34,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
         })),
     };
     match to_op(unordered) {
-        Some(SessionOp::Begin {
+        Ok(SessionOp::Begin {
             ordering,
             drain_timeout_ms,
         }) => {
@@ -52,7 +52,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
     };
     assert!(matches!(
         to_op(unspecified),
-        Some(SessionOp::Begin {
+        Ok(SessionOp::Begin {
             ordering: CoreOrdering::Ordered,
             ..
         })
@@ -70,7 +70,7 @@ fn to_op_maps_commit_rollback_cancel() {
     };
     assert!(matches!(
         to_op(commit),
-        Some(SessionOp::Commit {
+        Ok(SessionOp::Commit {
             txid: 4,
             last_nonce: 9
         })
@@ -81,7 +81,7 @@ fn to_op_maps_commit_rollback_cancel() {
     };
     assert!(matches!(
         to_op(rollback),
-        Some(SessionOp::Rollback { txid: 4 })
+        Ok(SessionOp::Rollback { txid: 4 })
     ));
     let cancel = ClientFrame {
         request_id: 1,
@@ -91,21 +91,56 @@ fn to_op_maps_commit_rollback_cancel() {
     };
     assert!(matches!(
         to_op(cancel),
-        Some(SessionOp::Cancel {
+        Ok(SessionOp::Cancel {
             target_request_id: 8
         })
     ));
 }
 
 #[test]
-fn to_op_returns_none_for_a_frame_with_no_op() {
+fn to_op_refuses_a_frame_with_no_op() {
     assert!(
         to_op(ClientFrame {
             request_id: 9,
             op: None
         })
-        .is_none()
+        .is_err()
     );
+}
+
+/// A Configure carrying a write concern the server cannot honour is refused
+/// at the frame boundary, with the message naming the offending combination;
+/// one it can honour lands typed in the settings.
+#[test]
+fn to_op_configure_maps_or_refuses_the_write_concern() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    let configure = |wc: replication::WriteConcern| ClientFrame {
+        request_id: 1,
+        op: Some(client_frame::Op::Configure(Configure {
+            write_concern: Some(wc),
+            ..Default::default()
+        })),
+    };
+
+    match to_op(configure(replication::WriteConcern {
+        w: Some(replication::write_concern::W::Acks(1)),
+        journal: replication::Journal::Cache as i32,
+        timeout_ms: 0,
+    })) {
+        Ok(SessionOp::Configure(settings)) => {
+            assert_eq!(settings.write_concern, Some(WriteConcern::cache()));
+        }
+        other => panic!("expected Configure op, got {other:?}"),
+    }
+
+    let refused = to_op(configure(replication::WriteConcern {
+        w: Some(replication::write_concern::W::Acks(2)),
+        journal: replication::Journal::Memory as i32,
+        timeout_ms: 0,
+    }))
+    .expect_err("w:2 with j:memory must be refused");
+    assert!(refused.contains("w:2,j:memory"), "got: {refused}");
 }
 
 #[test]
@@ -162,7 +197,7 @@ fn to_op_converts_execute_parameters_to_engine_values() {
         })),
     };
     match to_op(frame) {
-        Some(SessionOp::Execute { params, .. }) => {
+        Ok(SessionOp::Execute { params, .. }) => {
             assert_eq!(params.get("n"), Some(&Value::Int(5)));
         }
         other => panic!("expected Execute op, got {other:?}"),

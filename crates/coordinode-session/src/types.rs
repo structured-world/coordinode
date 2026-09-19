@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
+use coordinode_core::txn::write_concern::WriteConcern;
 
 /// Per-transaction statement ordering, fixed when the transaction begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +62,8 @@ pub struct ConnectionSettings {
     pub after_index: Option<u64>,
     /// Snapshot pin applied to reads that carry no concern of their own.
     pub at_timestamp: Option<u64>,
-    /// Default write concern level for statements that carry none.
-    pub write_concern: Option<u8>,
+    /// Default write concern for statements that carry none.
+    pub write_concern: Option<WriteConcern>,
     /// Default read preference for statements that carry none.
     pub read_preference: Option<u8>,
     /// Default reorder-buffer drain timeout for ordered transactions, in

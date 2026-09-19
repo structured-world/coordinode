@@ -184,10 +184,53 @@ pub fn checkpoint_oplog_last_index(checkpoint_dir: &std::path::Path) -> Option<u
 ///
 /// All fields use `Arc` so `get_log_reader()` returns a cheap clone that
 /// shares the same oplog handle and caches.
+/// Tells a waiting writer at which log index its proposal became durable in
+/// this member's log.
+///
+/// The proposal pipeline subscribes by proposal id before it submits; the log
+/// store fires after the batch fsync in [`RaftLogStorage::append`]. This is
+/// what a write concern of `w:1` waits for, and what `w:N` counts from: the
+/// leader's own copy is the first of the N.
+#[derive(Default)]
+pub struct AppendNotifier {
+    waiters: Mutex<
+        HashMap<coordinode_core::txn::proposal::ProposalId, tokio::sync::oneshot::Sender<u64>>,
+    >,
+}
+
+impl AppendNotifier {
+    /// Wait for `id` to be durable in this member's log; resolves to its
+    /// log index. Subscribe before submitting the proposal, or the append may
+    /// fire first and the receiver never resolves.
+    pub fn subscribe(
+        &self,
+        id: coordinode_core::txn::proposal::ProposalId,
+    ) -> tokio::sync::oneshot::Receiver<u64> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.insert(id, tx);
+        }
+        rx
+    }
+
+    fn notify(&self, id: coordinode_core::txn::proposal::ProposalId, index: u64) {
+        let waiter = match self.waiters.lock() {
+            Ok(mut waiters) => waiters.remove(&id),
+            Err(_) => None,
+        };
+        if let Some(tx) = waiter {
+            // A receiver that gave up (timeout) is not an error here.
+            let _ = tx.send(index);
+        }
+    }
+}
+
 pub struct LogStore {
     engine: Arc<StorageEngine>,
     /// Oplog manager for log entry segments.
     oplog: Arc<Mutex<OplogManager>>,
+    /// Waiters for "my proposal is durable in this log", see [`AppendNotifier`].
+    append_notifier: Arc<AppendNotifier>,
     /// In-memory cache of the last appended log id. Updated on every
     /// `append()` and persisted to `Partition::Raft` so it survives restarts.
     last_log_id: Arc<Mutex<Option<LogId>>>,
@@ -203,6 +246,12 @@ impl LogStore {
     /// through openraft. Reads serialize against appends via the inner `Mutex`.
     pub fn oplog_handle(&self) -> Arc<Mutex<OplogManager>> {
         Arc::clone(&self.oplog)
+    }
+
+    /// The local-append notifier the proposal pipeline waits on for `w:1` and
+    /// `w:N`. Cloned out before the `LogStore` is moved into `openraft::Raft`.
+    pub fn append_notifier(&self) -> Arc<AppendNotifier> {
+        Arc::clone(&self.append_notifier)
     }
 
     /// Open the LogStore, routing oplog segments to the oplog-eligible
@@ -287,6 +336,7 @@ impl LogStore {
         Ok(Self {
             engine,
             oplog: Arc::new(Mutex::new(oplog)),
+            append_notifier: Arc::new(AppendNotifier::default()),
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
         })
@@ -547,6 +597,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             oplog: Arc::clone(&self.oplog),
             last_log_id: Arc::clone(&self.last_log_id),
             last_purged: Arc::clone(&self.last_purged),
+            append_notifier: Arc::clone(&self.append_notifier),
         }
     }
 
@@ -592,6 +643,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I::IntoIter: OptionalSend,
     {
         let mut last: Option<LogId> = None;
+        // (proposal id, log index) of every proposal in this batch, told to
+        // the waiting writers only after the fsync below.
+        let mut appended: Vec<(coordinode_core::txn::proposal::ProposalId, u64)> = Vec::new();
         {
             let mut oplog = self
                 .oplog
@@ -599,6 +653,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 .map_err(|_| io::Error::other("oplog mutex poisoned"))?;
             for entry in entries {
                 let oplog_entry = Self::entry_to_oplog(&entry)?;
+                if let openraft::entry::EntryPayload::Normal(request) = &entry.payload {
+                    appended.extend(request.proposals.iter().map(|p| (p.id, entry.log_id.index)));
+                }
                 last = Some(entry.log_id);
                 oplog
                     .append(&oplog_entry)
@@ -608,6 +665,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             // All entries above are durable after this call. This is the crash-safety
             // boundary: a process killed after flush_and_sync() will NOT lose these entries.
             oplog.flush().map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        for (id, index) in appended {
+            self.append_notifier.notify(id, index);
         }
 
         // Update and persist the last_log_id cache.

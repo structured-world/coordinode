@@ -1361,7 +1361,7 @@ impl Database {
         QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: self.snapshot_read_ts.take(),
-            write_concern: self.write_concern.clone(),
+            write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         }
@@ -1549,8 +1549,8 @@ impl Database {
             session.read_concern = rc.level;
             session.snapshot_read_ts = rc.at_timestamp;
         }
-        if let Some(ref wc) = write_concern {
-            session.write_concern = wc.clone();
+        if let Some(wc) = write_concern {
+            session.write_concern = wc;
         }
 
         let params = params.filter(|p| !p.is_empty());
@@ -1621,7 +1621,7 @@ impl Database {
         let session = QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
-            write_concern: self.write_concern.clone(),
+            write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         };
@@ -1683,7 +1683,7 @@ impl Database {
             Some(&self.oracle),
             state,
         );
-        let wc = self.write_concern.clone();
+        let wc = self.write_concern;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
@@ -1866,12 +1866,9 @@ impl Database {
         self.read_concern
     }
 
-    /// Set session-level write concern level.
-    pub fn set_write_concern(
-        &mut self,
-        level: coordinode_core::txn::write_concern::WriteConcernLevel,
-    ) {
-        self.write_concern.level = level;
+    /// Set the session-level write concern (`w`, `journal` and timeout).
+    pub fn set_write_concern(&mut self, wc: coordinode_core::txn::write_concern::WriteConcern) {
+        self.write_concern = wc;
     }
 
     /// Override the AFTER COMMIT trigger dispatcher knobs (cascade-depth cap +
@@ -1881,17 +1878,9 @@ impl Database {
         self.trigger_dispatch_config = cfg;
     }
 
-    /// Set session-level write concern (full configuration including journal + timeout).
-    pub fn set_write_concern_full(
-        &mut self,
-        wc: coordinode_core::txn::write_concern::WriteConcern,
-    ) {
-        self.write_concern = wc;
-    }
-
-    /// Get current session-level write concern level.
-    pub fn write_concern(&self) -> coordinode_core::txn::write_concern::WriteConcernLevel {
-        self.write_concern.level
+    /// Get the current session-level write concern.
+    pub fn write_concern(&self) -> coordinode_core::txn::write_concern::WriteConcern {
+        self.write_concern
     }
 
     /// Execute a Cypher query with a specific read concern.
@@ -1935,7 +1924,7 @@ impl Database {
         let mut session = QuerySession {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
-            write_concern: self.write_concern.clone(),
+            write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         };
@@ -1946,7 +1935,7 @@ impl Database {
             session.snapshot_read_ts = rc.at_timestamp;
         }
         if let Some(wc) = write_concern {
-            session.write_concern = wc.clone();
+            session.write_concern = *wc;
         }
 
         let params = params.filter(|p| !p.is_empty());
@@ -1993,7 +1982,7 @@ impl Database {
         let session = QuerySession {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::Snapshot,
             snapshot_read_ts: Some(pinned),
-            write_concern: self.write_concern.clone(),
+            write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             after_commit_generation: 0,
         };
@@ -2316,7 +2305,7 @@ impl Database {
             proposal_pipeline: Some(self.pipeline.as_ref()),
             proposal_id_gen: Some(&self.proposal_id_gen),
             read_concern: session.read_concern,
-            write_concern: session.write_concern.clone(),
+            write_concern: session.write_concern,
             drain_buffer: Some(&self.drain_buffer),
             nvme_write_buffer: self.nvme_write_buffer.as_deref(),
             mvcc_snapshot: None,

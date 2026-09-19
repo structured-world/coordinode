@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_core::txn::transaction::CommitReceipt;
+use coordinode_core::txn::write_concern::WriteConcern;
 use tokio::sync::mpsc;
 
 use super::*;
@@ -548,7 +549,7 @@ async fn configure_changes_one_setting_and_reports_all_of_them() {
         vec![
             SessionOp::Configure(ConnectionSettings {
                 read_concern: Some(2),
-                write_concern: Some(4),
+                write_concern: Some(WriteConcern::w1()),
                 ..Default::default()
             }),
             // Changes only the preference; the concerns above must survive.
@@ -569,13 +570,13 @@ async fn configure_changes_one_setting_and_reports_all_of_them() {
 
     let first = settings_of(1);
     assert_eq!(first.read_concern, Some(2));
-    assert_eq!(first.write_concern, Some(4));
+    assert_eq!(first.write_concern, Some(WriteConcern::w1()));
 
     let second = settings_of(2);
     assert_eq!(second.read_preference, Some(3));
     assert_eq!(
         (second.read_concern, second.write_concern),
-        (Some(2), Some(4)),
+        (Some(2), Some(WriteConcern::w1())),
         "a partial Configure must not reset the settings it did not mention"
     );
 

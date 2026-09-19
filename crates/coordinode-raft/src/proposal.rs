@@ -13,12 +13,13 @@ use std::time::Duration;
 use coordinode_core::txn::proposal::{
     PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
+use coordinode_core::txn::write_concern::WriteAck;
 use coordinode_storage::engine::config::FlushPolicy;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::StorageError;
 
-use crate::storage::{CoordinodeStateMachine, Request, TypeConfig};
+use crate::storage::{AppendNotifier, CoordinodeStateMachine, Request, TypeConfig};
 
 /// Map a [`StorageError`] from the engine into a [`ProposalError`]
 /// preserving the typed `CapacityExhausted` variant. Other storage
@@ -306,6 +307,10 @@ pub struct RaftProposalPipeline {
     /// OS thread. The volatile-write drain is one such caller: it runs on its
     /// own `std::thread`, where `Handle::current()` panics.
     runtime: Option<tokio::runtime::Handle>,
+    /// The log store's local-append notifier. Without it `w:1` and `w:N`
+    /// cannot be told apart from a majority and are served as one (a stronger
+    /// wait, never a weaker one).
+    append_notifier: Option<Arc<AppendNotifier>>,
 }
 
 impl RaftProposalPipeline {
@@ -315,6 +320,16 @@ impl RaftProposalPipeline {
             raft,
             rate_limiter: RateLimiter::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
+            append_notifier: None,
+        }
+    }
+
+    /// Create a pipeline that can wait for `w:1` / `w:N` through the log
+    /// store's local-append notifier.
+    pub fn with_append_notifier(raft: Arc<RaftInstance>, notifier: Arc<AppendNotifier>) -> Self {
+        Self {
+            append_notifier: Some(notifier),
+            ..Self::new(raft)
         }
     }
 
@@ -324,6 +339,121 @@ impl RaftProposalPipeline {
             raft,
             rate_limiter: RateLimiter::new(max_pending),
             runtime: tokio::runtime::Handle::try_current().ok(),
+            append_notifier: None,
+        }
+    }
+
+    /// A handle to spawn the commit future on when the caller does not wait
+    /// for the commit itself (`w:0`, `w:1`, `w:N` below a majority).
+    fn spawn_handle(&self) -> Result<tokio::runtime::Handle, ProposalError> {
+        tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime.clone())
+            .ok_or_else(|| {
+                ProposalError::Raft(
+                    "proposal pipeline has no tokio runtime to carry a write the caller does \
+                     not wait for"
+                        .to_string(),
+                )
+            })
+    }
+
+    /// Submit `proposal` and return once `n` members hold it durably, the
+    /// leader counted first.
+    ///
+    /// The leader's own copy is known from the log store's append notifier;
+    /// followers' copies from openraft's replication metrics (a follower's
+    /// matched index covers the entry once its own log store has fsynced it).
+    /// The commit itself is spawned and completes on its own, so returning
+    /// early never cancels the write. `applied_index` is reported only once a
+    /// majority holds the entry, since only then is it committed.
+    async fn propose_acks(
+        &self,
+        proposal: &RaftProposal,
+        n: u32,
+        notifier: &AppendNotifier,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        use openraft::rt::watch::WatchReceiver;
+
+        let mut metrics_rx = self.raft.metrics();
+        let (members, majority) = {
+            let m = metrics_rx.borrow_watched();
+            if !m.state.is_leader() {
+                return Err(ProposalError::NotLeader {
+                    leader_id: m.current_leader,
+                });
+            }
+            let members = m.membership_config.membership().voter_ids().count() as u32;
+            (members, members / 2 + 1)
+        };
+        if n > members {
+            return Err(ProposalError::InvalidWriteConcern(format!(
+                "w:{n} asks for {n} members, the group has {members}"
+            )));
+        }
+
+        // Subscribe before submitting: the append may fire before the future
+        // below is even polled.
+        let mut appended = notifier.subscribe(proposal.id);
+        let _permit = self.rate_limiter.acquire(0).await?;
+        let raft = Arc::clone(&self.raft);
+        let request = Request::single(proposal.clone());
+        let mut commit = self
+            .spawn_handle()?
+            .spawn(async move { raft.client_write(request).await });
+
+        // The entry's index: from the local append, or from the commit if
+        // that lands first (a one-member group commits on append).
+        let index = tokio::select! {
+            appended = &mut appended => appended.map_err(|_| {
+                ProposalError::Raft("the log store dropped the append notifier".to_string())
+            })?,
+            committed = &mut commit => match committed {
+                Ok(Ok(response)) => response.log_id.index,
+                Ok(Err(raft_err)) => {
+                    return Err(match extract_forward_leader(&raft_err) {
+                        Some(leader_id) => ProposalError::NotLeader { leader_id },
+                        None => ProposalError::Raft(raft_err.to_string()),
+                    });
+                }
+                Err(join) => return Err(ProposalError::Raft(format!("commit task failed: {join}"))),
+            },
+        };
+
+        loop {
+            let held = {
+                let m = metrics_rx.borrow_watched();
+                if !m.state.is_leader() {
+                    return Err(ProposalError::NotLeader {
+                        leader_id: m.current_leader,
+                    });
+                }
+                let followers = m
+                    .replication
+                    .as_ref()
+                    .map(|r| {
+                        r.iter()
+                            .filter(|(id, matched)| {
+                                **id != m.id && matched.is_some_and(|l| l.index >= index)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                1 + followers as u32
+            };
+            if held >= n {
+                metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
+                return Ok(if held >= majority {
+                    ProposalOutcome::replicated(index)
+                } else {
+                    ProposalOutcome::local()
+                });
+            }
+            metrics_rx.changed().await.map_err(|_| {
+                ProposalError::Raft(
+                    "raft metrics channel closed while waiting for acks".to_string(),
+                )
+            })?;
         }
     }
 
@@ -482,6 +612,76 @@ impl ProposalPipeline for RaftProposalPipeline {
                         timeout_ms: timeout.as_millis() as u32,
                     })
                 }
+            }
+        })
+    }
+
+    fn propose_with_ack(
+        &self,
+        proposal: &RaftProposal,
+        ack: WriteAck,
+        timeout: Option<Duration>,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        let n = match ack {
+            WriteAck::Majority => {
+                return match timeout {
+                    Some(t) => self.propose_with_timeout(proposal, t),
+                    None => self.propose_and_wait(proposal),
+                };
+            }
+            WriteAck::Acks(n) => n,
+        };
+        if n == 0 {
+            // Fire-and-forget: the write goes through the leader and the log
+            // like any other; only the waiting is skipped. A member that is
+            // not the leader still refuses, so the caller can route.
+            return self.block_on_runtime(async {
+                {
+                    use openraft::rt::watch::WatchReceiver;
+                    let rx = self.raft.metrics();
+                    let m = rx.borrow_watched();
+                    if !m.state.is_leader() {
+                        return Err(ProposalError::NotLeader {
+                            leader_id: m.current_leader,
+                        });
+                    }
+                }
+                let _permit = self.rate_limiter.acquire(0).await?;
+                let raft = Arc::clone(&self.raft);
+                let request = Request::single(proposal.clone());
+                let id = proposal.id;
+                self.spawn_handle()?.spawn(async move {
+                    if let Err(e) = raft.client_write(request).await {
+                        tracing::warn!(proposal_id = %id, error = %e, "w:0 write did not commit");
+                    }
+                });
+                metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
+                Ok(ProposalOutcome::local())
+            });
+        }
+        let Some(notifier) = self.append_notifier.as_ref() else {
+            // No way to see the leader's own append: wait for the majority,
+            // which holds everything w:N asks for and more.
+            return match timeout {
+                Some(t) => self.propose_with_timeout(proposal, t),
+                None => self.propose_and_wait(proposal),
+            };
+        };
+        self.block_on_runtime(async {
+            match timeout {
+                Some(t) => {
+                    match tokio::time::timeout(t, self.propose_acks(proposal, n, notifier)).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => {
+                            metrics::counter!("coordinode_raft_write_concern_timeouts_total")
+                                .increment(1);
+                            Err(ProposalError::WriteConcernTimeout {
+                                timeout_ms: t.as_millis() as u32,
+                            })
+                        }
+                    }
+                }
+                None => self.propose_acks(proposal, n, notifier).await,
             }
         })
     }

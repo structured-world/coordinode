@@ -590,18 +590,18 @@ fn read_concern_session_level() {
     );
 }
 
-/// R124: Write concern levels — W0 fire-and-forget still writes data locally,
-/// Majority uses proposal pipeline, session API works.
+/// Write concern `w` axis through the session API: the default is majority,
+/// `w:0` (fire-and-forget) and `w:1` still write the data locally in embedded
+/// mode, and the setting reads back as what was set.
 #[test]
-fn write_concern_levels() {
-    use coordinode_core::txn::write_concern::WriteConcernLevel;
+fn write_concern_acks_through_session_api() {
+    use coordinode_core::txn::write_concern::WriteConcern;
 
     let mut db = open_db();
 
-    // Default is Majority
-    assert_eq!(db.write_concern(), WriteConcernLevel::Majority);
+    // Default is w:majority, j:journal.
+    assert_eq!(db.write_concern(), WriteConcern::majority());
 
-    // Write with Majority (default) — data visible
     db.execute_cypher("CREATE (n:WC {name: 'majority', v: 1})")
         .expect("create with majority");
     let rows = db
@@ -609,11 +609,8 @@ fn write_concern_levels() {
         .expect("read majority");
     assert!(!rows.is_empty(), "majority write should be visible");
 
-    // Switch to W0 (fire-and-forget)
-    db.set_write_concern(WriteConcernLevel::W0);
-    assert_eq!(db.write_concern(), WriteConcernLevel::W0);
-
-    // W0 write — data still visible locally (embedded mode, direct write)
+    db.set_write_concern(WriteConcern::w0());
+    assert_eq!(db.write_concern(), WriteConcern::w0());
     db.execute_cypher("CREATE (n:WC {name: 'w0', v: 2})")
         .expect("create with w0");
     let w0_rows = db
@@ -624,8 +621,7 @@ fn write_concern_levels() {
         "w0 write visible locally in embedded mode"
     );
 
-    // Switch to W1
-    db.set_write_concern(WriteConcernLevel::W1);
+    db.set_write_concern(WriteConcern::w1());
     db.execute_cypher("CREATE (n:WC {name: 'w1', v: 3})")
         .expect("create with w1");
     let w1_rows = db
@@ -633,54 +629,54 @@ fn write_concern_levels() {
         .expect("read w1");
     assert!(!w1_rows.is_empty(), "w1 write visible locally");
 
-    // Restore to Majority
-    db.set_write_concern(WriteConcernLevel::Majority);
-    assert_eq!(db.write_concern(), WriteConcernLevel::Majority);
+    db.set_write_concern(WriteConcern::majority());
+    assert_eq!(db.write_concern(), WriteConcern::majority());
 }
 
-/// R124: Write concern validation — causal session rejects volatile writes.
+/// Causal sessions accept only `w:majority` with `j:journal`: anything weaker
+/// on either axis may be lost after the caller learned its position.
 #[test]
 fn write_concern_causal_validation() {
-    use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
+    use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 
-    // Majority is causal-safe
     assert!(
         WriteConcern::majority()
             .validate_for_causal_session()
             .is_ok()
     );
-
-    // W0, W1 are NOT causal-safe
     assert!(WriteConcern::w0().validate_for_causal_session().is_err());
     assert!(WriteConcern::w1().validate_for_causal_session().is_err());
+    assert!(WriteConcern::acks(3).validate_for_causal_session().is_err());
 
-    // j:true + W0 upgrades to W1, still not causal-safe
+    // Majority with a volatile journal level is not causal-safe either, and
+    // is refused outright by `validate` since a volatile state cannot be
+    // confirmed across members.
     let wc = WriteConcern {
-        level: WriteConcernLevel::W0,
-        journal: true,
+        w: WriteAck::Majority,
+        journal: Journal::Memory,
         timeout_ms: 0,
     };
-    assert_eq!(wc.effective_level(), WriteConcernLevel::W1);
     assert!(wc.validate_for_causal_session().is_err());
+    assert!(wc.validate(None).is_err());
 }
 
-/// R124: Journal gate (j:true) forces WAL fsync; write concern full API.
+/// The `journal` axis through the session API: an explicit `j:journal` with a
+/// timeout writes and reads back, and `w:0` is answered at once whatever `j`
+/// says (no silent upgrade to `w:1`).
 #[test]
-fn write_concern_journal_and_full_api() {
-    use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
+fn write_concern_journal_axis_through_session_api() {
+    use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 
     let mut db = open_db();
 
-    // Set full write concern with journal gate
     let wc = WriteConcern {
-        level: WriteConcernLevel::Majority,
-        journal: true,
-        timeout_ms: 0,
+        w: WriteAck::Majority,
+        journal: Journal::Journal,
+        timeout_ms: 5_000,
     };
-    db.set_write_concern_full(wc);
-    assert_eq!(db.write_concern(), WriteConcernLevel::Majority);
+    db.set_write_concern(wc);
+    assert_eq!(db.write_concern(), wc);
 
-    // Write with j:true — forces WAL fsync after commit
     db.execute_cypher("CREATE (n:Journal {name: 'durable', v: 1})")
         .expect("create with journal");
     let rows = db
@@ -688,20 +684,26 @@ fn write_concern_journal_and_full_api() {
         .expect("read journal");
     assert!(!rows.is_empty(), "journaled write should be visible");
 
-    // j:true + W0 → effective level W1 (journal gate upgrade)
-    let wc_upgrade = WriteConcern {
-        level: WriteConcernLevel::W0,
-        journal: true,
+    let fire_and_forget_journaled = WriteConcern {
+        w: WriteAck::NONE,
+        journal: Journal::Journal,
         timeout_ms: 0,
     };
-    db.set_write_concern_full(wc_upgrade);
-    // Effective level is W1, not W0 — write goes through pipeline, not fire-and-forget
-    db.execute_cypher("CREATE (n:Journal {name: 'upgraded', v: 2})")
-        .expect("create with j:true upgrade");
+    assert!(
+        !fire_and_forget_journaled.is_volatile(),
+        "w:0 takes the ordinary log path, it is not an overlay write"
+    );
+    db.set_write_concern(fire_and_forget_journaled);
+    assert_eq!(db.write_concern(), fire_and_forget_journaled);
+    db.execute_cypher("CREATE (n:Journal {name: 'fire_and_forget', v: 2})")
+        .expect("create with w:0, j:journal");
     let rows2 = db
-        .execute_cypher("MATCH (n:Journal {name: 'upgraded'}) RETURN n.v")
-        .expect("read upgraded");
-    assert!(!rows2.is_empty(), "j:true upgraded W0→W1 write visible");
+        .execute_cypher("MATCH (n:Journal {name: 'fire_and_forget'}) RETURN n.v")
+        .expect("read fire_and_forget");
+    assert!(
+        !rows2.is_empty(),
+        "w:0 write visible locally in embedded mode"
+    );
 }
 
 // ── #51 Edge-case audit: non-temporal modalities ──────────────────────

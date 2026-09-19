@@ -33,11 +33,13 @@ pub mod proto {
         // Re-export replication types at this level so generated code for other
         // proto packages that import coordinode.v1.replication can resolve them
         // via `super::replication::TypeName`.
+        pub use cdc::Journal;
         pub use cdc::ReadConcern;
         pub use cdc::ReadConcernLevel;
         pub use cdc::ReadPreference;
         pub use cdc::WriteConcern;
-        pub use cdc::WriteConcernLevel;
+        pub use cdc::WriteConcernMode;
+        pub use cdc::write_concern;
     }
     pub mod admin {
         pub mod cluster {

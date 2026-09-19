@@ -76,6 +76,11 @@ pub enum Reason {
     /// read succeeds at. Terminal for that timestamp: the horizon only moves
     /// forward.
     OutsideRetention,
+    /// A write concern the server cannot honour: an unknown mode or journal
+    /// value, a member count above the group's size, or a volatile journal
+    /// level asked of more than one member. Terminal for that request; the
+    /// message names the offending combination.
+    InvalidWriteConcern,
 }
 
 impl Reason {
@@ -95,6 +100,7 @@ impl Reason {
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::NotLeader => "NOT_LEADER",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
+            Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
         }
     }
 

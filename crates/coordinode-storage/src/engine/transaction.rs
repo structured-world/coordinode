@@ -30,7 +30,7 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
+use coordinode_core::txn::write_concern::{Journal, WriteConcern};
 use lsm_tree::Guard;
 
 use crate::cache::write_buffer::NvmeWriteBuffer;
@@ -49,9 +49,10 @@ pub type KvPair = (Vec<u8>, Vec<u8>);
 /// of the transaction's identity, so they are supplied at commit time rather
 /// than stored on the transaction.
 pub struct CommitContext<'b> {
-    /// Effective write concern (W0 / volatile / W1 / majority, journal gate).
+    /// Write concern: how many members hold the write (`w`) and in what state
+    /// (`journal`) before the caller is answered.
     pub write_concern: &'b WriteConcern,
-    /// Raft proposal pipeline for durable W1/Majority application. `None` in
+    /// Raft proposal pipeline for durable application. `None` in
     /// legacy / embedded single-node mode (writes go straight to the engine).
     pub pipeline: Option<&'b dyn ProposalPipeline>,
     /// Monotonic proposal-id source, paired with `pipeline`.
@@ -886,22 +887,26 @@ impl<'a> Transaction<'a> {
         // applies / replicates them.
         let mut wb = std::mem::take(&mut self.write_buffer);
 
-        // Resolve effective write concern (j:true upgrades W0 → W1).
-        let effective_level = ctx.write_concern.effective_level();
+        // A write concern the group cannot honour is refused before anything is
+        // written; the member count is checked at the pipeline, which knows it.
+        ctx.write_concern
+            .validate(None)
+            .map_err(|e| CommitError::Serialization(e.to_string()))?;
 
-        // W0 takes the same path as every other commit below. A write concern
+        // w:0 takes the same path as every other commit below. A write concern
         // decides when the caller is answered, never whether the write is
         // replicated: a commit applied to this member alone would be a record no
         // other member ever sees, on a follower and on the leader alike.
 
-        // Write concern Memory/Cache (volatile with drain):
-        // 1. Apply locally for immediate read visibility (same as W0)
+        // Volatile journal (j:memory / j:cache with the leader as the one
+        // acknowledging member):
+        // 1. Apply locally for immediate read visibility
         // 2. Buffer mutations in DrainBuffer for background Raft replication
         // 3. Return immediately — drain thread handles durability
         //
         // Crash before drain = data lost (explicit contract).
         // Drained entries preserve original commit_ts for CDC fidelity.
-        if effective_level.is_volatile() {
+        if ctx.write_concern.is_volatile() {
             // Step 1: Apply locally for read visibility.
             for ((part, key), value) in &wb {
                 match value {
@@ -977,9 +982,9 @@ impl<'a> Transaction<'a> {
 
                 let entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
 
-                // w:cache: persist to NVMe before ACK for process-crash recovery.
-                // w:memory skips this — data loss on crash is the explicit contract.
-                if effective_level == WriteConcernLevel::Cache {
+                // j:cache: persist to NVMe before ACK for process-crash recovery.
+                // j:memory skips this: data loss on crash is the explicit contract.
+                if ctx.write_concern.journal == Journal::Cache {
                     if let Some(nvme) = ctx.nvme_write_buffer {
                         nvme.append(&entry).map_err(|e| {
                             CommitError::Serialization(format!("w:cache NVMe write failed: {e}"))
@@ -1005,13 +1010,13 @@ impl<'a> Transaction<'a> {
             });
         }
 
-        // W1 / Majority: apply through proposal pipeline (or direct write).
+        // Journaled path (and w:0): apply through the proposal pipeline, or
+        // write directly when none is configured.
         //
         // When a pipeline is configured, mutations are packaged into a
-        // RaftProposal and sent through the pipeline for durable application.
-        // In single-node mode (W1 and Majority are equivalent), the pipeline
-        // applies directly to CoordiNode storage. In cluster mode, Majority
-        // replicates via Raft first while W1 returns after leader WAL fsync.
+        // RaftProposal and sent through the pipeline; `w` decides how many
+        // members must hold the entry before the pipeline returns. In
+        // single-node mode every `w` is satisfied by the local apply.
         //
         // When no pipeline is configured (legacy/test mode), mutations are
         // written directly to the engine.
@@ -1085,26 +1090,15 @@ impl<'a> Transaction<'a> {
                 bypass_rate_limiter: false,
             };
 
-            // Apply write concern timeout if configured (wtimeout > 0).
-            //
-            // propose_with_timeout uses true async timeout in cluster mode
-            // (RaftProposalPipeline wraps propose_async with tokio::time::timeout).
-            // In embedded/single-node mode, the default impl delegates to
-            // propose_and_wait (proposals complete in µs, timeout irrelevant).
-            //
-            // Per MongoDB spec: "On timeout, data is NOT rolled back."
-            // The proposal may still commit after timeout fires.
-            let timeout_ms = ctx.write_concern.timeout_ms;
-            let outcome = if timeout_ms > 0 {
-                let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
-                pipeline
-                    .propose_with_timeout(&proposal, timeout)
-                    .map_err(proposal_err_to_commit)?
-            } else {
-                pipeline
-                    .propose_and_wait(&proposal)
-                    .map_err(proposal_err_to_commit)?
-            };
+            // The wait is bounded by wtimeout when one is set. Per MongoDB:
+            // on timeout the data is NOT rolled back, the proposal may still
+            // commit after the timeout fires. In embedded/single-node mode the
+            // default pipeline applies at once and the timeout is moot.
+            let timeout = (ctx.write_concern.timeout_ms > 0)
+                .then(|| std::time::Duration::from_millis(u64::from(ctx.write_concern.timeout_ms)));
+            let outcome = pipeline
+                .propose_with_ack(&proposal, ctx.write_concern.w, timeout)
+                .map_err(proposal_err_to_commit)?;
             // Record the committed Raft index of this write so the gRPC layer
             // can return it as the causal operationTime token. `None` in
             // local/embedded mode (no Raft log).
@@ -1116,10 +1110,16 @@ impl<'a> Transaction<'a> {
                 .apply_proposal_at(&mutations, commit_ts.as_raw())?;
         }
 
-        // Journal gate (j:true): force WAL fsync after commit.
-        // With FlushPolicy::SyncPerBatch this is already done by WriteBatch,
-        // but with Periodic/Manual policies, j:true forces an explicit persist.
-        if ctx.write_concern.journal {
+        // j:journal on a member without a Raft log (legacy / embedded direct
+        // write): force the fsync after commit. With FlushPolicy::SyncPerBatch
+        // this is already done by WriteBatch; with Periodic/Manual policies the
+        // explicit persist is what makes the journal promise true. A caller
+        // that waits for nobody (w:0) is not held for it.
+        if ctx.write_concern.journal == Journal::Journal
+            && !ctx.write_concern.w.is_fire_and_forget()
+            && ctx.pipeline.is_none()
+            && self.engine.flush_policy() != crate::engine::config::FlushPolicy::SyncPerBatch
+        {
             self.engine
                 .persist()
                 .map_err(|e| CommitError::Serialization(format!("journal fsync failed: {e}")))?;

@@ -24,7 +24,9 @@ use std::sync::Arc;
 use coordinode_storage::engine::core::StorageEngine;
 
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
-use crate::storage::{CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config};
+use crate::storage::{
+    AppendNotifier, CoordinodeStateMachine, LogStore, TypeConfig, default_raft_config,
+};
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 pub use grpc_server::RaftGrpcHandler;
@@ -90,6 +92,9 @@ pub struct RaftNode {
     /// Shared handle to the Raft oplog, for reading committed entries since a
     /// checkpoint (WAL-replay repair). Shares the `LogStore`'s manager.
     oplog: Arc<std::sync::Mutex<coordinode_storage::oplog::OplogManager>>,
+    /// Local-append notifier of the `LogStore`, for `w:1` / `w:N` in the
+    /// proposal pipeline.
+    append_notifier: Arc<AppendNotifier>,
     /// gRPC server shutdown signal. Taken by `shutdown()` (or dropped with
     /// the node) to stop the accept loop.
     grpc_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -133,6 +138,7 @@ impl RaftNode {
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
+        let append_notifier = log_store.append_notifier();
         // Explicit oracle wins; otherwise fall back to the oracle the
         // engine itself stamps writes with (see the cluster constructors
         // for why the state machine must advance it).
@@ -196,6 +202,7 @@ impl RaftNode {
             advertise_addr: None,
             engine,
             oplog,
+            append_notifier,
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: None,
@@ -255,6 +262,7 @@ impl RaftNode {
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
+        let append_notifier = log_store.append_notifier();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -344,6 +352,7 @@ impl RaftNode {
             advertise_addr: Some(advertise_addr),
             engine,
             oplog,
+            append_notifier,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
@@ -401,6 +410,7 @@ impl RaftNode {
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
+        let append_notifier = log_store.append_notifier();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -465,6 +475,7 @@ impl RaftNode {
             advertise_addr: Some(advertise_addr),
             engine,
             oplog,
+            append_notifier,
             // no internal server — caller manages the router
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
@@ -506,6 +517,7 @@ impl RaftNode {
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
+        let append_notifier = log_store.append_notifier();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -548,6 +560,7 @@ impl RaftNode {
             advertise_addr: None,
             engine,
             oplog,
+            append_notifier,
             // no internal server — caller manages the router
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
@@ -591,6 +604,7 @@ impl RaftNode {
         // Clone the oplog handle before openraft consumes the LogStore, so
         // WAL-replay repair can read committed entries since a checkpoint.
         let oplog = log_store.oplog_handle();
+        let append_notifier = log_store.append_notifier();
         // Wire the engine's own timestamp oracle into the state machine:
         // applied entries carry the leader's commit timestamps, and the
         // local oracle must advance past them or MVCC readers on this
@@ -651,6 +665,7 @@ impl RaftNode {
             advertise_addr: None,
             engine,
             oplog,
+            append_notifier,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
@@ -902,7 +917,17 @@ impl RaftNode {
     /// [`batch_pipeline()`](Self::batch_pipeline) which coalesces
     /// proposals into fewer Raft entries.
     pub fn pipeline(&self) -> RaftProposalPipeline {
-        RaftProposalPipeline::new(Arc::clone(&self.raft))
+        RaftProposalPipeline::with_append_notifier(
+            Arc::clone(&self.raft),
+            Arc::clone(&self.append_notifier),
+        )
+    }
+
+    /// The log store's local-append notifier, so a pipeline built elsewhere
+    /// (the server) can wait for `w:1` / `w:N` instead of falling back to a
+    /// majority.
+    pub fn append_notifier(&self) -> &Arc<AppendNotifier> {
+        &self.append_notifier
     }
 
     /// Create a [`WaitForMajorityService`] for batched proposal submission.

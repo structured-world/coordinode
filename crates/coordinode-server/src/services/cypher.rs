@@ -10,7 +10,7 @@ use coordinode_core::graph::types::{PathRel, PathValue, Value};
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
 };
-use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
+use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
@@ -371,21 +371,80 @@ fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
     }
 }
 
-/// Translate the proto `WriteConcernLevel` integer to the executor enum.
-/// Unspecified (and any level this build does not know) is majority, the same
-/// default the embedded library uses: an acknowledged write survives the loss
-/// of one replica unless the caller explicitly asked for less.
-fn write_concern_level_to_executor(level: i32) -> WriteConcernLevel {
-    match replication::WriteConcernLevel::try_from(level)
-        .unwrap_or(replication::WriteConcernLevel::Unspecified)
-    {
-        replication::WriteConcernLevel::W0 => WriteConcernLevel::W0,
-        replication::WriteConcernLevel::Memory => WriteConcernLevel::Memory,
-        replication::WriteConcernLevel::Cache => WriteConcernLevel::Cache,
-        replication::WriteConcernLevel::W1 => WriteConcernLevel::W1,
-        replication::WriteConcernLevel::Majority | replication::WriteConcernLevel::Unspecified => {
-            WriteConcernLevel::Majority
+/// Translate a wire `WriteConcern` to the executor's.
+///
+/// `w` unset is majority and `journal` unset is journaled, the same defaults
+/// the embedded library uses: an acknowledged write survives the loss of a
+/// minority unless the caller explicitly asked for less. A value this build
+/// does not know, or a combination the engine cannot honour, is refused
+/// rather than mapped to something weaker or stronger than what was asked.
+pub(crate) fn write_concern_from_proto(
+    wc: &replication::WriteConcern,
+) -> Result<WriteConcern, Status> {
+    use crate::services::error_details::{Reason, status_with_reason};
+    use replication::write_concern::W;
+    use tonic::Code;
+
+    let refuse = |message: String| {
+        status_with_reason(
+            Code::InvalidArgument,
+            message,
+            Reason::InvalidWriteConcern,
+            Vec::new(),
+        )
+    };
+
+    let w = match wc.w {
+        None => WriteAck::Majority,
+        Some(W::Acks(n)) => WriteAck::Acks(n),
+        Some(W::Mode(mode)) => match replication::WriteConcernMode::try_from(mode) {
+            Ok(replication::WriteConcernMode::Majority) => WriteAck::Majority,
+            Ok(replication::WriteConcernMode::Unspecified) | Err(_) => {
+                return Err(refuse(format!(
+                    "write_concern.mode {mode} is not a mode this server knows; \
+                     leave `w` unset for MAJORITY or name a member count with `acks`"
+                )));
+            }
+        },
+    };
+    let journal = match replication::Journal::try_from(wc.journal) {
+        Ok(replication::Journal::Unspecified) | Ok(replication::Journal::Journal) => {
+            Journal::Journal
         }
+        Ok(replication::Journal::Cache) => Journal::Cache,
+        Ok(replication::Journal::Memory) => Journal::Memory,
+        Err(_) => {
+            return Err(refuse(format!(
+                "write_concern.journal {} is not a journal level this server knows",
+                wc.journal
+            )));
+        }
+    };
+    let concern = WriteConcern {
+        w,
+        journal,
+        timeout_ms: wc.timeout_ms,
+    };
+    concern.validate(None).map_err(|e| refuse(e.to_string()))?;
+    Ok(concern)
+}
+
+/// Render an executor `WriteConcern` on the wire, so a setting is confirmed
+/// by what is in effect rather than by what was asked for.
+pub(crate) fn write_concern_to_proto(wc: &WriteConcern) -> replication::WriteConcern {
+    use replication::write_concern::W;
+
+    replication::WriteConcern {
+        w: Some(match wc.w {
+            WriteAck::Acks(n) => W::Acks(n),
+            WriteAck::Majority => W::Mode(replication::WriteConcernMode::Majority as i32),
+        }),
+        journal: match wc.journal {
+            Journal::Journal => replication::Journal::Journal,
+            Journal::Cache => replication::Journal::Cache,
+            Journal::Memory => replication::Journal::Memory,
+        } as i32,
+        timeout_ms: wc.timeout_ms,
     }
 }
 
@@ -652,23 +711,21 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             // On parse failure we let execution proceed and fail with a richer error.
             if let Ok(ast) = coordinode_query::cypher::parse(&req.query) {
                 if ast.is_write() {
-                    let level = req
-                        .write_concern
-                        .as_ref()
-                        .map(|wc| wc.level)
-                        .unwrap_or(replication::WriteConcernLevel::Unspecified as i32);
-                    // The effective level: a request that names none gets the
-                    // majority default and is as safe here as one that asks for it.
-                    let is_majority =
-                        write_concern_level_to_executor(level) == WriteConcernLevel::Majority;
-                    if !is_majority {
+                    // A request that names no concern gets the majority default
+                    // and is as safe here as one that asks for it.
+                    let concern = match req.write_concern.as_ref() {
+                        Some(wc) => write_concern_from_proto(wc)?,
+                        None => WriteConcern::default(),
+                    };
+                    if !concern.is_causal_safe() {
                         return Err(Status::failed_precondition(
-                            "Causal sessions require writeConcern=MAJORITY for write \
-                             statements. A sub-majority write (w:1, w:0) may be lost \
-                             before replication: the resulting applied_index would be a \
-                             dangling causal dependency that followers can never satisfy. \
-                             Use a non-causal session for volatile writes, or upgrade to \
-                             writeConcern=MAJORITY.",
+                            "Causal sessions require writeConcern w:majority with \
+                             j:journal for write statements. A weaker write (w:1, w:0, \
+                             or a volatile journal level) may be lost before replication: \
+                             the resulting applied_index would be a dangling causal \
+                             dependency that followers can never satisfy. Use a \
+                             non-causal session for such writes, or upgrade to \
+                             w:majority.",
                         ));
                     }
                 }
@@ -749,11 +806,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             after_index: if after_idx > 0 { Some(after_idx) } else { None },
             at_timestamp: if at_ts_raw > 0 { Some(at_ts_raw) } else { None },
         };
-        let executor_write_concern = req.write_concern.as_ref().map(|wc| WriteConcern {
-            level: write_concern_level_to_executor(wc.level),
-            journal: wc.journal,
-            timeout_ms: wc.timeout_ms,
-        });
+        let executor_write_concern = req
+            .write_concern
+            .as_ref()
+            .map(write_concern_from_proto)
+            .transpose()?;
 
         // Execute under a shared read lock by default. CypherService
         // accepts any Cypher (CREATE / MATCH / SET / …); the

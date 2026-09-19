@@ -7,9 +7,10 @@
 //!
 //! | Test | Gap | Scenario |
 //! |------|-----|---------|
-//! | `g088_causal_write_without_majority_rejected` | G088 | Write + after_index > 0 + no write_concern → FAILED_PRECONDITION |
-//! | `g088_causal_write_with_w1_rejected` | G088 | Write + after_index > 0 + W1 → FAILED_PRECONDITION |
+//! | `g088_causal_write_without_concern_uses_the_majority_default` | G088 | Write + after_index > 0 + no write_concern → OK (default is majority) |
+//! | `g088_causal_write_with_w1_rejected` | G088 | Write + after_index > 0 + w:1 → FAILED_PRECONDITION |
 //! | `g088_causal_write_with_majority_accepted` | G088 | Write + after_index > 0 + MAJORITY → OK |
+//! | `write_concern_volatile_journal_above_leader_rejected` | | w:majority + j:memory → INVALID_ARGUMENT with INVALID_WRITE_CONCERN |
 //! | `g088_causal_read_without_majority_accepted` | G088 | Read + after_index > 0 + no write_concern → OK (gate skipped) |
 //! | `bug5_match_set_persists_across_queries` | Bug5 | MATCH+SET change must be visible in subsequent MATCH RETURN (no index) |
 //! | `bug5_match_set_persists_with_btree_index` | Bug5 | MATCH+SET change must be visible in subsequent MATCH RETURN (with B-tree index) |
@@ -29,7 +30,9 @@ use std::collections::HashMap;
 use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::common::{PropertyValue, property_value::Value as PvKind};
 use coordinode_integration::proto::query::{ExecuteCypherRequest, Row};
-use coordinode_integration::proto::replication::{ReadConcern, WriteConcern, WriteConcernLevel};
+use coordinode_integration::proto::replication::{
+    Journal, ReadConcern, WriteConcern, WriteConcernMode, write_concern::W,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -81,14 +84,16 @@ fn int_val(row: &HashMap<String, PropertyValue>, col: &str) -> Option<i64> {
 
 // ── G088: write-concern validation in causal sessions ─────────────────────────
 
-/// Causal write without write_concern is rejected end-to-end (gRPC path).
+/// Causal write without write_concern is accepted end-to-end (gRPC path):
+/// the default is majority with the write journaled, which is exactly what
+/// a causal session requires.
 ///
 /// Full production path:
 ///   gRPC client → CypherService::execute_cypher()
 ///     → after_index > 0, is_write() == true, write_concern == None
-///       → FAILED_PRECONDITION
+///       → the majority default → OK
 #[tokio::test]
-async fn g088_causal_write_without_majority_rejected() {
+async fn g088_causal_write_without_concern_uses_the_majority_default() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
@@ -102,30 +107,22 @@ async fn g088_causal_write_without_majority_rejected() {
                 after_index: 1,
                 at_timestamp: 0,
             }),
-            write_concern: None, // omitted → treated as UNSPECIFIED (w:1)
+            write_concern: None, // omitted → the majority default
             transaction_id: 0,
         })
         .await;
 
-    let status = result.expect_err("causal write without write_concern must be rejected");
-    assert_eq!(
-        status.code(),
-        tonic::Code::FailedPrecondition,
-        "expected FAILED_PRECONDITION, got {:?}: {}",
-        status.code(),
-        status.message()
-    );
     assert!(
-        status.message().contains("MAJORITY") || status.message().contains("causal"),
-        "error must mention MAJORITY or causal, got: {}",
-        status.message()
+        result.is_ok(),
+        "a causal write at the default write concern must be accepted, got: {:?}",
+        result.err()
     );
 }
 
-/// Causal write with WriteConcern=W1 is rejected end-to-end (gRPC path).
+/// Causal write with `w: 1` is rejected end-to-end (gRPC path).
 ///
-/// W1 is insufficient for causal sessions — the write may never replicate,
-/// making the returned applied_index a dangling dependency.
+/// The leader alone is insufficient for causal sessions: the write may never
+/// replicate, making the returned applied_index a dangling dependency.
 #[tokio::test]
 async fn g088_causal_write_with_w1_rejected() {
     let server = CoordinodeProcess::start().await;
@@ -142,15 +139,15 @@ async fn g088_causal_write_with_w1_rejected() {
                 at_timestamp: 0,
             }),
             write_concern: Some(WriteConcern {
-                level: WriteConcernLevel::W1 as i32,
+                w: Some(W::Acks(1)),
+                journal: Journal::Journal as i32,
                 timeout_ms: 0,
-                journal: false,
             }),
             transaction_id: 0,
         })
         .await;
 
-    let status = result.expect_err("causal write with W1 must be rejected");
+    let status = result.expect_err("causal write with w:1 must be rejected");
     assert_eq!(
         status.code(),
         tonic::Code::FailedPrecondition,
@@ -182,9 +179,9 @@ async fn g088_causal_write_with_majority_accepted() {
                 at_timestamp: 0,
             }),
             write_concern: Some(WriteConcern {
-                level: WriteConcernLevel::Majority as i32,
+                w: Some(W::Mode(WriteConcernMode::Majority as i32)),
+                journal: Journal::Journal as i32,
                 timeout_ms: 0,
-                journal: false,
             }),
             transaction_id: 0,
         })
@@ -194,6 +191,44 @@ async fn g088_causal_write_with_majority_accepted() {
         result.is_ok(),
         "causal write with MAJORITY must succeed in standalone, got: {:?}",
         result.err()
+    );
+}
+
+/// A volatile journal level asked of more than the leader is refused at the
+/// boundary (gRPC path): the two axes are never silently rewritten to fit
+/// each other, the caller is told the combination is not honoured.
+#[tokio::test]
+async fn write_concern_volatile_journal_above_leader_rejected() {
+    let server = CoordinodeProcess::start().await;
+    let mut client = server.cypher_client().await;
+
+    let result = client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (n:WcTest {x: 1})".to_string(),
+            parameters: HashMap::new(),
+            read_preference: 0,
+            read_concern: None,
+            write_concern: Some(WriteConcern {
+                w: Some(W::Mode(WriteConcernMode::Majority as i32)),
+                journal: Journal::Memory as i32,
+                timeout_ms: 0,
+            }),
+            transaction_id: 0,
+        })
+        .await;
+
+    let status = result.expect_err("w:majority with j:memory must be rejected");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "expected INVALID_ARGUMENT, got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    assert!(
+        status.message().contains("j:memory"),
+        "the message names the offending concern, got: {}",
+        status.message()
     );
 }
 

@@ -1,21 +1,21 @@
 //! Integration tests for volatile write drain (R077a).
 //!
-//! Tests the full flow: Database with w:memory → write data → verify local
-//! visibility → drain → verify data persisted. Also tests backpressure,
-//! j:true upgrade, and causal session rejection.
+//! Tests the full flow: Database with j:memory → write data → verify local
+//! visibility → drain → verify data persisted. Also tests the volatile
+//! journal levels' membership rule and causal session rejection.
 
 #![allow(clippy::unwrap_used)]
 
-use coordinode_core::txn::write_concern::{WriteConcern, WriteConcernLevel};
+use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_embed::Database;
 use tempfile::tempdir;
 
-/// w:memory write is visible immediately to local reader (same Database).
+/// j:memory write is visible immediately to local reader (same Database).
 #[test]
 fn memory_write_locally_visible() {
     let dir = tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
-    db.set_write_concern(WriteConcernLevel::Memory);
+    db.set_write_concern(WriteConcern::memory());
 
     // CREATE a node with w:memory.
     let results = db
@@ -30,12 +30,12 @@ fn memory_write_locally_visible() {
     assert_eq!(read[0].get("n.name").unwrap().as_str(), Some("alice"));
 }
 
-/// w:memory writes are drained to pipeline after drain interval.
+/// j:memory writes are drained to pipeline after drain interval.
 #[test]
 fn memory_write_drains_to_pipeline() {
     let dir = tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
-    db.set_write_concern(WriteConcernLevel::Memory);
+    db.set_write_concern(WriteConcern::memory());
 
     // Write multiple nodes with w:memory.
     db.execute_cypher("CREATE (n:Person {name: 'bob'})")
@@ -54,12 +54,12 @@ fn memory_write_drains_to_pipeline() {
     assert_eq!(results.len(), 2);
 }
 
-/// w:cache write is visible immediately and survives drain cycle.
+/// j:cache write is visible immediately and survives drain cycle.
 #[test]
 fn cache_write_locally_visible() {
     let dir = tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
-    db.set_write_concern(WriteConcernLevel::Cache);
+    db.set_write_concern(WriteConcern::cache());
 
     let results = db
         .execute_cypher("CREATE (n:Device {mac: 'aa:bb:cc'}) RETURN n.mac")
@@ -71,18 +71,18 @@ fn cache_write_locally_visible() {
     assert_eq!(read[0].get("n.mac").unwrap().as_str(), Some("aa:bb:cc"));
 }
 
-/// Switching write concern mid-session: w:memory then w:majority.
+/// Switching write concern mid-session: j:memory then w:majority.
 #[test]
 fn switch_write_concern_mid_session() {
     let dir = tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
 
-    // Write with w:memory.
-    db.set_write_concern(WriteConcernLevel::Memory);
+    // Write with j:memory.
+    db.set_write_concern(WriteConcern::memory());
     db.execute_cypher("CREATE (n:Sensor {id: 1})").unwrap();
 
     // Switch to w:majority.
-    db.set_write_concern(WriteConcernLevel::Majority);
+    db.set_write_concern(WriteConcern::majority());
     db.execute_cypher("CREATE (n:Sensor {id: 2})").unwrap();
 
     // Both should be visible.
@@ -90,27 +90,52 @@ fn switch_write_concern_mid_session() {
     assert_eq!(results.len(), 2);
 }
 
-/// j:true + w:memory upgrades effective level to w:1.
+/// A volatile journal level is honoured for the leader alone: with `w` above
+/// one the concern is refused instead of being silently rewritten on either
+/// axis, and `w:0` bypasses the overlay because nobody waits for it.
 #[test]
-fn journal_true_upgrades_memory_to_w1() {
-    let wc = WriteConcern {
-        level: WriteConcernLevel::Memory,
-        journal: true,
-        timeout_ms: 0,
-    };
-    // Should upgrade to W1 (not volatile).
-    assert_eq!(wc.effective_level(), WriteConcernLevel::W1);
-    assert!(!wc.effective_level().is_volatile());
+fn volatile_journal_is_leader_only() {
+    for journal in [Journal::Memory, Journal::Cache] {
+        let leader_only = WriteConcern {
+            w: WriteAck::LEADER,
+            journal,
+            timeout_ms: 0,
+        };
+        assert!(leader_only.validate(None).is_ok());
+        assert!(leader_only.is_volatile());
+
+        let two_members = WriteConcern {
+            w: WriteAck::Acks(2),
+            journal,
+            timeout_ms: 0,
+        };
+        assert!(two_members.validate(None).is_err());
+
+        let majority = WriteConcern {
+            w: WriteAck::Majority,
+            journal,
+            timeout_ms: 0,
+        };
+        assert!(majority.validate(None).is_err());
+
+        let fire_and_forget = WriteConcern {
+            w: WriteAck::NONE,
+            journal,
+            timeout_ms: 0,
+        };
+        assert!(fire_and_forget.validate(None).is_ok());
+        assert!(!fire_and_forget.is_volatile());
+    }
 }
 
-/// w:memory rejects causal session validation.
+/// j:memory rejects causal session validation.
 #[test]
 fn memory_rejects_causal_session() {
     let wc = WriteConcern::memory();
     assert!(wc.validate_for_causal_session().is_err());
 }
 
-/// w:cache rejects causal session validation.
+/// j:cache rejects causal session validation.
 #[test]
 fn cache_rejects_causal_session() {
     let wc = WriteConcern::cache();
@@ -123,9 +148,9 @@ fn graceful_shutdown_flushes_drain() {
     let dir = tempdir().unwrap();
     {
         let mut db = Database::open(dir.path()).unwrap();
-        db.set_write_concern(WriteConcernLevel::Memory);
+        db.set_write_concern(WriteConcern::memory());
 
-        // Write data with w:memory.
+        // Write data with j:memory.
         db.execute_cypher("CREATE (n:Log {msg: 'event1'})").unwrap();
         db.execute_cypher("CREATE (n:Log {msg: 'event2'})").unwrap();
 
@@ -138,12 +163,12 @@ fn graceful_shutdown_flushes_drain() {
     assert_eq!(results.len(), 2);
 }
 
-/// w:memory with edges: edge create uses merge operators, should drain correctly.
+/// j:memory with edges: edge create uses merge operators, should drain correctly.
 #[test]
 fn memory_write_with_edges() {
     let dir = tempdir().unwrap();
     let mut db = Database::open(dir.path()).unwrap();
-    db.set_write_concern(WriteConcernLevel::Memory);
+    db.set_write_concern(WriteConcern::memory());
 
     db.execute_cypher("CREATE (a:Person {name: 'alice'})-[:KNOWS]->(b:Person {name: 'bob'})")
         .unwrap();

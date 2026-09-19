@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use coordinode_core::txn::timestamp::TimestampOracle;
-use coordinode_core::txn::write_concern::WriteConcernLevel;
+use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_embed::Database;
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -62,9 +62,9 @@ fn from_engine_volatile_write_drains() {
         Arc::new(OwnedLocalProposalPipeline::new(&engine));
 
     let mut db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
-    db.set_write_concern(WriteConcernLevel::Memory);
+    db.set_write_concern(WriteConcern::memory());
 
-    // w:memory write — locally visible immediately
+    // j:memory write: locally visible immediately
     db.execute_cypher("CREATE (n:Sensor {id: 's1'}) RETURN n")
         .unwrap();
     let results = db.execute_cypher("MATCH (n:Sensor) RETURN n.id").unwrap();
@@ -185,9 +185,9 @@ fn from_engine_drop_flushes_drain() {
 
     {
         let mut db = Database::from_engine(dir.path(), engine, oracle, pipeline).unwrap();
-        db.set_write_concern(WriteConcernLevel::Memory);
+        db.set_write_concern(WriteConcern::memory());
 
-        // Write with w:memory — buffered in DrainBuffer
+        // Write with j:memory: buffered in DrainBuffer
         db.execute_cypher("CREATE (n:Temp {x: 1})").unwrap();
         db.execute_cypher("CREATE (n:Temp {x: 2})").unwrap();
 

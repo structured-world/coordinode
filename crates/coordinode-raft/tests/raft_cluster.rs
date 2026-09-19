@@ -3085,6 +3085,175 @@ async fn cluster_write_concern_w0_vs_majority() {
     );
 }
 
+/// `w:N` counts members, the leader first, and is honoured as asked on a
+/// three-member group.
+///
+/// `w:1` returns once the leader's own log holds the entry and reports no
+/// applied index (the write is not yet committed); `w:2` is a majority here
+/// and reports the index; `w:3` waits for every member's log; `w:4` is refused
+/// up front because the group has three members. Every write, waited for or
+/// not, reaches both followers' state.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_write_concern_acks_counts_members() {
+    use coordinode_core::txn::write_concern::WriteAck;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let dir1 = tempfile::tempdir().expect("d1");
+        let dir2 = tempfile::tempdir().expect("d2");
+        let dir3 = tempfile::tempdir().expect("d3");
+
+        let open = |dir: &std::path::Path| {
+            Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    dir,
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open engine"),
+            )
+        };
+        let e1 = open(dir1.path());
+        let e2 = open(dir2.path());
+        let e3 = open(dir3.path());
+
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+        )
+        .await
+        .expect("n1");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+        )
+        .await
+        .expect("n3");
+
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add n2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add n3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let pipeline = n1.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(2u64 << 48);
+        let proposal = |key: &[u8], value: &[u8], ts: u64| RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts - 1),
+            bypass_rate_limiter: false,
+        };
+
+        // w:4 on a three-member group is refused before anything is written.
+        let too_many = proposal(b"node:0:w4", b"never", 200);
+        let refused = pipeline.propose_with_ack(&too_many, WriteAck::Acks(4), None);
+        assert!(
+            matches!(&refused, Err(ProposalError::InvalidWriteConcern(msg)) if msg.contains("w:4")),
+            "w:4 must be refused as an invalid write concern naming it, got {refused:?}"
+        );
+        assert!(
+            e1.get(Partition::Node, b"node:0:w4")
+                .expect("read w4 on leader")
+                .is_none(),
+            "a refused write concern must not write anything"
+        );
+
+        // w:1: answered from the leader's own log, not yet committed.
+        let leader_only = proposal(b"node:0:w1", b"leader", 201);
+        let outcome = pipeline
+            .propose_with_ack(&leader_only, WriteAck::Acks(1), None)
+            .expect("w:1 write");
+        assert!(
+            outcome.applied_index.is_none(),
+            "w:1 is answered before a majority holds the entry, so it must not \
+             report an applied index: {outcome:?}"
+        );
+
+        // w:2 is a majority of three: committed, index reported.
+        let two = proposal(b"node:0:w2", b"two", 202);
+        let outcome = pipeline
+            .propose_with_ack(&two, WriteAck::Acks(2), None)
+            .expect("w:2 write");
+        assert!(
+            outcome.applied_index.is_some(),
+            "w:2 on three members is a majority and must report the applied index"
+        );
+
+        // w:3 waits for every member's log, with a timeout that is not hit.
+        // "Holds" means the entry is in the member's log; applying it to the
+        // member's state follows the commit and is not what w:N waits for.
+        let all = proposal(b"node:0:w3", b"three", 203);
+        let outcome = pipeline
+            .propose_with_ack(&all, WriteAck::Acks(3), Some(Duration::from_secs(10)))
+            .expect("w:3 write");
+        assert!(
+            outcome.applied_index.is_some(),
+            "w:3 holds a majority and must report the applied index"
+        );
+
+        // Whatever was waited for, every write reaches both followers.
+        for (key, value) in [
+            (&b"node:0:w1"[..], &b"leader"[..]),
+            (b"node:0:w2", b"two"),
+            (b"node:0:w3", b"three"),
+        ] {
+            assert!(
+                await_replicated(&e2, key, value).await,
+                "{} never reached n2",
+                String::from_utf8_lossy(key)
+            );
+            assert!(
+                await_replicated(&e3, key, value).await,
+                "{} never reached n3",
+                String::from_utf8_lossy(key)
+            );
+        }
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: cluster_write_concern_acks_counts_members"
+    );
+}
+
 // ── R091b: monitor_and_promote join lifecycle ──────────────────────────────────
 
 /// Regression test for the join protocol (R091b).

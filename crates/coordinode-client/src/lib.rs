@@ -123,7 +123,7 @@ mod proto {
 
 use proto::{
     query::{ExecuteCypherRequest, cypher_service_client::CypherServiceClient},
-    replication::{ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernLevel},
+    replication::{Journal, ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernMode},
 };
 
 /// Routing preference for read queries in a replicated cluster.
@@ -437,9 +437,13 @@ impl CoordinodeClient {
         params: HashMap<String, Value>,
         location: Option<&'static Location<'static>>,
     ) -> Result<(Vec<Row>, CausalToken), ClientError> {
+        // Named explicitly rather than left to the server default: a causal
+        // write's position is only a promise when a majority holds it journaled.
         let write_concern = Some(WriteConcern {
-            level: WriteConcernLevel::Majority as i32,
-            journal: false,
+            w: Some(proto::replication::write_concern::W::Mode(
+                WriteConcernMode::Majority as i32,
+            )),
+            journal: Journal::Journal as i32,
             timeout_ms: 0,
         });
         let (rows, applied_index) = self

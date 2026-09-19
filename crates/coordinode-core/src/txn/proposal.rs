@@ -324,6 +324,11 @@ pub enum ProposalError {
     #[error("pipeline shutting down")]
     ShuttingDown,
 
+    /// The write concern cannot be satisfied by this group as it is: more
+    /// acknowledging members were asked for than the group has.
+    #[error("invalid write concern: {0}")]
+    InvalidWriteConcern(String),
+
     /// All retries exhausted. Proposal was not committed within the
     /// timeout window (3 attempts: 4s, 8s, 16s).
     #[error("proposal timed out after {retries} retries")]
@@ -433,6 +438,32 @@ pub trait ProposalPipeline: Send + Sync {
     ) -> Result<ProposalOutcome, ProposalError> {
         let _ = timeout; // default: ignore timeout (local proposals are instant)
         self.propose_and_wait(proposal)
+    }
+
+    /// Propose mutations and return once `ack` members hold them.
+    ///
+    /// `WriteAck::Majority` is [`propose_and_wait`](Self::propose_and_wait).
+    /// `WriteAck::Acks(0)` returns as soon as the proposal is on its way
+    /// through the leader; `Acks(1)` once the leader's log holds it;
+    /// `Acks(n)` once `n` members do. A `timeout` bounds the wait for the
+    /// acknowledgement, never the write itself.
+    ///
+    /// ## Default implementation
+    ///
+    /// Applies through [`propose_and_wait`](Self::propose_and_wait) /
+    /// [`propose_with_timeout`](Self::propose_with_timeout): a local pipeline
+    /// has one member, so every `ack` is satisfied by the local apply.
+    fn propose_with_ack(
+        &self,
+        proposal: &RaftProposal,
+        ack: crate::txn::write_concern::WriteAck,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        let _ = ack;
+        match timeout {
+            Some(t) => self.propose_with_timeout(proposal, t),
+            None => self.propose_and_wait(proposal),
+        }
     }
 }
 

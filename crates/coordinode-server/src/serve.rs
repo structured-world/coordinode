@@ -554,9 +554,8 @@ pub(crate) async fn serve(
 
     let raft_node = Arc::new(raft_node);
 
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
-        coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(raft_node.raft())),
-    );
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(raft_node.pipeline());
 
     // no-std: spin::RwLock (drop-in).
     let database = Arc::new(parking_lot::RwLock::new(

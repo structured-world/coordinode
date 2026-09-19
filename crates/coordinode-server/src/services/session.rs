@@ -21,7 +21,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use self::engine::DatabaseCursorEngine;
-use super::cypher::{proto_to_value_pub, value_to_proto_pub};
+use super::cypher::{
+    proto_to_value_pub, value_to_proto_pub, write_concern_from_proto, write_concern_to_proto,
+};
 use crate::proto::query;
 use crate::proto::replication;
 use crate::proto::session::server_frame::Event;
@@ -125,8 +127,9 @@ impl SessionServiceTrait for SessionSvc {
         // transport-agnostic.
         tokio::spawn(self.manager.open(peer).run(op_rx, ev_tx.clone()));
 
-        // Reader: map each proto frame to a neutral op. A frame with no op is a
-        // malformed request, answered directly with an Error event.
+        // Reader: map each proto frame to a neutral op. A frame with no op, or
+        // one whose settings the server cannot honour, is a malformed request,
+        // answered directly with an Error event.
         let err_tx = ev_tx;
         tokio::spawn(async move {
             // Ends when the client half-closes (`Ok(None)`) or on a transport
@@ -134,18 +137,18 @@ impl SessionServiceTrait for SessionSvc {
             while let Ok(Some(frame)) = inbound.message().await {
                 let request_id = frame.request_id;
                 match to_op(frame) {
-                    Some(op) => {
+                    Ok(op) => {
                         if op_tx.send((request_id, op)).await.is_err() {
                             break;
                         }
                     }
-                    None => {
+                    Err(message) => {
                         let _ = err_tx
                             .send((
                                 request_id,
                                 SessionEvent::Error {
                                     code: ErrorCode::InvalidArgument,
-                                    message: "client frame had no op".to_string(),
+                                    message,
                                 },
                             ))
                             .await;
@@ -171,9 +174,14 @@ impl SessionServiceTrait for SessionSvc {
     }
 }
 
-/// Map a gRPC client frame to a neutral op. `None` if the frame carries no op.
-fn to_op(frame: ClientFrame) -> Option<SessionOp> {
-    Some(match frame.op? {
+/// Map a gRPC client frame to a neutral op. `Err` carries the message for the
+/// INVALID_ARGUMENT answer: the frame has no op, or names a write concern the
+/// server cannot honour.
+fn to_op(frame: ClientFrame) -> Result<SessionOp, String> {
+    let op = frame
+        .op
+        .ok_or_else(|| "client frame had no op".to_string())?;
+    Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
             query: e.query,
             params: e
@@ -200,7 +208,9 @@ fn to_op(frame: ClientFrame) -> Option<SessionOp> {
         client_frame::Op::Cancel(c) => SessionOp::Cancel {
             target_request_id: c.target_request_id,
         },
-        client_frame::Op::Configure(c) => SessionOp::Configure(settings_from_proto(&c)),
+        client_frame::Op::Configure(c) => {
+            SessionOp::Configure(settings_from_proto(&c).map_err(|s| s.message().to_string())?)
+        }
     })
 }
 
@@ -210,8 +220,8 @@ fn to_op(frame: ClientFrame) -> Option<SessionOp> {
 /// change one setting without restating the rest. The concern messages carry
 /// more than a level, and each part is optional in the same way: a read
 /// concern that sets a level but no fence leaves the fence alone.
-fn settings_from_proto(c: &Configure) -> ConnectionSettings {
-    ConnectionSettings {
+fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
+    Ok(ConnectionSettings {
         read_concern: c.read_concern.as_ref().map(|rc| rc.level as u8),
         after_index: c
             .read_concern
@@ -221,10 +231,14 @@ fn settings_from_proto(c: &Configure) -> ConnectionSettings {
             .read_concern
             .as_ref()
             .and_then(|rc| (rc.at_timestamp != 0).then_some(rc.at_timestamp)),
-        write_concern: c.write_concern.as_ref().map(|wc| wc.level as u8),
+        write_concern: c
+            .write_concern
+            .as_ref()
+            .map(write_concern_from_proto)
+            .transpose()?,
         read_preference: c.read_preference.map(|p| p as u8),
         drain_timeout_ms: c.drain_timeout_ms,
-    }
+    })
 }
 
 /// Render settings back for the client, so a Configure is confirmed by what is
@@ -236,10 +250,7 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
             after_index: s.after_index.unwrap_or(0),
             at_timestamp: s.at_timestamp.unwrap_or(0),
         }),
-        write_concern: s.write_concern.map(|level| replication::WriteConcern {
-            level: level as i32,
-            ..Default::default()
-        }),
+        write_concern: s.write_concern.as_ref().map(write_concern_to_proto),
         read_preference: s.read_preference.map(|p| p as i32),
         drain_timeout_ms: s.drain_timeout_ms,
     }
