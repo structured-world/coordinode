@@ -889,42 +889,10 @@ impl<'a> Transaction<'a> {
         // Resolve effective write concern (j:true upgrades W0 → W1).
         let effective_level = ctx.write_concern.effective_level();
 
-        // Write concern W0 (fire-and-forget): apply directly to local storage
-        // without going through the proposal pipeline. No durability guarantee.
-        // Data visible locally but NOT replicated. Lost on crash.
-        //
-        // ADR-016: writes use plain engine.put()/delete() — no versioned key
-        // encoding. LSM seqno from OracleSeqnoGenerator provides native MVCC.
-        if effective_level == WriteConcernLevel::W0 {
-            for ((part, key), value) in wb.drain() {
-                match value {
-                    Some(v) => self.engine.put(part, &key, &v)?,
-                    None => self.engine.delete(part, &key)?,
-                }
-            }
-            // Apply adj merge operands directly to StorageEngine (raw keys).
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))?;
-                }
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                self.engine.merge(Partition::Node, &key, &operand)?;
-            }
-            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
-                self.engine
-                    .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
-            }
-            return Ok(CommitOutcome {
-                commit_ts: Some(commit_ts),
-                applied_index: None,
-            });
-        }
+        // W0 takes the same path as every other commit below. A write concern
+        // decides when the caller is answered, never whether the write is
+        // replicated: a commit applied to this member alone would be a record no
+        // other member ever sees, on a follower and on the leader alike.
 
         // Write concern Memory/Cache (volatile with drain):
         // 1. Apply locally for immediate read visibility (same as W0)

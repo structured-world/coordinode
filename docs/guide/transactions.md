@@ -118,11 +118,13 @@ A write is durable once the Raft leader has written it to the level requested by
 
 | Level | ACK after | Survives | Use for |
 |-------|-----------|----------|---------|
-| `W0` | request received | nothing (fire-and-forget) | non-critical metrics |
+| `W0` | no acknowledgement is promised (fire-and-forget) | what any committed write survives; the caller is simply not told whether it committed | non-critical metrics |
 | `MEMORY` | RAM-only write (~1µs) | nothing before drain | hot counters, session state |
 | `CACHE` | RAM + NVMe cache (~100µs) | process crash, not power loss before drain | analytics events, throughput-sensitive non-critical data |
 | `W1` (default) | leader WAL fsync | leader crash if pre-replication | typical reads-mostly workloads |
 | `MAJORITY` | Raft quorum (`RF/2 + 1` replicas) | single-replica failure | source-of-truth data, production writes |
+
+A write concern decides when the caller is answered, never whether the write is replicated. Every write, `W0` included, goes through the Raft log and is applied on every replica in the same order; no level writes to one node only.
 
 `MEMORY` and `CACHE` use a background drain thread that batches volatile writes into Raft proposals asynchronously. The trade-off: ~1000× lower latency in exchange for losing in-flight writes on a leader crash before the drain completes. **Never select `MEMORY` or `CACHE` for data that you cannot reconstruct or afford to lose.**
 

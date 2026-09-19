@@ -308,3 +308,60 @@ fn commit_rejects_writes_under_stop_pressure() {
         Some(&b"v"[..])
     );
 }
+
+/// A pipeline on a member that is not the leader: every proposal is refused.
+struct NotLeaderPipeline;
+
+impl coordinode_core::txn::proposal::ProposalPipeline for NotLeaderPipeline {
+    fn propose_and_wait(
+        &self,
+        _proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        Err(coordinode_core::txn::proposal::ProposalError::NotLeader { leader_id: Some(2) })
+    }
+}
+
+/// A write concern decides when the caller is answered, never whether the
+/// write is replicated. With w:0 the commit used to apply straight to the
+/// local engine, bypassing the pipeline: on a member that is not the leader
+/// that left a record no other member would ever see. The commit must go to
+/// the pipeline like any other, so here it fails and nothing is written.
+#[test]
+fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::w0();
+    let pipeline = NotLeaderPipeline;
+    let ids = coordinode_core::txn::proposal::ProposalIdGenerator::new();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: Some(&pipeline),
+        id_gen: Some(&ids),
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"w0:node", b"v").unwrap();
+    txn.merge_adj_add(b"w0:adj", 7);
+    let err = txn
+        .commit(&ctx)
+        .expect_err("a member that is not the leader cannot commit, whatever the write concern");
+    assert!(
+        matches!(err, CommitError::NotLeader { .. }),
+        "expected NotLeader, got {err:?}"
+    );
+
+    assert_eq!(
+        engine.get(Partition::Node, b"w0:node").unwrap(),
+        None,
+        "a refused commit left a local record"
+    );
+    assert_eq!(
+        engine.get(Partition::Adj, b"w0:adj").unwrap(),
+        None,
+        "a refused commit left a local adjacency operand"
+    );
+}

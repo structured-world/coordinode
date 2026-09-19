@@ -2923,8 +2923,10 @@ async fn cluster_read_concern_levels() {
     assert!(result.is_ok(), "TIMED OUT — cluster_read_concern_levels");
 }
 
-/// R124: Write concern W0 vs Majority — Majority replicates to followers,
-/// W0 (direct local write) does NOT replicate.
+/// A write concern decides when the caller is answered, never whether the write
+/// is replicated: a majority write and a w:0 commit both reach the followers.
+/// A w:0 commit used to be applied to the leader's engine alone, a record no
+/// other member ever saw.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_write_concern_w0_vs_majority() {
     let _ = tracing_subscriber::fmt()
@@ -3040,34 +3042,36 @@ async fn cluster_write_concern_w0_vs_majority() {
             "majority write should replicate to follower"
         );
 
-        // ── Write with w:0 (direct local, NO Raft proposal) → NOT replicated ──
-        // Simulates the W0 path: writes directly to engine
-        // without going through the proposal pipeline.
-        e1.put(Partition::Node, b"node:0:w0-write", b"local-only")
-            .expect("w0 direct write");
+        // ── A w:0 commit on the leader goes through the log like any other ──
+        {
+            use coordinode_core::txn::write_concern::WriteConcern;
+            use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 
-        // Wait to ensure any hypothetical replication would have happened
-        tokio::time::sleep(Duration::from_secs(2)).await;
+            let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+            let snap = e1.snapshot();
+            let mut txn =
+                Transaction::new(&e1, Some(&oracle), Timestamp::from_raw(snap), Some(snap));
+            txn.put(Partition::Node, b"node:0:w0-write", b"replicated-too")
+                .expect("buffer w0 write");
+            let wc = WriteConcern::w0();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: Some(&pipeline),
+                id_gen: Some(&id_gen),
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).expect("w0 commit on the leader");
+        }
 
-        // Leader should see W0 write (it's local)
-        let w0_on_leader = e1
-            .get(Partition::Node, b"node:0:w0-write")
-            .expect("read w0 on leader");
         assert!(
-            w0_on_leader.is_some(),
-            "w0 write should be visible on leader"
+            await_replicated(&e2, b"node:0:w0-write", b"replicated-too").await,
+            "a w:0 commit never reached the follower: it was written to the leader alone"
         );
-
-        // Follower should NOT see W0 write (not replicated via Raft)
-        let w0_on_follower = e2
-            .get(Partition::Node, b"node:0:w0-write")
-            .expect("read w0 on follower");
         assert!(
-            w0_on_follower.is_none(),
-            "w0 write should NOT replicate to follower (bypasses Raft)"
+            await_replicated(&e3, b"node:0:w0-write", b"replicated-too").await,
+            "a w:0 commit never reached the second follower"
         );
-
-        tracing::info!("R124: w:0 vs w:majority replication verified");
 
         n1.shutdown().await.expect("s1");
         n2.shutdown().await.expect("s2");
