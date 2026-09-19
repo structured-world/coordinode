@@ -29,7 +29,6 @@ release_commits = "^(feat|fix|perf|refactor|docs|test)"
 # version bump it prints the previous entry of its changelog as if it were new.
 pr_body = """
 ## New release
-
 {% for release in releases %}{% if release.package == "coordinode-server" %}
 `coordinode` {{ release.previous_version }} -> {{ release.next_version }} (all {{ releases | length }} workspace crates share this version)
 
