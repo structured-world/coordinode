@@ -4,7 +4,10 @@ description = "Official Rust client for CoordiNode — gRPC driver with source l
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Permissive on purpose, unlike the rest of the workspace: a driver is linked
+# into the caller's program, and one that only AGPL programs may link has no
+# users. The server stays AGPL-3.0-only.
+license = "Apache-2.0"
 repository.workspace = true
 authors.workspace = true
 publish.workspace = true

@@ -229,6 +229,8 @@ Copyright (C) 2026 Dmitry Prudnikov.
 
 CoordiNode Community Edition is licensed under **AGPL-3.0-only**: genuine open source with SaaS protection. See [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
 
+What your program links to talk to the server is **Apache-2.0**: the wire definitions ([proto](proto)) and the Rust driver ([crates/coordinode-client](crates/coordinode-client)). Connecting to CoordiNode puts no licence condition on your application.
+
 The same code base is also available under a commercial licence as the Enterprise Edition (horizontal sharding, multi-tenancy, CRUSH placement, geo-distribution), for deployments that cannot meet the AGPL terms. Contact: enterprise@sw.foundation. The commercial licence never narrows the Community Edition: everything published here stays under AGPL-3.0-only, in full.
 
 ## Support the project

@@ -24,6 +24,15 @@ The Community Edition is never narrowed to create the Enterprise Edition:
 nothing published here is later withheld, and the commercial licence does not
 change the terms under which the Community Edition is published.
 
+Client code
+-----------
+
+What a program links in order to talk to CoordiNode is permissive, so that any
+program may connect to the server whatever its own licence: the wire
+definitions (the proto submodule) and the Rust driver (crates/coordinode-client)
+are licensed under the Apache License, version 2.0. Each carries its own LICENSE
+file. The server and the engine remain under the AGPL as above.
+
 Third parties
 -------------
 
