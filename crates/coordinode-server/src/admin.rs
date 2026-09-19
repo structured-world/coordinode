@@ -34,6 +34,22 @@ pub(crate) fn admin_storage_config(
     Ok(cfg.resolve_storage_config())
 }
 
+/// Open the database for an offline admin command the way the server opens it.
+///
+/// The oracle is what tells the engine its seqnos are a clock, and only then
+/// does the configured retention window hold the GC watermark back. Opened
+/// with a plain counter instead, the window is inert and the watermark sits at
+/// the newest seqno, so the first compaction folds every version underneath
+/// it: an operator command would end time travel over the whole window without
+/// saying so. A fresh oracle is correct here because the engine seeds it from
+/// the highest seqno it recovers, which is where a server would have resumed.
+pub(crate) fn admin_open_engine(
+    config: &coordinode_storage::engine::config::StorageConfig,
+) -> Result<coordinode_storage::engine::core::StorageEngine, Box<dyn std::error::Error>> {
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    Ok(coordinode_storage::engine::core::StorageEngine::open_with_oracle(config, oracle)?)
+}
+
 /// Export the database to a backup file in the requested format.
 ///
 /// Takes a consistent MVCC snapshot up front, so writes are never blocked for
@@ -568,5 +584,5 @@ pub(crate) async fn admin_node_join(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;

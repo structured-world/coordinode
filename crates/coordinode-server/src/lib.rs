@@ -67,7 +67,7 @@ mod serve;
 /// binary is the product, and no crate may depend on it.
 pub mod services;
 
-use admin::{admin_node_decommission, admin_node_join, admin_storage_config};
+use admin::{admin_node_decommission, admin_node_join, admin_open_engine, admin_storage_config};
 use tracing::info;
 
 pub use builder::{
@@ -112,7 +112,7 @@ pub(crate) async fn run_with(
             info!(data_dir = %data_dir, deep = deep, "verifying storage integrity");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
-            let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
+            let engine = admin_open_engine(&config)?;
             let disk = engine.disk_space()?;
             info!(disk_bytes = disk, "storage opened successfully");
 
@@ -159,7 +159,7 @@ pub(crate) async fn run_with(
             info!(data_dir = %data_dir, output = %output, "creating checkpoint");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
-            let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
+            let engine = admin_open_engine(&config)?;
             let summary = engine
                 .create_checkpoint(std::path::Path::new(&output))
                 .map_err(|e| format!("checkpoint failed: {e}"))?;
@@ -181,7 +181,7 @@ pub(crate) async fn run_with(
             info!(data_dir = %data_dir, "compacting database");
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
-            let engine = coordinode_storage::engine::core::StorageEngine::open(&config)?;
+            let engine = admin_open_engine(&config)?;
             for &part in coordinode_storage::engine::partition::Partition::all() {
                 engine
                     .force_compaction(part)
