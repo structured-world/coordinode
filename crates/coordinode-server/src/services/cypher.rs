@@ -383,8 +383,9 @@ fn write_concern_level_to_executor(level: i32) -> WriteConcernLevel {
         replication::WriteConcernLevel::Memory => WriteConcernLevel::Memory,
         replication::WriteConcernLevel::Cache => WriteConcernLevel::Cache,
         replication::WriteConcernLevel::W1 => WriteConcernLevel::W1,
-        replication::WriteConcernLevel::Majority
-        | replication::WriteConcernLevel::Unspecified => WriteConcernLevel::Majority,
+        replication::WriteConcernLevel::Majority | replication::WriteConcernLevel::Unspecified => {
+            WriteConcernLevel::Majority
+        }
     }
 }
 
