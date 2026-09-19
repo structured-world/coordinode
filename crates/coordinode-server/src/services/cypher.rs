@@ -381,17 +381,23 @@ fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
 pub(crate) fn write_concern_from_proto(
     wc: &replication::WriteConcern,
 ) -> Result<WriteConcern, Status> {
-    use crate::services::error_details::{Reason, status_with_reason};
+    use coordinode_core::txn::write_concern::WriteConcernError;
     use replication::write_concern::W;
     use tonic::Code;
+    use tonic_types::{ErrorDetails, StatusExt};
 
-    let refuse = |message: String| {
-        status_with_reason(
-            Code::InvalidArgument,
-            message,
-            Reason::InvalidWriteConcern,
-            Vec::new(),
-        )
+    use crate::services::error_details::{ERROR_DOMAIN, Reason};
+
+    // The reason says what kind of failure this is; the BadRequest violation
+    // says which field to look at.
+    let refuse = |field: &str, message: String| {
+        let mut details = ErrorDetails::with_error_info(
+            Reason::InvalidWriteConcern.as_str(),
+            ERROR_DOMAIN,
+            HashMap::new(),
+        );
+        details.add_bad_request_violation(field, message.clone());
+        Status::with_error_details(Code::InvalidArgument, message, details)
     };
 
     let w = match wc.w {
@@ -400,10 +406,13 @@ pub(crate) fn write_concern_from_proto(
         Some(W::Mode(mode)) => match replication::WriteConcernMode::try_from(mode) {
             Ok(replication::WriteConcernMode::Majority) => WriteAck::Majority,
             Ok(replication::WriteConcernMode::Unspecified) | Err(_) => {
-                return Err(refuse(format!(
-                    "write_concern.mode {mode} is not a mode this server knows; \
-                     leave `w` unset for MAJORITY or name a member count with `acks`"
-                )));
+                return Err(refuse(
+                    "write_concern.mode",
+                    format!(
+                        "write_concern.mode {mode} is not a mode this server knows; \
+                         leave `w` unset for MAJORITY or name a member count with `acks`"
+                    ),
+                ));
             }
         },
     };
@@ -414,10 +423,13 @@ pub(crate) fn write_concern_from_proto(
         Ok(replication::Journal::Cache) => Journal::Cache,
         Ok(replication::Journal::Memory) => Journal::Memory,
         Err(_) => {
-            return Err(refuse(format!(
-                "write_concern.journal {} is not a journal level this server knows",
-                wc.journal
-            )));
+            return Err(refuse(
+                "write_concern.journal",
+                format!(
+                    "write_concern.journal {} is not a journal level this server knows",
+                    wc.journal
+                ),
+            ));
         }
     };
     let concern = WriteConcern {
@@ -425,7 +437,13 @@ pub(crate) fn write_concern_from_proto(
         journal,
         timeout_ms: wc.timeout_ms,
     };
-    concern.validate(None).map_err(|e| refuse(e.to_string()))?;
+    concern.validate(None).map_err(|e| {
+        let field = match e {
+            WriteConcernError::TooManyAcks { .. } => "write_concern.acks",
+            WriteConcernError::VolatileReplication(_) => "write_concern.journal",
+        };
+        refuse(field, e.to_string())
+    })?;
     Ok(concern)
 }
 

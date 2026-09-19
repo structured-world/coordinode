@@ -524,10 +524,11 @@ fn write_concern_defaults_and_explicit_axes() {
     );
 }
 
-/// A write concern the server cannot honour is refused with INVALID_ARGUMENT
-/// and the INVALID_WRITE_CONCERN reason, never mapped to something weaker or
-/// stronger than what was asked: an unknown mode or journal value, and a
-/// volatile journal level with more than one acknowledging member.
+/// A write concern the server cannot honour is refused with INVALID_ARGUMENT,
+/// the INVALID_WRITE_CONCERN reason and a BadRequest violation naming the
+/// field, never mapped to something weaker or stronger than what was asked:
+/// an unknown mode or journal value, and a volatile journal level with more
+/// than one acknowledging member.
 #[test]
 fn unsupported_write_concerns_are_refused_with_a_reason() {
     use replication::write_concern::W;
@@ -539,23 +540,34 @@ fn unsupported_write_concerns_are_refused_with_a_reason() {
         timeout_ms: 0,
     };
 
-    for (concern, needle) in [
+    for (concern, needle, field) in [
         (
             wire(
                 Some(W::Mode(replication::WriteConcernMode::Unspecified as i32)),
                 0,
             ),
             "write_concern.mode",
+            "write_concern.mode",
         ),
-        (wire(Some(W::Mode(9999)), 0), "write_concern.mode"),
-        (wire(None, 9999), "write_concern.journal"),
+        (
+            wire(Some(W::Mode(9999)), 0),
+            "write_concern.mode",
+            "write_concern.mode",
+        ),
+        (
+            wire(None, 9999),
+            "write_concern.journal",
+            "write_concern.journal",
+        ),
         (
             wire(None, replication::Journal::Memory as i32),
             "w:majority,j:memory",
+            "write_concern.journal",
         ),
         (
             wire(Some(W::Acks(2)), replication::Journal::Cache as i32),
             "w:2,j:cache",
+            "write_concern.journal",
         ),
     ] {
         let status = write_concern_from_proto(&concern).expect_err("must be refused");
@@ -575,6 +587,18 @@ fn unsupported_write_concerns_are_refused_with_a_reason() {
             .error_info()
             .unwrap_or_else(|| panic!("{needle} must carry ErrorInfo"));
         assert_eq!(info.reason, "INVALID_WRITE_CONCERN");
+        let bad_request = details
+            .bad_request()
+            .unwrap_or_else(|| panic!("{needle} must carry a BadRequest detail"));
+        assert_eq!(
+            bad_request
+                .field_violations
+                .iter()
+                .map(|v| v.field.as_str())
+                .collect::<Vec<_>>(),
+            vec![field],
+            "{needle}: the violation names the field to look at"
+        );
     }
 }
 

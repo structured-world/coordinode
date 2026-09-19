@@ -3242,9 +3242,24 @@ async fn cluster_write_concern_acks_counts_members() {
             );
         }
 
+        // With one member down, w:3 cannot be satisfied: the call times out,
+        // but a timeout is not a rollback. The entry still commits on the
+        // remaining majority and reaches the surviving follower.
+        n3.shutdown().await.expect("s3");
+        let short_one = proposal(b"node:0:w3-timeout", b"still-commits", 204);
+        let timed_out =
+            pipeline.propose_with_ack(&short_one, WriteAck::Acks(3), Some(Duration::from_secs(2)));
+        assert!(
+            matches!(timed_out, Err(ProposalError::WriteConcernTimeout { .. })),
+            "w:3 with a member down must time out, got {timed_out:?}"
+        );
+        assert!(
+            await_replicated(&e2, b"node:0:w3-timeout", b"still-commits").await,
+            "a timed-out w:3 write must still commit on the remaining majority"
+        );
+
         n1.shutdown().await.expect("s1");
         n2.shutdown().await.expect("s2");
-        n3.shutdown().await.expect("s3");
     })
     .await;
 
