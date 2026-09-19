@@ -82,6 +82,9 @@ pub struct RaftNode {
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// This node's ID.
     node_id: u64,
+    /// Address peers dial to reach this node. `None` for a standalone node and
+    /// for a joining one, whose address the leader supplies when adding it.
+    advertise_addr: Option<String>,
     /// Storage engine — held so `shutdown()` can flush before returning.
     engine: Arc<StorageEngine>,
     /// Shared handle to the Raft oplog, for reading committed entries since a
@@ -190,6 +193,7 @@ impl RaftNode {
             applied_rx,
             snapshot_builds,
             node_id,
+            advertise_addr: None,
             engine,
             oplog,
             grpc_shutdown: std::sync::Mutex::new(None),
@@ -277,7 +281,7 @@ impl RaftNode {
         // Try initialize — succeeds on fresh, NotAllowed on restart
         let mut members = std::collections::BTreeMap::new();
         let node_info = openraft::impls::BasicNode {
-            addr: advertise_addr,
+            addr: advertise_addr.clone(),
         };
         members.insert(node_id, node_info);
 
@@ -337,6 +341,7 @@ impl RaftNode {
             applied_rx,
             snapshot_builds,
             node_id,
+            advertise_addr: Some(advertise_addr),
             engine,
             oplog,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
@@ -424,7 +429,7 @@ impl RaftNode {
         members.insert(
             node_id,
             openraft::impls::BasicNode {
-                addr: advertise_addr,
+                addr: advertise_addr.clone(),
             },
         );
 
@@ -457,6 +462,7 @@ impl RaftNode {
             applied_rx,
             snapshot_builds,
             node_id,
+            advertise_addr: Some(advertise_addr),
             engine,
             oplog,
             // no internal server — caller manages the router
@@ -539,6 +545,7 @@ impl RaftNode {
             applied_rx,
             snapshot_builds,
             node_id,
+            advertise_addr: None,
             engine,
             oplog,
             // no internal server — caller manages the router
@@ -641,6 +648,7 @@ impl RaftNode {
             applied_rx,
             snapshot_builds,
             node_id,
+            advertise_addr: None,
             engine,
             oplog,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
@@ -661,6 +669,8 @@ impl RaftNode {
     /// 4. On node 1: `add_node(2, addr2)`, `add_node(3, addr3)`
     /// 5. On node 1: `change_membership([1, 2, 3])` → all become voters
     pub async fn add_node(&self, node_id: u64, addr: String) -> Result<(), RaftNodeError> {
+        self.publish_own_address().await?;
+
         let node_info = openraft::impls::BasicNode { addr };
 
         // Add as learner (non-voting, receives log replication)
@@ -670,6 +680,50 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
 
         tracing::info!(node_id, "added node as learner");
+        Ok(())
+    }
+
+    /// Record this node's advertised address in the membership while it is
+    /// still the cluster's only member.
+    ///
+    /// A directory first opened standalone holds a placeholder address for its
+    /// single member, and reopening it in cluster mode resumes that state rather
+    /// than initialising again. Peers dial members by this address, so it has to
+    /// be right before the first peer joins. Replacing an address is safe only
+    /// while no other member exists: with peers present a wrong address can split
+    /// the cluster, and the node has to be removed and added back instead.
+    async fn publish_own_address(&self) -> Result<(), RaftNodeError> {
+        use openraft::rt::watch::WatchReceiver;
+
+        let Some(advertise) = self.advertise_addr.as_ref() else {
+            return Ok(());
+        };
+        let stale = {
+            let rx = self.raft.metrics();
+            let metrics = rx.borrow_watched();
+            let mut members = metrics.membership_config.membership().nodes();
+            match (members.next(), members.next()) {
+                (Some((id, info)), None) => *id == self.node_id && info.addr != *advertise,
+                _ => false,
+            }
+        };
+        if !stale {
+            return Ok(());
+        }
+
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(
+            self.node_id,
+            openraft::impls::BasicNode {
+                addr: advertise.clone(),
+            },
+        );
+        self.raft
+            .change_membership(openraft::ChangeMembers::SetNodes(nodes), true)
+            .await
+            .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
+
+        tracing::info!(node_id = self.node_id, addr = %advertise, "published own address");
         Ok(())
     }
 
