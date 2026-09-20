@@ -167,6 +167,87 @@ fn an_attempt_with_no_claims_is_free() {
         .expect("the budget was untouched");
 }
 
+/// An edge transfer needs several conditions at once, and a new edge into the
+/// scope it enumerated cannot be admitted beside it.
+///
+/// This is the composition case: the transfer holds rights on both endpoints,
+/// coverage of the source set it walked and the projection of the pair it
+/// moves. Each is a different class, none of them alone excludes the
+/// insertion, and together they must. The two attempts write different keys,
+/// so nothing else would have compared them.
+#[test]
+fn a_transfer_and_a_new_edge_into_its_scope_cannot_both_be_admitted() {
+    use coordinode_core::txn::invariant::Adjacency;
+
+    let reg = ClaimRegistry::new(64);
+
+    let mut transfer = ClaimSet::new();
+    transfer.insert(Claim::new(
+        ClaimScope::Node(NodeId::from_raw(1)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    ));
+    transfer.insert(Claim::new(
+        ClaimScope::Node(NodeId::from_raw(2)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    ));
+    transfer.insert(Claim::new(
+        ClaimScope::Incident {
+            node: NodeId::from_raw(1),
+            edge_type: "OWNS".to_string(),
+            direction: Direction::Outgoing,
+        },
+        ClaimPredicate::IncidentSetComplete,
+        GEN,
+    ));
+    transfer.insert(Claim::new(
+        ClaimScope::Pair {
+            source: NodeId::from_raw(1),
+            target: NodeId::from_raw(2),
+            edge_type: "OWNS".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Present,
+        },
+        GEN,
+    ));
+    reg.reserve(1, &transfer).expect("the transfer is admitted");
+
+    // A new edge from the same source under the same type: a member of the
+    // set the transfer enumerated, arriving after it walked past.
+    let mut new_edge = ClaimSet::new();
+    new_edge.insert(Claim::new(
+        ClaimScope::Pair {
+            source: NodeId::from_raw(1),
+            target: NodeId::from_raw(9),
+            edge_type: "OWNS".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        GEN,
+    ));
+    let refusal = reg
+        .reserve(2, &new_edge)
+        .expect_err("the enumeration covers this pair");
+    assert!(
+        matches!(*refusal, ClaimRefusal::Incompatible { .. }),
+        "the refusal names the conditions, got {refusal:?}"
+    );
+
+    // A reference to the node whose set is being walked is excluded too, and
+    // for the same reason: attaching an edge to it is how an unaccounted
+    // member appears in the set the transfer claims to have enumerated.
+    reg.reserve(3, &reference_to(1))
+        .expect_err("a reference into the enumerated scope is a phantom");
+
+    // Composing conditions does not make every vertex exclusive, though: a
+    // reference to a node this attempt says nothing about is admitted.
+    reg.reserve(4, &reference_to(77))
+        .expect("an unrelated node is unrelated");
+}
+
 /// Unrelated scopes are admitted concurrently, which is what keeps one
 /// contended vertex from stopping the rest of the graph.
 #[test]
