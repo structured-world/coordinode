@@ -1184,6 +1184,103 @@ fn a_merge_chain_reads_the_same_through_flush_compaction_and_reopen() {
     assert_eq!(read(&reopened), vec![1, 2], "after a reopen");
 }
 
+/// A scan resolves a merge chain the same way a point read does, forwards,
+/// backwards and at a snapshot.
+///
+/// The point read and the scan are different code paths over the same
+/// operands, and a chain that a `get` folds correctly can still reach a scan
+/// unfolded: an iterator that returned the raw operand, or the base without
+/// the operands above it, would answer with a value no caller could tell from
+/// a real one. The chain here is order-sensitive on purpose, so a path that
+/// merges the operands in the wrong order fails rather than passing on a sum
+/// that happens to commute.
+#[test]
+fn every_read_path_resolves_a_merge_chain() {
+    use coordinode_core::graph::edge::PostingList;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let key = b"adj:FOLLOWS:out:7";
+    for operand in [
+        crate::engine::merge::encode_add(1),
+        crate::engine::merge::encode_add(2),
+        crate::engine::merge::encode_remove(1),
+        crate::engine::merge::encode_add(3),
+    ] {
+        engine.merge(Partition::Adj, key, &operand).expect("merge");
+    }
+    let expected = vec![2u64, 3];
+
+    let decode = |bytes: &[u8]| {
+        PostingList::from_bytes(bytes)
+            .expect("decode")
+            .as_slice()
+            .to_vec()
+    };
+
+    // The point read, as the baseline every other path must match.
+    let point = engine
+        .get(Partition::Adj, key)
+        .expect("get")
+        .expect("present");
+    assert_eq!(decode(&point), expected, "point read");
+
+    // A forward prefix scan.
+    let mut seen = Vec::new();
+    for guard in engine.prefix_scan(Partition::Adj, b"adj:").expect("scan") {
+        let (k, v) = guard.into_inner().expect("entry");
+        if k.as_ref() == key {
+            seen.push(decode(&v));
+        }
+    }
+    assert_eq!(seen, vec![expected.clone()], "forward scan");
+
+    // The reverse scan, which walks the same entries the other way.
+    let mut seen_rev = Vec::new();
+    for guard in engine
+        .prefix_scan_rev(Partition::Adj, b"adj:")
+        .expect("reverse scan")
+    {
+        let (k, v) = guard.into_inner().expect("entry");
+        if k.as_ref() == key {
+            seen_rev.push(decode(&v));
+        }
+    }
+    assert_eq!(seen_rev, vec![expected.clone()], "reverse scan");
+
+    // A snapshot scan taken after the whole chain is written sees all of it.
+    let snapshot = engine.snapshot();
+    let at_snapshot = engine
+        .snapshot_prefix_scan(&snapshot, Partition::Adj, b"adj:")
+        .expect("snapshot scan");
+    let found: Vec<Vec<u64>> = at_snapshot
+        .into_iter()
+        .filter(|(k, _)| k.as_slice() == key)
+        .map(|(_, v)| decode(&v))
+        .collect();
+    assert_eq!(found, vec![expected.clone()], "snapshot scan");
+
+    // And the same after a flush, where the operands are in tables rather
+    // than in the memtable the iterator merged them from.
+    engine.persist().expect("flush");
+    let mut after_flush = Vec::new();
+    for guard in engine.prefix_scan(Partition::Adj, b"adj:").expect("scan") {
+        let (k, v) = guard.into_inner().expect("entry");
+        if k.as_ref() == key {
+            after_flush.push(decode(&v));
+        }
+    }
+    assert_eq!(after_flush, vec![expected], "forward scan after a flush");
+}
+
 #[test]
 fn a_fresh_store_holds_no_user_data() {
     let dir = TempDir::new().expect("tempdir");
