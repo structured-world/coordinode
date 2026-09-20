@@ -2148,6 +2148,27 @@ impl StorageEngine {
         Ok(Box::new(tree.prefix(prefix, seqno, None)))
     }
 
+    /// Whether this store holds any data of its own: one live key under any
+    /// partition's [user-data prefix](Partition::user_data_prefix).
+    ///
+    /// Consensus state, partition routing and internal bookkeeping do not
+    /// count, so a node that has only ever been started answers `false`
+    /// however many times it was restarted. This is the question a node has
+    /// to answer before it joins a group that already holds data: only the
+    /// member a group is formed around brings data into it, and a joining
+    /// node that brought its own would have to lose it silently.
+    pub fn holds_user_data(&self) -> StorageResult<bool> {
+        for &part in Partition::all() {
+            let Some(prefix) = part.user_data_prefix() else {
+                continue;
+            };
+            if self.prefix_scan(part, prefix)?.next().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Prefix scan in descending key order (high to low) — the reverse-iteration
     /// counterpart of [`Self::prefix_scan`], walking the same double-ended LSM
     /// iterator from its high end. A "latest" / "last N within a prefix"

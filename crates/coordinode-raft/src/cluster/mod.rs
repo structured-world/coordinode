@@ -511,6 +511,7 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        refuse_join_with_local_data(&engine)?;
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -598,6 +599,7 @@ impl RaftNode {
         listen_addr: std::net::SocketAddr,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<Self, RaftNodeError> {
+        refuse_join_with_local_data(&engine)?;
         let config = Arc::new(default_raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -1912,6 +1914,33 @@ pub enum RaftNodeError {
 
     #[error("read concern check failed: {0}")]
     ReadConcern(String),
+
+    /// A node was asked to join a group while holding data of its own.
+    ///
+    /// Only the member a group is formed around brings data into it. A
+    /// joining node receives the group's state and would have to drop
+    /// whatever it held, so the refusal happens before anything is lost:
+    /// either start the group from this node, or join with an empty store.
+    #[error(
+        "this node holds data of its own and cannot join an existing group: a joining node \
+         receives the group's state, which would replace what is here. Form the group from \
+         this node instead, or point it at an empty data directory"
+    )]
+    JoinWithLocalData,
+}
+
+/// Refuse to join a group while this store holds data of its own.
+///
+/// The check reads one key at most per partition, so it costs nothing on the
+/// empty store a joining node is supposed to have.
+fn refuse_join_with_local_data(engine: &StorageEngine) -> Result<(), RaftNodeError> {
+    let holds = engine
+        .holds_user_data()
+        .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+    if holds {
+        return Err(RaftNodeError::JoinWithLocalData);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

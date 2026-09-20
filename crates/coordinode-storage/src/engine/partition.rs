@@ -112,6 +112,27 @@ impl Partition {
         matches!(self, Self::Adj | Self::Counter)
     }
 
+    /// The key prefix under which this partition holds data a user put
+    /// there, or `None` when the whole partition is state the deployment
+    /// keeps about itself.
+    ///
+    /// `Raft` is consensus state and `Registry` is internal bookkeeping, so
+    /// neither holds any. The `Schema` tree is shared: the operator's label
+    /// and edge-type definitions live under its own `schema:` prefix, while
+    /// the engine keeps partition routing under `meta:` and the Raft state
+    /// machine keeps its applied id, membership and snapshot under `raft:`.
+    /// Every other partition holds nothing but what was written to it.
+    ///
+    /// This is what lets a node answer whether it holds anything of its own,
+    /// which decides whether it may join a group that already has data.
+    pub fn user_data_prefix(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Raft | Self::Registry => None,
+            Self::Schema => Some(b"schema:"),
+            _ => Some(b""),
+        }
+    }
+
     /// All partitions in creation order.
     pub fn all() -> &'static [Partition] {
         &[

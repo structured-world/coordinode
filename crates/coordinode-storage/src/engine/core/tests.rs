@@ -1109,3 +1109,76 @@ fn power_loss_recovery_replays_journal_over_rolled_back_trees() {
         );
     }
 }
+
+/// A store nobody has written to holds no data of its own, and one written to
+/// holds it in the partition it was written to.
+///
+/// This is the question a node answers before joining a group that already has
+/// data, so the false answer has to be exact: state the engine keeps about
+/// itself must not read as the operator's data, or a fresh node could never
+/// join, and the operator's data must not read as engine state, or a join
+/// would silently replace it.
+#[test]
+fn a_fresh_store_holds_no_user_data() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let occupied: Vec<&str> = Partition::all()
+        .iter()
+        .filter(|p| {
+            p.user_data_prefix().is_some_and(|prefix| {
+                engine
+                    .prefix_scan(**p, prefix)
+                    .expect("scan")
+                    .next()
+                    .is_some()
+            })
+        })
+        .map(|p| p.name())
+        .collect();
+    assert!(
+        occupied.is_empty(),
+        "a fresh store must hold nothing of the operator's, found keys in {occupied:?}"
+    );
+    assert!(!engine.holds_user_data().expect("read the fresh store"));
+
+    // The engine's own state in the shared Schema tree stays invisible to the
+    // question: routing metadata is written at open, and the Raft state
+    // machine keeps its applied id beside it.
+    engine
+        .put(Partition::Schema, b"raft:sm:applied", b"7")
+        .expect("put");
+    assert!(
+        !engine.holds_user_data().expect("read"),
+        "state the deployment keeps about itself is not the operator's data"
+    );
+
+    engine
+        .put(Partition::Schema, b"schema:label:Person", b"{}")
+        .expect("put");
+    assert!(
+        engine.holds_user_data().expect("read"),
+        "a label the operator defined is theirs"
+    );
+
+    let dir2 = TempDir::new().expect("tempdir");
+    let engine2 = StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir2.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]))
+    .expect("open");
+    engine2
+        .put(Partition::Node, b"node:00:00000001", b"mine")
+        .expect("put");
+    assert!(engine2.holds_user_data().expect("read the written store"));
+}

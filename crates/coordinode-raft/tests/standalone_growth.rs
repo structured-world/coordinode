@@ -346,3 +346,76 @@ async fn first_node_of_a_grown_directory_rejoins_after_failover() {
     .await;
     assert!(result.is_ok(), "TIMED OUT — rejoin after failover");
 }
+
+/// Only the member a group is formed around brings data into it.
+///
+/// A node that already holds data of its own is refused when it is opened to
+/// join an existing group: joining means receiving the group's state, so its
+/// own would be replaced, and a silent replacement is how a single-machine
+/// deployment loses everything it had. Growing that same directory into a
+/// group, where it is the first member, stays the supported path (the tests
+/// above), and an empty node joins as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_holding_data_is_refused_when_it_joins() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ids = ProposalIdGenerator::with_base(9u64 << 48);
+
+        // The same directory a single-machine deployment accumulates.
+        {
+            let engine = open_engine(dir.path());
+            let standalone = RaftNode::open(1, Arc::clone(&engine))
+                .await
+                .expect("open standalone");
+            await_leadership(&standalone).await;
+            put(&standalone, &ids, "node:1:mine", "mine", 101);
+            standalone.shutdown().await.expect("shutdown standalone");
+        }
+
+        let engine = open_engine(dir.path());
+        assert!(
+            engine.holds_user_data().expect("read the store"),
+            "the standalone run must have left data behind for this test to mean anything"
+        );
+        let refused = RaftNode::open_joining(
+            2,
+            Arc::clone(&engine),
+            format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(coordinode_raft::cluster::RaftNodeError::JoinWithLocalData)
+            ),
+            "a node holding data must be refused when it joins, got {:?}",
+            refused.map(|_| "a running joining node")
+        );
+        assert_eq!(
+            engine
+                .get(Partition::Node, b"node:1:mine")
+                .expect("read")
+                .map(|v| v.to_vec()),
+            Some(b"mine".to_vec()),
+            "the refusal must leave the data where it was"
+        );
+
+        // An empty directory is what a joining node is supposed to have.
+        let empty_dir = tempfile::tempdir().expect("tempdir");
+        let empty = open_engine(empty_dir.path());
+        assert!(!empty.holds_user_data().expect("read the empty store"));
+        let joining = RaftNode::open_joining(
+            3,
+            empty,
+            format!("127.0.0.1:{}", alloc_port()).parse().expect("addr"),
+        )
+        .await
+        .expect("an empty node joins");
+        joining.shutdown().await.expect("shutdown joining");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a node holding data is refused when it joins"
+    );
+}
