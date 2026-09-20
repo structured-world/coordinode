@@ -1,0 +1,216 @@
+//! Deciding a claim against authoritative state and the attempt's own writes.
+//!
+//! The registry answers whether two attempts can coexist. This answers the
+//! other half: whether the condition an attempt validated against is still
+//! true where it counts. A coherent earlier snapshot is not that proof, so
+//! the evaluation reads the authoritative state at the moment it is asked and
+//! applies the attempt's staged mutations on top, because a node and its
+//! mandatory edge created together are one valid post-state and the
+//! intermediate absence of the edge is not a violation.
+//!
+//! The two cardinality measures are counted from different places and neither
+//! is inferred from the other. Distinct neighbours come from the adjacency
+//! posting, which is a set of neighbours by construction. Edge instances come
+//! from the edge-property entries, one per discriminator value, because two
+//! instances to one neighbour are two identities and one neighbour. Asking
+//! the posting for an instance count would answer the wrong question with a
+//! plausible number.
+
+use coordinode_core::graph::edge::{PostingList, encode_adj_key_forward, encode_adj_key_reverse};
+use coordinode_core::graph::node::NodeId;
+use coordinode_core::txn::invariant::{
+    Adjacency, CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, Direction,
+};
+
+use lsm_tree::Guard;
+
+use crate::engine::core::StorageEngine;
+use crate::engine::partition::Partition;
+use crate::engine::transaction::AdjOp;
+use crate::error::StorageResult;
+
+/// The attempt's own staged adjacency mutations, in the order they were
+/// staged, so the evaluation sees the post-state rather than the state before
+/// the attempt ran.
+pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
+
+/// Whether a claim still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The condition holds over the whole post-state.
+    Holds,
+    /// The condition does not hold; the attempt must not be admitted.
+    Broken,
+    /// This evaluator cannot decide the claim, so nothing may be concluded
+    /// from it. A caller treats it as a refusal rather than as a pass: an
+    /// undecidable condition is not a satisfied one.
+    Undecidable,
+}
+
+/// Decide `claim` against the engine's authoritative state plus the attempt's
+/// staged adjacency writes.
+pub fn evaluate(
+    engine: &StorageEngine,
+    claim: &Claim,
+    staged: StagedAdj<'_>,
+) -> StorageResult<Verdict> {
+    match (&claim.scope, &claim.predicate) {
+        (
+            ClaimScope::Incident {
+                node,
+                edge_type,
+                direction,
+            },
+            ClaimPredicate::CardinalityBound {
+                measure,
+                at_most,
+                at_least,
+            },
+        ) => {
+            let count = match measure {
+                CardinalityMeasure::DistinctNeighbours => {
+                    distinct_neighbours(engine, *node, edge_type, *direction, staged)?
+                }
+                CardinalityMeasure::EdgeInstances => {
+                    match edge_instances(engine, *node, edge_type, *direction)? {
+                        Some(n) => n,
+                        // Instances are counted from the edge-property
+                        // entries of each pair, which an incoming scope
+                        // cannot enumerate without the neighbour set it is
+                        // being asked about.
+                        None => return Ok(Verdict::Undecidable),
+                    }
+                }
+            };
+            let within_upper = at_most.is_none_or(|limit| count <= limit as usize);
+            let within_lower = at_least.is_none_or(|limit| count >= limit as usize);
+            Ok(if within_upper && within_lower {
+                Verdict::Holds
+            } else {
+                Verdict::Broken
+            })
+        }
+
+        (
+            ClaimScope::Pair {
+                source,
+                target,
+                edge_type,
+            },
+            ClaimPredicate::PairAdjacency { observed },
+        ) => {
+            let neighbours = adjacency(engine, *source, edge_type, Direction::Outgoing, staged)?;
+            let present = neighbours.contains(&target.as_raw());
+            let now = if present {
+                Adjacency::Present
+            } else {
+                Adjacency::Absent
+            };
+            Ok(if now == *observed {
+                Verdict::Holds
+            } else {
+                Verdict::Broken
+            })
+        }
+
+        (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
+            let key = coordinode_core::graph::node::encode_node_key(0, *node);
+            Ok(if engine.get(Partition::Node, &key)?.is_some() {
+                Verdict::Holds
+            } else {
+                Verdict::Broken
+            })
+        }
+
+        // A destroyed endpoint, a completed scan, a cleanup condition and
+        // schema applicability are decided against evidence this evaluator is
+        // not given: the attempt's own destruction intent, the enumeration it
+        // performed, the version it observed and the schema catalog. Each is
+        // decided where that evidence lives, and answering here would mean
+        // inventing it.
+        _ => Ok(Verdict::Undecidable),
+    }
+}
+
+/// The neighbour set of one incident scope, with the attempt's staged writes
+/// applied in the order they were staged.
+fn adjacency(
+    engine: &StorageEngine,
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+    staged: StagedAdj<'_>,
+) -> StorageResult<Vec<u64>> {
+    let key = match direction {
+        Direction::Outgoing => encode_adj_key_forward(edge_type, node),
+        Direction::Incoming => encode_adj_key_reverse(edge_type, node),
+    };
+
+    let mut plist = match engine.get(Partition::Adj, &key)? {
+        Some(bytes) => PostingList::from_bytes(&bytes).unwrap_or_else(|_| PostingList::new()),
+        None => PostingList::new(),
+    };
+
+    for (staged_key, op) in staged {
+        if staged_key.as_slice() != key.as_slice() {
+            continue;
+        }
+        match op {
+            AdjOp::Add(uid) => {
+                plist.insert(*uid);
+            }
+            AdjOp::Remove(uid) => {
+                plist.remove(*uid);
+            }
+        }
+    }
+
+    Ok(plist.as_slice().to_vec())
+}
+
+/// Distinct neighbours of the scope: the adjacency posting is a set of
+/// neighbours, so its size is the measure directly.
+fn distinct_neighbours(
+    engine: &StorageEngine,
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+    staged: StagedAdj<'_>,
+) -> StorageResult<usize> {
+    Ok(adjacency(engine, node, edge_type, direction, staged)?.len())
+}
+
+/// Logical edge identities of the scope, counted from the edge-property
+/// entries of each neighbouring pair: a discriminated edge type stores one
+/// entry per discriminator value, so the entries are the identities.
+///
+/// Returns `None` for an incoming scope, whose pairs are keyed by their
+/// source and so are not reachable from the target's side by prefix.
+fn edge_instances(
+    engine: &StorageEngine,
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+) -> StorageResult<Option<usize>> {
+    if direction == Direction::Incoming {
+        return Ok(None);
+    }
+
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(b"edgeprop:");
+    prefix.extend_from_slice(edge_type.as_bytes());
+    prefix.push(b':');
+    prefix.extend_from_slice(&node.as_raw().to_be_bytes());
+
+    let mut count = 0;
+    for guard in engine.prefix_scan(Partition::EdgeProp, &prefix)? {
+        if guard.into_inner().is_ok() {
+            count += 1;
+        }
+    }
+    Ok(Some(count))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests;

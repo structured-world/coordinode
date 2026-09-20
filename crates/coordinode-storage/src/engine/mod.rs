@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod capacity;
+pub mod claims;
 pub(crate) mod compaction;
 pub mod config;
 pub mod coordinator;

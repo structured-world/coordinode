@@ -34,6 +34,10 @@ io-uring = ["lsm-tree/io-uring"]
 [dependencies]
 coordinode-core = { workspace = true }
 
+# Guard table on the hot commit path: an 8-byte userspace-fast-path mutex
+# rather than std's ~40-byte futex-backed one.
+parking_lot = { workspace = true }
+
 # LSM engine — permanent fork (ADR-018), crates.io dependency
 lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 
