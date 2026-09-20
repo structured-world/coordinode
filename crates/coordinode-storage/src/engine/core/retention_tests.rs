@@ -183,6 +183,71 @@ fn time_travel_inside_the_window_survives_compaction() {
     }
 }
 
+/// A chain of merge operands inside the window keeps its intermediate
+/// states, so time travel over it answers what the counter held at each
+/// point rather than what it holds now.
+///
+/// This is the invariant the merge contract states from the other side:
+/// operands at or above the horizon are never folded into the base, because
+/// folding them would leave one value where the history was. It is worth its
+/// own test because the cost of breaking it is invisible from the current
+/// value, which stays right whatever the fold did to what came before it.
+#[test]
+fn time_travel_over_a_merge_chain_keeps_its_steps() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(3_600));
+
+    let key = b"counter:degree:1";
+    let bump = |commit_ts: u64| {
+        engine
+            .apply_proposal_at(
+                &[Mutation::Merge {
+                    partition: PartitionId::Counter,
+                    key: key.to_vec(),
+                    operand: crate::engine::merge::encode_counter_delta(1),
+                }],
+                commit_ts,
+            )
+            .expect("apply the operand");
+    };
+    let read_at = |snapshot: u64| {
+        engine
+            .snapshot_get(&snapshot, Partition::Counter, key)
+            .expect("read")
+            .map(|v| crate::engine::merge::decode_counter(&v).expect("decode"))
+    };
+
+    // Three separate operands, each sealed into its own table so the
+    // compaction below has a chain to work on rather than one memtable.
+    for (i, ts) in [base + 1_000, base + 2_000, base + 3_000]
+        .iter()
+        .enumerate()
+    {
+        bump(*ts);
+        flush_in(&engine, Partition::Counter);
+        assert_eq!(
+            read_at(ts + 1),
+            Some(i as i64 + 1),
+            "the counter reads its running total as each operand lands"
+        );
+    }
+
+    engine
+        .force_compaction(Partition::Counter)
+        .expect("compact");
+
+    // Every point of the chain still answers what it held there.
+    assert_eq!(read_at(base + 1_500), Some(1), "after the first operand");
+    assert_eq!(read_at(base + 2_500), Some(2), "after the second");
+    assert_eq!(read_at(base + 3_500), Some(3), "after the third");
+    assert_eq!(
+        read_at(base + 500),
+        None,
+        "before the first operand the counter does not exist"
+    );
+}
+
 /// Inside the window the superseded key version survives in the compaction
 /// output, so the old snapshot is served from the latest tables while the
 /// consumed inputs are already gone. Once the clock moves the watermark past
