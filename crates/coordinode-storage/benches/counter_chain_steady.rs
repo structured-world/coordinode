@@ -1,19 +1,12 @@
-//! What the planner's counter costs to read while the system keeps running.
+//! What a merge chain costs: bytes on disk, read latency at the tail, the
+//! write amplification of folding it, and the price of opening a directory
+//! that holds one.
 //!
-//! The companion point benchmark writes a burst and reads straight after, so
-//! it cannot say whether background compaction bounds the operand chain or
-//! merely lags it. This one keeps writing, pauses to let compaction settle,
-//! and samples the read at each step, so the shape of the curve answers the
-//! question: a chain that compaction bounds gives a flat line, one it never
-//! reaches gives a rising one.
-//!
-//! The second arm is the alternative that needs no engine change: the writer
-//! materialises the counter itself every so often with an ordinary put, which
-//! gives compaction the proven base it otherwise lacks. It is measured here
-//! for its cost only. Whether it is sound is a separate question, and it is
-//! not: reading a sum and writing it back supersedes every delta that landed
-//! in between, which is the read-modify-write that merge operands exist to
-//! avoid.
+//! A chain of operands is cheap to write and is paid for on every read, so a
+//! mean read latency is the least interesting number about it. This reports
+//! the distribution, the bytes the chain occupies before and after it folds,
+//! and how long a directory holding one takes to open, because those are the
+//! costs an operator meets and none of them follows from the others.
 //!
 //! Run: cargo bench -p coordinode-storage --bench counter_chain_steady
 
@@ -27,25 +20,14 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::encode_counter_delta;
 use coordinode_storage::engine::partition::Partition;
 
-/// Deltas between flushes. The engine also flushes a non-empty memtable on an
-/// age timer, so this stands for a flush cadence in time at a given write rate
-/// rather than for anything the writer decides.
+/// Deltas between flushes, so the chain is spread over tables rather than
+/// sitting in one memtable.
 const DELTAS_PER_FLUSH: usize = 256;
 
-/// Deltas between samples.
-const DELTAS_PER_SAMPLE: usize = 20_000;
+/// Reads timed per measurement.
+const READS: usize = 2_000;
 
-/// Total deltas per arm.
-const TOTAL_DELTAS: usize = 200_000;
-
-/// How long compaction is given to settle before a sample, so the sample
-/// measures the state the system rests in and not the one it is leaving.
-const SETTLE: Duration = Duration::from_secs(2);
-
-/// Reads timed per sample.
-const READS_PER_SAMPLE: u32 = 200;
-
-fn open_engine(dir: &tempfile::TempDir) -> StorageEngine {
+fn open(dir: &tempfile::TempDir) -> StorageEngine {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
@@ -64,56 +46,100 @@ fn read_total(engine: &StorageEngine) -> i64 {
     i64::from_le_bytes(value.as_ref().try_into().expect("eight bytes"))
 }
 
-/// Mean nanoseconds of a point read of the counter.
-fn sample_read_ns(engine: &StorageEngine) -> u128 {
-    let start = Instant::now();
-    for _ in 0..READS_PER_SAMPLE {
-        std::hint::black_box(read_total(engine));
+/// Bytes on disk under the directory. The counter partition is the only thing
+/// written here, so this is the chain's footprint plus a fixed overhead that
+/// the empty baseline reports.
+fn bytes_on_disk(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += bytes_on_disk(&entry.path());
+        } else {
+            total += meta.len();
+        }
     }
-    start.elapsed().as_nanos() / u128::from(READS_PER_SAMPLE)
+    total
 }
 
-/// Write `TOTAL_DELTAS` deltas, sampling the read as it goes. With
-/// `checkpoint_every` set, the writer also materialises the counter with a put
-/// at that interval.
-fn run(name: &str, checkpoint_every: Option<usize>) {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let engine = open_engine(&dir);
-    let operand = encode_counter_delta(1);
-
-    println!("\n{name}");
-    println!("{:>10}  {:>12}  {:>10}", "deltas", "read (ns)", "value");
-
-    for i in 1..=TOTAL_DELTAS {
-        engine
-            .merge(Partition::Counter, NODES_TOTAL_KEY, &operand)
-            .expect("merge");
-
-        if i % DELTAS_PER_FLUSH == 0 {
-            engine.persist().expect("persist");
-        }
-
-        if let Some(every) = checkpoint_every {
-            if i % every == 0 {
-                // Deliberately the unsound form, measured for its cost: the
-                // sum is read and written back, so anything that landed since
-                // the read is superseded by the put.
-                let total = read_total(&engine);
-                engine
-                    .put(Partition::Counter, NODES_TOTAL_KEY, &total.to_le_bytes())
-                    .expect("put");
-            }
-        }
-
-        if i % DELTAS_PER_SAMPLE == 0 {
-            std::thread::sleep(SETTLE);
-            let ns = sample_read_ns(&engine);
-            println!("{:>10}  {:>12}  {:>10}", i, ns, read_total(&engine));
-        }
+/// Read latency at the median and the tail, in nanoseconds.
+///
+/// Reported rather than a mean because a chain's cost is a long read that
+/// happens on every planning call: the median says what it usually costs and
+/// the tail says what it costs when the chain is at its longest.
+fn read_latency(engine: &StorageEngine) -> (u128, u128, u128) {
+    let mut samples: Vec<u128> = Vec::with_capacity(READS);
+    for _ in 0..READS {
+        let start = Instant::now();
+        std::hint::black_box(read_total(engine));
+        samples.push(start.elapsed().as_nanos());
     }
+    samples.sort_unstable();
+    let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+    (at(0.50), at(0.99), at(0.999))
 }
 
 fn main() {
-    run("merge only, compaction left to itself", None);
-    run("writer materialises every 1000 deltas", Some(1_000));
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}",
+        "operands", "p50 (ns)", "p99 (ns)", "p999 (ns)", "bytes", "folded", "reopen (ms)"
+    );
+
+    for operands in [1_000usize, 10_000, 100_000] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = open(&dir);
+        let operand = encode_counter_delta(1);
+
+        let write_start = Instant::now();
+        for i in 1..=operands {
+            engine
+                .merge(Partition::Counter, NODES_TOTAL_KEY, &operand)
+                .expect("merge");
+            if i % DELTAS_PER_FLUSH == 0 {
+                engine.persist().expect("persist");
+            }
+        }
+        engine.persist().expect("persist");
+        let write_time = write_start.elapsed();
+
+        let (p50, p99, p999) = read_latency(&engine);
+        let unfolded = bytes_on_disk(dir.path());
+
+        // Folding is the write amplification of the chain: the bytes it costs
+        // to turn the operands into the one value they mean.
+        let fold_start = Instant::now();
+        engine
+            .major_compact(Partition::Counter)
+            .expect("fold the chain");
+        let fold_time = fold_start.elapsed();
+        let folded = bytes_on_disk(dir.path());
+
+        assert_eq!(read_total(&engine), operands as i64, "the sum survives");
+        drop(engine);
+
+        // Recovery: opening a directory that holds the folded chain.
+        let reopen_start = Instant::now();
+        let reopened = open(&dir);
+        let reopen = reopen_start.elapsed();
+        assert_eq!(
+            read_total(&reopened),
+            operands as i64,
+            "and survives a reopen"
+        );
+
+        println!(
+            "{operands:>10}  {p50:>10}  {p99:>10}  {p999:>10}  {unfolded:>12}  {folded:>12}  {:>10.1}",
+            reopen.as_secs_f64() * 1_000.0
+        );
+        println!(
+            "{:>10}  write {:?}, fold {:?}, amplification {:.2}x",
+            "",
+            Duration::from_millis(write_time.as_millis() as u64),
+            Duration::from_millis(fold_time.as_millis() as u64),
+            unfolded as f64 / folded.max(1) as f64
+        );
+    }
 }

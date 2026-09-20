@@ -472,7 +472,15 @@ mod proptest_merge;
 #[allow(clippy::expect_used, clippy::panic)]
 mod doc_merge_tests;
 
-// ─── CounterMerge (R163b) ────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Composition contract tests (what may be folded before the base is known)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod composition_tests;
+
+// ─── Counter merge operator (counter: partition) ─────────────────────
 
 /// Encode a counter delta operand: i64 little-endian (8 bytes).
 pub fn encode_counter_delta(delta: i64) -> Vec<u8> {

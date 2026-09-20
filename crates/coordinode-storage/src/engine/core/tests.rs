@@ -1118,6 +1118,72 @@ fn power_loss_recovery_replays_journal_over_rolled_back_trees() {
 /// itself must not read as the operator's data, or a fresh node could never
 /// join, and the operator's data must not read as engine state, or a join
 /// would silently replace it.
+/// An order-sensitive merge chain means the same thing after every stage the
+/// bytes pass through: in the memtable, after a flush, after a compaction and
+/// after the directory is closed and opened again.
+///
+/// The operands of a posting list do not commute, and each stage is a chance
+/// to reorder them: a flush writes them out, a compaction folds a prefix or
+/// keeps it, and a reopen replays what the log and the tables hold. The
+/// answer is read at every stage rather than only at the end, so a stage that
+/// changed it is named by the assertion that fails.
+#[test]
+fn a_merge_chain_reads_the_same_through_flush_compaction_and_reopen() {
+    use coordinode_core::graph::edge::PostingList;
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+
+    let key = b"adj:FOLLOWS:out:42";
+    let read = |engine: &StorageEngine| -> Vec<u64> {
+        match engine.get(Partition::Adj, key).expect("get") {
+            Some(bytes) => PostingList::from_bytes(&bytes)
+                .expect("decode")
+                .as_slice()
+                .to_vec(),
+            None => Vec::new(),
+        }
+    };
+
+    {
+        let engine = StorageEngine::open(&config).expect("open");
+
+        // A chain whose meaning depends on its order: 2 is added, removed and
+        // added again, 3 is added and removed. Only the order says that 2
+        // survives and 3 does not.
+        for operand in [
+            crate::engine::merge::encode_add(1),
+            crate::engine::merge::encode_add(2),
+            crate::engine::merge::encode_add(3),
+            crate::engine::merge::encode_remove(2),
+            crate::engine::merge::encode_remove(3),
+            crate::engine::merge::encode_add(2),
+        ] {
+            engine.merge(Partition::Adj, key, &operand).expect("merge");
+        }
+
+        assert_eq!(read(&engine), vec![1, 2], "in the memtable");
+
+        engine.persist().expect("flush");
+        assert_eq!(read(&engine), vec![1, 2], "after a flush");
+
+        engine
+            .major_compact(Partition::Adj)
+            .expect("compact the partition");
+        assert_eq!(read(&engine), vec![1, 2], "after a compaction");
+    }
+
+    // Closed and opened again: what the directory holds is what it said.
+    let reopened = StorageEngine::open(&config).expect("reopen");
+    assert_eq!(read(&reopened), vec![1, 2], "after a reopen");
+}
+
 #[test]
 fn a_fresh_store_holds_no_user_data() {
     let dir = TempDir::new().expect("tempdir");
