@@ -286,6 +286,55 @@ impl StorageStatsComputer {
     }
 }
 
+/// Recompute the planner's node and label counters from the node rows.
+///
+/// The counters are staged by the write executor on the transaction that
+/// writes the node, so a path that writes node rows directly leaves them
+/// untouched: a bulk restore fills the graph and the counters keep saying
+/// what they said before, which for a fresh database is nothing. The cost
+/// estimator then prices every plan against an empty graph. This reads the
+/// rows that are actually there and writes the counters to match.
+///
+/// Written with `put` rather than with deltas because this establishes the
+/// value rather than moving it; it is a rebuild from the truth on disk, not
+/// an increment, so it must not be composed with what was there before.
+///
+/// One row counts once, so a temporal node counts once per stored version,
+/// which is what the counters mean and what a scan of the partition sees.
+pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
+    use coordinode_core::graph::node::NODE_KEY_PREFIX;
+    use coordinode_core::graph::stats::{NODES_TOTAL_KEY, label_count_key};
+
+    use crate::engine::merge::decode_node_record;
+
+    let mut total: i64 = 0;
+    let mut label_counts: HashMap<String, i64> = HashMap::new();
+
+    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+        let Ok((_key, value)) = guard.into_inner() else {
+            continue;
+        };
+        let Ok(record) = decode_node_record(&value) else {
+            continue;
+        };
+        total += 1;
+        for label in &record.labels {
+            *label_counts.entry(label.clone()).or_insert(0) += 1;
+        }
+    }
+
+    engine.put(Partition::Counter, NODES_TOTAL_KEY, &total.to_le_bytes())?;
+    for (label, count) in label_counts {
+        engine.put(
+            Partition::Counter,
+            &label_count_key(&label),
+            &count.to_le_bytes(),
+        )?;
+    }
+
+    Ok(())
+}
+
 impl StorageStats for StorageStatsComputer {
     fn total_node_count(&self) -> u64 {
         self.total_nodes

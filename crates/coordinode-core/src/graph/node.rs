@@ -287,8 +287,9 @@ impl NodeIdAllocator {
 
 // -- Key encoding --
 
-/// Key prefix for node records.
-const NODE_KEY_PREFIX: &[u8] = b"node:";
+/// Key prefix for node records. Public so that a scan of every node row
+/// names the prefix from here rather than repeating the literal.
+pub const NODE_KEY_PREFIX: &[u8] = b"node:";
 
 /// Encode a node key: `node:<shard_id u16 BE>:<node_id u64 BE>`.
 ///

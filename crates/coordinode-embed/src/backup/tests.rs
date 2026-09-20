@@ -86,6 +86,82 @@ fn binary_roundtrip() {
     assert_eq!(restore_stats.nodes, export_stats.nodes);
 }
 
+/// A restored database tells the planner how much it holds.
+///
+/// The node and label counts the cost estimator reads are counter rows
+/// maintained by the write path, and a binary restore writes the rows
+/// themselves rather than replaying the writes. Without a rebuild the
+/// restored database reports an empty graph while holding a full one, and
+/// every plan chosen on it is costed against zero.
+#[test]
+fn a_restored_database_reports_what_it_holds() {
+    use coordinode_core::graph::stats::StorageStats;
+    use coordinode_storage::engine::stats::StorageStatsComputer;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+
+    db.execute_cypher("CREATE (:User {name: 'Alice'})").unwrap();
+    db.execute_cypher("CREATE (:User {name: 'Bob'})").unwrap();
+    db.execute_cypher("CREATE (:Post {title: 'Hello'})")
+        .unwrap();
+
+    let source = StorageStatsComputer::compute(db.engine()).unwrap();
+    assert_eq!(source.total_node_count(), 3, "the source counts its nodes");
+    assert_eq!(source.node_count_for_label("User"), Some(2));
+    assert_eq!(source.node_count_for_label("Post"), Some(1));
+
+    let mut buf = Vec::new();
+    let snapshot = db.engine().snapshot();
+    export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = Database::open(dir2.path()).unwrap();
+    let mut cursor = std::io::Cursor::new(&buf);
+    restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
+
+    let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
+    assert_eq!(
+        restored.total_node_count(),
+        source.total_node_count(),
+        "a restored database holds as many nodes as the one it came from"
+    );
+    assert_eq!(
+        restored.node_count_for_label("User"),
+        Some(2),
+        "and as many of each label"
+    );
+    assert_eq!(restored.node_count_for_label("Post"), Some(1));
+}
+
+/// The same obligation on the JSON path, which writes its rows through the
+/// typed node store rather than through the executor that stages the
+/// counters, and so leaves them behind exactly as the binary path does.
+#[test]
+fn a_json_restore_also_reports_what_it_holds() {
+    use coordinode_core::graph::stats::StorageStats;
+    use coordinode_storage::engine::stats::StorageStatsComputer;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_cypher("CREATE (:User {name: 'Alice'})").unwrap();
+    db.execute_cypher("CREATE (:User {name: 'Bob'})").unwrap();
+
+    let mut buf = Vec::new();
+    let snapshot = db.engine().snapshot();
+    export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = Database::open(dir2.path()).unwrap();
+    let mut interner2 = coordinode_core::graph::intern::FieldInterner::new();
+    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
+    restore::restore_json(db2.engine(), &mut interner2, 1, &mut cursor, None).unwrap();
+
+    let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
+    assert_eq!(restored.total_node_count(), 2);
+    assert_eq!(restored.node_count_for_label("User"), Some(2));
+}
+
 #[test]
 fn json_roundtrip() {
     let dir = tempfile::tempdir().unwrap();

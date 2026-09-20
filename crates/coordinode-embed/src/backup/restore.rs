@@ -134,6 +134,10 @@ pub fn restore_binary<R: Read>(
         }
     }
 
+    // The rows went in directly, so the planner's counters never saw them.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
     Ok((stats, interner))
 }
 
@@ -281,6 +285,11 @@ pub fn restore_json<R: BufRead>(
         }
     }
 
+    // The rows went in through the typed store, not the executor that
+    // stages the counters, so the planner's counts need rebuilding.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
     Ok(stats)
 }
 
@@ -360,6 +369,11 @@ pub fn restore_apoc_json<R: BufRead>(
             _ => {}
         }
     }
+
+    // The rows went in through the typed store, not the executor that
+    // stages the counters, so the planner's counts need rebuilding.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
 
     Ok(stats)
 }
@@ -572,6 +586,12 @@ pub fn restore_cypher<R: BufRead>(
             stats.nodes += 1;
         }
     }
+
+    // The rows went in through the typed store, not the executor that
+    // stages the counters, so the planner's counts need rebuilding.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
     Ok(stats)
 }
 
@@ -811,6 +831,12 @@ pub fn restore_apoc_cypher<R: BufRead>(
         }
         apply_apoc_cypher_stmt(stmt, engine, interner, shard_id, &mut stats)?;
     }
+
+    // The rows went in through the typed store, not the executor that
+    // stages the counters, so the planner's counts need rebuilding.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
     Ok(stats)
 }
 
@@ -1590,6 +1616,12 @@ pub fn restore_hetio_json<R: BufRead>(
         write_edge_record(engine, interner, src, tgt, &e.kind, props)?;
         stats.edges += 1;
     }
+
+    // The rows went in through the typed store, not the executor that
+    // stages the counters, so the planner's counts need rebuilding.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine)
+        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+
     Ok(stats)
 }
 
