@@ -134,6 +134,8 @@ pub(crate) async fn serve(
         write_buffer_mb,
         // Applied to the engine through resolve_storage_config above.
         retention_window_secs: _,
+        max_invariant_claims: _,
+        node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
         cdc_consumer_ttl_secs,

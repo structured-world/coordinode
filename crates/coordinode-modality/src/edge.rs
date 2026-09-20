@@ -42,6 +42,7 @@ use coordinode_core::graph::edge::{
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::schema::definition::PropertyType;
+use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -446,6 +447,33 @@ pub trait EdgeStore {
 pub struct LocalEdgeStore;
 
 impl LocalEdgeStore {
+    /// State what attaching an edge depends on: both endpoints keeping their
+    /// identity until the attachment lands.
+    ///
+    /// Only the attaching side states it. A detachment needs no such claim:
+    /// removing a member from a posting list that a concurrent node deletion
+    /// is purging anyway leaves the same empty adjacency either way, and
+    /// claiming the endpoint there would make two agreeing removals queue.
+    ///
+    /// The claim is `EndpointAlive`, which many attempts hold at once, so
+    /// edges attaching to one popular node do not serialise against each
+    /// other; the only thing it excludes is that node being destroyed.
+    fn claim_endpoints_alive(txn: &mut Transaction, src: NodeId, tgt: NodeId) {
+        let generation = txn.schema_generation();
+        txn.claim(Claim::new(
+            ClaimScope::Node(src),
+            ClaimPredicate::EndpointAlive,
+            generation,
+        ));
+        if tgt != src {
+            txn.claim(Claim::new(
+                ClaimScope::Node(tgt),
+                ClaimPredicate::EndpointAlive,
+                generation,
+            ));
+        }
+    }
+
     fn decode_err(e: impl core::fmt::Display) -> StoreError {
         StoreError::Decode {
             kind: "posting list",
@@ -527,6 +555,7 @@ impl EdgeStore for LocalEdgeStore {
         tgt: NodeId,
         props: Option<&EdgeProperties>,
     ) -> StoreResult<()> {
+        Self::claim_endpoints_alive(txn, src, tgt);
         let fwd_key = encode_adj_key_forward(edge_type, src);
         let rev_key = encode_adj_key_reverse(edge_type, tgt);
         txn.merge_adj_add(&fwd_key, tgt.as_raw());
@@ -636,6 +665,7 @@ impl EdgeStore for LocalEdgeStore {
         let rev_key = encode_adj_key_reverse(edge_type, tgt);
         let ep_key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
         let body = Self::encode_props(props)?;
+        Self::claim_endpoints_alive(txn, src, tgt);
         txn.merge_adj_add(&fwd_key, tgt.as_raw());
         txn.merge_adj_add(&rev_key, src.as_raw());
         txn.put(Partition::EdgeProp, &ep_key, &body)?;
@@ -716,6 +746,7 @@ impl EdgeStore for LocalEdgeStore {
                 ))
             })?;
         let body = Self::encode_props(props)?;
+        Self::claim_endpoints_alive(txn, src, tgt);
         txn.merge_adj_add(&encode_adj_key_forward(edge_type, src), tgt.as_raw());
         txn.merge_adj_add(&encode_adj_key_reverse(edge_type, tgt), src.as_raw());
         txn.put(Partition::EdgeProp, &ep_key, &body)?;

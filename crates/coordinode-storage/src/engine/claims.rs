@@ -119,6 +119,27 @@ impl ClaimRegistry {
         }
     }
 
+    /// Reserve `claims` for `attempt` and hold them until the returned guard
+    /// is dropped.
+    ///
+    /// The reservation protects the window between deciding that a condition
+    /// holds and applying the writes built on it, and that window is exactly
+    /// the lifetime of the guard. Tying it to a value the compiler drops on
+    /// every path, rather than to a call at each exit, is what keeps a
+    /// refusal, an error and a success from each needing their own release,
+    /// and one forgotten path from filling the table for good.
+    pub fn reserve_held<'r>(
+        &'r self,
+        attempt: u64,
+        claims: &ClaimSet,
+    ) -> Result<Reservation<'r>, Box<ClaimRefusal>> {
+        self.reserve(attempt, claims)?;
+        Ok(Reservation {
+            registry: self,
+            attempt,
+        })
+    }
+
     /// Claims currently reserved, across all attempts. The guard budget is
     /// observed through this.
     pub fn reserved_claims(&self) -> usize {
@@ -128,6 +149,18 @@ impl ClaimRegistry {
     /// Attempts currently holding claims.
     pub fn attempts(&self) -> usize {
         self.inner.lock().by_attempt.len()
+    }
+}
+
+/// One attempt's live reservation. Releases it on drop.
+pub struct Reservation<'r> {
+    registry: &'r ClaimRegistry,
+    attempt: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.registry.release(self.attempt);
     }
 }
 

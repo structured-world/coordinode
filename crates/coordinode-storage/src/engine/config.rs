@@ -669,6 +669,18 @@ pub struct StorageConfig {
     /// Runtime-tunable through the engine; restart-free.
     pub max_invariant_claims: usize,
 
+    /// The shard whose node rows this engine holds.
+    ///
+    /// Node keys carry the shard ahead of the id, so a lookup by node id
+    /// needs it. The invariant guard is the one place inside the engine that
+    /// has to resolve a node from its id alone (a claim names the node, not a
+    /// row), and this is where it gets the missing half. The layers above
+    /// pass the same value as their statement shard.
+    ///
+    /// Runtime-settable through the engine, because the handle above is
+    /// constructed after the engine is open.
+    pub node_shard: u16,
+
     /// Background drain thread polling interval in milliseconds.
     /// Controls how frequently volatile writes (w:memory/w:cache) are
     /// batched into Raft proposals. Lower = less data at risk.
@@ -837,6 +849,7 @@ impl StorageConfig {
             oplog_retention_secs: 7 * 24 * 3600,
             retention_window_secs: 7 * 24 * 3600,
             max_invariant_claims: 100_000,
+            node_shard: 0,
             drain_interval_ms: 100,
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,

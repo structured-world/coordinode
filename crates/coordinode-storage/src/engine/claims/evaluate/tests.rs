@@ -2,6 +2,7 @@ use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use crate::engine::merge::{encode_add, encode_remove};
 use coordinode_core::txn::invariant::ClaimScope;
+use std::collections::HashMap;
 use tempfile::TempDir;
 
 const GEN: u64 = 1;
@@ -16,6 +17,15 @@ fn engine() -> (StorageEngine, TempDir) {
         Tier::Warm,
     )]);
     (StorageEngine::open(&config).expect("open"), dir)
+}
+
+/// Decide a claim for an attempt that has staged no point writes, which is
+/// every case below except the ones about staged writes themselves.
+fn decide(engine: &StorageEngine, claim: &Claim, staged: &[(Vec<u8>, AdjOp)]) -> Verdict {
+    let no_points = HashMap::new();
+    // An attempt whose view is the current state: nothing has been written
+    // since it, which is the case every test here but the destruction ones.
+    evaluate(engine, claim, staged, &no_points, engine.snapshot()).expect("evaluate")
 }
 
 fn node(id: u64) -> NodeId {
@@ -46,7 +56,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
 
     // No edges: at-most-one holds.
     assert_eq!(
-        evaluate(&engine, &bound(1, Some(1), None), &[]).expect("evaluate"),
+        decide(&engine, &bound(1, Some(1), None), &[]),
         Verdict::Holds
     );
 
@@ -54,7 +64,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
         .merge(Partition::Adj, &key, &encode_add(2))
         .expect("merge");
     assert_eq!(
-        evaluate(&engine, &bound(1, Some(1), None), &[]).expect("evaluate"),
+        decide(&engine, &bound(1, Some(1), None), &[]),
         Verdict::Holds,
         "one neighbour is within at-most-one"
     );
@@ -63,7 +73,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
         .merge(Partition::Adj, &key, &encode_add(3))
         .expect("merge");
     assert_eq!(
-        evaluate(&engine, &bound(1, Some(1), None), &[]).expect("evaluate"),
+        decide(&engine, &bound(1, Some(1), None), &[]),
         Verdict::Broken,
         "two neighbours are not"
     );
@@ -80,7 +90,7 @@ fn a_lower_bound_refuses_an_empty_result() {
         .expect("merge");
 
     assert_eq!(
-        evaluate(&engine, &bound(1, None, Some(1)), &[]).expect("evaluate"),
+        decide(&engine, &bound(1, None, Some(1)), &[]),
         Verdict::Holds
     );
 
@@ -88,7 +98,7 @@ fn a_lower_bound_refuses_an_empty_result() {
     // would leave is what the bound is decided against, not the state before.
     let staged = vec![(key.clone(), AdjOp::Remove(2))];
     assert_eq!(
-        evaluate(&engine, &bound(1, None, Some(1)), &staged).expect("evaluate"),
+        decide(&engine, &bound(1, None, Some(1)), &staged),
         Verdict::Broken,
         "the bound is decided against the post-state the attempt would leave"
     );
@@ -104,7 +114,7 @@ fn the_attempts_own_writes_are_part_of_the_post_state() {
 
     // Nothing stored: a lower bound is broken.
     assert_eq!(
-        evaluate(&engine, &bound(5, None, Some(1)), &[]).expect("evaluate"),
+        decide(&engine, &bound(5, None, Some(1)), &[]),
         Verdict::Broken
     );
 
@@ -112,7 +122,7 @@ fn the_attempts_own_writes_are_part_of_the_post_state() {
     // and the intermediate absence is not a violation.
     let staged = vec![(key, AdjOp::Add(6))];
     assert_eq!(
-        evaluate(&engine, &bound(5, None, Some(1)), &staged).expect("evaluate"),
+        decide(&engine, &bound(5, None, Some(1)), &staged),
         Verdict::Holds
     );
 }
@@ -129,14 +139,14 @@ fn staged_writes_are_applied_in_the_order_they_were_staged() {
         (key.clone(), AdjOp::Remove(2)),
     ];
     assert_eq!(
-        evaluate(&engine, &bound(1, None, Some(1)), &add_then_remove).expect("evaluate"),
+        decide(&engine, &bound(1, None, Some(1)), &add_then_remove),
         Verdict::Broken,
         "add then remove leaves the set empty"
     );
 
     let remove_then_add = vec![(key.clone(), AdjOp::Remove(2)), (key, AdjOp::Add(2))];
     assert_eq!(
-        evaluate(&engine, &bound(1, None, Some(1)), &remove_then_add).expect("evaluate"),
+        decide(&engine, &bound(1, None, Some(1)), &remove_then_add),
         Verdict::Holds,
         "remove then add leaves the member"
     );
@@ -168,27 +178,18 @@ fn a_pair_claim_is_decided_against_adjacency() {
         GEN,
     );
 
-    assert_eq!(
-        evaluate(&engine, &saw_absent, &[]).expect("evaluate"),
-        Verdict::Holds
-    );
-    assert_eq!(
-        evaluate(&engine, &saw_present, &[]).expect("evaluate"),
-        Verdict::Broken
-    );
+    assert_eq!(decide(&engine, &saw_absent, &[]), Verdict::Holds);
+    assert_eq!(decide(&engine, &saw_present, &[]), Verdict::Broken);
 
     engine
         .merge(Partition::Adj, &key, &encode_add(2))
         .expect("merge");
     assert_eq!(
-        evaluate(&engine, &saw_absent, &[]).expect("evaluate"),
+        decide(&engine, &saw_absent, &[]),
         Verdict::Broken,
         "the absence the attempt observed is gone"
     );
-    assert_eq!(
-        evaluate(&engine, &saw_present, &[]).expect("evaluate"),
-        Verdict::Holds
-    );
+    assert_eq!(decide(&engine, &saw_present, &[]), Verdict::Holds);
 }
 
 /// A removal of an unrelated neighbour does not disturb a pair claim about a
@@ -213,15 +214,17 @@ fn a_pair_claim_ignores_other_neighbours() {
         GEN,
     );
     assert_eq!(
-        evaluate(&engine, &claim, &[]).expect("evaluate"),
+        decide(&engine, &claim, &[]),
         Verdict::Holds,
         "another neighbour is not this pair"
     );
 }
 
-/// An endpoint claim is decided against whether the node record is there.
+/// An endpoint claim is about destruction, not about existence: a node row
+/// that is simply absent, and that nobody has written since the attempt's
+/// view, is not a node that was taken away from it.
 #[test]
-fn an_endpoint_claim_is_decided_against_the_node_record() {
+fn an_endpoint_claim_admits_a_node_that_was_never_written() {
     let (engine, _d) = engine();
     let claim = Claim::new(
         ClaimScope::Node(node(3)),
@@ -229,16 +232,143 @@ fn an_endpoint_claim_is_decided_against_the_node_record() {
         GEN,
     );
     assert_eq!(
-        evaluate(&engine, &claim, &[]).expect("evaluate"),
-        Verdict::Broken,
-        "a node that is not there cannot be referenced"
+        decide(&engine, &claim, &[]),
+        Verdict::Holds,
+        "refusing here would make every edge writer an enforcer of \
+         referential integrity"
     );
 
-    let key = coordinode_core::graph::node::encode_node_key(0, node(3));
+    let key = coordinode_core::graph::node::encode_node_key(engine.node_shard(), node(3));
     engine.put(Partition::Node, &key, b"record").expect("put");
+    assert_eq!(decide(&engine, &claim, &[]), Verdict::Holds);
+}
+
+/// The row was there when the attempt built its result and is gone now: that
+/// is the destruction the claim guards against, and the only case in which an
+/// absent row refuses.
+#[test]
+fn an_endpoint_claim_refuses_a_node_deleted_since_the_attempts_view() {
+    let (engine, _d) = engine();
+    let key = coordinode_core::graph::node::encode_node_key(engine.node_shard(), node(3));
+    engine.put(Partition::Node, &key, b"record").expect("put");
+    let view = engine.snapshot();
+    engine.delete(Partition::Node, &key).expect("delete");
+
+    let claim = Claim::new(
+        ClaimScope::Node(node(3)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    );
+    let no_points = HashMap::new();
     assert_eq!(
-        evaluate(&engine, &claim, &[]).expect("evaluate"),
-        Verdict::Holds
+        evaluate(&engine, &claim, &[], &no_points, view).expect("evaluate"),
+        Verdict::Broken,
+        "the identity this attempt references was reclaimed under it"
+    );
+}
+
+/// The node row is looked up in the shard the engine holds, not in shard zero:
+/// a deployment whose statements run against another shard would otherwise
+/// read another node's row, or none.
+#[test]
+fn an_endpoint_claim_reads_the_shard_the_engine_holds() {
+    let (engine, _d) = engine();
+    engine.set_node_shard(7);
+
+    let held = coordinode_core::graph::node::encode_node_key(7, node(3));
+    engine.put(Partition::Node, &held, b"record").expect("put");
+    let view = engine.snapshot();
+    engine.delete(Partition::Node, &held).expect("delete");
+
+    // The same id in another shard is another node, and its surviving row is
+    // no evidence about this one.
+    let elsewhere = coordinode_core::graph::node::encode_node_key(0, node(3));
+    engine
+        .put(Partition::Node, &elsewhere, b"record")
+        .expect("put");
+
+    let claim = Claim::new(
+        ClaimScope::Node(node(3)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    );
+    let no_points = HashMap::new();
+    assert_eq!(
+        evaluate(&engine, &claim, &[], &no_points, view).expect("evaluate"),
+        Verdict::Broken,
+        "another shard's row is another node"
+    );
+}
+
+/// A node of a temporal label exists only as versions under the per-version
+/// key. Reading the plain row alone would call it dead and refuse every edge
+/// attached to it.
+#[test]
+fn an_endpoint_claim_sees_a_node_stored_as_versions() {
+    let (engine, _d) = engine();
+    let claim = Claim::new(
+        ClaimScope::Node(node(8)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    );
+    let versioned =
+        coordinode_core::graph::node::encode_temporal_node_key(engine.node_shard(), node(8), 1_700);
+    engine
+        .put(Partition::Node, &versioned, b"record")
+        .expect("put");
+    assert_eq!(
+        decide(&engine, &claim, &[]),
+        Verdict::Holds,
+        "a version of the node is the node"
+    );
+}
+
+/// The attempt's own point writes decide the endpoint in both directions: a
+/// node it is creating is alive before anything is committed, and one it is
+/// deleting is gone before the tombstone lands.
+#[test]
+fn an_endpoint_claim_reads_the_attempts_own_point_writes() {
+    let (engine, _d) = engine();
+    let claim = Claim::new(
+        ClaimScope::Node(node(4)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    );
+    let key = coordinode_core::graph::node::encode_node_key(engine.node_shard(), node(4));
+
+    let mut staged_points = HashMap::new();
+    staged_points.insert((Partition::Node, key.clone()), Some(b"record".to_vec()));
+    assert_eq!(
+        evaluate(&engine, &claim, &[], &staged_points, engine.snapshot()).expect("evaluate"),
+        Verdict::Holds,
+        "a node created by this attempt is alive for this attempt's own edge"
+    );
+
+    engine.put(Partition::Node, &key, b"record").expect("put");
+    let mut deleted = HashMap::new();
+    deleted.insert((Partition::Node, key), None);
+    assert_eq!(
+        evaluate(&engine, &claim, &[], &deleted, engine.snapshot()).expect("evaluate"),
+        Verdict::Broken,
+        "a node this attempt deletes is not one it may attach to"
+    );
+}
+
+/// A destruction is the attempt's own intent, not a condition read from state,
+/// so it is admitted here and excluded where it belongs: against the reference
+/// rights other attempts hold.
+#[test]
+fn a_destruction_claim_is_admitted_by_the_evaluator() {
+    let (engine, _d) = engine();
+    let claim = Claim::new(
+        ClaimScope::Node(node(3)),
+        ClaimPredicate::EndpointDestroyed,
+        GEN,
+    );
+    assert_eq!(
+        decide(&engine, &claim, &[]),
+        Verdict::Holds,
+        "refusing this would refuse every deletion"
     );
 }
 
@@ -258,7 +388,7 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
         GEN,
     );
     assert_eq!(
-        evaluate(&engine, &scan, &[]).expect("evaluate"),
+        decide(&engine, &scan, &[]),
         Verdict::Undecidable,
         "the enumeration the attempt performed is not visible here"
     );
@@ -270,20 +400,14 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
         },
         GEN,
     );
-    assert_eq!(
-        evaluate(&engine, &cleanup, &[]).expect("evaluate"),
-        Verdict::Undecidable
-    );
+    assert_eq!(decide(&engine, &cleanup, &[]), Verdict::Undecidable);
 
     let schema = Claim::new(
         ClaimScope::SchemaElement("OWNS".to_string()),
         ClaimPredicate::SchemaApplicability,
         GEN,
     );
-    assert_eq!(
-        evaluate(&engine, &schema, &[]).expect("evaluate"),
-        Verdict::Undecidable
-    );
+    assert_eq!(decide(&engine, &schema, &[]), Verdict::Undecidable);
 
     // An incoming instance count is not reachable from the target's side,
     // and saying so is not the same as saying the bound holds.
@@ -301,7 +425,7 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
         GEN,
     );
     assert_eq!(
-        evaluate(&engine, &incoming_instances, &[]).expect("evaluate"),
+        decide(&engine, &incoming_instances, &[]),
         Verdict::Undecidable
     );
 }
@@ -360,12 +484,12 @@ fn the_two_measures_count_different_things_on_one_adjacency() {
     );
 
     assert_eq!(
-        evaluate(&engine, &neighbours, &[]).expect("evaluate"),
+        decide(&engine, &neighbours, &[]),
         Verdict::Holds,
         "one neighbour satisfies at-most-one distinct neighbours"
     );
     assert_eq!(
-        evaluate(&engine, &instances, &[]).expect("evaluate"),
+        decide(&engine, &instances, &[]),
         Verdict::Broken,
         "the same adjacency holds two identities and violates at-most-one instances"
     );
@@ -384,7 +508,7 @@ fn staged_writes_for_another_scope_are_ignored() {
     let staged = vec![(other, AdjOp::Remove(2))];
 
     assert_eq!(
-        evaluate(&engine, &bound(1, None, Some(1)), &staged).expect("evaluate"),
+        decide(&engine, &bound(1, None, Some(1)), &staged),
         Verdict::Holds,
         "another scope's staged removal is not this scope's"
     );

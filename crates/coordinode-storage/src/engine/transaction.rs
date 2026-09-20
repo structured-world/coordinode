@@ -237,6 +237,13 @@ pub struct Transaction<'a> {
     /// go. Checked and reserved at commit: the write set alone cannot tell
     /// two attempts apart that each validated a condition the other breaks.
     claims: ClaimSet,
+    /// The schema generation as it stood when this attempt began. Every claim
+    /// it makes is stamped with it, so a predicate evaluated here is not taken
+    /// as evidence about a graph whose definitions have since changed.
+    schema_generation: u64,
+    /// Whether this attempt changes a schema definition. Set by the writer
+    /// that stages the change, acted on once the commit lands.
+    schema_changed: bool,
     /// GC-watermark pin at `snapshot`, held for the transaction's life (and
     /// parked with its state between interactive statements) so compaction
     /// never collects the history this transaction reads. `None` in legacy
@@ -265,6 +272,10 @@ pub struct TransactionState {
     /// because an interactive transaction is one attempt across statements
     /// and a condition stated by the first still binds the last.
     claims: ClaimSet,
+    /// Parked with the claims it stamps: the generation belongs to the
+    /// attempt, and the attempt spans the statements.
+    schema_generation: u64,
+    schema_changed: bool,
     snapshot_pin: Option<SnapshotPin>,
 }
 
@@ -363,6 +374,8 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: HashMap::new(),
             counter_overflow: None,
             claims: ClaimSet::new(),
+            schema_generation: engine.schema_generation(),
+            schema_changed: false,
             snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
         }
     }
@@ -386,6 +399,8 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope,
             merge_adj_ops: self.merge_adj_ops,
             claims: self.claims,
+            schema_generation: self.schema_generation,
+            schema_changed: self.schema_changed,
             merge_node_deltas: self.merge_node_deltas,
             merge_counter_deltas: self.merge_counter_deltas,
             snapshot_pin: self.snapshot_pin,
@@ -408,6 +423,8 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope.take(),
             merge_adj_ops: std::mem::take(&mut self.merge_adj_ops),
             claims: std::mem::take(&mut self.claims),
+            schema_generation: self.schema_generation,
+            schema_changed: std::mem::take(&mut self.schema_changed),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
             snapshot_pin: self.snapshot_pin.take(),
@@ -435,6 +452,8 @@ impl<'a> Transaction<'a> {
             merge_adj_ops: state.merge_adj_ops,
             counter_overflow: None,
             claims: state.claims,
+            schema_generation: state.schema_generation,
+            schema_changed: state.schema_changed,
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
@@ -737,7 +756,21 @@ impl<'a> Transaction<'a> {
         use crate::engine::claims::evaluate::{Verdict, evaluate};
 
         for claim in self.claims.claims() {
-            match evaluate(self.engine, claim, &self.merge_adj_ops)? {
+            // The attempt's view as a sequence number, which is what "written
+            // since" is asked in. The pinned snapshot is that number by
+            // construction; `read_ts` only coincides with it where the oracle
+            // and the engine share one space, and reading it here would make
+            // the check silently pass wherever they do not. A transaction
+            // without a snapshot is the legacy direct path, which has no view
+            // to protect and applies as it goes.
+            let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
+            match evaluate(
+                self.engine,
+                claim,
+                &self.merge_adj_ops,
+                &self.write_buffer,
+                view,
+            )? {
                 Verdict::Holds => {}
                 Verdict::Broken => {
                     return Err(CommitError::InvariantRefused {
@@ -767,6 +800,23 @@ impl<'a> Transaction<'a> {
     /// which graph predicate a mutation was constructed against.
     pub fn claim(&mut self, claim: Claim) {
         self.claims.insert(claim);
+    }
+
+    /// The schema generation this attempt evaluates its predicates under.
+    ///
+    /// A writer stamps it on every claim it states, which is why it is read
+    /// once per attempt rather than once per claim: two claims of one attempt
+    /// that disagreed about the generation would describe two attempts.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+    }
+
+    /// Record that this attempt changes a schema definition.
+    ///
+    /// The generation moves when the change lands, not when it is staged, so
+    /// an attempt that is refused or rolled back invalidates nothing.
+    pub fn note_schema_change(&mut self) {
+        self.schema_changed = true;
     }
 
     /// The conditions stated so far.
@@ -941,19 +991,25 @@ impl<'a> Transaction<'a> {
         // halves, and neither is sufficient alone: the registry sees the
         // attempts in flight beside this one, the evaluation sees the state
         // they have all committed.
-        if !self.claims.is_empty() {
+        //
+        // The reservation is held for the rest of the commit, by a guard that
+        // releases it however the commit ends: the window it protects is the
+        // one between deciding a condition holds and applying the writes built
+        // on it, and once those are applied the state carries the fact itself.
+        let _reservation = if self.claims.is_empty() {
+            None
+        } else {
             let attempt = self.read_ts.as_raw();
-            if let Err(refusal) = self.engine.claim_registry().reserve(attempt, &self.claims) {
-                return Err(CommitError::InvariantRefused {
+            let engine: &'a StorageEngine = self.engine;
+            let held = engine
+                .claim_registry()
+                .reserve_held(attempt, &self.claims)
+                .map_err(|refusal| CommitError::InvariantRefused {
                     reason: format!("{refusal:?}"),
-                });
-            }
-            let verdicts = self.evaluate_claims();
-            if let Err(reason) = verdicts {
-                self.engine.claim_registry().release(attempt);
-                return Err(reason);
-            }
-        }
+                })?;
+            self.evaluate_claims()?;
+            Some(held)
+        };
 
         // Write-admission gate: under Stop pressure (storage over its
         // compaction-debt stop threshold) a commit carrying writes is
@@ -986,6 +1042,7 @@ impl<'a> Transaction<'a> {
                     .merge(Partition::Counter, &key, &encode_counter_delta(delta))?;
             }
             // Legacy mode — writes already applied.
+            self.publish_schema_change();
             return Ok(CommitOutcome {
                 commit_ts: None,
                 applied_index: None,
@@ -1150,6 +1207,7 @@ impl<'a> Transaction<'a> {
                 self.merge_counter_deltas.clear();
             }
 
+            self.publish_schema_change();
             return Ok(CommitOutcome {
                 commit_ts: Some(commit_ts),
                 applied_index: None,
@@ -1263,10 +1321,20 @@ impl<'a> Transaction<'a> {
                 .map_err(|e| CommitError::Serialization(format!("journal fsync failed: {e}")))?;
         }
 
+        self.publish_schema_change();
         Ok(CommitOutcome {
             commit_ts: Some(commit_ts),
             applied_index,
         })
+    }
+
+    /// Move the engine's schema generation if this attempt changed a
+    /// definition and its writes landed. Called on the paths that applied
+    /// them, never on one that returned early.
+    fn publish_schema_change(&mut self) {
+        if std::mem::take(&mut self.schema_changed) {
+            self.engine.note_schema_change();
+        }
     }
 
     /// MVCC-aware prefix scan: snapshot results overlaid with buffered writes

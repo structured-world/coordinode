@@ -971,6 +971,12 @@ impl Database {
             None
         };
 
+        // The engine resolves a node from its id alone when it decides an
+        // invariant claim, and node keys carry the shard ahead of the id. This
+        // is where the two halves meet: the handle knows the shard, the engine
+        // does the lookup.
+        engine.set_node_shard(1);
+
         Ok(Self {
             engine,
             interner: shared_interner,

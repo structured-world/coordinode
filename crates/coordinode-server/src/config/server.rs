@@ -116,6 +116,12 @@ pub struct ServerConfig {
     pub write_buffer_mb: Option<u64>,
     /// MVCC time-travel / `AS OF TIMESTAMP` horizon in seconds (`None` = 7 days).
     pub retention_window_secs: Option<u64>,
+    /// Ceiling on the invariant claims held by all in-flight write attempts on
+    /// this node, together (`None` = 100000).
+    pub max_invariant_claims: Option<usize>,
+    /// The shard whose node rows this engine holds (`None` = 0). The invariant
+    /// guard resolves a node from its id alone and needs it to build the key.
+    pub node_shard: Option<u16>,
     /// Consumer-registry heartbeat coalescing window in ms (`None` = 100).
     pub registry_heartbeat_ms: Option<u64>,
     /// Consumer-registry TTL-eviction sweep interval in ms (`None` = 1000).
@@ -223,6 +229,8 @@ impl Default for ServerConfig {
             cache_size_mb: None,
             write_buffer_mb: None,
             retention_window_secs: None,
+            max_invariant_claims: None,
+            node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
             cdc_consumer_ttl_secs: None,
@@ -425,6 +433,14 @@ impl ServerConfig {
         // its GC watermark back by it on every node, registry or not.
         if let Some(secs) = self.retention_window_secs {
             cfg.retention_window_secs = secs;
+        }
+        // The invariant guard lives in the engine, so both of its settings are
+        // engine settings: what it may hold, and where it looks for a node.
+        if let Some(limit) = self.max_invariant_claims {
+            cfg.max_invariant_claims = limit;
+        }
+        if let Some(shard) = self.node_shard {
+            cfg.node_shard = shard;
         }
         cfg
     }

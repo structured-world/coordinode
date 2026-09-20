@@ -102,6 +102,18 @@ pub struct StorageEngine {
     /// by every transaction, because a condition is only protected if the
     /// attempt that would break it is looking at the same table.
     claim_registry: crate::engine::claims::ClaimRegistry,
+    /// Counts the schema changes this process has applied. A claim carries the
+    /// value it read, so a predicate evaluated before a definition changed is
+    /// not taken as evidence about the graph after it.
+    ///
+    /// Process-local on purpose: it is only ever compared between attempts
+    /// running at the same time, and no attempt outlives the process. Giving
+    /// it durable identity would buy nothing and cost a write on every DDL.
+    schema_generation: AtomicU64,
+    /// The shard whose node rows this engine holds, for the one lookup inside
+    /// the engine that starts from a node id rather than a key. Settable at
+    /// runtime because the layer that knows it is built after the engine.
+    node_shard: std::sync::atomic::AtomicU16,
     flush_policy: FlushPolicy,
     /// Optional tiered block cache (DRAM → NVMe → SSD cascade).
     tiered_cache: Option<TieredCache>,
@@ -779,6 +791,8 @@ impl StorageEngine {
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
+            schema_generation: AtomicU64::new(0),
+            node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
             tiered_cache,
             access_tracker: AccessTracker::new(),
@@ -1885,6 +1899,45 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// The invariant-claim table shared by every attempt on this engine.
+    ///
+    /// Shared rather than per-transaction: a condition is only protected if
+    /// the attempt that would break it consults the same table.
+    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
+        &self.claim_registry
+    }
+
+    /// The schema generation as it stands now. An attempt reads this once and
+    /// stamps it on every claim it makes.
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a schema definition changed, so that predicates evaluated
+    /// before the change stop counting as evidence about the graph after it.
+    ///
+    /// Called when the change lands, not when it is staged: a definition that
+    /// never commits never invalidated anything.
+    pub fn note_schema_change(&self) {
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The shard whose node rows this engine holds.
+    pub fn node_shard(&self) -> u16 {
+        self.node_shard.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tell the engine which shard's node rows it holds.
+    ///
+    /// Called by the handle above once it is constructed; the configured value
+    /// stands until then.
+    pub fn set_node_shard(&self, shard: u16) {
+        self.node_shard
+            .store(shard, std::sync::atomic::Ordering::Release);
+    }
+
     /// Check if a key exists in the given partition.
     pub fn contains_key(&self, part: Partition, key: &[u8]) -> StorageResult<bool> {
         let tree = self.tree(part)?;
@@ -1892,8 +1945,6 @@ impl StorageEngine {
         Ok(value.is_some())
     }
 
-    /// Flush all pending writes to durable storage.
-    ///
     /// Force a major compaction on the named partition tree.
     ///
     /// Drives the lsm-tree compactor to push all SSTs down to the
@@ -1905,11 +1956,6 @@ impl StorageEngine {
     /// Blocks the caller until compaction finishes. Intended for
     /// operator-driven maintenance, capacity-pressure cascade eviction,
     /// and end-to-end tests; not used on the steady-state write path.
-    /// The invariant-claim table shared by every attempt on this engine.
-    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
-        &self.claim_registry
-    }
-
     pub fn major_compact(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
         // Target table size of 64 MiB is the lsm-tree default — picked

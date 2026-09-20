@@ -488,12 +488,16 @@ impl SchemaStore for LocalSchemaStore<'_> {
             &pointer_key,
             &schema.schema_revision.to_be_bytes(),
         )?;
+        // A definition changed, so predicates other attempts evaluated under
+        // the old one stop counting as evidence once this lands.
+        txn.note_schema_change();
         Ok(())
     }
 
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         let pointer_key = encode_label_current_revision_key(name);
         txn.delete(Partition::Schema, &pointer_key)?;
+        txn.note_schema_change();
         Ok(())
     }
 
@@ -514,9 +518,14 @@ impl SchemaStore for LocalSchemaStore<'_> {
             &pointer_key,
             &schema.schema_revision.to_be_bytes(),
         )?;
+        txn.note_schema_change();
         Ok(())
     }
 
+    /// Records that a type has been seen, which declares nothing about the
+    /// shapes it admits, so it deliberately does not move the schema
+    /// generation: invalidating other attempts' evidence for a marker that
+    /// constrains nothing would cost refusals and buy nothing.
     fn register_edge_type_marker(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         let key = encode_edge_type_schema_key(name, 1);
         let already = txn.buffered(Partition::Schema, &key).is_some()

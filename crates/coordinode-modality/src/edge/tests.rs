@@ -739,6 +739,113 @@ fn scan_discriminators_sorted_with_set_adjacency() {
     assert_eq!(store.scan_neighbors_out(&r, "KNOWS", a).unwrap(), vec![b]);
 }
 
+/// Attaching an edge to a node that is being deleted must not commit.
+///
+/// The two write disjoint keys: the deletion writes the node row, the
+/// attachment merges into an adjacency list. First-committer-wins sees no
+/// conflict between them, so without the claims both would land and the
+/// posting list would keep pointing at an identity that no longer exists.
+#[test]
+fn an_edge_cannot_attach_to_a_node_that_was_deleted_under_it() {
+    use crate::node::{LocalNodeStore, NodeStore};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_storage::engine::transaction::CommitError;
+
+    let db = open();
+    let alice = NodeId::from_raw(1);
+    let bob = NodeId::from_raw(2);
+    let shard = db.engine.node_shard();
+
+    // Both endpoints exist to begin with.
+    let mut setup = mvcc_txn(&db.engine, &db.oracle);
+    for id in [alice, bob] {
+        LocalNodeStore
+            .put(&mut setup, shard, id, &NodeRecord::new("Person"))
+            .expect("put node");
+    }
+    commit(&mut setup);
+
+    // The attachment opens its view here, while both endpoints are still
+    // there, which is what makes this a race rather than a sequence.
+    let mut attach = mvcc_txn(&db.engine, &db.oracle);
+
+    let mut remove = mvcc_txn(&db.engine, &db.oracle);
+    LocalNodeStore
+        .delete(&mut remove, shard, bob)
+        .expect("delete node");
+    commit(&mut remove);
+
+    LocalEdgeStore
+        .put_edge(&mut attach, "KNOWS", alice, bob, None)
+        .expect("stage the edge");
+
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    let err = attach
+        .commit(&ctx)
+        .expect_err("the endpoint was reclaimed under this attempt");
+    assert!(
+        matches!(err, CommitError::InvariantRefused { .. }),
+        "expected the invariant to refuse, got {err:?}"
+    );
+
+    // Nothing of the refused attempt reached the adjacency.
+    let r = db.read();
+    assert_eq!(
+        LocalEdgeStore
+            .scan_neighbors_out(&r, "KNOWS", alice)
+            .expect("scan"),
+        Vec::<NodeId>::new(),
+        "a refused attempt leaves no dangling neighbour"
+    );
+}
+
+/// The ordinary case is untouched: attaching to endpoints nobody is deleting
+/// commits, and two edges to one node do not queue behind each other.
+#[test]
+fn edges_to_one_live_node_commit_together() {
+    use crate::node::{LocalNodeStore, NodeStore};
+    use coordinode_core::graph::node::NodeRecord;
+
+    let db = open();
+    let hub = NodeId::from_raw(7);
+    let shard = db.engine.node_shard();
+
+    let mut setup = mvcc_txn(&db.engine, &db.oracle);
+    for id in [hub, NodeId::from_raw(8), NodeId::from_raw(9)] {
+        LocalNodeStore
+            .put(&mut setup, shard, id, &NodeRecord::new("Person"))
+            .expect("put node");
+    }
+    commit(&mut setup);
+
+    let mut first = mvcc_txn(&db.engine, &db.oracle);
+    let mut second = mvcc_txn(&db.engine, &db.oracle);
+    LocalEdgeStore
+        .put_edge(&mut first, "KNOWS", hub, NodeId::from_raw(8), None)
+        .expect("stage");
+    LocalEdgeStore
+        .put_edge(&mut second, "KNOWS", hub, NodeId::from_raw(9), None)
+        .expect("stage");
+    commit(&mut first);
+    commit(&mut second);
+
+    let r = db.read();
+    assert_eq!(
+        LocalEdgeStore
+            .scan_neighbors_out(&r, "KNOWS", hub)
+            .expect("scan"),
+        vec![NodeId::from_raw(8), NodeId::from_raw(9)],
+        "references to one node are compatible and both land"
+    );
+}
+
 #[test]
 fn put_edge_discriminated_rejects_unsupported_discriminator() {
     let db = open();

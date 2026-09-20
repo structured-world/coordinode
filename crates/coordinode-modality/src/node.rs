@@ -32,6 +32,7 @@ use coordinode_core::graph::node::{
     NodeId, NodeRecord, decode_temporal_node_key, encode_node_key, encode_temporal_node_key,
     temporal_node_id_prefix,
 };
+use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -484,6 +485,18 @@ impl NodeStore for LocalNodeStore {
     }
 
     fn delete(&self, txn: &mut Transaction, shard_id: u16, node_id: NodeId) -> StoreResult<()> {
+        // Destroying the identity invalidates every reference right held on
+        // it, so the deletion says so: an attempt attaching an edge to this
+        // node has stated that the node stays, and the two cannot both be
+        // right. Without this the write sets are disjoint (one deletes a node
+        // row, the other merges into an adjacency list) and validation admits
+        // both, leaving an edge pointing at a node that no longer exists.
+        let generation = txn.schema_generation();
+        txn.claim(Claim::new(
+            ClaimScope::Node(node_id),
+            ClaimPredicate::EndpointDestroyed,
+            generation,
+        ));
         let key = encode_node_key(shard_id, node_id);
         txn.delete(Partition::Node, &key)?;
         Ok(())

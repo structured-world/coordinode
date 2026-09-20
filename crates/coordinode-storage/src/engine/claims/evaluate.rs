@@ -34,6 +34,16 @@ use crate::error::StorageResult;
 /// the attempt ran.
 pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
 
+/// The attempt's staged point writes, as the commit will apply them: `Some`
+/// for a value written, `None` for a row deleted.
+///
+/// The evaluation needs them for the same reason it needs the adjacency
+/// operands. A node and the edge attached to it, created by one statement,
+/// are one valid post-state; reading only committed state would find the node
+/// absent and call the edge dangling, refusing the most ordinary write there
+/// is.
+pub type StagedPoints<'a> = &'a std::collections::HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>;
+
 /// Whether a claim still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -53,6 +63,8 @@ pub fn evaluate(
     engine: &StorageEngine,
     claim: &Claim,
     staged: StagedAdj<'_>,
+    staged_points: StagedPoints<'_>,
+    read_ts: u64,
 ) -> StorageResult<Verdict> {
     match (&claim.scope, &claim.predicate) {
         (
@@ -114,22 +126,83 @@ pub fn evaluate(
         }
 
         (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
-            let key = coordinode_core::graph::node::encode_node_key(0, *node);
-            Ok(if engine.get(Partition::Node, &key)?.is_some() {
-                Verdict::Holds
-            } else {
-                Verdict::Broken
-            })
+            endpoint_alive(engine, *node, staged_points, read_ts)
         }
 
-        // A destroyed endpoint, a completed scan, a cleanup condition and
-        // schema applicability are decided against evidence this evaluator is
-        // not given: the attempt's own destruction intent, the enumeration it
-        // performed, the version it observed and the schema catalog. Each is
-        // decided where that evidence lives, and answering here would mean
-        // inventing it.
+        // The destruction is the attempt's own intent, not a condition on the
+        // state it reads: there is nothing to re-check, and what the claim
+        // buys is stated entirely in the registry, where it excludes every
+        // reference right held on the same node. Answering `Undecidable` here
+        // would refuse every deletion.
+        (ClaimScope::Node(_), ClaimPredicate::EndpointDestroyed) => Ok(Verdict::Holds),
+
+        // A completed scan, a cleanup condition and schema applicability are
+        // decided against evidence this evaluator is not given: the
+        // enumeration the attempt performed, the version it observed and the
+        // schema catalog. Each is decided where that evidence lives, and
+        // answering here would mean inventing it.
         _ => Ok(Verdict::Undecidable),
     }
+}
+
+/// Whether the identity an attempt is attaching to survived until its commit.
+///
+/// The claim is about destruction, not about existence. An attempt that
+/// references a node needs that node not to be reclaimed under it; whether the
+/// node was ever materialised is a different question, answered where the
+/// statement resolves its endpoints, and answering it here would turn every
+/// writer of an edge into an enforcer of referential integrity and refuse the
+/// bulk paths (restore, import) that write adjacency before node rows.
+///
+/// So the row's absence alone decides nothing. What decides is absence
+/// together with a write to that row after the attempt's snapshot: the node
+/// was there when the attempt built its result and is gone now, which is
+/// exactly the destruction the claim guards against.
+fn endpoint_alive(
+    engine: &StorageEngine,
+    node: NodeId,
+    staged_points: StagedPoints<'_>,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    let shard = engine.node_shard();
+    let key = coordinode_core::graph::node::encode_node_key(shard, node);
+
+    // The attempt's own writes decide first. A node it is creating is alive
+    // for its own edge, and one it is deleting in the same breath it attaches
+    // to is a result it cannot have both halves of.
+    if let Some(staged) = staged_points.get(&(Partition::Node, key.clone())) {
+        return Ok(if staged.is_some() {
+            Verdict::Holds
+        } else {
+            Verdict::Broken
+        });
+    }
+
+    if engine.get(Partition::Node, &key)?.is_some() {
+        return Ok(Verdict::Holds);
+    }
+
+    // A label in temporal mode stores its nodes only as versions under the
+    // per-version key, so the plain row is absent for a node that very much
+    // exists. The scans run only when the plain row is missing, so an
+    // ordinary node costs one point read.
+    let prefix = coordinode_core::graph::node::temporal_node_id_prefix(shard, node);
+    if staged_points.iter().any(|((part, k), value)| {
+        *part == Partition::Node && k.starts_with(&prefix) && value.is_some()
+    }) {
+        return Ok(Verdict::Holds);
+    }
+    for guard in engine.prefix_scan(Partition::Node, &prefix)? {
+        if guard.into_inner().is_ok() {
+            return Ok(Verdict::Holds);
+        }
+    }
+
+    Ok(if engine.has_write_after(Partition::Node, &key, read_ts)? {
+        Verdict::Broken
+    } else {
+        Verdict::Holds
+    })
 }
 
 /// The neighbour set of one incident scope, with the attempt's staged writes
