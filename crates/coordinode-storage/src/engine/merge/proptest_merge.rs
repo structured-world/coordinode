@@ -20,6 +20,52 @@ fn merge_ops_strategy() -> impl Strategy<Value = Vec<MergeOp>> {
     )
 }
 
+/// Deltas over a small key space, so paths collide and the order-dependent
+/// operations actually meet each other.
+fn doc_deltas_strategy() -> impl Strategy<Value = Vec<DocDelta>> {
+    let key = prop_oneof![Just("a".to_string()), Just("b".to_string())];
+    let value = prop_oneof![
+        (0..4i64).prop_map(|n| rmpv::Value::Integer(n.into())),
+        Just(rmpv::Value::Boolean(true)),
+    ];
+    let path = key.prop_map(|k| vec![k]);
+
+    prop::collection::vec(
+        prop_oneof![
+            (path.clone(), value.clone()).prop_map(|(path, value)| DocDelta::SetPath {
+                target: PathTarget::Extra,
+                path,
+                value,
+            }),
+            path.clone().prop_map(|path| DocDelta::DeletePath {
+                target: PathTarget::Extra,
+                path,
+            }),
+            (path.clone(), value.clone()).prop_map(|(path, value)| DocDelta::ArrayPush {
+                target: PathTarget::Extra,
+                path,
+                value,
+            }),
+            (path.clone(), value.clone()).prop_map(|(path, value)| DocDelta::ArrayPull {
+                target: PathTarget::Extra,
+                path,
+                value,
+            }),
+            (path.clone(), value).prop_map(|(path, value)| DocDelta::ArrayAddToSet {
+                target: PathTarget::Extra,
+                path,
+                value,
+            }),
+            (path, 0..4i64).prop_map(|(path, amount)| DocDelta::Increment {
+                target: PathTarget::Extra,
+                path,
+                amount: amount as f64,
+            }),
+        ],
+        1..24,
+    )
+}
+
 /// Apply operations to a reference HashSet to compute expected result.
 fn expected_uids(ops: &[MergeOp]) -> Vec<u64> {
     let mut set = std::collections::BTreeSet::new();
@@ -106,6 +152,55 @@ proptest! {
         let incremental = base.unwrap_or_default();
         prop_assert_eq!(&*full, incremental.as_slice(),
             "full merge and incremental merge must produce identical output");
+    }
+
+    /// A document fold means the same whatever the compaction split it into.
+    ///
+    /// The engine may call the operator with any prefix of a chain already
+    /// folded into the base, because that is what a compaction leaves behind.
+    /// Posting lists are checked for this above; documents carry the harder
+    /// cases, an array whose order is observable, a pull that removes the
+    /// first match only, a set-add that must not, and a numeric increment
+    /// that goes through an encode and a decode of the record at every split.
+    ///
+    /// The comparison is of the decoded records, not of their bytes. The
+    /// engine asks for the stronger property, that repeated merging produce
+    /// identical bytes, and the record cannot give it today: `props` and
+    /// `extra` are hash maps, so a record with more than one property
+    /// serialises its keys in whatever order the table yields, and two
+    /// replicas that compacted differently hold different bytes for the same
+    /// document. That is its own defect, with its own consequences for
+    /// anything that compares records across nodes by their bytes, and it is
+    /// reported rather than asserted here; when the encoding is made
+    /// canonical, this assertion becomes the byte comparison it should be.
+    #[test]
+    fn fuzz_document_partial_fold_matches_full(deltas in doc_deltas_strategy()) {
+        let merger = DocumentMerge;
+
+        let operands: Vec<Vec<u8>> = deltas
+            .iter()
+            .map(|d| d.encode().expect("encode delta"))
+            .collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_slice()).collect();
+
+        let full = merger
+            .merge(b"node:00:00000001", None, &operand_refs)
+            .expect("full fold");
+
+        let mut base: Option<Vec<u8>> = None;
+        for operand in &operands {
+            let folded = merger
+                .merge(b"node:00:00000001", base.as_deref(), &[operand.as_slice()])
+                .expect("one-at-a-time fold");
+            base = Some(folded.to_vec());
+        }
+        let incremental = base.expect("at least one delta");
+
+        let full_record = decode_node_record(&full).expect("decode the full fold");
+        let incremental_record =
+            decode_node_record(&incremental).expect("decode the incremental fold");
+        prop_assert_eq!(full_record, incremental_record,
+            "a compaction that folded a prefix of the chain must leave the same document");
     }
 
     #[test]

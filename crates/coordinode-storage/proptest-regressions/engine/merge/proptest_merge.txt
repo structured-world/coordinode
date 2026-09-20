@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 67668fcf53928c3bb13669c0ea5c4452617f1c5f7895149660971294051a6f0e # shrinks to deltas = [DeletePath { target: Extra, path: ["a"] }, ArrayAddToSet { target: Extra, path: ["a"], value: Boolean(true) }, ArrayAddToSet { target: Extra, path: ["a"], value: Integer(PosInt(3)) }, ArrayPush { target: Extra, path: ["a"], value: Boolean(true) }, ArrayPull { target: Extra, path: ["b"], value: Boolean(true) }, DeletePath { target: Extra, path: ["b"] }, ArrayPull { target: Extra, path: ["b"], value: Integer(PosInt(1)) }, SetPath { target: Extra, path: ["b"], value: Integer(PosInt(3)) }]
