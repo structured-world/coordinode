@@ -419,3 +419,112 @@ async fn a_node_holding_data_is_refused_when_it_joins() {
         "TIMED OUT: a node holding data is refused when it joins"
     );
 }
+
+/// A directory written by the non-replicated embedded build opens under the
+/// replicated one, as the member a group is formed around.
+///
+/// That build has no consensus at all: its writes go straight to the engine
+/// and its own journal, so nothing in the directory ever passed through a
+/// log. Opening it as the first member of a group therefore starts from a
+/// state machine that is already populated and a log that is empty, and the
+/// question is whether what it holds reaches a member added afterwards. It
+/// does, because a member catches up from a snapshot of the state machine
+/// rather than by replaying history it never had. The same directory as a
+/// joiner is refused, which is the other half of the rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir1 = tempfile::tempdir().expect("tempdir");
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let config = |path: &Path| {
+            StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                path,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )])
+        };
+
+        // What the non-replicated embedded build leaves behind: data applied
+        // to the engine directly, with no Raft anywhere in the directory.
+        let base = {
+            let oracle = Arc::new(TimestampOracle::new());
+            let engine = StorageEngine::open_embedded(&config(dir1.path()), Arc::clone(&oracle))
+                .expect("open embedded");
+            let base = oracle.next().as_raw() + 1_000;
+            for i in 1..=3u64 {
+                engine
+                    .apply_proposal_at(
+                        &[Mutation::Put {
+                            partition: PartitionId::Node,
+                            key: format!("node:1:embedded-{i}").into_bytes(),
+                            value: format!("embedded-{i}").into_bytes(),
+                        }],
+                        base + i,
+                    )
+                    .expect("apply");
+            }
+            engine.persist().expect("persist");
+            base
+        };
+        let _ = base;
+
+        // The same directory, now the first member of a group.
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let e1 = Arc::new(
+            StorageEngine::open_with_oracle(&config(dir1.path()), Arc::new(TimestampOracle::new()))
+                .expect("reopen the embedded directory under the replicated build"),
+        );
+        assert!(
+            e1.holds_user_data().expect("read"),
+            "the embedded run must have left data behind"
+        );
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+        )
+        .await
+        .expect("open the embedded directory as the first member");
+        await_leadership(&n1).await;
+
+        let e2 = Arc::new(
+            StorageEngine::open_with_oracle(&config(dir2.path()), Arc::new(TimestampOracle::new()))
+                .expect("open the empty member"),
+        );
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("addr"),
+        )
+        .await
+        .expect("an empty member joins");
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.change_membership(vec![1, 2]).await.expect("membership");
+
+        for i in 1..=3u64 {
+            let key = format!("node:1:embedded-{i}");
+            let value = format!("embedded-{i}");
+            assert!(
+                await_value(&e2, key.as_bytes(), value.as_bytes()).await,
+                "{key} never reached the member added after the group was formed: data written \
+                 before there was any log has to travel in the snapshot"
+            );
+        }
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: an embedded directory opens as the first member of a group"
+    );
+}

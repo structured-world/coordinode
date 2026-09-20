@@ -167,6 +167,7 @@ impl RaftNode {
         match raft.initialize(members).await {
             Ok(_) => {
                 tracing::info!(node_id, "fresh raft node initialized");
+                publish_existing_state_as_group_base(&raft, &engine).await?;
             }
             Err(openraft::error::RaftError::APIError(
                 openraft::error::InitializeError::NotAllowed(_),
@@ -296,6 +297,7 @@ impl RaftNode {
         match raft.initialize(members).await {
             Ok(_) => {
                 tracing::info!(node_id, "fresh cluster node initialized as leader");
+                publish_existing_state_as_group_base(&raft, &engine).await?;
             }
             Err(openraft::error::RaftError::APIError(
                 openraft::error::InitializeError::NotAllowed(_),
@@ -446,6 +448,7 @@ impl RaftNode {
         match raft.initialize(members).await {
             Ok(_) => {
                 tracing::info!(node_id, "fresh cluster node initialized as leader");
+                publish_existing_state_as_group_base(&raft, &engine).await?;
             }
             Err(openraft::error::RaftError::APIError(
                 openraft::error::InitializeError::NotAllowed(_),
@@ -1940,6 +1943,89 @@ fn refuse_join_with_local_data(engine: &StorageEngine) -> Result<(), RaftNodeErr
     if holds {
         return Err(RaftNodeError::JoinWithLocalData);
     }
+    Ok(())
+}
+
+/// Publish what this store already holds as the base state of the group it
+/// has just formed, so a member added later receives it.
+///
+/// A group formed around a store that already holds data starts with a
+/// populated state machine and a log that never carried any of it: the data
+/// was written before there was a group, by a standalone node or by the
+/// non-replicated embedded build. A member added afterwards is caught up
+/// from the log by default, and a log that never held the data cannot
+/// deliver it, so the new member would come up empty while the leader shows
+/// the data, and a later leadership move would make it disappear.
+///
+/// Taking a snapshot and purging the log up to it leaves the leader with
+/// nothing a new member could be caught up from except the snapshot, which
+/// is built from the state machine and therefore carries everything. This
+/// runs only when the group is formed (the open that initialized it) and
+/// only when there is data to publish, so the ordinary empty start does
+/// nothing at all.
+async fn publish_existing_state_as_group_base(
+    raft: &RaftInstance,
+    engine: &StorageEngine,
+) -> Result<(), RaftNodeError> {
+    use openraft::rt::watch::WatchReceiver;
+
+    if !engine
+        .holds_user_data()
+        .map_err(|e| RaftNodeError::Init(e.to_string()))?
+    {
+        return Ok(());
+    }
+
+    // The snapshot is taken at the applied index, so wait for the membership
+    // entry this open just proposed to apply; snapshotting before it would
+    // publish a base the group cannot place in its own history.
+    let metrics = raft.metrics();
+    let mut applied = None;
+    for _ in 0..100 {
+        applied = metrics.borrow_watched().last_applied;
+        if applied.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let Some(applied) = applied else {
+        return Err(RaftNodeError::Init(
+            "a group formed around existing data never applied its own membership entry, so \
+             that data could not be published as the group's base state"
+                .to_string(),
+        ));
+    };
+
+    raft.trigger()
+        .snapshot()
+        .await
+        .map_err(|e| RaftNodeError::Init(format!("snapshot of the existing state: {e}")))?;
+
+    let mut snapshot = None;
+    for _ in 0..200 {
+        snapshot = metrics.borrow_watched().snapshot;
+        if snapshot.is_some_and(|s| s.index >= applied.index) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let Some(snapshot) = snapshot.filter(|s| s.index >= applied.index) else {
+        return Err(RaftNodeError::Init(
+            "the snapshot carrying this store's existing data never completed, so the data \
+             could not be published as the group's base state"
+                .to_string(),
+        ));
+    };
+
+    raft.trigger()
+        .purge_log(snapshot.index)
+        .await
+        .map_err(|e| RaftNodeError::Init(format!("purge of the pre-group log: {e}")))?;
+
+    tracing::info!(
+        snapshot_index = snapshot.index,
+        "published the store's existing data as the group's base state"
+    );
     Ok(())
 }
 
