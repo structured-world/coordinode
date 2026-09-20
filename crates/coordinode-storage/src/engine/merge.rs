@@ -480,23 +480,37 @@ pub fn encode_counter_delta(delta: i64) -> Vec<u8> {
 }
 
 /// Decode a counter value from raw bytes (i64 little-endian).
-pub fn decode_counter(data: &[u8]) -> i64 {
-    if data.len() >= 8 {
-        i64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]))
-    } else {
-        0
-    }
+///
+/// Exactly eight bytes or nothing: data of any other length is corrupt, and a
+/// corrupt counter is reported rather than read as zero. Reading it as zero
+/// would turn a damaged byte range into a silent reset of whatever it counted,
+/// which no reader could tell from a counter that really was zero.
+pub fn decode_counter(data: &[u8]) -> Result<i64, LsmError> {
+    let bytes: [u8; 8] = data.try_into().map_err(|_| LsmError::MergeOperator)?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 /// Merge operator for atomic i64 counters on the `counter:` partition.
 ///
-/// Base value: i64 LE (8 bytes). Zero if absent.
-/// Operands: i64 LE deltas (8 bytes each).
-/// Result: base + sum(operands), encoded as i64 LE.
+/// Base value: i64 LE (8 bytes), absent meaning zero, since absent is proven
+/// absence here (the engine resolves the base before asking, and a compaction
+/// that can prove neither a base nor its absence keeps the operands instead).
+/// Operands: i64 LE deltas (8 bytes each). Result: base + sum(operands).
 ///
-/// Conflict-free: addition is commutative and associative, so concurrent
-/// increments from multiple writers produce the correct total regardless
-/// of operand order or partial compaction.
+/// Order-independent: addition over the chosen domain is commutative and
+/// associative, so concurrent increments produce the same total whatever order
+/// the operands reach this function in, and whatever prefix of them a previous
+/// compaction already folded into the base.
+///
+/// **The domain is i64 with its own boundaries, not a wider one folded into
+/// it.** A sum that leaves the range is refused, because the alternatives are
+/// worse in the same way as each other: wrapping turns a counter at its
+/// maximum into a large negative number, and clamping reports a maximum that
+/// no longer counts anything, and neither is distinguishable by a reader from
+/// a true value. A refusal is, and it names the key. Refusing here is the last
+/// line rather than the first: a total that cannot exist should be refused
+/// when the write is admitted, which is the write path's to do and needs the
+/// accumulated value, not this function, which sees one fold at a time.
 pub struct CounterMerge;
 
 impl MergeOperator for CounterMerge {
@@ -507,12 +521,13 @@ impl MergeOperator for CounterMerge {
         operands: &[&[u8]],
     ) -> Result<UserValue, LsmError> {
         let mut total = match base_value {
-            Some(data) => decode_counter(data),
+            Some(data) => decode_counter(data)?,
             None => 0,
         };
 
         for operand in operands {
-            total = total.wrapping_add(decode_counter(operand));
+            let delta = decode_counter(operand)?;
+            total = total.checked_add(delta).ok_or(LsmError::MergeOperator)?;
         }
 
         Ok(total.to_le_bytes().to_vec().into())
