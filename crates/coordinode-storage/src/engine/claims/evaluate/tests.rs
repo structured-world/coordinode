@@ -552,6 +552,79 @@ fn the_two_measures_count_different_things_on_one_adjacency() {
     );
 }
 
+/// An instance bound is decided against the post-state the attempt would
+/// leave, so the entries it stages count and the ones it tombstones do not.
+/// Counting only what is committed would admit the instance that breaks the
+/// bound and refuse the deletion that repairs it.
+#[test]
+fn an_instance_bound_counts_the_attempts_own_entries() {
+    let (engine, _d) = engine();
+    let adj = encode_adj_key_forward("KNOWS", node(1));
+    engine
+        .merge(Partition::Adj, &adj, &encode_add(2))
+        .expect("merge");
+
+    let entry = |disc: &[u8]| {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"edgeprop:KNOWS:");
+        key.extend_from_slice(&node(1).as_raw().to_be_bytes());
+        key.push(b':');
+        key.extend_from_slice(&node(2).as_raw().to_be_bytes());
+        key.push(b':');
+        key.extend_from_slice(disc);
+        key
+    };
+
+    let committed = entry(b"work");
+    engine
+        .put(Partition::EdgeProp, &committed, b"props")
+        .expect("put");
+
+    let at_most_one = Claim::new(
+        ClaimScope::Incident {
+            node: node(1),
+            edge_type: "KNOWS".to_string(),
+            direction: Direction::Outgoing,
+        },
+        ClaimPredicate::CardinalityBound {
+            measure: CardinalityMeasure::EdgeInstances,
+            at_most: Some(1),
+            at_least: None,
+        },
+        GEN,
+    );
+    assert_eq!(decide(&engine, &at_most_one, &[]), Verdict::Holds);
+
+    // The attempt stages a second identity: the bound it claims is broken by
+    // its own post-state, not by anything committed.
+    let mut adding = HashMap::new();
+    adding.insert(
+        (Partition::EdgeProp, entry(b"college")),
+        Some(b"props".to_vec()),
+    );
+    assert_eq!(
+        evaluate(&engine, &at_most_one, &[], &adding, engine.snapshot()).expect("evaluate"),
+        Verdict::Broken,
+        "the instance this attempt adds is part of what the bound counts"
+    );
+
+    // And the reverse: with two committed identities, the attempt that
+    // removes one leaves a post-state the bound admits.
+    let second = entry(b"college");
+    engine
+        .put(Partition::EdgeProp, &second, b"props")
+        .expect("put");
+    assert_eq!(decide(&engine, &at_most_one, &[]), Verdict::Broken);
+
+    let mut removing = HashMap::new();
+    removing.insert((Partition::EdgeProp, second), None);
+    assert_eq!(
+        evaluate(&engine, &at_most_one, &[], &removing, engine.snapshot()).expect("evaluate"),
+        Verdict::Holds,
+        "the entry this attempt tombstones is not one the bound still counts"
+    );
+}
+
 /// A staged removal that does not name this scope's key leaves it alone.
 #[test]
 fn staged_writes_for_another_scope_are_ignored() {

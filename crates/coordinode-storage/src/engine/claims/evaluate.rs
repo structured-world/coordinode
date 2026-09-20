@@ -84,7 +84,7 @@ pub fn evaluate(
                     distinct_neighbours(engine, *node, edge_type, *direction, staged)?
                 }
                 CardinalityMeasure::EdgeInstances => {
-                    match edge_instances(engine, *node, edge_type, *direction)? {
+                    match edge_instances(engine, *node, edge_type, *direction, staged_points)? {
                         Some(n) => n,
                         // Instances are counted from the edge-property
                         // entries of each pair, which an incoming scope
@@ -296,11 +296,17 @@ fn distinct_neighbours(
 ///
 /// Returns `None` for an incoming scope, whose pairs are keyed by their
 /// source and so are not reachable from the target's side by prefix.
+///
+/// The attempt's own entries count, and its own deletions do not: a bound is
+/// decided against the post-state the attempt would leave, and counting only
+/// what is committed would admit the instance that breaks it and refuse the
+/// deletion that repairs it.
 fn edge_instances(
     engine: &StorageEngine,
     node: NodeId,
     edge_type: &str,
     direction: Direction,
+    staged_points: StagedPoints<'_>,
 ) -> StorageResult<Option<usize>> {
     if direction == Direction::Incoming {
         return Ok(None);
@@ -312,12 +318,29 @@ fn edge_instances(
     prefix.push(b':');
     prefix.extend_from_slice(&node.as_raw().to_be_bytes());
 
-    let mut count = 0;
+    let mut count: usize = 0;
     for guard in engine.prefix_scan(Partition::EdgeProp, &prefix)? {
-        if guard.into_inner().is_ok() {
+        let Ok(key) = guard.key() else {
+            continue;
+        };
+        // A row this attempt tombstones is already gone as far as the bound
+        // is concerned; one it rewrites is still the same identity.
+        match staged_points.get(&(Partition::EdgeProp, key.to_vec())) {
+            Some(None) => {}
+            _ => count += 1,
+        }
+    }
+
+    // Entries the attempt adds that the committed scan could not see.
+    for ((part, key), value) in staged_points {
+        if *part != Partition::EdgeProp || value.is_none() || !key.starts_with(&prefix) {
+            continue;
+        }
+        if engine.get(Partition::EdgeProp, key)?.is_none() {
             count += 1;
         }
     }
+
     Ok(Some(count))
 }
 

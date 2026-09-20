@@ -112,6 +112,14 @@ Two concurrent write transactions conflict if they modify the **same node or edg
 
 Posting-list operations (adding/removing edges on a node) use **merge operators** — they are commutative and never conflict with each other, only with DELETE on the same node.
 
+### Invariant refusals
+
+Writing the same key is not the only way two transactions can be incompatible. Two of them can write entirely different keys and still, together, break a condition each of them checked on its own: an edge attached to a node the other is deleting, or a MERGE that created a relationship because it saw none while the other erased the last one. First-writer-wins cannot see either case, because there is no shared key to see it on.
+
+So every mutation states the conditions its result depends on, and the server checks and reserves them before anything is applied. When one of those conditions no longer holds, the commit is refused with gRPC `ABORTED` and `reason = INVARIANT_REFUSED`, distinct from `TRANSACTION_CONFLICT` so that the cause is not misreported as a contended key. Nothing of the refused transaction is applied. The advised retry delay is zero, as for a conflict: re-running the transaction re-reads the state the condition is evaluated against, and waiting changes nothing. In the embedded API this is `DatabaseError::InvariantRefused`.
+
+Conditions that agree do not exclude each other. Any number of transactions may attach edges to one node at the same time: they all state that the node keeps its identity, which is compatible with itself, so a popular node does not serialise the writes that reference it. Only a mutation that destroys the identity excludes them.
+
 ## Durability
 
 A write concern is two independent parameters, as in MongoDB. `w` says how many members of the replica group must hold the write before the caller is answered; `journal` says what state each of those members holds it in.
