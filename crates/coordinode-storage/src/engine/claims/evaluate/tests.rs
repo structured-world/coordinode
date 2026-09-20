@@ -429,11 +429,17 @@ fn a_destruction_claim_is_admitted_by_the_evaluator() {
     );
 }
 
-/// What this evaluator is not given evidence for, it refuses to decide, and
-/// the caller must not read that as a pass.
+/// An enumeration is invalidated by a member that joined the set after the
+/// scan passed: the very member the scan could not have found, and the one
+/// first-committer-wins cannot see either, because the two writes name
+/// different keys.
 #[test]
-fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
+fn a_completed_scan_is_broken_by_a_member_that_joined_after_it() {
     let (engine, _d) = engine();
+    let key = encode_adj_key_forward("OWNS", node(1));
+    engine
+        .merge(Partition::Adj, &key, &encode_add(2))
+        .expect("merge");
 
     let scan = Claim::new(
         ClaimScope::Incident {
@@ -446,25 +452,92 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
     );
     assert_eq!(
         decide(&engine, &scan, &[]),
-        Verdict::Undecidable,
-        "the enumeration the attempt performed is not visible here"
+        Verdict::Holds,
+        "nothing joined or left since the scan"
     );
 
+    let view = engine.snapshot();
+    engine
+        .merge(Partition::Adj, &key, &encode_add(3))
+        .expect("merge");
+    let no_points = HashMap::new();
+    assert_eq!(
+        evaluate(&engine, &scan, &[], &no_points, view).expect("evaluate"),
+        Verdict::Broken,
+        "a member the scan never saw is exactly what completeness excludes"
+    );
+}
+
+/// A cleanup condition was evaluated against one version of the record, so a
+/// renewal that rewrites it invalidates the condition whatever it wrote.
+#[test]
+fn a_cleanup_condition_is_broken_by_a_renewal_of_the_record() {
+    let (engine, _d) = engine();
+    let key = coordinode_core::graph::node::encode_node_key(engine.node_shard(), node(42));
+    engine.put(Partition::Node, &key, b"v1").expect("put");
+    let observed = engine.snapshot();
+
     let cleanup = Claim::new(
-        ClaimScope::Record(b"node:00:0000002a".to_vec()),
+        ClaimScope::Record(key.clone()),
         ClaimPredicate::CleanupCondition {
-            observed_version: 4,
+            observed_version: observed,
         },
         GEN,
     );
-    assert_eq!(decide(&engine, &cleanup, &[]), Verdict::Undecidable);
+    assert_eq!(
+        decide(&engine, &cleanup, &[]),
+        Verdict::Holds,
+        "the record still stands as the condition read it"
+    );
 
-    let schema = Claim::new(
+    engine.put(Partition::Node, &key, b"v2").expect("touch");
+    assert_eq!(
+        decide(&engine, &cleanup, &[]),
+        Verdict::Broken,
+        "an ID-only later deletion would have missed this"
+    );
+}
+
+/// A predicate evaluated under one schema generation is no evidence about the
+/// graph under another: activating a constraint between the evaluation and
+/// the commit changes what the same shape means.
+#[test]
+fn schema_applicability_is_broken_by_a_definition_change() {
+    let (engine, _d) = engine();
+    let claim = Claim::new(
         ClaimScope::SchemaElement("OWNS".to_string()),
         ClaimPredicate::SchemaApplicability,
+        engine.schema_generation(),
+    );
+    assert_eq!(decide(&engine, &claim, &[]), Verdict::Holds);
+
+    engine.note_schema_change();
+    assert_eq!(
+        decide(&engine, &claim, &[]),
+        Verdict::Broken,
+        "a background scan alone would not close this activation race"
+    );
+}
+
+/// What this evaluator is not given evidence for, it refuses to decide, and
+/// the caller must not read that as a pass.
+#[test]
+fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
+    let (engine, _d) = engine();
+
+    // A predicate over a scope it was never defined for: an endpoint
+    // predicate carries nothing about a storage row, and the pairing has no
+    // meaning to decide either way.
+    let mismatched = Claim::new(
+        ClaimScope::Record(b"node:00:0000002a".to_vec()),
+        ClaimPredicate::EndpointAlive,
         GEN,
     );
-    assert_eq!(decide(&engine, &schema, &[]), Verdict::Undecidable);
+    assert_eq!(
+        decide(&engine, &mismatched, &[]),
+        Verdict::Undecidable,
+        "an overlap with no evidence behind it is not a pass"
+    );
 
     // An incoming instance count is not reachable from the target's side,
     // and saying so is not the same as saying the bound holds.

@@ -169,6 +169,118 @@ fn an_attempt_with_no_claims_commits_as_before() {
     );
 }
 
+/// Folding the mutations does not fold what they protect.
+///
+/// The commit coalesces a run of adjacency adds on one key into a single
+/// batch operand, which is the point of the merge path. The conditions those
+/// adds stated are held apart from the operands and survive that reduction:
+/// the attempt still carries one claim per endpoint it referenced, and the
+/// commit still decides each of them.
+#[test]
+fn composing_the_deltas_preserves_the_claims_they_carried() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    let hub = b"adj:OWNS:out:\x00\x00\x00\x00\x00\x00\x00\x01";
+    for peer in 2..8_u64 {
+        txn.merge_adj_add(hub, peer);
+        txn.claim(Claim::new(
+            ClaimScope::Node(NodeId::from_raw(peer)),
+            ClaimPredicate::EndpointAlive,
+            txn.schema_generation(),
+        ));
+    }
+
+    assert_eq!(
+        txn.claims().len(),
+        6,
+        "one claim per endpoint referenced, whatever the operands fold into"
+    );
+
+    txn.commit(&ctx).expect("commit");
+
+    // The six adds became one batch operand; the six conditions did not
+    // become one condition, and each was decided.
+    let stored = engine
+        .get(Partition::Adj, hub)
+        .expect("get")
+        .expect("posting");
+    let plist = PostingList::from_bytes(&stored).expect("decode");
+    assert_eq!(plist.as_slice(), &[2, 3, 4, 5, 6, 7]);
+}
+
+/// A refusal is clean, which is what makes the retry it advises safe: nothing
+/// of the attempt is applied and the guard budget it held is returned. A
+/// refusal that left either behind would turn a retry into a second attempt
+/// racing the remains of the first.
+#[test]
+fn a_refused_attempt_leaves_neither_writes_nor_reservations() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{Adjacency, Claim, ClaimPredicate, ClaimScope};
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"node:refused", b"v").unwrap();
+    txn.merge_adj_add(b"adj:TAGGED:out:\x00\x00\x00\x00\x00\x00\x00\x01", 2);
+    txn.claim(Claim::new(
+        ClaimScope::Pair {
+            source: NodeId::from_raw(1),
+            target: NodeId::from_raw(2),
+            edge_type: "TAGGED".to_string(),
+        },
+        // An observation that was already untrue when it was made: the
+        // shortest way to a refusal that is nobody else's fault.
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Present,
+        },
+        txn.schema_generation(),
+    ));
+
+    let err = txn.commit(&ctx).expect_err("the observation does not hold");
+    assert!(matches!(err, CommitError::InvariantRefused { .. }));
+
+    assert_eq!(
+        engine.get(Partition::Node, b"node:refused").unwrap(),
+        None,
+        "a refused attempt applied none of its writes"
+    );
+    assert_eq!(
+        engine
+            .get(
+                Partition::Adj,
+                b"adj:TAGGED:out:\x00\x00\x00\x00\x00\x00\x00\x01"
+            )
+            .unwrap(),
+        None,
+        "nor any of its operands"
+    );
+    assert_eq!(
+        engine.claim_registry().reserved_claims(),
+        0,
+        "and holds nothing that would refuse its own retry"
+    );
+}
+
 /// A counter whose staged deltas leave i64 is refused at commit, not written
 /// and met again in a compaction.
 ///

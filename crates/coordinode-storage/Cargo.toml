@@ -97,6 +97,10 @@ name = "write_batch_parallel"
 harness = false
 
 [[bench]]
+name = "invariant_guard"
+harness = false
+
+[[bench]]
 name = "coordinator_dispatch"
 harness = false
 

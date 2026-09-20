@@ -2450,6 +2450,31 @@ impl StorageEngine {
         Ok(results)
     }
 
+    /// Whether `key` was written by anything this snapshot does not already
+    /// include.
+    ///
+    /// The bound is inclusive, unlike [`Self::has_write_after`], because a
+    /// snapshot names the first seqno it does *not* see: a write landing
+    /// immediately after the snapshot was taken carries exactly that number,
+    /// and a strict comparison would call the one write the view certainly
+    /// missed invisible. Callers that hold an oracle timestamp rather than a
+    /// snapshot want the strict form; callers holding a snapshot want this.
+    pub fn written_since_snapshot(
+        &self,
+        part: Partition,
+        key: &[u8],
+        snapshot: lsm_tree::SeqNo,
+    ) -> StorageResult<bool> {
+        let tree = self.tree(part)?;
+        match tree.get_internal_entry(key, lsm_tree::SeqNo::MAX)? {
+            Some(e) if e.key.seqno >= snapshot => Ok(true),
+            Some(_) => Ok(false),
+            // Nothing live now: it was taken away since the view if the view
+            // could still see it.
+            None => Ok(self.snapshot_get(&snapshot, part, key)?.is_some()),
+        }
+    }
+
     /// Check if a key has been written after the given sequence number.
     ///
     /// Returns `true` if the latest version of `key` in `part` has a seqno

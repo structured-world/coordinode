@@ -1796,6 +1796,31 @@ impl<'a> ExecutionContext<'a> {
         ));
     }
 
+    /// State that this statement enumerated the whole incident set of the
+    /// scope and its result depends on nothing having joined or left it.
+    ///
+    /// A detach, a node merge or a redirect is only correct if it saw every
+    /// member. The rows it read prove nothing about the one that arrives
+    /// while it is reading: that member and this statement write different
+    /// keys, so first-committer-wins never compares them.
+    pub fn claim_incident_set_complete(&mut self, edge_type: &str, node: NodeId, outgoing: bool) {
+        use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, Direction};
+        let generation = self.txn.schema_generation();
+        self.txn.claim(Claim::new(
+            ClaimScope::Incident {
+                node,
+                edge_type: edge_type.to_string(),
+                direction: if outgoing {
+                    Direction::Outgoing
+                } else {
+                    Direction::Incoming
+                },
+            },
+            ClaimPredicate::IncidentSetComplete,
+            generation,
+        ));
+    }
+
     /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
     pub fn adj_merge_add_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
         use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
@@ -12383,6 +12408,15 @@ fn detach_delete_node(
             AdjDirection::In => ctx.adj_get_rev(edge_type, node_id)?,
         };
         if let Some(plist) = plist {
+            // The detach is built on this posting list being the whole set:
+            // every peer it names is unhooked and the node's own list is
+            // purged. An edge attached while this ran would survive both
+            // steps and point at a node that is gone.
+            ctx.claim_incident_set_complete(
+                edge_type,
+                node_id,
+                matches!(direction, AdjDirection::Out),
+            );
             let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
             for peer_uid in plist.iter() {
                 let peer_id = NodeId::from_raw(peer_uid);

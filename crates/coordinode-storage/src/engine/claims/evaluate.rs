@@ -123,13 +123,88 @@ pub fn evaluate(
         // would refuse every deletion.
         (ClaimScope::Node(_), ClaimPredicate::EndpointDestroyed) => Ok(Verdict::Holds),
 
-        // A completed scan, a cleanup condition and schema applicability are
-        // decided against evidence this evaluator is not given: the
-        // enumeration the attempt performed, the version it observed and the
-        // schema catalog. Each is decided where that evidence lives, and
-        // answering here would mean inventing it.
+        // An enumeration is proved by what it enumerated over: the attempt
+        // read the whole incident set at its view, and the claim is that
+        // nothing joined or left it since. A member added after the scan is
+        // exactly the one the scan could not have found.
+        (
+            ClaimScope::Incident {
+                node,
+                edge_type,
+                direction,
+            },
+            ClaimPredicate::IncidentSetComplete,
+        ) => incident_set_unchanged(engine, *node, edge_type, *direction, read_ts),
+
+        // The condition was evaluated against one version of the record, so
+        // any later write to it is a renewal that invalidates the condition,
+        // whatever it wrote.
+        (ClaimScope::Record(key), ClaimPredicate::CleanupCondition { observed_version }) => Ok(
+            if engine.written_since_snapshot(Partition::Node, key, *observed_version)? {
+                Verdict::Broken
+            } else {
+                Verdict::Holds
+            },
+        ),
+
+        // A predicate evaluated under one schema generation says nothing
+        // about the graph under another, and the generation the attempt
+        // stamped on the claim is what it read when it evaluated.
+        (ClaimScope::SchemaElement(_), ClaimPredicate::SchemaApplicability) => {
+            Ok(if claim.schema_revision == engine.schema_generation() {
+                Verdict::Holds
+            } else {
+                Verdict::Broken
+            })
+        }
+
+        // An overlap this evaluator has no evidence for stays undecided, and
+        // a caller treats that as a refusal rather than a pass.
         _ => Ok(Verdict::Undecidable),
     }
+}
+
+/// Whether the incident set is still the one the attempt enumerated.
+///
+/// A scan that decides what to delete, redirect or move is only as good as
+/// its completeness, and completeness is not preserved by reading rows: a
+/// member that arrives after the scan passed is invisible to it and to
+/// first-committer-wins alike, because the two write different keys.
+///
+/// Any change to the set breaks it, in either direction. A member that left
+/// matters as much as one that joined: an enumeration that carries a row
+/// which no longer exists is describing a different operation than the one
+/// being committed.
+fn incident_set_unchanged(
+    engine: &StorageEngine,
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    let key = match direction {
+        Direction::Outgoing => encode_adj_key_forward(edge_type, node),
+        Direction::Incoming => encode_adj_key_reverse(edge_type, node),
+    };
+    let members = |bytes: Option<Vec<u8>>| -> Vec<u64> {
+        bytes
+            .and_then(|b| PostingList::from_bytes(&b).ok())
+            .map(|p| p.as_slice().to_vec())
+            .unwrap_or_default()
+    };
+
+    let at_view = members(
+        engine
+            .snapshot_get(&read_ts, Partition::Adj, &key)?
+            .map(|b| b.to_vec()),
+    );
+    let now = members(engine.get(Partition::Adj, &key)?.map(|b| b.to_vec()));
+
+    Ok(if at_view == now {
+        Verdict::Holds
+    } else {
+        Verdict::Broken
+    })
 }
 
 /// Whether the observation an attempt built its result on still stands.
@@ -235,11 +310,13 @@ fn endpoint_alive(
         }
     }
 
-    Ok(if engine.has_write_after(Partition::Node, &key, read_ts)? {
-        Verdict::Broken
-    } else {
-        Verdict::Holds
-    })
+    Ok(
+        if engine.written_since_snapshot(Partition::Node, &key, read_ts)? {
+            Verdict::Broken
+        } else {
+            Verdict::Holds
+        },
+    )
 }
 
 /// The neighbour set of one incident scope, with the attempt's staged writes
