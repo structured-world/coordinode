@@ -15912,6 +15912,11 @@ fn commit_err_to_execution(
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
         CommitError::Backpressure => ExecutionError::Backpressure,
         CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
+        // A caller error, not a transient one: retrying the same statement
+        // stages the same deltas and is refused again.
+        CommitError::CounterOverflow { key } => ExecutionError::Serialization(format!(
+            "counter '{key}' would leave the i64 range; nothing was written"
+        )),
     }
 }
 

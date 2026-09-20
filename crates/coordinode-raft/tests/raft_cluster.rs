@@ -396,6 +396,106 @@ async fn cluster_committed_index_advances_and_replicates() {
     assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
 }
 
+/// An order-sensitive merge chain means the same thing on every member.
+///
+/// Merge operands are not values: a follower does not receive the result, it
+/// receives the operands and folds them itself. So the order they are applied
+/// in is what the log carries, and a member that applied them in a different
+/// order would hold a different posting list while reporting the same
+/// committed index. The chain here adds a member, removes it and adds it
+/// again in one proposal, so only the order distinguishes the right answer
+/// from the wrong one, and a sum that commutes cannot hide a mistake.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_merge_chain_folds_identically_on_every_member() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+
+        let pipeline = n1.node.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(3u64 << 48);
+        let key = b"adj:FOLLOWS:out:9".to_vec();
+
+        let operand = |tag: u8, uid: u64| {
+            let mut v = vec![tag];
+            v.extend_from_slice(&uid.to_be_bytes());
+            v
+        };
+        const ADD: u8 = 0x01;
+        const REMOVE: u8 = 0x02;
+
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: key.clone(),
+                    operand: operand(ADD, 5),
+                },
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: key.clone(),
+                    operand: operand(ADD, 6),
+                },
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: key.clone(),
+                    operand: operand(REMOVE, 5),
+                },
+                Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: key.clone(),
+                    operand: operand(ADD, 5),
+                },
+            ],
+            commit_ts: Timestamp::from_raw(500),
+            start_ts: Timestamp::from_raw(499),
+            bypass_rate_limiter: false,
+        };
+
+        pipeline
+            .propose_and_wait(&proposal)
+            .expect("propose the chain on the leader");
+
+        // 6 was added once; 5 was added, removed and added again, so it is
+        // present only if the operands were folded in the order the log has.
+        let expected: Vec<u64> = vec![5, 6];
+        for (label, node) in [("n1", &n1), ("n2", &n2), ("n3", &n3)] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let got = node
+                    .engine
+                    .get(Partition::Adj, &key)
+                    .expect("read the posting list")
+                    .map(|bytes| {
+                        coordinode_core::graph::edge::PostingList::from_bytes(&bytes)
+                            .expect("decode")
+                            .as_slice()
+                            .to_vec()
+                    });
+                if got.as_deref() == Some(expected.as_slice()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label}: merge chain folded to {got:?}, expected {expected:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
+}
+
 /// Multiple proposals replicate correctly across cluster.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_multiple_proposals_replicate() {

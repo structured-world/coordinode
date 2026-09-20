@@ -16,8 +16,13 @@ period = "30s"
 # oversubscription. Pattern: each test claims 3 threads (one per node);
 # group caps at 6 → at most 2 raft tests concurrent on a ≥8-core host.
 # Verified stable across 3 consecutive runs (25/25 each, ~104s).
+#
+# The integration crate's cluster binary joins the same group: it spawns
+# multi-node clusters with the same election timing, so leaving it outside
+# let it oversubscribe the CPU alongside the tests that are inside, and the
+# failures landed on whichever test was waiting on an election at the time.
 [[profile.default.overrides]]
-filter = "binary(raft_cluster)"
+filter = "binary(raft_cluster) + binary(cluster)"
 threads-required = 3
 test-group = "raft-cluster"
 
@@ -48,7 +53,7 @@ period = "60s"
 path = "junit.xml"
 
 [[profile.ci.overrides]]
-filter = "binary(raft_cluster)"
+filter = "binary(raft_cluster) + binary(cluster)"
 threads-required = 3
 test-group = "raft-cluster"
 

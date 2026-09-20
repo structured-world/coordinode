@@ -23,6 +23,53 @@ fn mvcc_txn<'a>(engine: &'a StorageEngine, oracle: &'a TimestampOracle) -> Trans
     Transaction::new(engine, Some(oracle), Timestamp::from_raw(snap), Some(snap))
 }
 
+/// A counter whose staged deltas leave i64 is refused at commit, not written
+/// and met again in a compaction.
+///
+/// A counter operand carries no base, so nothing between here and the fold
+/// can tell that the sum cannot exist. If the operand were written, the
+/// caller would be told the write succeeded and the failure would surface in
+/// a compaction, which has nobody to answer and would stop making progress on
+/// that partition. The decision belongs where the deltas are assembled.
+#[test]
+fn a_counter_that_would_leave_the_range_is_refused_before_it_is_written() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"node:ovf", b"v").unwrap();
+    txn.push_counter_delta(b"counter:hot", i64::MAX);
+    txn.push_counter_delta(b"counter:hot", 1);
+
+    let err = txn
+        .commit(&ctx)
+        .expect_err("a sum outside i64 cannot commit");
+    assert!(
+        matches!(err, CommitError::CounterOverflow { .. }),
+        "expected CounterOverflow, got {err:?}"
+    );
+
+    // Nothing from the transaction reached the engine: the refusal is before
+    // the durable promise, so the ordinary write in it is gone too.
+    assert_eq!(
+        engine.get(Partition::Node, b"node:ovf").unwrap(),
+        None,
+        "a refused commit must leave no write behind"
+    );
+    assert_eq!(
+        engine.get(Partition::Counter, b"counter:hot").unwrap(),
+        None,
+        "and no counter operand"
+    );
+}
+
 /// Adjacency operands staged in one transaction apply in the order they were
 /// staged, not in an order the commit path chose.
 ///

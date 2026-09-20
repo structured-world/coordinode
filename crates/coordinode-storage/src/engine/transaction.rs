@@ -113,6 +113,16 @@ pub enum CommitError {
         /// The node the cluster last named leader, if any.
         leader_id: Option<u64>,
     },
+    /// The deltas staged for one counter sum to a value outside `i64`.
+    /// Nothing was applied. A counter operand carries no base, so a sum that
+    /// cannot exist is only discoverable where it is assembled; refusing it
+    /// here keeps it out of a compaction, which has no caller to answer and
+    /// would stop making progress on that partition instead.
+    #[error("counter '{key}' would leave the i64 range; nothing was written")]
+    CounterOverflow {
+        /// The counter key whose staged deltas overflowed.
+        key: String,
+    },
 }
 
 /// Map a storage [`Partition`] to its wire [`PartitionId`] for Raft proposals.
@@ -206,6 +216,9 @@ pub struct Transaction<'a> {
     /// Drained at commit as `CounterMerge` operands; a sum that folded to
     /// zero is skipped at drain (nothing to apply).
     merge_counter_deltas: HashMap<Vec<u8>, i64>,
+    /// The first counter key whose staged deltas left `i64`, if any. Held so
+    /// that commit refuses instead of writing an operand no fold can apply.
+    counter_overflow: Option<Vec<u8>>,
     /// GC-watermark pin at `snapshot`, held for the transaction's life (and
     /// parked with its state between interactive statements) so compaction
     /// never collects the history this transaction reads. `None` in legacy
@@ -326,6 +339,7 @@ impl<'a> Transaction<'a> {
             merge_adj_ops: Vec::new(),
             merge_node_deltas: Vec::new(),
             merge_counter_deltas: HashMap::new(),
+            counter_overflow: None,
             snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
         }
     }
@@ -394,6 +408,7 @@ impl<'a> Transaction<'a> {
             write_buffer: state.write_buffer,
             occ_scope: state.occ_scope,
             merge_adj_ops: state.merge_adj_ops,
+            counter_overflow: None,
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
@@ -715,12 +730,24 @@ impl<'a> Transaction<'a> {
     /// operand; not OCC-tracked. Deltas to the same key COALESCE (summed),
     /// so bulk statements stage one entry per distinct counter, and a key
     /// already present is found by slice lookup without allocating.
+    /// A sum that leaves `i64` is recorded here and refused at commit rather
+    /// than staged: an operand that cannot be folded would otherwise be
+    /// acknowledged and then fail in a compaction, where the caller is long
+    /// gone and the partition stops making progress. The decision belongs
+    /// before the durable promise, and this is where it can still be made.
     pub fn push_counter_delta(&mut self, counter_key: &[u8], delta: i64) {
         if delta == 0 {
             return;
         }
         if let Some(sum) = self.merge_counter_deltas.get_mut(counter_key) {
-            *sum += delta;
+            match sum.checked_add(delta) {
+                Some(next) => *sum = next,
+                None => {
+                    if self.counter_overflow.is_none() {
+                        self.counter_overflow = Some(counter_key.to_vec());
+                    }
+                }
+            }
         } else {
             self.merge_counter_deltas
                 .insert(counter_key.to_vec(), delta);
@@ -827,6 +854,15 @@ impl<'a> Transaction<'a> {
     /// Returns the commit timestamp used (or `None` for a read-only / legacy
     /// transaction) plus the committed Raft index on the pipeline path.
     pub fn commit(&mut self, ctx: &CommitContext<'_>) -> Result<CommitOutcome, CommitError> {
+        // An operand whose fold cannot succeed is refused here, where the
+        // caller is still listening, rather than acknowledged and then met
+        // again in a compaction that has nowhere to report it.
+        if let Some(key) = &self.counter_overflow {
+            return Err(CommitError::CounterOverflow {
+                key: String::from_utf8_lossy(key).into_owned(),
+            });
+        }
+
         // Write-admission gate: under Stop pressure (storage over its
         // compaction-debt stop threshold) a commit carrying writes is
         // rejected BEFORE anything is applied, as a retryable error. One

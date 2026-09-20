@@ -1712,6 +1712,10 @@ impl Database {
             CommitError::Backpressure => DatabaseError::WriteBackpressure,
             // Retryable at a different address: the leader.
             CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
+            // Not retryable: the same statement stages the same deltas.
+            CommitError::CounterOverflow { key } => DatabaseError::Other(format!(
+                "counter '{key}' would leave the i64 range; nothing was written"
+            )),
         })?;
         // An interactive transaction is always opened against the oracle
         // (`begin_transaction`), so the storage commit is never on the legacy
