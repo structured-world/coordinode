@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use coordinode_core::graph::edge::PostingList;
 use coordinode_core::txn::drain::{DrainBuffer, DrainEntry};
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
@@ -180,13 +181,18 @@ pub struct Transaction<'a> {
     /// concurrent writers. `None` until the first tracked read (and always in
     /// legacy mode).
     occ_scope: Option<OccScope>,
-    /// Buffered adjacency-posting merge adds: `adj key -> uids`. Adjacency
-    /// writes are commutative merge operands (not point writes), so they live
-    /// in a separate buffer from `write_buffer` and bypass OCC conflict
+    /// Buffered adjacency-posting merge operands, in the order they were
+    /// staged. Adjacency writes are merge operands (not point writes), so they
+    /// live in a separate buffer from `write_buffer` and bypass OCC conflict
     /// detection. Drained at commit.
-    merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
-    /// Buffered adjacency-posting merge removes: `adj key -> uids`.
-    merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
+    ///
+    /// The order is the buffer's whole job. An add and a remove of one member
+    /// do not commute, and both carry the same commit timestamp once the
+    /// transaction commits, so nothing downstream can recover an order this
+    /// buffer did not keep: whatever order reaches the merge operator is the
+    /// only order that key will ever have. A transaction that removes an edge
+    /// and writes it again means it to be there at the end.
+    merge_adj_ops: Vec<(Vec<u8>, AdjOp)>,
     /// Buffered node merge operands: `(node key, operand bytes)`. Read-modify
     /// -write document deltas (SET nested path) materialise these against the
     /// node record before a read; drained at commit.
@@ -221,11 +227,54 @@ pub struct TransactionState {
     adj_snapshot: Option<StorageSnapshot>,
     write_buffer: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
     occ_scope: Option<OccScope>,
-    merge_adj_adds: HashMap<Vec<u8>, Vec<u64>>,
-    merge_adj_removes: HashMap<Vec<u8>, Vec<u64>>,
+    merge_adj_ops: Vec<(Vec<u8>, AdjOp)>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
     merge_counter_deltas: HashMap<Vec<u8>, i64>,
     snapshot_pin: Option<SnapshotPin>,
+}
+
+/// One staged adjacency operand. Kept as a sequence rather than as two sets
+/// because an add and a remove of the same member do not commute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdjOp {
+    /// Add a member to the posting list.
+    Add(u64),
+    /// Remove a member from the posting list.
+    Remove(u64),
+}
+
+/// Turn the staged operands into encoded merge operands, in order.
+///
+/// A run of consecutive adds on one key becomes one batch operand, which is
+/// what the bulk paths stage and what keeps a large insert to one operand
+/// rather than thousands. A remove ends the run it is part of, because putting
+/// it anywhere else would change what the chain means.
+fn encode_staged_adj(ops: &[(Vec<u8>, AdjOp)]) -> Vec<(&[u8], Vec<u8>)> {
+    let mut out: Vec<(&[u8], Vec<u8>)> = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let key = ops[i].0.as_slice();
+        match ops[i].1 {
+            AdjOp::Add(uid) => {
+                let mut uids = vec![uid];
+                let mut j = i + 1;
+                while let Some((next_key, AdjOp::Add(next))) = ops.get(j).map(|(k, o)| (k, *o)) {
+                    if next_key.as_slice() != key {
+                        break;
+                    }
+                    uids.push(next);
+                    j += 1;
+                }
+                out.push((key, encode_add_batch(&uids)));
+                i = j;
+            }
+            AdjOp::Remove(uid) => {
+                out.push((key, encode_remove(uid)));
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 impl TransactionState {
@@ -247,22 +296,13 @@ impl TransactionState {
             .iter()
             .map(|((_, k), v)| k.len() + v.as_ref().map_or(0, Vec::len))
             .sum();
-        let adj_adds: usize = self
-            .merge_adj_adds
-            .iter()
-            .map(|(k, uids)| k.len() + uids.len() * 8)
-            .sum();
-        let adj_removes: usize = self
-            .merge_adj_removes
-            .iter()
-            .map(|(k, uids)| k.len() + uids.len() * 8)
-            .sum();
+        let adj_ops: usize = self.merge_adj_ops.iter().map(|(k, _)| k.len() + 8).sum();
         let node_deltas: usize = self
             .merge_node_deltas
             .iter()
             .map(|(k, op)| k.len() + op.len())
             .sum();
-        writes + adj_adds + adj_removes + node_deltas
+        writes + adj_ops + node_deltas
     }
 }
 
@@ -283,8 +323,7 @@ impl<'a> Transaction<'a> {
             adj_snapshot: None,
             write_buffer: HashMap::new(),
             occ_scope: None,
-            merge_adj_adds: HashMap::new(),
-            merge_adj_removes: HashMap::new(),
+            merge_adj_ops: Vec::new(),
             merge_node_deltas: Vec::new(),
             merge_counter_deltas: HashMap::new(),
             snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
@@ -308,8 +347,7 @@ impl<'a> Transaction<'a> {
             adj_snapshot: self.adj_snapshot,
             write_buffer: self.write_buffer,
             occ_scope: self.occ_scope,
-            merge_adj_adds: self.merge_adj_adds,
-            merge_adj_removes: self.merge_adj_removes,
+            merge_adj_ops: self.merge_adj_ops,
             merge_node_deltas: self.merge_node_deltas,
             merge_counter_deltas: self.merge_counter_deltas,
             snapshot_pin: self.snapshot_pin,
@@ -330,8 +368,7 @@ impl<'a> Transaction<'a> {
             adj_snapshot: self.adj_snapshot,
             write_buffer: std::mem::take(&mut self.write_buffer),
             occ_scope: self.occ_scope.take(),
-            merge_adj_adds: std::mem::take(&mut self.merge_adj_adds),
-            merge_adj_removes: std::mem::take(&mut self.merge_adj_removes),
+            merge_adj_ops: std::mem::take(&mut self.merge_adj_ops),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
             snapshot_pin: self.snapshot_pin.take(),
@@ -356,8 +393,7 @@ impl<'a> Transaction<'a> {
             adj_snapshot: state.adj_snapshot,
             write_buffer: state.write_buffer,
             occ_scope: state.occ_scope,
-            merge_adj_adds: state.merge_adj_adds,
-            merge_adj_removes: state.merge_adj_removes,
+            merge_adj_ops: state.merge_adj_ops,
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
@@ -637,20 +673,36 @@ impl<'a> Transaction<'a> {
         self.oracle = oracle;
     }
 
-    /// Buffer an adjacency add (commutative merge operand). Not OCC-tracked.
+    /// Buffer an adjacency add, after everything staged before it. Not
+    /// OCC-tracked.
     pub fn merge_adj_add(&mut self, adj_key: &[u8], uid: u64) {
-        self.merge_adj_adds
-            .entry(adj_key.to_vec())
-            .or_default()
-            .push(uid);
+        self.merge_adj_ops.push((adj_key.to_vec(), AdjOp::Add(uid)));
     }
 
-    /// Buffer an adjacency remove (commutative merge operand). Not OCC-tracked.
+    /// Buffer an adjacency remove, after everything staged before it. Not
+    /// OCC-tracked.
     pub fn merge_adj_remove(&mut self, adj_key: &[u8], uid: u64) {
-        self.merge_adj_removes
-            .entry(adj_key.to_vec())
-            .or_default()
-            .push(uid);
+        self.merge_adj_ops
+            .push((adj_key.to_vec(), AdjOp::Remove(uid)));
+    }
+
+    /// Replay this transaction's own staged adjacency operands onto `plist`,
+    /// in the order they were staged, so a read sees its own writes the way
+    /// the commit will apply them.
+    pub fn apply_staged_adj(&self, adj_key: &[u8], plist: &mut PostingList) {
+        for (key, op) in &self.merge_adj_ops {
+            if key.as_slice() != adj_key {
+                continue;
+            }
+            match op {
+                AdjOp::Add(uid) => {
+                    plist.insert(*uid);
+                }
+                AdjOp::Remove(uid) => {
+                    plist.remove(*uid);
+                }
+            }
+        }
     }
 
     /// Buffer a node merge operand (pre-encoded document delta) at `node_key`.
@@ -678,21 +730,14 @@ impl<'a> Transaction<'a> {
     /// Whether any merge operand (adjacency, node delta, or counter delta) is
     /// buffered. Used by the commit path's read-only fast exit.
     pub fn has_pending_merges(&self) -> bool {
-        !self.merge_adj_adds.is_empty()
-            || !self.merge_adj_removes.is_empty()
+        !self.merge_adj_ops.is_empty()
             || !self.merge_node_deltas.is_empty()
             || !self.merge_counter_deltas.is_empty()
     }
 
-    /// Borrow buffered adjacency adds (read-your-own-writes overlay on the
-    /// posting-list read path; commit-path local-apply iteration).
-    pub fn merge_adj_adds(&self) -> &HashMap<Vec<u8>, Vec<u64>> {
-        &self.merge_adj_adds
-    }
-
-    /// Borrow buffered adjacency removes (see [`Self::merge_adj_adds`]).
-    pub fn merge_adj_removes(&self) -> &HashMap<Vec<u8>, Vec<u64>> {
-        &self.merge_adj_removes
+    /// Borrow the buffered adjacency operands in the order they were staged.
+    pub fn merge_adj_ops(&self) -> &[(Vec<u8>, AdjOp)] {
+        &self.merge_adj_ops
     }
 
     /// Borrow buffered node merge operands (materialisation read + has-pending
@@ -707,14 +752,10 @@ impl<'a> Transaction<'a> {
         &mut self.merge_node_deltas
     }
 
-    /// Take the buffered adjacency adds, leaving the buffer empty.
-    pub fn take_merge_adj_adds(&mut self) -> HashMap<Vec<u8>, Vec<u64>> {
-        std::mem::take(&mut self.merge_adj_adds)
-    }
-
-    /// Take the buffered adjacency removes, leaving the buffer empty.
-    pub fn take_merge_adj_removes(&mut self) -> HashMap<Vec<u8>, Vec<u64>> {
-        std::mem::take(&mut self.merge_adj_removes)
+    /// Take the buffered adjacency operands, leaving the buffer empty and the
+    /// order intact.
+    pub fn take_merge_adj_ops(&mut self) -> Vec<(Vec<u8>, AdjOp)> {
+        std::mem::take(&mut self.merge_adj_ops)
     }
 
     /// Take the buffered node merge operands, leaving the buffer empty.
@@ -725,8 +766,7 @@ impl<'a> Transaction<'a> {
     /// Clear all buffered merge operands (commit path's volatile no-drain
     /// branch: local writes already applied, nothing to replicate).
     pub fn clear_merges(&mut self) {
-        self.merge_adj_adds.clear();
-        self.merge_adj_removes.clear();
+        self.merge_adj_ops.clear();
         self.merge_node_deltas.clear();
         self.merge_counter_deltas.clear();
     }
@@ -735,8 +775,8 @@ impl<'a> Transaction<'a> {
     /// node-delete cascade tombstones the posting list — pending merge
     /// operands must not resurrect it.
     pub fn drop_adj_merges(&mut self, adj_key: &[u8]) {
-        self.merge_adj_adds.remove(adj_key);
-        self.merge_adj_removes.remove(adj_key);
+        self.merge_adj_ops
+            .retain(|(key, _)| key.as_slice() != adj_key);
     }
 
     /// Base adjacency point read: reads `Partition::Adj` at the adjacency
@@ -806,15 +846,9 @@ impl<'a> Transaction<'a> {
         // Flush adj merge buffers even in legacy (no MVCC) mode.
         // Legacy puts write directly to engine, but merge adds are buffered.
         if self.oracle.is_none() {
-            for (key, uids) in self.merge_adj_adds.drain() {
-                self.engine
-                    .merge(Partition::Adj, &key, &encode_add_batch(&uids))?;
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, &key, &encode_remove(uid))?;
-                }
+            let staged = std::mem::take(&mut self.merge_adj_ops);
+            for (key, operand) in encode_staged_adj(&staged) {
+                self.engine.merge(Partition::Adj, key, &operand)?;
             }
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 self.engine.merge(Partition::Node, &key, &operand)?;
@@ -914,15 +948,8 @@ impl<'a> Transaction<'a> {
                     None => self.engine.delete(*part, key)?,
                 }
             }
-            for (key, uids) in &self.merge_adj_adds {
-                self.engine
-                    .merge(Partition::Adj, key, &encode_add_batch(uids))?;
-            }
-            for (key, uids) in &self.merge_adj_removes {
-                for uid in uids {
-                    self.engine
-                        .merge(Partition::Adj, key, &encode_remove(*uid))?;
-                }
+            for (key, operand) in encode_staged_adj(&self.merge_adj_ops) {
+                self.engine.merge(Partition::Adj, key, &operand)?;
             }
             for (key, operand) in &self.merge_node_deltas {
                 self.engine.merge(Partition::Node, key, operand)?;
@@ -949,21 +976,13 @@ impl<'a> Transaction<'a> {
                     })
                     .collect();
 
-                for (key, uids) in self.merge_adj_adds.drain() {
+                let staged = std::mem::take(&mut self.merge_adj_ops);
+                for (key, operand) in encode_staged_adj(&staged) {
                     mutations.push(Mutation::Merge {
                         partition: PartitionId::Adj,
-                        key,
-                        operand: encode_add_batch(&uids),
+                        key: key.to_vec(),
+                        operand,
                     });
-                }
-                for (key, uids) in self.merge_adj_removes.drain() {
-                    for uid in uids {
-                        mutations.push(Mutation::Merge {
-                            partition: PartitionId::Adj,
-                            key: key.clone(),
-                            operand: encode_remove(uid),
-                        });
-                    }
                 }
                 for (key, operand) in self.merge_node_deltas.drain(..) {
                     mutations.push(Mutation::Merge {
@@ -998,8 +1017,7 @@ impl<'a> Transaction<'a> {
             } else {
                 // No drain buffer — clear write buffers (local writes already applied).
                 wb.clear();
-                self.merge_adj_adds.clear();
-                self.merge_adj_removes.clear();
+                self.merge_adj_ops.clear();
                 self.merge_node_deltas.clear();
                 self.merge_counter_deltas.clear();
             }
@@ -1038,22 +1056,14 @@ impl<'a> Transaction<'a> {
                 })
                 .collect();
 
-            // Adj merge operands: bypass MVCC, raw keys.
-            for (key, uids) in self.merge_adj_adds.drain() {
+            // Adj merge operands: bypass MVCC, raw keys, staged order kept.
+            let staged = std::mem::take(&mut self.merge_adj_ops);
+            for (key, operand) in encode_staged_adj(&staged) {
                 mutations.push(Mutation::Merge {
                     partition: PartitionId::Adj,
-                    key,
-                    operand: encode_add_batch(&uids),
+                    key: key.to_vec(),
+                    operand,
                 });
-            }
-            for (key, uids) in self.merge_adj_removes.drain() {
-                for uid in uids {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Adj,
-                        key: key.clone(),
-                        operand: encode_remove(uid),
-                    });
-                }
             }
             for (key, operand) in self.merge_node_deltas.drain(..) {
                 mutations.push(Mutation::Merge {

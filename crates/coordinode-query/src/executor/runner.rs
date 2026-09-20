@@ -1715,18 +1715,11 @@ impl<'a> ExecutionContext<'a> {
             }
         };
 
-        // Apply pending adds from this transaction (read-your-own-writes).
-        if let Some(adds) = self.txn.merge_adj_adds().get(adj_key) {
-            for &uid in adds {
-                plist.insert(uid);
-            }
-        }
-        // Apply pending removes from this transaction.
-        if let Some(removes) = self.txn.merge_adj_removes().get(adj_key) {
-            for &uid in removes {
-                plist.remove(uid);
-            }
-        }
+        // This transaction's own staged operands, replayed in the order they
+        // were staged (read-your-own-writes). An add and a remove of one
+        // member do not commute, so the order is what makes this the state the
+        // commit will produce rather than a different one.
+        self.txn.apply_staged_adj(adj_key, &mut plist);
 
         if plist.is_empty() {
             Ok(None)

@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_core::graph::edge::PostingList;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -20,6 +21,58 @@ fn test_engine() -> (Arc<StorageEngine>, Arc<TimestampOracle>, TempDir) {
 fn mvcc_txn<'a>(engine: &'a StorageEngine, oracle: &'a TimestampOracle) -> Transaction<'a> {
     let snap = engine.snapshot();
     Transaction::new(engine, Some(oracle), Timestamp::from_raw(snap), Some(snap))
+}
+
+/// Adjacency operands staged in one transaction apply in the order they were
+/// staged, not in an order the commit path chose.
+///
+/// Both operands of a remove-then-add pair carry the same commit timestamp, so
+/// nothing downstream can reorder them back: whatever order the commit emits is
+/// the order the merge operator sees and the only order the key will ever have.
+/// A transaction that detaches an edge and reattaches it, which a MERGE or a
+/// delete-then-create in one statement does, means the edge to be present at
+/// the end.
+#[test]
+fn adjacency_operands_keep_the_order_they_were_staged_in() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    // Add, then remove: the member is gone at the end.
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.merge_adj_add(b"adj:T:out:gone", 7);
+    txn.merge_adj_remove(b"adj:T:out:gone", 7);
+    txn.commit(&ctx).expect("commit");
+
+    let gone = engine.get(Partition::Adj, b"adj:T:out:gone").unwrap();
+    let gone = gone.map(|v| PostingList::from_bytes(&v).unwrap());
+    assert_eq!(
+        gone.as_ref().map(|p| p.as_slice()).unwrap_or(&[]),
+        &[] as &[u64],
+        "add then remove leaves nothing"
+    );
+
+    // Remove, then add: the member is present at the end. The removal is of
+    // something that was not there, which is exactly the shape a reattach
+    // takes when the edge is written again in the same transaction.
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.merge_adj_remove(b"adj:T:out:kept", 7);
+    txn.merge_adj_add(b"adj:T:out:kept", 7);
+    txn.commit(&ctx).expect("commit");
+
+    let kept = engine.get(Partition::Adj, b"adj:T:out:kept").unwrap();
+    let kept = kept.map(|v| PostingList::from_bytes(&v).unwrap());
+    assert_eq!(
+        kept.as_ref().map(|p| p.as_slice()).unwrap_or(&[]),
+        &[7],
+        "remove then add leaves the member, because that is the order it was staged in"
+    );
 }
 
 #[test]

@@ -474,16 +474,11 @@ impl LocalEdgeStore {
                 None => PostingList::new(),
             },
         };
-        if let Some(adds) = txn.merge_adj_adds().get(adj_key) {
-            for &uid in adds {
-                plist.insert(uid);
-            }
-        }
-        if let Some(removes) = txn.merge_adj_removes().get(adj_key) {
-            for &uid in removes {
-                plist.remove(uid);
-            }
-        }
+        // Own staged operands, replayed in the order they were staged: an add
+        // and a remove of one member do not commute, so applying all the adds
+        // and then all the removes would answer with a state the commit will
+        // not produce.
+        txn.apply_staged_adj(adj_key, &mut plist);
         Ok(plist)
     }
 
