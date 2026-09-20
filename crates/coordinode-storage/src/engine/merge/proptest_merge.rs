@@ -66,6 +66,20 @@ fn doc_deltas_strategy() -> impl Strategy<Value = Vec<DocDelta>> {
     )
 }
 
+/// Deltas that are usually small and occasionally enormous, so that a chain
+/// leaving i64 is generated often enough to be worth asserting about.
+fn counter_deltas_strategy() -> impl Strategy<Value = Vec<i64>> {
+    prop::collection::vec(
+        prop_oneof![
+            8 => -1_000..1_000i64,
+            1 => Just(i64::MAX),
+            1 => Just(i64::MIN),
+            1 => Just(i64::MAX / 2),
+        ],
+        1..32,
+    )
+}
+
 /// Apply operations to a reference HashSet to compute expected result.
 fn expected_uids(ops: &[MergeOp]) -> Vec<u64> {
     let mut set = std::collections::BTreeSet::new();
@@ -84,6 +98,48 @@ fn expected_uids(ops: &[MergeOp]) -> Vec<u64> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// A counter fold is the sum the same deltas make in an independent model,
+    /// and it is that sum however the compaction split the chain.
+    ///
+    /// The model is an i64 added up with the same checked arithmetic and
+    /// nothing else: no base, no encoding, no folding. Deltas are drawn near
+    /// the boundaries as well as small, so a chain that would leave the range
+    /// is generated and both sides have to refuse it rather than disagree
+    /// about what it became.
+    #[test]
+    fn fuzz_counter_fold_matches_a_plain_sum(deltas in counter_deltas_strategy()) {
+        let merger = CounterMerge;
+
+        let model = deltas.iter().try_fold(0i64, |acc, d| acc.checked_add(*d));
+
+        let operands: Vec<Vec<u8>> = deltas.iter().map(|d| encode_counter_delta(*d)).collect();
+        let operand_refs: Vec<&[u8]> = operands.iter().map(|v| v.as_slice()).collect();
+        let full = merger.merge(b"counter:k", None, &operand_refs);
+
+        match model {
+            Some(expected) => {
+                let folded = full.expect("a sum inside the range must fold");
+                prop_assert_eq!(decode_counter(&folded).expect("decode"), expected);
+
+                // And one delta at a time, the way a compaction leaves it.
+                let mut base: Option<Vec<u8>> = None;
+                for operand in &operands {
+                    let step = merger
+                        .merge(b"counter:k", base.as_deref(), &[operand.as_slice()])
+                        .expect("each step stays inside the range");
+                    base = Some(step.to_vec());
+                }
+                let incremental = base.expect("at least one delta");
+                prop_assert_eq!(decode_counter(&incremental).expect("decode"), expected,
+                    "a counter folded one delta at a time is the same sum");
+            }
+            None => {
+                prop_assert!(full.is_err(),
+                    "a running total that leaves i64 must be refused, not folded back in");
+            }
+        }
+    }
 
     #[test]
     fn fuzz_merge_sorted_unique(ops in merge_ops_strategy()) {
