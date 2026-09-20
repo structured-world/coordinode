@@ -82,6 +82,68 @@ fn read_latency(engine: &StorageEngine) -> (u128, u128, u128) {
     (at(0.50), at(0.99), at(0.999))
 }
 
+/// The same cost for a document chain, which the operator declines to fold
+/// before its base is known.
+///
+/// A counter chain is the best case for folding and a document chain is the
+/// case that cannot fold at all, so this is what declining costs a reader: the
+/// chain is carried to its base whole and every read walks it. Whether asking
+/// the engine for a per-chain decision is worth anything depends on this
+/// number, which is why it is measured rather than assumed.
+fn document_chain() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    use coordinode_core::graph::node::{NodeId, encode_node_key};
+
+    println!("\ndocument chain (declines to fold)");
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>10}  {:>12}",
+        "operands", "p50 (ns)", "p99 (ns)", "p999 (ns)", "bytes"
+    );
+
+    for operands in [100usize, 1_000, 10_000] {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = open(&dir);
+        let key = encode_node_key(0, NodeId::from_raw(1));
+
+        // A chain of patches with no proven base: the shape a document key
+        // holds between the write that made it and the compaction that can
+        // prove it, which is what the operator has to carry whole.
+        for i in 0..operands {
+            let operand = DocDelta::SetPath {
+                target: PathTarget::Extra,
+                path: vec![format!("f{}", i % 8)],
+                value: rmpv::Value::Integer((i as i64).into()),
+            }
+            .encode()
+            .expect("encode the delta");
+            engine
+                .merge(Partition::Node, &key, &operand)
+                .expect("merge");
+            if i % DELTAS_PER_FLUSH == 0 {
+                engine.persist().expect("persist");
+            }
+        }
+        engine.persist().expect("persist");
+
+        let mut samples: Vec<u128> = Vec::with_capacity(READS);
+        for _ in 0..READS {
+            let start = Instant::now();
+            std::hint::black_box(engine.get(Partition::Node, &key).expect("get"));
+            samples.push(start.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+        let bytes = bytes_on_disk(dir.path());
+
+        println!(
+            "{operands:>10}  {:>10}  {:>10}  {:>10}  {bytes:>12}",
+            at(0.50),
+            at(0.99),
+            at(0.999)
+        );
+    }
+}
+
 fn main() {
     println!(
         "{:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>12}  {:>10}",
@@ -142,4 +204,6 @@ fn main() {
             unfolded as f64 / folded.max(1) as f64
         );
     }
+
+    document_chain();
 }
