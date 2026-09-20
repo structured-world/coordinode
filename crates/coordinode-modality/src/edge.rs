@@ -1011,10 +1011,16 @@ impl EdgeStore for LocalEdgeStore {
     }
 
     fn merge_add_fwd(&self, txn: &mut Transaction, edge_type: &str, src: NodeId, uid: u64) {
+        // Every adjacency add goes through here or through its reverse twin,
+        // whichever layer above stages it, so this is where the attachment
+        // states what it needs: both ends keeping their identity. The two
+        // sides state the same pair and the set keeps one copy.
+        Self::claim_endpoints_alive(txn, src, NodeId::from_raw(uid));
         txn.merge_adj_add(&encode_adj_key_forward(edge_type, src), uid);
     }
 
     fn merge_add_rev(&self, txn: &mut Transaction, edge_type: &str, tgt: NodeId, uid: u64) {
+        Self::claim_endpoints_alive(txn, NodeId::from_raw(uid), tgt);
         txn.merge_adj_add(&encode_adj_key_reverse(edge_type, tgt), uid);
     }
 

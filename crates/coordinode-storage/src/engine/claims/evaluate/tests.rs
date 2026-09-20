@@ -192,6 +192,63 @@ fn a_pair_claim_is_decided_against_adjacency() {
     assert_eq!(decide(&engine, &saw_present, &[]), Verdict::Holds);
 }
 
+/// The attempt's own staging is not what decides its observation: it is
+/// usually the reason the pair looks different, and refusing it for that would
+/// refuse every statement that acted on what it saw.
+#[test]
+fn a_pair_claim_is_not_broken_by_the_attempts_own_edge() {
+    let (engine, _d) = engine();
+    let key = encode_adj_key_forward("TAGGED", node(1));
+    let saw_absent = Claim::new(
+        ClaimScope::Pair {
+            source: node(1),
+            target: node(2),
+            edge_type: "TAGGED".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        GEN,
+    );
+
+    let staged = vec![(key, AdjOp::Add(2))];
+    assert_eq!(
+        decide(&engine, &saw_absent, &staged),
+        Verdict::Holds,
+        "creating the edge the absence called for is not a violation of it"
+    );
+}
+
+/// Somebody else made the pair adjacent after the attempt looked: the
+/// observation the attempt built on is gone, and the two write different keys,
+/// so nothing else would have caught it.
+#[test]
+fn a_pair_claim_is_broken_by_a_change_under_the_attempt() {
+    let (engine, _d) = engine();
+    let key = encode_adj_key_forward("TAGGED", node(1));
+    let view = engine.snapshot();
+    engine
+        .merge(Partition::Adj, &key, &encode_add(2))
+        .expect("merge");
+
+    let saw_absent = Claim::new(
+        ClaimScope::Pair {
+            source: node(1),
+            target: node(2),
+            edge_type: "TAGGED".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        GEN,
+    );
+    let no_points = HashMap::new();
+    assert_eq!(
+        evaluate(&engine, &saw_absent, &[], &no_points, view).expect("evaluate"),
+        Verdict::Broken
+    );
+}
+
 /// A removal of an unrelated neighbour does not disturb a pair claim about a
 /// different target.
 #[test]

@@ -110,20 +110,7 @@ pub fn evaluate(
                 edge_type,
             },
             ClaimPredicate::PairAdjacency { observed },
-        ) => {
-            let neighbours = adjacency(engine, *source, edge_type, Direction::Outgoing, staged)?;
-            let present = neighbours.contains(&target.as_raw());
-            let now = if present {
-                Adjacency::Present
-            } else {
-                Adjacency::Absent
-            };
-            Ok(if now == *observed {
-                Verdict::Holds
-            } else {
-                Verdict::Broken
-            })
-        }
+        ) => pair_observation_survived(engine, *source, *target, edge_type, *observed, read_ts),
 
         (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
             endpoint_alive(engine, *node, staged_points, read_ts)
@@ -143,6 +130,56 @@ pub fn evaluate(
         // answering here would mean inventing it.
         _ => Ok(Verdict::Undecidable),
     }
+}
+
+/// Whether the observation an attempt built its result on still stands.
+///
+/// The question is not what the pair looks like now: the attempt is usually
+/// the reason it looks different, and asking that of a MERGE would refuse
+/// every MERGE for having done what the observation told it to do. The
+/// question is whether somebody else moved the pair under it, which is the
+/// comparison between the state its view showed and the state now.
+///
+/// Two attempts that observed the same thing and act the same way are left
+/// alone here, as they are in the registry: both add the same member to a set
+/// and the result is one edge either way. What this catches is the erase of
+/// the last qualifying row racing the insertion that was built on its absence,
+/// or the reverse, where the two write different keys and first-committer-wins
+/// sees nothing.
+fn pair_observation_survived(
+    engine: &StorageEngine,
+    source: NodeId,
+    target: NodeId,
+    edge_type: &str,
+    observed: Adjacency,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    let key = encode_adj_key_forward(edge_type, source);
+
+    let at_view = match engine.snapshot_get(&read_ts, Partition::Adj, &key)? {
+        Some(bytes) => PostingList::from_bytes(&bytes)
+            .map(|p| p.as_slice().contains(&target.as_raw()))
+            .unwrap_or(false),
+        None => false,
+    };
+    let now = match engine.get(Partition::Adj, &key)? {
+        Some(bytes) => PostingList::from_bytes(&bytes)
+            .map(|p| p.as_slice().contains(&target.as_raw()))
+            .unwrap_or(false),
+        None => false,
+    };
+
+    // The view has to agree with what the attempt says it saw; a claim whose
+    // own observation was already stale when it was made is no evidence.
+    let seen = match observed {
+        Adjacency::Present => true,
+        Adjacency::Absent => false,
+    };
+    Ok(if at_view == seen && now == seen {
+        Verdict::Holds
+    } else {
+        Verdict::Broken
+    })
 }
 
 /// Whether the identity an attempt is attaching to survived until its commit.

@@ -1773,6 +1773,29 @@ impl<'a> ExecutionContext<'a> {
         LocalEdgeStore.merge_add_fwd(&mut self.txn, edge_type, src, uid);
     }
 
+    /// State that this statement observed the pair as not adjacent, and built
+    /// its result on that.
+    ///
+    /// Only a statement whose decision turned on the observation says this.
+    /// A plain CREATE does not: it attaches regardless of what was there, so
+    /// claiming an observation it never made would refuse writers that agree
+    /// with each other.
+    pub fn claim_pair_observed_absent(&mut self, edge_type: &str, source: NodeId, target: NodeId) {
+        use coordinode_core::txn::invariant::{Adjacency, Claim, ClaimPredicate, ClaimScope};
+        let generation = self.txn.schema_generation();
+        self.txn.claim(Claim::new(
+            ClaimScope::Pair {
+                source,
+                target,
+                edge_type: edge_type.to_string(),
+            },
+            ClaimPredicate::PairAdjacency {
+                observed: Adjacency::Absent,
+            },
+            generation,
+        ));
+    }
+
     /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
     pub fn adj_merge_add_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
         use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
@@ -7868,6 +7891,17 @@ fn execute_merge_relationship_create(
         Direction::Outgoing | Direction::Both => (source_id, target_id),
         Direction::Incoming => (target_id, source_id),
     };
+    // This branch runs because the check found nothing to match. What was
+    // observed depends on the pattern: with no property filters it is the
+    // plain absence of the pair, and saying so protects the creation against
+    // a concurrent erase that writes different keys and so passes
+    // first-committer-wins. With filters the check answered a narrower
+    // question ("no edge matching these properties"), which a pair claim does
+    // not state; an edge can be there and still not match. Claiming absence
+    // there would assert an observation nobody made.
+    if edge_filters.is_empty() {
+        ctx.claim_pair_observed_absent(et, from_id, to_id);
+    }
     ctx.adj_merge_add_fwd(et, from_id, to_id.as_raw());
     ctx.adj_merge_add_rev(et, to_id, from_id.as_raw());
     ctx.write_stats.edges_created += 1;
