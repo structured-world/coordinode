@@ -94,6 +94,71 @@ fn bench_node_put(c: &mut Criterion) {
     group.finish();
 }
 
+/// One edge attached and committed: the write path a statement actually
+/// takes, endpoints included.
+///
+/// Both endpoints have rows, which is the ordinary case and also the one
+/// where the invariant guard takes its fast path; an attachment to an
+/// endpoint with no row yet is a different and slower shape, measured in the
+/// storage crate's guard bench.
+fn bench_edge_put(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge_put");
+    group.sample_size(20);
+    let (_dir, engine) = mk_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalEdgeStore;
+    let node_store = LocalNodeStore;
+    let record = NodeRecord::new("User");
+
+    // Materialise the hub and the peers so the attachment references
+    // endpoints that exist.
+    const PEERS: u64 = 20_000;
+    bench_write(&engine, |txn| {
+        node_store
+            .put(txn, 0, NodeId::from_raw(1), &record)
+            .unwrap();
+    });
+    for chunk in 0..PEERS / 1_000 {
+        bench_write(&engine, |txn| {
+            for i in 0..1_000 {
+                node_store
+                    .put(txn, 0, NodeId::from_raw(chunk * 1_000 + i + 2), &record)
+                    .unwrap();
+            }
+        });
+    }
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("single_attach", |b| {
+        let mut peer = 2u64;
+        b.iter(|| {
+            let read_ts = oracle.next();
+            let mut txn =
+                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            store
+                .put_edge(
+                    &mut txn,
+                    "KNOWS",
+                    NodeId::from_raw(1),
+                    NodeId::from_raw(peer),
+                    None,
+                )
+                .unwrap();
+            let wc = WriteConcern::majority();
+            let ctx = CommitContext {
+                write_concern: &wc,
+                pipeline: None,
+                id_gen: None,
+                drain_buffer: None,
+                nvme_write_buffer: None,
+            };
+            txn.commit(&ctx).unwrap();
+            peer = 2 + (peer - 1) % PEERS;
+        });
+    });
+    group.finish();
+}
+
 /// Edge super-node: scaling neighbour-list scan with posting list size.
 fn bench_edge_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("edge_scan_neighbours");
@@ -448,6 +513,7 @@ fn bench_blob_chunk(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_node_put,
+    bench_edge_put,
     bench_edge_scan,
     bench_vector_knn,
     bench_spatial_bbox,

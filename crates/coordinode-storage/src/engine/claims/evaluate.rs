@@ -282,22 +282,39 @@ fn endpoint_alive(
     // The attempt's own writes decide first. A node it is creating is alive
     // for its own edge, and one it is deleting in the same breath it attaches
     // to is a result it cannot have both halves of.
-    if let Some(staged) = staged_points.get(&(Partition::Node, key.clone())) {
-        return Ok(if staged.is_some() {
-            Verdict::Holds
-        } else {
-            Verdict::Broken
-        });
+    //
+    // The emptiness check is not a micro-optimisation dressed as a guard: the
+    // lookup key has to be built by cloning, and an attempt that staged no
+    // point writes at all (every plain edge attachment) would pay that
+    // allocation to look inside an empty map.
+    if !staged_points.is_empty() {
+        if let Some(staged) = staged_points.get(&(Partition::Node, key.clone())) {
+            return Ok(if staged.is_some() {
+                Verdict::Holds
+            } else {
+                Verdict::Broken
+            });
+        }
     }
 
+    // The ordinary answer is decided without reading the node at all. Nobody
+    // has touched the row since this attempt's view, so whatever it was then
+    // it still is, and nothing was taken away. This is the case nearly every
+    // edge write is in, and it costs one key-only probe: reading the record
+    // to prove a node was not deleted copies a value the answer never uses.
+    if !engine.written_since_snapshot(Partition::Node, &key, read_ts)? {
+        return Ok(Verdict::Holds);
+    }
+
+    // The row moved under the attempt, so what it is now has to be looked at.
+    // An update is not a destruction; only an absence is.
     if engine.get(Partition::Node, &key)?.is_some() {
         return Ok(Verdict::Holds);
     }
 
     // A label in temporal mode stores its nodes only as versions under the
     // per-version key, so the plain row is absent for a node that very much
-    // exists. The scans run only when the plain row is missing, so an
-    // ordinary node costs one point read.
+    // exists.
     let prefix = coordinode_core::graph::node::temporal_node_id_prefix(shard, node);
     if staged_points.iter().any(|((part, k), value)| {
         *part == Partition::Node && k.starts_with(&prefix) && value.is_some()
@@ -310,13 +327,7 @@ fn endpoint_alive(
         }
     }
 
-    Ok(
-        if engine.written_since_snapshot(Partition::Node, &key, read_ts)? {
-            Verdict::Broken
-        } else {
-            Verdict::Holds
-        },
-    )
+    Ok(Verdict::Broken)
 }
 
 /// The neighbour set of one incident scope, with the attempt's staged writes
