@@ -263,6 +263,24 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 [("transaction_id", id.to_string())],
             );
         }
+        // Both spellings of one refusal: an interactive commit fails with the
+        // typed variant, an auto-commit statement carries it inside the
+        // execution error. ABORTED like a conflict (the retry is the whole
+        // transaction), but under its own reason, because the cause is a
+        // condition rather than a contended key.
+        DatabaseError::InvariantRefused { id, .. } => {
+            return status_with_reason(
+                Code::Aborted,
+                rendered,
+                Reason::InvariantRefused,
+                [("transaction_id", id.to_string())],
+            );
+        }
+        DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::InvariantRefused(_),
+        ) => {
+            return status_with_reason(Code::Aborted, rendered, Reason::InvariantRefused, []);
+        }
         DatabaseError::TransactionTooLarge {
             id,
             buffered,

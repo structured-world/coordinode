@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::txn::drain::{DrainBuffer, DrainEntry};
+use coordinode_core::txn::invariant::{Claim, ClaimSet};
 use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
@@ -122,6 +123,19 @@ pub enum CommitError {
     CounterOverflow {
         /// The counter key whose staged deltas overflowed.
         key: String,
+    },
+    /// A condition this attempt's result depends on no longer holds, or
+    /// another attempt in flight holds an incompatible one. Nothing was
+    /// applied.
+    ///
+    /// Separate from `Conflict`, which is the write set losing first-committer
+    /// -wins: two attempts can write disjoint keys and still break a graph
+    /// condition together, and telling a caller "write conflict" for that
+    /// would name the wrong cause.
+    #[error("invariant refused the commit: {reason}")]
+    InvariantRefused {
+        /// Which condition refused it, in the words of the condition.
+        reason: String,
     },
 }
 
@@ -219,6 +233,10 @@ pub struct Transaction<'a> {
     /// The first counter key whose staged deltas left `i64`, if any. Held so
     /// that commit refuses instead of writing an operand no fold can apply.
     counter_overflow: Option<Vec<u8>>,
+    /// What this attempt's result depends on, stated by the writers as they
+    /// go. Checked and reserved at commit: the write set alone cannot tell
+    /// two attempts apart that each validated a condition the other breaks.
+    claims: ClaimSet,
     /// GC-watermark pin at `snapshot`, held for the transaction's life (and
     /// parked with its state between interactive statements) so compaction
     /// never collects the history this transaction reads. `None` in legacy
@@ -243,6 +261,10 @@ pub struct TransactionState {
     merge_adj_ops: Vec<(Vec<u8>, AdjOp)>,
     merge_node_deltas: Vec<(Vec<u8>, Vec<u8>)>,
     merge_counter_deltas: HashMap<Vec<u8>, i64>,
+    /// The attempt's stated conditions. Parked with the rest of its state,
+    /// because an interactive transaction is one attempt across statements
+    /// and a condition stated by the first still binds the last.
+    claims: ClaimSet,
     snapshot_pin: Option<SnapshotPin>,
 }
 
@@ -340,6 +362,7 @@ impl<'a> Transaction<'a> {
             merge_node_deltas: Vec::new(),
             merge_counter_deltas: HashMap::new(),
             counter_overflow: None,
+            claims: ClaimSet::new(),
             snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
         }
     }
@@ -362,6 +385,7 @@ impl<'a> Transaction<'a> {
             write_buffer: self.write_buffer,
             occ_scope: self.occ_scope,
             merge_adj_ops: self.merge_adj_ops,
+            claims: self.claims,
             merge_node_deltas: self.merge_node_deltas,
             merge_counter_deltas: self.merge_counter_deltas,
             snapshot_pin: self.snapshot_pin,
@@ -383,6 +407,7 @@ impl<'a> Transaction<'a> {
             write_buffer: std::mem::take(&mut self.write_buffer),
             occ_scope: self.occ_scope.take(),
             merge_adj_ops: std::mem::take(&mut self.merge_adj_ops),
+            claims: std::mem::take(&mut self.claims),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
             snapshot_pin: self.snapshot_pin.take(),
@@ -409,6 +434,7 @@ impl<'a> Transaction<'a> {
             occ_scope: state.occ_scope,
             merge_adj_ops: state.merge_adj_ops,
             counter_overflow: None,
+            claims: state.claims,
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
@@ -701,6 +727,53 @@ impl<'a> Transaction<'a> {
             .push((adj_key.to_vec(), AdjOp::Remove(uid)));
     }
 
+    /// Decide every stated condition against authoritative state and this
+    /// attempt's own staged writes.
+    ///
+    /// A condition the evaluator cannot decide refuses the commit rather than
+    /// passing it: an undecidable claim is not a satisfied one, and admitting
+    /// it would mean the protection is absent exactly where the evidence is.
+    fn evaluate_claims(&self) -> Result<(), CommitError> {
+        use crate::engine::claims::evaluate::{Verdict, evaluate};
+
+        for claim in self.claims.claims() {
+            match evaluate(self.engine, claim, &self.merge_adj_ops)? {
+                Verdict::Holds => {}
+                Verdict::Broken => {
+                    return Err(CommitError::InvariantRefused {
+                        reason: format!(
+                            "{:?} no longer holds on {:?}",
+                            claim.predicate, claim.scope
+                        ),
+                    });
+                }
+                Verdict::Undecidable => {
+                    return Err(CommitError::InvariantRefused {
+                        reason: format!(
+                            "{:?} on {:?} cannot be decided here, so it cannot be admitted",
+                            claim.predicate, claim.scope
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// State a condition this attempt's result depends on.
+    ///
+    /// Called by the writer that knows the condition, as it writes: the
+    /// storage layer sees keys and operands and cannot recover from them
+    /// which graph predicate a mutation was constructed against.
+    pub fn claim(&mut self, claim: Claim) {
+        self.claims.insert(claim);
+    }
+
+    /// The conditions stated so far.
+    pub fn claims(&self) -> &ClaimSet {
+        &self.claims
+    }
+
     /// Replay this transaction's own staged adjacency operands onto `plist`,
     /// in the order they were staged, so a read sees its own writes the way
     /// the commit will apply them.
@@ -861,6 +934,25 @@ impl<'a> Transaction<'a> {
             return Err(CommitError::CounterOverflow {
                 key: String::from_utf8_lossy(key).into_owned(),
             });
+        }
+
+        // The conditions this attempt's result was built on, checked where
+        // the caller is still listening and before anything is applied. Two
+        // halves, and neither is sufficient alone: the registry sees the
+        // attempts in flight beside this one, the evaluation sees the state
+        // they have all committed.
+        if !self.claims.is_empty() {
+            let attempt = self.read_ts.as_raw();
+            if let Err(refusal) = self.engine.claim_registry().reserve(attempt, &self.claims) {
+                return Err(CommitError::InvariantRefused {
+                    reason: format!("{refusal:?}"),
+                });
+            }
+            let verdicts = self.evaluate_claims();
+            if let Err(reason) = verdicts {
+                self.engine.claim_registry().release(attempt);
+                return Err(reason);
+            }
         }
 
         // Write-admission gate: under Stop pressure (storage over its

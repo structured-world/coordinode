@@ -1242,6 +1242,7 @@ dependencies = [
  "lz4_flex 0.14.0",
  "metrics",
  "nanoid",
+ "parking_lot",
  "proptest",
  "rand 0.10.3",
  "rayon",

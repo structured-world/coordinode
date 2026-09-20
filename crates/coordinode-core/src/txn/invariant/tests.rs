@@ -145,6 +145,43 @@ fn erasing_the_last_row_cannot_race_an_insertion_into_the_same_pair() {
     assert!(!eraser.compatible_with(&inserter));
 }
 
+/// Two attempts inserting the same edge agree about the pair and both leave
+/// it present, so they must not queue behind each other. Writing an edge
+/// twice is the ordinary idempotent case, not a conflict.
+#[test]
+fn two_insertions_of_one_edge_agree_and_coexist() {
+    let scope = pair(1, 2, "TAGGED");
+    let observed_absent = || {
+        set(vec![Claim::new(
+            scope.clone(),
+            ClaimPredicate::PairAdjacency {
+                observed: Adjacency::Absent,
+            },
+            GEN,
+        )])
+    };
+
+    assert!(
+        observed_absent().compatible_with(&observed_absent()),
+        "the same observation of one pair is agreement, not contention"
+    );
+
+    // Two removals likewise agree: both saw the edge and both leave it gone.
+    let observed_present = || {
+        set(vec![Claim::new(
+            scope.clone(),
+            ClaimPredicate::PairAdjacency {
+                observed: Adjacency::Present,
+            },
+            GEN,
+        )])
+    };
+    assert!(observed_present().compatible_with(&observed_present()));
+
+    // Only a disagreement is a conflict.
+    assert!(!observed_absent().compatible_with(&observed_present()));
+}
+
 /// Insertions into different pairs are independent of each other, and both
 /// still meet a bound declared on the vertex they share.
 #[test]

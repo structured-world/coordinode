@@ -53,6 +53,14 @@ pub enum Reason {
     /// A commit lost to a concurrent write. Nothing of the transaction was
     /// applied; retrying the whole transaction is the intended response.
     TransactionConflict,
+    /// A declared condition the write depends on no longer holds, or a
+    /// concurrent transaction holds an incompatible claim on it. Nothing was
+    /// applied; re-running the transaction re-reads that state.
+    ///
+    /// Told apart from `TRANSACTION_CONFLICT` so a caller can see which of the
+    /// two it hit: a conflict is two transactions over one key, a refusal is
+    /// two of them over one condition, which their key sets need not share.
+    InvariantRefused,
     /// A transaction buffered more uncommitted data than it may. Splitting the
     /// work into smaller transactions is the fix; retrying as-is will not help.
     TransactionTooLarge,
@@ -94,6 +102,7 @@ impl Reason {
             Reason::LongOverflow => "LONG_OVERFLOW",
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",
             Reason::TransactionConflict => "TRANSACTION_CONFLICT",
+            Reason::InvariantRefused => "INVARIANT_REFUSED",
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
@@ -112,7 +121,9 @@ impl Reason {
     /// A conflict says "retry now": it is resolved by re-running the
     /// transaction, not by waiting, and the explicit zero delay is what stops
     /// a client from inventing a backoff for a condition backing off does not
-    /// help. Backpressure says the opposite: the server is shedding writes
+    /// help. An invariant refusal answers the same way and for the same
+    /// reason: the retry re-reads the state the condition is evaluated
+    /// against, and waiting does not change what it will read. Backpressure says the opposite: the server is shedding writes
     /// until compaction catches up, so an immediate retry would bounce off
     /// the same verdict; the delay is a floor for the client's backoff.
     ///
@@ -123,7 +134,9 @@ impl Reason {
     /// backoff governs how often, which is why the floor here stays zero.
     pub const fn retry_delay(self) -> Option<std::time::Duration> {
         match self {
-            Reason::TransactionConflict | Reason::NotLeader => Some(std::time::Duration::ZERO),
+            Reason::TransactionConflict | Reason::InvariantRefused | Reason::NotLeader => {
+                Some(std::time::Duration::ZERO)
+            }
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
             _ => None,
         }

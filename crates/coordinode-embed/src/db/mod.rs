@@ -541,6 +541,22 @@ pub enum DatabaseError {
     #[error("transaction {id} conflicts with a concurrent write: {source_message}")]
     TransactionConflict { id: u64, source_message: String },
 
+    /// A commit refused by a declared condition: the state the transaction's
+    /// result depends on no longer holds, or a concurrent transaction holds an
+    /// incompatible claim on it. Nothing was applied; re-running the whole
+    /// transaction from begin re-reads that state.
+    ///
+    /// Separate from `TransactionConflict` because the two transactions need
+    /// not touch a common key: disjoint writes can break one graph condition
+    /// together, and reporting that as a write conflict names the wrong cause.
+    #[error("transaction {id} was refused by an invariant: {reason}")]
+    InvariantRefused {
+        /// The transaction the refusal belongs to.
+        id: u64,
+        /// Which condition refused it, in the words of the condition.
+        reason: String,
+    },
+
     /// A transaction buffered more uncommitted data than it is allowed to, and
     /// was discarded. Splitting the work into smaller transactions is the fix.
     #[error("transaction {id} exceeded its buffer limit ({buffered} > {limit} bytes)")]
@@ -1716,6 +1732,12 @@ impl Database {
             CommitError::CounterOverflow { key } => DatabaseError::Other(format!(
                 "counter '{key}' would leave the i64 range; nothing was written"
             )),
+            // Retryable from begin, like a conflict, but for a different
+            // reason: the condition is re-evaluated against the state the
+            // retry reads.
+            CommitError::InvariantRefused { reason } => {
+                DatabaseError::InvariantRefused { id: txn_id, reason }
+            }
         })?;
         // An interactive transaction is always opened against the oracle
         // (`begin_transaction`), so the storage commit is never on the legacy

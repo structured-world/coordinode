@@ -98,6 +98,10 @@ pub struct StorageEngine {
     /// partition-keyed read/write delegates here. See
     /// [`crate::engine::coordinator`].
     coordinator: LocalMultiModalCoordinator,
+    /// Invariant claims of the attempts running against this engine. Shared
+    /// by every transaction, because a condition is only protected if the
+    /// attempt that would break it is looking at the same table.
+    claim_registry: crate::engine::claims::ClaimRegistry,
     flush_policy: FlushPolicy,
     /// Optional tiered block cache (DRAM → NVMe → SSD cascade).
     tiered_cache: Option<TieredCache>,
@@ -774,6 +778,7 @@ impl StorageEngine {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),
             coordinator,
+            claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             flush_policy: config.flush_policy,
             tiered_cache,
             access_tracker: AccessTracker::new(),
@@ -1900,6 +1905,11 @@ impl StorageEngine {
     /// Blocks the caller until compaction finishes. Intended for
     /// operator-driven maintenance, capacity-pressure cascade eviction,
     /// and end-to-end tests; not used on the steady-state write path.
+    /// The invariant-claim table shared by every attempt on this engine.
+    pub fn claim_registry(&self) -> &crate::engine::claims::ClaimRegistry {
+        &self.claim_registry
+    }
+
     pub fn major_compact(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
         // Target table size of 64 MiB is the lsm-tree default — picked

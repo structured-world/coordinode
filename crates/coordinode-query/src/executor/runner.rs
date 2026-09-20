@@ -72,6 +72,17 @@ pub enum ExecutionError {
     #[error("write conflict: {0}")]
     Conflict(String),
 
+    /// A condition the statement's result depends on no longer holds, or
+    /// another statement in flight holds an incompatible one. Nothing was
+    /// applied; re-running the statement re-reads the state it depends on.
+    ///
+    /// Kept apart from `Conflict` for the same reason the engine keeps them
+    /// apart: two statements can write disjoint keys and still break a graph
+    /// condition together, and calling that a write conflict names the wrong
+    /// cause to whoever reads the message.
+    #[error("invariant refused the write: {0}")]
+    InvariantRefused(String),
+
     /// The engine rejected the commit's writes because storage is over its
     /// compaction-debt stop threshold. Nothing was applied; retryable after
     /// a short delay.
@@ -15917,6 +15928,7 @@ fn commit_err_to_execution(
         CommitError::CounterOverflow { key } => ExecutionError::Serialization(format!(
             "counter '{key}' would leave the i64 range; nothing was written"
         )),
+        CommitError::InvariantRefused { reason } => ExecutionError::InvariantRefused(reason),
     }
 }
 

@@ -23,6 +23,152 @@ fn mvcc_txn<'a>(engine: &'a StorageEngine, oracle: &'a TimestampOracle) -> Trans
     Transaction::new(engine, Some(oracle), Timestamp::from_raw(snap), Some(snap))
 }
 
+/// Two attempts that each satisfy an at-most-one bound alone cannot both
+/// commit, and the second is refused before anything of it is applied.
+///
+/// This is the schedule snapshot isolation admits: the two write different
+/// adjacency keys, so first-committer-wins sees no conflict, and each
+/// validated the bound against a state where it held. Only the claim they
+/// both state about the bound tells them apart.
+#[test]
+fn two_attempts_deciding_one_bound_cannot_both_commit() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{
+        CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, Direction,
+    };
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let bound = || {
+        Claim::new(
+            ClaimScope::Incident {
+                node: NodeId::from_raw(1),
+                edge_type: "OWNS".to_string(),
+                direction: Direction::Outgoing,
+            },
+            ClaimPredicate::CardinalityBound {
+                measure: CardinalityMeasure::DistinctNeighbours,
+                at_most: Some(1),
+                at_least: None,
+            },
+            0,
+        )
+    };
+
+    // Both attempts are open at once, which is what makes this a race rather
+    // than a sequence.
+    let mut first = mvcc_txn(&engine, &oracle);
+    let mut second = mvcc_txn(&engine, &oracle);
+
+    first.merge_adj_add(b"adj:OWNS:out:\x00\x00\x00\x00\x00\x00\x00\x01", 2);
+    first.claim(bound());
+    second.merge_adj_add(b"adj:OWNS:out:\x00\x00\x00\x00\x00\x00\x00\x01", 3);
+    second.claim(bound());
+
+    first
+        .commit(&ctx)
+        .expect("the first attempt decides the bound");
+
+    let err = second
+        .commit(&ctx)
+        .expect_err("the second cannot decide the same bound");
+    assert!(
+        matches!(err, CommitError::InvariantRefused { .. }),
+        "expected the invariant to refuse, got {err:?}"
+    );
+}
+
+/// An attempt whose condition no longer holds is refused even with nobody
+/// else in flight: the registry sees attempts, the evaluation sees the state
+/// they have all committed, and neither is sufficient alone.
+#[test]
+fn a_condition_broken_by_committed_state_refuses_the_commit() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{Adjacency, Claim, ClaimPredicate, ClaimScope};
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    // Somebody already made the pair adjacent.
+    engine
+        .merge(
+            Partition::Adj,
+            b"adj:TAGGED:out:\x00\x00\x00\x00\x00\x00\x00\x01",
+            &crate::engine::merge::encode_add(2),
+        )
+        .expect("merge");
+
+    // This attempt was built on having seen the pair absent.
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.claim(Claim::new(
+        ClaimScope::Pair {
+            source: NodeId::from_raw(1),
+            target: NodeId::from_raw(2),
+            edge_type: "TAGGED".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        0,
+    ));
+    txn.put(Partition::Node, b"node:claimed", b"v").unwrap();
+
+    let err = txn.commit(&ctx).expect_err("the observation is stale");
+    assert!(matches!(err, CommitError::InvariantRefused { .. }));
+    assert_eq!(
+        engine.get(Partition::Node, b"node:claimed").unwrap(),
+        None,
+        "a refused commit applied nothing"
+    );
+}
+
+/// An attempt that states no condition is untouched by any of this: the
+/// ordinary write path does not pay for a guard it does not need.
+#[test]
+fn an_attempt_with_no_claims_commits_as_before() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, b"node:plain", b"v").unwrap();
+    txn.commit(&ctx).expect("commit");
+
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:plain")
+            .unwrap()
+            .as_deref(),
+        Some(&b"v"[..])
+    );
+    assert_eq!(
+        engine.claim_registry().reserved_claims(),
+        0,
+        "no claims were reserved for an attempt that stated none"
+    );
+}
+
 /// A counter whose staged deltas leave i64 is refused at commit, not written
 /// and met again in a compaction.
 ///

@@ -204,10 +204,13 @@ impl Claim {
             // from, so neither can be decided without the other.
             (CardinalityBound { .. }, PairAdjacency { .. } | IncidentSetComplete) => false,
 
-            // Both attempts observed the pair and each needs its observation
-            // to survive: an insertion that saw absence and a removal that
-            // saw presence cannot both be right.
-            (PairAdjacency { .. }, PairAdjacency { .. }) => false,
+            // Two attempts that observed the pair the same way agree about
+            // it, and agreeing is not a conflict: two insertions of one edge
+            // both saw absence and both leave it present, which is the
+            // idempotent case and must not queue. Observations that differ
+            // cannot both be right, and that is the last-row erase racing an
+            // insertion.
+            (PairAdjacency { observed: a }, PairAdjacency { observed: b }) => a == b,
 
             // A scan that enumerated the set is invalidated by anything that
             // changes membership, including a member it never saw.

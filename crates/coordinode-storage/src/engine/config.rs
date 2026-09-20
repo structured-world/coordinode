@@ -651,6 +651,24 @@ pub struct StorageConfig {
     /// Default: 7 days.
     pub retention_window_secs: u64,
 
+    /// Ceiling on the invariant claims held by all in-flight attempts on this
+    /// node, together.
+    ///
+    /// A claim is what a mutation says its result depends on, and the guard
+    /// table holds one set per attempt until the attempt ends. The bound is
+    /// on claims rather than attempts because one statement scanning a large
+    /// incident set states many and one adding an edge states few, and what
+    /// has to stay bounded under load is the memory. At the ceiling a new
+    /// attempt is refused while it can still be retried cheaply, rather than
+    /// the table growing with the load.
+    ///
+    /// The default admits far more than a healthy workload holds at once: a
+    /// deployment that reaches it is either running a scan far larger than
+    /// this node is sized for, or leaking attempts that never end.
+    ///
+    /// Runtime-tunable through the engine; restart-free.
+    pub max_invariant_claims: usize,
+
     /// Background drain thread polling interval in milliseconds.
     /// Controls how frequently volatile writes (w:memory/w:cache) are
     /// batched into Raft proposals. Lower = less data at risk.
@@ -818,6 +836,7 @@ impl StorageConfig {
             oplog_segment_max_entries: 50_000,
             oplog_retention_secs: 7 * 24 * 3600,
             retention_window_secs: 7 * 24 * 3600,
+            max_invariant_claims: 100_000,
             drain_interval_ms: 100,
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,
