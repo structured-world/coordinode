@@ -160,6 +160,42 @@ impl CoordinodeProcess {
         proc
     }
 
+    /// Stop the process and bring the SAME data directory back up as a cluster
+    /// member, the way an operator turns a single machine into a replicated
+    /// one: same data, `--node-id` and `--peers` added.
+    ///
+    /// The port changes because the old one may still be in `TIME_WAIT`, which
+    /// is what a member's advertised address is for: peers dial what the
+    /// membership records, not what it recorded yesterday.
+    pub async fn restart_as_cluster_member(mut self, node_id: u64, peer_ports: &[u16]) -> Self {
+        send_sigterm(&self.child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !has_exited(&mut self.child) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        force_reap(&mut self.child);
+
+        let data_dir = self
+            .data_dir
+            .take()
+            .expect("data_dir missing: restart called twice?");
+        let port = free_port();
+        let data_path = data_dir.path().to_path_buf();
+        let peers: Vec<String> = peer_ports
+            .iter()
+            .map(|p| format!("http://[::1]:{p}"))
+            .collect();
+
+        let child = spawn_cluster_binary(node_id, port, &peers, data_path);
+        let proc = Self {
+            child,
+            port,
+            data_dir: Some(data_dir),
+        };
+        proc.wait_for_grpc(Duration::from_secs(15)).await;
+        proc
+    }
+
     /// gRPC endpoint URL for use with tonic.
     pub fn endpoint(&self) -> String {
         format!("http://[::1]:{}", self.port)
@@ -253,6 +289,77 @@ impl CoordinodeProcess {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
+
+    /// Stop the process and hand the data directory over, so a test can start
+    /// something else against the same bytes. The directory lives as long as
+    /// the returned handle.
+    pub async fn stop_keeping_data(mut self) -> tempfile::TempDir {
+        send_sigterm(&self.child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !has_exited(&mut self.child) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        force_reap(&mut self.child);
+        self.data_dir
+            .take()
+            .expect("data_dir missing: the process was already restarted")
+    }
+}
+
+/// Start a cluster member that is expected to refuse to start, and return what
+/// the operator sees: the exit status and everything the process printed.
+///
+/// Waits for the process to exit rather than for a port, because the point of
+/// the call is that no port is ever served.
+pub async fn start_cluster_member_expecting_refusal(
+    node_id: u64,
+    port: u16,
+    peer_ports: &[u16],
+    data_dir: &std::path::Path,
+) -> (std::process::ExitStatus, String) {
+    let peers: Vec<String> = peer_ports
+        .iter()
+        .map(|p| format!("http://[::1]:{p}"))
+        .collect();
+    let bin = binary_path();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .arg("--node-id")
+        .arg(node_id.to_string())
+        .arg("--addr")
+        .arg(format!("[::1]:{port}"))
+        .arg("--advertise-addr")
+        .arg(format!("http://[::1]:{port}"))
+        .arg("--peers")
+        .arg(peers.join(","))
+        .arg("--ops-addr")
+        .arg("[::1]:0")
+        .arg("--data")
+        .arg(data_dir)
+        .env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e));
+    let out = tokio::task::spawn_blocking(move || {
+        child
+            .wait_with_output()
+            .expect("wait for the refusing process")
+    })
+    .await
+    .expect("join the wait task");
+
+    let mut printed = String::from_utf8_lossy(&out.stderr).into_owned();
+    printed.push_str(&String::from_utf8_lossy(&out.stdout));
+    (out.status, printed)
 }
 
 impl Drop for CoordinodeProcess {
