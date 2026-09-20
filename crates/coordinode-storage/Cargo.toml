@@ -100,5 +100,13 @@ harness = false
 name = "txn_point_read"
 harness = false
 
+[[bench]]
+name = "counter_chain_read"
+harness = false
+
+[[bench]]
+name = "counter_chain_steady"
+harness = false
+
 [lints]
 workspace = true

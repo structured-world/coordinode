@@ -1,5 +1,77 @@
 use super::*;
 
+/// Folding a prefix without a base and applying the result to the real base
+/// gives what the whole chain gives, at every split of the chain.
+///
+/// This is the law the engine relies on when it folds operands above the last
+/// level: the composite it writes in their place is later applied to a base it
+/// could not see at the time, and the answer has to be the one the operands
+/// would have given.
+#[test]
+fn a_folded_prefix_equals_the_whole_chain_at_every_split() {
+    let merger = CounterMerge;
+    let base = 100i64.to_le_bytes();
+    let deltas: Vec<Vec<u8>> = [7i64, -3, 20, -1, 5]
+        .iter()
+        .map(|d| encode_counter_delta(*d))
+        .collect();
+    let refs: Vec<&[u8]> = deltas.iter().map(|v| v.as_slice()).collect();
+
+    let whole = merger.merge(b"counter:k", Some(&base), &refs).unwrap();
+
+    for split in 0..=refs.len() {
+        let (prefix, suffix) = refs.split_at(split);
+        let composed = merger.merge(b"counter:k", None, prefix).unwrap();
+
+        let mut with_composite: Vec<&[u8]> = vec![&composed];
+        with_composite.extend_from_slice(suffix);
+        let folded = merger
+            .merge(b"counter:k", Some(&base), &with_composite)
+            .unwrap();
+
+        assert_eq!(
+            decode_counter(&folded).unwrap(),
+            decode_counter(&whole).unwrap(),
+            "a prefix of {split} folded separately must give the whole chain's sum"
+        );
+    }
+}
+
+/// A composition may refuse earlier than the whole chain would, and the engine
+/// answers by keeping the operands; it may never refuse later, because a
+/// composite it accepted has already replaced them on disk.
+#[test]
+fn a_prefix_may_overflow_where_the_chain_against_its_base_does_not() {
+    let merger = CounterMerge;
+    let base = (-1i64).to_le_bytes();
+    let d1 = encode_counter_delta(i64::MAX);
+    let d2 = encode_counter_delta(1);
+
+    // Against the real base the chain stays inside the range.
+    let whole = merger
+        .merge(b"counter:k", Some(&base), &[&d1, &d2])
+        .unwrap();
+    assert_eq!(decode_counter(&whole).unwrap(), i64::MAX);
+
+    // The same prefix folded from nothing leaves it, and is refused rather
+    // than wrapped. The engine re-emits the operands, so the fold above still
+    // happens where the base is.
+    assert!(
+        merger.merge(b"counter:k", None, &[&d1, &d2]).is_err(),
+        "a prefix that leaves i64 is refused, not folded back in"
+    );
+}
+
+/// Only the counter composes. The other two operators are order-dependent
+/// against an unknown base: a removal folded onto an assumed-empty set becomes
+/// an empty set, and a document patch becomes a whole record.
+#[test]
+fn only_the_counter_declares_that_it_composes() {
+    assert!(CounterMerge.composes_operands());
+    assert!(!PostingListMerge.composes_operands());
+    assert!(!DocumentMerge.composes_operands());
+}
+
 #[test]
 fn counter_merge_no_base_single_delta() {
     let merger = CounterMerge;

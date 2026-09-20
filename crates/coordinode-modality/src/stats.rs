@@ -15,8 +15,11 @@
 //!   counts one per VERSION, matching what a partition scan would count).
 //! - `stat:label:<label>` — rows carrying `<label>`.
 //!
-//! Deltas are commutative merge operands: they carry no OCC surface, cannot
-//! conflict, and fold at compaction.
+//! Deltas are commutative merge operands: they carry no OCC surface and
+//! cannot conflict. They fold only where the engine can prove what they
+//! apply to, which above the last level it cannot, so between compactions
+//! that reach it the chain on a key grows with the write volume and every
+//! read of the counter resolves all of it.
 
 use coordinode_storage::engine::transaction::Transaction;
 

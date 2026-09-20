@@ -244,7 +244,7 @@ impl MergeOperator for DocumentMerge {
 
 /// Decode a NodeRecord from storage bytes.
 /// Handles both prefixed (0x00 + msgpack) and legacy bare msgpack formats.
-fn decode_node_record(data: &[u8]) -> Result<NodeRecord, LsmError> {
+pub(crate) fn decode_node_record(data: &[u8]) -> Result<NodeRecord, LsmError> {
     if data.is_empty() {
         return Err(LsmError::MergeOperator);
     }
@@ -531,6 +531,25 @@ impl MergeOperator for CounterMerge {
         }
 
         Ok(total.to_le_bytes().to_vec().into())
+    }
+
+    /// A sum of deltas is itself a delta, so a prefix may be folded where the
+    /// base is not yet known.
+    ///
+    /// The composite is another eight-byte counter, zero is the identity of
+    /// addition so folding from no base yields the prefix itself rather than a
+    /// state, and addition is associative. Refusing is safe in the one
+    /// direction that matters: the composed step lands on `base + sum(prefix)`,
+    /// which the un-composed chain also passes through, so a chain that folds
+    /// against a real base never meets an overflow the composition introduced.
+    ///
+    /// This matters because the statistics counters are written once per node
+    /// insert and delete and are never written as a value, so no compaction
+    /// above the last level can prove their base, and without folding here the
+    /// chain on one key grows with the write volume while every read of it
+    /// resolves the whole chain.
+    fn composes_operands(&self) -> bool {
+        true
     }
 }
 
