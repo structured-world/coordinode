@@ -5478,9 +5478,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "structured-proxy"
-version = "3.0.2"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c4f0e8599a94a44e69bd0cb534a66a6ded5af4cd3ca47e53ae76cf9e1c0ee1c"
+checksum = "d68fd53b65a2af84a2a89596d0aaa6247e03d6a6e99f958296c40342104a177b"
 dependencies = [
  "anyhow",
  "async-trait",
