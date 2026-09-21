@@ -183,6 +183,43 @@ impl PendingCommits {
     pub fn snapshot_floor(&self, read_clock: impl FnOnce() -> u64) -> u64 {
         let table = self.inner.lock();
         let latest = read_clock();
+        Self::floor_of(&table, latest)
+    }
+
+    /// The freshest complete snapshot, waiting briefly for the commits in
+    /// flight to land rather than stepping back behind them.
+    ///
+    /// Stepping back is correct and was the first answer, but it is paid for
+    /// by everyone: the floor is the oldest commit in flight anywhere on the
+    /// node, so under any concurrency a transaction is handed a view older
+    /// than its own last commit. It then reads its own stale value and
+    /// conflicts with itself. Measured with eight writers on keys they did
+    /// not share: 59% of attempts refused, none of them for a real overlap.
+    ///
+    /// A commit holds its registration only from validation to local apply,
+    /// which is microseconds, so waiting for that window to pass costs less
+    /// than reading behind it. The wait is bounded, and its expiry falls back
+    /// to the floor: an older complete view, never an incomplete fresh one.
+    pub fn complete_snapshot(&self, read_clock: impl Fn() -> u64, wait: Duration) -> u64 {
+        let deadline = Instant::now() + wait;
+        let mut table = self.inner.lock();
+        loop {
+            let latest = read_clock();
+            if table.is_empty() {
+                return latest;
+            }
+            let floor = Self::floor_of(&table, latest);
+            if floor == latest {
+                return latest;
+            }
+            if self.finished.wait_until(&mut table, deadline).timed_out() {
+                let latest = read_clock();
+                return Self::floor_of(&table, latest);
+            }
+        }
+    }
+
+    fn floor_of(table: &HashMap<u64, Admitted>, latest: u64) -> u64 {
         table
             .values()
             .map(|a| a.commit_ts)

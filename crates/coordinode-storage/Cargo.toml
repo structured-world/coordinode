@@ -101,6 +101,10 @@ name = "invariant_guard"
 harness = false
 
 [[bench]]
+name = "commit_fence"
+harness = false
+
+[[bench]]
 name = "coordinator_dispatch"
 harness = false
 

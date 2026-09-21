@@ -2411,8 +2411,14 @@ impl StorageEngine {
     /// commit lags by that commit, which is the definition of complete rather
     /// than a delay added on top of it.
     pub fn snapshot(&self) -> lsm_tree::SeqNo {
-        self.pending_commits
-            .snapshot_floor(|| self.coordinator.snapshot())
+        self.pending_commits.complete_snapshot(
+            || self.coordinator.snapshot(),
+            // Short on purpose: a registration is held from validation to
+            // local apply, which is microseconds. Anything longer than that
+            // is a commit that is stuck, and a reader should step behind it
+            // rather than wait on it.
+            std::time::Duration::from_millis(5),
+        )
     }
 
     /// Creates a point-in-time snapshot at a specific sequence number.
