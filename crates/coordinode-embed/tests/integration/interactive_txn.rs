@@ -532,6 +532,112 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
 }
 
+/// A fenced claim is the same primitive, not a second one.
+///
+/// The claim is a record. Holding it means having written it; keeping it
+/// means every protected write states the version it was written at. When
+/// somebody takes the claim over, the old holder's next write is refused, and
+/// refused for the claim rather than for the data it was about to change,
+/// which is what makes the fence a fence: the work it would have done never
+/// reaches the records it protects.
+#[test]
+fn a_claim_fences_the_writes_of_the_holder_it_replaced() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE (c:Claim {holder: 'first'})")
+        .expect("take the claim");
+    db.execute_cypher("CREATE (d:Data {value: 0})")
+        .expect("the record the claim protects");
+
+    let claim = NodeId::from_raw(1);
+    let held_at = db
+        .node_version(claim)
+        .expect("read")
+        .expect("the claim exists");
+
+    // The holder is about to write under its claim, and states the claim's
+    // version alongside the write it protects.
+    let protected = db.begin_transaction();
+    db.execute_in_transaction(protected, "MATCH (d:Data) SET d.value = 1", None)
+        .expect("statement");
+    db.expect_node_version(protected, claim, Some(held_at))
+        .expect("state the claim");
+
+    // Somebody takes the claim over first.
+    db.execute_cypher("MATCH (c:Claim) SET c.holder = 'second'")
+        .expect("take over");
+
+    let refusal = db
+        .commit_transaction(protected)
+        .expect_err("the claim is no longer held by this writer");
+    assert!(
+        matches!(refusal, DatabaseError::RevisionMismatch { expected, .. } if expected == Some(held_at)),
+        "the refusal is about the claim it named, got {refusal:?}"
+    );
+
+    let data = db
+        .execute_cypher("MATCH (d:Data) RETURN d.value AS value")
+        .expect("read");
+    assert_eq!(
+        data[0].get("value").and_then(|v| v.as_int()),
+        Some(0),
+        "the fenced writer changed nothing it was about to change"
+    );
+}
+
+/// After an outcome the caller never learned, the same condition tells it
+/// which way the first attempt went.
+///
+/// The dangerous retry is the blind one: the client did not hear back, so it
+/// runs the write again and applies it twice. Retrying with the version it
+/// originally read answers the question instead. If the first attempt landed,
+/// the version moved and the retry is refused, which is the client learning
+/// that it succeeded; if it did not, the version is unchanged and the retry
+/// does the work.
+#[test]
+fn a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Counter {value: 0})")
+        .expect("create");
+    let counter = NodeId::from_raw(1);
+    let before = db.node_version(counter).expect("read").expect("exists");
+
+    // The first attempt commits, but the caller never hears the receipt.
+    let attempt = db.begin_transaction();
+    db.execute_in_transaction(attempt, "MATCH (n:Counter) SET n.value = 1", None)
+        .expect("statement");
+    db.expect_node_version(attempt, counter, Some(before))
+        .expect("state the condition");
+    db.commit_transaction(attempt).expect("it did land");
+
+    // Not knowing that, the caller retries the same work against the same
+    // version it read at the start.
+    let retry = db.begin_transaction();
+    db.execute_in_transaction(retry, "MATCH (n:Counter) SET n.value = 1", None)
+        .expect("statement");
+    db.expect_node_version(retry, counter, Some(before))
+        .expect("state the same condition");
+    let outcome = db.commit_transaction(retry);
+
+    assert!(
+        matches!(outcome, Err(DatabaseError::RevisionMismatch { .. })),
+        "the refusal is how the caller learns the first attempt landed, got {outcome:?}"
+    );
+    let value = db
+        .execute_cypher("MATCH (n:Counter) RETURN n.value AS value")
+        .expect("read");
+    assert_eq!(
+        value[0].get("value").and_then(|v| v.as_int()),
+        Some(1),
+        "and the work happened exactly once"
+    );
+}
+
 /// The condition can only be stated on a transaction that exists, and a node
 /// that does not exist has no version rather than a zero one.
 #[test]

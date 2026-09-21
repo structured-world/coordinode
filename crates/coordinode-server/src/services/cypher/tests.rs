@@ -238,6 +238,89 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .expect("the version matches now");
 }
 
+/// Two claimers of one record over the wire: exactly one takes it, and the
+/// other is told which version is there rather than that something contended.
+///
+/// Both state the same condition, which each believes to be true, and the
+/// condition is what tells them apart: they write the same key, so one would
+/// lose anyway, but losing on the version is what lets the loser act rather
+/// than guess.
+#[tokio::test]
+async fn grpc_two_claimers_of_one_record_produce_one_winner() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    svc.execute_cypher(cypher_request("CREATE (c:Lease {holder: 'nobody'})"))
+        .await
+        .expect("create");
+
+    let lease = coordinode_core::graph::node::NodeId::from_raw(1);
+    let free_at = svc
+        .database
+        .read()
+        .node_version(lease)
+        .expect("read")
+        .expect("the lease record exists");
+
+    // Both open a transaction and stake the same version before either
+    // commits, which is what makes this a race rather than a sequence.
+    let mut claims = Vec::new();
+    for holder in ["first", "second"] {
+        let tx = svc
+            .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+            .await
+            .expect("begin")
+            .into_inner()
+            .transaction_id;
+        svc.execute_cypher(cypher_request_in_txn(
+            &format!("MATCH (c:Lease) SET c.holder = '{holder}'"),
+            tx,
+        ))
+        .await
+        .expect("statement");
+        claims.push(tx);
+    }
+
+    let commit = |tx: u64| {
+        svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![query::ExpectedNodeVersion {
+                node_id: lease.as_raw(),
+                version: Some(free_at),
+            }],
+        }))
+    };
+
+    commit(claims[0]).await.expect("the first claimer takes it");
+    let status = commit(claims[1])
+        .await
+        .expect_err("the lease is no longer free");
+
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "REVISION_MISMATCH");
+    assert_eq!(
+        info.metadata.get("current_version"),
+        Some(
+            &svc.database
+                .read()
+                .node_version(lease)
+                .expect("read")
+                .expect("still there")
+                .to_string()
+        ),
+        "the loser is told the version that is actually there"
+    );
+
+    let holder = svc
+        .execute_cypher(cypher_request("MATCH (c:Lease) RETURN c.holder AS holder"))
+        .await
+        .expect("read")
+        .into_inner();
+    assert_eq!(holder.rows.len(), 1, "one lease, one holder");
+}
+
 /// gRPC interactive transaction: begin → statement-in-txn → commit, with
 /// the buffered writes invisible until commit, then visible after.
 #[tokio::test]

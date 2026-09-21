@@ -116,6 +116,24 @@ A transaction is told about the conflict whether the other one has finished or i
 
 Posting-list operations (adding/removing edges on a node) use **merge operators** — they are commutative and never conflict with each other, only with DELETE on the same node.
 
+### Writing at the version you read
+
+A record's **version** is the timestamp of the commit that last wrote it: the same number a write receipt returns as `commit_ts`. It comes back with the node (`Node.version` over gRPC, `Database::node_version` embedded), so a read gives you the value and the version together rather than making you fetch them separately and race in between.
+
+A transaction can be committed on the condition that a node is still at the version you read. Over gRPC that is `CommitTransactionRequest.expect`; embedded it is `Database::expect_node_version` on the open transaction. An unset version means the node must **not** exist, which is the create-if-absent form of the same condition.
+
+When the version has moved, the whole transaction is refused with `ABORTED` and `reason = REVISION_MISMATCH`, and the error metadata carries `expected_version` and `current_version`. Nothing of the transaction is applied. The current version travels with the refusal because your next move is computed from it: retry against what is there, merge, or stop. The server attaches no retry advice for this reason, unlike a write conflict: you named a version, so the decision is yours, and repeating a write whose premise was just disproved is rarely the right one.
+
+Two uses follow from the same primitive.
+
+**Read-modify-write without a lock.** Read the node and its version, compute, write on the condition of that version. First-writer-wins is a compare-and-set here, so the loser is told rather than silently overwritten.
+
+**A fenced claim.** A lease or a claim is a record; holding it means having written it. Every write done under the claim states the claim record's version. When someone takes the claim over, the previous holder's next write is refused on the claim rather than on the data, so the work it would have done never reaches the records the claim protects.
+
+**Retrying after an outcome you never heard.** If a commit's reply is lost, retry the same work against the version you originally read. If the first attempt landed, the version moved and the retry is refused, which is how you learn it succeeded; if it did not, the version is unchanged and the retry does the work. The blind retry, which applies the write twice, is what this avoids.
+
+Adjacency and counters carry no version. Their rows are folded from operands rather than replaced, so no single commit last wrote one, and a conditional write over them would be a condition on nothing. Asking for their version is refused rather than answered with "nothing is there", and so is conditioning a write on one. Edges added and removed, and counters incremented, are ordered by their merge operator and need no version to be safe under concurrency.
+
 ### Invariant refusals
 
 Writing the same key is not the only way two transactions can be incompatible. Two of them can write entirely different keys and still, together, break a condition each of them checked on its own: an edge attached to a node the other is deleting, or a MERGE that created a relationship because it saw none while the other erased the last one. First-writer-wins cannot see either case, because there is no shared key to see it on.
