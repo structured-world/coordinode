@@ -1132,16 +1132,22 @@ impl<'a> Transaction<'a> {
         // abort storms the merge path exists to prevent. Detects ABA (write +
         // revert) via lsm-tree seqno inspection, same as the read-set probe
         // this replaced.
-        let occ_read_ts = self.read_ts.as_raw();
+        // Validated against the view this transaction read, not against the
+        // timestamp it was issued. The two are not the same number: an
+        // attempt's timestamp identifies it and orders it, while its view is
+        // where its values came from, and it is the view that says which
+        // writes it could not have seen. Validating against the higher of the
+        // two would silently forgive every write in between.
+        let occ_read_ts = self.snapshot.unwrap_or_else(|| self.read_ts.as_raw());
         for (part, key) in self.write_buffer.keys() {
             if part.is_commutative() {
                 continue;
             }
-            // Inclusive against the read timestamp, which is a snapshot: a
-            // snapshot sees sequence numbers strictly below itself, so a write
-            // landing at exactly that number is one this transaction could not
-            // have seen. The strict comparison missed precisely the closest
-            // concurrent writer, which is the one most likely to be there.
+            // Inclusive: a snapshot sees sequence numbers strictly below
+            // itself, so a write landing at exactly that number is one this
+            // transaction could not have seen. The strict comparison missed
+            // precisely the closest concurrent writer, which is the one most
+            // likely to be there.
             if self
                 .engine
                 .written_since_snapshot(*part, key, occ_read_ts)?

@@ -1601,7 +1601,12 @@ impl Database {
         self.reap_idle_transactions(self.interactive_idle_timeout);
         let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed) + 1;
         let read_ts = self.oracle.next();
-        let snapshot = self.engine.snapshot_at(read_ts.as_raw());
+        // The view is the engine's complete snapshot, not the timestamp just
+        // allocated: a fresh number from the clock can already cover a commit
+        // that has not applied, and a transaction starting there would see
+        // neither that write nor any sign of it. `read_ts` stays the
+        // allocated value because it identifies this attempt.
+        let snapshot = Some(self.engine.snapshot());
         let mut txn = coordinode_storage::engine::transaction::Transaction::new(
             &self.engine,
             Some(&self.oracle),
