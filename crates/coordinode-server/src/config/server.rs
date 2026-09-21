@@ -119,6 +119,9 @@ pub struct ServerConfig {
     /// Ceiling on the invariant claims held by all in-flight write attempts on
     /// this node, together (`None` = 100000).
     pub max_invariant_claims: Option<usize>,
+    /// Ceiling on the commits admitted and not yet applied on this node
+    /// (`None` = 10000).
+    pub max_commits_in_flight: Option<usize>,
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
@@ -230,6 +233,7 @@ impl Default for ServerConfig {
             write_buffer_mb: None,
             retention_window_secs: None,
             max_invariant_claims: None,
+            max_commits_in_flight: None,
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
@@ -438,6 +442,9 @@ impl ServerConfig {
         // engine settings: what it may hold, and where it looks for a node.
         if let Some(limit) = self.max_invariant_claims {
             cfg.max_invariant_claims = limit;
+        }
+        if let Some(limit) = self.max_commits_in_flight {
+            cfg.max_commits_in_flight = limit;
         }
         if let Some(shard) = self.node_shard {
             cfg.node_shard = shard;

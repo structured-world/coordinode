@@ -45,30 +45,37 @@ struct Admitted {
 #[derive(Debug)]
 pub struct PendingCommits {
     inner: Mutex<HashMap<u64, Admitted>>,
+    max_in_flight: usize,
 }
 
 /// Why an admission was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Overlap {
-    /// The key both commits write.
-    pub partition: Partition,
-    /// The key itself, for the message the caller has to produce.
-    pub key: Vec<u8>,
-    /// The timestamp the commit holding it will land at.
-    pub holder_ts: u64,
-}
-
-impl Default for PendingCommits {
-    fn default() -> Self {
-        Self::new()
-    }
+pub enum Refusal {
+    /// Another commit in flight writes a key this one writes.
+    Overlap {
+        /// The key both commits write.
+        partition: Partition,
+        /// The key itself, for the message the caller has to produce.
+        key: Vec<u8>,
+        /// The timestamp the commit holding it will land at.
+        holder_ts: u64,
+    },
+    /// The table is at its bound. Admitting more would let the memory the
+    /// guard holds grow with load, so the commit is refused while it can
+    /// still be retried, rather than the bound being discovered later as
+    /// exhaustion somewhere else.
+    AtCapacity {
+        /// The number of commits the table admits at once.
+        limit: usize,
+    },
 }
 
 impl PendingCommits {
-    /// An empty table.
-    pub fn new() -> Self {
+    /// An empty table admitting at most `max_in_flight` commits at once.
+    pub fn new(max_in_flight: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            max_in_flight,
         }
     }
 
@@ -92,14 +99,23 @@ impl PendingCommits {
         &'p self,
         allocate: impl FnOnce() -> u64,
         scope: Vec<(Partition, Vec<u8>)>,
-    ) -> Result<(u64, Admission<'p>), Overlap> {
+    ) -> Result<(u64, Admission<'p>), Refusal> {
         let mut table = self.inner.lock();
+
+        // Accounted before the timestamp is taken: a number allocated and then
+        // refused is a hole in the clock nobody closes.
+        if table.len() >= self.max_in_flight {
+            return Err(Refusal::AtCapacity {
+                limit: self.max_in_flight,
+            });
+        }
+
         let commit_ts = allocate();
 
         for other in table.values() {
             for (partition, key) in &scope {
                 if other.scope.iter().any(|(p, k)| p == partition && k == key) {
-                    return Err(Overlap {
+                    return Err(Refusal::Overlap {
                         partition: *partition,
                         key: key.clone(),
                         holder_ts: other.commit_ts,

@@ -669,6 +669,20 @@ pub struct StorageConfig {
     /// Runtime-tunable through the engine; restart-free.
     pub max_invariant_claims: usize,
 
+    /// Ceiling on the commits admitted and not yet applied on this node.
+    ///
+    /// A commit registers the keys it will write before it validates, and
+    /// holds that registration until its writes are local state. The table
+    /// therefore holds one entry per commit in flight, which is bounded by
+    /// concurrency rather than by data size; the ceiling is what stops a
+    /// pathological backlog (a stalled replication wait, a flood of writers)
+    /// from growing it without limit. At the ceiling a commit is refused
+    /// while it can still be retried.
+    ///
+    /// The default is far above what a healthy node holds at once: reaching
+    /// it means commits are not finishing, not that the node is busy.
+    pub max_commits_in_flight: usize,
+
     /// The shard whose node rows this engine holds.
     ///
     /// Node keys carry the shard ahead of the id, so a lookup by node id
@@ -849,6 +863,7 @@ impl StorageConfig {
             oplog_retention_secs: 7 * 24 * 3600,
             retention_window_secs: 7 * 24 * 3600,
             max_invariant_claims: 100_000,
+            max_commits_in_flight: 10_000,
             node_shard: 0,
             drain_interval_ms: 100,
             drain_batch_max: 10_000,

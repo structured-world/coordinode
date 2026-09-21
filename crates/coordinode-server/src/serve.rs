@@ -135,6 +135,7 @@ pub(crate) async fn serve(
         // Applied to the engine through resolve_storage_config above.
         retention_window_secs: _,
         max_invariant_claims: _,
+        max_commits_in_flight: _,
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,

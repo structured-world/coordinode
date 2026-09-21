@@ -1093,13 +1093,28 @@ impl<'a> Transaction<'a> {
             .engine
             .pending_commits()
             .admit_allocated(|| oracle.next().as_raw(), scope)
-            .map_err(|overlap| {
-                CommitError::Conflict(format!(
-                    "write conflict: a key in the {:?} partition is already being \
-                     written by a transaction committing at {}. Nothing was \
-                     applied; retry the whole transaction.",
-                    overlap.partition, overlap.holder_ts,
-                ))
+            .map_err(|refusal| match refusal {
+                crate::engine::pending::Refusal::Overlap {
+                    partition,
+                    holder_ts,
+                    ..
+                } => CommitError::Conflict(format!(
+                    "write conflict: a key in the {partition:?} partition is already \
+                     being written by a transaction committing at {holder_ts}. \
+                     Nothing was applied; retry the whole transaction."
+                )),
+                // Not a conflict with anyone in particular: the node is
+                // holding more unfinished commits than it admits, and the
+                // answer is the same one backpressure gives, a retry after a
+                // delay rather than an immediate one that bounces off the
+                // same ceiling.
+                crate::engine::pending::Refusal::AtCapacity { limit } => {
+                    tracing::warn!(
+                        limit,
+                        "commit refused: more commits are in flight than this node admits"
+                    );
+                    CommitError::Backpressure
+                }
             })?;
         let commit_ts = Timestamp::from_raw(commit_ts_raw);
 

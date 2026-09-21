@@ -796,7 +796,9 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
-            pending_commits: crate::engine::pending::PendingCommits::new(),
+            pending_commits: crate::engine::pending::PendingCommits::new(
+                config.max_commits_in_flight,
+            ),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
             tiered_cache,
