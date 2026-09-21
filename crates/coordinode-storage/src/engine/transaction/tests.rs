@@ -267,6 +267,85 @@ fn concurrent_writers_on_one_key_lose_no_update() {
     );
 }
 
+/// A reader never sees part of a batch.
+///
+/// The whole batch lands at one sequence number, but not at one instant: the
+/// apply walks it key by key. A reader whose snapshot covers that number
+/// while the walk is still going would answer from a prefix of a transaction
+/// that has not finished, which is neither the state before it nor the state
+/// after. The registration is what stops the snapshot short of it.
+#[test]
+fn a_reader_never_sees_part_of_a_batch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const KEYS: usize = 1_000;
+    let (engine, oracle, _d) = test_engine();
+    let key = |i: usize| format!("node:batch:{i:04}").into_bytes();
+
+    let done = AtomicBool::new(false);
+    let observations = std::thread::scope(|scope| {
+        let reader = {
+            let engine = Arc::clone(&engine);
+            let done = &done;
+            scope.spawn(move || {
+                let mut seen_counts = Vec::new();
+                let mut saw_complete = false;
+                while !done.load(Ordering::Relaxed) || !saw_complete {
+                    let snap = engine.snapshot();
+                    let present = (0..KEYS)
+                        .filter(|i| {
+                            engine
+                                .snapshot_get(&snap, Partition::Node, &key(*i))
+                                .expect("read")
+                                .is_some()
+                        })
+                        .count();
+                    if present == KEYS {
+                        saw_complete = true;
+                    }
+                    seen_counts.push(present);
+                }
+                seen_counts
+            })
+        };
+
+        let mut txn = mvcc_txn(&engine, &oracle);
+        for i in 0..KEYS {
+            txn.put(Partition::Node, &key(i), b"v").expect("stage");
+        }
+        let wc = WriteConcern::default();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).expect("commit");
+        done.store(true, Ordering::Relaxed);
+
+        reader.join().expect("reader")
+    });
+
+    let partial: Vec<usize> = observations
+        .iter()
+        .copied()
+        .filter(|n| *n != 0 && *n != KEYS)
+        .collect();
+    assert!(
+        partial.is_empty(),
+        "a reader saw a partial batch: {} of {} observations were neither \
+         empty nor complete, first few {:?}",
+        partial.len(),
+        observations.len(),
+        &partial[..partial.len().min(5)]
+    );
+    assert!(
+        observations.contains(&KEYS),
+        "the reader never saw the batch at all, so it proved nothing"
+    );
+}
+
 /// Folding the mutations does not fold what they protect.
 ///
 /// The commit coalesces a run of adjacency adds on one key into a single
