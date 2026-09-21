@@ -162,9 +162,27 @@ fn mk_engine() -> coordinode_test_fixtures::EngineFixture {
 /// `Partition::Idx`) and commit, so the buffered index rows land
 /// for a subsequent read.
 fn write_spatial(engine: &StorageEngine, body: impl FnOnce(&LocalSpatialStore, &mut Transaction)) {
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    // Resumed from the engine's own clock rather than from one. A fixture
+    // oracle that starts at one hands out commit timestamps far below
+    // everything the engine has already applied, and a reader whose snapshot
+    // stops below such a commit sees almost nothing. Starting where the
+    // engine is keeps the two numbers comparable.
+    //
+    // One per call is fine for a single-threaded test; concurrent writers
+    // share one through `write_spatial_with`.
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(engine.snapshot()));
+    write_spatial_with(engine, &oracle, body)
+}
+
+/// The same, against a clock the caller owns. Two commits that believe they
+/// are at one timestamp are two commits the engine cannot order.
+fn write_spatial_with(
+    engine: &StorageEngine,
+    oracle: &TimestampOracle,
+    body: impl FnOnce(&LocalSpatialStore, &mut Transaction),
+) {
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::new(engine, Some(oracle), read_ts, Some(engine.snapshot()));
     body(&LocalSpatialStore, &mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -793,12 +811,18 @@ fn concurrent_insert_distinct_ids_all_visible() {
     let fx = mk_engine();
     let engine = Arc::clone(&fx.engine);
 
+    // One clock for all four, as a deployment has.
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(
+        engine.snapshot(),
+    )));
+
     let handles: Vec<_> = (0..4u64)
         .map(|t| {
             let engine = Arc::clone(&engine);
+            let oracle = Arc::clone(&oracle);
             thread::spawn(move || {
                 let point = Point::new_2d(Crs::Cartesian2d, t as f64, t as f64);
-                write_spatial(&engine, |s, txn| {
+                write_spatial_with(&engine, &oracle, |s, txn| {
                     s.insert(txn, 1, NodeId::from_raw(t + 1), &point)
                         .expect("insert");
                 });

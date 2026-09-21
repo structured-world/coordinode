@@ -986,31 +986,6 @@ impl<'a> Transaction<'a> {
             });
         }
 
-        // The conditions this attempt's result was built on, checked where
-        // the caller is still listening and before anything is applied. Two
-        // halves, and neither is sufficient alone: the registry sees the
-        // attempts in flight beside this one, the evaluation sees the state
-        // they have all committed.
-        //
-        // The reservation is held for the rest of the commit, by a guard that
-        // releases it however the commit ends: the window it protects is the
-        // one between deciding a condition holds and applying the writes built
-        // on it, and once those are applied the state carries the fact itself.
-        let _reservation = if self.claims.is_empty() {
-            None
-        } else {
-            let attempt = self.read_ts.as_raw();
-            let engine: &'a StorageEngine = self.engine;
-            let held = engine
-                .claim_registry()
-                .reserve_held(attempt, &self.claims)
-                .map_err(|refusal| CommitError::InvariantRefused {
-                    reason: format!("{refusal:?}"),
-                })?;
-            self.evaluate_claims()?;
-            Some(held)
-        };
-
         // Write-admission gate: under Stop pressure (storage over its
         // compaction-debt stop threshold) a commit carrying writes is
         // rejected BEFORE anything is applied, as a retryable error. One
@@ -1068,6 +1043,30 @@ impl<'a> Transaction<'a> {
             });
         }
 
+        // Protection is installed here, in one place, and nothing of this
+        // attempt is applied until all of it is: the conditions it declared,
+        // the timestamp it will land at, and the keys it will write. They
+        // were once taken apart, the conditions at the top of the commit and
+        // the keys much later, with the admission checks and the mutation
+        // building in between; no schedule could tell the two forms apart,
+        // since the apply follows both either way, but an attempt that failed
+        // in between held a reservation it had no use for, and a reader of
+        // this function had to reconstruct that the two belonged together.
+        let _reservation = if self.claims.is_empty() {
+            None
+        } else {
+            let attempt = self.read_ts.as_raw();
+            let engine: &'a StorageEngine = self.engine;
+            Some(
+                engine
+                    .claim_registry()
+                    .reserve_held(attempt, &self.claims)
+                    .map_err(|refusal| CommitError::InvariantRefused {
+                        reason: format!("{refusal:?}"),
+                    })?,
+            )
+        };
+
         // The scope this commit is about to write, registered together with
         // the timestamp it will land at and held until its writes are there.
         //
@@ -1117,6 +1116,15 @@ impl<'a> Transaction<'a> {
                 }
             })?;
         let commit_ts = Timestamp::from_raw(commit_ts_raw);
+
+        // Both halves of the condition check, now that the protection is
+        // installed: the registry saw the attempts in flight beside this one,
+        // and this sees the state they have all committed. Neither is
+        // sufficient alone, and the evaluation reads storage, so it belongs
+        // outside the tables rather than inside them.
+        if !self.claims.is_empty() {
+            self.evaluate_claims()?;
+        }
 
         // First-committer-wins over the WRITE set (ADR-016 seqno probing, write
         // keys only). Every mainstream engine conflicts on concurrent writes

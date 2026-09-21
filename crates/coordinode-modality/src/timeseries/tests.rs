@@ -29,9 +29,28 @@ fn ts_write<R>(
     engine: &StorageEngine,
     body: impl FnOnce(&LocalTimeSeriesStore, &mut Transaction) -> R,
 ) -> R {
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    // Resumed from the engine's own clock rather than from one. A fixture
+    // oracle that starts at one hands out commit timestamps far below
+    // everything the engine has already applied, and a reader whose snapshot
+    // stops below such a commit sees almost nothing.
+    //
+    // One oracle per call is fine for a single-threaded test and wrong for
+    // concurrent writers, who would each hand out the same numbers from their
+    // own copy: see `ts_write_with`, which takes the one they share.
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(engine.snapshot()));
+    ts_write_with(engine, &oracle, body)
+}
+
+/// The same, against a clock the caller owns. Concurrent writers must share
+/// one: two commits that believe they are at the same timestamp are two
+/// commits the engine cannot order, and no amount of care below fixes that.
+fn ts_write_with<R>(
+    engine: &StorageEngine,
+    oracle: &TimestampOracle,
+    body: impl FnOnce(&LocalTimeSeriesStore, &mut Transaction) -> R,
+) -> R {
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::new(engine, Some(oracle), read_ts, Some(engine.snapshot()));
     let out = body(&LocalTimeSeriesStore, &mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -51,7 +70,7 @@ fn ts_read<R>(
     engine: &StorageEngine,
     body: impl FnOnce(&LocalTimeSeriesStore, &Transaction) -> R,
 ) -> R {
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(engine.snapshot()));
     let read_ts = oracle.next();
     let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
     body(&LocalTimeSeriesStore, &txn)
@@ -163,15 +182,23 @@ fn concurrent_put_overflow_distinct_seqnos_converges() {
     let bid = NodeId::from_raw(70);
     let label = 13u32;
 
+    // One clock for all four, as a deployment has: a per-thread oracle would
+    // hand every thread the same timestamps, and commits the engine cannot
+    // order are not what this test is about.
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(
+        engine.snapshot(),
+    )));
+
     let handles: Vec<_> = (0..4u64)
         .map(|t| {
             let engine = Arc::clone(&engine);
+            let oracle = Arc::clone(&oracle);
             thread::spawn(move || {
                 let entry = OverflowEntry {
                     arrival_seqno: t + 1,
                     measurement: mk_measurement((t as i64 + 1) * 100, t as f64),
                 };
-                ts_write(&engine, |s, txn| {
+                ts_write_with(&engine, &oracle, |s, txn| {
                     s.put_overflow(txn, label, bid, &entry).expect("put");
                 });
             })
