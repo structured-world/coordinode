@@ -1821,6 +1821,57 @@ impl Database {
         }
     }
 
+    /// The version of a node: the timestamp of the commit that last wrote it,
+    /// or `None` when there is no such node.
+    ///
+    /// This is the number a conditional write is stated against. It is the
+    /// commit timestamp rather than a counter of the node's own, so the same
+    /// value a write receipt already returns is the one a later write
+    /// conditions on.
+    pub fn node_version(
+        &self,
+        node_id: coordinode_core::graph::node::NodeId,
+    ) -> Result<Option<u64>, DatabaseError> {
+        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
+        Ok(self
+            .engine
+            .record_version(coordinode_storage::engine::partition::Partition::Node, &key)?)
+    }
+
+    /// Commit this transaction only while the node is still at `expected`.
+    ///
+    /// `None` requires the node not to exist, which is the create-if-absent
+    /// form of the same condition. The condition is checked when the
+    /// transaction commits, against the state at that moment, and a mismatch
+    /// refuses the whole transaction with the version that is there instead.
+    ///
+    /// Stating it does not read the node or write anything by itself: it is
+    /// the caller saying what its statements were built on. A caller that
+    /// wants the ordinary read-modify-write pairs this with
+    /// [`Self::node_version`] before the statements that change the node.
+    pub fn expect_node_version(
+        &self,
+        txn_id: u64,
+        node_id: coordinode_core::graph::node::NodeId,
+        expected: Option<u64>,
+    ) -> Result<(), DatabaseError> {
+        let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
+        let mut reg = self
+            .interactive_txns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some((state, touched)) = reg.get_mut(&txn_id) else {
+            return Err(DatabaseError::UnknownTransaction(txn_id));
+        };
+        *touched = Instant::now();
+        state.expect_version(
+            coordinode_storage::engine::partition::Partition::Node,
+            &key,
+            expected,
+        )?;
+        Ok(())
+    }
+
     /// Drop interactive transactions idle longer than `timeout` (ADR-042
     /// mandatory idle timeout). An open transaction pins an MVCC snapshot and
     /// buffers writes in memory, so an abandoned one would leak retention and

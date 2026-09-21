@@ -459,3 +459,121 @@ fn rollback_yields_no_receipt_and_no_change_to_scan_from() {
         "handle consumed by rollback"
     );
 }
+
+/// Read-modify-write against the version the caller read: it commits while
+/// the node is still there, and is refused with the version that replaced it
+/// once somebody else has written.
+///
+/// This is the loop a caller used to hand-roll out of a read, a write and a
+/// hope. The point of stating the version is that the refusal is a fact about
+/// the record rather than a guess about the race.
+#[test]
+fn a_transaction_commits_only_at_the_node_version_it_read() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:Account {balance: 100})")
+        .expect("create");
+
+    // The first node of a fresh database. Asserting the version is there also
+    // asserts that assumption, loudly, rather than silently testing nothing.
+    let account = NodeId::from_raw(1);
+    let read_version = db
+        .node_version(account)
+        .expect("read version")
+        .expect("the account exists");
+
+    // Somebody else changes it between the read and the write.
+    db.execute_cypher("MATCH (n:Account) SET n.balance = 250")
+        .expect("concurrent write");
+    let moved_to = db
+        .node_version(account)
+        .expect("read version")
+        .expect("still there");
+    assert_ne!(moved_to, read_version, "the write moved the version");
+
+    // The stale writer's transaction is refused, and told what is there now.
+    let stale = db.begin_transaction();
+    db.execute_in_transaction(stale, "MATCH (n:Account) SET n.balance = 500", None)
+        .expect("statement");
+    db.expect_node_version(stale, account, Some(read_version))
+        .expect("state the condition");
+    match db.commit_transaction(stale) {
+        Err(DatabaseError::RevisionMismatch {
+            expected, current, ..
+        }) => {
+            assert_eq!(expected, Some(read_version));
+            assert_eq!(current, Some(moved_to));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+
+    let after = db
+        .execute_cypher("MATCH (n:Account) RETURN n.balance AS balance")
+        .expect("read");
+    assert_eq!(
+        after[0].get("balance").and_then(|v| v.as_int()),
+        Some(250),
+        "the refused transaction applied nothing"
+    );
+
+    // Retried against what is actually there, it lands.
+    let fresh = db.begin_transaction();
+    db.execute_in_transaction(fresh, "MATCH (n:Account) SET n.balance = 500", None)
+        .expect("statement");
+    db.expect_node_version(fresh, account, Some(moved_to))
+        .expect("state the condition");
+    db.commit_transaction(fresh).expect("the version matches");
+
+    let after = db
+        .execute_cypher("MATCH (n:Account) RETURN n.balance AS balance")
+        .expect("read");
+    assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
+}
+
+/// The condition can only be stated on a transaction that exists, and a node
+/// that does not exist has no version rather than a zero one.
+#[test]
+fn a_version_condition_refuses_what_it_cannot_be_stated_on() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+
+    let db = open_db();
+
+    assert_eq!(
+        db.node_version(NodeId::from_raw(404)).expect("read"),
+        None,
+        "a node that was never written has no version"
+    );
+
+    let err = db
+        .expect_node_version(4242, NodeId::from_raw(1), None)
+        .expect_err("there is no such transaction");
+    assert!(
+        matches!(err, DatabaseError::UnknownTransaction(4242)),
+        "expected the unknown-transaction error, got {err:?}"
+    );
+
+    // An absent node with the create-if-absent condition commits, and the
+    // same condition afterwards does not.
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (n:Account {balance: 1})", None)
+        .expect("statement");
+    db.expect_node_version(tx, NodeId::from_raw(1), None)
+        .expect("state the condition");
+    db.commit_transaction(tx).expect("nothing was there");
+
+    let again = db.begin_transaction();
+    db.execute_in_transaction(again, "MATCH (n:Account) SET n.balance = 2", None)
+        .expect("statement");
+    db.expect_node_version(again, NodeId::from_raw(1), None)
+        .expect("state the condition");
+    assert!(
+        matches!(
+            db.commit_transaction(again),
+            Err(DatabaseError::RevisionMismatch { expected: None, .. })
+        ),
+        "the node exists now, so requiring its absence must refuse"
+    );
+}

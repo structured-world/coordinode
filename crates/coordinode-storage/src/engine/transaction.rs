@@ -358,6 +358,29 @@ impl TransactionState {
         self.read_ts
     }
 
+    /// State a version condition on a transaction that is parked between
+    /// statements.
+    ///
+    /// An interactive transaction spends most of its life here rather than as
+    /// a `Transaction`, and a caller that wants to condition its commit has
+    /// nowhere else to say so. The condition binds the commit, not the
+    /// statement it was stated beside.
+    pub fn expect_version(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        expected: Option<u64>,
+    ) -> StorageResult<()> {
+        if part.is_commutative() {
+            return Err(StorageError::InvalidConfig(format!(
+                "the {part:?} partition is merge-composed: its rows are folded from \
+                 operands, so a write cannot be conditioned on their version"
+            )));
+        }
+        self.expected_versions.push((part, key.to_vec(), expected));
+        Ok(())
+    }
+
     /// Approximate size in bytes of the buffered, uncommitted mutations —
     /// the point write buffer (keys + values) plus the adjacency and node
     /// merge buffers. An interactive transaction caps this against a
