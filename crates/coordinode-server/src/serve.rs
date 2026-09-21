@@ -136,6 +136,7 @@ pub(crate) async fn serve(
         retention_window_secs: _,
         max_invariant_claims: _,
         max_commits_in_flight: _,
+        snapshot_wait_ms: _,
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,

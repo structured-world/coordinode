@@ -346,6 +346,85 @@ fn a_reader_never_sees_part_of_a_batch() {
     );
 }
 
+/// Commutative operands are exempt from the fence, as they are from
+/// validation.
+///
+/// Two commits that merge into one adjacency list are not competing for it:
+/// the merge operator is what orders them, and excluding one would serialise
+/// the super-node writes that path exists to keep parallel. The guarantee
+/// this test holds is that the exemption is real and not an accident of
+/// timing: both commit, and both operands are in the result.
+#[test]
+fn commits_that_only_merge_do_not_exclude_each_other() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let key = b"adj:KNOWS:out:\x00\x00\x00\x00\x00\x00\x00\x01";
+
+    let mut first = mvcc_txn(&engine, &oracle);
+    let mut second = mvcc_txn(&engine, &oracle);
+    first.merge_adj_add(key, 2);
+    second.merge_adj_add(key, 3);
+
+    for txn in [&mut first, &mut second] {
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx)
+            .expect("a merge operand competes with nobody");
+    }
+
+    let stored = engine
+        .get(Partition::Adj, key)
+        .expect("get")
+        .expect("posting");
+    assert_eq!(
+        PostingList::from_bytes(&stored).expect("decode").as_slice(),
+        &[2, 3],
+        "both operands are in the result: neither commit excluded the other"
+    );
+    assert_eq!(engine.pending_commits().in_flight(), 0);
+}
+
+/// A read between two commits waits for the one below it and not for the one
+/// above.
+///
+/// The arrangement the contract names: work pending at 100, other work
+/// applied at 200, a read at 150. The read covers the pending commit, so it
+/// cannot be answered until that commit lands; it does not cover the one at
+/// 200, which is therefore none of its business. Answering by comparing
+/// against the highest applied timestamp would get this backwards, which is
+/// why the two are not the same number.
+#[test]
+fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
+    use crate::engine::pending::PendingCommits;
+    use std::time::Duration;
+
+    let pending = PendingCommits::new(16);
+
+    let _at_100 = pending
+        .admit_allocated(|| 100, vec![(Partition::Node, b"a".to_vec())])
+        .expect("admit")
+        .1;
+    let _at_200 = pending
+        .admit_allocated(|| 200, vec![(Partition::Node, b"b".to_vec())])
+        .expect("admit")
+        .1;
+
+    // A read at 150 is held by the commit at 100.
+    let blocking = pending
+        .await_complete_at(150, Duration::from_millis(20))
+        .expect_err("the commit at 100 is inside this read");
+    assert_eq!(blocking, 100);
+
+    // And the snapshot it would otherwise be given stops at 100, not at 200:
+    // the highest applied number says nothing about the hole below it.
+    assert_eq!(pending.snapshot_floor(|| 250), 100);
+}
+
 /// Folding the mutations does not fold what they protect.
 ///
 /// The commit coalesces a run of adjacency adds on one key into a single

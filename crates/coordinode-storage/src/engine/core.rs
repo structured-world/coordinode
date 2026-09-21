@@ -114,6 +114,10 @@ pub struct StorageEngine {
     /// state, which is exactly what these are not part of yet, so they are
     /// consulted beside it.
     pending_commits: crate::engine::pending::PendingCommits,
+    /// How long a snapshot waits for those commits before stepping behind
+    /// them. Runtime-settable: it trades read latency against freshness, and
+    /// which side a deployment wants is not known at compile time.
+    snapshot_wait: std::sync::atomic::AtomicU64,
     /// The shard whose node rows this engine holds, for the one lookup inside
     /// the engine that starts from a node id rather than a key. Settable at
     /// runtime because the layer that knows it is built after the engine.
@@ -799,6 +803,7 @@ impl StorageEngine {
             pending_commits: crate::engine::pending::PendingCommits::new(
                 config.max_commits_in_flight,
             ),
+            snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
             tiered_cache,
@@ -2413,12 +2418,27 @@ impl StorageEngine {
     pub fn snapshot(&self) -> lsm_tree::SeqNo {
         self.pending_commits.complete_snapshot(
             || self.coordinator.snapshot(),
-            // Short on purpose: a registration is held from validation to
-            // local apply, which is microseconds. Anything longer than that
-            // is a commit that is stuck, and a reader should step behind it
-            // rather than wait on it.
-            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(
+                self.snapshot_wait
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         )
+    }
+
+    /// How long a snapshot waits for the commits still landing.
+    pub fn snapshot_wait_ms(&self) -> u64 {
+        self.snapshot_wait
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Change that wait without a restart.
+    ///
+    /// Zero makes a snapshot step behind an unapplied commit immediately
+    /// rather than waiting for it: still complete, but older, and a writer
+    /// starting from it can conflict with its own last commit.
+    pub fn set_snapshot_wait_ms(&self, ms: u64) {
+        self.snapshot_wait
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Creates a point-in-time snapshot at a specific sequence number.

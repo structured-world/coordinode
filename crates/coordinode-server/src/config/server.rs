@@ -122,6 +122,9 @@ pub struct ServerConfig {
     /// Ceiling on the commits admitted and not yet applied on this node
     /// (`None` = 10000).
     pub max_commits_in_flight: Option<usize>,
+    /// How long a read waits, in ms, for commits still landing before it is
+    /// answered from a view that stops behind them (`None` = 5).
+    pub snapshot_wait_ms: Option<u64>,
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
@@ -234,6 +237,7 @@ impl Default for ServerConfig {
             retention_window_secs: None,
             max_invariant_claims: None,
             max_commits_in_flight: None,
+            snapshot_wait_ms: None,
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
@@ -445,6 +449,9 @@ impl ServerConfig {
         }
         if let Some(limit) = self.max_commits_in_flight {
             cfg.max_commits_in_flight = limit;
+        }
+        if let Some(ms) = self.snapshot_wait_ms {
+            cfg.snapshot_wait_ms = ms;
         }
         if let Some(shard) = self.node_shard {
             cfg.node_shard = shard;

@@ -110,6 +110,8 @@ What the window costs: the engine keeps every table a compaction consumed until 
 
 Two concurrent write transactions conflict if they modify the **same node or edge**. Conflict resolution is first-writer-wins: the first transaction to commit succeeds; the second is aborted and must retry.
 
+A read at a timestamp you name (`AS OF TIMESTAMP`, `ReadConcern.at_timestamp`) is answered at that timestamp and no other. When a commit covered by it has not finished landing, the read waits for it rather than answering from a state missing a write its own timestamp includes. The wait is bounded (2 seconds); when it expires the read is refused and names the commit it was waiting for. It is never quietly moved to a timestamp that happens to be ready, because that would answer a different question than the one asked.
+
 A transaction is told about the conflict whether the other one has finished or is still landing. A commit registers the keys it is about to write before it validates them, so the second transaction is refused while the first is still being applied rather than being allowed through to overwrite it. For the same reason a snapshot stops below the oldest commit still in flight: a reader is never handed a timestamp that covers a write it cannot see yet, because a writer that started from such a timestamp would find the key untouched and replace an update it never observed.
 
 Posting-list operations (adding/removing edges on a node) use **merge operators** — they are commutative and never conflict with each other, only with DELETE on the same node.

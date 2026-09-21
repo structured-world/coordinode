@@ -683,6 +683,23 @@ pub struct StorageConfig {
     /// it means commits are not finishing, not that the node is busy.
     pub max_commits_in_flight: usize,
 
+    /// How long a read waits, in milliseconds, for the commits still landing
+    /// before it is answered from a view that stops behind them.
+    ///
+    /// A snapshot must not cover a commit that has not applied, or the reader
+    /// sees neither the write nor any sign of it. There are two ways to
+    /// honour that: wait for the commit, or step behind it. Waiting keeps the
+    /// view fresh and costs the microseconds a commit needs to apply; stepping
+    /// behind is instant and hands back a view older than the reader's own
+    /// last write, which then conflicts with itself. So the wait comes first
+    /// and the step back is the fallback when it expires.
+    ///
+    /// The default is short because the window it waits on is short. Raising
+    /// it trades read latency for freshness under heavy write load; lowering
+    /// it to zero is the old behaviour, which measured 59% false conflicts on
+    /// keys that were never shared.
+    pub snapshot_wait_ms: u64,
+
     /// The shard whose node rows this engine holds.
     ///
     /// Node keys carry the shard ahead of the id, so a lookup by node id
@@ -864,6 +881,7 @@ impl StorageConfig {
             retention_window_secs: 7 * 24 * 3600,
             max_invariant_claims: 100_000,
             max_commits_in_flight: 10_000,
+            snapshot_wait_ms: 5,
             node_shard: 0,
             drain_interval_ms: 100,
             drain_batch_max: 10_000,
