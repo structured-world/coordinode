@@ -1068,7 +1068,40 @@ impl<'a> Transaction<'a> {
             });
         }
 
-        let commit_ts = oracle.next();
+        // The scope this commit is about to write, registered together with
+        // the timestamp it will land at and held until its writes are there.
+        //
+        // Validation below reads committed state, and a commit in flight is
+        // exactly what committed state does not contain yet. Without this
+        // registration two commits validate in the same window, each finding
+        // the other's keys untouched, and both apply: the later one replaces
+        // the earlier, which is the lost update first-committer-wins exists to
+        // prevent. Registering first is what leaves no interval in which a
+        // writer sees neither the effect nor the obligation.
+        //
+        // Commutative partitions stay out of the scope for the same reason
+        // they are exempt from validation below: their concurrency story is
+        // the merge operator, and excluding them here would serialise the
+        // super-node writes that path exists to keep parallel.
+        let scope: Vec<(Partition, Vec<u8>)> = self
+            .write_buffer
+            .keys()
+            .filter(|(part, _)| !part.is_commutative())
+            .map(|(part, key)| (*part, key.clone()))
+            .collect();
+        let (commit_ts_raw, admission) = self
+            .engine
+            .pending_commits()
+            .admit_allocated(|| oracle.next().as_raw(), scope)
+            .map_err(|overlap| {
+                CommitError::Conflict(format!(
+                    "write conflict: a key in the {:?} partition is already being \
+                     written by a transaction committing at {}. Nothing was \
+                     applied; retry the whole transaction.",
+                    overlap.partition, overlap.holder_ts,
+                ))
+            })?;
+        let commit_ts = Timestamp::from_raw(commit_ts_raw);
 
         // First-committer-wins over the WRITE set (ADR-016 seqno probing, write
         // keys only). Every mainstream engine conflicts on concurrent writes
@@ -1089,10 +1122,14 @@ impl<'a> Transaction<'a> {
             if part.is_commutative() {
                 continue;
             }
+            // Inclusive against the read timestamp, which is a snapshot: a
+            // snapshot sees sequence numbers strictly below itself, so a write
+            // landing at exactly that number is one this transaction could not
+            // have seen. The strict comparison missed precisely the closest
+            // concurrent writer, which is the one most likely to be there.
             if self
                 .engine
-                .coordinator()
-                .has_write_after(*part, key, occ_read_ts)?
+                .written_since_snapshot(*part, key, occ_read_ts)?
             {
                 return Err(CommitError::Conflict(format!(
                     "write conflict: key in {part:?} partition was also written by a \
@@ -1143,6 +1180,12 @@ impl<'a> Transaction<'a> {
                 self.engine
                     .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
             }
+
+            // The writes are local state now, so the registration has done its
+            // work: from here a validating writer finds them by reading, and a
+            // reader's snapshot may cover this timestamp. What remains is
+            // durability, which is not what the floor is about.
+            drop(admission);
 
             // Step 2: Buffer for drain (if drain buffer is available).
             if let Some(drain_buf) = ctx.drain_buffer {
@@ -1305,6 +1348,14 @@ impl<'a> Transaction<'a> {
             self.engine
                 .apply_proposal_at(&mutations, commit_ts.as_raw())?;
         }
+
+        // Released where the writes become local state, not where the caller
+        // is answered. The registration exists to close the window between
+        // validating against committed state and being part of it; holding it
+        // through a replication wait would pin every reader's snapshot on this
+        // node for as long as the slowest member takes to acknowledge, which
+        // is durability, not visibility.
+        drop(admission);
 
         // j:journal on a member without a Raft log (legacy / embedded direct
         // write): force the fsync after commit. With FlushPolicy::SyncPerBatch
@@ -1484,5 +1535,5 @@ fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;

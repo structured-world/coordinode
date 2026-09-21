@@ -11,6 +11,7 @@ pub(crate) mod flush;
 pub mod merge;
 pub mod oplog_journal;
 pub mod partition;
+pub mod pending;
 pub mod retention_stats;
 pub mod routing;
 pub mod stats;

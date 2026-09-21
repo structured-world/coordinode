@@ -169,6 +169,104 @@ fn an_attempt_with_no_claims_commits_as_before() {
     );
 }
 
+/// Concurrent read-modify-write on one key loses nothing.
+///
+/// Each writer reads the value at its snapshot, writes the successor and
+/// commits, retrying whenever it is told the key was taken. First-committer
+/// -wins says every successful commit must have seen the value its predecessor
+/// wrote, so the final value equals the number of successful commits. It does
+/// not follow from validation alone: validation reads committed state, and
+/// between one writer deciding the key is untouched and its write appearing,
+/// another writer decides the same thing about the same key. Both used to be
+/// applied, and the later one replaced the earlier without either being told.
+#[test]
+fn concurrent_writers_on_one_key_lose_no_update() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (engine, oracle, _d) = test_engine();
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 40;
+    const KEY: &[u8] = b"node:contended";
+
+    engine
+        .put(Partition::Node, KEY, &0u64.to_le_bytes())
+        .expect("seed");
+
+    let commits = AtomicU64::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..WRITERS {
+            let engine = Arc::clone(&engine);
+            let oracle = Arc::clone(&oracle);
+            let commits = &commits;
+            scope.spawn(move || {
+                let wc = WriteConcern::default();
+                for _ in 0..PER_WRITER {
+                    // Retry until this writer's own increment lands. A refusal
+                    // is the contract working, not a failure.
+                    loop {
+                        let snap = engine.snapshot();
+                        let mut txn = Transaction::new(
+                            &engine,
+                            Some(&oracle),
+                            Timestamp::from_raw(snap),
+                            Some(snap),
+                        );
+                        let current = txn
+                            .get(Partition::Node, KEY)
+                            .expect("read")
+                            .map(|v| {
+                                u64::from_le_bytes(v.as_slice().try_into().expect("eight bytes"))
+                            })
+                            .unwrap_or(0);
+                        txn.put(Partition::Node, KEY, &(current + 1).to_le_bytes())
+                            .expect("stage");
+
+                        let ctx = CommitContext {
+                            write_concern: &wc,
+                            pipeline: None,
+                            id_gen: None,
+                            drain_buffer: None,
+                            nvme_write_buffer: None,
+                        };
+                        match txn.commit(&ctx) {
+                            Ok(_) => {
+                                commits.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            Err(CommitError::Conflict(_)) => continue,
+                            // A refusal of any other kind is a real failure,
+                            // and naming it here says which one it was.
+                            Err(e) => panic!("unexpected commit failure: {e:?}"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let stored = engine
+        .get(Partition::Node, KEY)
+        .expect("read")
+        .expect("the key was seeded");
+    let final_value = u64::from_le_bytes((&stored[..]).try_into().expect("eight bytes"));
+    assert_eq!(
+        final_value,
+        commits.load(Ordering::Relaxed),
+        "every successful commit must be represented in the value; a lower \
+         value is an update that was applied and then silently replaced"
+    );
+    assert_eq!(
+        final_value,
+        (WRITERS * PER_WRITER) as u64,
+        "and every writer's work must eventually land"
+    );
+    assert_eq!(
+        engine.pending_commits().in_flight(),
+        0,
+        "no commit holds an admission after it is done"
+    );
+}
+
 /// Folding the mutations does not fold what they protect.
 ///
 /// The commit coalesces a run of adjacency adds on one key into a single

@@ -110,6 +110,10 @@ pub struct StorageEngine {
     /// running at the same time, and no attempt outlives the process. Giving
     /// it durable identity would buy nothing and cost a write on every DDL.
     schema_generation: AtomicU64,
+    /// Commits admitted here and not yet applied. Validation reads committed
+    /// state, which is exactly what these are not part of yet, so they are
+    /// consulted beside it.
+    pending_commits: crate::engine::pending::PendingCommits,
     /// The shard whose node rows this engine holds, for the one lookup inside
     /// the engine that starts from a node id rather than a key. Settable at
     /// runtime because the layer that knows it is built after the engine.
@@ -792,6 +796,7 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
+            pending_commits: crate::engine::pending::PendingCommits::new(),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
             tiered_cache,
@@ -1907,6 +1912,16 @@ impl StorageEngine {
         &self.claim_registry
     }
 
+    /// The commits admitted on this node and not yet applied.
+    ///
+    /// A writer registers its scope here before it validates, so no interval
+    /// exists in which another writer sees neither its effect nor the
+    /// obligation to account for it. A reader consults the same table to know
+    /// whether a snapshot is complete.
+    pub fn pending_commits(&self) -> &crate::engine::pending::PendingCommits {
+        &self.pending_commits
+    }
+
     /// The schema generation as it stands now. An attempt reads this once and
     /// stamps it on every claim it makes.
     pub fn schema_generation(&self) -> u64 {
@@ -2377,10 +2392,25 @@ impl StorageEngine {
 
     /// Take a snapshot of the current sequence number.
     ///
-    /// Returns the current LSM seqno. Reads with this seqno see all writes
-    /// up to and including this point; later writes are invisible.
+    /// A snapshot that is complete: everything below it has landed.
+    ///
+    /// The engine's own counter is not that. A commit takes its timestamp
+    /// before it applies, so between the two there is a number the counter has
+    /// already passed and whose effect is nowhere to be seen. A reader handed
+    /// that number sees neither the write nor any sign that one is coming, and
+    /// a writer built on such a read validates against a state that is missing
+    /// the very commit it is racing: it finds nothing written, commits, and
+    /// replaces an update that was never visible to it.
+    ///
+    /// So the snapshot stops below the oldest commit still in flight. Reads
+    /// see sequence numbers strictly below it, so that commit is excluded
+    /// rather than half-present, and a writer starting there is told about the
+    /// conflict when it validates. The cost is that a snapshot taken during a
+    /// commit lags by that commit, which is the definition of complete rather
+    /// than a delay added on top of it.
     pub fn snapshot(&self) -> lsm_tree::SeqNo {
-        self.coordinator.snapshot()
+        self.pending_commits
+            .snapshot_floor(|| self.coordinator.snapshot())
     }
 
     /// Creates a point-in-time snapshot at a specific sequence number.
