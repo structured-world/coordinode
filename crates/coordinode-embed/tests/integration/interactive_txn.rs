@@ -532,6 +532,67 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
 }
 
+/// Two claimers of one record on the embedded surface: exactly one takes it,
+/// and the other is told which version is there.
+///
+/// The same race the wire transport runs. Both are tested because a contract
+/// that holds on one surface and not the other is not a contract: they share
+/// the engine, but not the code that states the condition or renders the
+/// refusal, and that code is where a guarantee gets lost.
+#[test]
+fn two_claimers_of_one_record_produce_one_winner() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_embed::DatabaseError;
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE (c:Lease {holder: 'nobody'})")
+        .expect("create");
+
+    let lease = NodeId::from_raw(1);
+    let free_at = db
+        .node_version(lease)
+        .expect("read")
+        .expect("the lease record exists");
+
+    // Both stake the same version before either commits.
+    let mut claims = Vec::new();
+    for holder in ["first", "second"] {
+        let tx = db.begin_transaction();
+        db.execute_in_transaction(
+            tx,
+            &format!("MATCH (c:Lease) SET c.holder = '{holder}'"),
+            None,
+        )
+        .expect("statement");
+        db.expect_node_version(tx, lease, Some(free_at))
+            .expect("each believes the lease is free");
+        claims.push(tx);
+    }
+
+    db.commit_transaction(claims[0])
+        .expect("the first claimer takes it");
+    let refusal = db
+        .commit_transaction(claims[1])
+        .expect_err("the lease is no longer free");
+    let DatabaseError::RevisionMismatch { current, .. } = refusal else {
+        panic!("expected a version mismatch, got {refusal:?}");
+    };
+    assert_eq!(
+        current,
+        db.node_version(lease).expect("read"),
+        "the loser is told the version that is actually there"
+    );
+
+    let holder = db
+        .execute_cypher("MATCH (c:Lease) RETURN c.holder AS holder")
+        .expect("read");
+    assert_eq!(
+        holder[0].get("holder").and_then(|v| v.as_str()),
+        Some("first"),
+        "and the winner's write is the one that stands"
+    );
+}
+
 /// A fenced claim is the same primitive, not a second one.
 ///
 /// The claim is a record. Holding it means having written it; keeping it
@@ -557,11 +618,16 @@ fn a_claim_fences_the_writes_of_the_holder_it_replaced() {
         .expect("read")
         .expect("the claim exists");
 
-    // The holder is about to write under its claim, and states the claim's
-    // version alongside the write it protects.
+    // A protected write does two things, and needs both. It states the
+    // claim's version, which is what catches a takeover that has already
+    // committed; and it writes the claim record itself, which puts the claim
+    // in its write set, so a takeover racing this very commit loses to
+    // first-committer-wins instead of interleaving with it.
     let protected = db.begin_transaction();
     db.execute_in_transaction(protected, "MATCH (d:Data) SET d.value = 1", None)
         .expect("statement");
+    db.execute_in_transaction(protected, "MATCH (c:Claim) SET c.touched = 1", None)
+        .expect("write the claim record too");
     db.expect_node_version(protected, claim, Some(held_at))
         .expect("state the claim");
 

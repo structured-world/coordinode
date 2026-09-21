@@ -238,6 +238,144 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .expect("the version matches now");
 }
 
+/// A fenced claim over the wire: the replaced holder's write is refused on
+/// the claim and never reaches the data the claim protected.
+///
+/// The protected commit does both halves. It states the claim's version,
+/// which catches a takeover that has already committed, and it writes the
+/// claim record itself, so a takeover racing this very commit loses to
+/// first-committer-wins instead of interleaving with it.
+#[tokio::test]
+async fn grpc_a_claim_fences_the_writes_of_the_holder_it_replaced() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    svc.execute_cypher(cypher_request("CREATE (c:Claim {holder: 'first'})"))
+        .await
+        .expect("take the claim");
+    svc.execute_cypher(cypher_request("CREATE (d:Data {value: 0})"))
+        .await
+        .expect("the record the claim protects");
+
+    let claim = coordinode_core::graph::node::NodeId::from_raw(1);
+    let held_at = svc
+        .database
+        .read()
+        .node_version(claim)
+        .expect("read")
+        .expect("the claim exists");
+
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn("MATCH (d:Data) SET d.value = 1", tx))
+        .await
+        .expect("the protected write");
+    svc.execute_cypher(cypher_request_in_txn(
+        "MATCH (c:Claim) SET c.touched = 1",
+        tx,
+    ))
+    .await
+    .expect("the claim record too");
+
+    // The claim changes hands before the protected commit lands.
+    svc.execute_cypher(cypher_request("MATCH (c:Claim) SET c.holder = 'second'"))
+        .await
+        .expect("take over");
+
+    let status = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![query::ExpectedNodeVersion {
+                node_id: claim.as_raw(),
+                version: Some(held_at),
+            }],
+        }))
+        .await
+        .expect_err("the claim is held by somebody else now");
+
+    let details = status.get_error_details();
+    assert_eq!(
+        details.error_info().expect("ErrorInfo").reason,
+        "REVISION_MISMATCH"
+    );
+
+    let data = svc
+        .execute_cypher(cypher_request("MATCH (d:Data) RETURN d.value AS value"))
+        .await
+        .expect("read")
+        .into_inner();
+    let value = match &data.rows[0].values[0].value {
+        Some(common::property_value::Value::IntValue(v)) => *v,
+        other => panic!("expected an int, got {other:?}"),
+    };
+    assert_eq!(
+        value, 0,
+        "the fenced writer changed nothing it was about to change"
+    );
+}
+
+/// A retry after an outcome the caller never heard, over the wire: the same
+/// condition tells it which way the first attempt went, so it does not apply
+/// the write twice.
+#[tokio::test]
+async fn grpc_a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    svc.execute_cypher(cypher_request("CREATE (n:Counter {value: 0})"))
+        .await
+        .expect("create");
+
+    let counter = coordinode_core::graph::node::NodeId::from_raw(1);
+    let before = svc
+        .database
+        .read()
+        .node_version(counter)
+        .expect("read")
+        .expect("exists");
+
+    let run = |value: i64| {
+        let svc = &svc;
+        async move {
+            let tx = svc
+                .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+                .await
+                .expect("begin")
+                .into_inner()
+                .transaction_id;
+            svc.execute_cypher(cypher_request_in_txn(
+                &format!("MATCH (n:Counter) SET n.value = {value}"),
+                tx,
+            ))
+            .await
+            .expect("statement");
+            svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+                transaction_id: tx,
+                expect: vec![query::ExpectedNodeVersion {
+                    node_id: counter.as_raw(),
+                    version: Some(before),
+                }],
+            }))
+            .await
+        }
+    };
+
+    run(1).await.expect("the first attempt lands");
+    // The caller never heard that, and retries the same work against the same
+    // version it read at the start.
+    let status = run(1).await.expect_err("the version has moved since");
+    let details = status.get_error_details();
+    assert_eq!(
+        details.error_info().expect("ErrorInfo").reason,
+        "REVISION_MISMATCH",
+        "the refusal is how the caller learns the first attempt landed"
+    );
+}
+
 /// Two claimers of one record over the wire: exactly one takes it, and the
 /// other is told which version is there rather than that something contended.
 ///

@@ -128,7 +128,7 @@ Two uses follow from the same primitive.
 
 **Read-modify-write without a lock.** Read the node and its version, compute, write on the condition of that version. First-writer-wins is a compare-and-set here, so the loser is told rather than silently overwritten.
 
-**A fenced claim.** A lease or a claim is a record; holding it means having written it. Every write done under the claim states the claim record's version. When someone takes the claim over, the previous holder's next write is refused on the claim rather than on the data, so the work it would have done never reaches the records the claim protects.
+**A fenced claim.** A lease or a claim is a record; holding it means having written it. A write done under the claim does two things: it states the claim record's version, and it writes the claim record too. The version catches a takeover that has already committed; writing the record puts the claim in the transaction's write set, so a takeover racing that very commit loses to first-writer-wins instead of interleaving with it. Either way the previous holder's write is refused on the claim rather than on the data, so the work it would have done never reaches the records the claim protects.
 
 **Retrying after an outcome you never heard.** If a commit's reply is lost, retry the same work against the version you originally read. If the first attempt landed, the version moved and the retry is refused, which is how you learn it succeeded; if it did not, the version is unchanged and the retry does the work. The blind retry, which applies the write twice, is what this avoids.
 
