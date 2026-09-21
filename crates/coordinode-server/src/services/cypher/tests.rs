@@ -123,6 +123,121 @@ fn cypher_request_in_txn(q: &str, transaction_id: u64) -> Request<query::Execute
     })
 }
 
+/// A commit conditioned on a node's version over the wire: it lands at the
+/// version the caller read, and once somebody else has written, it is refused
+/// with the version that is there, in the error metadata rather than only in
+/// the message.
+#[tokio::test]
+async fn grpc_commit_conditioned_on_a_node_version() {
+    let (svc, _dir) = test_service();
+
+    svc.execute_cypher(cypher_request("CREATE (n:Account {balance: 100})"))
+        .await
+        .expect("create");
+
+    // The first node of a fresh database; reading its version through the
+    // handle is what a client does through GetNode.
+    let account = coordinode_core::graph::node::NodeId::from_raw(1);
+    let read_version = svc
+        .database
+        .read()
+        .node_version(account)
+        .expect("read version")
+        .expect("the account exists");
+
+    // Somebody else writes between the read and the conditional commit.
+    svc.execute_cypher(cypher_request("MATCH (n:Account) SET n.balance = 250"))
+        .await
+        .expect("concurrent write");
+
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn(
+        "MATCH (n:Account) SET n.balance = 500",
+        tx,
+    ))
+    .await
+    .expect("statement");
+
+    let status = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![query::ExpectedNodeVersion {
+                node_id: account.as_raw(),
+                version: Some(read_version),
+            }],
+        }))
+        .await
+        .expect_err("the version the caller read is gone");
+
+    use tonic_types::StatusExt;
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("a refusal carries ErrorInfo");
+    assert_eq!(
+        info.reason, "REVISION_MISMATCH",
+        "told apart from a write conflict: the caller named a version"
+    );
+    assert_eq!(
+        info.metadata.get("expected_version"),
+        Some(&read_version.to_string()),
+        "the metadata says what was asked for"
+    );
+    let reported_current = info
+        .metadata
+        .get("current_version")
+        .expect("and what is there instead")
+        .parse::<u64>()
+        .expect("a version is a number");
+    assert_ne!(
+        reported_current, read_version,
+        "the version reported is the one that replaced it"
+    );
+
+    // The refused transaction applied nothing.
+    let after = svc
+        .execute_cypher(cypher_request(
+            "MATCH (n:Account) RETURN n.balance AS balance",
+        ))
+        .await
+        .expect("read")
+        .into_inner();
+    assert_eq!(after.rows.len(), 1);
+
+    // Retried against the version that is actually there, it lands.
+    let current = svc
+        .database
+        .read()
+        .node_version(account)
+        .expect("read version")
+        .expect("still there");
+    let retry = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn(
+        "MATCH (n:Account) SET n.balance = 500",
+        retry,
+    ))
+    .await
+    .expect("statement");
+    svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+        transaction_id: retry,
+        expect: vec![query::ExpectedNodeVersion {
+            node_id: account.as_raw(),
+            version: Some(current),
+        }],
+    }))
+    .await
+    .expect("the version matches now");
+}
+
 /// gRPC interactive transaction: begin → statement-in-txn → commit, with
 /// the buffered writes invisible until commit, then visible after.
 #[tokio::test]
@@ -152,6 +267,7 @@ async fn grpc_interactive_transaction_commit() {
     let receipt = svc
         .commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            expect: vec![],
         }))
         .await
         .expect("commit")
@@ -238,6 +354,7 @@ async fn grpc_interactive_transaction_rollback() {
     assert!(
         svc.commit_transaction(Request::new(query::CommitTransactionRequest {
             transaction_id: tx,
+            expect: vec![],
         }))
         .await
         .is_err()

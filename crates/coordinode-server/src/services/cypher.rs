@@ -281,6 +281,29 @@ fn db_error_to_status(err: DatabaseError) -> Status {
         ) => {
             return status_with_reason(Code::Aborted, rendered, Reason::InvariantRefused, []);
         }
+        // Both spellings of a version mismatch. The versions travel in the
+        // metadata rather than only in the message, because the caller's next
+        // move is computed from them: retry against what is there, merge, or
+        // stop. An absent version is absent from the metadata rather than
+        // rendered as a zero, which would read as a real version.
+        DatabaseError::RevisionMismatch {
+            expected, current, ..
+        }
+        | DatabaseError::Execution(
+            coordinode_query::executor::runner::ExecutionError::RevisionMismatch {
+                expected,
+                current,
+            },
+        ) => {
+            let mut metadata: Vec<(&str, String)> = Vec::with_capacity(2);
+            if let Some(expected) = expected {
+                metadata.push(("expected_version", expected.to_string()));
+            }
+            if let Some(current) = current {
+                metadata.push(("current_version", current.to_string()));
+            }
+            return status_with_reason(Code::Aborted, rendered, Reason::RevisionMismatch, metadata);
+        }
         DatabaseError::TransactionTooLarge {
             id,
             buffered,
@@ -1037,10 +1060,24 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
-        let receipt = self
-            .database
-            .read()
-            .commit_transaction(request.into_inner().transaction_id)
+        let request = request.into_inner();
+        let db = self.database.read();
+
+        // The conditions the caller built its statements on, stated before
+        // the commit that checks them. A condition naming a node the caller
+        // never read is still a condition: the engine decides it against the
+        // state, not against what the caller happens to know.
+        for expect in &request.expect {
+            db.expect_node_version(
+                request.transaction_id,
+                coordinode_core::graph::node::NodeId::from_raw(expect.node_id),
+                expect.version,
+            )
+            .map_err(db_error_to_status)?;
+        }
+
+        let receipt = db
+            .commit_transaction(request.transaction_id)
             .map_err(db_error_to_status)?;
         // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`
         // is present in every mode.

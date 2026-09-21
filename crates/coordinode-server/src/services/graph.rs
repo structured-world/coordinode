@@ -15,6 +15,21 @@ use crate::services::cypher::{proto_to_value_pub, value_to_proto_pub};
 use crate::services::db_err_to_status;
 
 /// Backtick-escape a Cypher identifier (label, relationship type, or property key).
+/// The version to report for a node on the wire: the timestamp of the commit
+/// that last wrote it.
+///
+/// Zero when the database cannot name one, which the field documents as "no
+/// version resolved" rather than as version zero. That is the honest answer
+/// for a node that is gone by the time the reply is built, and it keeps a
+/// failed lookup from being read as a real version a client could then write
+/// against.
+fn node_version(db: &Database, node_id: u64) -> u64 {
+    db.node_version(NodeId::from_raw(node_id))
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
 fn cypher_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
@@ -84,6 +99,9 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             labels: req.labels,
             properties: req.properties,
             element_id: NodeId::from_raw(node_id).to_element_id(),
+            // The version the node was created at, so a caller that means to
+            // write it again conditionally already has what to state.
+            version: node_version(&self.database.read(), node_id),
         }))
     }
 
@@ -170,6 +188,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
                     labels: labels.clone(),
                     properties: req.nodes[i].properties.clone(),
                     element_id: NodeId::from_raw(node_id).to_element_id(),
+                    version: node_version(&self.database.read(), node_id),
                 })
             })
             .collect();
@@ -244,6 +263,9 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             labels,
             properties,
             element_id: NodeId::from_raw(node_id).to_element_id(),
+            // What a reader needs to write this node back conditionally: the
+            // version it is at, read in the same call as its contents.
+            version: node_version(&self.database.read(), node_id),
         }))
     }
 
@@ -382,6 +404,10 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
                 .rows
         };
 
+        // Held across the mapping so every node in one traversal reports its
+        // version against one view, rather than each taking its own lock and
+        // its own moment.
+        let db = self.database.read();
         let nodes: Vec<graph::Node> = rows
             .iter()
             .filter_map(|row| {
@@ -419,6 +445,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
                     labels,
                     properties,
                     element_id: NodeId::from_raw(node_id).to_element_id(),
+                    version: node_version(&db, node_id),
                 })
             })
             .collect();

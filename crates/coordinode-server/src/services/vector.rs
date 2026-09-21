@@ -46,6 +46,7 @@ fn metric_cypher(metric: i32) -> (&'static str, &'static str) {
 /// Returns `None` if the row lacks the required `n` (node_id) or `_dist` columns.
 fn row_to_vector_result(
     row: std::collections::BTreeMap<String, Value>,
+    version_of: impl Fn(u64) -> u64,
 ) -> Option<query::VectorResult> {
     let node_id = match row.get("n")? {
         Value::Int(id) => *id as u64,
@@ -80,6 +81,7 @@ fn row_to_vector_result(
             labels,
             properties,
             element_id: NodeId::from_raw(node_id).to_element_id(),
+            version: version_of(node_id),
         }),
         distance,
     })
@@ -202,8 +204,19 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
             (rows, health)
         };
 
-        let results: Vec<query::VectorResult> =
-            rows.into_iter().filter_map(row_to_vector_result).collect();
+        let results: Vec<query::VectorResult> = {
+            let db = self.database.read();
+            rows.into_iter()
+                .filter_map(|row| {
+                    row_to_vector_result(row, |id| {
+                        db.node_version(NodeId::from_raw(id))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    })
+                })
+                .collect()
+        };
 
         let mut response = Response::new(query::VectorSearchResponse {
             results,
@@ -266,8 +279,19 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                 .rows
         };
 
-        let results: Vec<query::VectorResult> =
-            rows.into_iter().filter_map(row_to_vector_result).collect();
+        let results: Vec<query::VectorResult> = {
+            let db = self.database.read();
+            rows.into_iter()
+                .filter_map(|row| {
+                    row_to_vector_result(row, |id| {
+                        db.node_version(NodeId::from_raw(id))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    })
+                })
+                .collect()
+        };
 
         // The hybrid request carries no label, so the vector phase can span
         // several labels' indexes — there is no single index whose health to

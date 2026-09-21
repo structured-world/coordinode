@@ -61,6 +61,15 @@ pub enum Reason {
     /// two it hit: a conflict is two transactions over one key, a refusal is
     /// two of them over one condition, which their key sets need not share.
     InvariantRefused,
+    /// A write conditioned on a record's version found a different one.
+    /// Nothing was applied. The metadata carries `expected_version` and
+    /// `current_version`, so a caller decides what to do without reading the
+    /// record again; `current_version` is absent when the record is gone.
+    ///
+    /// Told apart from `TRANSACTION_CONFLICT` because the caller asked for
+    /// this: it named a version, and what it needs back is which version is
+    /// there, not that something contended.
+    RevisionMismatch,
     /// A transaction buffered more uncommitted data than it may. Splitting the
     /// work into smaller transactions is the fix; retrying as-is will not help.
     TransactionTooLarge,
@@ -103,6 +112,7 @@ impl Reason {
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",
             Reason::TransactionConflict => "TRANSACTION_CONFLICT",
             Reason::InvariantRefused => "INVARIANT_REFUSED",
+            Reason::RevisionMismatch => "REVISION_MISMATCH",
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
@@ -132,6 +142,12 @@ impl Reason {
     /// else. When the metadata names a leader the retry is a redirect; when
     /// an election is still in flight it is a short poll, and the client's own
     /// backoff governs how often, which is why the floor here stays zero.
+    ///
+    /// A version mismatch deliberately advises nothing. The caller named a
+    /// version, so what happens next is its decision and not a delay: it may
+    /// retry against the version in the metadata, merge, or stop. Advising a
+    /// retry would tell it to repeat a write whose premise the server has
+    /// just disproved.
     pub const fn retry_delay(self) -> Option<std::time::Duration> {
         match self {
             Reason::TransactionConflict | Reason::InvariantRefused | Reason::NotLeader => {
