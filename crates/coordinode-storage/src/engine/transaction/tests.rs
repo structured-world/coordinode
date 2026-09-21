@@ -425,6 +425,153 @@ fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
     assert_eq!(pending.snapshot_floor(|| 250), 100);
 }
 
+/// A write conditioned on the record's version lands while the version is
+/// what the caller read, and is refused once somebody else has moved it.
+#[test]
+fn a_conditional_write_lands_only_at_the_version_it_named() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    const KEY: &[u8] = b"node:claimed";
+
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    // Create-if-absent: the condition with nothing on the other side.
+    let mut create = mvcc_txn(&engine, &oracle);
+    create.put(Partition::Node, KEY, b"first").expect("stage");
+    create
+        .expect_version(Partition::Node, KEY, None)
+        .expect("the record must not exist");
+    create.commit(&ctx()).expect("nothing was there");
+
+    let version = engine
+        .record_version(Partition::Node, KEY)
+        .expect("version")
+        .expect("the record is there now");
+
+    // The same condition a second time: the record exists, so it fails, and
+    // the error carries what is there rather than making the caller look.
+    let mut again = mvcc_txn(&engine, &oracle);
+    again.put(Partition::Node, KEY, b"second").expect("stage");
+    again
+        .expect_version(Partition::Node, KEY, None)
+        .expect("state the condition");
+    match again.commit(&ctx()) {
+        Err(CommitError::RevisionMismatch { expected, current }) => {
+            assert_eq!(expected, None);
+            assert_eq!(current, Some(version));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"first"[..]),
+        "a refused conditional write applied nothing"
+    );
+
+    // Against the version that is actually there, it lands.
+    let mut update = mvcc_txn(&engine, &oracle);
+    update.put(Partition::Node, KEY, b"second").expect("stage");
+    update
+        .expect_version(Partition::Node, KEY, Some(version))
+        .expect("state the condition");
+    update.commit(&ctx()).expect("the version still matches");
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"second"[..])
+    );
+
+    // And the version it named is now stale: the write moved it.
+    let mut stale = mvcc_txn(&engine, &oracle);
+    stale.put(Partition::Node, KEY, b"third").expect("stage");
+    stale
+        .expect_version(Partition::Node, KEY, Some(version))
+        .expect("state the condition");
+    match stale.commit(&ctx()) {
+        Err(CommitError::RevisionMismatch { expected, current }) => {
+            assert_eq!(expected, Some(version));
+            assert_ne!(current, Some(version), "the record moved");
+            assert!(current.is_some(), "and it is still there");
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+}
+
+/// Two claimers race for one record and exactly one wins. The loser is told
+/// which version is there, which is what makes its next attempt a decision
+/// rather than another guess.
+#[test]
+fn two_claimers_of_one_record_produce_one_winner() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    const KEY: &[u8] = b"node:lease";
+
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut first = mvcc_txn(&engine, &oracle);
+    let mut second = mvcc_txn(&engine, &oracle);
+    for (txn, holder) in [(&mut first, &b"first"[..]), (&mut second, &b"second"[..])] {
+        txn.put(Partition::Node, KEY, holder).expect("stage");
+        txn.expect_version(Partition::Node, KEY, None)
+            .expect("each believes the lease is free");
+    }
+
+    first.commit(&ctx()).expect("the first claimer takes it");
+    let refusal = second
+        .commit(&ctx())
+        .expect_err("the lease is no longer free");
+    let CommitError::RevisionMismatch { current, .. } = refusal else {
+        panic!("expected a version mismatch, got {refusal:?}");
+    };
+    assert_eq!(
+        current,
+        engine
+            .record_version(Partition::Node, KEY)
+            .expect("version"),
+        "the refusal carries the version that is actually there"
+    );
+    assert_eq!(
+        engine.get(Partition::Node, KEY).unwrap().as_deref(),
+        Some(&b"first"[..]),
+        "the loser overwrote nothing"
+    );
+}
+
+/// A merge-composed record has no version, and asking for one is refused
+/// rather than answered. Folding operands has no single commit that wrote the
+/// row, so a conditional write over it would be a condition on nothing.
+#[test]
+fn a_merge_composed_record_has_no_version_to_condition_on() {
+    let (engine, oracle, _d) = test_engine();
+
+    for part in [Partition::Adj, Partition::Counter] {
+        let err = engine
+            .record_version(part, b"whatever")
+            .expect_err("a folded row has no single writer");
+        assert!(
+            format!("{err}").contains("merge-composed"),
+            "the refusal should say why, got {err}"
+        );
+
+        let mut txn = mvcc_txn(&engine, &oracle);
+        let err = txn
+            .expect_version(part, b"whatever", None)
+            .expect_err("and cannot be conditioned on");
+        assert!(format!("{err}").contains("merge-composed"));
+    }
+}
+
 /// Folding the mutations does not fold what they protect.
 ///
 /// The commit coalesces a run of adjacency adds on one key into a single

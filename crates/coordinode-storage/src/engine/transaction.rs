@@ -124,6 +124,23 @@ pub enum CommitError {
         /// The counter key whose staged deltas overflowed.
         key: String,
     },
+    /// A record this attempt wrote on the condition of its version has a
+    /// different one. Nothing was applied.
+    ///
+    /// The version that is there now is carried here so the caller can
+    /// decide what to do without reading the record again, and so that a
+    /// retry starts from a fact rather than from another race.
+    #[error(
+        "record version mismatch: expected {expected:?}, found {current:?}; \
+         nothing was applied"
+    )]
+    RevisionMismatch {
+        /// The version the caller wrote against. `None` means it required
+        /// the record to be absent.
+        expected: Option<u64>,
+        /// The version the record has now. `None` means it is absent.
+        current: Option<u64>,
+    },
     /// A condition this attempt's result depends on no longer holds, or
     /// another attempt in flight holds an incompatible one. Nothing was
     /// applied.
@@ -237,6 +254,13 @@ pub struct Transaction<'a> {
     /// go. Checked and reserved at commit: the write set alone cannot tell
     /// two attempts apart that each validated a condition the other breaks.
     claims: ClaimSet,
+    /// Records this attempt will only write if their version is still what it
+    /// read. `None` as the expected version means the record must not exist.
+    ///
+    /// Held apart from the write buffer because the condition is not a write:
+    /// it is what makes the write admissible, and the two are checked at
+    /// different points against different evidence.
+    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
     /// The schema generation as it stood when this attempt began. Every claim
     /// it makes is stamped with it, so a predicate evaluated here is not taken
     /// as evidence about a graph whose definitions have since changed.
@@ -272,6 +296,9 @@ pub struct TransactionState {
     /// because an interactive transaction is one attempt across statements
     /// and a condition stated by the first still binds the last.
     claims: ClaimSet,
+    /// Parked for the same reason as the claims: a condition stated by one
+    /// statement of an interactive transaction binds the commit of the last.
+    expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
     /// Parked with the claims it stamps: the generation belongs to the
     /// attempt, and the attempt spans the statements.
     schema_generation: u64,
@@ -374,6 +401,7 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: HashMap::new(),
             counter_overflow: None,
             claims: ClaimSet::new(),
+            expected_versions: Vec::new(),
             schema_generation: engine.schema_generation(),
             schema_changed: false,
             snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
@@ -399,6 +427,7 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope,
             merge_adj_ops: self.merge_adj_ops,
             claims: self.claims,
+            expected_versions: self.expected_versions,
             schema_generation: self.schema_generation,
             schema_changed: self.schema_changed,
             merge_node_deltas: self.merge_node_deltas,
@@ -423,6 +452,7 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope.take(),
             merge_adj_ops: std::mem::take(&mut self.merge_adj_ops),
             claims: std::mem::take(&mut self.claims),
+            expected_versions: std::mem::take(&mut self.expected_versions),
             schema_generation: self.schema_generation,
             schema_changed: std::mem::take(&mut self.schema_changed),
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
@@ -452,6 +482,7 @@ impl<'a> Transaction<'a> {
             merge_adj_ops: state.merge_adj_ops,
             counter_overflow: None,
             claims: state.claims,
+            expected_versions: state.expected_versions,
             schema_generation: state.schema_generation,
             schema_changed: state.schema_changed,
             merge_node_deltas: state.merge_node_deltas,
@@ -802,6 +833,37 @@ impl<'a> Transaction<'a> {
         self.claims.insert(claim);
     }
 
+    /// Write this record only while its version is still `expected`.
+    ///
+    /// `None` means the record must not exist: the create-if-absent form,
+    /// which is the same condition with nothing on the other side of it.
+    ///
+    /// The condition is checked at commit against committed state, in the
+    /// same protected step as the write set, because a check performed here
+    /// would prove something about a moment that has passed. What the caller
+    /// gets from stating it is a refusal carrying the version that is there
+    /// now, so a retry needs no second read.
+    pub fn expect_version(
+        &mut self,
+        part: Partition,
+        key: &[u8],
+        expected: Option<u64>,
+    ) -> StorageResult<()> {
+        if part.is_commutative() {
+            return Err(StorageError::InvalidConfig(format!(
+                "the {part:?} partition is merge-composed: its rows are folded from \
+                 operands, so a write cannot be conditioned on their version"
+            )));
+        }
+        self.expected_versions.push((part, key.to_vec(), expected));
+        Ok(())
+    }
+
+    /// The conditions stated so far, for a caller that has to report them.
+    pub fn expected_versions(&self) -> &[(Partition, Vec<u8>, Option<u64>)] {
+        &self.expected_versions
+    }
+
     /// The schema generation this attempt evaluates its predicates under.
     ///
     /// A writer stamps it on every claim it states, which is why it is read
@@ -1124,6 +1186,20 @@ impl<'a> Transaction<'a> {
         // outside the tables rather than inside them.
         if !self.claims.is_empty() {
             self.evaluate_claims()?;
+        }
+
+        // Records written on the condition of their version. Checked here,
+        // under the same admission as the write set, because this is where
+        // the answer is still true when the writes land: the scope is
+        // registered, so nobody else can move these records in between.
+        for (part, key, expected) in &self.expected_versions {
+            let current = self.engine.record_version(*part, key)?;
+            if current != *expected {
+                return Err(CommitError::RevisionMismatch {
+                    expected: *expected,
+                    current,
+                });
+            }
         }
 
         // First-committer-wins over the WRITE set (ADR-016 seqno probing, write

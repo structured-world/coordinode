@@ -2508,6 +2508,36 @@ impl StorageEngine {
         Ok(results)
     }
 
+    /// The version of a record: the timestamp of the commit that last wrote
+    /// it, or `None` when no live row is there.
+    ///
+    /// This is the value a caller compares against when it writes on the
+    /// condition that nobody else has. It is the commit timestamp rather than
+    /// a counter of its own, because the commit that wrote the row is exactly
+    /// what a conditional write is asking about, and inventing a second
+    /// number would mean keeping two things in step for no gain.
+    ///
+    /// A commutative partition has no version to give: adjacency and counter
+    /// rows are folded from operands rather than replaced, so there is no
+    /// single commit that last wrote one. Asking is a caller error rather
+    /// than an answer of `None`, which would read as "nothing is there".
+    pub fn record_version(
+        &self,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<lsm_tree::SeqNo>> {
+        if part.is_commutative() {
+            return Err(StorageError::InvalidConfig(format!(
+                "the {part:?} partition is merge-composed: its rows are folded from \
+                 operands, so no single commit is their version"
+            )));
+        }
+        let tree = self.tree(part)?;
+        Ok(tree
+            .get_internal_entry(key, lsm_tree::SeqNo::MAX)?
+            .map(|e| e.key.seqno))
+    }
+
     /// Whether `key` was written by anything this snapshot does not already
     /// include.
     ///

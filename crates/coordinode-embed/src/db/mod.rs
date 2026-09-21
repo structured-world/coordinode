@@ -556,6 +556,26 @@ pub enum DatabaseError {
     /// Separate from `TransactionConflict` because the two transactions need
     /// not touch a common key: disjoint writes can break one graph condition
     /// together, and reporting that as a write conflict names the wrong cause.
+    /// A write conditioned on a record's version found a different one.
+    /// Nothing was applied.
+    ///
+    /// The version that is there now is part of the error: a caller that has
+    /// to decide whether to retry, merge or give up needs it, and making it
+    /// read the record again would hand it a second race instead of an
+    /// answer.
+    #[error(
+        "transaction {id}: record version mismatch, expected {expected:?}, \
+         found {current:?}; nothing was applied"
+    )]
+    RevisionMismatch {
+        /// The transaction the refusal belongs to.
+        id: u64,
+        /// The version the write was conditioned on; `None` required absence.
+        expected: Option<u64>,
+        /// The version the record has now; `None` means it is absent.
+        current: Option<u64>,
+    },
+
     #[error("transaction {id} was refused by an invariant: {reason}")]
     InvariantRefused {
         /// The transaction the refusal belongs to.
@@ -1755,6 +1775,17 @@ impl Database {
             // retry reads.
             CommitError::InvariantRefused { reason } => {
                 DatabaseError::InvariantRefused { id: txn_id, reason }
+            }
+            // Retryable, but whether retrying is the right answer is the
+            // caller's to decide: the record moved, and what that means
+            // depends on what it was writing. The new version travels with
+            // the refusal so that decision needs no second read.
+            CommitError::RevisionMismatch { expected, current } => {
+                DatabaseError::RevisionMismatch {
+                    id: txn_id,
+                    expected,
+                    current,
+                }
             }
         })?;
         // An interactive transaction is always opened against the oracle

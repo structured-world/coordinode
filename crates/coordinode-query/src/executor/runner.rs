@@ -83,6 +83,20 @@ pub enum ExecutionError {
     #[error("invariant refused the write: {0}")]
     InvariantRefused(String),
 
+    /// A write conditioned on a record's version found a different one.
+    /// Nothing was applied. The version that is there now travels with the
+    /// error so the caller can decide without reading the record again.
+    #[error(
+        "record version mismatch: expected {expected:?}, found {current:?}; \
+         nothing was applied"
+    )]
+    RevisionMismatch {
+        /// The version the write was conditioned on; `None` required absence.
+        expected: Option<u64>,
+        /// The version the record has now; `None` means it is absent.
+        current: Option<u64>,
+    },
+
     /// The engine rejected the commit's writes because storage is over its
     /// compaction-debt stop threshold. Nothing was applied; retryable after
     /// a short delay.
@@ -15997,6 +16011,9 @@ fn commit_err_to_execution(
             "counter '{key}' would leave the i64 range; nothing was written"
         )),
         CommitError::InvariantRefused { reason } => ExecutionError::InvariantRefused(reason),
+        CommitError::RevisionMismatch { expected, current } => {
+            ExecutionError::RevisionMismatch { expected, current }
+        }
     }
 }
 
