@@ -27,8 +27,9 @@
 //! promise is the prepared-participant mechanism, with its own lifetime.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::engine::partition::Partition;
 
@@ -44,7 +45,17 @@ struct Admitted {
 /// The commits this leader has admitted but not yet applied.
 #[derive(Debug)]
 pub struct PendingCommits {
+    /// Keyed by an identity of its own rather than by the commit timestamp.
+    /// Two commits sharing a timestamp are not something the clock produces,
+    /// but a table that assumes it silently drops one of them and releases
+    /// the other's registration early, which is a lost update arriving
+    /// through the mechanism that exists to prevent it. The assumption is
+    /// cheaper to remove than to rely on.
     inner: Mutex<HashMap<u64, Admitted>>,
+    next_id: std::sync::atomic::AtomicU64,
+    /// Woken whenever a commit finishes, so a reader waiting for the view it
+    /// asked for does not have to poll for it.
+    finished: Condvar,
     max_in_flight: usize,
 }
 
@@ -75,7 +86,39 @@ impl PendingCommits {
     pub fn new(max_in_flight: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(0),
+            finished: Condvar::new(),
             max_in_flight,
+        }
+    }
+
+    /// Wait until no commit at or below `ts` is still in flight, so a read at
+    /// exactly `ts` sees a complete state.
+    ///
+    /// This is for a caller that named its timestamp: a time-travel read, a
+    /// causal read with a lower bound, a cursor resuming at the cut it
+    /// started on. Such a timestamp is preserved rather than lowered, so the
+    /// only way to make it complete is to let the commits under it land.
+    ///
+    /// Returns the timestamp of a commit still in flight when the deadline
+    /// passed. A caller answers that with an explicit timeout: waiting longer
+    /// is its decision to make, and quietly reading an incomplete state or
+    /// moving to another timestamp is not.
+    pub fn await_complete_at(&self, ts: u64, timeout: Duration) -> Result<(), u64> {
+        let deadline = Instant::now() + timeout;
+        let mut table = self.inner.lock();
+        loop {
+            let Some(blocking) = table
+                .values()
+                .map(|a| a.commit_ts)
+                .filter(|c| *c <= ts)
+                .min()
+            else {
+                return Ok(());
+            };
+            if self.finished.wait_until(&mut table, deadline).timed_out() {
+                return Err(blocking);
+            }
         }
     }
 
@@ -124,14 +167,11 @@ impl PendingCommits {
             }
         }
 
-        table.insert(commit_ts, Admitted { commit_ts, scope });
-        Ok((
-            commit_ts,
-            Admission {
-                pending: self,
-                commit_ts,
-            },
-        ))
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.insert(id, Admitted { commit_ts, scope });
+        Ok((commit_ts, Admission { pending: self, id }))
     }
 
     /// The highest snapshot that covers no commit still in flight, given the
@@ -156,8 +196,12 @@ impl PendingCommits {
         self.inner.lock().len()
     }
 
-    fn withdraw(&self, commit_ts: u64) {
-        self.inner.lock().remove(&commit_ts);
+    fn withdraw(&self, id: u64) {
+        self.inner.lock().remove(&id);
+        // Every waiter is woken rather than one: they are waiting on
+        // different timestamps, and the one this commit unblocks is not
+        // necessarily the one a single wake would reach.
+        self.finished.notify_all();
     }
 }
 
@@ -167,12 +211,12 @@ impl PendingCommits {
 #[derive(Debug)]
 pub struct Admission<'p> {
     pending: &'p PendingCommits,
-    commit_ts: u64,
+    id: u64,
 }
 
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
-        self.pending.withdraw(self.commit_ts);
+        self.pending.withdraw(self.id);
     }
 }
 

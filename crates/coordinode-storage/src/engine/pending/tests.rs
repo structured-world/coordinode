@@ -163,6 +163,88 @@ fn a_commit_with_no_exclusive_writes_is_still_in_flight() {
     assert_eq!(pending.snapshot_floor(|| 50), 10);
 }
 
+/// Two commits sharing a timestamp are both held. A table keyed by the
+/// timestamp would drop one of them and release the survivor's registration
+/// when the other finished, which is the lost update coming back through the
+/// mechanism that exists to stop it.
+#[test]
+fn two_commits_at_one_timestamp_are_both_held() {
+    let pending = table();
+    let _first = admit_at(&pending, 10, key(Partition::Node, b"a")).expect("first");
+    let _second = admit_at(&pending, 10, key(Partition::Node, b"b")).expect("second");
+    assert_eq!(pending.in_flight(), 2);
+
+    drop(_first);
+    assert_eq!(
+        pending.in_flight(),
+        1,
+        "the commit that finished released its own registration and not the other's"
+    );
+    assert_eq!(pending.snapshot_floor(|| 100), 10);
+}
+
+/// A read at a named timestamp waits for the commits under it and then
+/// proceeds, rather than being answered from a state missing one of them.
+#[test]
+fn a_named_timestamp_waits_for_the_commits_it_covers() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let pending = Arc::new(PendingCommits::new(ROOMY));
+
+    let holder = Arc::clone(&pending);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let admitted = holder
+            .admit_allocated(|| 50, key(Partition::Node, b"a"))
+            .map(|(_, a)| a)
+            .expect("admit");
+        started_tx.send(()).expect("signal");
+        std::thread::sleep(Duration::from_millis(60));
+        drop(admitted);
+    });
+    started_rx.recv().expect("the commit is in flight");
+
+    let waited = std::time::Instant::now();
+    pending
+        .await_complete_at(100, Duration::from_secs(5))
+        .expect("the commit landed within the wait");
+    assert!(
+        waited.elapsed() >= Duration::from_millis(40),
+        "the reader returned before the commit it was waiting for finished"
+    );
+    worker.join().expect("worker");
+}
+
+/// When the wait runs out the read is refused and told what it was waiting
+/// for. It is not answered from an incomplete state, and it is not quietly
+/// moved to a timestamp that happens to be ready.
+#[test]
+fn an_exhausted_wait_names_what_it_waited_for() {
+    use std::time::Duration;
+
+    let pending = table();
+    let _admitted = admit_at(&pending, 50, key(Partition::Node, b"a")).expect("admit");
+
+    let blocking = pending
+        .await_complete_at(100, Duration::from_millis(20))
+        .expect_err("the commit never landed");
+    assert_eq!(blocking, 50);
+}
+
+/// A commit above the requested timestamp is not in its way.
+#[test]
+fn a_named_timestamp_does_not_wait_for_commits_above_it() {
+    use std::time::Duration;
+
+    let pending = table();
+    let _admitted = admit_at(&pending, 200, key(Partition::Node, b"a")).expect("admit");
+
+    pending
+        .await_complete_at(100, Duration::from_millis(20))
+        .expect("nothing under this timestamp is in flight");
+}
+
 /// At the ceiling a commit is refused rather than admitted, and refused
 /// before its timestamp is taken: a number allocated and then thrown away is
 /// a hole in the clock that nobody closes.

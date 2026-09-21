@@ -144,6 +144,13 @@ impl<'a> coordinode_core::graph::stats::StorageStats for CombinedStats<'a> {
 /// repeated EXPLAIN calls while keeping estimates reasonably fresh.
 const STATS_CACHE_TTL_SECS: u64 = 60;
 
+/// How long a read waits for the state its timestamp names to be complete.
+///
+/// It bounds the wait, never the obligation: when it passes, the read is
+/// refused with what it was waiting for rather than answered from a state
+/// missing a write its own timestamp covers.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// Number of node IDs to pre-allocate per batch.
 ///
 /// On startup, the database reserves `ID_BATCH_SIZE` IDs by persisting
@@ -2248,6 +2255,23 @@ impl Database {
                     // to include, so the top snapshot is the right bound, not
                     // an overflow.
                     let seqno = ts.saturating_add(1);
+                    // A named timestamp is preserved, not lowered, so the
+                    // only way to make it complete is to let the commits
+                    // under it land. Answering before they do would read a
+                    // state missing a write the caller's own timestamp
+                    // covers; answering at another timestamp would silently
+                    // give them a different read than the one they asked for.
+                    if let Err(blocking) = self
+                        .engine
+                        .pending_commits()
+                        .await_complete_at(ts, READ_TIMEOUT)
+                    {
+                        return Err(DatabaseError::Other(format!(
+                            "read at timestamp {ts} timed out waiting for the commit at \
+                             {blocking} to land; it is covered by this timestamp and the \
+                             read cannot be answered without it"
+                        )));
+                    }
                     // Refused when the seqno is already below the GC
                     // watermark: that history may be collected, and a read
                     // there would answer from whatever survived.
@@ -2360,7 +2384,7 @@ impl Database {
             applied_watermark: None,
             read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
             ),
-            read_timeout: std::time::Duration::from_millis(2000),
+            read_timeout: READ_TIMEOUT,
             params: std::collections::HashMap::new(),
             pending_vector_writes: Vec::new(),
         };
