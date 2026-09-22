@@ -24,9 +24,16 @@ git_tag_name = "v{{ version }}"
 release_commits = "^(feat|fix|perf|refactor|docs|test)"
 
 # Every crate shares one version and the server's changelog already folds in
-# the commits of all of them, so the release PR shows that one changelog. The
-# default body lists every crate separately, and for a crate that only got the
-# version bump it prints the previous entry of its changelog as if it were new.
+# the commits of all of them, so the release PR leads with that one changelog.
+# Under it, each library crate that received commits gets its own collapsed
+# section, so a reader can see which crate an entry came from. Attribution is
+# by the files a commit touched, so a dependency bump can land an entry in a
+# crate its subject never mentions.
+#
+# The stock body lists every crate unconditionally, and for a crate that only
+# got the version bump it prints the previous entry of its changelog as if it
+# were new. The `## v<next_version>` test is what separates the two: a crate
+# with no commits carries an older heading, so it is left out.
 pr_body = """
 ## New release
 {% for release in releases %}{% if release.package == "coordinode-server" %}
@@ -34,6 +41,16 @@ pr_body = """
 
 {% if release.changelog %}{{ release.changelog }}{% endif %}
 {% endif %}{% endfor %}
+### Where the changes landed
+
+The list above is the folded view. Each crate below carries the entries written
+to its own changelog; a crate with no commits since the last release is absent.
+{% for release in releases %}{% if release.package != "coordinode-server" %}{% if release.changelog %}{% set marker = "## v" ~ release.next_version %}{% if marker in release.changelog %}
+<details><summary><code>{{ release.package }}</code></summary>
+{% set lines = release.changelog | trim | split(pat="\n") %}{% for line in lines %}{% if not loop.first %}{{ line }}
+{% endif %}{% endfor %}
+</details>
+{% endif %}{% endif %}{% endif %}{% endfor %}
 ---
 This PR was generated with [release-plz](https://github.com/release-plz/release-plz/).
 """
