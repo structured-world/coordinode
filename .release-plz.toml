@@ -32,8 +32,10 @@ release_commits = "^(feat|fix|perf|refactor|docs|test)"
 #
 # The stock body lists every crate unconditionally, and for a crate that only
 # got the version bump it prints the previous entry of its changelog as if it
-# were new. The `## v<next_version>` test is what separates the two: a crate
-# with no commits carries an older heading, so it is left out.
+# were new: with no entry to show, release-plz falls back to the last one the
+# crate's file already held. `release.title` is that entry's heading, so the
+# version named in it separates the two. A crate whose changelog file is not
+# written at all reports no title and can only be carrying a fresh entry.
 pr_body = """
 ## New release
 {% for release in releases %}{% if release.package == "coordinode-server" %}
@@ -45,10 +47,11 @@ pr_body = """
 
 The list above is the folded view. Each crate below carries the entries written
 to its own changelog; a crate with no commits since the last release is absent.
-{% for release in releases %}{% if release.package != "coordinode-server" %}{% if release.changelog %}{% set marker = "## v" ~ release.next_version %}{% if marker in release.changelog %}
+{% for release in releases %}{% if release.package != "coordinode-server" %}{% if release.changelog %}{% set marker = "v" ~ release.next_version %}{% set heading = release.title | default(value="") %}{% if heading == "" or marker in heading %}
 <details><summary><code>{{ release.package }}</code></summary>
-{% set lines = release.changelog | trim | split(pat="\n") %}{% for line in lines %}{% if not loop.first %}{{ line }}
-{% endif %}{% endfor %}
+
+{{ release.changelog | trim }}
+
 </details>
 {% endif %}{% endif %}{% endif %}{% endfor %}
 ---
