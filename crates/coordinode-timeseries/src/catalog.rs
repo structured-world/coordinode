@@ -225,6 +225,12 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     /// share a Raft-leader-stamped clock; CE single-node uses
     /// [`crate::clock::MonotonicHlcClock`]; tests use `ScriptedClock`.
     clock: std::sync::Arc<dyn IngestionClock>,
+    /// Commit timestamps for the bucket transactions: the engine's own
+    /// clock. A hybrid clock can run ahead of the wall clock, and a commit
+    /// stamped by any other clock lands beneath what the engine already
+    /// applied. An engine without one (a plain counter) gets a single clock
+    /// resumed from its snapshot, shared by every commit of this catalog.
+    oracle: std::sync::Arc<TimestampOracle>,
 }
 
 impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
@@ -252,6 +258,11 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
             next_node_id: std::sync::atomic::AtomicU64::new(next_node_id_seed),
             next_overflow_seqno: std::sync::atomic::AtomicU64::new(1),
             clock,
+            oracle: engine.oracle().unwrap_or_else(|| {
+                std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(
+                    engine.snapshot(),
+                )))
+            }),
         })
     }
 
@@ -269,9 +280,8 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         &self,
         body: impl FnOnce(&Self, &mut Transaction) -> CatalogResult<R>,
     ) -> CatalogResult<R> {
-        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
-        let read_ts = oracle.next();
-        let mut txn = Transaction::begin(self.engine, Some(&oracle), read_ts);
+        let read_ts = self.oracle.next();
+        let mut txn = Transaction::begin(self.engine, Some(&self.oracle), read_ts);
         let out = body(self, &mut txn)?;
         let wc = WriteConcern::majority();
         let ctx = CommitContext {

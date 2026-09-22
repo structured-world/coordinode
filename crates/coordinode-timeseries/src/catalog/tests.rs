@@ -163,6 +163,77 @@ fn count_rollover_flushes_and_reopens() {
     assert!(persisted.control.closed, "flushed bucket is closed");
 }
 
+/// A bucket the catalog commits lands at a timestamp from the engine's own
+/// clock, newer than everything the engine applied before it.
+///
+/// A hybrid clock runs ahead of the wall clock once it has seen a later
+/// timestamp: from another member, or resumed after a restart. A clock of
+/// the catalog's own, started fresh for every commit, knows none of that and
+/// hands out wall-clock time, so the bucket lands beneath state the engine
+/// already applied, and a later rewrite of it can land beneath the earlier
+/// one.
+#[test]
+fn a_flushed_bucket_is_committed_at_the_engines_clock() {
+    use coordinode_core::graph::node::encode_node_key;
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // An engine clock an hour ahead of the wall clock.
+    let ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros()
+        + 3_600_000_000;
+    let oracle = std::sync::Arc::new(
+        coordinode_core::txn::timestamp::TimestampOracle::resume_from(Timestamp::from_raw(
+            u64::try_from(ahead).expect("fits"),
+        )),
+    );
+    let config = coordinode_storage::engine::config::StorageConfig::with_endpoints(vec![
+        coordinode_storage::engine::config::EndpointConfig::new(
+            "default",
+            dir.path(),
+            coordinode_storage::engine::config::Media::Hdd,
+            coordinode_storage::engine::config::Durability::Durable,
+            coordinode_storage::engine::config::Tier::Warm,
+        ),
+    ]);
+    let engine = StorageEngine::open_with_oracle(&config, oracle).expect("open");
+    let store = LocalTimeSeriesStore;
+    let cfg = CatalogConfig {
+        max_count: 1,
+        ..CatalogConfig::default()
+    };
+    let catalog = BucketCatalog::new(
+        cfg,
+        0,
+        &store,
+        &engine,
+        1,
+        std::sync::Arc::new(crate::clock::MonotonicHlcClock::new()),
+    )
+    .unwrap();
+    let meta = rmpv::Value::String("s1".into());
+
+    let before = engine.snapshot();
+    // The second measurement rolls the first bucket over, which flushes it.
+    catalog
+        .write_measurement(7, meta.clone(), measurement(0, &[("temp", 20.0)]))
+        .unwrap();
+    catalog
+        .write_measurement(7, meta, measurement(1000, &[("temp", 21.0)]))
+        .unwrap();
+
+    let version = engine
+        .record_version(Partition::Node, &encode_node_key(0, NodeId::from_raw(1)))
+        .expect("version")
+        .expect("the flushed bucket is there");
+    assert!(
+        version >= before,
+        "the bucket committed at {version}, below the {before} the engine had reached"
+    );
+}
+
 #[test]
 fn out_of_order_measurements_sorted_on_flush() {
     let (_dir, engine) = mk_engine();
