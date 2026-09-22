@@ -100,6 +100,9 @@ pub struct ServerConfig {
     pub storage: StorageTopology,
     /// Cluster peer addresses (empty = standalone single-node).
     pub peers: Vec<String>,
+    /// How long a membership change (join, promotion, decommission) waits for
+    /// the previous one to commit before it is refused, in seconds (`None` = 30).
+    pub membership_change_timeout_secs: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -227,6 +230,7 @@ impl Default for ServerConfig {
             data_dir: "./data".to_string(),
             storage: StorageTopology::default(),
             peers: Vec::new(),
+            membership_change_timeout_secs: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

@@ -144,6 +144,7 @@ pub(crate) async fn serve(
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
         peers: peers_vec,
+        membership_change_timeout_secs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -556,6 +557,9 @@ pub(crate) async fn serve(
         (rn, None)
     };
 
+    if let Some(secs) = membership_change_timeout_secs {
+        raft_node.set_membership_settle_timeout(std::time::Duration::from_secs(secs));
+    }
     let raft_node = Arc::new(raft_node);
 
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =

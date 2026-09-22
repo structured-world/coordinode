@@ -92,6 +92,7 @@ the key is unset.
 | `max_invariant_claims` | `100000` | restart | Ceiling on the invariant claims held by all in-flight write attempts on this node, together. A claim is what a mutation states its result depends on (an endpoint it needs to keep existing, a bound it decided, a pair it observed); the guard holds one set per attempt until the attempt ends, and refuses a claim beyond this ceiling rather than letting the table grow with load. A refused attempt is answered with `ABORTED` / `INVARIANT_REFUSED` and retries cheaply. Raise it only for workloads that legitimately hold many conditions at once (large scans inside write transactions); reaching it otherwise points at attempts that never end. |
 | `max_commits_in_flight` | `10000` | restart | Ceiling on the commits admitted and not yet applied on this node. A commit registers the keys it will write before it validates them and holds that registration until its writes are local state, so the table holds one entry per commit in flight: bounded by write concurrency, not by data size. At the ceiling a commit is refused as retryable backpressure (`RESOURCE_EXHAUSTED` / `WRITE_BACKPRESSURE`) rather than the table growing without limit. Reaching it means commits are not finishing (a stalled replication wait, a member that stopped acknowledging), not that the node is merely busy. |
 | `snapshot_wait_ms` | `5` | live (`StorageEngine::set_snapshot_wait_ms`) | How long a read waits for commits that are still landing before it is answered from a view that stops behind them. A snapshot must not cover a commit that has not applied, or the reader sees neither the write nor any sign of it; waiting keeps the view fresh for the microseconds a commit needs to apply, stepping behind is instant but hands back a view older than the reader's own last write, which then conflicts with itself. Raise it to favour freshness under heavy write load, lower it to favour read latency. Zero is the step-behind-only behaviour, measured at 59% false conflicts between writers that shared no keys. |
+| `membership_change_timeout_secs` | `30` | live (`RaftNode::set_membership_settle_timeout`) | How long a membership change (`admin node join`, the promotion that follows it, `admin node decommission`) waits for the previous change to commit before it is refused. Status shows a new member as soon as its change is proposed, before the change commits, and the cluster takes one change at a time, so a command issued the moment status shows the previous result waits here instead of failing. A change commits in one replication round, so running out of this means the cluster has lost the quorum to commit; the command is refused naming the change still in progress. |
 | `node_shard` | `0` | restart | The shard whose node rows this engine holds. Node keys carry the shard ahead of the id, and the invariant guard is the one place inside the engine that resolves a node from its id alone, so it needs this to find the row. It must match the shard the statements above run against; the embedded database sets it from its own handle. |
 | `registry_heartbeat_ms` | `100` | restart | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
 | `registry_eviction_ms` | `1000` | restart | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
@@ -239,6 +240,8 @@ storage:
 #   - "node2.internal:7080"
 #   - "node3.internal:7080"
 peers: []
+# How long a membership change waits for the previous one to commit.
+# membership_change_timeout_secs: 30
 
 # Resource / network / storage tuning (commented keys show the default):
 # nofile: 262144
@@ -493,7 +496,9 @@ horizon for both time-travel reads and lagging-consumer recovery.
   lagging beyond the window holds the floor back for itself rather than losing
   data silently. Reads older than the horizon are refused (`OUT_OF_RANGE`,
   reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) instead of being
-  answered from partially collected history.
+  answered from partially collected history. A window of `0` turns time travel
+  off; statements and open transactions reading the current state are
+  unaffected, because each holds its own snapshot for as long as it runs.
 - The window is paid for in storage, per key: compaction keeps every version
   of a key written inside the window plus the newest one below it, and folds
   the rest. Budget disk for the data size plus one stored version per update

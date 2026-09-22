@@ -3606,6 +3606,221 @@ async fn decommission_follower_succeeds_in_3_node_cluster() {
     );
 }
 
+/// A decommission issued the moment the status shows the new voter succeeds.
+///
+/// Status reports the membership in effect, which is visible before it is
+/// committed, and a membership change is refused while another one is still
+/// in flight. An operator acts on the status, so a decommission right after a
+/// promotion has to wait for that promotion to settle rather than fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn decommission_right_after_a_promotion_waits_for_it() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+        await_leadership(&n1.node).await;
+
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+
+        let is_voter = |id: u64| {
+            n1.node.replication_status().is_some_and(|all| {
+                all.iter().any(|s| {
+                    s.node_id == id && s.role == coordinode_raft::cluster::NodeRole::Follower
+                })
+            })
+        };
+        let (promoted, decommissioned) =
+            tokio::join!(n1.node.change_membership(vec![1, 2, 3]), async {
+                while !is_voter(3) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                n1.node.decommission_node(3, false, false).await
+            });
+        promoted.expect("promotion to three voters");
+        let decommissioned = decommissioned.expect("decommission right after the promotion");
+        assert_eq!(decommissioned.node_id, 3);
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+        let _ = n3.node.shutdown().await;
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — decommission_right_after_a_promotion_waits_for_it"
+    );
+}
+
+/// The last member of a group shuts down after the others are gone.
+///
+/// Shutdown asks whether this node leads, to hand leadership over first. Asked
+/// through a linearizable check, the question needs a quorum to answer, and
+/// with the other members already stopped there is none: the last member
+/// waited on it indefinitely and never stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_member_shuts_down_after_the_others_are_gone() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters");
+
+        // The survivor is the leader when the others go, which is how a group
+        // stopped one member at a time ends up: each member hands leadership
+        // on as it leaves.
+        n1.node
+            .transfer_leadership_to(3)
+            .await
+            .expect("hand leadership to 3");
+        assert!(n3.node.is_leader().await, "3 leads before the others stop");
+        n1.node.shutdown().await.expect("n1 shutdown");
+        n2.node.shutdown().await.expect("n2 shutdown");
+        // Past its lease, so whether it still leads can only be answered by a
+        // quorum it no longer has.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let started = std::time::Instant::now();
+        let stopped = tokio::time::timeout(Duration::from_secs(10), n3.node.shutdown()).await;
+        assert!(
+            stopped.is_ok(),
+            "the last member did not stop within 10s of being asked"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — the_last_member_shuts_down_after_the_others_are_gone"
+    );
+}
+
+/// A membership change behind one that cannot commit is refused once its wait
+/// runs out, naming the change in progress, rather than waiting for as long as
+/// the group has no quorum.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_behind_one_that_cannot_commit_is_refused_after_its_wait() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add node 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters");
+
+        // The other two voters go away: nothing can commit any more.
+        n2.node.shutdown().await.expect("n2 shutdown");
+        n3.node.shutdown().await.expect("n3 shutdown");
+        n1.node
+            .set_membership_settle_timeout(Duration::from_secs(1));
+        assert_eq!(n1.node.membership_settle_timeout(), Duration::from_secs(1));
+
+        let (_stuck, refused) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                n1.node.change_membership(vec![1, 2]),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let started = std::time::Instant::now();
+                let outcome = n1.node.decommission_node(3, false, false).await;
+                (outcome, started.elapsed())
+            }
+        );
+        // Two refusals are right here, and which one comes is a race the test
+        // does not control: while the node still leads, the change waits for
+        // the one in progress and is refused when its wait runs out; once the
+        // node has stepped down for want of a quorum, there is no leader to
+        // take the change at all. Either way it is refused, and never later
+        // than its wait.
+        let (outcome, waited) = refused;
+        let err = outcome
+            .expect_err("a change behind an uncommittable one is refused")
+            .to_string();
+        let waited_out = err.contains("previous membership change is still in progress");
+        let no_leader = err.contains("no leader is known") && err.contains("Nothing was changed");
+        assert!(
+            waited_out || no_leader,
+            "the refusal names the change in progress or the missing leader, got: {err}"
+        );
+        if waited_out {
+            assert!(
+                waited >= Duration::from_millis(900),
+                "a change refused for the one in progress waited first: {waited:?}"
+            );
+        }
+        assert!(
+            waited < Duration::from_secs(4),
+            "refused within its wait, never left hanging: {waited:?}"
+        );
+
+        n1.node.shutdown().await.expect("n1 shutdown");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — a_change_behind_one_that_cannot_commit_is_refused_after_its_wait"
+    );
+}
+
 /// Decommissioning a non-voter node must fail with a clear error.
 ///
 /// Phase 0a: the node must be in the current voter set.

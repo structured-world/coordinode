@@ -16,6 +16,7 @@
 //! | `self_decommission_transfers_leadership_off_the_leader` | DecommissionNode | Leader decommissions itself: leadership transfers to a peer + membership shrinks (the `decommission_self` service path) |
 //! | `a_standalone_server_with_data_grows_into_a_cluster` | JoinNode | A machine that already holds data restarts with `--peers`, a second machine is added, and the pre-cluster data is on it |
 //! | `a_server_that_still_holds_data_is_refused_as_a_joiner` | serve | The same machine started as a joiner refuses at startup and names the empty directory as the fix |
+//! | `a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor` | JoinNode, DecommissionNode | A machine with data grows to three and back to two with its data on both members; the step to one is refused naming the rule |
 //!
 //! ## Running
 //!
@@ -285,6 +286,123 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
              added to it"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// The round trip an operator makes through the binary: one machine with data
+/// becomes three, is shrunk back to the two a group needs, and what it held
+/// at the start is still there. The step below two is refused, where the
+/// operator sees it, naming the rule.
+///
+/// Growing is only half the promise. The way back is where data is easiest to
+/// lose: the member that leaves held a copy, and the ones that stay have to be
+/// complete members rather than survivors with whatever replication happened
+/// to deliver. A CE group keeps at least two voters, so shrinking to one is
+/// not a step the cluster takes, and asking for it must change nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
+    let n1 = CoordinodeProcess::start().await;
+    n1.wait_for_leader(Duration::from_secs(15)).await;
+    {
+        let mut cypher = n1.cypher_client().await;
+        cypher
+            .execute_cypher(ExecuteCypherRequest {
+                query: "CREATE (n:Durable {id: 1, name: 'written alone'}) RETURN n.id".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: None,
+                transaction_id: 0,
+            })
+            .await
+            .expect("the standalone server accepts the write");
+    }
+
+    let p2 = free_port();
+    let p3 = free_port();
+    let n1 = n1.restart_as_cluster_member(1, &[p2, p3]).await;
+    n1.wait_for_leader(Duration::from_secs(20)).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[n1.port, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[n1.port, p2]).await;
+
+    // One membership change at a time: a JoinNode is two of them, so adding
+    // both at once collides with the change already in flight.
+    let mut leader = n1.cluster_client().await;
+    for (id, endpoint) in [(2u64, n2.endpoint()), (3u64, n3.endpoint())] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: endpoint,
+                pre_seeded: false,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("JoinNode({id}) must be accepted: {e}"));
+        // Adding member `id` brings the voter count to `id`: node 1 was
+        // already there, and the members are added in order.
+        wait_for_voters(&mut leader, id as usize, Duration::from_secs(40)).await;
+    }
+
+    // Back down to two, removing the last member added. Node 1 keeps the
+    // leadership it has, so this is the shrink an operator performs when a
+    // machine goes away rather than a leadership handover.
+    let decommission = |node_id: u64| DecommissionNodeRequest {
+        node_id,
+        pruning: false,
+        force: false,
+        skip_confirmation: false,
+    };
+    leader
+        .decommission_node(decommission(3))
+        .await
+        .unwrap_or_else(|e| panic!("decommission of 3 must succeed: {e}"));
+    wait_for_voters(&mut leader, 2, Duration::from_secs(40)).await;
+
+    // One more would leave a single voter. The refusal comes back as a
+    // precondition, names the rule, and leaves the membership as it was.
+    let refused = leader
+        .decommission_node(decommission(2))
+        .await
+        .expect_err("a two-voter group must refuse to shrink to one");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message().contains("minimum 2 required"),
+        "the refusal must name the rule, got: {}",
+        refused.message()
+    );
+    wait_for_voters(&mut leader, 2, Duration::from_secs(10)).await;
+
+    // Both members that stayed still answer with what node 1 held before any
+    // of this, each read from itself: the leader as PRIMARY, the follower as
+    // SECONDARY with a local read concern, which answers from where the
+    // request landed.
+    for (id, node, read_preference) in [(1u64, &n1, 0), (2u64, &n2, 3)] {
+        let mut cypher = node.cypher_client().await;
+        let rows = cypher
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (n:Durable) RETURN n.name".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference,
+                read_concern: Some(ReadConcern {
+                    level: 1, // LOCAL
+                    after_index: 0,
+                    at_timestamp: 0,
+                }),
+                write_concern: None,
+                transaction_id: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("member {id} answers: {e}"))
+            .into_inner()
+            .rows;
+        assert_eq!(
+            rows.len(),
+            1,
+            "member {id}: the data the machine held before the cluster existed must survive"
+        );
     }
 }
 

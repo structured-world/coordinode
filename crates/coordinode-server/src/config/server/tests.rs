@@ -38,6 +38,22 @@ fn partial_yaml_overlays_only_its_keys() {
     assert_eq!(c.ops_addr, "[::]:7084");
 }
 
+/// The membership-change wait is a config-file setting: unset it leaves the
+/// node's default, set it carries the seconds given.
+#[test]
+fn membership_change_timeout_parses_from_the_config_file() {
+    assert!(
+        ServerConfig::default()
+            .membership_change_timeout_secs
+            .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "membership_change_timeout_secs: 90\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.membership_change_timeout_secs, Some(90));
+}
+
 #[test]
 fn cli_overrides_beat_the_config_file() {
     // The CLI carries only bootstrap-critical knobs now; a fine tunable

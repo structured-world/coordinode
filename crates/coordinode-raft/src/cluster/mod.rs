@@ -34,6 +34,12 @@ use network::{GrpcNetworkFactory, StubNetworkFactory};
 
 use crate::proto::replication::raft_service_server::RaftServiceServer;
 
+/// Default for how long a membership change waits for the previous one to
+/// settle, in ms. A change commits in one replication round to the voters it
+/// involves, so running out of this means the group has lost the quorum to
+/// commit, which is an error to report rather than a delay to extend.
+pub const DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS: u64 = 30_000;
+
 /// Raft node orchestrator.
 ///
 /// Manages the lifecycle of an openraft instance, providing:
@@ -106,9 +112,29 @@ pub struct RaftNode {
     grpc_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Snapshot trigger background task abort handle.
     _snapshot_trigger: Option<tokio::task::JoinHandle<()>>,
+    /// How long a membership change waits for the previous one to settle,
+    /// in ms. See [`Self::set_membership_settle_timeout`].
+    membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
 }
 
 impl RaftNode {
+    /// How long a membership change waits for the previous one to commit.
+    pub fn membership_settle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.membership_settle_timeout_ms
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Change that wait without a restart. A change still unsettled when it
+    /// runs out is refused with an error naming the previous change, rather
+    /// than waited on for as long as the group has no quorum to commit it.
+    pub fn set_membership_settle_timeout(&self, timeout: std::time::Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.membership_settle_timeout_ms
+            .store(ms, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Open a Raft node, handling both fresh start and restart.
     ///
     /// If the storage has no existing Raft state (fresh), initializes
@@ -207,6 +233,9 @@ impl RaftNode {
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: None,
+            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
+            ),
         })
     }
 
@@ -358,6 +387,9 @@ impl RaftNode {
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
+            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
+            ),
         })
     }
 
@@ -483,6 +515,9 @@ impl RaftNode {
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: Some(snap_handle),
+            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
+            ),
         };
 
         Ok((node, handler))
@@ -569,6 +604,9 @@ impl RaftNode {
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
             _snapshot_trigger: Some(snap_handle),
+            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
+            ),
         };
 
         Ok((node, handler))
@@ -674,7 +712,58 @@ impl RaftNode {
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             _snapshot_trigger: Some(snap_handle),
+            membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
+                DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
+            ),
         })
+    }
+
+    /// Say why openraft refused a membership change in the terms an operator
+    /// acts on. Its own wording for a missing leader is
+    /// "has to forward request to: None, None", which names neither the cause
+    /// (no quorum to elect one) nor the fact that nothing changed.
+    fn describe_membership_refusal(
+        e: &openraft::error::RaftError<TypeConfig, openraft::error::ClientWriteError<TypeConfig>>,
+    ) -> String {
+        match e.forward_to_leader().map(|f| f.leader_id) {
+            Some(Some(leader)) => {
+                format!("node {leader} is the leader; send the change there. Nothing was changed.")
+            }
+            Some(None) => "no leader is known: without a quorum the cluster cannot elect one. \
+                           Nothing was changed."
+                .to_string(),
+            None => e.to_string(),
+        }
+    }
+
+    /// Wait until no membership change is in flight: the membership in effect
+    /// is a single configuration, not a joint one, and the log entry that
+    /// installed it is committed.
+    ///
+    /// The membership in effect is visible before it commits, so status can
+    /// already show a new voter while the change that added it is still being
+    /// replicated, and openraft refuses a second change until the first one
+    /// settles. An operator acts on the status; every membership change here
+    /// starts by waiting for the previous one rather than failing with it.
+    async fn membership_settled(&self) -> Result<(), RaftNodeError> {
+        use openraft::LogIdOptionExt;
+
+        self.raft
+            .wait(Some(self.membership_settle_timeout()))
+            .metrics(
+                |m| {
+                    m.membership_config.membership().get_joint_config().len() == 1
+                        && m.membership_config.log_id().index() <= m.local_committed.index()
+                },
+                "the previous membership change settles",
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                RaftNodeError::Membership(format!(
+                    "a previous membership change is still in progress: {e}"
+                ))
+            })
     }
 
     /// Add a new node to the cluster (leader-only).
@@ -690,6 +779,7 @@ impl RaftNode {
     /// 5. On node 1: `change_membership([1, 2, 3])` → all become voters
     pub async fn add_node(&self, node_id: u64, addr: String) -> Result<(), RaftNodeError> {
         self.publish_own_address().await?;
+        self.membership_settled().await?;
 
         let node_info = openraft::impls::BasicNode { addr };
 
@@ -752,12 +842,13 @@ impl RaftNode {
     /// Sets the voting members to the given set of node IDs.
     /// All nodes must have been previously added as learners.
     pub async fn change_membership(&self, member_ids: Vec<u64>) -> Result<(), RaftNodeError> {
+        self.membership_settled().await?;
         let members: std::collections::BTreeSet<u64> = member_ids.into_iter().collect();
 
         self.raft
             .change_membership(members, false)
             .await
-            .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
+            .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
 
         tracing::info!("cluster membership updated");
         Ok(())
@@ -772,6 +863,7 @@ impl RaftNode {
     pub async fn remove_node(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::rt::watch::WatchReceiver;
 
+        self.membership_settled().await?;
         // Get current voter set from raft metrics.
         // Must collect inside borrow scope — voter_ids() borrows from the ref guard.
         let current_members: std::collections::BTreeSet<u64> = {
@@ -799,7 +891,7 @@ impl RaftNode {
         self.raft
             .change_membership(new_members, false)
             .await
-            .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
+            .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
 
         tracing::info!(node_id, "removed node from cluster");
         Ok(())
@@ -820,6 +912,7 @@ impl RaftNode {
     pub async fn promote_to_voter(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
+        self.membership_settled().await?;
         let current_voters: std::collections::BTreeSet<u64> = {
             let metrics = self.raft.metrics().borrow_watched().clone();
             let joint = metrics.membership_config.membership().get_joint_config();
@@ -840,7 +933,12 @@ impl RaftNode {
         self.raft
             .change_membership(new_members, false)
             .await
-            .map_err(|e| RaftNodeError::Membership(format!("promote_to_voter failed: {e}")))?;
+            .map_err(|e| {
+                RaftNodeError::Membership(format!(
+                    "promote_to_voter failed: {}",
+                    Self::describe_membership_refusal(&e)
+                ))
+            })?;
 
         tracing::info!(node_id, "promoted learner to voter");
         Ok(())
@@ -866,6 +964,7 @@ impl RaftNode {
     pub async fn demote_to_learner(&self, node_id: u64) -> Result<(), RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
+        self.membership_settled().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
         let current_voters: std::collections::BTreeSet<u64> = {
             let joint = metrics.membership_config.membership().get_joint_config();
@@ -906,7 +1005,12 @@ impl RaftNode {
         self.raft
             .change_membership(new_members, true)
             .await
-            .map_err(|e| RaftNodeError::Membership(format!("demote_to_learner failed: {e}")))?;
+            .map_err(|e| {
+                RaftNodeError::Membership(format!(
+                    "demote_to_learner failed: {}",
+                    Self::describe_membership_refusal(&e)
+                ))
+            })?;
 
         tracing::info!(node_id, "demoted voter to learner");
         Ok(())
@@ -1519,6 +1623,10 @@ impl RaftNode {
     ) -> Result<DecommissionResult, RaftNodeError> {
         use openraft::async_runtime::watch::WatchReceiver;
 
+        // The gates below read the voter set, which must be the committed one:
+        // a change still in flight would be judged by a membership that may
+        // not stand, and then refused by openraft anyway.
+        self.membership_settled().await?;
         let metrics = self.raft.metrics().borrow_watched().clone();
 
         // Snapshot current voter set from openraft membership config.
@@ -1586,7 +1694,12 @@ impl RaftNode {
         self.raft
             .change_membership(new_members, false)
             .await
-            .map_err(|e| RaftNodeError::Membership(format!("change_membership failed: {e}")))?;
+            .map_err(|e| {
+                RaftNodeError::Membership(format!(
+                    "change_membership failed: {}",
+                    Self::describe_membership_refusal(&e)
+                ))
+            })?;
 
         tracing::info!(
             node_id,
