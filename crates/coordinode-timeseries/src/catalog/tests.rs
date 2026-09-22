@@ -38,7 +38,7 @@ fn ts_write<R>(
 ) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     let out = body(&LocalTimeSeriesStore, &mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -60,7 +60,7 @@ fn ts_read<R>(
 ) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&LocalTimeSeriesStore, &txn)
 }
 

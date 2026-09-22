@@ -125,7 +125,7 @@ fn insert_node(
     }
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore.put(&mut txn, 1, nid, &record).expect("put");
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -145,7 +145,7 @@ fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_i
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalEdgeStore
         .put_edge(
             &mut txn,

@@ -332,7 +332,7 @@ fn definition_txn_round_trip() {
 
     // CREATE INDEX: persist the definition through a statement transaction.
     let read_ts = oracle.next();
-    let mut t = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut t = Transaction::begin(engine, Some(&oracle), read_ts);
     store.put_definition_txn(&mut t, &def).expect("put txn");
     commit(&mut t);
     let loaded = store
@@ -344,7 +344,7 @@ fn definition_txn_round_trip() {
 
     // DROP INDEX: delete the definition through a statement transaction.
     let read_ts = oracle.next();
-    let mut t = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut t = Transaction::begin(engine, Some(&oracle), read_ts);
     store
         .delete_definition_txn(&mut t, "user_email")
         .expect("delete txn");

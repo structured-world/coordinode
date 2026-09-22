@@ -84,12 +84,10 @@ fn increment(
 ) {
     let wc = WriteConcern::default();
     loop {
-        let snap = engine.snapshot();
-        let mut txn = Transaction::new(
+        let mut txn = Transaction::begin(
             engine,
             Some(oracle),
             Timestamp::from_raw(oracle.next().as_raw()),
-            Some(snap),
         );
         let current = txn
             .get(Partition::Node, key)

@@ -113,7 +113,7 @@ fn insert_node(
     }
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .put(&mut txn, shard_id, NodeId::from_raw(node_id), &record)
         .expect("put node");
@@ -154,7 +154,7 @@ fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_i
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalEdgeStore
         .put_edge(
             &mut txn,
@@ -11819,7 +11819,7 @@ fn out_neighbors(engine: &StorageEngine, edge_type: &str, src: u64) -> Vec<u64> 
     use coordinode_storage::engine::transaction::Transaction;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalEdgeStore
         .scan_neighbors_out(&txn, edge_type, NodeId::from_raw(src))
         .expect("scan out-neighbors")

@@ -53,6 +53,7 @@ use lsm_tree::{AbstractTree, Guard};
 
 use super::{SeekableStorageIter, StorageIter};
 use crate::engine::partition::Partition;
+use crate::engine::pending::PendingCommits;
 use crate::error::{StorageError, StorageResult};
 
 /// OCC read scope — Layer-3 owned read-set tracker for optimistic
@@ -433,11 +434,16 @@ pub trait MultiModalCoordinator: Send + Sync {
 pub struct GcWatermarkController {
     /// Pinned seqno -> reference count. The smallest key is the oldest live
     /// snapshot; an empty map means no reader is pinned.
-    pins: Mutex<BTreeMap<u64, usize>>,
+    pins: parking_lot::Mutex<BTreeMap<u64, usize>>,
     /// The shared atomic the compaction filter reads as its fold/GC threshold.
     gc_watermark: Arc<AtomicU64>,
-    /// Current-seqno source; the watermark target when nothing is pinned.
+    /// Current-seqno source; with `pending`, the watermark target when
+    /// nothing is pinned.
     seqno: lsm_tree::SharedSequenceNumberGenerator,
+    /// The commits admitted but not yet applied. The clock has already passed
+    /// their timestamps, and a snapshot stops below the oldest of them, so the
+    /// clock alone is a ceiling above the snapshots the engine hands out.
+    pending: Arc<PendingCommits>,
     /// External retention floor, published by the `SeqnoConsumerRegistry`
     /// (`coordinode-replicate`): `min(consumer_checkpoints, retention_window)`.
     /// Combined into the watermark by `min`, so the effective GC threshold is
@@ -461,28 +467,33 @@ impl GcWatermarkController {
     fn new(
         gc_watermark: Arc<AtomicU64>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
+        pending: Arc<PendingCommits>,
         seqno_is_clock: bool,
     ) -> Self {
         let controller = Self {
-            pins: Mutex::new(BTreeMap::new()),
+            pins: parking_lot::Mutex::new(BTreeMap::new()),
             gc_watermark,
             seqno,
+            pending,
             external_floor: AtomicU64::new(u64::MAX),
             retention_window_us: AtomicU64::new(u64::MAX),
             seqno_is_clock,
         };
-        if let Ok(pins) = controller.pins.lock() {
-            controller.recompute(&pins);
-        }
+        controller.tick();
         controller
     }
 
     /// Recompute and publish the watermark: the least of (the oldest pinned
-    /// seqno, or the current seqno when nothing is pinned), the external
-    /// retention floor, and the time-travel window floor. Caller holds the
-    /// `pins` lock.
+    /// seqno, or the latest complete snapshot when nothing is pinned), the
+    /// external retention floor, and the time-travel window floor. Caller
+    /// holds the `pins` lock.
+    ///
+    /// The latest complete snapshot, not the clock: a snapshot stops below the
+    /// oldest commit still in flight, and a watermark above it refuses the pin
+    /// of a reader that was just handed it. Lock order is `pins` then the
+    /// pending table; nothing holding the pending table takes `pins`.
     fn recompute(&self, pins: &BTreeMap<u64, usize>) {
-        let current = self.seqno.get();
+        let current = self.pending.snapshot_floor(|| self.seqno.get());
         let pin_floor = pins.keys().next().copied().unwrap_or(current);
         let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
         let window = self.retention_window_us.load(Ordering::Acquire);
@@ -498,9 +509,7 @@ impl GcWatermarkController {
     /// Set the time-travel retention window (seqno units) and republish.
     pub fn set_retention_window_us(&self, window_us: u64) {
         self.retention_window_us.store(window_us, Ordering::Release);
-        if let Ok(pins) = self.pins.lock() {
-            self.recompute(&pins);
-        }
+        self.tick();
     }
 
     /// The configured time-travel retention window (seqno units).
@@ -546,9 +555,7 @@ impl GcWatermarkController {
     /// reader's versions to be collected.
     pub fn set_external_floor(&self, floor: u64) {
         self.external_floor.store(floor, Ordering::Release);
-        if let Ok(pins) = self.pins.lock() {
-            self.recompute(&pins);
-        }
+        self.tick();
     }
 
     /// Pin the current snapshot seqno so the watermark cannot advance past it
@@ -576,37 +583,69 @@ impl GcWatermarkController {
     /// the same lock that publishes the watermark closes the race between
     /// "check the watermark" and "pin": a granted pin always protects live
     /// history.
+    ///
+    /// Granting does not republish the watermark. A pin at or above it
+    /// already holds it where it must be; republishing only ever moves it
+    /// forward, which is the release's and the tick's job, and here would
+    /// cost every reader the pending-commit lock on its way in.
     pub fn pin_at(self: &Arc<Self>, seqno: u64) -> Option<SnapshotPin> {
-        let mut pins = self.pins.lock().ok()?;
+        let mut pins = self.pins.lock();
         if seqno < self.gc_watermark.load(Ordering::Acquire) {
             return None;
         }
         *pins.entry(seqno).or_insert(0) += 1;
-        self.recompute(&pins);
         Some(SnapshotPin {
             controller: Arc::clone(self),
             seqno,
         })
     }
 
+    /// Hold the watermark where it stands until the guard drops. Read under
+    /// the lock that publishes it, so the hold is always granted: it is what a
+    /// reader takes for the moment it spends choosing its snapshot.
+    pub fn hold_watermark(self: &Arc<Self>) -> WatermarkHold {
+        let mut pins = self.pins.lock();
+        let seqno = self.gc_watermark.load(Ordering::Acquire);
+        *pins.entry(seqno).or_insert(0) += 1;
+        WatermarkHold {
+            controller: Arc::clone(self),
+            seqno,
+        }
+    }
+
+    /// Drop a hold without republishing. The hold lasted only while a reader
+    /// chose and pinned its snapshot; moving the watermark forward is left to
+    /// the next release of a real pin or the next tick, rather than charged
+    /// to every reader on its way in.
+    fn release_hold(&self, seqno: u64) {
+        Self::unpin(&mut self.pins.lock(), seqno);
+    }
+
     /// Advance the watermark toward the current seqno. A no-op while any
     /// snapshot is pinned; call periodically so folding and version GC keep up
     /// during quiescent periods with no read traffic.
     pub fn tick(&self) {
-        if let Ok(pins) = self.pins.lock() {
+        self.recompute(&self.pins.lock());
+    }
+
+    /// Drop one pin at `seqno`. The watermark is republished only when the
+    /// oldest pin is gone, since that is the only release that lets it move;
+    /// any other one leaves the minimum where it was.
+    fn release(&self, seqno: u64) {
+        let mut pins = self.pins.lock();
+        let oldest = pins.keys().next().copied();
+        Self::unpin(&mut pins, seqno);
+        if pins.keys().next().copied() != oldest {
             self.recompute(&pins);
         }
     }
 
-    fn release(&self, seqno: u64) {
-        if let Ok(mut pins) = self.pins.lock() {
-            if let Some(count) = pins.get_mut(&seqno) {
-                *count -= 1;
-                if *count == 0 {
-                    pins.remove(&seqno);
-                }
+    fn unpin(pins: &mut BTreeMap<u64, usize>, seqno: u64) {
+        if let Some(count) = pins.get_mut(&seqno) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&seqno);
             }
-            self.recompute(&pins);
         }
     }
 }
@@ -630,6 +669,21 @@ impl SnapshotPin {
 impl Drop for SnapshotPin {
     fn drop(&mut self) {
         self.controller.release(self.seqno);
+    }
+}
+
+/// RAII guard keeping the GC watermark from rising while a reader chooses and
+/// pins its snapshot. Unlike a [`SnapshotPin`], dropping it does not move the
+/// watermark forward.
+#[must_use = "dropping the hold immediately releases it"]
+pub struct WatermarkHold {
+    controller: Arc<GcWatermarkController>,
+    seqno: u64,
+}
+
+impl Drop for WatermarkHold {
+    fn drop(&mut self) {
+        self.controller.release_hold(self.seqno);
     }
 }
 
@@ -682,11 +736,13 @@ impl LocalMultiModalCoordinator {
     pub(crate) fn build_gc_controller(
         gc_watermark: Arc<AtomicU64>,
         seqno: lsm_tree::SharedSequenceNumberGenerator,
+        pending: Arc<PendingCommits>,
         seqno_is_clock: bool,
     ) -> Arc<GcWatermarkController> {
         Arc::new(GcWatermarkController::new(
             gc_watermark,
             seqno,
+            pending,
             seqno_is_clock,
         ))
     }
@@ -720,6 +776,12 @@ impl LocalMultiModalCoordinator {
     /// consumer.
     pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<SnapshotPin> {
         self.gc_controller.pin_at(seqno)
+    }
+
+    /// Hold the GC watermark where it stands until the guard drops. See
+    /// [`GcWatermarkController::hold_watermark`].
+    pub(crate) fn hold_watermark(&self) -> WatermarkHold {
+        self.gc_controller.hold_watermark()
     }
 
     /// Advance the GC watermark toward the current seqno when no snapshot is

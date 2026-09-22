@@ -178,7 +178,7 @@ fn evaluate_predicate_via_engine_round_trip() {
         use coordinode_storage::engine::transaction::{CommitContext, Transaction};
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
         LocalNodeStore
             .put(&mut txn, shard_id, node_id, &record)
             .expect("put node");

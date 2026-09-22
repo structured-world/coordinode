@@ -204,13 +204,7 @@ fn concurrent_writers_on_one_key_lose_no_update() {
                     // Retry until this writer's own increment lands. A refusal
                     // is the contract working, not a failure.
                     loop {
-                        let snap = engine.snapshot();
-                        let mut txn = Transaction::new(
-                            &engine,
-                            Some(&oracle),
-                            Timestamp::from_raw(snap),
-                            Some(snap),
-                        );
+                        let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
                         let current = txn
                             .get(Partition::Node, KEY)
                             .expect("read")
@@ -871,11 +865,10 @@ fn prefix_scan_overlays_buffer_over_snapshot() {
     let (engine, oracle, _d) = test_engine();
     // Seed a committed row directly.
     engine.put(Partition::Node, b"p:a", b"old").unwrap();
-    let mut txn = Transaction::new(
+    let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
-        Some(engine.snapshot()),
     );
     // Buffer overrides the committed value and adds a new key.
     txn.put(Partition::Node, b"p:a", b"new").unwrap();
@@ -899,11 +892,10 @@ fn prefix_scan_buffered_tombstone_does_not_hide_storage_row() {
     // `get`; scans surface the snapshot row.
     let (engine, oracle, _d) = test_engine();
     engine.put(Partition::Node, b"p:x", b"v").unwrap();
-    let mut txn = Transaction::new(
+    let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
-        Some(engine.snapshot()),
     );
     txn.delete(Partition::Node, b"p:x").unwrap();
     // Point read sees the tombstone (RYOW).
@@ -937,11 +929,10 @@ fn prefix_scan_paged_walks_the_prefix_in_keyset_pages() {
         engine.put(Partition::Node, &[b'p', b':', i], &[i]).unwrap();
     }
     engine.put(Partition::Node, b"q:z", b"x").unwrap();
-    let mut txn = Transaction::new(
+    let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
-        Some(engine.snapshot()),
     );
 
     // Page in batches of two, resuming by keyset off the last key.
@@ -972,11 +963,10 @@ fn prefix_scan_paged_walks_the_prefix_in_keyset_pages() {
 fn prefix_scan_paged_empty_prefix_is_exhausted_with_no_last_key() {
     let (engine, oracle, _d) = test_engine();
     engine.put(Partition::Node, b"q:a", b"x").unwrap();
-    let mut txn = Transaction::new(
+    let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
-        Some(engine.snapshot()),
     );
     let page = txn
         .prefix_scan_paged(Partition::Node, b"p:", None, 10)
@@ -991,11 +981,10 @@ fn prefix_scan_paged_exact_limit_reports_exhausted() {
     let (engine, oracle, _d) = test_engine();
     engine.put(Partition::Node, b"p:a", b"1").unwrap();
     engine.put(Partition::Node, b"p:b", b"2").unwrap();
-    let mut txn = Transaction::new(
+    let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
-        Some(engine.snapshot()),
     );
     // Exactly `limit` matching rows: exhausted, no phantom extra page.
     let page = txn

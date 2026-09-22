@@ -147,7 +147,7 @@ fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_i
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalEdgeStore
         .put_edge(
             &mut txn,
@@ -175,7 +175,7 @@ fn adj_contains(engine: &StorageEngine, edge_type: &str, src: u64, tgt: u64) -> 
     use coordinode_storage::engine::transaction::Transaction;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalEdgeStore
         .scan_neighbors_out(&txn, edge_type, NodeId::from_raw(src))
         .expect("scan out-neighbors")
@@ -191,7 +191,7 @@ fn put_node_committed(engine: &StorageEngine, shard: u16, id: u64, record: &Node
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .put(&mut txn, shard, NodeId::from_raw(id), record)
         .expect("put node");
@@ -213,7 +213,7 @@ fn read_node_record(engine: &StorageEngine, shard: u16, id: u64) -> Option<NodeR
     use coordinode_storage::engine::transaction::Transaction;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .get(&txn, shard, NodeId::from_raw(id))
         .expect("get node")

@@ -904,9 +904,12 @@ impl<'a> ExecutionContext<'a> {
         let Some(oracle) = self.mvcc_oracle else {
             return;
         };
-        let now = oracle.next();
-        self.mvcc_read_ts = now;
-        self.mvcc_snapshot = Some(now.as_raw());
+        // Allocated and pinned in one step: pinned later, the watermark can
+        // have passed it by the first read.
+        let (now, pin) = self.engine.pin_new_snapshot(|| oracle.next().as_raw());
+        self.mvcc_read_ts = Timestamp::from_raw(now);
+        self.mvcc_snapshot = Some(now);
+        self.txn.adopt_snapshot(now, pin);
         self.sync_txn_state();
     }
 

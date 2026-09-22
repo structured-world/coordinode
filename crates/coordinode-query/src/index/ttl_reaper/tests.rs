@@ -53,7 +53,7 @@ fn seed_node_record(engine: &StorageEngine, shard_id: u16, node_id: NodeId, reco
     use coordinode_storage::engine::transaction::{CommitContext, Transaction};
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .put(&mut txn, shard_id, node_id, record)
         .expect("put node");
@@ -75,7 +75,7 @@ fn read_node(engine: &StorageEngine, shard_id: u16, node_id: NodeId) -> Option<N
     use coordinode_storage::engine::transaction::Transaction;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .get(&txn, shard_id, node_id)
         .expect("get node")

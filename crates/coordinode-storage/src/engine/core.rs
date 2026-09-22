@@ -113,7 +113,7 @@ pub struct StorageEngine {
     /// Commits admitted here and not yet applied. Validation reads committed
     /// state, which is exactly what these are not part of yet, so they are
     /// consulted beside it.
-    pending_commits: crate::engine::pending::PendingCommits,
+    pending_commits: Arc<crate::engine::pending::PendingCommits>,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -352,9 +352,15 @@ impl StorageEngine {
         // is spawned below, before the coordinator exists, and its cascade
         // eviction compacts — so it needs to publish and read the same
         // watermark.
+        // Shared with the watermark controller: a snapshot stops below the
+        // oldest commit in flight, and the watermark must not pass it.
+        let pending_commits = Arc::new(crate::engine::pending::PendingCommits::new(
+            config.max_commits_in_flight,
+        ));
         let gc_controller = LocalMultiModalCoordinator::build_gc_controller(
             Arc::clone(&gc_watermark),
             seqno.clone(),
+            Arc::clone(&pending_commits),
             oracle.is_some(),
         );
 
@@ -800,9 +806,7 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
-            pending_commits: crate::engine::pending::PendingCommits::new(
-                config.max_commits_in_flight,
-            ),
+            pending_commits,
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -1441,6 +1445,41 @@ impl StorageEngine {
     /// read at or above [`Self::gc_watermark`] instead.
     pub fn pin_snapshot_at(&self, seqno: lsm_tree::SeqNo) -> Option<SnapshotPin> {
         self.coordinator.pin_snapshot_at(seqno)
+    }
+
+    /// The latest complete snapshot, already pinned.
+    pub fn pin_latest_snapshot(&self) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
+        self.pin_new_snapshot(|| self.snapshot())
+    }
+
+    /// Choose a snapshot that is not behind the present and pin it in the same
+    /// step: the latest complete snapshot, or a timestamp freshly allocated
+    /// from the clock.
+    ///
+    /// Choosing and then calling [`Self::pin_snapshot_at`] is two steps, and
+    /// commits can land between them: the snapshot floor rises past the
+    /// choice, the next pin released anywhere publishes it as the watermark,
+    /// and the pin is refused. So the watermark is held where it stands first.
+    /// The watermark never exceeds the snapshot floor, the floor only rises,
+    /// and a fresh timestamp is above it, so the choice made under the hold is
+    /// at or above the held watermark and pinning it cannot be refused.
+    ///
+    /// `choose` must not return a seqno older than the moment it is called;
+    /// a historical snapshot is pinned with [`Self::pin_snapshot_at`], which
+    /// refuses it when its history may be gone.
+    pub fn pin_new_snapshot(
+        &self,
+        choose: impl FnOnce() -> lsm_tree::SeqNo,
+    ) -> (lsm_tree::SeqNo, Option<SnapshotPin>) {
+        let hold = self.coordinator.hold_watermark();
+        let snapshot = choose();
+        let pin = self.coordinator.pin_snapshot_at(snapshot);
+        debug_assert!(
+            pin.is_some(),
+            "a snapshot chosen under a watermark hold was refused its pin"
+        );
+        drop(hold);
+        (snapshot, pin)
     }
 
     /// The oldest seqno a time-travel read can still be served at.

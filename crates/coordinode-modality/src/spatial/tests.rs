@@ -182,7 +182,7 @@ fn write_spatial_with(
     body: impl FnOnce(&LocalSpatialStore, &mut Transaction),
 ) {
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(oracle), read_ts);
     body(&LocalSpatialStore, &mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -203,7 +203,7 @@ fn read_spatial<R>(
 ) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&LocalSpatialStore, &txn)
 }
 

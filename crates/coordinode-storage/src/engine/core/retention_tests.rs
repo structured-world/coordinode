@@ -1197,3 +1197,162 @@ fn read_below_the_physical_floor_is_refused_not_panicked() {
     // so the answer is "no such key", which is a result and not an error.
     assert_eq!(read_at(&engine, key, horizon).expect("served"), None);
 }
+
+/// An oracle engine configured with no time-travel window, the setting in
+/// which nothing but the pins and the snapshot rule hold the watermark back,
+/// and whose snapshots step behind an unapplied commit at once.
+fn windowless_engine(base: u64) -> (StorageEngine, Arc<TimestampOracle>, TempDir) {
+    let (engine, oracle, dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::ZERO);
+    engine.set_snapshot_wait_ms(0);
+    (engine, oracle, dir)
+}
+
+/// Register a commit that has its timestamp but has not applied, the way a
+/// transaction's commit holds one between admission and local apply.
+fn commit_in_flight<'e>(
+    engine: &'e StorageEngine,
+    oracle: &TimestampOracle,
+    key: &[u8],
+) -> (u64, crate::engine::pending::Admission<'e>) {
+    engine
+        .pending_commits()
+        .admit_allocated(
+            || oracle.next().as_raw(),
+            vec![(Partition::Node, key.to_vec())],
+        )
+        .expect("admit")
+}
+
+/// With nothing pinned, the watermark must not rise above the snapshot the
+/// engine hands out. A snapshot stops below the oldest commit still in flight,
+/// so the clock is not the right ceiling: the commit has taken a number the
+/// snapshot excludes. A watermark that follows the clock leaves every reader
+/// just handed a snapshot unable to pin it, and its commit refused with
+/// `SnapshotOutsideRetention` although it asked for the latest state.
+#[test]
+fn an_unpinned_watermark_stays_at_or_below_the_snapshot_handed_out() {
+    let base = future_base();
+    let (engine, oracle, _dir) = windowless_engine(base);
+    put_at(&engine, b"node:00:00000001", b"v", base + 1_000);
+
+    let (commit_ts, in_flight) = commit_in_flight(&engine, &oracle, b"node:00:00000002");
+    let snapshot = engine.snapshot();
+    assert_eq!(
+        snapshot, commit_ts,
+        "the snapshot excludes the unapplied commit"
+    );
+
+    engine.advance_gc_watermark();
+    assert!(
+        engine.gc_watermark() <= snapshot,
+        "watermark {} above the snapshot {snapshot} the engine just handed out",
+        engine.gc_watermark()
+    );
+    assert!(
+        engine.pin_snapshot_at(snapshot).is_some(),
+        "a snapshot the engine handed out can be pinned"
+    );
+    drop(in_flight);
+}
+
+/// A transaction opened at the latest state holds its snapshot from the moment
+/// it is taken. Taking the snapshot and pinning it as two steps leaves a gap:
+/// the commit the snapshot stepped behind can land in between, the snapshot
+/// floor rises past it, and any pin released elsewhere lets the watermark
+/// follow, so the pin that comes next is refused.
+#[test]
+fn a_transaction_begun_at_the_latest_state_keeps_its_snapshot() {
+    let base = future_base();
+    let (engine, oracle, _dir) = windowless_engine(base);
+    let key = b"node:00:00000001";
+    put_at(&engine, key, b"old", base + 1_000);
+
+    let (commit_ts, in_flight) = commit_in_flight(&engine, &oracle, key);
+    // Some other reader's pin is released meanwhile, which republishes the
+    // watermark while the commit is still in flight.
+    engine.advance_gc_watermark();
+    let txn = crate::engine::transaction::Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(commit_ts),
+    );
+    let snapshot = txn.snapshot().expect("begun at a snapshot");
+    assert_eq!(snapshot, commit_ts, "begun behind the unapplied commit");
+
+    // The commit lands and the node moves on, as it does under any load.
+    put_at(&engine, key, b"new", commit_ts);
+    drop(in_flight);
+    let other = engine.pin_snapshot_at(engine.snapshot()).expect("pin");
+    drop(other);
+    engine.advance_gc_watermark();
+
+    assert!(
+        engine.gc_watermark() <= snapshot,
+        "watermark {} passed the snapshot {snapshot} a live transaction reads at",
+        engine.gc_watermark()
+    );
+    assert_eq!(
+        read_at(&engine, key, snapshot).expect("still readable"),
+        Some(b"old".to_vec())
+    );
+    drop(txn);
+}
+
+/// Under concurrent commits every transaction begun at the latest state gets
+/// its snapshot pinned. Taking the snapshot and then pinning it lets a commit
+/// land in between: the floor rises past the snapshot, the next release
+/// publishes it, and the pin is refused. Only concurrency opens that gap, so
+/// this drives it with writers landing commits while readers begin.
+#[test]
+fn every_transaction_begun_under_concurrent_commits_is_pinned() {
+    let base = future_base();
+    let (engine, oracle, _dir) = windowless_engine(base);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let unpinned = std::sync::atomic::AtomicUsize::new(0);
+    const READERS: usize = 4;
+    const WRITERS: usize = 4;
+    const BEGINS_PER_READER: usize = 20_000;
+
+    std::thread::scope(|s| {
+        for w in 0..WRITERS {
+            let (engine, oracle, stop) = (&engine, &oracle, &stop);
+            s.spawn(move || {
+                let key = format!("node:00:{w:08}").into_bytes();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (ts, in_flight) = commit_in_flight(engine, oracle, &key);
+                    put_at(engine, &key, b"v", ts);
+                    drop(in_flight);
+                    engine.advance_gc_watermark();
+                }
+            });
+        }
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let (engine, oracle, unpinned) = (&engine, &oracle, &unpinned);
+                s.spawn(move || {
+                    for _ in 0..BEGINS_PER_READER {
+                        let txn = crate::engine::transaction::Transaction::begin(
+                            engine,
+                            Some(oracle),
+                            oracle.next(),
+                        );
+                        if !txn.snapshot_pinned() {
+                            unpinned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    assert_eq!(
+        unpinned.into_inner(),
+        0,
+        "transactions begun at the latest state whose snapshot could not be pinned"
+    );
+}

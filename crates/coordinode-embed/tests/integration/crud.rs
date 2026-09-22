@@ -3274,7 +3274,7 @@ fn trigger_drop_clears_secondary_index_entries() {
     let probe = |engine: &StorageEngine| -> (bool, bool, bool, bool) {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         let store = LocalTriggerStore;
         (
             store

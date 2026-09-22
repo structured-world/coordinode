@@ -46,7 +46,7 @@ fn mk_engine() -> (TempDir, StorageEngine) {
 fn bench_write(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -74,8 +74,7 @@ fn bench_node_put(c: &mut Criterion) {
         let mut id = 0u64;
         b.iter(|| {
             let read_ts = oracle.next();
-            let mut txn =
-                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
             store
                 .put(&mut txn, 0, NodeId::from_raw(id), &record)
                 .unwrap();
@@ -133,8 +132,7 @@ fn bench_edge_put(c: &mut Criterion) {
         let mut peer = 2u64;
         b.iter(|| {
             let read_ts = oracle.next();
-            let mut txn =
-                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
             store
                 .put_edge(
                     &mut txn,
@@ -172,8 +170,7 @@ fn bench_edge_scan(c: &mut Criterion) {
         let store = LocalEdgeStore;
         {
             let read_ts = oracle.next();
-            let mut txn =
-                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
             for i in 0..n as u64 {
                 store
                     .put_edge(&mut txn, "F", src, NodeId::from_raw(i + 1000), None)
@@ -192,7 +189,7 @@ fn bench_edge_scan(c: &mut Criterion) {
         // Read-only transaction reused across iterations: measures the
         // posting-list scan, not transaction setup.
         let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let rtxn = Transaction::begin(&engine, Some(&oracle), read_ts);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| store.scan_neighbors_out(&rtxn, "F", src).unwrap())
@@ -267,7 +264,7 @@ fn bench_spatial_bbox(c: &mut Criterion) {
         };
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let rtxn = Transaction::begin(&engine, Some(&oracle), read_ts);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 store
@@ -314,7 +311,7 @@ fn bench_spatial_bbox_long_thin_band(c: &mut Criterion) {
         };
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let rtxn = Transaction::begin(&engine, Some(&oracle), read_ts);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 store
@@ -370,7 +367,7 @@ fn bench_spatial_bbox_tight_in_large(c: &mut Criterion) {
         };
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let rtxn = Transaction::begin(&engine, Some(&oracle), read_ts);
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 store
@@ -412,7 +409,7 @@ fn bench_document_set_path(c: &mut Criterion) {
     {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
         LocalNodeStore
             .put(&mut txn, 0, NodeId::from_raw(1), &NodeRecord::new("L"))
             .unwrap();
@@ -432,8 +429,7 @@ fn bench_document_set_path(c: &mut Criterion) {
             // SET n.path = x transaction shape.
             let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
             let read_ts = oracle.next();
-            let mut txn =
-                Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+            let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
             docs.set_path(
                 &mut txn,
                 0,
@@ -482,7 +478,7 @@ fn bench_timeseries_bucket(c: &mut Criterion) {
         });
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let rtxn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let rtxn = Transaction::begin(&engine, Some(&oracle), read_ts);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| store.get_bucket(&rtxn, 0, NodeId::from_raw(1)).unwrap())

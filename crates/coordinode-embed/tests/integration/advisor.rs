@@ -1285,7 +1285,7 @@ fn stats_cache_ttl_zero_always_recomputes() {
         let engine = db.engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         for raw_id in 9000..9005u64 {
             let rec = NodeRecord {
                 labels: vec!["ZeroTTL".to_string()],
@@ -1352,7 +1352,7 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
         let engine = db.engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         for raw_id in 8000..8005u64 {
             let rec = NodeRecord {
                 labels: vec!["MaxTTL".to_string()],

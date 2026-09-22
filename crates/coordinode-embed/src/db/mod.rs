@@ -1627,6 +1627,19 @@ impl Database {
         .map(|(rows, write_stats, _)| CypherResult { rows, write_stats })
     }
 
+    /// A fresh read timestamp for a statement, pinned in the same step it is
+    /// allocated. The pin goes into `hold`, which the caller keeps for the
+    /// statement; pinned later, at the first read, the watermark can already
+    /// have passed it and the read would be refused.
+    fn fresh_pinned_read_ts(
+        &self,
+        hold: &mut Option<coordinode_storage::engine::coordinator::SnapshotPin>,
+    ) -> Timestamp {
+        let (seqno, pin) = self.engine.pin_new_snapshot(|| self.oracle.next().as_raw());
+        *hold = pin;
+        Timestamp::from_raw(seqno)
+    }
+
     /// Begin an interactive multi-statement transaction (ADR-042).
     ///
     /// Returns a server-allocated transaction id. Pass it to
@@ -1646,12 +1659,10 @@ impl Database {
         // that has not applied, and a transaction starting there would see
         // neither that write nor any sign of it. `read_ts` stays the
         // allocated value because it identifies this attempt.
-        let snapshot = Some(self.engine.snapshot());
-        let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+        let mut txn = coordinode_storage::engine::transaction::Transaction::begin(
             &self.engine,
             Some(&self.oracle),
             read_ts,
-            snapshot,
         );
         let state = txn.take_state();
         self.interactive_txns
@@ -2383,10 +2394,10 @@ impl Database {
                     retention_pin = Some(pin);
                     Timestamp::from_raw(seqno)
                 } else {
-                    self.oracle.next()
+                    self.fresh_pinned_read_ts(&mut retention_pin)
                 }
             }
-            TxnMode::AutoCommit => self.oracle.next(),
+            TxnMode::AutoCommit => self.fresh_pinned_read_ts(&mut retention_pin),
         };
         let _retention_pin = retention_pin.take();
         // Build the transaction up front: a fresh one for auto-commit, or

@@ -411,6 +411,29 @@ impl<'a> Transaction<'a> {
         read_ts: Timestamp,
         snapshot: Option<StorageSnapshot>,
     ) -> Self {
+        let pin = snapshot.and_then(|s| engine.pin_snapshot_at(s));
+        Self::with_pin(engine, oracle, read_ts, snapshot, pin)
+    }
+
+    /// Open a transaction at the latest complete state, its snapshot pinned
+    /// in the same step it is taken. See [`StorageEngine::pin_latest_snapshot`]
+    /// for why the two cannot be separate calls.
+    pub fn begin(
+        engine: &'a StorageEngine,
+        oracle: Option<&'a TimestampOracle>,
+        read_ts: Timestamp,
+    ) -> Self {
+        let (snapshot, pin) = engine.pin_latest_snapshot();
+        Self::with_pin(engine, oracle, read_ts, Some(snapshot), pin)
+    }
+
+    fn with_pin(
+        engine: &'a StorageEngine,
+        oracle: Option<&'a TimestampOracle>,
+        read_ts: Timestamp,
+        snapshot: Option<StorageSnapshot>,
+        snapshot_pin: Option<SnapshotPin>,
+    ) -> Self {
         Self {
             engine,
             oracle,
@@ -427,8 +450,19 @@ impl<'a> Transaction<'a> {
             expected_versions: Vec::new(),
             schema_generation: engine.schema_generation(),
             schema_changed: false,
-            snapshot_pin: snapshot.and_then(|s| engine.pin_snapshot_at(s)),
+            snapshot_pin,
         }
+    }
+
+    /// The snapshot this transaction reads at, if it reads at one.
+    pub fn snapshot(&self) -> Option<StorageSnapshot> {
+        self.snapshot
+    }
+
+    /// Whether the history at this transaction's snapshot is protected.
+    #[cfg(test)]
+    pub(crate) fn snapshot_pinned(&self) -> bool {
+        self.snapshot_pin.is_some()
     }
 
     /// Consume the transaction, returning its borrow-free owned state.
@@ -761,9 +795,24 @@ impl<'a> Transaction<'a> {
     /// the snapshot after building the context and syncs it here. The pin
     /// follows the snapshot: history at the new seqno is protected for the
     /// rest of the transaction, the old pin is released.
+    ///
+    /// Setting the snapshot it already holds keeps the pin it has: the executor
+    /// syncs before every read, and re-pinning the same seqno each time would
+    /// take the watermark lock per read for nothing.
     pub fn set_snapshot(&mut self, snapshot: Option<StorageSnapshot>) {
+        if snapshot.is_some() && snapshot == self.snapshot && self.snapshot_pin.is_some() {
+            return;
+        }
         self.snapshot = snapshot;
         self.snapshot_pin = snapshot.and_then(|s| self.engine.pin_snapshot_at(s));
+    }
+
+    /// Take a snapshot whose pin the caller already holds, from
+    /// [`StorageEngine::pin_new_snapshot`], rather than pinning it here after
+    /// the fact.
+    pub fn adopt_snapshot(&mut self, snapshot: StorageSnapshot, pin: Option<SnapshotPin>) {
+        self.snapshot = Some(snapshot);
+        self.snapshot_pin = pin;
     }
 
     /// The adjacency time-travel snapshot, if any. Adjacency base reads go

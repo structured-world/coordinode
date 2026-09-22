@@ -32,7 +32,7 @@ fn insert_node(
     }
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .put(&mut txn, shard_id, NodeId::from_raw(node_id), &record)
         .expect("put");

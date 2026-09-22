@@ -23,7 +23,7 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
 fn commit_txn(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -40,7 +40,7 @@ fn commit_txn(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
 fn read_txn<R>(engine: &StorageEngine, body: impl FnOnce(&Transaction) -> R) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&txn)
 }
 

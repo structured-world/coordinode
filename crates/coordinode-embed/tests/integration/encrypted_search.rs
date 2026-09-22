@@ -28,7 +28,7 @@ fn commit_sse(
 
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {

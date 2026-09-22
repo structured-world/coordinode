@@ -16,7 +16,7 @@ fn open_engine() -> coordinode_test_fixtures::EngineFixture {
 fn write_blob(engine: &StorageEngine, body: impl FnOnce(&LocalBlobStore, &mut Transaction)) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&LocalBlobStore, &mut txn);
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
@@ -36,7 +36,7 @@ fn read_blob<R>(
 ) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&LocalBlobStore, &txn)
 }
 

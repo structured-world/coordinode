@@ -41,7 +41,7 @@ fn write_txn(
 ) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&mut txn);
     commit(&mut txn);
 }
@@ -53,7 +53,7 @@ fn read_txn<R>(
 ) -> R {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     body(&txn)
 }
 
@@ -66,7 +66,7 @@ fn put_node(
 ) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore
         .put(&mut txn, shard, id, record)
         .expect("put node");
@@ -81,7 +81,7 @@ fn get_node(
 ) -> Option<NodeRecord> {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();
-    let txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let txn = Transaction::begin(engine, Some(&oracle), read_ts);
     LocalNodeStore.get(&txn, shard, id).expect("get node")
 }
 
@@ -129,7 +129,7 @@ fn node_edge_index_document_flow() {
     props.set(1, Value::String("since-2020".into()));
     {
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         edges
             .put_edge(&mut txn, "KNOWS", alice, bob, Some(&props))
             .expect("edge");
@@ -139,7 +139,7 @@ fn node_edge_index_document_flow() {
     // 4. Document update on alice's profile sub-tree (buffered, committed).
     {
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
         docs.set_path(
             &mut txn,
             0,
@@ -188,7 +188,7 @@ fn node_edge_index_document_flow() {
 
     // EdgeStore: alice's forward neighbours include bob.
     let read_ts = oracle.next();
-    let rtxn = Transaction::new(engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+    let rtxn = Transaction::begin(engine, Some(&oracle), read_ts);
     let out = edges
         .scan_neighbors_out(&rtxn, "KNOWS", alice)
         .expect("scan");

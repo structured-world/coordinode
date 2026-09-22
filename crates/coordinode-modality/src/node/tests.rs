@@ -27,9 +27,7 @@ fn open() -> TestDb {
 }
 
 fn mvcc_txn<'a>(engine: &'a StorageEngine, oracle: &'a TimestampOracle) -> Transaction<'a> {
-    let read_ts = oracle.next();
-    let snap = engine.snapshot();
-    Transaction::new(engine, Some(oracle), read_ts, Some(snap))
+    Transaction::begin(engine, Some(oracle), oracle.next())
 }
 
 fn commit(t: &mut Transaction) {

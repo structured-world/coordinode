@@ -271,12 +271,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     ) -> CatalogResult<R> {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(
-            self.engine,
-            Some(&oracle),
-            read_ts,
-            Some(self.engine.snapshot()),
-        );
+        let mut txn = Transaction::begin(self.engine, Some(&oracle), read_ts);
         let out = body(self, &mut txn)?;
         let wc = WriteConcern::majority();
         let ctx = CommitContext {

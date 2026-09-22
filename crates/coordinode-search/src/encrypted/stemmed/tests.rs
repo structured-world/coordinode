@@ -207,7 +207,7 @@ fn end_to_end_stemmed_sse_storage() {
     {
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let read_ts = oracle.next();
-        let mut txn = Transaction::new(&engine, Some(&oracle), read_ts, Some(engine.snapshot()));
+        let mut txn = Transaction::begin(&engine, Some(&oracle), read_ts);
         for st in &stems {
             idx.insert(&mut txn, &st.token, 1).unwrap();
         }
@@ -229,12 +229,7 @@ fn end_to_end_stemmed_sse_storage() {
     let query_token = stem_query_token("run", "english", &key).unwrap();
     let rt_oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let rt_read_ts = rt_oracle.next();
-    let rtxn = Transaction::new(
-        &engine,
-        Some(&rt_oracle),
-        rt_read_ts,
-        Some(engine.snapshot()),
-    );
+    let rtxn = Transaction::begin(&engine, Some(&rt_oracle), rt_read_ts);
     let results = idx.search(&rtxn, &query_token).unwrap();
     assert!(results.contains(&1), "'run' should find doc 1 in SSE index");
     assert!(
