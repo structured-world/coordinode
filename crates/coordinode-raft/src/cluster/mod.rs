@@ -1364,8 +1364,15 @@ impl RaftNode {
             // Continue shutdown even if checkpoint fails
         }
 
-        // Step 2: Transfer leadership if we're the leader
-        if self.is_leader().await {
+        // Step 2: Transfer leadership if we're the leader. Each step is logged
+        // so a shutdown that does not return shows which one it is stuck in.
+        let leads = self.is_leader().await;
+        tracing::info!(
+            node_id = self.node_id,
+            leads,
+            "shutdown: leadership checked"
+        );
+        if leads {
             if let Some(target_id) = self.find_transfer_target() {
                 if let Err(e) = self.transfer_leadership_to(target_id).await {
                     tracing::warn!(target_id, "leadership transfer failed: {e}");
@@ -1376,6 +1383,7 @@ impl RaftNode {
         }
 
         // Step 3: Stop Raft
+        tracing::info!(node_id = self.node_id, "shutdown: stopping consensus");
         self.raft
             .shutdown()
             .await
