@@ -140,6 +140,12 @@ pub struct SessionStats {
     pub applied_index: u64,
     /// Whether the read was served by the Raft leader.
     pub served_by_leader: bool,
+    /// The timestamp this statement's writes landed at, when it committed on
+    /// its own; zero for a read and for a statement inside an interactive
+    /// transaction. It is the version of what the statement wrote, so a
+    /// client that writes and then writes again conditionally needs no read
+    /// in between.
+    pub commit_ts: u64,
 }
 
 /// Neutral error class for a failed request. The binding maps this to its

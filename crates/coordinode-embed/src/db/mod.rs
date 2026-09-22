@@ -41,6 +41,19 @@ pub struct CypherResult {
     pub write_stats: WriteStats,
 }
 
+impl CypherResult {
+    /// The timestamp this statement's writes landed at, when it committed on
+    /// its own. `None` for a read and for a statement inside an interactive
+    /// transaction, whose timestamp belongs to the commit that ends it.
+    ///
+    /// This is the record's new version. A caller that writes and then means
+    /// to write again conditionally already has what to state, without
+    /// reading the record back and racing in between.
+    pub fn commit_ts(&self) -> Option<u64> {
+        self.write_stats.commit_ts
+    }
+}
+
 /// One page of a keyset-resumable server-side cursor.
 ///
 /// A cursor pins `read_ts` once and feeds it back into every subsequent

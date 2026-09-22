@@ -532,6 +532,51 @@ fn a_transaction_commits_only_at_the_node_version_it_read() {
     assert_eq!(after[0].get("balance").and_then(|v| v.as_int()), Some(500));
 }
 
+/// A statement that commits on its own reports the timestamp it committed at,
+/// and that timestamp is the version of what it wrote.
+///
+/// Without it a caller that writes and then means to write again
+/// conditionally has to read the record back, which is a second round trip
+/// and a second race. The number it needs was produced by its own commit.
+#[test]
+fn an_auto_commit_statement_reports_the_version_it_wrote() {
+    use coordinode_core::graph::node::NodeId;
+
+    let mut db = open_db();
+    let created = db
+        .execute_cypher_full("CREATE (n:Account {balance: 1})", None, None, None, None)
+        .expect("create");
+    let reported = created
+        .commit_ts()
+        .expect("a statement that wrote something committed at some timestamp");
+
+    assert_eq!(
+        db.node_version(NodeId::from_raw(1)).expect("read"),
+        Some(reported),
+        "what the statement reports is the version of what it wrote"
+    );
+
+    // A read commits nothing, so it has no timestamp to report.
+    let read = db
+        .execute_cypher_full("MATCH (n:Account) RETURN n", None, None, None, None)
+        .expect("read");
+    assert_eq!(
+        read.commit_ts(),
+        None,
+        "a read has no commit of its own to report"
+    );
+
+    // And the version it reported is directly usable as the condition of the
+    // next write, with no read in between.
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "MATCH (n:Account) SET n.balance = 2", None)
+        .expect("statement");
+    db.expect_node_version(tx, NodeId::from_raw(1), Some(reported))
+        .expect("state the version the write reported");
+    db.commit_transaction(tx)
+        .expect("the reported version is the one that is there");
+}
+
 /// Two claimers of one record on the embedded surface: exactly one takes it,
 /// and the other is told which version is there.
 ///

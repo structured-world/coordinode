@@ -283,6 +283,16 @@ pub struct WriteStats {
     /// client's follow-up causal read fences on *its own* write index
     /// rather than the node's current applied index.
     pub applied_index: Option<u64>,
+    /// The timestamp this statement's writes landed at, for a statement that
+    /// committed on its own. `None` for a read, and for a statement of an
+    /// interactive transaction, whose timestamp belongs to the commit that
+    /// ends it rather than to any one statement inside it.
+    ///
+    /// It is the same number the commit receipt of an interactive transaction
+    /// returns, and the same number a record's version is stated against, so
+    /// a caller that wrote a record already holds the version to condition
+    /// its next write on rather than having to read it back.
+    pub commit_ts: Option<u64>,
 }
 
 impl WriteStats {
@@ -1625,6 +1635,9 @@ impl<'a> ExecutionContext<'a> {
         // locus (ADR-041): OCC validation, commit_ts assignment, write-concern
         // fan-out, and the Raft proposal pipeline all live in `Transaction`.
         self.sync_txn_state();
+        // Asked before the commit drains the buffers, which is the only
+        // moment the answer exists.
+        let wrote = !self.txn.write_buffer_is_empty() || self.txn.has_pending_merges();
         let write_concern = self.write_concern;
         let ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &write_concern,
@@ -1639,6 +1652,20 @@ impl<'a> ExecutionContext<'a> {
         // proposal (e.g. CREATE VECTOR INDEX schema persist) whose index must
         // remain covered. (`Option` orders `None < Some`.)
         self.write_stats.applied_index = self.write_stats.applied_index.max(outcome.applied_index);
+        // The timestamp travels with the statistics rather than only as a
+        // return value, because the caller that needs it is two layers up and
+        // reads the statistics anyway: a statement that wrote a record holds
+        // the record's new version without reading it back.
+        //
+        // Only when there was something to commit. A read-only commit answers
+        // with the timestamp it read at, which is the right answer to "when
+        // did this transaction see the world" and the wrong one to "what
+        // version is this record now": reporting it would hand a caller a
+        // number that no write ever landed at, and a conditional write
+        // against it would be refused for a reason nobody could explain.
+        if wrote {
+            self.write_stats.commit_ts = outcome.commit_ts.map(|ts| ts.as_raw());
+        }
         Ok(outcome.commit_ts)
     }
 

@@ -118,7 +118,11 @@ Posting-list operations (adding/removing edges on a node) use **merge operators*
 
 ### Writing at the version you read
 
-A record's **version** is the timestamp of the commit that last wrote it: the same number a write receipt returns as `commit_ts`. It comes back with the node (`Node.version` over gRPC, `Database::node_version` embedded), so a read gives you the value and the version together rather than making you fetch them separately and race in between.
+A record's **version** is the timestamp of the commit that last wrote it. It comes back three ways, all the same number:
+
+- with the node you read (`Node.version` over gRPC, `Database::node_version` embedded), so a read gives you the value and the version together;
+- from the write that produced it (`QueryStats.commit_ts` on a statement that commits on its own, `CypherResult::commit_ts()` embedded), so after writing you already hold the version to condition your next write on, with no read in between;
+- from the commit of an interactive transaction (`CommitTransactionResponse.commit_ts`), which is the timestamp every statement in it landed at. A statement *inside* such a transaction reports no timestamp of its own, because it has not committed yet; a read reports none either, having committed nothing.
 
 A transaction can be committed on the condition that a node is still at the version you read. Over gRPC that is `CommitTransactionRequest.expect`; embedded it is `Database::expect_node_version` on the open transaction. An unset version means the node must **not** exist, which is the create-if-absent form of the same condition.
 

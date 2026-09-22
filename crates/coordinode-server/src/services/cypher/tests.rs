@@ -238,6 +238,101 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .expect("the version matches now");
 }
 
+/// A self-committing statement reports the version it wrote, so the next
+/// conditional write needs no read in between.
+#[tokio::test]
+async fn grpc_a_self_committing_statement_reports_the_version_it_wrote() {
+    let (svc, _dir) = test_service();
+
+    let created = svc
+        .execute_cypher(cypher_request("CREATE (n:Account {balance: 1})"))
+        .await
+        .expect("create")
+        .into_inner();
+    let reported = created.stats.expect("stats").commit_ts;
+    assert_ne!(reported, 0, "a statement that wrote something committed");
+
+    let node = coordinode_core::graph::node::NodeId::from_raw(1);
+    assert_eq!(
+        svc.database.read().node_version(node).expect("read"),
+        Some(reported),
+        "what the statement reports is the version of what it wrote"
+    );
+
+    // A read commits nothing of its own, so it reports no timestamp.
+    let read = svc
+        .execute_cypher(cypher_request("MATCH (n:Account) RETURN n"))
+        .await
+        .expect("read")
+        .into_inner();
+    assert_eq!(
+        read.stats.expect("stats").commit_ts,
+        0,
+        "a read has no commit of its own to report"
+    );
+
+    // The reported version is directly usable as the next write's condition.
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn(
+        "MATCH (n:Account) SET n.balance = 2",
+        tx,
+    ))
+    .await
+    .expect("statement");
+    svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+        transaction_id: tx,
+        expect: vec![query::ExpectedNodeVersion {
+            node_id: node.as_raw(),
+            version: Some(reported),
+        }],
+    }))
+    .await
+    .expect("the reported version is the one that is there");
+}
+
+/// A statement inside an interactive transaction reports no timestamp of its
+/// own: its writes commit when the transaction does, and that commit is what
+/// carries the timestamp.
+#[tokio::test]
+async fn grpc_a_buffered_statement_reports_no_timestamp_of_its_own() {
+    let (svc, _dir) = test_service();
+
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    let buffered = svc
+        .execute_cypher(cypher_request_in_txn("CREATE (n:Buffered {id: 1})", tx))
+        .await
+        .expect("statement")
+        .into_inner();
+    assert_eq!(
+        buffered.stats.expect("stats").commit_ts,
+        0,
+        "nothing has committed yet"
+    );
+
+    let receipt = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![],
+        }))
+        .await
+        .expect("commit")
+        .into_inner();
+    assert_ne!(
+        receipt.commit_ts, 0,
+        "the transaction's commit is what carries the timestamp"
+    );
+}
+
 /// A fenced claim over the wire: the replaced holder's write is refused on
 /// the claim and never reaches the data the claim protected.
 ///

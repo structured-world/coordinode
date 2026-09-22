@@ -232,6 +232,9 @@ fn write_stats(ws: &WriteStats) -> SessionStats {
         edges_created: ws.edges_created as i64,
         edges_deleted: ws.edges_deleted as i64,
         properties_set: ws.properties_set as i64,
+        // The version of what this statement wrote, when it committed on its
+        // own; zero otherwise, which is what the session protocol documents.
+        commit_ts: ws.commit_ts.unwrap_or(0),
         ..SessionStats::default()
     }
 }

@@ -703,8 +703,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             return Ok(Response::new(query::ExecuteCypherResponse {
                 columns,
                 rows: proto_rows,
-                // Buffered statement: no commit yet, so no mutation stats and no
-                // applied_index — those land on the CommitTransaction response.
+                // Buffered statement: no commit yet, so no mutation stats, no
+                // applied_index and no commit timestamp — those land on the
+                // CommitTransaction response, which is where this statement's
+                // writes will actually be committed.
                 stats: Some(query::QueryStats {
                     nodes_created: 0,
                     nodes_deleted: 0,
@@ -714,6 +716,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     execution_time_ms: start.elapsed().as_millis() as i64,
                     applied_index: 0,
                     served_by_leader: false,
+                    commit_ts: 0,
                 }),
             }));
         }
@@ -984,6 +987,12 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 execution_time_ms: duration_ms as i64,
                 applied_index,
                 served_by_leader,
+                // The version of what this statement wrote, for a statement
+                // that committed on its own. Zero when there was no commit of
+                // its own to report: a read, or a statement of an interactive
+                // transaction, whose timestamp belongs to the commit that
+                // ends it.
+                commit_ts: write_stats.commit_ts.unwrap_or(0),
             }),
         }))
     }

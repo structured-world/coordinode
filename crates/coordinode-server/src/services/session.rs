@@ -311,6 +311,7 @@ fn stats_to_proto(stats: SessionStats) -> query::QueryStats {
         execution_time_ms: stats.execution_time_ms,
         applied_index: stats.applied_index,
         served_by_leader: stats.served_by_leader,
+        commit_ts: stats.commit_ts,
     }
 }
 
