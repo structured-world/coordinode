@@ -546,3 +546,39 @@ ignored.
 | `coordinode admin node decommission` | `--node ADDR --id ID` | `--pruning`, `--force`, `--skip-confirmation` |
 
 Run `coordinode` with no recognized subcommand to print the full usage summary.
+
+## Growing and shrinking a cluster
+
+A single machine that already holds data becomes a replicated cluster in
+place, without export or import.
+
+1. Stop the standalone server and start it again as the first member, naming
+   the members to come: `coordinode serve --node-id 1 --advertise-addr
+   node1:7080 --peers node2:7080,node3:7080 --data /var/lib/coordinode`. What
+   it holds becomes the group's starting state.
+2. Start each new machine as a member with an **empty** data directory:
+   `coordinode serve --node-id 2 --peers node1:7080,node3:7080 --data ...`.
+3. Add the members from the first one, one at a time:
+   `coordinode admin node join --node node1:7080 --id 2 --addr node2:7080`,
+   then the same for node 3. A member joins as a learner, receives the
+   group's state, and is promoted to a voter once it has caught up.
+
+Only the member a group is formed around brings data into it. A machine that
+still holds data of its own is refused when it starts as a joiner, and the
+refusal says so and names the fix: start it with an empty data directory.
+Its data is not merged; anything it holds that the cluster needs is written
+into the cluster through its members, like any other write.
+
+To take a member out, run `coordinode admin node decommission --node
+node1:7080 --id 3`. Decommissioning the current leader hands leadership to
+another voter first. A CE cluster keeps at least two voters: a decommission
+that would leave one is refused with `FAILED_PRECONDITION` and changes
+nothing.
+
+The cluster takes one membership change at a time, and status shows a new
+member as soon as its change is proposed, before it commits. A join or
+decommission issued while the previous change is still committing waits for
+it, up to `membership_change_timeout_secs` (default 30), and is refused
+naming the change in progress when that runs out. When no leader is known,
+because the cluster has lost the quorum to elect one, the command is refused
+saying so; nothing is changed.
