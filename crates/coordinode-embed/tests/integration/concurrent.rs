@@ -208,6 +208,69 @@ fn concurrent_upsert_data_consistency() {
     );
 }
 
+/// Auto-commit read-modify-write from several threads on one node, through the
+/// public API: every increment reported as committed is in the final value.
+///
+/// A statement reads at the timestamp it is given, and that timestamp can
+/// already cover a commit that has taken its number but not applied. Read
+/// there, the statement misses that commit; if the commit lands before this
+/// one registers its own write, nothing is in flight to collide with, and a
+/// validation that looks only at writes after the snapshot finds nothing
+/// either. Both report success and one increment is gone. Refusals are
+/// retried, so the count of successes is exactly what the value must reach.
+#[test]
+fn concurrent_auto_commit_increments_lose_nothing() {
+    use coordinode_embed::{Database, DatabaseError};
+    const THREADS: u64 = 8;
+    const PER_THREAD: u64 = 100;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:Tally {id: 0, v: 0})")
+        .expect("seed");
+
+    let committed = AtomicU64::new(0);
+    let refused = AtomicU64::new(0);
+    thread::scope(|s| {
+        for _ in 0..THREADS {
+            let (db, committed, refused) = (&db, &committed, &refused);
+            s.spawn(move || {
+                let mut done = 0;
+                while done < PER_THREAD {
+                    match db.execute_cypher_shared(
+                        "MATCH (n:Tally {id: 0}) SET n.v = n.v + 1",
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        Ok(_) => {
+                            done += 1;
+                            committed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => panic!("unexpected failure: {e}"),
+                    }
+                }
+            });
+        }
+    });
+
+    let rows = db
+        .execute_cypher("MATCH (n:Tally {id: 0}) RETURN n.v AS v")
+        .expect("read tally");
+    let committed = committed.into_inner();
+    assert_eq!(committed, THREADS * PER_THREAD);
+    assert_eq!(
+        rows[0].get("v"),
+        Some(&Value::Int(i64::try_from(committed).expect("fits"))),
+        "{committed} increments committed ({} refused and retried), the value must hold all of them",
+        refused.into_inner()
+    );
+}
+
 /// Two threads doing UPSERTs with different ON MATCH SET values.
 /// Verifies the final value is set by the last successful writer (serializable).
 #[test]

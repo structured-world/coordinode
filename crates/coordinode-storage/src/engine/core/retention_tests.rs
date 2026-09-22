@@ -1299,6 +1299,141 @@ fn a_transaction_begun_at_the_latest_state_keeps_its_snapshot() {
     drop(txn);
 }
 
+/// A transaction that reads at a timestamp covering a commit still in flight
+/// misses that commit, and if the commit lands before this one registers,
+/// nothing tells them apart but validation. Validation has to refuse: the
+/// value this transaction computed came from a state the landed commit had
+/// already replaced.
+///
+/// This is the shape of a statement that reads at the timestamp it was given
+/// rather than at the engine's complete snapshot.
+#[test]
+fn a_read_that_missed_a_commit_in_flight_is_refused_when_it_writes() {
+    let base = future_base();
+    let (engine, oracle, _dir) = oracle_engine(base);
+    let key = b"node:00:00000001";
+    put_at(&engine, key, b"0", base + 1_000);
+
+    let (landing_ts, in_flight) = commit_in_flight(&engine, &oracle, key);
+    let read_ts = oracle.next();
+    assert!(
+        read_ts.as_raw() > landing_ts,
+        "the read covers the commit in flight"
+    );
+    let mut txn = crate::engine::transaction::Transaction::new(
+        &engine,
+        Some(&oracle),
+        read_ts,
+        Some(read_ts.as_raw()),
+    );
+    assert_eq!(
+        txn.get(Partition::Node, key).expect("read").as_deref(),
+        Some(&b"0"[..]),
+        "the commit in flight is not visible yet"
+    );
+
+    // The commit lands before this transaction registers its own write.
+    put_at(&engine, key, b"1", landing_ts);
+    drop(in_flight);
+
+    txn.put(Partition::Node, key, b"1").expect("stage");
+    let wc = coordinode_core::txn::write_concern::WriteConcern::majority();
+    let ctx = crate::engine::transaction::CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    assert!(
+        txn.commit(&ctx).is_err(),
+        "a write computed from a state a landed commit replaced must be refused"
+    );
+}
+
+/// The hold taken while a snapshot is chosen is gone once the snapshot is
+/// pinned. A hold left behind would keep the watermark at the point the
+/// reader started for as long as the engine runs.
+#[test]
+fn choosing_a_snapshot_leaves_no_hold_behind() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = windowless_engine(base);
+    put_at(&engine, b"node:00:00000001", b"v", base + 1_000);
+
+    let (_, pin) = engine.pin_latest_snapshot();
+    drop(pin.expect("pinned"));
+    put_at(&engine, b"node:00:00000001", b"w", base + 2_000);
+    engine.advance_gc_watermark();
+
+    assert_eq!(
+        engine.gc_watermark(),
+        engine.snapshot(),
+        "nothing is pinned, so the watermark reaches the latest complete snapshot"
+    );
+}
+
+/// Only the release of the oldest pin moves the watermark. A younger pin
+/// going away leaves the minimum where it was; the oldest going away lets it
+/// advance to what is still pinned, or to the latest snapshot.
+#[test]
+fn only_the_oldest_release_moves_the_watermark() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = windowless_engine(base);
+    put_at(&engine, b"node:00:00000001", b"v", base + 1_000);
+    let (older, older_pin) = engine.pin_latest_snapshot();
+    put_at(&engine, b"node:00:00000001", b"w", base + 2_000);
+    let (younger, younger_pin) = engine.pin_latest_snapshot();
+    assert!(older < younger);
+    let held = engine.gc_watermark();
+    assert!(held <= older);
+
+    drop(younger_pin);
+    assert_eq!(
+        engine.gc_watermark(),
+        held,
+        "a younger release moves nothing"
+    );
+
+    drop(older_pin);
+    assert_eq!(
+        engine.gc_watermark(),
+        engine.snapshot(),
+        "the oldest release lets the watermark reach the latest snapshot"
+    );
+}
+
+/// Setting the snapshot a transaction already reads at keeps its pin; setting
+/// one below the watermark is refused a pin rather than being given one that
+/// protects nothing; adopting a snapshot with its pin keeps that pin.
+#[test]
+fn a_transaction_keeps_or_is_refused_its_pin_as_the_snapshot_changes() {
+    let base = future_base();
+    let (engine, oracle, _dir) = windowless_engine(base);
+    put_at(&engine, b"node:00:00000001", b"v", base + 1_000);
+
+    let mut txn =
+        crate::engine::transaction::Transaction::begin(&engine, Some(&oracle), oracle.next());
+    let view = txn.snapshot();
+    txn.set_snapshot(view);
+    assert!(txn.snapshot_pinned(), "the same snapshot keeps its pin");
+
+    // Everything the transaction pinned is released, and the node moves on.
+    txn.set_snapshot(None);
+    put_at(&engine, b"node:00:00000001", b"w", base + 2_000);
+    engine.advance_gc_watermark();
+    let below = engine.gc_watermark() - 1;
+    txn.set_snapshot(Some(below));
+    assert!(
+        !txn.snapshot_pinned(),
+        "a snapshot below the watermark is not given a pin"
+    );
+
+    let (latest, pin) = engine.pin_latest_snapshot();
+    txn.adopt_snapshot(latest, pin);
+    assert_eq!(txn.snapshot(), Some(latest));
+    assert!(txn.snapshot_pinned(), "an adopted snapshot keeps its pin");
+}
+
 /// Under concurrent commits every transaction begun at the latest state gets
 /// its snapshot pinned. Taking the snapshot and then pinning it lets a commit
 /// land in between: the floor rises past the snapshot, the next release

@@ -248,6 +248,98 @@ fn open_transaction_snapshot_survives_window_narrowing() {
     db.rollback_transaction(tx).expect("rollback");
 }
 
+/// With no time-travel window, only live pins hold the GC watermark back, so
+/// a statement's snapshot has to be pinned the moment it is chosen. Pinned
+/// later, commits landing meanwhile let the watermark pass it and the
+/// statement is refused as outside retention although it asked for the
+/// latest state. No statement here may fail that way, through either the
+/// auto-commit or the interactive path, and every counter ends exact.
+///
+/// A write conflict is a different and legitimate answer: a snapshot that
+/// waited its bounded time for a commit still in flight steps behind it, and
+/// can then miss the writer's own previous commit. The attempt is refused and
+/// retried, which is what a client does.
+#[test]
+fn a_zero_window_refuses_no_statement_under_concurrent_writes() {
+    const WRITERS: u64 = 4;
+    const ROUNDS: u64 = 150;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_db(dir.path());
+    db.set_retention_window(Duration::ZERO);
+    for w in 0..WRITERS {
+        db.execute_cypher(&format!("CREATE (:Tally {{id: {w}, v: 0}})"))
+            .expect("seed");
+    }
+
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for w in 0..WRITERS {
+            let (db, failures) = (&db, &failures);
+            s.spawn(move || {
+                let bump = format!("MATCH (n:Tally {{id: {w}}}) SET n.v = n.v + 1");
+                let retryable = |e: &DatabaseError| {
+                    matches!(
+                        e,
+                        DatabaseError::TransactionConflict { .. }
+                            | DatabaseError::Execution(ExecutionError::Conflict(_))
+                    )
+                };
+                for _ in 0..ROUNDS {
+                    loop {
+                        match db.execute_cypher_shared(&bump, None, None, None, None) {
+                            Ok(_) => break,
+                            Err(e) if retryable(&e) => {}
+                            Err(e) => {
+                                failures
+                                    .lock()
+                                    .expect("lock")
+                                    .push(format!("auto-commit: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                    loop {
+                        let tx = db.begin_transaction();
+                        let outcome = db
+                            .execute_in_transaction(tx, &bump, None)
+                            .and_then(|_| db.commit_transaction(tx).map(|_| ()));
+                        match outcome {
+                            Ok(()) => break,
+                            Err(e) if retryable(&e) => {}
+                            Err(e) => {
+                                failures
+                                    .lock()
+                                    .expect("lock")
+                                    .push(format!("interactive: {e}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures.into_inner().expect("lock");
+    assert!(
+        failures.is_empty(),
+        "{} of {} statements refused, first: {:?}",
+        failures.len(),
+        WRITERS * ROUNDS * 2,
+        failures.first()
+    );
+    for w in 0..WRITERS {
+        let rows = db
+            .execute_cypher(&format!("MATCH (n:Tally {{id: {w}}}) RETURN n.v AS v"))
+            .expect("read tally");
+        assert_eq!(
+            rows[0].get("v"),
+            Some(&Value::Int(i64::try_from(ROUNDS * 2).expect("fits"))),
+            "tally {w}"
+        );
+    }
+}
+
 fn commit(db: &mut Database, cypher: &str) -> u64 {
     let tx = db.begin_transaction();
     db.execute_in_transaction(tx, cypher, None)

@@ -274,6 +274,12 @@ pub struct Transaction<'a> {
     /// mode, or when the snapshot was already below the watermark when set
     /// (reads then fail with `SnapshotOutsideRetention` instead of guessing).
     snapshot_pin: Option<SnapshotPin>,
+    /// The first sequence number whose writes this transaction may not have
+    /// seen: its snapshot, or lower when the snapshot covered commits still
+    /// in flight at the moment it was set. Those commits land below the
+    /// snapshot but after the reads, so validating from the snapshot alone
+    /// would forgive exactly the writes this transaction missed.
+    validate_from: Option<StorageSnapshot>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -304,6 +310,7 @@ pub struct TransactionState {
     schema_generation: u64,
     schema_changed: bool,
     snapshot_pin: Option<SnapshotPin>,
+    validate_from: Option<StorageSnapshot>,
 }
 
 /// One staged adjacency operand. Kept as a sequence rather than as two sets
@@ -451,7 +458,16 @@ impl<'a> Transaction<'a> {
             schema_generation: engine.schema_generation(),
             schema_changed: false,
             snapshot_pin,
+            validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
         }
+    }
+
+    /// The first sequence number a view at `snapshot` may have missed writes
+    /// at: the oldest commit still in flight at or below it, else the
+    /// snapshot itself. A commit in flight has its number but not its effect,
+    /// so a read now cannot see it, and it lands below the snapshot later.
+    fn first_unseen(engine: &StorageEngine, snapshot: StorageSnapshot) -> StorageSnapshot {
+        engine.pending_commits().snapshot_floor(|| snapshot)
     }
 
     /// The snapshot this transaction reads at, if it reads at one.
@@ -490,6 +506,7 @@ impl<'a> Transaction<'a> {
             merge_node_deltas: self.merge_node_deltas,
             merge_counter_deltas: self.merge_counter_deltas,
             snapshot_pin: self.snapshot_pin,
+            validate_from: self.validate_from,
         }
     }
 
@@ -515,6 +532,7 @@ impl<'a> Transaction<'a> {
             merge_node_deltas: std::mem::take(&mut self.merge_node_deltas),
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
             snapshot_pin: self.snapshot_pin.take(),
+            validate_from: self.validate_from,
         }
     }
 
@@ -545,6 +563,7 @@ impl<'a> Transaction<'a> {
             merge_node_deltas: state.merge_node_deltas,
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
+            validate_from: state.validate_from,
         }
     }
 
@@ -805,6 +824,7 @@ impl<'a> Transaction<'a> {
         }
         self.snapshot = snapshot;
         self.snapshot_pin = snapshot.and_then(|s| self.engine.pin_snapshot_at(s));
+        self.validate_from = snapshot.map(|s| Self::first_unseen(self.engine, s));
     }
 
     /// Take a snapshot whose pin the caller already holds, from
@@ -813,6 +833,7 @@ impl<'a> Transaction<'a> {
     pub fn adopt_snapshot(&mut self, snapshot: StorageSnapshot, pin: Option<SnapshotPin>) {
         self.snapshot = Some(snapshot);
         self.snapshot_pin = pin;
+        self.validate_from = Some(Self::first_unseen(self.engine, snapshot));
     }
 
     /// The adjacency time-travel snapshot, if any. Adjacency base reads go
@@ -1293,8 +1314,10 @@ impl<'a> Transaction<'a> {
         // attempt's timestamp identifies it and orders it, while its view is
         // where its values came from, and it is the view that says which
         // writes it could not have seen. Validating against the higher of the
-        // two would silently forgive every write in between.
-        let occ_read_ts = self.snapshot.unwrap_or_else(|| self.read_ts.as_raw());
+        // two would silently forgive every write in between. And the view
+        // starts below its snapshot when commits were still in flight under
+        // it: those land beneath the snapshot after the reads were made.
+        let occ_read_ts = self.validate_from.unwrap_or_else(|| self.read_ts.as_raw());
         for (part, key) in self.write_buffer.keys() {
             if part.is_commutative() {
                 continue;

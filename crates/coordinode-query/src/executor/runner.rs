@@ -2102,11 +2102,18 @@ pub fn execute_no_commit(
     // All reads (node, schema, edgeprop) go through this snapshot for O(1) lookups.
     // When oracle is set, snapshot_at(seqno) pins the LSM tree at read_ts.
     // For legacy mode (no oracle), mvcc_snapshot stays None → direct engine reads.
+    //
+    // A transaction that already chose its view (an interactive one, begun
+    // at the engine's complete snapshot and pinned there) keeps it. Its
+    // `read_ts` was allocated before that view was taken and can sit below
+    // it: reading there would lose the view's completeness, and re-pinning
+    // it can be refused once the watermark has followed the view.
     if ctx.mvcc_snapshot.is_none() && ctx.mvcc_oracle.is_some() {
-        ctx.mvcc_snapshot = ctx
-            .engine
-            .snapshot_at(ctx.mvcc_read_ts.as_raw())
-            .or_else(|| Some(ctx.engine.snapshot()));
+        ctx.mvcc_snapshot = ctx.txn.snapshot().or_else(|| {
+            ctx.engine
+                .snapshot_at(ctx.mvcc_read_ts.as_raw())
+                .or_else(|| Some(ctx.engine.snapshot()))
+        });
     }
 
     // Take a storage snapshot for statement-level adj: partition consistency.
