@@ -11,6 +11,7 @@ publish.workspace = true
 coordinode-core = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

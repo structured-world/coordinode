@@ -29,6 +29,7 @@ prost = { workspace = true }
 # Inter-node gRPC transport compression codec (pure-Rust zstd, shared with the
 # other inter-node services); wired into RaftService stubs via codec_path.
 coordinode-wire = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 coordinode-test-fixtures = { workspace = true }

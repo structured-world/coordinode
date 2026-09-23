@@ -15,6 +15,7 @@ coordinode-storage = { workspace = true }
 # engine builder would be unusable.
 lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
 tempfile = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [lints.clippy]
 # The ADR-041 partition guard (clippy.toml `disallowed-types`) is global and

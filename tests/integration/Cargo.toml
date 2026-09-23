@@ -37,6 +37,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 coordinode-client = { path = "../../crates/coordinode-client" }
+coordinode-workspace-hack = { version = "0.1", path = "../../crates/coordinode-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

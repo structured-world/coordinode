@@ -15,6 +15,7 @@ rmpv = { workspace = true, features = ["with-serde"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

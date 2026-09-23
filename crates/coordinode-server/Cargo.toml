@@ -72,6 +72,7 @@ futures-util = { workspace = true }
 pgwire = "0.41"
 async-trait = "0.1.89"
 futures = "0.3.32"
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 # Safe setrlimit(RLIMIT_NOFILE) wrapper for the configurable fd limit.
 [target.'cfg(unix)'.dependencies]

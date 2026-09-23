@@ -34,6 +34,7 @@ rustc-hash = { workspace = true }
 rand = { workspace = true }
 regex = "1"
 unicode-normalization = "0.1"
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

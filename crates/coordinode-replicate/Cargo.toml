@@ -29,6 +29,7 @@ tonic = { workspace = true, features = ["tls-webpki-roots"] }
 tonic-prost = "0.14"
 prost = { workspace = true }
 futures-util = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

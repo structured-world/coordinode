@@ -16,6 +16,7 @@ lz4_flex = "0.14"
 # `^0` on purpose: the crate is ours and still on 0.0.x, where a plain
 # requirement pins one exact version and `cargo update` never moves it.
 structured-zstd = "^0"
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [lints]
 workspace = true

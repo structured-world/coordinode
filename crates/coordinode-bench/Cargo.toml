@@ -15,6 +15,7 @@ sysinfo = "0.39"
 clap = { version = "4", features = ["derive"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

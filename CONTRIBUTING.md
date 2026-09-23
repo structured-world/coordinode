@@ -19,14 +19,42 @@ cd coordinode
 # Build
 cargo build
 
-# Run tests
-cargo test --workspace
+# Run tests (the same selection CI runs, so local builds reuse its artefacts).
+# The cluster tests time Raft elections; on a machine busy running the whole
+# suite in parallel, the generous timeouts CI uses keep them from electing
+# spuriously and timing out.
+COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run --workspace --all-features
+cargo test --doc --all-features
 
 # Run with Clippy (must pass with zero warnings)
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Requires Rust 1.90+ (see `rust-toolchain.toml` for the pinned toolchain).
+Requires Rust 1.90+ (see `rust-toolchain.toml` for the pinned toolchain) and
+[cargo-nextest](https://nexte.st).
+
+**After adding, removing or changing a dependency**, regenerate the
+workspace-hack crate and commit the result; CI fails when it is stale:
+
+```bash
+cargo install cargo-hakari --locked   # once
+cargo hakari generate
+cargo hakari manage-deps
+```
+
+`crates/coordinode-workspace-hack` pins the features of third-party
+dependencies so that building one crate (`-p`) and building the workspace
+compile the same artefacts instead of a second copy of each.
+
+**Debugging.** The everyday `dev` profile keeps file and line information for
+panics and backtraces but leaves out what a debugger needs. To step through
+code, build with the `debugger` profile; it goes to `target/debugger` and does
+not replace the everyday build:
+
+```bash
+cargo build --profile debugger
+cargo nextest run --cargo-profile debugger -E 'test(name)'
+```
 
 ## Pull Request Process
 
@@ -34,9 +62,10 @@ Requires Rust 1.90+ (see `rust-toolchain.toml` for the pinned toolchain).
 2. Create a feature branch (`feat/description` or `fix/description`)
 3. Make your changes
 4. Ensure all checks pass:
-   - `cargo check --workspace`
-   - `cargo clippy --all-targets --all-features -- -D warnings` (zero warnings)
-   - `cargo test --workspace` (all tests pass)
+   - `cargo fmt --all -- --check`
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings` (zero warnings)
+   - `COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run --workspace --all-features` and `cargo test --doc --all-features` (all tests pass)
+   - `cargo hakari generate --diff` and `cargo hakari manage-deps --dry-run` (workspace-hack up to date)
 5. Write a clear commit message following [Conventional Commits](https://www.conventionalcommits.org/)
 6. Open a pull request with a description of what changed and why
 

@@ -22,6 +22,7 @@ rustls-rustcrypto = "0.0.2-alpha"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).
 rustls-pki-types = { version = "1", features = ["std"] }
 thiserror = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 rcgen = "0.14"

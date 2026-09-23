@@ -49,6 +49,22 @@ jobs:
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  hakari:
+    name: Workspace hack
+    # The workspace-hack crate pins the unified features of third-party
+    # dependencies so a single-package build and a workspace build share their
+    # artefacts. It is generated; a dependency change that is not followed by
+    # `cargo hakari generate && cargo hakari manage-deps` leaves it stale.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hakari
+      - name: Check the workspace-hack is up to date
+        run: |
+          cargo hakari generate --diff
+          cargo hakari manage-deps --dry-run
+
   test:
     name: Test
     # GH-hosted ubuntu-latest has ~14 GB disk which the full workspace

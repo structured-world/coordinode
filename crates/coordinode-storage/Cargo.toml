@@ -65,6 +65,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
 crc32c = "0.6"
 rayon = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

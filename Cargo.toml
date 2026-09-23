@@ -21,6 +21,7 @@ members = [
     "crates/coordinode-bench",
     "crates/coordinode-wire",
     "crates/coordinode-session",
+    "crates/coordinode-workspace-hack",
     "tests/integration",
 ]
 exclude = [
@@ -171,6 +172,28 @@ panic = "warn"
 # global, so this keeps the lint inert in the storage / modality / embed
 # crates that legitimately name partitions.
 disallowed_types = "allow"
+
+# Everyday builds and tests (`cargo build`, `cargo nextest run`; the test
+# profile inherits this one). Line tables keep file:line in panics and
+# backtraces; variable and type information is left out, which is what a
+# debugger needs and what makes a debug build large.
+[profile.dev]
+debug = "line-tables-only"
+
+# Build scripts and proc macros get the same settings as ordinary code. Cargo
+# otherwise builds them without debug info, so a crate used by both (itertools
+# under prost-derive) is compiled twice, and a single-package build and a
+# workspace build resolve it differently: two copies of everything above it.
+[profile.dev.build-override]
+debug = "line-tables-only"
+
+# Stepping through code in a debugger: `cargo build --profile debugger`
+# (tests: `cargo nextest run --cargo-profile debugger`). Full debug
+# information on top of the everyday profile, built into target/debugger so it
+# never replaces the everyday artefacts. The name `debug` is reserved by cargo.
+[profile.debugger]
+inherits = "dev"
+debug = "full"
 
 [profile.release]
 lto = "fat"

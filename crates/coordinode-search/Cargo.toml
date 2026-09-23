@@ -33,6 +33,7 @@ rand = { workspace = true }
 # CJK tokenization (optional, activated by per-language features)
 lindera = { workspace = true, optional = true }
 jieba-rs = { workspace = true, optional = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
 coordinode-core = { workspace = true }

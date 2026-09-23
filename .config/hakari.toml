@@ -1,0 +1,67 @@
+# This file contains settings for `cargo hakari`.
+# See https://docs.rs/cargo-hakari/latest/cargo_hakari/config for a full list of options.
+
+hakari-package = "coordinode-workspace-hack"
+
+# Format version for hakari's output. Version 4 requires cargo-hakari 0.9.22 or above.
+dep-format-version = "4"
+
+# Setting workspace.resolver = "2" or higher in the root Cargo.toml is HIGHLY recommended.
+# Hakari works much better with the v2 resolver. (The v2 and v3 resolvers are identical from
+# hakari's perspective, so you're welcome to set either.)
+#
+# For more about the new feature resolver, see:
+# https://blog.rust-lang.org/2021/03/25/Rust-1.51.0.html#cargos-new-feature-resolver
+resolver = "2"
+
+# Add triples corresponding to platforms commonly used by developers here.
+# https://doc.rust-lang.org/rustc/platform-support.html
+platforms = [
+    # CI (self-hosted Fedora) and the servers.
+    "x86_64-unknown-linux-gnu",
+    # arm64 image build.
+    "aarch64-unknown-linux-gnu",
+    # Release binaries.
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    # Developer machines and the library crates' desktop targets.
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build scripts and proc macros (prost-derive, tonic-build) share third-party
+# crates with ordinary code. Replicating the target set on the host side makes
+# those crates resolve the same way whether a build selects one package or the
+# whole workspace, so neither selection produces a second copy.
+unify-target-host = "replicate-target-on-host"
+
+# The excluded crates below are not traversed, so a dependency they share with
+# the rest of the workspace (rustc-hash under lsm-tree) looks as if it had a
+# single feature set and would be left out. Writing those out too keeps a
+# single-package build and a workspace build on the same copy.
+output-single-feature = true
+
+# Write out exact versions rather than a semver range. (Defaults to false.)
+# exact-versions = true
+
+# coordinode-core targets a no_std + alloc build. The workspace-hack turns on
+# the workspace's unified (std) features of shared dependencies, so a
+# dependency on it would pull std into core. Core is still part of every
+# workspace build; only a `-p coordinode-core` build resolves its own few
+# dependencies separately.
+[final-excludes]
+workspace-members = ["coordinode-core"]
+
+# Crates that sit behind our own opt-in features. hakari unifies over every
+# feature combination, so without this a default build (the release server
+# binary included) would compile lsm-tree's encryption, io-uring and page_ecc
+# code and the CJK dictionaries, which those features exist to keep out: a
+# disabled feature is not compiled. These crates resolve per build instead;
+# the cost is one extra copy of each between a default and an --all-features
+# build, which is a different binary anyway.
+[traversal-excludes]
+third-party = [
+    { name = "coordinode-lsm-tree" },
+    { name = "lindera" },
+    { name = "jieba-rs" },
+]
