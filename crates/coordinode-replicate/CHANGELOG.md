@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+
+### Documentation
+
+- fix broken links and stray tags in the API docs
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

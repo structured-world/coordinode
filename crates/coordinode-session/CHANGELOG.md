@@ -2,6 +2,14 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(query)* a write reports the version it produced
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

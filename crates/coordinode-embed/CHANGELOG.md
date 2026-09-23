@@ -2,6 +2,49 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(server)* configure the planner statistics lifetime
+- *(query)* a write reports the version it produced
+- *(embed)* expected-revision writes on the embedded handle
+- *(txn)* write a record only at the version it was read at
+- *(txn)* make a read at a named timestamp wait for what it covers
+- *(txn)* writers state what their result depends on
+- *(txn)* refuse a commit that breaks a declared condition
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- fix broken and private intra-doc links
+- *(test)* stop the vector-filter test claiming an acceleration it lost
+- *(test)* correct what the forced-offload end-to-end test covers
+
+### Fixed
+
+- *(query)* answer a past timestamp only from history
+- *(storage)* recover the journal segment a killed process left open
+- *(storage)* report damaged planner statistics
+- *(txn)* validate from the first write a view may have missed
+- *(storage)* never let the watermark pass a snapshot just handed out
+- *(txn)* validate against the view a transaction read, not its timestamp
+- *(storage)* refuse a counter overflow where the caller can still hear it
+- *(embed)* rebuild the planner's counters after a restore
+- *(query)* create the edge of a path with anonymous nodes
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+
+### Testing
+
+- *(txn)* run every race on both transports, and fence with both halves
+- *(txn)* the two uses of an expected-revision write, and its rule
+- *(embed)* assert the retention contract, not survival
+- *(query)* cover the threshold vector predicate beyond the happy path
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

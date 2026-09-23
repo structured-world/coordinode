@@ -2,6 +2,33 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(cluster)* [**breaking**] refuse a join from a node that holds data
+- *(server)* name the field in a refused write concern
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- fix broken links and stray tags in the API docs
+
+### Fixed
+
+- *(raft)* wait for the previous membership change to commit
+- *(storage)* refuse a counter overflow where the caller can still hear it
+- *(cluster)* publish existing data as the group's base state
+- *(raft)* publish own address before adding a peer
+- *(storage)* commit w:0 writes through the log
+
+### Testing
+
+- *(raft)* log shutdown steps in the partition test
+- *(raft)* a node without a quorum still stops
+
 ## 0.5.8 - 2026-09-05
 
 #### Testing

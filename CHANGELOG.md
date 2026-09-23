@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(server)* configure the planner statistics lifetime
+- *(query)* a write reports the version it produced
+- *(server)* expected-revision writes over gRPC
+- *(txn)* make the snapshot wait an operator setting
+- *(txn)* bound the commits a node admits at once
+- *(txn)* writers state what their result depends on
+- *(txn)* refuse a commit that breaks a declared condition
+- *(server)* name the field in a refused write concern
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(storage)* measure retained MVCC history per partition
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+- *(txn)* typed invariant claims and their compatibility
+- *(embed)* expected-revision writes on the embedded handle
+- *(txn)* write a record only at the version it was read at
+- *(txn)* make a read at a named timestamp wait for what it covers
+- *(txn)* protect a MERGE that acted on an absence it observed
+- *(txn)* decide the remaining condition classes and measure the guard
+- *(cluster)* [**breaking**] refuse a join from a node that holds data
+- *(storage)* reserve and decide invariant claims
+- *(storage)* compress cold levels with zstd by default
+
+### Documentation
+
+- *(license)* apache-2.0 for driver and proto
+- fix broken links and stray tags in the API docs
+- fix broken and private intra-doc links
+- *(test)* stop the vector-filter test claiming an acceleration it lost
+- *(test)* correct what the forced-offload end-to-end test covers
+
+### Fixed
+
+- *(query)* answer a past timestamp only from history
+- *(raft)* wait for the previous membership change to commit
+- *(server)* open the database for maintenance as the server does
+- *(server)* default the write concern to majority
+- *(search)* index compound words in chinese text
+- *(storage)* adopt per-key mvcc retention
+- *(core)* encode node records canonically
+- *(embed)* rebuild the planner's counters after a restore
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(storage)* recover the journal segment a killed process left open
+- *(storage)* report damaged planner statistics
+- *(txn)* validate from the first write a view may have missed
+- *(storage)* never let the watermark pass a snapshot just handed out
+- *(txn)* validate against the view a transaction read, not its timestamp
+- *(storage)* refuse a counter overflow where the caller can still hear it
+- *(query)* create the edge of a path with anonymous nodes
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+- *(storage)* keep adjacency operands in the order they were staged
+- *(cluster)* publish existing data as the group's base state
+- *(raft)* publish own address before adding a peer
+- *(storage)* commit w:0 writes through the log
+- *(storage)* open a partition whose L0 holds more than 255 runs
+- *(txn)* close the window between validating a write and applying it
+- *(txn)* count an instance bound over the attempt's own entries
+- *(storage)* refuse a counter that leaves i64 or arrives corrupt
+- *(storage)* stop compaction losing merged writes
+- *(storage)* open when the clock restarts behind the floor
+- *(timeseries)* commit catalog buckets at the engine's clock
+
+### Performance
+
+- *(txn)* decide a live endpoint without reading its record
+- *(storage)* let a counter chain fold before its base is known
+- *(txn)* wait for a complete snapshot instead of reading behind one
+
+### Refactored
+
+- *(txn)* install a commit's protections in one place
+- *(storage)* drop a saturating add the invariant makes unnecessary
+
+### Testing
+
+- *(txn)* run every race on both transports, and fence with both halves
+- *(txn)* the two uses of an expected-revision write, and its rule
+- *(integration)* grow a machine with data into a cluster
+- *(integration)* reap the server on every shutdown path
+- *(embed)* assert the retention contract, not survival
+- *(query)* cover the threshold vector predicate beyond the happy path
+- *(raft)* log shutdown steps in the partition test
+- *(raft)* a node without a quorum still stops
+- *(txn)* a reader never sees part of a batch
+- *(txn)* a transfer and a new edge into its scope exclude each other
+- *(storage)* measure what declining to fold costs a document
+- *(storage)* resolve a merge chain on every read path
+- *(storage)* state the composition contract as executable facts
+- *(storage)* time travel over a merge chain keeps its steps
+- *(storage)* a counter fold is the sum an independent model makes
+- *(storage)* a document fold means the same however it is split
+- *(storage)* wait for replaced tables to be unlinked
+
 ## v0.5.8 - 2026-09-05
 
 ### coordinode-raft 0.5.8

@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Fixed
+
+- *(timeseries)* commit catalog buckets at the engine's clock
+- *(storage)* never let the watermark pass a snapshot just handed out
+
 ## 0.5.2 - 2026-08-30
 
 #### Fixed
