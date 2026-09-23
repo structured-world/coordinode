@@ -2,6 +2,31 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(txn)* protect a MERGE that acted on an absence it observed
+- *(txn)* writers state what their result depends on
+
+### Documentation
+
+- fix broken links and stray tags in the API docs
+
+### Fixed
+
+- *(storage)* never let the watermark pass a snapshot just handed out
+- *(storage)* keep adjacency operands in the order they were staged
+
+### Performance
+
+- *(txn)* decide a live endpoint without reading its record
+- *(storage)* let a counter chain fold before its base is known
+
+### Refactored
+
+- *(txn)* install a commit's protections in one place
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

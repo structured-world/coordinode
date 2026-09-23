@@ -2,6 +2,22 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(server)* configure the planner statistics lifetime
+- *(txn)* refuse a commit that breaks a declared condition
+- *(txn)* typed invariant claims and their compatibility
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Fixed
+
+- *(core)* encode node records canonically
+- *(embed)* rebuild the planner's counters after a restore
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+
 ## 0.5.6 - 2026-09-01
 
 #### Performance

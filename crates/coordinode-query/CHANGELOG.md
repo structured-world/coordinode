@@ -2,6 +2,36 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(query)* a write reports the version it produced
+- *(txn)* write a record only at the version it was read at
+- *(txn)* decide the remaining condition classes and measure the guard
+- *(txn)* protect a MERGE that acted on an absence it observed
+- *(txn)* refuse a commit that breaks a declared condition
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- fix broken links and stray tags in the API docs
+
+### Fixed
+
+- *(query)* answer a past timestamp only from history
+- *(txn)* validate from the first write a view may have missed
+- *(storage)* never let the watermark pass a snapshot just handed out
+- *(storage)* refuse a counter overflow where the caller can still hear it
+- *(storage)* keep adjacency operands in the order they were staged
+- *(search)* index compound words in chinese text
+- *(query)* create the edge of a path with anonymous nodes
+- *(query)* clone a temporal node at the engine clock, not a wall clock
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+- *(query)* [**breaking**] evaluate threshold vector predicates exactly
+
 ## 0.5.7 - 2026-09-01
 
 #### Added

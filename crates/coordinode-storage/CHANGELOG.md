@@ -2,6 +2,75 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.6.0 - 2026-09-23
+
+### Added
+
+- *(embed)* expected-revision writes on the embedded handle
+- *(txn)* write a record only at the version it was read at
+- *(txn)* make the snapshot wait an operator setting
+- *(txn)* make a read at a named timestamp wait for what it covers
+- *(txn)* bound the commits a node admits at once
+- *(txn)* decide the remaining condition classes and measure the guard
+- *(txn)* protect a MERGE that acted on an absence it observed
+- *(txn)* writers state what their result depends on
+- *(txn)* refuse a commit that breaks a declared condition
+- *(storage)* reserve and decide invariant claims
+- *(cluster)* [**breaking**] refuse a join from a node that holds data
+- *(txn)* [**breaking**] write concern as two axes, w and journal
+- *(storage)* compress cold levels with zstd by default
+- *(storage)* measure retained MVCC history per partition
+- *(storage)* [**breaking**] engine-owned MVCC retention window
+- *(txn)* [**breaking**] commit receipt, one seqno per proposal
+
+### Documentation
+
+- fix broken and private intra-doc links
+
+### Fixed
+
+- *(storage)* open a partition whose L0 holds more than 255 runs
+- *(storage)* recover the journal segment a killed process left open
+- *(core)* encode node records canonically
+- *(storage)* report damaged planner statistics
+- *(txn)* validate from the first write a view may have missed
+- *(storage)* never let the watermark pass a snapshot just handed out
+- *(txn)* validate against the view a transaction read, not its timestamp
+- *(txn)* close the window between validating a write and applying it
+- *(txn)* count an instance bound over the attempt's own entries
+- *(storage)* refuse a counter overflow where the caller can still hear it
+- *(storage)* keep adjacency operands in the order they were staged
+- *(embed)* rebuild the planner's counters after a restore
+- *(storage)* refuse a counter that leaves i64 or arrives corrupt
+- *(storage)* stop compaction losing merged writes
+- *(storage)* commit w:0 writes through the log
+- *(storage)* open when the clock restarts behind the floor
+- *(storage)* adopt per-key mvcc retention
+- *(storage)* [**breaking**] honour the retention boundary, and stop maintenance compaction destroying history
+
+### Performance
+
+- *(txn)* wait for a complete snapshot instead of reading behind one
+- *(txn)* decide a live endpoint without reading its record
+- *(storage)* let a counter chain fold before its base is known
+
+### Refactored
+
+- *(txn)* install a commit's protections in one place
+- *(storage)* drop a saturating add the invariant makes unnecessary
+
+### Testing
+
+- *(txn)* a reader never sees part of a batch
+- *(txn)* a transfer and a new edge into its scope exclude each other
+- *(storage)* measure what declining to fold costs a document
+- *(storage)* resolve a merge chain on every read path
+- *(storage)* state the composition contract as executable facts
+- *(storage)* time travel over a merge chain keeps its steps
+- *(storage)* a counter fold is the sum an independent model makes
+- *(storage)* a document fold means the same however it is split
+- *(storage)* wait for replaced tables to be unlinked
+
 ## 0.5.7 - 2026-09-01
 
 #### Added
