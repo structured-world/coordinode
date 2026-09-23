@@ -49,6 +49,29 @@ jobs:
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  rustdoc:
+    name: API docs
+    # Broken intra-doc links, links to private items and stray HTML tags only
+    # surface in rustdoc, which no other job runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler (skip if present)
+        run: |
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          fi
+      - uses: Swatinem/rust-cache@v2
+      - name: Build API docs (zero warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --workspace --all-features
+
   hakari:
     name: Workspace hack
     # The workspace-hack crate pins the unified features of third-party
