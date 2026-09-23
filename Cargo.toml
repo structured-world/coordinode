@@ -187,6 +187,12 @@ debug = "line-tables-only"
 [profile.dev.build-override]
 debug = "line-tables-only"
 
+# Dependencies are optimized; the workspace's own crates stay at opt-level 0
+# for fast rebuilds. The same value as the machine-wide developer config, so
+# local and CI builds of a dependency are one cache entry.
+[profile.dev.package."*"]
+opt-level = 2
+
 # Stepping through code in a debugger: `cargo build --profile debugger`
 # (tests: `cargo nextest run --cargo-profile debugger`). Full debug
 # information on top of the everyday profile, built into target/debugger so it
