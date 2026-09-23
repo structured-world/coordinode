@@ -369,8 +369,10 @@ async fn read_your_writes_after_failover() {
 /// no split-brain (its uncommitted write never appears on the majority).
 #[tokio::test(flavor = "multi_thread")]
 async fn partition_minority_cannot_commit_majority_can() {
+    // coordinode_raft at info: a run that times out shows which shutdown
+    // step each node reached (the output is only printed on failure).
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("openraft=off")
+        .with_env_filter("openraft=off,coordinode_raft=info")
         .with_test_writer()
         .try_init();
     nemesis::heal(); // defensive: clean matrix at start
