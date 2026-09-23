@@ -94,15 +94,19 @@ jobs:
           # tree and building whatever main holds right now.
           ref: ${{ env.TAG_NAME }}
 
-      - name: Install Rust + musl target
+      - name: Install rustup
         uses: dtolnay/rust-toolchain@stable
-        with:
-          # Must match rust-toolchain.toml. The target's std is installed per
-          # toolchain, and cargo picks the toolchain from that file, so a
-          # mismatch here installs the musl std somewhere cargo never looks
-          # and the build dies on "can't find crate for `core`".
-          toolchain: "1.98"
-          targets: ${{ matrix.target }}
+
+      # The target's std is installed per toolchain and cargo takes the
+      # toolchain from rust-toolchain.toml, so the musl std must go into that
+      # toolchain, not one named here. Run from the checkout, both commands
+      # resolve the pinned toolchain from the file, so a pin bump can never
+      # leave the target behind.
+      - name: Install the pinned toolchain + musl target
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+          rustup show active-toolchain
 
       - name: Install musl tools + protobuf
         run: |
