@@ -697,3 +697,13 @@ jobs:
           path: bench-results/**/*.json
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Clean the build output
+        # The self-hosted runner is shared by several repositories and keeps
+        # whatever a job leaves behind. The bench binary is built in its own
+        # workspace and copied into the root target/, so both trees go, at
+        # the end of every run, a failed one included.
+        if: always()
+        run: |
+          cargo clean --manifest-path benches/vector-ann/Cargo.toml
+          cargo clean

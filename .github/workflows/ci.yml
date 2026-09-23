@@ -89,19 +89,12 @@ jobs:
         run: cargo nextest run --all-features --workspace
       - name: Run doc tests
         run: cargo test --doc --all-features
-      - name: Reclaim disk if the build tree passed 100 GB
-        # The runner keeps target/ between jobs so builds stay incremental.
-        # Left alone it grows without bound and eventually fills the volume,
-        # which surfaces as a linker "No space left on device". Runs even when
-        # the job failed, since a failed build still leaves artefacts behind.
+      - name: Clean the build output
+        # The self-hosted runner is shared by several repositories and keeps
+        # whatever a job leaves behind, so the build tree goes at the end of
+        # every run, a failed one included. The job's result is unaffected.
         if: always()
-        run: |
-          used_gb=$(( $(du -sk target 2>/dev/null | cut -f1 || echo 0) / 1024 / 1024 ))
-          echo "target/ occupies ${used_gb} GB"
-          if [ "$used_gb" -gt 100 ]; then
-            echo "above the 100 GB ceiling, discarding the build tree"
-            cargo clean
-          fi
+        run: cargo clean
 
   build:
     name: Build
@@ -130,17 +123,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release --all-features
-      - name: Reclaim disk if the build tree passed 100 GB
-        # Same ceiling as the `test` job; the release profile adds its own
-        # target/release tree on top of the debug one.
+      - name: Clean the build output
+        # Same as the `test` job: the shared self-hosted runner keeps nothing.
         if: always()
-        run: |
-          used_gb=$(( $(du -sk target 2>/dev/null | cut -f1 || echo 0) / 1024 / 1024 ))
-          echo "target/ occupies ${used_gb} GB"
-          if [ "$used_gb" -gt 100 ]; then
-            echo "above the 100 GB ceiling, discarding the build tree"
-            cargo clean
-          fi
+        run: cargo clean
 
   audit:
     name: Security Audit
