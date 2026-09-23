@@ -885,6 +885,84 @@ fn open_repairs_partition_with_lost_manifest_pointer() {
     ));
 }
 
+/// Repair at open makes every recovered table a run of its own in L0, so a
+/// partition of more than 255 tables comes back as a level wider than a
+/// manifest snapshot used to count. The repaired engine must open, keep
+/// writing on top of that level, and open again afterwards.
+#[test]
+fn open_repairs_partition_with_more_than_255_tables() {
+    use lsm_tree::AbstractTree;
+
+    const TABLES: usize = 300;
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    // No compaction worker, so every flush stays a table of its own.
+    config.compaction_workers = 0;
+
+    {
+        let engine = StorageEngine::open(&config).expect("initial open");
+        for i in 0..TABLES {
+            let key = format!("k{i:05}");
+            engine
+                .put(Partition::Node, key.as_bytes(), key.as_bytes())
+                .expect("put");
+            engine
+                .tree(Partition::Node)
+                .expect("tree")
+                .flush_active_memtable(0)
+                .expect("flush");
+        }
+    }
+
+    let current = dir.path().join(Partition::Node.name()).join("current");
+    assert!(current.exists(), "layout changed: no current pointer file");
+    std::fs::remove_file(&current).expect("remove current");
+
+    {
+        let engine = StorageEngine::open(&config).expect("open after manifest loss");
+        assert_eq!(engine.open_repairs().len(), 1, "the Node tree was repaired");
+        assert!(
+            engine.tree(Partition::Node).expect("tree").l0_run_count() > 255,
+            "repair must have rebuilt a level wider than a byte can count",
+        );
+        engine
+            .put(Partition::Node, b"after-repair", b"written")
+            .expect("put after repair");
+        engine.persist().expect("flush after repair");
+    }
+
+    let engine = StorageEngine::open(&config).expect("reopen after repair");
+    assert!(
+        engine.open_repairs().is_empty(),
+        "the repaired tree opens without another repair",
+    );
+    for i in 0..TABLES {
+        let key = format!("k{i:05}");
+        assert_eq!(
+            engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(key.as_bytes()),
+            "{key} must survive the repair",
+        );
+    }
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"after-repair")
+            .expect("get")
+            .as_deref(),
+        Some(&b"written"[..]),
+    );
+}
+
 /// Fail-closed: an open failure that is NOT positively-identified structural
 /// damage (here: the directory lock held by a live engine) must propagate as
 /// an error, never trigger an in-place repair. Repairing on an ambiguous

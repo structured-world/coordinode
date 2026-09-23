@@ -138,3 +138,82 @@ fn checkpoint_refuses_existing_target() {
         Ok(_) => panic!("checkpoint must refuse an existing target"),
     }
 }
+
+/// Flushes that outpace compaction leave more than 255 runs in L0 (the L0
+/// backpressure wall only rejects client writes, and an operator may raise
+/// it). The storage engine used to write such a level into a manifest
+/// snapshot with its run count wrapped to a byte, so a checkpoint of it did
+/// not open. Both the checkpoint and the source must open with every run.
+#[test]
+fn checkpoint_of_more_than_255_l0_runs_opens_with_every_run() {
+    use lsm_tree::AbstractTree;
+
+    const RUNS: usize = 300;
+
+    let src_dir = TempDir::new().expect("src tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        src_dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    // No compaction worker, so nothing folds L0 while it grows.
+    config.compaction_workers = 0;
+    let engine = StorageEngine::open(&config).expect("open engine");
+
+    for i in 0..RUNS {
+        let key = format!("k{i:05}");
+        engine
+            .put(Partition::Node, key.as_bytes(), key.as_bytes())
+            .expect("put key");
+        // Every flush also rewrites `zzz`, so each table overlaps every other
+        // one and each flush stays a run of its own.
+        engine
+            .put(Partition::Node, b"zzz", key.as_bytes())
+            .expect("put zzz");
+        engine
+            .tree(Partition::Node)
+            .expect("node tree")
+            .flush_active_memtable(0)
+            .expect("flush");
+    }
+    assert!(
+        engine
+            .tree(Partition::Node)
+            .expect("node tree")
+            .l0_run_count()
+            > 255,
+        "the scenario needs a level wider than a byte can count",
+    );
+
+    let ckpt_parent = TempDir::new().expect("ckpt parent");
+    let target = ckpt_parent.path().join("wide");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    drop(engine);
+
+    let newest = format!("k{:05}", RUNS - 1);
+    for (what, dir) in [("checkpoint", target.as_path()), ("source", src_dir.path())] {
+        let reopened = disk_engine(dir);
+        for i in 0..RUNS {
+            let key = format!("k{i:05}");
+            assert_eq!(
+                reopened
+                    .get(Partition::Node, key.as_bytes())
+                    .expect("get")
+                    .as_deref(),
+                Some(key.as_bytes()),
+                "{key} must read back from the {what}",
+            );
+        }
+        // The newest run still shadows the older ones: run order survived.
+        assert_eq!(
+            reopened
+                .get(Partition::Node, b"zzz")
+                .expect("get zzz")
+                .as_deref(),
+            Some(newest.as_bytes()),
+            "run order must survive in the {what}",
+        );
+    }
+}
