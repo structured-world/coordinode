@@ -1550,3 +1550,45 @@ fn damaged_planner_counter_disables_stats_not_queries() {
         Some(2)
     );
 }
+
+/// A failed statistics read is remembered for the stats TTL, like a
+/// successful one: otherwise a damaged counter would be re-read and logged on
+/// every query that plans. With a zero TTL nothing is remembered, so a repair
+/// shows at once.
+#[test]
+fn failed_planner_stats_are_cached_for_the_ttl() {
+    use coordinode_core::graph::stats::{StorageStats, label_count_key};
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:User {name: 'a'})")
+        .expect("create");
+    db.set_stats_ttl(Duration::MAX);
+    let write_counter = |db: &Database, bytes: &[u8]| {
+        db.engine()
+            .put(Partition::Counter, &label_count_key("User"), bytes)
+            .expect("write the counter");
+    };
+
+    write_counter(&db, b"bad");
+    db.invalidate_stats_cache();
+    assert!(
+        db.compute_stats().is_none(),
+        "the damaged counter is refused"
+    );
+    write_counter(&db, &1i64.to_le_bytes());
+    assert!(
+        db.compute_stats().is_none(),
+        "within the TTL the failure is served from the cache, not re-read"
+    );
+
+    db.set_stats_ttl(Duration::ZERO);
+    assert_eq!(
+        db.compute_stats()
+            .expect("stats")
+            .node_count_for_label("User"),
+        Some(1),
+        "with no TTL the repaired counter is read at once"
+    );
+}

@@ -145,6 +145,7 @@ pub(crate) async fn serve(
         interactive_txn_max_bytes,
         peers: peers_vec,
         membership_change_timeout_secs,
+        planner_stats_ttl_secs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -565,16 +566,18 @@ pub(crate) async fn serve(
     let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
         Arc::new(raft_node.pipeline());
 
+    let mut database = coordinode_embed::Database::from_engine(
+        &data_dir,
+        Arc::clone(&engine),
+        oracle.clone(),
+        Arc::clone(&pipeline),
+    )
+    .map_err(|e| format!("failed to open database: {e}"))?;
+    if let Some(secs) = planner_stats_ttl_secs {
+        database.set_stats_ttl(std::time::Duration::from_secs(secs));
+    }
     // no-std: spin::RwLock (drop-in).
-    let database = Arc::new(parking_lot::RwLock::new(
-        coordinode_embed::Database::from_engine(
-            &data_dir,
-            Arc::clone(&engine),
-            oracle.clone(),
-            Arc::clone(&pipeline),
-        )
-        .map_err(|e| format!("failed to open database: {e}"))?,
-    ));
+    let database = Arc::new(parking_lot::RwLock::new(database));
 
     // Live session registry for operational introspection
     // (SHOW SESSIONS / SHOW TRANSACTIONS). Shared between the session

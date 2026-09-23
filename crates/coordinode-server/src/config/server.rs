@@ -103,6 +103,10 @@ pub struct ServerConfig {
     /// How long a membership change (join, promotion, decommission) waits for
     /// the previous one to commit before it is refused, in seconds (`None` = 30).
     pub membership_change_timeout_secs: Option<u64>,
+    /// How long the planner's storage statistics are reused before they are
+    /// read again, in seconds (`None` = 60). A read that fails is remembered
+    /// for the same time.
+    pub planner_stats_ttl_secs: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -231,6 +235,7 @@ impl Default for ServerConfig {
             storage: StorageTopology::default(),
             peers: Vec::new(),
             membership_change_timeout_secs: None,
+            planner_stats_ttl_secs: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

@@ -32,5 +32,9 @@ tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 name = "document_projection"
 harness = false
 
+[[bench]]
+name = "node_record_encode"
+harness = false
+
 [lints]
 workspace = true

@@ -4,8 +4,10 @@
 //!
 //! ```text
 //! Key:   node:<shard_id u16 BE>:<node_id u64 BE>
-//! Value: MessagePack { label: String, props: HashMap<u32, Value> }
+//! Value: MessagePack [labels, props: map<u32, Value>, extra?: map<String, Value>]
 //! ```
+//!
+//! Both maps are written with keys ascending, so equal records have equal bytes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

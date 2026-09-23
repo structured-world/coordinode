@@ -6,7 +6,7 @@
 //! the message text instead works until someone rewords it.
 //!
 //! So every failure a client may reasonably branch on also carries a
-//! [`google.rpc.ErrorInfo`] in the `grpc-status-details-bin` trailer, with a
+//! `google.rpc.ErrorInfo` in the `grpc-status-details-bin` trailer, with a
 //! stable [`Reason`] string, this server's [`ERROR_DOMAIN`], and whatever
 //! values the caller needs to act (the offending function name, the id of a
 //! transaction that no longer exists). The code and the message stay exactly

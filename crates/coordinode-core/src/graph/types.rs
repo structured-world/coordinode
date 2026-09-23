@@ -156,7 +156,8 @@ pub enum Value {
 }
 
 /// One relationship hop inside a [`PathValue`]: its type and endpoint node ids
-/// (raw [`NodeId`] values). Properties are not carried in v1 of the path model.
+/// (raw [`NodeId`](crate::graph::node::NodeId) values). Properties are not
+/// carried in v1 of the path model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathRel {
     /// Relationship type (edge label).
@@ -175,7 +176,8 @@ pub struct PathRel {
 /// direction). `length(p)` is `rels.len()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathValue {
-    /// Ordered node ids along the path (raw [`NodeId`] values), start to end.
+    /// Ordered node ids along the path (raw [`NodeId`](crate::graph::node::NodeId)
+    /// values), start to end.
     pub nodes: Vec<u64>,
     /// Ordered relationship hops, one fewer than `nodes` on a non-empty path.
     pub rels: Vec<PathRel>,
