@@ -25,6 +25,10 @@ pub struct ParsedQuery {
     pub canonical: String,
     /// Stable fingerprint over [`ParsedQuery::canonical`].
     pub fingerprint: u64,
+    /// The query named its vector consistency itself, so
+    /// [`LogicalPlan::vector_consistency`] is what it asked for and a session
+    /// setting must not replace it.
+    pub vector_consistency_hinted: bool,
 }
 
 /// Why a [`QueryFrontend`] could not turn surface text into a [`ParsedQuery`].
@@ -101,10 +105,15 @@ impl QueryFrontend for CypherFrontend {
             return Err(FrontendError::Semantic(errors));
         }
         let plan = crate::planner::build_logical_plan(&ast).map_err(FrontendError::Plan)?;
+        let vector_consistency_hinted = ast
+            .hints
+            .iter()
+            .any(|h| matches!(h, crate::cypher::ast::QueryHint::VectorConsistency(_)));
         Ok(ParsedQuery {
             plan,
             canonical,
             fingerprint,
+            vector_consistency_hinted,
         })
     }
 

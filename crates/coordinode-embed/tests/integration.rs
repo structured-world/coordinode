@@ -22,6 +22,7 @@ mod integration {
     mod encrypted_search;
     mod g063_from_engine;
     mod helpers;
+    mod historical_index;
     mod hnsw;
     mod interactive_txn;
     mod merge_stress;

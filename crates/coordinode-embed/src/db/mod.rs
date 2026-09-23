@@ -329,8 +329,11 @@ pub struct Database {
     /// (writing to the local engine directly) silently breaks
     /// replication: followers never see the data.
     pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
-    /// Session-level vector MVCC consistency mode.
-    vector_consistency: VectorConsistencyMode,
+    /// Session-level vector MVCC consistency mode, set by
+    /// `SET vector_consistency` or [`Database::set_vector_consistency`]. It
+    /// replaces what a query's `read_consistency` implies, but not a mode the
+    /// query names in a hint. `None`: each query decides.
+    vector_consistency: Option<VectorConsistencyMode>,
     /// Session-level read concern. Default: Local.
     read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
     /// One-shot snapshot timestamp for the next query (consumed on use).
@@ -439,6 +442,19 @@ pub struct Database {
 /// annotation, predicate push-down) still run per call because they
 /// depend on the live index registry / storage statistics and would
 /// stale-bind if cached.
+/// Settle a plan's vector consistency: a mode the query named in a hint wins,
+/// then the session's `SET vector_consistency`, then what the query's
+/// `read_consistency` implies (already in the plan).
+fn apply_session_vector_consistency(
+    plan: &mut planner::logical::LogicalPlan,
+    hinted: bool,
+    session: Option<VectorConsistencyMode>,
+) {
+    if let (false, Some(mode)) = (hinted, session) {
+        plan.vector_consistency = mode;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedPlan {
     /// Canonical form (literals scrubbed) — fed to the advisor.
@@ -449,6 +465,8 @@ struct CachedPlan {
     /// every cache hit so the per-call optimizer passes mutate a fresh
     /// copy without invalidating the cache entry.
     plan: planner::logical::LogicalPlan,
+    /// The query named its own vector consistency in a hint.
+    vector_consistency_hinted: bool,
 }
 
 /// Bounded query-string → [`CachedPlan`] cache shared across all
@@ -520,7 +538,8 @@ struct QuerySession {
     /// was captured).
     snapshot_read_ts: Option<u64>,
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
-    vector_consistency: VectorConsistencyMode,
+    /// The session's vector consistency, when it set one.
+    vector_consistency: Option<VectorConsistencyMode>,
     /// Async AFTER COMMIT cascade generation for this statement. `0` for user
     /// statements; set to the queued event's generation when the dispatcher
     /// runs a trigger body so enqueued child events are stamped `generation + 1`.
@@ -1033,7 +1052,7 @@ impl Database {
             oracle,
             proposal_id_gen,
             pipeline,
-            vector_consistency: VectorConsistencyMode::default(),
+            vector_consistency: None,
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             cached_stats: Mutex::new(None),
@@ -1442,7 +1461,7 @@ impl Database {
     /// mutates the session default field.
     fn try_apply_session_set(&mut self, query: &str) -> bool {
         if let Some(mode) = Self::try_parse_session_set(query) {
-            self.vector_consistency = mode;
+            self.vector_consistency = Some(mode);
             true
         } else {
             false
@@ -1546,6 +1565,7 @@ impl Database {
                 canonical: parsed.canonical,
                 fingerprint: parsed.fingerprint,
                 plan: parsed.plan,
+                vector_consistency_hinted: parsed.vector_consistency_hinted,
             }),
         );
         let session = self.capture_session();
@@ -1996,14 +2016,17 @@ impl Database {
 
     /// Set session-level vector consistency mode.
     ///
-    /// Equivalent to `SET vector_consistency = 'snapshot'` in Cypher.
+    /// Equivalent to `SET vector_consistency = 'snapshot'` in Cypher. It
+    /// replaces the mode a query's `read_consistency` implies; a query that
+    /// names its own mode in a hint keeps it.
     pub fn set_vector_consistency(&mut self, mode: VectorConsistencyMode) {
-        self.vector_consistency = mode;
+        self.vector_consistency = Some(mode);
     }
 
-    /// Get current session-level vector consistency mode.
+    /// Get current session-level vector consistency mode; `current` when the
+    /// session has not set one.
     pub fn vector_consistency(&self) -> VectorConsistencyMode {
-        self.vector_consistency
+        self.vector_consistency.unwrap_or_default()
     }
 
     /// Set session-level read concern.
@@ -2271,11 +2294,12 @@ impl Database {
         // canonical form, fingerprint, and unoptimized logical plan.
         // Optimizer passes below still run on the cloned plan so they
         // observe the current index registry / stats.
-        let (canonical, fp, mut plan) = match self.plan_cache.get(query) {
+        let (canonical, fp, mut plan, hinted) = match self.plan_cache.get(query) {
             Some(cached) => (
                 cached.canonical.clone(),
                 cached.fingerprint,
                 cached.plan.clone(),
+                cached.vector_consistency_hinted,
             ),
             None => {
                 // Parse, validate, lower, and fingerprint through the query
@@ -2288,13 +2312,18 @@ impl Database {
                         canonical: parsed.canonical.clone(),
                         fingerprint: parsed.fingerprint,
                         plan: parsed.plan.clone(),
+                        vector_consistency_hinted: parsed.vector_consistency_hinted,
                     }),
                 );
-                (parsed.canonical, parsed.fingerprint, parsed.plan)
+                (
+                    parsed.canonical,
+                    parsed.fingerprint,
+                    parsed.plan,
+                    parsed.vector_consistency_hinted,
+                )
             }
         };
-        // Inject the per-call vector consistency into the plan for EXPLAIN output.
-        plan.vector_consistency = session.vector_consistency;
+        apply_session_vector_consistency(&mut plan, hinted, session.vector_consistency);
 
         // Apply index selection optimizer: rewrite Filter(NodeScan) → IndexScan
         // when a matching B-tree index is registered.
@@ -2303,13 +2332,21 @@ impl Database {
         // Annotate VectorTopK nodes with the HNSW index name when an applicable
         // index exists. This ensures the executor's VectorTopK operator carries
         // the resolved index name at execution time, not just at EXPLAIN time.
-        plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
+        plan.root = planner::annotate_vector_top_k(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
 
         // Promote pure vector top-K to the HnswScan index access path:
         // the index becomes the row source and only the k result nodes
         // are fetched, instead of materialising the whole label before
         // ranking. Filtered queries keep the VectorTopK path.
-        plan.root = planner::apply_hnsw_scan_access_path(plan.root, &self.vector_index_registry);
+        plan.root = planner::apply_hnsw_scan_access_path(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
 
         // Apply graph-predicate push-down (R-PUSH1): for every VectorFilter
         // preceded by a Traverse, annotate with strategy decision
@@ -2346,6 +2383,9 @@ impl Database {
         // GC-watermark pin for an explicit historical snapshot, held for the
         // statement so compaction cannot collect the history it reads.
         let mut retention_pin = None;
+        // The timestamp a snapshot read concern names, which the executor
+        // treats like `AS OF TIMESTAMP`.
+        let mut named_read_ts: Option<i64> = None;
         let read_ts = match &txn_mode {
             // Interactive transaction: every statement reuses the pinned
             // start_ts so all reads resolve against the same snapshot
@@ -2395,6 +2435,10 @@ impl Database {
                         });
                     };
                     retention_pin = Some(pin);
+                    // A timestamp past i64::MAX is later than every commit, and
+                    // so is i64::MAX itself: both name the read of everything
+                    // committed, so the executor gets the largest value it holds.
+                    named_read_ts = Some(i64::try_from(ts).unwrap_or(i64::MAX));
                     Timestamp::from_raw(seqno)
                 } else {
                     self.fresh_pinned_read_ts(&mut retention_pin)
@@ -2445,7 +2489,7 @@ impl Database {
             operations: self.operations.as_deref(),
             adaptive: self.adaptive_config.clone(),
             dedup_varlen_targets: false,
-            snapshot_ts: None,
+            snapshot_ts: named_read_ts,
             snapshot_pin: None,
             warnings: Vec::new(),
             write_stats: WriteStats::default(),
@@ -2467,7 +2511,7 @@ impl Database {
                 dismissed: Arc::clone(&self.dismissed),
             }),
             txn,
-            vector_consistency: session.vector_consistency,
+            vector_consistency: plan.vector_consistency,
             vector_overfetch_factor: 1.2,
             vector_mvcc_stats: None,
             // The injected pipeline (Raft in cluster mode) — NOT a local
@@ -2691,16 +2735,29 @@ impl Database {
     /// Uses real storage statistics (node counts, fan-out) for
     /// more accurate cost estimates than hardcoded defaults.
     pub fn explain_cypher(&self, query: &str) -> Result<String, DatabaseError> {
-        let mut plan = CypherFrontend::new().parse(query)?.plan;
-        plan.vector_consistency = self.vector_consistency;
+        let parsed = CypherFrontend::new().parse(query)?;
+        let mut plan = parsed.plan;
+        apply_session_vector_consistency(
+            &mut plan,
+            parsed.vector_consistency_hinted,
+            self.vector_consistency,
+        );
         // Apply index selection optimizer so EXPLAIN reflects the actual plan
         // that would be executed (IndexScan instead of Filter+NodeScan when
         // a matching B-tree index is registered).
         plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
-        plan.root = planner::annotate_vector_top_k(plan.root, &self.vector_index_registry);
+        plan.root = planner::annotate_vector_top_k(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
         // Same access-path promotion as the execute path so EXPLAIN
         // shows the plan that actually runs.
-        plan.root = planner::apply_hnsw_scan_access_path(plan.root, &self.vector_index_registry);
+        plan.root = planner::apply_hnsw_scan_access_path(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
         let stats = self.compute_stats();
         let combined_for_push_down = stats.as_ref().map(|g| CombinedStats {
             graph: g,
@@ -2747,8 +2804,13 @@ impl Database {
         &self,
         query: &str,
     ) -> Result<coordinode_query::advisor::ExplainSuggestResult, DatabaseError> {
-        let mut plan = CypherFrontend::new().parse(query)?.plan;
-        plan.vector_consistency = self.vector_consistency;
+        let parsed = CypherFrontend::new().parse(query)?;
+        let mut plan = parsed.plan;
+        apply_session_vector_consistency(
+            &mut plan,
+            parsed.vector_consistency_hinted,
+            self.vector_consistency,
+        );
         let stats = self.compute_stats();
         let stats_ref = stats
             .as_ref()

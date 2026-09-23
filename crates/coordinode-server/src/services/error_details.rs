@@ -93,6 +93,13 @@ pub enum Reason {
     /// read succeeds at. Terminal for that timestamp: the horizon only moves
     /// forward.
     OutsideRetention,
+    /// A read at a named timestamp (`AS OF TIMESTAMP`,
+    /// `ReadConcern.at_timestamp`) would be answered by a vector or full-text
+    /// index that holds only the current state. Metadata carries
+    /// `index_kind` (`vector` or `full-text`), `label`, `property` and
+    /// `timestamp`. Terminal for that query: a vector search can be asked
+    /// with `vector_consistency('exact')` instead.
+    IndexNotHistorical,
     /// A write concern the server cannot honour: an unknown mode or journal
     /// value, a member count above the group's size, or a volatile journal
     /// level asked of more than one member. Terminal for that request; the
@@ -119,6 +126,7 @@ impl Reason {
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::NotLeader => "NOT_LEADER",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
+            Reason::IndexNotHistorical => "INDEX_NOT_HISTORICAL",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
         }
     }

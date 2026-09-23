@@ -441,7 +441,9 @@ RETURN u.name, u.balance
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 ```
 
-The bound is inclusive: `AS OF TIMESTAMP T` sees every transaction with `commit_ts <= T` and nothing committed later. Every mutation of a transaction is applied at its single commit timestamp, so a read never observes a partially applied transaction. The `commit_ts` returned by an interactive transaction's commit receipt (embedded `CommitReceipt`, gRPC `CommitTransactionResponse`) is therefore the exact anchor for its own write: `AS OF TIMESTAMP <commit_ts>` sees it, `<commit_ts> - 1` does not. An integer literal is the raw HLC value in microseconds; negative literals are rejected.
+The bound is inclusive: `AS OF TIMESTAMP T` sees every transaction with `commit_ts <= T` and nothing committed later. Every mutation of a transaction is applied at its single commit timestamp, so a read never observes a partially applied transaction. The `commit_ts` returned by an interactive transaction's commit receipt (embedded `CommitReceipt`, gRPC `CommitTransactionResponse`) is therefore the exact anchor for its own write: `AS OF TIMESTAMP <commit_ts>` sees it, `<commit_ts> - 1` does not. An integer literal is the raw HLC value in microseconds; negative literals are rejected. A string literal must be an RFC 3339 timestamp with a zone offset (`'2026-03-15T10:00:00Z'`, `'2026-03-15T13:00:00+03:00'`); anything else is refused.
+
+Vector and full-text indexes hold the current state only, so a time-travel query they would answer is refused with `INDEX_NOT_HISTORICAL`; a vector search can use `/*+ vector_consistency('exact') */` instead. See [Time-Travel Queries](./extensions#time-travel-queries).
 
 ---
 
@@ -656,7 +658,7 @@ Governs whether graph, vector, full-text, document, and time-series reads inside
 |------|-----------|
 | `current` | Each modality reads its latest state independently. No watermark wait. Lowest latency. Default for single-modality reads. |
 | `snapshot` | All modalities align at a single HLC `T` via `MaxAssignedWatermark::wait_for(T, read_timeout)`. HNSW post-filtered, tantivy segment-filtered by `commit_ts ≤ T`. **Auto-selected** when a query touches >1 modality. |
-| `exact` | As `snapshot`, plus HNSW is bypassed (brute-force scan with MVCC filter). 100% recall, 10–100× slower vector path; use for audit / correctness-critical reads. |
+| `exact` | As `snapshot`, plus HNSW is bypassed (brute-force scan with MVCC filter). 100% recall, 10–100× slower vector path; use for audit / correctness-critical reads, and for vector search at an `AS OF TIMESTAMP`, which the current-state index cannot answer. |
 
 **What counts as a "modality" for the auto-promotion rule:**
 
@@ -694,7 +696,7 @@ RETURN n /*+ read_consistency('snapshot') */
 
 ### `vector_consistency` as narrower override
 
-When `read_consistency` and `vector_consistency` are both set, `vector_consistency` wins for the vector modality only — every other modality still follows `read_consistency`. This lets power users pin the vector path to `exact` (brute-force) while keeping FTS + graph aligned via snapshot:
+When `read_consistency` and `vector_consistency` are both set, `vector_consistency` wins for the vector modality only — every other modality still follows `read_consistency`. A session `SET vector_consistency = '...'` replaces what `read_consistency` implies, but a query's own `vector_consistency` hint wins over the session. This lets power users pin the vector path to `exact` (brute-force) while keeping FTS + graph aligned via snapshot:
 
 ```cypher
 MATCH (c:Chunk)

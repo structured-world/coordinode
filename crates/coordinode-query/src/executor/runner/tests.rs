@@ -1952,16 +1952,27 @@ fn as_of_timestamp_rejects_expired() {
     );
 }
 
+/// An RFC 3339 string names the same HLC microsecond as its integer form, so
+/// the snapshot is set to it instead of the string being read as "now".
 #[test]
-fn as_of_timestamp_string_warning() {
+fn as_of_timestamp_string_is_parsed_as_rfc3339() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
+    // One hour ago, inside the retention window, in the offset form.
+    let recent_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+        - 3600 * 1_000_000;
+    let rfc3339 = chrono::DateTime::from_timestamp_micros(recent_ts)
+        .expect("in range")
+        .with_timezone(&chrono::FixedOffset::west_opt(5 * 3600).expect("offset"))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+
     let plan = LogicalPlan {
-        snapshot_ts: Some(nx(Expr::Literal(Value::String(
-            "2025-06-15T10:00:00Z".into(),
-        )))),
+        snapshot_ts: Some(nx(Expr::Literal(Value::String(rfc3339)))),
         vector_consistency: VectorConsistencyMode::default(),
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         root: LogicalOp::Project {
@@ -1980,8 +1991,7 @@ fn as_of_timestamp_string_warning() {
 
     let result = execute(&plan, &mut ctx).expect("execute");
     assert!(!result.is_empty());
-    // Should have a warning about string parsing
-    assert!(ctx.warnings.iter().any(|w| w.contains("AS OF TIMESTAMP")));
+    assert_eq!(ctx.snapshot_ts, Some(recent_ts));
 }
 
 #[test]

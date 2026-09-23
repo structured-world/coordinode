@@ -1983,6 +1983,39 @@ fn outside_retention_maps_to_out_of_range_with_horizon() {
     }
 }
 
+/// A read at a named timestamp that only a current-state index could answer
+/// is FAILED_PRECONDITION / INDEX_NOT_HISTORICAL, naming the index so a caller
+/// can switch a vector search to `exact` without parsing the message.
+#[test]
+fn index_not_historical_maps_to_failed_precondition_with_the_index() {
+    use coordinode_query::executor::runner::{ExecutionError, HistoricalIndexKind};
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(
+        ExecutionError::IndexNotHistorical {
+            kind: HistoricalIndexKind::Vector,
+            label: "Item".into(),
+            property: "emb".into(),
+            at: 42,
+        },
+    ));
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert!(
+        status.message().contains("vector_consistency('exact')"),
+        "the message names the alternative: {}",
+        status.message()
+    );
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "INDEX_NOT_HISTORICAL");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("index_kind"), Some("vector"));
+    assert_eq!(meta("label"), Some("Item"));
+    assert_eq!(meta("property"), Some("emb"));
+    assert_eq!(meta("timestamp"), Some("42"));
+    assert!(details.retry_info().is_none(), "terminal: no retry advice");
+}
+
 /// SNAPSHOT read pinned at `u64::MAX` sees everything ever committed: the
 /// inclusive pin saturates at the top instead of wrapping to an empty past.
 #[tokio::test]

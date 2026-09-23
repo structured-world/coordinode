@@ -35,6 +35,7 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 
 [dev-dependencies]
 lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
+chrono = { workspace = true }
 tempfile = { workspace = true }
 coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }

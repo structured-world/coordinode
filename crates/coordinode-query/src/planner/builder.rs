@@ -1748,10 +1748,21 @@ fn extract_index_property(expr: &crate::plan::expr::Expr, variable: &str) -> Opt
 ///    annotation to resolve (label, property) by index name instead of scanning
 ///    `rows[0].__label__`. Falls back to row detection when annotation is absent
 ///    or the index was dropped between planning and execution.
+///
+/// An `exact` plan is returned unchanged: it evaluates every vector, so there
+/// is no index strategy to show or to feed a pushdown predicate to.
 pub fn annotate_vector_top_k(
     op: LogicalOp,
     registry: &crate::index::VectorIndexRegistry,
+    vector_consistency: VectorConsistencyMode,
 ) -> LogicalOp {
+    if vector_consistency == VectorConsistencyMode::Exact {
+        return op;
+    }
+    annotate_top_k_index(op, registry)
+}
+
+fn annotate_top_k_index(op: LogicalOp, registry: &crate::index::VectorIndexRegistry) -> LogicalOp {
     match op {
         LogicalOp::VectorTopK {
             input,
@@ -1813,7 +1824,7 @@ pub fn annotate_vector_top_k(
             });
 
             // Recurse into input.
-            let input = Box::new(annotate_vector_top_k(*input, registry));
+            let input = Box::new(annotate_top_k_index(*input, registry));
 
             LogicalOp::VectorTopK {
                 input,
@@ -1829,7 +1840,7 @@ pub fn annotate_vector_top_k(
 
         // Recurse into all other operators with children.
         LogicalOp::Filter { input, predicate } => LogicalOp::Filter {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             predicate,
         },
         LogicalOp::Project {
@@ -1837,20 +1848,20 @@ pub fn annotate_vector_top_k(
             items,
             distinct,
         } => LogicalOp::Project {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             items,
             distinct,
         },
         LogicalOp::Sort { input, items } => LogicalOp::Sort {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             items,
         },
         LogicalOp::Limit { input, count } => LogicalOp::Limit {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             count,
         },
         LogicalOp::Skip { input, count } => LogicalOp::Skip {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             count,
         },
         LogicalOp::Aggregate {
@@ -1858,17 +1869,17 @@ pub fn annotate_vector_top_k(
             group_by,
             aggregates,
         } => LogicalOp::Aggregate {
-            input: Box::new(annotate_vector_top_k(*input, registry)),
+            input: Box::new(annotate_top_k_index(*input, registry)),
             group_by,
             aggregates,
         },
         LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
-            left: Box::new(annotate_vector_top_k(*left, registry)),
-            right: Box::new(annotate_vector_top_k(*right, registry)),
+            left: Box::new(annotate_top_k_index(*left, registry)),
+            right: Box::new(annotate_top_k_index(*right, registry)),
         },
         LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
-            left: Box::new(annotate_vector_top_k(*left, registry)),
-            right: Box::new(annotate_vector_top_k(*right, registry)),
+            left: Box::new(annotate_top_k_index(*left, registry)),
+            right: Box::new(annotate_top_k_index(*right, registry)),
         },
         // Leaf nodes, DDL, Traverse, EdgeVectorSearch, and other complex operators.
         // VectorTopK always sits above the NodeScan/Traverse level, so these never
@@ -1890,10 +1901,21 @@ pub fn annotate_vector_top_k(
 /// label/property extraction logic stay in one place conceptually; this
 /// pass re-derives them because the annotation only carries a display
 /// string.
+///
+/// An `exact` plan is returned unchanged: it asked for every vector to be
+/// evaluated, and the index is exactly what it declined.
 pub fn apply_hnsw_scan_access_path(
     op: LogicalOp,
     registry: &crate::index::VectorIndexRegistry,
+    vector_consistency: VectorConsistencyMode,
 ) -> LogicalOp {
+    if vector_consistency == VectorConsistencyMode::Exact {
+        return op;
+    }
+    promote_hnsw_scan(op, registry)
+}
+
+fn promote_hnsw_scan(op: LogicalOp, registry: &crate::index::VectorIndexRegistry) -> LogicalOp {
     match op {
         LogicalOp::VectorTopK {
             input,
@@ -1918,7 +1940,7 @@ pub fn apply_hnsw_scan_access_path(
                     index_name,
                 },
                 None => LogicalOp::VectorTopK {
-                    input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+                    input: Box::new(promote_hnsw_scan(*input, registry)),
                     vector_expr,
                     query_vector,
                     function,
@@ -1934,24 +1956,24 @@ pub fn apply_hnsw_scan_access_path(
             items,
             distinct,
         } => LogicalOp::Project {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             items,
             distinct,
         },
         LogicalOp::Filter { input, predicate } => LogicalOp::Filter {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             predicate,
         },
         LogicalOp::Sort { input, items } => LogicalOp::Sort {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             items,
         },
         LogicalOp::Limit { input, count } => LogicalOp::Limit {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             count,
         },
         LogicalOp::Skip { input, count } => LogicalOp::Skip {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             count,
         },
         LogicalOp::Aggregate {
@@ -1959,7 +1981,7 @@ pub fn apply_hnsw_scan_access_path(
             group_by,
             aggregates,
         } => LogicalOp::Aggregate {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             group_by,
             aggregates,
         },
@@ -1968,17 +1990,17 @@ pub fn apply_hnsw_scan_access_path(
             expr,
             variable,
         } => LogicalOp::Unwind {
-            input: Box::new(apply_hnsw_scan_access_path(*input, registry)),
+            input: Box::new(promote_hnsw_scan(*input, registry)),
             expr,
             variable,
         },
         LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
-            left: Box::new(apply_hnsw_scan_access_path(*left, registry)),
-            right: Box::new(apply_hnsw_scan_access_path(*right, registry)),
+            left: Box::new(promote_hnsw_scan(*left, registry)),
+            right: Box::new(promote_hnsw_scan(*right, registry)),
         },
         LogicalOp::LeftOuterJoin { left, right } => LogicalOp::LeftOuterJoin {
-            left: Box::new(apply_hnsw_scan_access_path(*left, registry)),
-            right: Box::new(apply_hnsw_scan_access_path(*right, registry)),
+            left: Box::new(promote_hnsw_scan(*left, registry)),
+            right: Box::new(promote_hnsw_scan(*right, registry)),
         },
         // VectorTopK never hides below other operator kinds in a valid
         // plan; leaves / DDL / writes are returned unchanged.

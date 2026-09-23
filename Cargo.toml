@@ -107,6 +107,9 @@ aes-gcm = "0.11"
 hmac = "0.13"
 rand = "0.10"
 
+# RFC 3339 timestamps (`AS OF TIMESTAMP '...'`).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # Parallelism
 rayon = "1.10"
 crossbeam-epoch = "0.9"

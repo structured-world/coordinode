@@ -161,7 +161,7 @@ The practical consequence is about cost, not correctness: a threshold filter sco
 Override the consistency mode for a single query:
 
 ```cypher
-/*+ vector_consistency('eventual') */
+/*+ vector_consistency('exact') */
 MATCH (p:Product)
 RETURN p.name, vector_distance(p.embedding, $query_vector) AS dist
 ORDER BY dist LIMIT 10
@@ -169,8 +169,11 @@ ORDER BY dist LIMIT 10
 
 | Mode | Description |
 |------|-------------|
-| `snapshot` | Consistent snapshot read (default). Reflects all committed writes |
-| `eventual` | May read slightly stale index. Lower latency on hot workloads |
+| `current` | Reads the index's latest state. Fastest; the default for a query that touches vectors only |
+| `snapshot` | Reads the index and drops candidates not visible at the query's snapshot. The default for a query that also touches graph or text |
+| `exact` | Evaluates every vector of the label at the query's snapshot, without the index. 100% recall; cost grows with the label. The only vector mode a time-travel read accepts on an indexed label |
+
+Without a hint, the mode follows `read_consistency`; a session `SET vector_consistency = '...'` replaces that, and the hint wins over both. See the consistency hints in the [Cypher reference](./reference).
 
 ### Graph + Vector Combination ✅
 
@@ -331,13 +334,28 @@ MATCH (u:User {id: 42})
 RETURN u.name, u.email
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
--- ISO 8601 format, UTC
+-- RFC 3339, zone offset required: '2026-03-15T10:00:00Z', '2026-03-15T13:00:00+03:00'
 -- Microsecond precision: '2026-03-15T10:00:00.123456Z'
+-- Or the raw HLC value (microseconds since the Unix epoch) as an integer
 ```
 
-The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp.
+The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp. A string that is not an RFC 3339 timestamp (a bare date, a missing zone offset) is refused rather than read as the current state.
 
 **Retention:** 7 days by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
+
+**Vector and full-text search at a timestamp.** A vector or full-text index holds the current state only: it no longer contains what was deleted since the timestamp, and it matches and ranks by today's values. A time-travel query that such an index would answer is therefore refused with `FAILED_PRECONDITION` (reason `INDEX_NOT_HISTORICAL`, metadata `index_kind`, `label`, `property`, `timestamp`); the embedded API returns `ExecutionError::IndexNotHistorical`. The same applies to `ReadConcern.at_timestamp`.
+
+- **Vector search** has an exact alternative that reads the snapshot itself and needs no index: ask for it with `/*+ vector_consistency('exact') */` (or `SET vector_consistency = 'exact'` for the session). It evaluates every vector of the label at that timestamp, so its cost grows with the label.
+- **Full-text search** has no exact alternative; read without the timestamp, or without text search.
+- A vector top-k over a label **without** a vector index is always evaluated exactly and is answered at any timestamp in the retention window.
+
+```cypher
+MATCH (d:Doc)
+WITH d, vector_distance(d.embedding, $q) AS dist
+ORDER BY dist LIMIT 10
+RETURN d.title /*+ vector_consistency('exact') */
+AS OF TIMESTAMP '2026-03-15T10:00:00Z'
+```
 
 ---
 

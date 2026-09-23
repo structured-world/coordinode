@@ -44,6 +44,36 @@ const DEFAULT_MAX_HOPS: u64 = 10;
 /// Key-value pair returned by MVCC prefix scan: (user_key, value).
 type KvPair = (Vec<u8>, Vec<u8>);
 
+/// The kind of index a refused read at a named timestamp would have used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoricalIndexKind {
+    /// An HNSW vector index.
+    Vector,
+    /// A full-text index.
+    FullText,
+}
+
+impl HistoricalIndexKind {
+    /// What the caller can do instead.
+    const fn remedy(self) -> &'static str {
+        match self {
+            Self::Vector => {
+                "evaluate it exactly at that timestamp with /*+ vector_consistency('exact') */"
+            }
+            Self::FullText => "full-text search reads the current state only",
+        }
+    }
+}
+
+impl std::fmt::Display for HistoricalIndexKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Vector => "vector",
+            Self::FullText => "full-text",
+        })
+    }
+}
+
 /// Execution error.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -133,6 +163,28 @@ pub enum ExecutionError {
         requested: i64,
         /// The oldest timestamp still readable when the query ran.
         oldest_readable: u64,
+    },
+
+    /// A read at a caller-named timestamp (`AS OF TIMESTAMP`,
+    /// `ReadConcern.at_timestamp`) would be answered by an index that holds
+    /// only the current state. Such an index cannot say what matched at that
+    /// timestamp: it no longer holds what was deleted since, and it matches
+    /// and ranks by today's values. The read is refused rather than answered
+    /// from today's contents.
+    #[error(
+        "{kind} index on :{label}({property}) holds only the current state and cannot \
+         answer a read at timestamp {at}; {}",
+        kind.remedy()
+    )]
+    IndexNotHistorical {
+        /// Which kind of index would have answered.
+        kind: HistoricalIndexKind,
+        /// The indexed label.
+        label: String,
+        /// The indexed property.
+        property: String,
+        /// The timestamp the read named.
+        at: i64,
     },
 
     /// Schema mode violation: STRICT label rejected an undeclared property, or
@@ -2139,13 +2191,19 @@ pub fn execute_no_commit(
         let ts_val = eval_neutral(ts_expr, &Row::new())?;
         let resolved_ts: Option<i64> = match ts_val {
             Value::Timestamp(ts) => Some(ts),
-            Value::String(ref s) => {
-                ctx.warnings.push(format!(
-                    "AS OF TIMESTAMP '{s}': string timestamps parsed as current \
-                     (full datetime parsing pending)"
-                ));
-                None
-            }
+            // The HLC value is wall-clock microseconds since the Unix epoch,
+            // so an RFC 3339 instant (RFC 3339 §5.6, zone offset required)
+            // names the same point on it.
+            Value::String(ref s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| {
+                        ExecutionError::Unsupported(format!(
+                            "AS OF TIMESTAMP '{s}' is not an RFC 3339 timestamp \
+                             (for example 2026-03-15T10:00:00Z): {e}"
+                        ))
+                    })?
+                    .timestamp_micros(),
+            ),
             Value::Int(ts) => Some(ts),
             _ => {
                 return Err(ExecutionError::Unsupported(
@@ -3594,6 +3652,27 @@ fn execute_btree_index_scan(
     Ok(results)
 }
 
+/// Refuse a read at a caller-named timestamp that an index holding only the
+/// current state would answer. Every vector and full-text index holds the
+/// current state only: it matches and ranks by today's values, and what was
+/// written after the named timestamp shapes its answer.
+fn refuse_current_only_index(
+    ctx: &ExecutionContext<'_>,
+    kind: HistoricalIndexKind,
+    label: &str,
+    property: &str,
+) -> Result<(), ExecutionError> {
+    match ctx.snapshot_ts {
+        Some(at) => Err(ExecutionError::IndexNotHistorical {
+            kind,
+            label: label.to_string(),
+            property: property.to_string(),
+            at,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Execute the `HnswScan` index access path: ask the HNSW index for the
 /// top-k candidates, then point-fetch ONLY those k node records into
 /// rows. O(k) storage reads — the whole point of the access path versus
@@ -3626,6 +3705,7 @@ fn execute_hnsw_scan(
             "HnswScan({index_name}) requires vector_index_registry in ExecutionContext"
         )));
     };
+    refuse_current_only_index(ctx, HistoricalIndexKind::Vector, label, property)?;
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
     gate_vector_index_read(ctx.engine, registry, label, property)?;
@@ -3637,23 +3717,41 @@ fn execute_hnsw_scan(
         )));
     };
 
-    let Some(hits) = registry.search(label, property, &qv, k) else {
-        // Index disappeared between planning and execution (concurrent
-        // DROP). Empty result keeps the read path total; the planner
-        // will not pick HnswScan on the next statement.
-        return Ok(Vec::new());
-    };
-
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
-    let mut results = Vec::with_capacity(hits.len());
 
-    // Hydrate the k-NN hit set in one batched multi_get; the input order is
-    // preserved, so the rows stay in similarity order.
-    let ids: Vec<NodeId> = hits.iter().map(|h| NodeId::from_raw(h.id)).collect();
-    let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+    // A deleted node stays in the graph until a rebuild, so some hits do not
+    // hydrate. Ask for more until k of them do or the index runs out, instead
+    // of answering LIMIT k with fewer rows than exist.
+    let mut want = k;
+    let (hits, records) = loop {
+        let Some(hits) = registry.search(label, property, &qv, want) else {
+            // Index disappeared between planning and execution (concurrent
+            // DROP). Empty result keeps the read path total; the planner
+            // will not pick HnswScan on the next statement.
+            return Ok(Vec::new());
+        };
+        // Hydrate the hit set in one batched multi_get; the input order is
+        // preserved, so the rows stay in similarity order.
+        let ids: Vec<NodeId> = hits.iter().map(|h| NodeId::from_raw(h.id)).collect();
+        let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+        let visible = records
+            .iter()
+            .filter(|r| r.as_ref().is_some_and(|r| r.has_label(label)))
+            .count();
+        if visible >= k || hits.len() < want {
+            break (hits, records);
+        }
+        want = want.checked_mul(2).ok_or_else(|| {
+            ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
+        })?;
+    };
+    let mut results = Vec::with_capacity(k);
 
     for (hit, record_opt) in hits.into_iter().zip(records) {
+        if results.len() == k {
+            break;
+        }
         let Some(record) = record_opt else {
             // Node deleted after the index entry was written — skip.
             continue;
@@ -4830,10 +4928,8 @@ fn try_hnsw_vector_top_k(
         return Ok(Some(Vec::new()));
     }
 
-    // Small input: brute force is cheaper than HNSW + intersection overhead.
-    // This covers the typical hybrid_search case where traversal narrows the
-    // candidate set to a handful of nodes per query.
-    if rows.len() < VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD {
+    // `exact` asks for every vector to be evaluated, never the index.
+    if ctx.vector_consistency == VectorConsistencyMode::Exact {
         return Ok(None);
     }
 
@@ -4885,6 +4981,17 @@ fn try_hnsw_vector_top_k(
         }
         (l, property.to_string())
     };
+
+    // Refused before the size threshold below, so whether a read at a named
+    // timestamp is answered does not depend on how many rows it sees.
+    refuse_current_only_index(ctx, HistoricalIndexKind::Vector, &label_str, &property_str)?;
+
+    // Small input: brute force is cheaper than HNSW + intersection overhead.
+    // This covers the typical hybrid_search case where traversal narrows the
+    // candidate set to a handful of nodes per query.
+    if rows.len() < VECTOR_TOP_K_BRUTE_FORCE_THRESHOLD {
+        return Ok(None);
+    }
 
     // Evaluate the query vector (constant across all rows).
     let query_val = eval_neutral(query_vector_expr, &rows[0])?;
@@ -5607,6 +5714,7 @@ fn score_text_method(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Option<usize>>, ExecutionError> {
     let _ = method_expr; // kept for symmetry + future column inspection
+    refuse_current_only_index(ctx, HistoricalIndexKind::FullText, label, property)?;
     let registry = ctx.text_index_registry.ok_or_else(|| {
         ExecutionError::Unsupported(
             "rrf_score(): text method requires a TextIndexRegistry; \
@@ -5747,6 +5855,7 @@ fn raw_scores_text_method(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Option<f64>>, ExecutionError> {
     let _ = method_expr;
+    refuse_current_only_index(ctx, HistoricalIndexKind::FullText, label, property)?;
     let registry = ctx.text_index_registry.ok_or_else(|| {
         ExecutionError::Unsupported(
             "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
@@ -6239,6 +6348,12 @@ fn execute_text_filter(
         _ => None,
     };
     let label = label_owned.as_deref();
+    refuse_current_only_index(
+        ctx,
+        HistoricalIndexKind::FullText,
+        label.unwrap_or("?"),
+        property.unwrap_or("?"),
+    )?;
 
     let search_results = if let Some(registry) = ctx.text_index_registry {
         if let (Some(l), Some(p)) = (label, property) {

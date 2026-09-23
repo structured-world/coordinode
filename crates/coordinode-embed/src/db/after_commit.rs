@@ -346,7 +346,8 @@ impl Database {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
-            vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
+            // A trigger body follows its own query's consistency, not a session.
+            vector_consistency: None,
             after_commit_generation: generation,
         };
         let params = if params.is_empty() {

@@ -371,6 +371,27 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 [("oldest_readable_ts", oldest_readable.to_string())],
             );
         }
+        // A read at a named timestamp that only a current-state index could
+        // answer. FAILED_PRECONDITION: the request is well formed, but the
+        // index it would need does not hold that timestamp.
+        DatabaseError::Execution(ExecutionError::IndexNotHistorical {
+            kind,
+            label,
+            property,
+            at,
+        }) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::IndexNotHistorical,
+                [
+                    ("index_kind", kind.to_string()),
+                    ("label", label.clone()),
+                    ("property", property.clone()),
+                    ("timestamp", at.to_string()),
+                ],
+            );
+        }
         // The engine's own guard on a snapshot read below the watermark:
         // the same condition reached through a storage-level read.
         DatabaseError::Storage(StorageError::SnapshotOutsideRetention { watermark, .. })

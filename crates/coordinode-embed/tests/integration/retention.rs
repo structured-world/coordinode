@@ -92,6 +92,59 @@ fn as_of_inside_the_window_is_exact_across_compaction() {
     );
 }
 
+/// `AS OF TIMESTAMP` takes an RFC 3339 string as well as the raw HLC value:
+/// the HLC value is wall-clock microseconds, so the string names the same
+/// instant and sees exactly what the integer form does, not the current state.
+#[test]
+fn as_of_accepts_an_rfc3339_timestamp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_db(dir.path());
+    let first = commit_anchor(&mut db, 1);
+    advance_clock(&db, Duration::from_secs(60));
+    commit_anchor(&mut db, 2);
+
+    let rfc3339 = |ts: u64| {
+        chrono::DateTime::from_timestamp_micros(i64::try_from(ts).expect("fits"))
+            .expect("in range")
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    };
+    let count = |db: &mut Database, at: &str| {
+        db.execute_cypher(&format!("MATCH (n:Anchor) RETURN n AS OF TIMESTAMP '{at}'"))
+            .map(|rows| rows.len())
+    };
+    assert_eq!(
+        count(&mut db, &rfc3339(first)).expect("at the first commit"),
+        1
+    );
+    assert_eq!(count(&mut db, &rfc3339(first - 1)).expect("before it"), 0);
+    // A zone offset names the same instant as its UTC form.
+    let offset = chrono::DateTime::from_timestamp_micros(i64::try_from(first).expect("fits"))
+        .expect("in range")
+        .with_timezone(&chrono::FixedOffset::east_opt(3 * 3600).expect("offset"))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+    assert_eq!(count(&mut db, &offset).expect("offset form"), 1);
+}
+
+/// A string that is not an RFC 3339 timestamp is refused, never read as the
+/// current state: that would answer a different question than the one asked.
+#[test]
+fn as_of_rejects_a_string_that_is_not_a_timestamp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_db(dir.path());
+    commit_anchor(&mut db, 1);
+    for bad in ["yesterday", "2026-03-15", "2026-03-15 10:00:00"] {
+        let err = db
+            .execute_cypher(&format!(
+                "MATCH (n:Anchor) RETURN n AS OF TIMESTAMP '{bad}'"
+            ))
+            .expect_err("not an RFC 3339 timestamp");
+        assert!(
+            err.to_string().contains("RFC 3339"),
+            "the error says what is expected for {bad:?}: {err}"
+        );
+    }
+}
+
 /// Once the window has elapsed (clock driven through the oracle) and
 /// compaction ran, a read below the horizon is refused by both APIs, a
 /// read at the horizon and above is served, and committed data is intact.

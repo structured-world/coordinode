@@ -899,7 +899,7 @@ fn hnsw_scan_replaces_scan_then_rank_for_pure_top_k() {
              LIMIT 10 \
              RETURN *",
     );
-    let root = apply_hnsw_scan_access_path(root, &registry);
+    let root = apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Current);
     let scan = find_hnsw_scan(&root).expect(
         "pure vector top-K with a registered index must plan HnswScan, \
              not scan-then-rank",
@@ -942,7 +942,7 @@ fn hnsw_scan_not_planned_with_filter() {
              LIMIT 10 \
              RETURN *",
     );
-    let root = apply_hnsw_scan_access_path(root, &registry);
+    let root = apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Current);
     assert!(
         find_hnsw_scan(&root).is_none(),
         "filtered query must keep the VectorTopK path: {root:?}"
@@ -964,11 +964,31 @@ fn hnsw_scan_not_planned_without_index() {
              LIMIT 10 \
              RETURN *",
     );
-    let root = apply_hnsw_scan_access_path(root, &registry);
+    let root = apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Current);
     assert!(
         find_hnsw_scan(&root).is_none(),
         "no index registered -> no HnswScan: {root:?}"
     );
+}
+
+/// An `exact` plan keeps the scan-then-rank path even with an index: it asked
+/// for every vector to be evaluated, and HnswScan would read the index.
+#[test]
+fn hnsw_scan_not_planned_for_exact() {
+    let registry = test_registry_with_doc_index();
+    let root = plan_root(
+        "MATCH (n:Doc) \
+             WITH *, vector_distance(n.embedding, [1.0, 0.0]) AS _dist \
+             ORDER BY _dist \
+             LIMIT 10 \
+             RETURN *",
+    );
+    let root = apply_hnsw_scan_access_path(root, &registry, VectorConsistencyMode::Exact);
+    assert!(
+        find_hnsw_scan(&root).is_none(),
+        "exact must not plan HnswScan: {root:?}"
+    );
+    assert!(find_vector_top_k(&root).is_some(), "{root:?}");
 }
 
 /// Pattern A with RETURN * preserves all columns → optimized.
