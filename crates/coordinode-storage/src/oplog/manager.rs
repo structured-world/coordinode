@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, ShardId};
-use crate::oplog::segment::{SegmentReader, SegmentWriter};
+use crate::oplog::segment::{SegmentReader, SegmentWriter, TailRecovery};
 
 // ── Filename helpers ──────────────────────────────────────────────────────────
 
@@ -132,6 +132,31 @@ impl OplogManager {
                  config-driven oplog endpoint re-route)",
                 window[0].0, window[0].1, window[1].1,
             )));
+        }
+
+        // Only the newest segment can have been open for writing when the
+        // process died: every earlier one was sealed at rotation. Seal it now,
+        // so everything below treats the list as what it claims to be.
+        if let Some((_, tail)) = paths.last() {
+            match SegmentWriter::recover_tail(tail, shard_id)? {
+                TailRecovery::Sealed => {}
+                TailRecovery::Resealed {
+                    entries,
+                    discarded_bytes,
+                } => tracing::warn!(
+                    segment = %tail.display(),
+                    entries,
+                    discarded_bytes,
+                    "oplog: sealed a segment left open by an unclean shutdown"
+                ),
+                TailRecovery::Removed => {
+                    tracing::warn!(
+                        segment = %tail.display(),
+                        "oplog: removed a segment that an unclean shutdown left without entries"
+                    );
+                    paths.pop();
+                }
+            }
         }
 
         Ok(Self {

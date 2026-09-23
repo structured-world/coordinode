@@ -177,6 +177,8 @@ Neither axis is ever silently changed to satisfy the other. `acks: 0` is answere
 
 The default is `w: MAJORITY, journal: JOURNAL`, in the embedded library and over every protocol alike: an acknowledged write survives the loss of a minority. Choose a weaker concern explicitly, per request, for writes you can afford to lose.
 
+**After a crash.** A process that is killed (`kill -9`, power loss, a panic that aborts) leaves the journal segment it was writing without the footer a clean shutdown adds. The next start recovers it on its own: every entry that was fsynced, and therefore acknowledged, is kept; a write that was cut off mid-way was never acknowledged and is dropped; the segment is then sealed and the database opens. The log records it at `WARN` as `oplog: sealed a segment left open by an unclean shutdown`, with the number of entries kept and bytes dropped. Nothing needs to be deleted by hand. A damaged entry inside a segment that *was* sealed is different: that is corruption, not an interrupted write, and it is reported rather than cut away.
+
 Replication factor (`RF`) is a deployment-time choice, independent of the write concern. The relationship between the two:
 
 - **`RF` is the total number of replicas** holding a copy of each shard's log.

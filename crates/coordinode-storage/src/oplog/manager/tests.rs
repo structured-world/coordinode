@@ -447,20 +447,25 @@ fn open_multi_recovers_segments_from_recovery_dirs() {
     let active = tmp.path().join("active");
     let recovery = tmp.path().join("recovery");
 
-    // Pre-populate recovery dir with two sealed segments (manually
-    // create empty files matching the segment_path naming convention
-    // — open_multi only enumerates filenames, doesn't validate
-    // contents for the path-merge logic).
-    std::fs::create_dir_all(&recovery).expect("create recovery");
-    let seg_a = segment_path(&recovery, 0);
-    let seg_b = segment_path(&recovery, 100);
-    std::fs::write(&seg_a, b"").expect("write seg a");
-    std::fs::write(&seg_b, b"").expect("write seg b");
+    // Real sealed segments: open_multi seals or discards a newest segment
+    // that an unclean shutdown left open, so placeholders would not survive.
+    let sealed_segment = |dir: &Path, first_index: u64| {
+        let mut writer = SegmentWriter::create(&segment_path(dir, first_index), 0, first_index)
+            .expect("create segment");
+        writer
+            .append(&make_entry(first_index, 1000 + first_index))
+            .expect("append");
+        writer.seal().expect("seal");
+    };
 
-    // Write one segment in active dir at first_index = 200.
+    // Two sealed segments in the recovery dir...
+    std::fs::create_dir_all(&recovery).expect("create recovery");
+    sealed_segment(&recovery, 0);
+    sealed_segment(&recovery, 100);
+
+    // ...and one in the active dir at first_index = 200.
     std::fs::create_dir_all(&active).expect("create active");
-    let seg_c = segment_path(&active, 200);
-    std::fs::write(&seg_c, b"").expect("write seg c");
+    sealed_segment(&active, 200);
 
     let mgr = OplogManager::open_multi(
         &active,
@@ -586,4 +591,156 @@ fn append_refuses_to_replace_a_segment_holding_entries() {
             "unexpected error: {e}"
         ),
     }
+}
+
+/// Append and fsync `indexes` through a manager, then lose it the way a
+/// killed process does: no `Drop`, so the active segment is never sealed.
+fn crash_after_appending(dir: &Path, indexes: std::ops::Range<u64>) {
+    let mut mgr = test_manager(dir);
+    for i in indexes {
+        mgr.append(&make_entry(i, 1000 + i)).expect("append");
+    }
+    mgr.flush().expect("flush");
+    std::mem::forget(mgr);
+}
+
+fn indexes_of(entries: &[OplogEntry]) -> Vec<u64> {
+    entries.iter().map(|e| e.index).collect()
+}
+
+/// A process killed after its write was fsynced leaves the active segment
+/// without a footer. Reopening must recover those entries: they were
+/// acknowledged as durable. Treating the file as sealed made every read fail
+/// on the missing footer and the store could not be opened at all.
+#[test]
+fn reopen_after_crash_recovers_the_unsealed_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    crash_after_appending(dir.path(), 0..3);
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read after crash");
+    assert_eq!(indexes_of(&entries), vec![0, 1, 2]);
+    mgr.verify_all()
+        .expect("every segment verifies after recovery");
+}
+
+/// The recovered tail is sealed, so writes after the restart go to a new
+/// segment and everything reads back in order, across restarts.
+#[test]
+fn appends_after_crash_recovery_continue_the_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    crash_after_appending(dir.path(), 0..3);
+
+    {
+        let mut mgr = test_manager(dir.path());
+        for i in 3..5 {
+            mgr.append(&make_entry(i, 1000 + i))
+                .expect("append after recovery");
+        }
+        mgr.flush().expect("flush");
+    }
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read");
+    assert_eq!(indexes_of(&entries), vec![0, 1, 2, 3, 4]);
+}
+
+/// A crash in the middle of writing an entry leaves a torn frame after the
+/// last complete one. That frame was never acknowledged; it is cut off and
+/// the entries before it are kept.
+#[test]
+fn reopen_after_crash_drops_a_torn_final_frame() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    crash_after_appending(dir.path(), 0..2);
+    let path = segment_path(dir.path(), 0);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open tail");
+    // A length prefix promising 50 bytes, followed by only 3 of them.
+    std::io::Write::write_all(&mut file, &[50, 1, 2, 3]).expect("write torn frame");
+    drop(file);
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read after torn write");
+    assert_eq!(indexes_of(&entries), vec![0, 1]);
+    mgr.verify_all().expect("the recovered segment verifies");
+}
+
+/// A crash between creating a segment and writing its first entry leaves a
+/// header and nothing else. There is nothing to recover, so the file goes,
+/// and the log starts fresh without an error.
+#[test]
+fn reopen_after_crash_discards_an_entryless_tail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = segment_path(dir.path(), 5);
+    let mut writer = SegmentWriter::create(&path, 0, 5).expect("create");
+    writer.flush_and_sync().expect("flush header");
+    drop(writer);
+
+    let mut mgr = test_manager(dir.path());
+    assert!(!mgr.has_segments(), "an entry-less tail holds nothing");
+    assert!(mgr.read_range(0, u64::MAX).expect("read").is_empty());
+    mgr.append(&make_entry(5, 1005))
+        .expect("append at the same index");
+    mgr.flush().expect("flush");
+}
+
+/// A crash while the footer itself was being written leaves part of it on
+/// disk. The partial footer is not a frame, so it is cut away with the rest
+/// of the torn tail and the segment is sealed again.
+#[test]
+fn reopen_after_crash_mid_seal_recovers_the_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    crash_after_appending(dir.path(), 0..4);
+    let path = segment_path(dir.path(), 0);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open tail");
+    // The first 20 of the 32 footer bytes.
+    std::io::Write::write_all(
+        &mut file,
+        &[4, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7],
+    )
+    .expect("write partial footer");
+    drop(file);
+
+    let mut mgr = test_manager(dir.path());
+    let entries = mgr.read_range(0, u64::MAX).expect("read after torn seal");
+    assert_eq!(indexes_of(&entries), vec![0, 1, 2, 3]);
+}
+
+/// Recovery is for the tail a crash can leave, and only for it. A segment
+/// that was sealed (valid footer) and later lost an entry to corruption is
+/// damage, not an interrupted write: it stays an error rather than being
+/// truncated, which would silently drop every entry after the bad one.
+#[test]
+fn corruption_inside_a_sealed_segment_is_not_truncated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut mgr = test_manager(dir.path());
+        for i in 0..3u64 {
+            mgr.append(&make_entry(i, 1000 + i)).expect("append");
+        }
+        mgr.rotate().expect("seal");
+    }
+    let path = segment_path(dir.path(), 0);
+    let mut bytes = std::fs::read(&path).expect("read segment");
+    // Flip a byte inside the first entry's payload.
+    let target = usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small") + 3;
+    bytes[target] ^= 0xFF;
+    std::fs::write(&path, &bytes).expect("write corrupted segment");
+    let len_before = bytes.len();
+
+    let mut mgr = test_manager(dir.path());
+    assert!(
+        mgr.read_range(0, u64::MAX).is_err(),
+        "a corrupt sealed segment must be reported"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read").len(),
+        len_before,
+        "a sealed segment is never truncated"
+    );
 }

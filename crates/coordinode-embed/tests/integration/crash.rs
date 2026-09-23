@@ -10,6 +10,62 @@ use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, Stor
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 
+// ── Process kill ────────────────────────────────────────────────────
+
+/// Set by the parent test; the child test does nothing without it.
+const CRASH_CHILD_DIR: &str = "COORDINODE_CRASH_CHILD_DIR";
+
+/// Child half of `acknowledged_write_survives_process_kill`: one acknowledged
+/// write, then the process dies without running a single destructor, as it
+/// does under SIGKILL. Run on its own it has no directory and returns.
+#[test]
+fn crash_child_writes_then_aborts() {
+    let Some(dir) = std::env::var_os(CRASH_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE (:Survivor {k: 1})")
+        .expect("write in child");
+    std::process::abort();
+}
+
+/// A write acknowledged before the process was killed survives it, and the
+/// database opens. A kill leaves the journal's active segment without the
+/// footer a clean close writes; reopening treated it as sealed and failed on
+/// the missing footer every time, so the installation could not be opened
+/// until someone deleted the journal and with it the acknowledged write.
+#[test]
+fn acknowledged_write_survives_process_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::crash::crash_child_writes_then_aborts",
+            "--nocapture",
+        ])
+        .env(CRASH_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    // The child must have reached its abort, not failed before the write.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after its write, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let mut db = Database::open(dir.path()).expect("reopen after the kill");
+    let rows = db
+        .execute_cypher("MATCH (n:Survivor) RETURN n.k AS k")
+        .expect("read after the kill");
+    assert_eq!(rows.len(), 1, "the acknowledged write was lost");
+}
+
 // ── Close/Reopen persistence ────────────────────────────────────────
 
 #[test]

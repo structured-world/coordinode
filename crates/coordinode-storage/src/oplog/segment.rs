@@ -190,6 +190,93 @@ fn read_footer<R: Read>(r: &mut R) -> StorageResult<SegmentFooter> {
     })
 }
 
+/// `true` when the last `FOOTER_SIZE` bytes of `data` are a footer whose
+/// checksum holds, i.e. the segment was sealed.
+fn has_valid_footer(data: &[u8]) -> bool {
+    let Some(start) = data.len().checked_sub(FOOTER_SIZE as usize) else {
+        return false;
+    };
+    start >= HEADER_SIZE as usize && read_footer(&mut Cursor::new(&data[start..])).is_ok()
+}
+
+/// The complete entries at the start of an entries section, and where they end.
+///
+/// Parsing stops at the first frame that is incomplete, fails its checksum or
+/// does not decode: after a crash that is the write that never finished, and
+/// nothing after it was acknowledged.
+struct FramePrefix {
+    entries: Vec<OplogEntry>,
+    /// Offset in the file just past the last complete frame.
+    end: u64,
+    first_ts: u64,
+    last_ts: u64,
+}
+
+fn read_frame_prefix(data: &[u8]) -> FramePrefix {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(HEADER_SIZE);
+    let mut prefix = FramePrefix {
+        entries: Vec::new(),
+        end: HEADER_SIZE,
+        first_ts: 0,
+        last_ts: 0,
+    };
+    let total_len = data.len() as u64;
+    while let Ok(payload_len) = decode_varint(&mut cursor) {
+        let payload_start = cursor.position();
+        // `payload_len + 4` cannot overflow a u64 built from a 10-byte varint
+        // in practice, but a hostile length must not wrap either.
+        let Some(frame_end) = payload_len
+            .checked_add(4)
+            .and_then(|n| payload_start.checked_add(n))
+        else {
+            break;
+        };
+        if frame_end > total_len {
+            break;
+        }
+        let payload = &data[payload_start as usize..(payload_start + payload_len) as usize];
+        let crc_at = (payload_start + payload_len) as usize;
+        let crc = u32::from_le_bytes([
+            data[crc_at],
+            data[crc_at + 1],
+            data[crc_at + 2],
+            data[crc_at + 3],
+        ]);
+        if crc32fast::hash(payload) != crc {
+            break;
+        }
+        let Ok(entry) = OplogEntry::decode(payload) else {
+            break;
+        };
+        if prefix.entries.is_empty() {
+            prefix.first_ts = entry.ts;
+        }
+        prefix.last_ts = entry.ts;
+        prefix.entries.push(entry);
+        prefix.end = frame_end;
+        cursor.set_position(frame_end);
+    }
+    prefix
+}
+
+/// What [`SegmentWriter::recover_tail`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailRecovery {
+    /// The segment already carries a valid footer; nothing was changed.
+    Sealed,
+    /// The segment had no valid footer. Its complete entries were kept, any
+    /// torn bytes after them cut off, and a footer written.
+    Resealed {
+        /// Entries recovered into the sealed segment.
+        entries: u32,
+        /// Bytes after the last complete entry that were cut off.
+        discarded_bytes: u64,
+    },
+    /// The segment held no complete entry and was removed.
+    Removed,
+}
+
 // ── SegmentWriter ─────────────────────────────────────────────────────────────
 
 /// Writes entries to a new segment file.
@@ -270,6 +357,92 @@ impl SegmentWriter {
         std::fs::remove_file(path)
             .map_err(|e| StorageError::Io(format!("remove empty segment {:?}: {e}", path)))?;
         Self::create(path, shard_id, first_index)
+    }
+
+    /// Seal the segment at `path` if a crash left it unsealed.
+    ///
+    /// Entries are made durable one `fsync` at a time, and the footer is only
+    /// written when a segment rotates, so a killed process leaves its active
+    /// segment with acknowledged entries and no footer, possibly followed by a
+    /// frame (or part of a footer) that was being written. This keeps every
+    /// complete entry, cuts off what follows the last one, and writes the
+    /// footer, so the segment reads like any other. A segment with no complete
+    /// entry never held anything acknowledged and is removed.
+    ///
+    /// Only a missing or invalid footer counts as a crash. A segment with a
+    /// valid footer is left untouched even if an entry inside it is damaged:
+    /// that is corruption, and cutting there would drop the entries after it.
+    /// Safe to repeat: a crash during recovery leaves a state it recovers
+    /// from again.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures, and a header that is not an oplog segment of `shard_id`
+    /// in the supported format (not a crash leftover; refused rather than
+    /// rewritten).
+    pub fn recover_tail(path: &Path, shard_id: u32) -> StorageResult<TailRecovery> {
+        let data = std::fs::read(path)
+            .map_err(|e| StorageError::Io(format!("read segment {:?}: {e}", path)))?;
+        if has_valid_footer(&data) {
+            return Ok(TailRecovery::Sealed);
+        }
+        let remove = || {
+            std::fs::remove_file(path)
+                .map_err(|e| StorageError::Io(format!("remove empty segment {:?}: {e}", path)))
+                .map(|()| TailRecovery::Removed)
+        };
+        if (data.len() as u64) < HEADER_SIZE {
+            // The header itself never reached the disk.
+            return remove();
+        }
+
+        let header = read_header(&mut Cursor::new(&data))?;
+        if header.version != FORMAT_VERSION {
+            return Err(StorageError::Io(format!(
+                "unsupported oplog version {} in {:?}",
+                header.version, path
+            )));
+        }
+        if header.shard_id != shard_id {
+            return Err(StorageError::Io(format!(
+                "segment {:?} belongs to shard {}, not {shard_id}",
+                path, header.shard_id
+            )));
+        }
+
+        let prefix = read_frame_prefix(&data);
+        if prefix.entries.is_empty() {
+            return remove();
+        }
+        let entries = u32::try_from(prefix.entries.len()).map_err(|_| {
+            StorageError::Io(format!(
+                "segment {:?} holds more entries than a footer counts",
+                path
+            ))
+        })?;
+        let footer = SegmentFooter {
+            entry_count: entries,
+            first_ts: prefix.first_ts,
+            last_ts: prefix.last_ts,
+            total_bytes: prefix.end - HEADER_SIZE,
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| StorageError::Io(format!("open segment {:?}: {e}", path)))?;
+        file.set_len(prefix.end)
+            .map_err(|e| StorageError::Io(format!("truncate segment {:?}: {e}", path)))?;
+        file.seek(SeekFrom::Start(prefix.end)).map_err(io_err)?;
+        write_footer(&mut file, &footer)
+            .map_err(|e| StorageError::Io(format!("write footer {:?}: {e}", path)))?;
+        file.sync_data()
+            .map_err(|e| StorageError::Io(format!("sync_data on recovery {:?}: {e}", path)))?;
+
+        Ok(TailRecovery::Resealed {
+            entries,
+            discarded_bytes: data.len() as u64 - prefix.end,
+        })
     }
 
     /// Append one [`OplogEntry`] to the segment.
@@ -495,8 +668,7 @@ impl SegmentReader {
             )));
         }
 
-        let mut cursor = Cursor::new(&data);
-        let header = read_header(&mut cursor)?;
+        let header = read_header(&mut Cursor::new(&data))?;
         if header.version != FORMAT_VERSION {
             return Err(StorageError::Io(format!(
                 "unsupported oplog version {} in {:?}",
@@ -504,54 +676,18 @@ impl SegmentReader {
             )));
         }
 
-        cursor.set_position(HEADER_SIZE);
-        let mut entries = Vec::new();
-        let mut first_ts = 0u64;
-        let mut last_ts = 0u64;
-        loop {
-            let frame_start = cursor.position();
-            let Ok(payload_len) = decode_varint(&mut cursor) else {
-                break; // truncated varint: writer mid-flush
-            };
-            let payload_len = payload_len as usize;
-            let remaining = (total_len - cursor.position()) as usize;
-            if remaining < payload_len + 4 {
-                break; // incomplete frame tail
-            }
-            let mut payload = vec![0u8; payload_len];
-            if cursor.read_exact(&mut payload).is_err() {
-                break;
-            }
-            let mut crc_buf = [0u8; 4];
-            if cursor.read_exact(&mut crc_buf).is_err() {
-                break;
-            }
-            if crc32fast::hash(&payload) != u32::from_le_bytes(crc_buf) {
-                // Torn write at the tail; everything before it is good.
-                cursor.set_position(frame_start);
-                break;
-            }
-            let Ok(entry) = OplogEntry::decode(&payload) else {
-                cursor.set_position(frame_start);
-                break;
-            };
-            if entries.is_empty() {
-                first_ts = entry.ts;
-            }
-            last_ts = entry.ts;
-            entries.push(entry);
-        }
-
+        // The writer may be mid-flush: the prefix stops at its unfinished frame.
+        let prefix = read_frame_prefix(&data);
         let footer = SegmentFooter {
-            entry_count: entries.len() as u32,
-            first_ts,
-            last_ts,
-            total_bytes: cursor.position(),
+            entry_count: prefix.entries.len() as u32,
+            first_ts: prefix.first_ts,
+            last_ts: prefix.last_ts,
+            total_bytes: prefix.end,
         };
         Ok(Self {
             header,
             footer,
-            entries,
+            entries: prefix.entries,
         })
     }
 
@@ -587,8 +723,7 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
-        let mut cursor = Cursor::new(&data);
-        let header = read_header(&mut cursor)?;
+        let header = read_header(&mut Cursor::new(&data))?;
 
         if header.version != FORMAT_VERSION {
             return Err(StorageError::Io(format!(
@@ -600,55 +735,8 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
 
-        // Scan forward, collecting entries with valid CRC32.  Stop at the
-        // first parse error — that marks the boundary of durable data.
-        let mut entries = Vec::new();
-        loop {
-            let pos_before = cursor.position() as usize;
-
-            // Try to read varint length prefix.
-            let payload_len = match decode_varint(&mut cursor) {
-                Ok(n) => n as usize,
-                Err(_) => break, // EOF or partial varint → done
-            };
-
-            let pos_after_varint = cursor.position() as usize;
-            let remaining = data.len().saturating_sub(pos_after_varint);
-
-            // Need payload_len bytes + 4 bytes CRC32.
-            if remaining < payload_len + 4 {
-                // Partial frame — not durable.
-                break;
-            }
-
-            let payload = &data[pos_after_varint..pos_after_varint + payload_len];
-            let crc_bytes =
-                &data[pos_after_varint + payload_len..pos_after_varint + payload_len + 4];
-
-            let expected = crc32fast::hash(payload);
-            let actual =
-                u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
-
-            if expected != actual {
-                // Checksum mismatch → partial / corrupt tail, stop here.
-                break;
-            }
-
-            match OplogEntry::decode(payload) {
-                Ok(entry) => {
-                    entries.push(entry);
-                    // Advance cursor past payload + CRC32.
-                    cursor.set_position((pos_after_varint + payload_len + 4) as u64);
-                }
-                Err(_) => {
-                    // Deserialization error → corrupt entry, rewind and stop.
-                    cursor.set_position(pos_before as u64);
-                    break;
-                }
-            }
-        }
-
-        Ok(entries)
+        // The first incomplete or failing frame marks the end of durable data.
+        Ok(read_frame_prefix(&data).entries)
     }
 }
 
