@@ -338,10 +338,12 @@ pub struct Database {
     snapshot_read_ts: Option<u64>,
     /// Cached storage statistics for EXPLAIN cost estimation.
     /// `None` = never computed or invalidated.  Refreshed when
-    /// the TTL expires (see `STATS_CACHE_TTL_SECS`).
+    /// the TTL expires (see `STATS_CACHE_TTL_SECS`). A failed computation is
+    /// cached as `(None, at)` for the same TTL, so a damaged counter is
+    /// reported once per window rather than recomputed on every query.
     cached_stats: Mutex<
         Option<(
-            coordinode_storage::engine::stats::StorageStatsComputer,
+            Option<coordinode_storage::engine::stats::StorageStatsComputer>,
             Instant,
         )>,
     >,
@@ -807,7 +809,8 @@ impl Database {
     /// checkpoint plus oplog replay (single-node WAL-replay-repair, repair
     /// path 2).
     ///
-    /// Returns a [`RepairReport`]. `report.is_clean()` is `false` only if
+    /// Returns a [`RepairReport`](crate::repair::RepairReport).
+    /// `report.is_clean()` is `false` only if
     /// corruption remained — e.g. no checkpoint existed to rebuild from, in
     /// which case the operator must restore from an off-device backup. Called
     /// automatically on open when a checkpoint is present.
@@ -1588,7 +1591,7 @@ impl Database {
     /// surface real mutation counts instead of hardcoded zeros.
     ///
     /// `read_concern` and `write_concern` are one-shot overrides
-    /// applied only to this call's [`QuerySession`]; session defaults
+    /// applied only to this call's query session; session defaults
     /// on the Database are not touched.
     pub fn execute_cypher_full(
         &mut self,
@@ -2043,7 +2046,7 @@ impl Database {
     ///
     /// Available to callers that only hold `&Database` — typically
     /// gRPC request handlers behind `Arc<RwLock<Database>>::read()`.
-    /// Builds a per-call [`QuerySession`] from the Database's session
+    /// Builds a per-call query session from the Database's session
     /// defaults plus any wire-supplied `read_concern` / `write_concern`
     /// overrides, then dispatches to the `&self` impl. Multiple
     /// shared callers run in parallel; only `set_*` session-config
@@ -2757,23 +2760,32 @@ impl Database {
     ///
     /// Returns a cached snapshot if it is younger than `stats_ttl`.
     /// Otherwise recomputes from MVCC storage and caches the result.
-    /// Returns `None` if both cache and recomputation fail (non-critical).
+    ///
+    /// Returns `None` when the statistics cannot be read, and the planner then
+    /// uses its defaults: they steer the choice of plan, never its result. The
+    /// failure itself is logged as an error, because the usual cause is a
+    /// damaged counter or adjacency list, which is worth an operator's look.
     pub fn compute_stats(&self) -> Option<coordinode_storage::engine::stats::StorageStatsComputer> {
         let mut guard = self.cached_stats.lock().ok()?;
         if let Some((ref stats, computed_at)) = *guard {
             if computed_at.elapsed() < self.stats_ttl {
-                return Some(stats.clone());
+                return stats.clone();
             }
         }
         // Cache miss or expired — recompute.
-        match coordinode_storage::engine::stats::StorageStatsComputer::compute_mvcc(&self.engine) {
-            Ok(fresh) => {
-                let cloned = fresh.clone();
-                *guard = Some((fresh, Instant::now()));
-                Some(cloned)
-            }
-            Err(_) => None,
-        }
+        let fresh =
+            match coordinode_storage::engine::stats::StorageStatsComputer::compute(&self.engine) {
+                Ok(fresh) => Some(fresh),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "planner statistics unavailable, planning with defaults"
+                    );
+                    None
+                }
+            };
+        *guard = Some((fresh.clone(), Instant::now()));
+        fresh
     }
 
     /// Invalidate the cached storage statistics.

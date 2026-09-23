@@ -7,17 +7,22 @@
 //! same transaction as the data writes); fan-out remains a bounded sample
 //! over the adjacency partition. A refresh therefore costs a handful of
 //! counter reads plus the sample, not a node-partition scan.
+//!
+//! Damaged bytes are reported, never read as a plausible number: a counter
+//! read as zero or a list left out of the sample would price plans against a
+//! graph that is not the one on disk, and nothing downstream could tell.
 
 use std::collections::HashMap;
 
 use lsm_tree::Guard;
 
-use coordinode_core::graph::edge::PostingList;
-use coordinode_core::graph::stats::StorageStats;
+use coordinode_core::graph::edge::{AdjDirection, PostingList, decode_adj_key};
+use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY, StorageStats};
 
 use crate::engine::core::StorageEngine;
+use crate::engine::merge;
 use crate::engine::partition::Partition;
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 
 /// Pre-computed storage statistics snapshot.
 ///
@@ -34,18 +39,52 @@ pub struct StorageStatsComputer {
     num_labels: u64,
 }
 
-/// Maximum number of adjacency entries to sample for fan-out estimation.
-/// Sampling avoids full-scan cost on large databases.
-const FAN_OUT_SAMPLE_LIMIT: usize = 1000;
+/// Maximum number of forward adjacency lists sampled per edge type.
+/// Sampling avoids full-scan cost on large databases; the cap is per type so
+/// that every type gets an estimate, not only the first ones in key order.
+const FAN_OUT_SAMPLE_PER_TYPE: u64 = 1000;
+
+/// Key prefix every adjacency key starts with (see `encode_adj_key_forward`).
+const ADJ_KEY_PREFIX: &[u8] = b"adj:";
+
+/// Inclusive upper bound for a range over [`ADJ_KEY_PREFIX`]: the prefix with
+/// its last byte incremented (`:` + 1 = `;`) sorts after every key under it.
+const ADJ_KEY_RANGE_END: &[u8] = b"adj;";
 
 impl StorageStatsComputer {
-    /// Compute statistics by scanning raw (non-MVCC) storage.
+    /// Compute statistics at a complete snapshot of the engine.
     ///
-    /// Use this when writing directly to StorageEngine (tests, bulk import).
-    /// For MVCC-enabled databases (normal operation), use [`Self::compute_mvcc`].
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Serialization`] naming the key when a counter,
+    /// an adjacency key or a posting list does not decode, and any error the
+    /// reads themselves return.
     pub fn compute(engine: &StorageEngine) -> StorageResult<Self> {
-        let (total_nodes, label_counts) = Self::count_nodes(engine)?;
-        let (edge_type_fan_outs, overall_avg_fan_out) = Self::sample_fan_out(engine)?;
+        // Pinned so the watermark cannot pass the snapshot mid-walk.
+        let (snapshot, _pin) = engine.pin_latest_snapshot();
+
+        // A counter below zero (drift from a doubled decrement) is well formed
+        // but counts nothing; the planner reads it as none.
+        let total_nodes =
+            match engine.snapshot_get(&snapshot, Partition::Counter, NODES_TOTAL_KEY)? {
+                Some(value) => u64::try_from(decode_counter(NODES_TOTAL_KEY, &value)?).unwrap_or(0),
+                None => 0,
+            };
+
+        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        for guard in engine.snapshot_prefix_iter(&snapshot, Partition::Counter, LABEL_KEY_PREFIX)? {
+            let (key, value) = guard.into_inner()?;
+            // Zero or below means every row with the label is gone, and a
+            // label with no rows is absent, as a scan of the rows reports it.
+            let Ok(count @ 1..) = u64::try_from(decode_counter(&key, &value)?) else {
+                continue;
+            };
+            let label = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..])
+                .map_err(|_| corrupt(Partition::Counter, &key, "label name is not UTF-8"))?;
+            label_counts.insert(label.to_owned(), count);
+        }
+
+        let (edge_type_fan_outs, overall_avg_fan_out) = sample_fan_out(engine, snapshot)?;
         let num_labels = label_counts.len() as u64;
 
         Ok(Self {
@@ -56,234 +95,94 @@ impl StorageStatsComputer {
             num_labels,
         })
     }
+}
 
-    /// Compute statistics from MVCC-versioned storage (ADR-016: native seqno snapshot).
-    ///
-    /// Uses a current snapshot for consistent reads across all partitions.
-    /// This is the method used by Database and Server for EXPLAIN cost estimation.
-    pub fn compute_mvcc(engine: &StorageEngine) -> StorageResult<Self> {
-        let snapshot = engine.snapshot();
+/// Decode a statistics counter, reporting a value of the wrong width.
+fn decode_counter(key: &[u8], value: &[u8]) -> StorageResult<i64> {
+    merge::decode_counter(value).map_err(|_| {
+        corrupt(
+            Partition::Counter,
+            key,
+            &format!("counter holds {} bytes, expected 8", value.len()),
+        )
+    })
+}
 
-        let (total_nodes, label_counts) = Self::count_nodes_snapshot(engine, &snapshot)?;
-        let (edge_type_fan_outs, overall_avg_fan_out) =
-            Self::sample_fan_out_snapshot(engine, &snapshot)?;
-        let num_labels = label_counts.len() as u64;
+/// A value or key that no writer of this partition produces.
+fn corrupt(part: Partition, key: &[u8], what: &str) -> StorageError {
+    StorageError::Serialization(format!("{part:?} key {}: {what}", key.escape_ascii()))
+}
 
-        Ok(Self {
-            total_nodes,
-            label_counts,
-            edge_type_fan_outs,
-            overall_avg_fan_out,
-            num_labels,
-        })
-    }
+/// Sample forward posting lists to estimate the average fan-out per edge type.
+///
+/// Reverse lists would count every edge twice, and for each type they all sort
+/// before the forward ones (`in` < `out`), so the walk seeks past them rather
+/// than reading each one; a type that reaches its sample cap is skipped the
+/// same way. The cost is therefore the sampled lists plus a seek per type.
+fn sample_fan_out(
+    engine: &StorageEngine,
+    snapshot: lsm_tree::SeqNo,
+) -> StorageResult<(HashMap<String, f64>, f64)> {
+    // Per type: (edges in the sampled lists, lists sampled).
+    let mut per_type: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut iter =
+        engine.range_seekable(Partition::Adj, ADJ_KEY_PREFIX, ADJ_KEY_RANGE_END, snapshot)?;
 
-    /// Decode a counter value (i64 little-endian; anything else reads 0).
-    fn decode_counter(bytes: &[u8]) -> i64 {
-        bytes.try_into().map(i64::from_le_bytes).unwrap_or_default()
-    }
-
-    /// Read the incrementally-maintained node/label counters (latest state).
-    ///
-    /// One point read for the total plus one tiny prefix walk over the
-    /// per-label counters (one row per distinct label) replaces the former
-    /// full scan + decode of the node partition. A counter that folded to
-    /// zero or below (all rows deleted) is omitted, matching the scan
-    /// behaviour of never reporting an absent label.
-    fn count_nodes(engine: &StorageEngine) -> StorageResult<(u64, HashMap<String, u64>)> {
-        use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY};
-
-        let total = engine
-            .get(Partition::Counter, NODES_TOTAL_KEY)?
-            .map(|v| Self::decode_counter(&v).max(0) as u64)
-            .unwrap_or(0);
-
-        let mut label_counts: HashMap<String, u64> = HashMap::new();
-        for guard in engine.prefix_scan(Partition::Counter, LABEL_KEY_PREFIX)? {
-            let Ok((key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let count = Self::decode_counter(&value);
-            if count <= 0 {
-                continue;
-            }
-            if let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) {
-                label_counts.insert(label.to_string(), count as u64);
-            }
+    while let Some(guard) = iter.next() {
+        let (key, value) = guard.into_inner()?;
+        if !key.starts_with(ADJ_KEY_PREFIX) {
+            // The inclusive bound itself; nothing under the prefix is left.
+            break;
         }
-
-        Ok((total, label_counts))
-    }
-
-    /// Sample adjacency posting lists to estimate average fan-out per edge type.
-    ///
-    /// Only scans outgoing (`adj:*:out:*`) keys to avoid double-counting.
-    /// Samples up to `FAN_OUT_SAMPLE_LIMIT` entries for efficiency.
-    fn sample_fan_out(engine: &StorageEngine) -> StorageResult<(HashMap<String, f64>, f64)> {
-        let mut type_total_edges: HashMap<String, u64> = HashMap::new();
-        let mut type_entry_count: HashMap<String, u64> = HashMap::new();
-        let mut global_total_edges: u64 = 0;
-        let mut global_entry_count: u64 = 0;
-
-        let iter = engine.prefix_scan(Partition::Adj, b"adj:")?;
-        let mut sampled = 0;
-
-        for guard in iter {
-            if sampled >= FAN_OUT_SAMPLE_LIMIT {
-                break;
-            }
-
-            let Ok((key, value)) = guard.into_inner() else {
-                continue;
-            };
-
-            // Parse key: adj:<TYPE>:out:<id> or adj:<TYPE>:in:<id>
-            // Only count outgoing to avoid double-counting
-            let key_bytes: &[u8] = &key;
-            let key_str = match std::str::from_utf8(key_bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            // Skip reverse (incoming) keys
-            if !key_str.contains(":out:") {
-                continue;
-            }
-
-            // Extract edge type: between first "adj:" and ":out:"
-            let after_adj = match key_str.strip_prefix("adj:") {
-                Some(rest) => rest,
-                None => continue,
-            };
-            let edge_type = match after_adj.find(":out:") {
-                Some(pos) => &after_adj[..pos],
-                None => continue,
-            };
-
-            // Count UIDs in posting list
-            let uid_count = match PostingList::from_bytes(&value) {
-                Ok(pl) => pl.len() as u64,
-                Err(_) => continue,
-            };
-
-            *type_total_edges.entry(edge_type.to_string()).or_insert(0) += uid_count;
-            *type_entry_count.entry(edge_type.to_string()).or_insert(0) += 1;
-            global_total_edges += uid_count;
-            global_entry_count += 1;
-            sampled += 1;
+        let parts = decode_adj_key(&key)
+            .ok_or_else(|| corrupt(Partition::Adj, &key, "not an adjacency key"))?;
+        if matches!(parts.direction, AdjDirection::In) {
+            iter.seek_to(&type_key(&parts.edge_type, ":out:"));
+            continue;
         }
-
-        // Compute per-type averages
-        let mut type_fan_outs = HashMap::new();
-        for (edge_type, total) in &type_total_edges {
-            let count = type_entry_count[edge_type];
-            if count > 0 {
-                type_fan_outs.insert(edge_type.clone(), *total as f64 / count as f64);
+        let list = PostingList::from_bytes(&value)
+            .map_err(|e| corrupt(Partition::Adj, &key, &format!("not a posting list: {e}")))?;
+        let edges = list.len() as u64;
+        let sampled = match per_type.get_mut(&parts.edge_type) {
+            Some(entry) => {
+                entry.0 += edges;
+                entry.1 += 1;
+                entry.1
             }
-        }
-
-        let overall = if global_entry_count > 0 {
-            global_total_edges as f64 / global_entry_count as f64
-        } else {
-            0.0
+            None => {
+                per_type.insert(parts.edge_type.clone(), (edges, 1));
+                1
+            }
         };
-
-        Ok((type_fan_outs, overall))
+        if sampled >= FAN_OUT_SAMPLE_PER_TYPE {
+            // `;` follows `:`, so this sorts after every forward list of the type.
+            iter.seek_to(&type_key(&parts.edge_type, ":out;"));
+        }
     }
 
-    /// Snapshot-pinned counterpart of [`Self::count_nodes`] (ADR-016 MVCC):
-    /// the same counter reads, resolved at the given snapshot.
-    fn count_nodes_snapshot(
-        engine: &StorageEngine,
-        snapshot: &lsm_tree::SeqNo,
-    ) -> StorageResult<(u64, HashMap<String, u64>)> {
-        use coordinode_core::graph::stats::{LABEL_KEY_PREFIX, NODES_TOTAL_KEY};
-
-        let total = engine
-            .snapshot_get(snapshot, Partition::Counter, NODES_TOTAL_KEY)?
-            .map(|v| Self::decode_counter(&v).max(0) as u64)
-            .unwrap_or(0);
-
-        let mut label_counts: HashMap<String, u64> = HashMap::new();
-        for (key, value) in
-            engine.snapshot_prefix_scan(snapshot, Partition::Counter, LABEL_KEY_PREFIX)?
-        {
-            let count = Self::decode_counter(&value);
-            if count <= 0 {
-                continue;
-            }
-            if let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) {
-                label_counts.insert(label.to_string(), count as u64);
-            }
-        }
-
-        Ok((total, label_counts))
+    let (mut edges, mut lists) = (0u64, 0u64);
+    let mut type_fan_outs = HashMap::with_capacity(per_type.len());
+    for (edge_type, (type_edges, type_lists)) in per_type {
+        edges += type_edges;
+        lists += type_lists;
+        // Every entry holds at least the list that created it.
+        type_fan_outs.insert(edge_type, type_edges as f64 / type_lists as f64);
     }
+    let overall = if lists > 0 {
+        edges as f64 / lists as f64
+    } else {
+        0.0
+    };
+    Ok((type_fan_outs, overall))
+}
 
-    /// Sample fan-out from snapshot-based adjacency data (ADR-016).
-    fn sample_fan_out_snapshot(
-        engine: &StorageEngine,
-        snapshot: &lsm_tree::SeqNo,
-    ) -> StorageResult<(HashMap<String, f64>, f64)> {
-        let mut type_total_edges: HashMap<String, u64> = HashMap::new();
-        let mut type_entry_count: HashMap<String, u64> = HashMap::new();
-        let mut global_total_edges: u64 = 0;
-        let mut global_entry_count: u64 = 0;
-
-        let entries = engine.snapshot_prefix_scan(snapshot, Partition::Adj, b"adj:")?;
-        let mut sampled = 0;
-
-        for (key, value) in entries {
-            if sampled >= FAN_OUT_SAMPLE_LIMIT {
-                break;
-            }
-
-            let key_str = match std::str::from_utf8(&key) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            if !key_str.contains(":out:") {
-                continue;
-            }
-
-            let after_adj = match key_str.strip_prefix("adj:") {
-                Some(rest) => rest,
-                None => continue,
-            };
-            let edge_type = match after_adj.find(":out:") {
-                Some(pos) => &after_adj[..pos],
-                None => continue,
-            };
-
-            let uid_count = match PostingList::from_bytes(&value) {
-                Ok(pl) => pl.len() as u64,
-                Err(_) => continue,
-            };
-
-            *type_total_edges.entry(edge_type.to_string()).or_insert(0) += uid_count;
-            *type_entry_count.entry(edge_type.to_string()).or_insert(0) += 1;
-            global_total_edges += uid_count;
-            global_entry_count += 1;
-            sampled += 1;
-        }
-
-        let mut type_fan_outs = HashMap::new();
-        for (edge_type, total) in &type_total_edges {
-            let count = type_entry_count[edge_type];
-            if count > 0 {
-                type_fan_outs.insert(edge_type.clone(), *total as f64 / count as f64);
-            }
-        }
-
-        let overall = if global_entry_count > 0 {
-            global_total_edges as f64 / global_entry_count as f64
-        } else {
-            0.0
-        };
-
-        Ok((type_fan_outs, overall))
-    }
+/// `adj:<edge_type><suffix>`: a seek target inside one type's key range.
+fn type_key(edge_type: &str, suffix: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ADJ_KEY_PREFIX.len() + edge_type.len() + suffix.len());
+    key.extend_from_slice(ADJ_KEY_PREFIX);
+    key.extend_from_slice(edge_type.as_bytes());
+    key.extend_from_slice(suffix.as_bytes());
+    key
 }
 
 /// Recompute the planner's node and label counters from the node rows.
@@ -301,9 +200,15 @@ impl StorageStatsComputer {
 ///
 /// One row counts once, so a temporal node counts once per stored version,
 /// which is what the counters mean and what a scan of the partition sees.
+///
+/// # Errors
+///
+/// A row that is not a node record is reported and no counter is written: a
+/// total that left it out would durably claim a smaller graph than the one
+/// on disk.
 pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
     use coordinode_core::graph::node::NODE_KEY_PREFIX;
-    use coordinode_core::graph::stats::{NODES_TOTAL_KEY, label_count_key};
+    use coordinode_core::graph::stats::label_count_key;
 
     use crate::engine::merge::decode_node_record;
 
@@ -311,12 +216,9 @@ pub fn rebuild_node_counters(engine: &StorageEngine) -> StorageResult<()> {
     let mut label_counts: HashMap<String, i64> = HashMap::new();
 
     for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
-        let Ok((_key, value)) = guard.into_inner() else {
-            continue;
-        };
-        let Ok(record) = decode_node_record(&value) else {
-            continue;
-        };
+        let (key, value) = guard.into_inner()?;
+        let record = decode_node_record(&value)
+            .map_err(|_| corrupt(Partition::Node, &key, "not a node record"))?;
         total += 1;
         for label in &record.labels {
             *label_counts.entry(label.clone()).or_insert(0) += 1;

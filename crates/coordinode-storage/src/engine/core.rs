@@ -2537,14 +2537,26 @@ impl StorageEngine {
         part: Partition,
         prefix: &[u8],
     ) -> StorageResult<Vec<(Vec<u8>, bytes::Bytes)>> {
-        self.check_snapshot_retained(*snapshot)?;
-        let tree = self.tree(part)?;
         let mut results = Vec::new();
-        for guard in tree.prefix(prefix, *snapshot, None) {
+        for guard in self.snapshot_prefix_iter(snapshot, part, prefix)? {
             let (key, value) = guard.into_inner()?;
             results.push((key.to_vec(), bytes::Bytes::copy_from_slice(&value)));
         }
         Ok(results)
+    }
+
+    /// Lazy counterpart of [`Self::snapshot_prefix_scan`]: entries are read as
+    /// the caller pulls them, so a caller that stops early reads only what it
+    /// consumed instead of the whole prefix.
+    pub fn snapshot_prefix_iter(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        prefix: &[u8],
+    ) -> StorageResult<StorageIter> {
+        self.check_snapshot_retained(*snapshot)?;
+        let tree = self.tree(part)?;
+        Ok(Box::new(tree.prefix(prefix, *snapshot, None)))
     }
 
     /// The version of a record: the timestamp of the commit that last wrote

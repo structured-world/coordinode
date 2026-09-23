@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use crate::error::StorageError;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::stats::{NODES_TOTAL_KEY, counter_delta_operand, label_count_key};
 
@@ -173,11 +174,11 @@ fn multiple_edge_types() {
     assert!((stats.avg_fan_out() - 3.0).abs() < 0.01);
 }
 
-/// Adversarial counter states must not poison the reader: a counter driven
-/// below zero (double-decrement drift) clamps to absent/zero, and a
-/// malformed counter value (wrong width) reads as zero instead of erroring.
+/// A counter driven below zero (double-decrement drift) is a well-formed value
+/// the planner cannot use as a cardinality: the total clamps to zero and the
+/// label reports absent.
 #[test]
-fn reader_clamps_underflow_and_ignores_malformed_counters() {
+fn reader_clamps_underflowed_counters() {
     let dir = tempfile::tempdir().unwrap();
     let engine = test_engine(dir.path());
 
@@ -196,10 +197,6 @@ fn reader_clamps_underflow_and_ignores_malformed_counters() {
             &counter_delta_operand(-5),
         )
         .unwrap();
-    // A malformed (non-8-byte) value under the label prefix.
-    engine
-        .put(Partition::Counter, &label_count_key("Junk"), b"not-an-i64")
-        .unwrap();
 
     let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
     assert_eq!(stats.total_node_count(), 0, "negative total clamps to zero");
@@ -208,9 +205,201 @@ fn reader_clamps_underflow_and_ignores_malformed_counters() {
         None,
         "an underflowed label reports absent"
     );
+}
+
+/// Assert the reader refuses the engine's state with a serialization error
+/// that names `key`, instead of answering with a plausible number.
+fn assert_refused(engine: &StorageEngine, key: &str) {
+    let err = StorageStatsComputer::compute(engine)
+        .err()
+        .expect("a corrupt value must not be read as a statistic");
+    assert!(
+        matches!(&err, StorageError::Serialization(msg) if msg.contains(key)),
+        "expected a serialization error naming {key}, got {err}"
+    );
+}
+
+/// A label counter of the wrong width is corrupt. Reading it as zero would
+/// make the planner price every plan over that label as if it were empty,
+/// and nothing downstream could tell that from a label that really is.
+#[test]
+fn corrupt_label_counter_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    seed_node_counters(&engine, &["User"]);
+    engine
+        .put(Partition::Counter, &label_count_key("Junk"), b"not-an-i64")
+        .unwrap();
+
+    assert_refused(&engine, "Junk");
+}
+
+/// The total is read by a point get rather than the label walk; a corrupt
+/// total is refused on that path too.
+#[test]
+fn corrupt_total_counter_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    engine
+        .put(Partition::Counter, NODES_TOTAL_KEY, b"\x01\x02\x03")
+        .unwrap();
+
+    assert_refused(&engine, &String::from_utf8_lossy(NODES_TOTAL_KEY));
+}
+
+/// A node id is stored as eight big-endian bytes at the end of the adjacency
+/// key, so most ids put a byte of 0x80 or above into it. Such a key is not
+/// UTF-8, and a sampler that parses the key as text skips it: here that is
+/// every forward list, and the fan-out would read as none at all.
+#[test]
+fn fan_out_counts_ids_that_are_not_text() {
+    use coordinode_core::graph::edge::encode_adj_key_forward;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    // 200 = 0xC8 and 0x80 00 00 00 00 00 00 01: neither key is valid UTF-8.
+    for (source, targets) in [
+        (200u64, &[1u64, 2][..]),
+        (0x8000_0000_0000_0001, &[3, 4, 5, 6][..]),
+    ] {
+        let mut pl = PostingList::new();
+        for &t in targets {
+            pl.insert(t);
+        }
+        engine
+            .put(
+                Partition::Adj,
+                &encode_adj_key_forward("KNOWS", NodeId::from_raw(source)),
+                &pl.to_bytes().unwrap(),
+            )
+            .unwrap();
+    }
+
+    let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
+    let knows = stats
+        .avg_fan_out_for_type("KNOWS")
+        .expect("both lists are sampled");
+    assert!((knows - 3.0).abs() < 0.01, "(2 + 4) / 2, got {knows}");
+    assert!((stats.avg_fan_out() - 3.0).abs() < 0.01);
+}
+
+/// The sample cap is per type. A single cap over the whole walk spends it on
+/// the first types in key order and leaves the later ones with no estimate,
+/// so the planner prices them with the overall average instead of their own.
+#[test]
+fn every_edge_type_is_sampled_past_the_cap() {
+    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut one = PostingList::new();
+    one.insert(1);
+    let one = one.to_bytes().unwrap();
+    // "A" sorts first and has more forward lists than the cap, plus reverse
+    // lists the walk must skip rather than count.
+    for id in 0..FAN_OUT_SAMPLE_PER_TYPE + 5 {
+        engine
+            .put(
+                Partition::Adj,
+                &encode_adj_key_forward("A", NodeId::from_raw(id)),
+                &one,
+            )
+            .unwrap();
+        engine
+            .put(
+                Partition::Adj,
+                &encode_adj_key_reverse("A", NodeId::from_raw(id)),
+                &one,
+            )
+            .unwrap();
+    }
+    let mut three = PostingList::new();
+    for t in [1, 2, 3] {
+        three.insert(t);
+    }
+    engine
+        .put(
+            Partition::Adj,
+            &encode_adj_key_forward("B", NodeId::from_raw(1)),
+            &three.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+    let stats = StorageStatsComputer::compute(&engine).expect("compute stats");
+    assert!((stats.avg_fan_out_for_type("A").expect("A sampled") - 1.0).abs() < 0.01);
+    assert!(
+        (stats
+            .avg_fan_out_for_type("B")
+            .expect("B sampled after A's cap")
+            - 3.0)
+            .abs()
+            < 0.01
+    );
+}
+
+/// A forward adjacency value that is not a posting list is corrupt; skipping
+/// it would silently bias the sample toward the lists that survived.
+#[test]
+fn corrupt_posting_list_is_refused() {
+    use coordinode_core::graph::edge::encode_adj_key_forward;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    engine
+        .put(
+            Partition::Adj,
+            &encode_adj_key_forward("KNOWS", NodeId::from_raw(7)),
+            b"\xff\xfe not a posting list",
+        )
+        .unwrap();
+
+    assert_refused(&engine, "KNOWS");
+}
+
+/// A key under the adjacency prefix that no adjacency encoder produces is
+/// corrupt, and is refused rather than skipped.
+#[test]
+fn malformed_adjacency_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let mut pl = PostingList::new();
+    pl.insert(1);
+    engine
+        .put(
+            Partition::Adj,
+            b"adj:KNOWS:sideways:x",
+            &pl.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+    assert_refused(&engine, "sideways");
+}
+
+/// Rebuilding the counters from the node rows must not write a total that
+/// quietly leaves out a row it could not read: the counters would then
+/// claim, durably, a graph smaller than the one on disk.
+#[test]
+fn rebuild_refuses_an_unreadable_node_row() {
+    use coordinode_core::graph::node::encode_node_key;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(1, NodeId::from_raw(9)),
+            b"\xc1 not msgpack",
+        )
+        .unwrap();
+
+    let result = rebuild_node_counters(&engine);
+    assert!(
+        matches!(result, Err(StorageError::Serialization(_))),
+        "expected a serialization error, got {result:?}"
+    );
     assert_eq!(
-        stats.node_count_for_label("Junk"),
+        engine.get(Partition::Counter, NODES_TOTAL_KEY).unwrap(),
         None,
-        "a malformed counter value reads as zero, not an error"
+        "a refused rebuild writes no counter"
     );
 }

@@ -1501,3 +1501,52 @@ fn show_transactions_without_an_operations_view_is_empty() {
     );
     assert!(db.execute_cypher("SHOW SESSIONS").expect("show").is_empty());
 }
+
+/// A damaged planner counter makes the statistics unavailable rather than
+/// wrong: the planner falls back to its defaults, which steer the plan and
+/// never the answer, so queries keep returning the right rows. Once the
+/// counter is repaired the statistics come back.
+#[test]
+fn damaged_planner_counter_disables_stats_not_queries() {
+    use coordinode_core::graph::stats::{StorageStats, label_count_key};
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:User {name: 'a'}), (:User {name: 'b'})")
+        .expect("create");
+    assert_eq!(
+        db.compute_stats()
+            .expect("stats")
+            .node_count_for_label("User"),
+        Some(2)
+    );
+
+    db.engine()
+        .put(Partition::Counter, &label_count_key("User"), b"bad")
+        .expect("damage the counter");
+    db.invalidate_stats_cache();
+    assert!(
+        db.compute_stats().is_none(),
+        "a damaged counter is not read as a count"
+    );
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS name ORDER BY name")
+        .expect("the query runs without statistics");
+    assert_eq!(rows.len(), 2);
+
+    db.engine()
+        .put(
+            Partition::Counter,
+            &label_count_key("User"),
+            &2i64.to_le_bytes(),
+        )
+        .expect("repair the counter");
+    db.invalidate_stats_cache();
+    assert_eq!(
+        db.compute_stats()
+            .expect("stats")
+            .node_count_for_label("User"),
+        Some(2)
+    );
+}
