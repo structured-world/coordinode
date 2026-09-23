@@ -26,10 +26,12 @@ ignore = true
 
 [advisories]
 ignore = [
-    # proc-macro-error2 marked unmaintained upstream; pulled transitively
-    # via include-flate-codegen. Tracking upstream migration; safe to
-    # ignore in CI until include-flate drops the dep.
-    "RUSTSEC-2026-0173",
+    # lru `LruCache::pop()` use-after-free when a key's `Drop` panics and the
+    # panic is caught. Reached only via tantivy's doc-store block cache, keyed by
+    # `usize`, whose drop cannot panic, so the unsound path is unreachable (and
+    # release builds abort on panic). The fix is in lru 0.18.2, but tantivy
+    # 0.26.2, its latest release, requires ^0.16. Revisit when tantivy moves on.
+    "RUSTSEC-2026-0253",
     # rsa "Marvin Attack" (timing sidechannel on RSA private-key operations).
     # Reached only via jsonwebtoken's pure-Rust `rust_crypto` backend (RSA JWT
     # verification in the REST proxy). No fixed `rsa` release exists (latest is
