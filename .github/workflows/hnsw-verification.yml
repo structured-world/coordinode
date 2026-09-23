@@ -7,7 +7,7 @@ on:
     branches: [main]
     paths:
       - 'crates/coordinode-vector/**'
-      - '.github/workflows/miri.yml'
+      - '.github/workflows/hnsw-verification.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,6 +62,18 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Install cargo-hakari
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
+
+      - name: Disable the workspace-hack
+        # The workspace-hack unifies the whole workspace's dependency features
+        # into every member, so building coordinode-vector alone would pull in
+        # crates such as hyper-util that need `tokio::net`, which tokio removes
+        # under `--cfg loom`. Emptying the hack builds only vector's own graph.
+        run: cargo hakari disable
+
       - uses: Swatinem/rust-cache@v2
         with:
           # Loom uses a different build cfg, so cache separately from the
@@ -76,9 +88,8 @@ jobs:
         #   correctly publishes slot writes to any subsequent reader,
         #   and `cas_append` never loses writes under concurrent senders.
         # * EntryPoint — packed `(level, idx)` CAS-loop honours the
-        #   layer-promotion linearisability invariant from
-        #   arch/search/vector-parallel-insert.md §"Layer-promotion
-        #   linearisability": after every legal interleaving of two
+        #   layer-promotion linearisability invariant: after every legal
+        #   interleaving of two
         #   concurrent `try_promote` callers, exactly one Installs on
         #   the seed race, the highest level always wins on a mixed
         #   race, and equal-level races are idempotent.

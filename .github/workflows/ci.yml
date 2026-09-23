@@ -82,7 +82,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cargo-hakari
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hakari
       - name: Check the workspace-hack is up to date
         run: |
           cargo hakari generate --diff
