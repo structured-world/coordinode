@@ -537,9 +537,9 @@ jobs:
               echo "::warning::high-d tier $D not provisioned at $TIER_DIR — skip (run fetch_high_d.sh $D on the runner)"
               continue
             fi
-            BASE=$(ls "$TIER_DIR"/*_base.fvecs 2>/dev/null | head -1 || true)
-            QUERY=$(ls "$TIER_DIR"/*_query.fvecs 2>/dev/null | head -1 || true)
-            TRUTH=$(ls "$TIER_DIR"/*_groundtruth.ivecs 2>/dev/null | head -1 || true)
+            BASE=$(find "$TIER_DIR" -maxdepth 1 -name '*_base.fvecs' -print -quit)
+            QUERY=$(find "$TIER_DIR" -maxdepth 1 -name '*_query.fvecs' -print -quit)
+            TRUTH=$(find "$TIER_DIR" -maxdepth 1 -name '*_groundtruth.ivecs' -print -quit)
             if [ -z "$BASE" ] || [ -z "$QUERY" ] || [ -z "$TRUTH" ]; then
               echo "::warning::tier $D missing one of base/query/groundtruth in $TIER_DIR — skip"
               continue

@@ -1,0 +1,6 @@
+# Labels of the self-hosted runners the workflows target, so actionlint
+# checks them instead of reporting every self-hosted job.
+self-hosted-runner:
+  labels:
+    - coordinode
+    - gpu-private-systems

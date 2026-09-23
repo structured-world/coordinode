@@ -212,7 +212,7 @@ jobs:
         continue-on-error: true
         run: |
           dnf install -y --setopt=install_weak_deps=False rpmlint || true
-          rpmlint $(find ~/rpmbuild/RPMS -name '*.rpm') || true
+          find ~/rpmbuild/RPMS -name '*.rpm' -exec rpmlint {} + || true
 
       - name: Stage artifact
         run: |
@@ -331,7 +331,7 @@ jobs:
       - name: Stage artifact
         run: |
           mkdir -p /tmp/artifacts
-          cp /tmp/coordinode_${VERSION}_${{ matrix.arch }}.deb /tmp/artifacts/
+          cp "/tmp/coordinode_${VERSION}_${{ matrix.arch }}.deb" /tmp/artifacts/
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
@@ -379,8 +379,8 @@ jobs:
           gh api repos/structured-world/repo/dispatches \
             --method POST \
             -f event_type=publish-from-coordinode \
-            -f client_payload[coordinode_run_id]="${{ github.run_id }}" \
-            -f client_payload[coordinode_repo]="${{ github.repository }}"
+            -f "client_payload[coordinode_run_id]=${{ github.run_id }}" \
+            -f "client_payload[coordinode_repo]=${{ github.repository }}"
 
   # Build per-platform images on native runners, then merge into a multi-arch manifest.
   # This avoids QEMU emulation (~90 min for arm64) — each platform builds natively (~15 min).
@@ -479,7 +479,14 @@ jobs:
 
       - name: Create and push multi-arch manifest
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # One `-t <tag>` pair per tag and one image reference per digest file,
+          # built as arrays so no value is split on whitespace or globbed.
+          args=()
+          while IFS= read -r tag; do
+            args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest in *; do
+            args+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${args[@]}"
         working-directory: /tmp/digests

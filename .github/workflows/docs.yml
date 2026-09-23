@@ -54,7 +54,7 @@ jobs:
           else
             echo "::notice::bench-data branch not present yet; using bench-results/ from main"
           fi
-          ls -R bench-results/ 2>/dev/null | head -30 || true
+          find bench-results/ 2>/dev/null | head -30 || true
 
       - uses: actions/setup-node@v6
         with:
