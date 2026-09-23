@@ -419,13 +419,47 @@ pub struct NodeRecord {
 
     /// Properties keyed by interned field ID.
     /// Values are MessagePack-compatible via `PropertyValue`.
+    #[serde(serialize_with = "serialize_sorted")]
     pub props: HashMap<u32, PropertyValue>,
 
     /// Overflow map for undeclared properties in VALIDATED schema mode.
     /// Uses string keys (no interning) to avoid polluting the field interner
     /// with ad-hoc property names. Empty/None in STRICT and FLEXIBLE modes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_sorted_opt"
+    )]
     pub extra: Option<HashMap<String, PropertyValue>>,
+}
+
+/// A property map serialised with its keys ascending, so equal records encode
+/// to equal bytes whatever the map's iteration order: the rule the edge
+/// property codec follows. It is still a MessagePack map and decodes as one.
+struct SortedProps<'a, K>(&'a HashMap<K, PropertyValue>);
+
+impl<K: Ord + Serialize> Serialize for SortedProps<'_, K> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Records usually carry a handful of properties; sorting them inline
+        // keeps the canonical order off the heap on the write path.
+        let mut entries: smallvec::SmallVec<[(&K, &PropertyValue); 16]> = self.0.iter().collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        serializer.collect_map(entries)
+    }
+}
+
+fn serialize_sorted<K: Ord + Serialize, S: serde::Serializer>(
+    map: &HashMap<K, PropertyValue>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    SortedProps(map).serialize(serializer)
+}
+
+fn serialize_sorted_opt<K: Ord + Serialize, S: serde::Serializer>(
+    map: &Option<HashMap<K, PropertyValue>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    map.as_ref().map(SortedProps).serialize(serializer)
 }
 
 /// A property value — alias for the full type system `Value` enum.

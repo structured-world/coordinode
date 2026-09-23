@@ -560,3 +560,66 @@ fn from_primary_key_is_deterministic_and_namespaced() {
     assert_eq!(a.origin_shard_hint(), 0);
     assert_eq!(a.sequence(), a.as_raw());
 }
+
+/// Equal records must encode to equal bytes. Properties live in hash maps
+/// whose iteration order differs between instances, so an encoder that walks
+/// the map as it lies makes two members compacting the same data disagree by
+/// checksum, and a byte scrub between replicas report damage that is not
+/// there. Here the same properties are inserted in opposite orders into maps
+/// of different capacity, which gives them different iteration orders.
+#[test]
+fn equal_records_encode_to_equal_bytes() {
+    let mut forward = NodeRecord::new("User");
+    let mut backward = NodeRecord::new("User");
+    backward.props.reserve(256);
+    for id in 0..32u32 {
+        forward.set(id, PropertyValue::Int(i64::from(id)));
+        forward.set_extra(format!("extra_{id}"), PropertyValue::Int(i64::from(id)));
+    }
+    for id in (0..32u32).rev() {
+        backward.set(id, PropertyValue::Int(i64::from(id)));
+        backward.set_extra(format!("extra_{id}"), PropertyValue::Int(i64::from(id)));
+    }
+    assert_eq!(forward, backward);
+
+    let bytes = forward.to_msgpack().expect("encode");
+    assert_eq!(bytes, backward.to_msgpack().expect("encode"));
+    // Canonical and still an ordinary map: it decodes to the same record.
+    assert_eq!(NodeRecord::from_msgpack(&bytes).expect("decode"), forward);
+}
+
+/// The canonical order is ascending field id for interned properties and
+/// ascending name for the overflow map, the same rule the edge property
+/// codec uses, so the bytes are fixed and not merely stable per build.
+#[test]
+fn record_properties_encode_in_ascending_key_order() {
+    let mut record = NodeRecord::new("User");
+    for id in [7u32, 1, 300, 42] {
+        record.set(id, PropertyValue::Bool(true));
+    }
+    for name in ["zeta", "alpha", "mid"] {
+        record.set_extra(name, PropertyValue::Bool(true));
+    }
+
+    let decoded: rmpv::Value =
+        rmpv::decode::read_value(&mut record.to_msgpack().expect("encode").as_slice())
+            .expect("valid msgpack");
+    // Compact struct encoding: [labels, props, extra].
+    let fields = decoded.as_array().expect("record is an array of fields");
+    let keys_of = |index: usize| -> Vec<rmpv::Value> {
+        fields[index]
+            .as_map()
+            .expect("a property map")
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    assert_eq!(
+        keys_of(1),
+        [1u32, 7, 42, 300].map(rmpv::Value::from).to_vec()
+    );
+    assert_eq!(
+        keys_of(2),
+        ["alpha", "mid", "zeta"].map(rmpv::Value::from).to_vec()
+    );
+}

@@ -219,16 +219,9 @@ proptest! {
     /// first match only, a set-add that must not, and a numeric increment
     /// that goes through an encode and a decode of the record at every split.
     ///
-    /// The comparison is of the decoded records, not of their bytes. The
-    /// engine asks for the stronger property, that repeated merging produce
-    /// identical bytes, and the record cannot give it today: `props` and
-    /// `extra` are hash maps, so a record with more than one property
-    /// serialises its keys in whatever order the table yields, and two
-    /// replicas that compacted differently hold different bytes for the same
-    /// document. That is its own defect, with its own consequences for
-    /// anything that compares records across nodes by their bytes, and it is
-    /// reported rather than asserted here; when the encoding is made
-    /// canonical, this assertion becomes the byte comparison it should be.
+    /// The comparison is of the bytes, which is what the engine asks for:
+    /// repeated merging must produce identical bytes, or two replicas that
+    /// compacted differently could not be compared by checksum.
     #[test]
     fn fuzz_document_partial_fold_matches_full(deltas in doc_deltas_strategy()) {
         let merger = DocumentMerge;
@@ -252,11 +245,8 @@ proptest! {
         }
         let incremental = base.expect("at least one delta");
 
-        let full_record = decode_node_record(&full).expect("decode the full fold");
-        let incremental_record =
-            decode_node_record(&incremental).expect("decode the incremental fold");
-        prop_assert_eq!(full_record, incremental_record,
-            "a compaction that folded a prefix of the chain must leave the same document");
+        prop_assert_eq!(&full[..], &incremental[..],
+            "a compaction that folded a prefix of the chain must leave the same bytes");
     }
 
     #[test]
