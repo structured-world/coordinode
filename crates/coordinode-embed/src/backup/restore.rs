@@ -507,7 +507,7 @@ fn write_edge_record(
 ///
 /// and writes directly to storage, preserving the original node ids so
 /// edges link to their endpoints. Property values are JSON literals (see
-/// `format_cypher_props`), parsed via the shared [`json_to_value`].
+/// `format_cypher_props`), parsed via the shared `json_to_value`.
 ///
 /// This is the round-trip path for CoordiNode's own cypher dumps. It is
 /// deliberately NOT a general OpenCypher importer: arbitrary external

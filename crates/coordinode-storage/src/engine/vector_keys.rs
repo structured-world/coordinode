@@ -29,7 +29,7 @@ const PREFIX_F32: &[u8; 4] = b"vec:";
 /// Total key length: `prefix(4) + label_id(4) + property_id(4) + node_id(8)`.
 pub const VECTOR_KEY_LEN: usize = 4 + 4 + 4 + 8;
 
-/// Encode a key for [`Partition::VectorF32`].
+/// Encode a key for [`Partition::VectorF32`](crate::engine::partition::Partition::VectorF32).
 pub fn encode_vec_f32_key(label_id: u32, property_id: u32, node_id: u64) -> [u8; VECTOR_KEY_LEN] {
     encode(PREFIX_F32, label_id, property_id, node_id)
 }

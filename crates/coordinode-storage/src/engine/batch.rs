@@ -93,7 +93,7 @@ impl Mutation {
 /// An atomic write batch with crash safety guarantees.
 ///
 /// Accumulates mutations, then applies them all at one seqno on `commit()`
-/// (allocating the seqno) or [`commit_at`](Self::commit_at) (caller-supplied
+/// (allocating the seqno) or, inside the crate, `commit_at` (caller-supplied
 /// seqno, the commit timestamp of a transaction).
 pub struct WriteBatch<'a> {
     engine: &'a StorageEngine,
