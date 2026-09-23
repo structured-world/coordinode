@@ -1,9 +1,9 @@
 //! Shard routing map: the per-label chunk-assignment table that resolves a
-//! routing key to its shard (R200, the shard-group coordinator's data model).
+//! routing key to its shard (the shard-group coordinator's data model).
 //!
 //! A label's keyspace is partitioned into contiguous half-open chunk ranges over
 //! a `u64` routing key (the NodeId, or `hash(prop)` / `range(prop)` per the
-//! label's [`PlacementPolicy`]). Each chunk maps to the [`ShardId`] that owns it.
+//! label's `PlacementPolicy`). Each chunk maps to the [`ShardId`] that owns it.
 //! The table is stored per label at `schema:chunks:<label>` (MessagePack) in the
 //! metadata Raft group, so every node resolves routing identically.
 //!

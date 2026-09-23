@@ -1,5 +1,5 @@
-//! Statistics store — incremental planner-statistics counters in
-//! [`Partition::Counter`].
+//! Statistics store: incremental planner-statistics counters in the storage
+//! engine's counter partition.
 //!
 //! Label cardinalities and the total node count were previously derived by a
 //! full scan + decode of the node partition on every statistics refresh.

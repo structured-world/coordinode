@@ -10,7 +10,7 @@
 //!   partitions: which local HNSW sub-index, within one label's vector index
 //!   on a single node, serves a vector. A [`PartitionId`] here is a local
 //!   `u32` index into a label's shard-HNSW vector, **not** a cluster
-//!   [`ShardId`]. This is index acceleration, not data placement.
+//!   [`ShardId`](crate::ShardId). This is index acceleration, not data placement.
 //!
 //! The CE default is [`SinglePartitionRouter`] (one partition, the Unsharded
 //! path, bit-identical to a non-partitioned index). The EE centroid router

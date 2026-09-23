@@ -374,7 +374,7 @@ pub struct HnswIndex {
     /// (f32 vector, SQ8 quantized, RaBitQ code) lives in the parallel
     /// `node_vectors` / `node_quantized` / `node_rabitq_codes` arrays so a
     /// search visit reads only the payload it actually needs. Before this
-    /// SoA split the whole `HnswNode` struct (id + 3× Option<Vec> + usize
+    /// SoA split the whole `HnswNode` struct (id + 3× `Option<Vec>` + usize
     /// = ~80 B) was loaded per visit; for a 1.18 M-node glove index that
     /// pulled ~90 MiB of mostly-unused metadata into L1/L2 during search.
     /// hnswlib's contiguous `data_level0_memory_` chose the opposite layout
@@ -897,9 +897,8 @@ impl HnswIndex {
 
     /// Check if the node at `idx` has an in-memory f32 vector.
     ///
-    /// Routed through [`Self::read_node_f32`] so the answer reflects every f32
-    /// store (the contiguous `data_level0` / `inline_layer0` blocks as well as
-    /// the legacy SoA), not just the SoA copy. Offloaded nodes (f32 on disk)
+    /// The answer reflects every f32 store (the contiguous `data_level0` /
+    /// `inline_layer0` blocks as well as the SoA copy). Offloaded nodes (f32 on disk)
     /// correctly report `false`.
     pub fn has_f32_vector(&self, idx: usize) -> bool {
         self.read_node_f32(idx).is_some()
@@ -907,8 +906,7 @@ impl HnswIndex {
 
     /// Get a reference to the f32 vector at node index `idx`, if present.
     ///
-    /// Reads from the contiguous f32 block first, falling back to the SoA copy
-    /// (see [`Self::read_node_f32`]).
+    /// Reads from the contiguous f32 block first, falling back to the SoA copy.
     pub fn get_vector(&self, idx: usize) -> Option<&[f32]> {
         self.read_node_f32(idx)
     }
@@ -1044,18 +1042,13 @@ impl HnswIndex {
     /// Insert a vector into the index.
     ///
     /// If the node `id` is already in the index, its vector is updated and its
-    /// graph position is rebuilt (G082 fix). This handles the `MATCH (n) SET
+    /// graph position is rebuilt. This handles the `MATCH (n) SET
     /// n.emb = $new_vec` path where `on_vector_written` calls `insert()` for
     /// both CREATE and SET.
     ///
-    /// Internally a two-phase operation since C2 (R858b):
-    /// 1. [`compute_insert_plan`] — read-only graph traversal that picks
-    ///    neighbours for each layer (no mutation, takes `&self`).
-    /// 2. [`apply_insert_plan`] — single-threaded mutation phase that
-    ///    publishes the new node + neighbour edges.
-    ///
-    /// Batch ingestion (next C2 day) parallelises step 1 across rayon
-    /// workers and then applies step 2 serially.
+    /// Internally two phases: a read-only graph traversal that picks the
+    /// neighbours for each layer, then a single-threaded mutation that
+    /// publishes the new node and its neighbour edges.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
         if let Some(&idx) = self.id_to_idx.get(&id) {
             // Node already indexed — update vector and reconnect in graph.
@@ -1213,8 +1206,7 @@ impl HnswIndex {
         bulk_build::bulk_build(self, items, false);
     }
 
-    /// Bulk-build then run an O6 BFS cache-locality reorder (see
-    /// [`reorder_for_cache_locality`](Self::reorder_for_cache_locality)).
+    /// Bulk-build then run a BFS cache-locality reorder.
     /// Renumbers nodes so graph-adjacent nodes are memory-adjacent, trading a
     /// one-off post-build pass for better search cache locality. Prefer this for
     /// read-heavy indexes built once and queried many times; use

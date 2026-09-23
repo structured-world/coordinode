@@ -98,7 +98,7 @@ fn list_buckets() -> Result<Response<Full<Bytes>>, String> {
     Ok(xml_response(StatusCode::OK, xml))
 }
 
-/// PUT /<bucket>/<key> — upload object as a blob.
+/// `PUT /<bucket>/<key>`: upload an object as a blob.
 async fn put_object(
     req: Request<Incoming>,
     engine: &StorageEngine,
@@ -153,7 +153,7 @@ async fn put_object(
     Ok(resp)
 }
 
-/// GET /<bucket>/<key> — download object.
+/// `GET /<bucket>/<key>`: download an object.
 fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>>, String> {
     let meta_key = s3_meta_key(path);
     let meta_bytes = engine
@@ -192,7 +192,7 @@ fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>
     Ok(resp)
 }
 
-/// DELETE /<bucket>/<key> — delete object.
+/// `DELETE /<bucket>/<key>`: delete an object.
 fn delete_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>>, String> {
     let meta_key = s3_meta_key(path);
     let meta_bytes = engine

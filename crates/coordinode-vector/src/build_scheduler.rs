@@ -50,7 +50,7 @@ pub enum Priority {
 ///
 /// Construct once at `coordinode-server` boot, share via `Arc` across
 /// `coordinode-storage`, `coordinode-cluster`, and `coordinode-vector` build
-/// entry points. Build code acquires a permit via [`acquire`] before
+/// entry points. Build code acquires a permit via [`Self::acquire`] before
 /// starting work; the permit's `Drop` releases the slot back to the bucket.
 ///
 /// # Concurrency model

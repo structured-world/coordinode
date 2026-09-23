@@ -1,6 +1,6 @@
-//! SQL query frontend (R650a).
+//! SQL query frontend.
 //!
-//! The second [`QueryFrontend`](crate::frontend::QueryFrontend) implementation:
+//! The second [`QueryFrontend`] implementation:
 //! it parses SQL with `sqlparser` and lowers the SQL AST **natively** into the
 //! same language-neutral [`LogicalPlan`] that Cypher lowers into — never a
 //! translation of SQL into Cypher. This validates that the planner / executor /

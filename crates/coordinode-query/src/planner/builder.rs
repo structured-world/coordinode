@@ -2438,11 +2438,11 @@ fn extract_literal_limit(count: &crate::plan::expr::Expr) -> Option<usize> {
     }
 }
 
-/// Planner pass implementing the **graph predicate push-down rule** from
-/// `arch/core/query-engine.md` § Graph Predicate Push-Down (R-PUSH1).
+/// Planner pass implementing the **graph predicate push-down rule**.
 ///
 /// Walks the plan tree bottom-up; for every `VectorFilter` whose upstream
-/// input contains a `Traverse`, computes a [`PushDownDecision`] and
+/// input contains a `Traverse`, computes a
+/// [`PushDownDecision`](crate::planner::push_down::PushDownDecision) and
 /// annotates the operator. The decision picks one of three strategies
 /// (graph-first / ACORN-filtered / vector-first) deterministically from
 /// the cost model.
@@ -2451,7 +2451,7 @@ fn extract_literal_limit(count: &crate::plan::expr::Expr) -> Option<usize> {
 /// tests): no plan emerging from this pass may contain a `VectorFilter`
 /// directly preceded by `Traverse` with `push_down == None`.
 ///
-/// Composes with [`optimize_edge_vector_search`] (runs before, may rewrite
+/// Composes with the edge-vector-search rewrite (runs before, may rewrite
 /// `VectorFilter` to `EdgeVectorSearch`) and [`annotate_vector_top_k`]
 /// (runs in parallel, independent dimension).
 pub fn optimize_push_down(

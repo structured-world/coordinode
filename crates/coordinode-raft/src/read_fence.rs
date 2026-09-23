@@ -167,7 +167,7 @@ pub enum ReadFenceError {
 
 /// Per-request read fence handle.
 ///
-/// Created via [`RaftNode::read_fence()`]. Apply before executing a query
+/// Created via [`RaftNode::read_fence()`](crate::cluster::RaftNode::read_fence). Apply before executing a query
 /// to enforce read preference and concern guarantees.
 ///
 /// ## Usage

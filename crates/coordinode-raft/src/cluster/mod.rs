@@ -395,7 +395,7 @@ impl RaftNode {
 
     /// Open a cluster-mode bootstrap node for embedding into an existing tonic server.
     ///
-    /// Unlike [`open_cluster`], this constructor does **not** start a dedicated
+    /// Unlike [`Self::open_cluster`], this constructor does **not** start a dedicated
     /// internal gRPC server. Instead it returns the [`RaftGrpcHandler`] for the
     /// caller to register into the main tonic router on `:7080`.
     ///
@@ -1237,16 +1237,18 @@ impl RaftNode {
     ///
     /// Returns a clone of the applied watermark receiver. The receiver
     /// delivers the latest applied log index whenever the state machine
-    /// advances. Used by [`ReadFence`] for causal read fencing.
+    /// advances. Used by [`ReadFence`](crate::read_fence::ReadFence) for causal
+    /// read fencing.
     pub fn subscribe_applied(&self) -> tokio::sync::watch::Receiver<u64> {
         self.applied_rx.clone()
     }
 
     /// Create a per-request read fence for enforcing read preference and concern.
     ///
-    /// The returned [`ReadFence`] is cheap to create — it clones a watch
-    /// receiver (pointer copy) and an Arc clone. Call [`ReadFence::apply()`]
-    /// before executing a query to enforce routing and consistency guarantees.
+    /// The returned [`ReadFence`](crate::read_fence::ReadFence) is cheap to
+    /// create: it clones a watch receiver (pointer copy) and an Arc. Call
+    /// [`ReadFence::apply()`](crate::read_fence::ReadFence::apply) before
+    /// executing a query to enforce routing and consistency guarantees.
     pub fn read_fence(&self) -> crate::read_fence::ReadFence {
         crate::read_fence::ReadFence::new(self.applied_rx.clone(), Arc::clone(&self.raft))
     }
@@ -1797,10 +1799,10 @@ pub struct JoinProgressEvent {
 impl RaftNode {
     /// Monitor replication lag for a Learner node and promote it to Voter when ready.
     ///
-    /// Called after the node has been added as a Learner via [`add_node`]. Polls
-    /// replication metrics every 500ms until lag drops below
+    /// Called after the node has been added as a Learner via [`Self::add_node`].
+    /// Polls replication metrics every 500ms until lag drops below
     /// `READINESS_LAG_THRESHOLD` (1 000 entries), then calls
-    /// [`change_membership`] to promote the node to a Voter.
+    /// [`Self::change_membership`] to promote the node to a Voter.
     ///
     /// Broadcasts [`JoinProgressEvent`] at each phase transition and every lag
     /// poll iteration so callers can stream progress to operators.
@@ -1808,8 +1810,8 @@ impl RaftNode {
     /// # Errors
     ///
     /// Returns [`RaftNodeError::Membership`] if `change_membership` fails.
-    /// The node remains a Learner on failure (no automatic rollback — caller
-    /// should call [`remove_node`] to clean up).
+    /// The node remains a Learner on failure (no automatic rollback; the caller
+    /// should call [`Self::remove_node`] to clean up).
     ///
     /// # Timeout
     ///

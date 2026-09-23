@@ -154,7 +154,7 @@ pub enum LogicalOp {
     },
 
     /// Traverse edges from a source node.
-    /// Produced from MATCH (a)-[:TYPE]->(b).
+    /// Produced from `MATCH (a)-[:TYPE]->(b)`.
     Traverse {
         input: Box<LogicalOp>,
         /// Source variable (must be in scope from input).
@@ -448,7 +448,7 @@ pub enum LogicalOp {
     /// DROP ENCRYPTED INDEX: remove an encrypted search index.
     DropEncryptedIndex { name: String },
 
-    /// CREATE [UNIQUE] [SPARSE] INDEX: create a B-tree index on a label property.
+    /// `CREATE [UNIQUE] [SPARSE] INDEX`: create a B-tree index on a label property.
     CreateIndex {
         name: String,
         label: String,
@@ -594,7 +594,9 @@ pub enum LogicalOp {
         /// traversal (no push-down applicable) or the optimizer pass was not
         /// invoked. The invariant contract test asserts that any plan with
         /// a `Traverse` directly preceding a `VectorFilter` carries
-        /// `Some(_)` here — see [`optimize_push_down`] and the regression
+        /// `Some(_)` here; see
+        /// [`optimize_push_down`](crate::planner::builder::optimize_push_down)
+        /// and the regression
         /// test `vector_filter_after_traverse_is_always_annotated`.
         push_down: Option<crate::planner::push_down::PushDownDecision>,
     },
@@ -792,7 +794,7 @@ pub enum LogicalOp {
         input: Box<LogicalOp>,
         /// Variable bound to a Document node whose HAS_CHUNK children get scored.
         doc_variable: String,
-        /// Query vector (or expression resolving to Vec<f32>).
+        /// Query vector (or expression resolving to `Vec<f32>`).
         query_vector: crate::plan::expr::Expr,
         /// α weight on max_chunk_score. Default 0.5.
         alpha: crate::plan::expr::Expr,

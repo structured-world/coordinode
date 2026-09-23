@@ -347,7 +347,7 @@ impl SegmentSink for SegmentInstaller {
     }
 }
 
-/// Failure modes of [`repair_partition`].
+/// Failure modes of [`SegmentInstaller::repair_partition`].
 #[derive(Debug, thiserror::Error)]
 pub enum RepairError {
     /// No reachable peer could serve the segment (all unreachable or none held
@@ -476,7 +476,7 @@ impl SegmentInstaller {
 
     /// Repair a corrupt partition with no healthy replica by rebuilding it from a
     /// local checkpoint plus oplog replay (the "WAL replay repair" fallback after
-    /// [`repair_partition`] returns [`RepairError::NoSource`]).
+    /// [`Self::repair_partition`] returns [`RepairError::NoSource`]).
     ///
     /// Opens `checkpoint_dir` read-only, exports the partition as of the
     /// checkpoint, drops the live (corrupt) tables, installs the checkpoint base,

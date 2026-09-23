@@ -341,7 +341,8 @@ impl ShardConsumerRegistry {
     /// `OplogEvents` consumers, or `u64::MAX` when none. The oplog manager
     /// keeps a segment iff its last index `>= ` this OR it is within the time
     /// window (logical OR — the time policy is the safety net for shards with
-    /// no CDC consumer). Raft-index space, distinct from [`shard_floor`].
+    /// no CDC consumer). Raft-index space, distinct from
+    /// [`shard_floor`](SeqnoConsumerRegistry::shard_floor).
     pub fn oplog_retention_floor(&self) -> u64 {
         self.core.oplog_index_floor.load(Ordering::Acquire)
     }

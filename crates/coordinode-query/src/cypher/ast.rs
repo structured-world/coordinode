@@ -312,7 +312,7 @@ pub struct DropEncryptedIndexClause {
     pub name: String,
 }
 
-/// CREATE [UNIQUE] [SPARSE] INDEX clause (B-tree single-field index).
+/// `CREATE [UNIQUE] [SPARSE] INDEX` clause (B-tree single-field index).
 ///
 /// Syntax: `CREATE [UNIQUE] [SPARSE] INDEX idx_name ON :Label(prop) [WHERE pred]`
 ///

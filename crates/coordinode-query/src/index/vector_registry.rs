@@ -236,8 +236,8 @@ impl VectorIndexRegistry {
     }
 
     /// Register a similarity-partitioned vector index: one empty HNSW graph per
-    /// partition, routed by `router`. The label is stored in [`Self::sharded`]
-    /// (not [`Self::indexes`]); the build path distributes vectors via
+    /// partition, routed by `router`. The label is stored with the partitioned
+    /// indexes, not the plain ones; the build path distributes vectors via
     /// [`VectorShardRouter::assign`] (closure replication may write a boundary
     /// vector to several partitions) and search scatter-gathers via
     /// [`VectorShardRouter::route`] (adaptive fan-out), merging by ascending

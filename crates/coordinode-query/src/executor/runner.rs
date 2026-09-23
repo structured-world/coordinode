@@ -643,7 +643,7 @@ pub struct ExecutionContext<'a> {
 impl<'a> ExecutionContext<'a> {
     /// Drain buffered HNSW inserts and apply them in one batched
     /// write per (label, property) index. The CREATE-row hot path
-    /// inside [`execute_create_node`] appends to
+    /// inside `execute_create_node` appends to
     /// `pending_vector_writes` instead of taking the HNSW write-lock
     /// per insert; the caller (`execute_cypher_impl`) calls this
     /// once after [`execute()`] returns to flush the batch.

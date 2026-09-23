@@ -327,7 +327,8 @@ impl GrpcPieceSource {
     ///
     /// `candidate` carries this peer's source-selection metadata (utilization,
     /// bandwidth, locality, tit-for-tat) from the caller's view. Must be called
-    /// from within a tokio runtime (it captures the current [`Handle`] for
+    /// from within a tokio runtime (it captures the current
+    /// [`Handle`](tokio::runtime::Handle) for
     /// [`fetch_piece`](PieceSource::fetch_piece)).
     ///
     /// # Errors

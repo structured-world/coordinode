@@ -262,8 +262,7 @@ impl SegmentManifest {
 
 /// Build a segment's [`SegmentManifest`] in a single streaming pass: encode each
 /// raw chunk, checksum the wire bytes, and fold the raw bytes into the total
-/// checksum — without materializing the encoded pieces. The source serves pieces
-/// on demand via [`PieceEncoding::encode`] over [`SegmentManifest::piece_range`].
+/// checksum, without keeping the encoded pieces.
 ///
 /// # Errors
 /// [`SwarmError::ZeroPieceSize`] if `piece_size == 0`.
@@ -290,9 +289,8 @@ pub fn build_manifest(
     })
 }
 
-/// Split a segment into encoded wire pieces plus its manifest. Materializes all
-/// pieces — a convenience for tests and small segments; the transport streams
-/// instead via [`build_manifest`] + on-demand [`PieceEncoding::encode`].
+/// Split a segment into encoded wire pieces plus its manifest. Every piece is
+/// held in memory; [`build_manifest`] computes the manifest alone without them.
 ///
 /// # Errors
 /// [`SwarmError::ZeroPieceSize`] if `piece_size == 0`.
