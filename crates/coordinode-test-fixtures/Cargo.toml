@@ -9,11 +9,10 @@ publish = false  # internal test fixture, not for crates.io
 
 [dependencies]
 coordinode-storage = { workspace = true }
-# Same package name + version as in coordinode-storage to ensure we
-# resolve to the same lsm-tree instance — different versions would
-# create two `Arc<dyn Fs>` types and the `MemFs` we hand to the
-# engine builder would be unusable.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5", default-features = false }
+# The workspace entry, as in coordinode-storage, so both resolve to the same
+# lsm-tree instance — different versions would create two `Arc<dyn Fs>` types
+# and the `MemFs` we hand to the engine builder would be unusable.
+lsm-tree = { workspace = true }
 tempfile = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 

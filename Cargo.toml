@@ -42,6 +42,11 @@ publish = false
 [workspace.dependencies]
 # Storage — coordinode-lsm-tree as crates.io dep (ADR-018), fjall consumed (ADR-019)
 # coordinode-lsm-tree remains as external crates.io dependency (ADR-018)
+# The floor is the oldest release the code actually needs (MergeOperator::
+# composes_operands, and manifests with more than 255 runs per level), not the
+# major: a consumer with its own lockfile otherwise keeps an older 5.x that
+# satisfies "5" and fails to build or to reopen a store.
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.2", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.25", features = ["serde"] }
