@@ -228,9 +228,9 @@ once_cell = { version = "1" }
 oneshot = { version = "0.1" }
 oorandom = { version = "11", default-features = false }
 opaque-debug = { version = "0.3", default-features = false }
-openraft = { version = "0.10.0-alpha.34", features = ["serde"] }
-openraft-rt = { version = "0.10.0-alpha.34" }
-openraft-rt-tokio = { version = "0.10.0-alpha.34" }
+openraft = { version = "0.10.0-alpha.35", features = ["serde"] }
+openraft-rt = { version = "0.10.0-alpha.35" }
+openraft-rt-tokio = { version = "0.10.0-alpha.35" }
 ordered-float-cdf1610d3e1514e9 = { package = "ordered-float", version = "5" }
 ordered-float-f595c2ba2a3f28df = { package = "ordered-float", version = "2" }
 ownedbytes = { version = "0.9", default-features = false }
@@ -279,6 +279,7 @@ protobuf-support = { version = "3", default-features = false }
 psm = { version = "0.1", default-features = false }
 quanta = { version = "0.12", default-features = false }
 quick-error = { version = "1", default-features = false }
+quorum-set = { version = "0.2", default-features = false }
 radix_trie = { version = "0.2", default-features = false }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
@@ -675,10 +676,10 @@ once_cell = { version = "1" }
 oneshot = { version = "0.1" }
 oorandom = { version = "11", default-features = false }
 opaque-debug = { version = "0.3", default-features = false }
-openraft = { version = "0.10.0-alpha.34", features = ["serde"] }
-openraft-macros = { version = "0.10.0-alpha.34", default-features = false }
-openraft-rt = { version = "0.10.0-alpha.34" }
-openraft-rt-tokio = { version = "0.10.0-alpha.34" }
+openraft = { version = "0.10.0-alpha.35", features = ["serde"] }
+openraft-macros = { version = "0.10.0-alpha.35", default-features = false }
+openraft-rt = { version = "0.10.0-alpha.35" }
+openraft-rt-tokio = { version = "0.10.0-alpha.35" }
 ordered-float-cdf1610d3e1514e9 = { package = "ordered-float", version = "5" }
 ordered-float-f595c2ba2a3f28df = { package = "ordered-float", version = "2" }
 ownedbytes = { version = "0.9", default-features = false }
@@ -743,6 +744,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 pulldown-cmark-to-cmark = { version = "22", default-features = false }
 quanta = { version = "0.12", default-features = false }
 quick-error = { version = "1", default-features = false }
+quorum-set = { version = "0.2", default-features = false }
 quote = { version = "1" }
 radix_trie = { version = "0.2", default-features = false }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
@@ -1168,8 +1170,8 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
@@ -1200,8 +1202,8 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_SystemInformation"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }

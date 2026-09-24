@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use coordinode_storage::oplog::{OplogEntry, OplogManager, OplogOp};
 
 use futures_util::stream::StreamExt;
-use openraft::entry::RaftPayload;
+use openraft::entry::RaftEntry;
 use openraft::storage::{IOFlushed, LogState, RaftLogStorage, RaftStateMachine};
 use openraft::{OptionalSend, RaftLogReader, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
@@ -117,8 +117,10 @@ pub type CommittedLeaderId = openraft::vote::leader_id_adv::CommittedLeaderId<u6
 pub type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 pub type LogId = openraft::LogId<CommittedLeaderId>;
 pub type Vote = openraft::impls::Vote<LeaderId>;
-pub type Entry =
-    openraft::impls::Entry<CommittedLeaderId, Request, u64, openraft::impls::BasicNode>;
+pub type Entry = openraft::impls::Entry<
+    CommittedLeaderId,
+    openraft::impls::EntryPayload<Request, u64, openraft::impls::BasicNode>,
+>;
 pub type SnapshotMeta =
     openraft::storage::SnapshotMeta<CommittedLeaderId, u64, openraft::impls::BasicNode>;
 pub type Snapshot = openraft::storage::Snapshot<
