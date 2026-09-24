@@ -7,6 +7,7 @@ pub(crate) mod compaction;
 pub mod config;
 pub mod coordinator;
 pub mod core;
+pub(crate) mod coverage;
 pub(crate) mod flush;
 pub mod merge;
 pub mod oplog_journal;

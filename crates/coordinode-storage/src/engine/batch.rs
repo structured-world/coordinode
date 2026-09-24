@@ -4,11 +4,11 @@
 //! A `WriteBatch` groups multiple mutations into a single logical unit. Every
 //! mutation in the batch lands at the SAME seqno, so an MVCC snapshot either
 //! sees the whole batch or none of it (ADR-016: seqno == commit_ts). Each
-//! partition group is handed to the tree as one lsm-tree batch, which holds
-//! the version-history guard for the whole insert: a concurrent memtable
-//! rotation cannot seal a memtable holding only a prefix of the batch, which
-//! is what keeps the oplog replay watermark ("a partition holds an entry iff
-//! its highest persisted seqno is at least the entry ts") sound.
+//! partition group's point writes are handed to the tree as one lsm-tree
+//! batch, which holds the version-history guard for the whole insert: a
+//! concurrent memtable rotation cannot seal a memtable holding only a prefix
+//! of it. A journalled commit puts its coverage marker in that batch, which is
+//! what lets recovery tell exactly which entries a partition holds.
 //!
 //! ## Crash Safety Invariant
 //!
@@ -28,6 +28,7 @@ use rayon::prelude::*;
 
 use crate::engine::config::FlushPolicy;
 use crate::engine::core::StorageEngine;
+use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;
 
@@ -228,6 +229,16 @@ impl<'a> WriteBatch<'a> {
     /// before it gets here, so the error marks a bug upstream, never a
     /// silent overwrite.
     pub(crate) fn commit_at(self, seqno: lsm_tree::SeqNo) -> StorageResult<()> {
+        self.commit_covered(seqno, None)
+    }
+
+    /// [`Self::commit_at`] that also records journal entry `cover` as applied
+    /// in every partition the batch touches, atomically with its effects.
+    pub(crate) fn commit_covered(
+        self,
+        seqno: lsm_tree::SeqNo,
+        cover: Option<u64>,
+    ) -> StorageResult<()> {
         if self.mutations.is_empty() {
             return Ok(());
         }
@@ -259,10 +270,10 @@ impl<'a> WriteBatch<'a> {
         if groups.len() >= 2 && mutations.len() >= PARALLEL_THRESHOLD {
             groups
                 .par_iter()
-                .try_for_each(|(&part, group)| apply_group(engine, part, group, seqno))?;
+                .try_for_each(|(&part, group)| apply_group(engine, part, group, seqno, cover))?;
         } else {
             for (&part, group) in &groups {
-                apply_group(engine, part, group, seqno)?;
+                apply_group(engine, part, group, seqno, cover)?;
             }
         }
 
@@ -284,18 +295,23 @@ impl<'a> WriteBatch<'a> {
     }
 }
 
-/// Apply one partition's group of a batch at `seqno`: the point operations go
-/// to the tree as a single lsm-tree batch (one version-history guard, one
-/// size accounting, no memtable rotation mid-batch); range tombstones follow
-/// at the same seqno.
+/// Apply one partition's group of a batch at `seqno`. Range tombstones go
+/// first; the point operations and the coverage marker for `cover` follow as
+/// one lsm-tree batch (one version-history guard, no memtable rotation
+/// mid-batch). Each tombstone is its own memtable insert, so a rotation can
+/// separate it from the point batch; with the marker last, the marker's
+/// memtable is sealed no earlier than any effect's, and a flush, which
+/// persists memtables as a prefix in seal order, never persists the marker
+/// without them. A re-applied tombstone at the same seqno is idempotent.
 fn apply_group(
     engine: &StorageEngine,
     part: Partition,
     group: &[&Mutation],
     seqno: lsm_tree::SeqNo,
+    cover: Option<u64>,
 ) -> StorageResult<()> {
     let tree = engine.tree(part)?;
-    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len());
+    let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
     for mutation in group {
         match mutation {
             Mutation::Put { key, value, .. } => batch.insert(key.as_slice(), value.as_slice()),
@@ -303,15 +319,18 @@ fn apply_group(
             Mutation::Merge { key, operand, .. } => {
                 batch.merge(key.as_slice(), operand.as_slice());
             }
-            Mutation::RemoveRange { .. } => {}
+            Mutation::RemoveRange { start, end, .. } => {
+                let start = coverage::clamp_user_start(start);
+                if start < end.as_slice() {
+                    tree.remove_range(start.to_vec(), end.clone(), seqno);
+                }
+            }
         }
+    }
+    if let Some(index) = cover {
+        batch.insert(coverage::marker_key(index).as_slice(), &[][..]);
     }
     tree.apply_batch(batch, seqno)?;
-    for mutation in group {
-        if let Mutation::RemoveRange { start, end, .. } = mutation {
-            tree.remove_range(start.clone(), end.clone(), seqno);
-        }
-    }
     Ok(())
 }
 

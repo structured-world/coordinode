@@ -193,29 +193,27 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
         // proposal to a RETAINED oplog before applying — this drives crash
         // recovery and WAL-replay-repair. Engines without a journal (plain
         // `open`, in-memory) fall through to the per-batch persist below.
+        // The journal append, the apply at commit_ts and the coverage marker
+        // that tells recovery this entry is in each partition it touched are
+        // one engine call.
         if self.engine.has_journal() {
             self.engine
-                .oplog_append(&proposal.mutations, proposal.commit_ts.as_raw())
-                .map_err(|e| ProposalError::Storage(format!("oplog append: {e}")))?;
-        }
-
-        // Apply the whole proposal to the memtables at one seqno, its
-        // commit_ts, matching the oplog entry stamped above: the journal's
-        // "an entry is durable in a partition iff the partition's highest
-        // persisted seqno is at least the entry ts" recovery rule holds only
-        // if every op of the entry carries exactly that seqno.
-        self.engine
-            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
-            .map_err(storage_to_proposal_err)?;
-
-        // ── Legacy durability path (no WAL) ──────────────────────────────────
-        // Without a WAL the only way to guarantee crash safety is a full SST
-        // flush after every proposal (atomic rename — no corruption possible).
-        // This is expensive but correct. Open with WAL to avoid this overhead.
-        if !self.engine.has_journal() && self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+                .commit_journaled(&proposal.mutations, proposal.commit_ts.as_raw())
+                .map_err(storage_to_proposal_err)?;
+        } else {
+            // The whole proposal lands at one seqno, its commit_ts.
             self.engine
-                .persist()
-                .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
+                .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
+                .map_err(storage_to_proposal_err)?;
+            // ── Legacy durability path (no WAL) ──────────────────────────────
+            // Without a WAL the only way to guarantee crash safety is a full SST
+            // flush after every proposal (atomic rename, no corruption possible).
+            // This is expensive but correct. Open with WAL to avoid this overhead.
+            if self.engine.flush_policy() == FlushPolicy::SyncPerBatch {
+                self.engine
+                    .persist()
+                    .map_err(|e| ProposalError::Storage(format!("persist failed: {e}")))?;
+            }
         }
 
         tracing::debug!(

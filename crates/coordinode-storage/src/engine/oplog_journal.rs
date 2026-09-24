@@ -8,22 +8,20 @@
 //! segment format the cluster Raft log uses, so the repair routine
 //! (`wal_replay_repair`) is shared between cluster and embedded.
 //!
-//! ## Why recovery needs no separate cursor
+//! ## What recovery replays
 //!
-//! Embedded engines open with the timestamp oracle, so every mutation's LSM
-//! seqno equals its commit_ts equals the [`OplogEntry`] `ts`. An entry is
-//! durable in a partition iff that partition's highest-persisted seqno is
-//! at least the entry ts. Recovery therefore replays only the entries whose
-//! `ts` exceeds a partition's persisted watermark — which is automatically
-//! correct even when the background flush worker persists memtables
-//! autonomously (a fixed index cursor would lag those flushes and risk
-//! double-applying a non-idempotent merge).
+//! An entry's `ts` is its MVCC version, not evidence that it is on disk: a
+//! commit that reserved its timestamp early can reach the memtable after a
+//! later one was flushed. Each partition tree therefore records, in-band,
+//! which journal indices it physically holds (see `engine::coverage`), and
+//! recovery replays entry `i` into partition `p` iff `p`'s record lacks `i`.
 
 use std::path::Path;
 
 use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::{AbstractTree, AnyTree};
 
+use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::error::StorageResult;
 use crate::oplog::convert::mutations_to_ops;
@@ -146,6 +144,18 @@ impl EmbeddedOplog {
         Ok(index)
     }
 
+    /// The index the next appended entry receives.
+    pub(crate) fn next_index(&self) -> u64 {
+        self.next_index
+    }
+
+    /// Never hand out an index below `floor`: an index the partition trees
+    /// already record as covered must not be reused after the segments that
+    /// held it were purged.
+    pub(crate) fn advance_next_index(&mut self, floor: u64) {
+        self.next_index = self.next_index.max(floor);
+    }
+
     /// All retained entries, ascending by index — for crash-recovery replay.
     pub(crate) fn read_all(&mut self) -> StorageResult<Vec<OplogEntry>> {
         self.manager.read_range(0, u64::MAX)
@@ -198,17 +208,18 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
     partition_from_wire_tag(tag)
 }
 
-/// Apply one entry's data ops for a single partition tree at the entry's
-/// commit_ts, as ONE tree batch: every op lands at the same seqno and the
-/// batch cannot straddle a memtable rotation, so the partition holds either
-/// the whole entry or none of it. Range tombstones follow at the same seqno.
-/// Non-data ops are no-ops.
+/// Replay one entry's data ops into a single partition tree at the entry's
+/// commit_ts, together with the entry's coverage marker, in the same order
+/// the commit path uses: range tombstones first, then the point ops and the
+/// marker as ONE tree batch, so a persisted marker implies every effect of
+/// the entry in this tree is persisted. Non-data ops are no-ops.
 pub(crate) fn apply_oplog_ops_at(
     tree: &AnyTree,
     ops: &[&OplogOp],
     seqno: u64,
+    index: u64,
 ) -> StorageResult<()> {
-    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len());
+    let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 1);
     for op in ops {
         match op {
             OplogOp::Insert { key, value, .. } => batch.insert(key.as_slice(), value.as_slice()),
@@ -216,22 +227,22 @@ pub(crate) fn apply_oplog_ops_at(
             OplogOp::Merge { key, operand, .. } => {
                 batch.merge(key.as_slice(), operand.as_slice());
             }
-            // Range tombstones are applied after the point batch below.
+            OplogOp::RemoveRange { start, end, .. } => {
+                let start = coverage::clamp_user_start(start);
+                if start < end.as_slice() {
+                    tree.remove_range(start.to_vec(), end.clone(), seqno);
+                }
+            }
             // Non-partition ops: Raft framing/heartbeats are not data, and
             // ColumnarInsert targets a columnar table tree (not a partition
             // tree), so it is replayed in a separate pass with the registry.
-            OplogOp::RemoveRange { .. }
-            | OplogOp::Noop
+            OplogOp::Noop
             | OplogOp::RaftEntry { .. }
             | OplogOp::RaftTruncation { .. }
             | OplogOp::ColumnarInsert { .. } => {}
         }
     }
+    batch.insert(coverage::marker_key(index).as_slice(), &[][..]);
     tree.apply_batch(batch, seqno)?;
-    for op in ops {
-        if let OplogOp::RemoveRange { start, end, .. } = op {
-            tree.remove_range(start.clone(), end.clone(), seqno);
-        }
-    }
     Ok(())
 }

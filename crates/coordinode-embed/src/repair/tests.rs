@@ -27,21 +27,20 @@ fn open(dir: &TempDir) -> Arc<StorageEngine> {
     Arc::new(StorageEngine::open_embedded(&durable_cfg(dir), oracle).expect("open_embedded"))
 }
 
-/// Journal a Put at a fresh commit_ts, then apply it (mirrors the embedded
-/// pipeline: oplog-first, then memtable).
-fn put(engine: &StorageEngine, oracle_ts: u64, part: PartitionId, key: &[u8], value: &[u8]) {
+/// Journal a Put at `commit_ts`, then apply it at that ts (the embedded
+/// pipeline's single call). The explicit ts lets a test tell entries apart by
+/// the ts it gave them.
+fn put(engine: &StorageEngine, commit_ts: u64, part: PartitionId, key: &[u8], value: &[u8]) {
     engine
-        .oplog_append(
+        .commit_journaled(
             &[Mutation::Put {
                 partition: part,
                 key: key.to_vec(),
                 value: value.to_vec(),
             }],
-            oracle_ts,
+            commit_ts,
         )
-        .expect("oplog_append")
-        .expect("journal active");
-    engine.put(Partition::from(part), key, value).expect("put");
+        .expect("commit_journaled");
 }
 
 /// XOR-corrupt several spread-out bytes in every SST table file beneath
@@ -533,13 +532,17 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
     );
 }
 
-/// A lossy open repair with a KNOWN lost span must be repaired range-scoped:
-/// only the lost key ranges are cleared and rebuilt from checkpoint + oplog,
-/// while untouched pre-checkpoint rows keep their original versions (their
-/// SSTs are not rewritten). A full-partition rebuild would re-put the base at
-/// fresh seqnos, so the original-snapshot read below is the discriminator.
+/// A lossy open repair whose lost span reaches the partition's apply-coverage
+/// record must take the FULL rebuild, even though the span is known. Every
+/// table a journalled commit flushes starts with its coverage markers, so a
+/// lost table takes some of them with it; the open then cannot tell which
+/// journal entries the surviving tables still hold, and replaying on a guess
+/// can apply a merge twice outside the lost span. Only clearing the partition
+/// and rebuilding it from checkpoint + oplog is exact. The full rebuild
+/// clears the partition's history, so the original-snapshot read below is
+/// refused where a scoped repair would still serve it.
 #[test]
-fn lossy_open_repair_with_known_span_repairs_only_the_lost_ranges() {
+fn lossy_open_repair_losing_the_coverage_record_rebuilds_in_full() {
     let dir = TempDir::new().expect("tempdir");
     let root = checkpoint_root(dir.path());
 
@@ -596,8 +599,8 @@ fn lossy_open_repair_with_known_span_repairs_only_the_lost_ranges() {
         "lossy open repair must be repaired: {report:?}"
     );
     assert!(
-        report.scoped.contains(&Partition::Node),
-        "a known lost span must be repaired range-scoped, not full: {report:?}"
+        !report.scoped.contains(&Partition::Node),
+        "a span that lost coverage markers must not be repaired range-scoped: {report:?}"
     );
     assert!(report.is_clean(), "{report:?}");
 
@@ -617,18 +620,14 @@ fn lossy_open_repair_with_known_span_repairs_only_the_lost_ranges() {
         Some(b"tail-B".as_slice())
     );
 
-    // The discriminator: base row 42's SST was never lost, so the pre-damage
-    // snapshot must still see it (its original version survives). A full
-    // rebuild re-puts the base at fresh post-repair seqnos, above that
-    // snapshot, and this read comes back empty.
-    let at_original_ts = engine
-        .prefix_scan_at(Partition::Node, b"node:0:00000042", snap_before_damage)
-        .expect("scan_at")
-        .count();
+    // The discriminator: a full rebuild clears the partition's history, so
+    // the pre-damage snapshot is no longer servable at all.
     assert!(
-        at_original_ts > 0,
-        "untouched base row must keep its original version (scoped repair \
-         must not rewrite SSTs outside the lost ranges)"
+        matches!(
+            engine.prefix_scan_at(Partition::Node, b"node:0:00000042", snap_before_damage),
+            Err(coordinode_storage::error::StorageError::SnapshotOutsideRetention { .. })
+        ),
+        "a full rebuild must have replaced the partition's history"
     );
 }
 

@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use lsm_tree::{AbstractTree, Guard};
 
 use super::{SeekableStorageIter, StorageIter};
+use crate::engine::coverage;
 use crate::engine::partition::Partition;
 use crate::engine::pending::PendingCommits;
 use crate::error::{StorageError, StorageResult};
@@ -899,7 +900,10 @@ impl LocalMultiModalCoordinator {
     ) -> StorageResult<lsm_tree::SeqNo> {
         let tree = self.tree(part)?;
         let seqno = self.seqno.next();
-        tree.remove_range(start.to_vec(), end.to_vec(), seqno);
+        let start = coverage::clamp_user_start(start);
+        if start < end {
+            tree.remove_range(start.to_vec(), end.to_vec(), seqno);
+        }
         Ok(seqno)
     }
 
@@ -965,7 +969,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
     fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         let seqno = self.seqno.get();
-        Ok(Box::new(tree.prefix(prefix, seqno, None)))
+        Ok(coverage::user_prefix(tree, prefix, seqno))
     }
 
     fn prefix_scan_at(
@@ -975,7 +979,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
         snapshot: lsm_tree::SeqNo,
     ) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
-        Ok(Box::new(tree.prefix(prefix, snapshot, None)))
+        Ok(coverage::user_prefix(tree, prefix, snapshot))
     }
 
     fn range_scan(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<StorageIter> {
@@ -985,7 +989,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
         // inclusive bounds map directly. Owned `Vec<u8>` so the bounds
         // outlive this call (lsm-tree borrows internally for the scan).
         let range = (
-            std::ops::Bound::Included(start.to_vec()),
+            std::ops::Bound::Included(coverage::clamp_user_start(start).to_vec()),
             std::ops::Bound::Included(end.to_vec()),
         );
         Ok(Box::new(tree.range(range, seqno, None)))
@@ -1002,7 +1006,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
         // Owned bounds outlive the call (lsm-tree borrows internally). The
         // returned `SeekableGuardIter` is already boxed by `range_seekable`.
         let range = (
-            std::ops::Bound::Included(start.to_vec()),
+            std::ops::Bound::Included(coverage::clamp_user_start(start).to_vec()),
             std::ops::Bound::Included(end.to_vec()),
         );
         Ok(tree.range_seekable(range, seqno, None))
@@ -1016,7 +1020,7 @@ impl MultiModalCoordinator for LocalMultiModalCoordinator {
     ) -> StorageResult<Vec<(Vec<u8>, bytes::Bytes)>> {
         let tree = self.tree(part)?;
         let mut results = Vec::new();
-        for guard in tree.prefix(prefix, *snapshot, None) {
+        for guard in coverage::user_prefix(tree, prefix, *snapshot) {
             let (key, value) = guard.into_inner()?;
             results.push((key.to_vec(), bytes::Bytes::copy_from_slice(&value)));
         }

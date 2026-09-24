@@ -1544,9 +1544,15 @@ impl<'a> Transaction<'a> {
             applied_index = outcome.applied_index;
         } else {
             // Direct-write path (no pipeline configured): the same single-seqno
-            // apply the pipelines perform, at this transaction's commit_ts.
-            self.engine
-                .apply_proposal_at(&mutations, commit_ts.as_raw())?;
+            // apply the pipelines perform, at this transaction's commit_ts,
+            // journalled first when the engine keeps a journal.
+            if self.engine.has_journal() {
+                self.engine
+                    .commit_journaled(&mutations, commit_ts.as_raw())?;
+            } else {
+                self.engine
+                    .apply_proposal_at(&mutations, commit_ts.as_raw())?;
+            }
         }
 
         // Released where the writes become local state, not where the caller

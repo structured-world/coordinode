@@ -71,6 +71,16 @@ pub enum StorageError {
          history that old may already be collected"
     )]
     SnapshotOutsideRetention { snapshot: u64, watermark: u64 },
+
+    /// The store has journal entries but no record of which of them its
+    /// partition trees physically hold, so replaying them could lose an
+    /// acknowledged write or apply a merge twice. Written by a release that
+    /// predates apply coverage; the store is left untouched.
+    #[error(
+        "store at {path} holds {entries} journal entries with no apply-coverage \
+         record; refusing to guess which of them are on disk"
+    )]
+    CoverageUnprovable { path: String, entries: usize },
 }
 
 impl From<lsm_tree::Error> for StorageError {

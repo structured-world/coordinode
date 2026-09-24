@@ -22,6 +22,7 @@ use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
+use crate::engine::coverage::{self, Coverage, TreeCoverage};
 use crate::engine::flush::FlushManager;
 use crate::engine::oplog_journal::{
     EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
@@ -162,6 +163,9 @@ pub struct StorageEngine {
     /// replay forward). In cluster mode this is `None` — the Raft log is the
     /// equivalent retained oplog (ADR-017).
     oplog: Option<Arc<Mutex<EmbeddedOplog>>>,
+    /// Which journal indices are applied, and the last fold of them into the
+    /// partition trees' coverage records. `Some` exactly when `oplog` is.
+    coverage: Option<Coverage>,
     /// The timestamp oracle this engine stamps writes with. `Some` only
     /// when opened via [`StorageEngine::open_with_oracle`]. Exposed via
     /// [`StorageEngine::oracle`] so subsystems applying externally
@@ -258,10 +262,20 @@ impl OpenRepair {
     /// ([`StorageEngine::repair_partition_ranges_from_checkpoint`]) instead
     /// of a full one. `None` when any excluded table's coverage never parsed
     /// (`unknowable_losses`): no key bound can prove a retained row is
-    /// unaffected, so only a full rebuild is sound.
+    /// unaffected, so only a full rebuild is sound. Also `None` when a loss
+    /// reaches the partition's apply-coverage record: without it the open
+    /// could not tell which journal entries the rest of the tree holds.
     #[must_use]
     pub fn scoped_ranges(&self) -> Option<Vec<KeyRange>> {
         if !self.report.unknowable_losses.is_empty() {
+            return None;
+        }
+        if self
+            .report
+            .lost_coverage
+            .iter()
+            .any(|(_, min, _, _)| coverage::is_reserved(min))
+        {
             return None;
         }
         Some(
@@ -503,35 +517,58 @@ impl StorageEngine {
 
         // ── Embedded oplog journal: open + crash recovery ────────────────────
         // Oracle-backed standalone engines journal every proposal to a RETAINED
-        // oplog (replacing the legacy per-batch persist()). On open, replay the
-        // entries that are not yet durable in their partition — entry.ts > that
-        // partition's highest seqno — applying each at seqno = entry.ts. Because
-        // the oracle makes seqno == commit_ts == entry.ts, this is correct even
-        // when the background flush worker persisted memtables on its own (a
-        // fixed index cursor would lag those flushes and could double-apply a
-        // non-idempotent merge). The replay must precede the seqno restore below
-        // so the restored watermark covers the replayed entries.
+        // oplog. Each partition tree records, in-band, which journal indices it
+        // physically holds (`engine::coverage`); on open, entry i is replayed
+        // into partition p iff p's record lacks i, at seqno = entry.ts, with
+        // its marker. A commit's ts is its MVCC version, not its position on
+        // disk: a late-finalized commit can sit in a memtable behind a flushed
+        // newer one, so no seqno comparison can stand in for the record. The
+        // replay precedes the seqno restore below so the restored watermark
+        // covers the replayed entries.
         //
         // Columnar tables live outside the partition trees and their registry is
         // built further below, so columnar ops are collected here and replayed
         // in a second pass once the registry exists.
         #[cfg(feature = "columnar")]
         let mut columnar_replay: Vec<(String, Vec<u8>, Vec<u8>, u64)> = Vec::new();
+        // `Some(next)` when a journal exists and its store carries no coverage
+        // record yet (a fresh store): the base covering every index below
+        // `next` is written once the seqno is restored.
+        let mut establish_coverage: Option<u64> = None;
         let oplog = match journal_config {
             Some(jcfg) => match config.select_oplog_endpoint(0) {
                 Ok(endpoint) => {
-                    use lsm_tree::AbstractTree;
                     let dir = endpoint.path.join("oplog").join("0");
                     let mut journal = EmbeddedOplog::open(&dir, 0, &jcfg)?;
                     let entries = journal.read_all()?;
+                    let mut covered: HashMap<Partition, TreeCoverage> =
+                        HashMap::with_capacity(trees.len());
+                    for (&part, tree) in &trees {
+                        covered.insert(part, TreeCoverage::read(tree)?);
+                    }
+                    if !covered.values().any(TreeCoverage::has_record) {
+                        if !entries.is_empty() {
+                            return Err(StorageError::CoverageUnprovable {
+                                path: dir.display().to_string(),
+                                entries: entries.len(),
+                            });
+                        }
+                        establish_coverage = Some(journal.next_index());
+                    }
+                    // An index a tree records as covered is never handed out
+                    // again, even when the segments that held it are gone.
+                    journal.advance_next_index(
+                        covered
+                            .values()
+                            .map(TreeCoverage::next_uncovered)
+                            .max()
+                            .unwrap_or(0),
+                    );
                     let mut replayed = 0usize;
                     for entry in &entries {
                         // Group the entry's data ops per partition so each
-                        // partition receives them as ONE batch at the entry's
-                        // ts: the watermark test below is per partition, and
-                        // the batch apply cannot straddle a memtable rotation,
-                        // so a partition either holds the whole entry or none
-                        // of it (the invariant `is_durable` relies on).
+                        // partition receives them as one batch at the entry's
+                        // ts, with the entry's marker last.
                         let mut per_partition: HashMap<Partition, Vec<&OplogOp>> = HashMap::new();
                         for op in &entry.ops {
                             #[cfg(feature = "columnar")]
@@ -560,8 +597,9 @@ impl StorageEngine {
                                     name: part.name().to_string(),
                                 }
                             })?;
-                            if entry.ts > tree.get_highest_seqno().unwrap_or(0) {
-                                apply_oplog_ops_at(tree, &ops, entry.ts)?;
+                            let holds = covered.get(&part).is_some_and(|c| c.contains(entry.index));
+                            if !holds {
+                                apply_oplog_ops_at(tree, &ops, entry.ts, entry.index)?;
                                 replayed += ops.len();
                             }
                         }
@@ -575,7 +613,7 @@ impl StorageEngine {
                             tree.flush_active_memtable(0)?;
                         }
                     }
-                    Some(Arc::new(Mutex::new(journal)))
+                    Some(journal)
                 }
                 // No oplog-eligible (Durable/Degraded) endpoint — in-memory /
                 // no-persistence config. Durability is best-effort; no journal.
@@ -621,6 +659,27 @@ impl StorageEngine {
                 seqno.fetch_max(first_servable);
             }
         }
+
+        // A fresh journalled store gets its coverage record before it accepts
+        // a write, and the record is made durable at once: a store with
+        // journal entries and no record is one whose coverage cannot be
+        // proven, and is refused on the next open.
+        if let Some(next) = establish_coverage {
+            let at = seqno.next();
+            for tree in trees.values() {
+                crate::engine::coverage::write_fold(tree, next, next, at);
+            }
+            for tree in trees.values() {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+        let (oplog, coverage) = match oplog {
+            Some(journal) => {
+                let coverage = Coverage::new(journal.next_index());
+                (Some(Arc::new(Mutex::new(journal))), Some(coverage))
+            }
+            None => (None, None),
+        };
 
         // Open tiered cache if configured.
         let tiered_cache = if config.cache.is_enabled() {
@@ -818,6 +877,7 @@ impl StorageEngine {
             capacity_scanner,
             partition_l0_endpoint,
             oplog,
+            coverage,
             oracle,
             #[cfg(feature = "columnar")]
             columnar_tables,
@@ -912,14 +972,22 @@ impl StorageEngine {
         // so they carry a table-id-tagged ColumnarInsert op routed back to the
         // table registry on recovery. No journal (cluster mode / plain open /
         // in-memory) → durability follows the tree's own flush, as before.
-        if let Some(oplog) = &self.oplog {
-            let mut guard = oplog
-                .lock()
-                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
-            guard.append_columnar(table_id, &key, &value, seqno)?;
-        }
+        let index = match &self.oplog {
+            Some(oplog) => {
+                let mut guard = oplog
+                    .lock()
+                    .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+                Some(guard.append_columnar(table_id, &key, &value, seqno)?)
+            }
+            None => None,
+        };
         let tree = self.columnar_tables.create_or_open(table_id)?;
         tree.insert(key, value, seqno);
+        // The entry touches no partition tree, so it is covered in every one
+        // of them; leaving it unmarked would stall the applied prefix.
+        if let (Some(index), Some(coverage)) = (index, &self.coverage) {
+            self.note_applied(coverage, index);
+        }
         Ok(())
     }
 
@@ -1156,7 +1224,30 @@ impl StorageEngine {
                 self.apply_repair_op(partition, op)?;
             }
         }
+        self.rebind_coverage(partition)?;
         Ok(base_len)
+    }
+
+    /// After a rebuild replayed the journal into `partition` up to its end,
+    /// record in the partition's tree that it holds every applied entry. The
+    /// clear removed its old record, and the replayed ops carry none.
+    ///
+    /// Precondition: no commit is in flight, so every journal entry is
+    /// applied and the rebuild replayed all of them.
+    fn rebind_coverage(&self, partition: Partition) -> StorageResult<()> {
+        let Some(coverage) = &self.coverage else {
+            return Ok(());
+        };
+        let tree = self.tree(partition)?;
+        let (next, above) = coverage.applied_snapshot();
+        // Written after the rebuilt data, so a persisted record implies the
+        // data it covers is persisted.
+        let at = self.next_seqno();
+        tree.insert(coverage::BASE_KEY, coverage::encode_base(next), at);
+        for index in above {
+            tree.insert(coverage::marker_key(index).as_slice(), &[][..], at);
+        }
+        Ok(())
     }
 
     /// Apply one journal op during a checkpoint rebuild (shared by the full
@@ -1329,26 +1420,23 @@ impl StorageEngine {
     /// Independently of the time window and the index floor, a segment
     /// holding any entry whose write is not yet persisted in its partition
     /// tree (the journal is its only copy) always survives the purge:
-    /// dropping it would silently lose the write on the next crash.
+    /// dropping it would silently lose the write on the next crash. Durable
+    /// means covered by a coverage base that is itself on disk: the purge
+    /// folds the applied prefix into every tree and flushes them first.
     pub fn oplog_purge_expired(&self, now_secs: u64, keep_from_index: u64) -> StorageResult<usize> {
-        use lsm_tree::AbstractTree;
-
-        match &self.oplog {
-            None => Ok(0),
-            Some(oplog) => {
-                // Per-partition persisted watermarks: everything at or below
-                // a tree's highest persisted seqno is durable in its SSTs (a
-                // flush persists the whole memtable prefix). A partition with
-                // data only in its memtable answers 0, keeping every one of
-                // its journal entries.
-                let mut persisted: HashMap<Partition, u64> = HashMap::new();
-                for &part in Partition::all() {
-                    let tree = self.tree(part)?;
-                    persisted.insert(part, tree.get_highest_persisted_seqno().unwrap_or(0));
-                }
+        match (&self.oplog, &self.coverage) {
+            (Some(oplog), Some(coverage)) => {
+                let durable_below = {
+                    let mut folded = coverage.lock_folded();
+                    let next = self.fold_coverage(coverage, &mut folded);
+                    // The flush persists every memtable sealed so far, and
+                    // with it the base just written.
+                    self.persist()?;
+                    next
+                };
                 let is_durable = |entry: &OplogEntry| -> bool {
                     entry.ops.iter().all(|op| match op_partition(op) {
-                        Some(part) => entry.ts <= persisted.get(&part).copied().unwrap_or(0),
+                        Some(_) => entry.index < durable_below,
                         // Columnar rows live outside the partition trees:
                         // check the table's own tree when the registry knows
                         // it, otherwise keep the entry (fail-safe).
@@ -1373,6 +1461,7 @@ impl StorageEngine {
                     .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
                 guard.purge_expired(now_secs, keep_from_index, &is_durable)
             }
+            _ => Ok(0),
         }
     }
 
@@ -1866,6 +1955,75 @@ impl StorageEngine {
     /// canonicalises each key to one final operation, so this marks an
     /// upstream bug rather than silently ordering the pair.
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        self.apply_proposal_covered(mutations, commit_ts, None)
+    }
+
+    /// Journal one committed proposal, then apply it at `commit_ts` together
+    /// with its coverage marker: the write path of an engine opened with a
+    /// retained journal ([`Self::open_embedded`]). The journal append is
+    /// ordered and fsynced; the apply runs outside the journal lock, so
+    /// proposals may reach the memtables in a different order than their
+    /// indices, which is exactly what per-index coverage makes safe.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidConfig`] when the engine has no journal; the
+    /// errors of [`Self::apply_proposal_at`] otherwise. An entry that was
+    /// journalled but failed to apply stays uncovered and is replayed on the
+    /// next open.
+    pub fn commit_journaled(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
+            return Err(StorageError::InvalidConfig(
+                "commit_journaled on an engine without a retained journal".into(),
+            ));
+        };
+        let index = {
+            let mut guard = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?;
+            guard.append(mutations, commit_ts)?
+        };
+        self.apply_proposal_covered(mutations, commit_ts, Some(index))?;
+        self.note_applied(coverage, index);
+        Ok(())
+    }
+
+    /// Record journal entry `index` as applied everywhere it lands, folding
+    /// the accumulated markers when enough have built up. The fold runs on
+    /// the committing thread unless another one is already folding.
+    fn note_applied(&self, coverage: &Coverage, index: u64) {
+        if coverage.mark_applied(index) {
+            if let Some(mut folded) = coverage.try_lock_folded() {
+                self.fold_coverage(coverage, &mut folded);
+            }
+        }
+    }
+
+    /// Fold every applied index below the applied prefix into each partition
+    /// tree's coverage base, removing the markers it replaces. Returns the
+    /// base now written to every tree.
+    fn fold_coverage(&self, coverage: &Coverage, folded: &mut coverage::FoldGuard<'_>) -> u64 {
+        let next = coverage.applied_prefix();
+        let from = folded.folded();
+        if next <= from {
+            return from;
+        }
+        // Above every marker below `next`: each of those entries drew its
+        // commit_ts from this generator before it was applied.
+        let at = self.next_seqno();
+        for tree in self.coordinator.trees().values() {
+            coverage::write_fold(tree, from, next, at);
+        }
+        folded.set_folded(next);
+        next
+    }
+
+    fn apply_proposal_covered(
+        &self,
+        mutations: &[Mutation],
+        commit_ts: u64,
+        cover: Option<u64>,
+    ) -> StorageResult<()> {
         if mutations.is_empty() {
             return Ok(());
         }
@@ -1896,7 +2054,7 @@ impl StorageEngine {
             (Some(_), ts) if ts > 0 => ts,
             _ => self.next_seqno(),
         };
-        batch.commit_at(seqno)?;
+        batch.commit_covered(seqno, cover)?;
         if let Some(oracle) = &self.oracle {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(seqno));
             // The commit path is the retention window's clock tick: with the
@@ -2085,20 +2243,16 @@ impl StorageEngine {
             tree.flush_active_memtable(0)?;
         }
         // The retained oplog journal is NOT truncated on flush — it must survive
-        // for WAL-replay-repair, and crash recovery skips already-durable entries
-        // via the seqno watermark (see `open_embedded`).
+        // for WAL-replay-repair, and crash recovery skips the entries each
+        // partition's coverage record already holds (see `open_embedded`).
         Ok(())
     }
 
-    /// Append a proposal's mutations to the retained oplog journal stamped at
-    /// `commit_ts`, before they are applied to the memtable.
-    ///
-    /// Called by `OwnedLocalProposalPipeline` on engines opened via
-    /// [`open_embedded`](Self::open_embedded). The journal is retained (not
-    /// truncated on flush) so it drives both crash recovery and
-    /// WAL-replay-repair. Returns `Some(index)` if a record was written, `None`
-    /// when no journal is configured (cluster mode, plain `open`, or in-memory).
-    pub fn oplog_append(
+    /// Journal a proposal without applying it, leaving the journal as its
+    /// only copy. Returns `Some(index)` if a record was written, `None` when
+    /// no journal is configured.
+    #[cfg(test)]
+    pub(crate) fn oplog_append(
         &self,
         mutations: &[Mutation],
         commit_ts: u64,
@@ -2262,7 +2416,7 @@ impl StorageEngine {
     pub fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         let seqno = self.coordinator.current_seqno();
-        Ok(Box::new(tree.prefix(prefix, seqno, None)))
+        Ok(coverage::user_prefix(tree, prefix, seqno))
     }
 
     /// Whether this store holds any data of its own: one live key under any
@@ -2294,7 +2448,7 @@ impl StorageEngine {
     pub fn prefix_scan_rev(&self, part: Partition, prefix: &[u8]) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         let seqno = self.coordinator.current_seqno();
-        Ok(Box::new(tree.prefix(prefix, seqno, None).rev()))
+        Ok(Box::new(coverage::user_prefix(tree, prefix, seqno).rev()))
     }
 
     /// Keys touched (written, merged, or deleted) at or after `since_seqno`
@@ -2330,7 +2484,16 @@ impl StorageEngine {
                 | ScanSinceEvent::MergeOperand { key, .. }
                 | ScanSinceEvent::PointTombstone { key, .. }
                 | ScanSinceEvent::WeakTombstone { key, .. } => {
-                    keys.push(key.to_vec());
+                    if !coverage::is_reserved(&key) {
+                        keys.push(key.to_vec());
+                    }
+                    Ok(())
+                }
+                // The coverage fold's tombstone lies wholly in the reserved
+                // namespace and touches no user key.
+                ScanSinceEvent::RangeTombstone { end_key, .. }
+                    if end_key.as_ref() <= coverage::USER_KEYSPACE_START =>
+                {
                     Ok(())
                 }
                 // CoordiNode's Mutation set is Put / Delete / Merge only — it
@@ -2375,7 +2538,7 @@ impl StorageEngine {
     ) -> StorageResult<StorageIter> {
         self.check_snapshot_retained(seqno)?;
         let tree = self.tree(part)?;
-        Ok(Box::new(tree.prefix(prefix, seqno, None)))
+        Ok(coverage::user_prefix(tree, prefix, seqno))
     }
 
     /// Inclusive-bounded range scan: yields entries with keys `K` such
@@ -2556,7 +2719,7 @@ impl StorageEngine {
     ) -> StorageResult<StorageIter> {
         self.check_snapshot_retained(*snapshot)?;
         let tree = self.tree(part)?;
-        Ok(Box::new(tree.prefix(prefix, *snapshot, None)))
+        Ok(coverage::user_prefix(tree, prefix, *snapshot))
     }
 
     /// The version of a record: the timestamp of the commit that last wrote

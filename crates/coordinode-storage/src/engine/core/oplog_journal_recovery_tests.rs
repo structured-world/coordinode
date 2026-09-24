@@ -5,12 +5,10 @@
 //!   open_embedded → verify the un-flushed tail is replayed from the journal.
 //!
 //! They mimic `OwnedLocalProposalPipeline`: a commit_ts is drawn from the
-//! oracle, the mutations are journalled at that ts, then applied to the
-//! memtables as ONE batch at exactly that ts (`apply_proposal_at`, the same
-//! call the real pipeline makes). The recovery rule under test is `entry.ts >
-//! partition.highest_persisted_seqno`, which must replay only the entries that
-//! did not reach an SST; it is sound only because every op of an entry
-//! carries the entry's ts.
+//! oracle and the proposal goes through `commit_journaled`, the same call the
+//! real pipeline makes (journal, then apply at that ts with the coverage
+//! marker). The recovery rule under test is per-partition coverage: an entry
+//! is replayed into a partition iff that partition's record lacks its index.
 
 use std::sync::Arc;
 
@@ -42,12 +40,8 @@ fn write_batch(
 ) -> u64 {
     let commit_ts = oracle.next().as_raw();
     engine
-        .oplog_append(mutations, commit_ts)
-        .expect("oplog_append")
-        .expect("journal active");
-    engine
-        .apply_proposal_at(mutations, commit_ts)
-        .expect("apply_proposal_at");
+        .commit_journaled(mutations, commit_ts)
+        .expect("commit_journaled");
     commit_ts
 }
 
@@ -101,9 +95,8 @@ fn multi_partition_entry_replays_as_one_batch_at_its_ts() {
     // One journal entry spanning three partitions and a merge operand must
     // come back from replay exactly as it was committed: every op visible at a
     // snapshot one past the entry's ts, none of them at the ts itself, on
-    // every partition. This pins the single-seqno contract across a crash,
-    // which the recovery watermark (`entry.ts > highest persisted seqno`)
-    // relies on to never skip a partially replayed entry.
+    // every partition. This pins the single-seqno MVCC contract across a
+    // crash: a replayed entry is as atomic to a reader as a live one.
     let dir = TempDir::new().expect("temp dir");
     let mutations = [
         Mutation::Put {
@@ -319,6 +312,508 @@ fn merge_replayed_once_not_doubled() {
             "a replayed merge must apply exactly once (byte-identical to a single clean apply)"
         );
     }
+}
+
+/// A store whose "power" can be cut: writes go through a fault injector over a
+/// crash simulator. Dropping an engine flushes its memtables, so a plain drop
+/// is a clean shutdown, not a crash; [`PowerRig::cut`] first makes every write
+/// and sync fail, so that last flush never reaches the disk, then rolls every
+/// file back to its last fsync.
+struct PowerRig {
+    dir: TempDir,
+    crash: Arc<lsm_tree::fs::CrashFs>,
+    faults: Arc<lsm_tree::fs::FaultInjector>,
+    fs: Arc<dyn lsm_tree::fs::Fs>,
+}
+
+impl PowerRig {
+    fn new() -> Self {
+        let dir = TempDir::new().expect("temp dir");
+        let crash = Arc::new(lsm_tree::fs::CrashFs::new(lsm_tree::fs::StdFs));
+        let faults = Arc::new(lsm_tree::fs::FaultInjector::new());
+        let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::FaultFs::with_injector(
+            lsm_tree::fs::CrashFs::clone(&crash),
+            Arc::clone(&faults),
+        ));
+        Self {
+            dir,
+            crash,
+            faults,
+            fs,
+        }
+    }
+
+    fn config(&self) -> StorageConfig {
+        durable_cfg(&self.dir).with_fs(Arc::clone(&self.fs))
+    }
+
+    fn open(&self) -> (StorageEngine, Arc<TimestampOracle>) {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine = StorageEngine::open_embedded(&self.config(), oracle.clone()).expect("open");
+        (engine, oracle)
+    }
+
+    /// Lose power: nothing written from now on is durable, the engine goes
+    /// away, and every file falls back to what was fsynced before the cut.
+    fn cut(&self, engine: StorageEngine) {
+        use lsm_tree::fs::{Fault, FaultOp, FaultRule};
+        let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+        for op in [
+            FaultOp::Open,
+            FaultOp::Write,
+            FaultOp::SyncAll,
+            FaultOp::SyncData,
+            FaultOp::Rename,
+        ] {
+            self.faults.arm(FaultRule::new(op, refuse));
+        }
+        drop(engine);
+        self.faults.clear();
+        self.crash.crash();
+    }
+}
+
+/// Journal and apply `mutations` at an explicit `commit_ts`, the way a late
+/// finalize does: the timestamp was reserved earlier than a commit that
+/// already landed, so the physical apply follows a larger timestamp.
+fn write_batch_at(engine: &StorageEngine, mutations: &[Mutation], commit_ts: u64) {
+    engine
+        .commit_journaled(mutations, commit_ts)
+        .expect("commit_journaled");
+}
+
+#[test]
+fn late_finalize_behind_a_flushed_newer_commit_survives_a_crash() {
+    // T100 reserves its timestamp first; T200 commits and reaches an SST;
+    // then T100 finalizes into the memtable only. A partition's highest
+    // persisted seqno is now 200, so a recovery that trusts it as coverage
+    // skips T100 and loses an acknowledged write.
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let t100 = oracle.next().as_raw();
+        let t200 = oracle.next().as_raw();
+        write_batch_at(
+            &engine,
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:0200".to_vec(),
+                value: b"t200".to_vec(),
+            }],
+            t200,
+        );
+        engine.persist().expect("persist t200");
+        write_batch_at(
+            &engine,
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:0100".to_vec(),
+                value: b"t100".to_vec(),
+            }],
+            t100,
+        );
+        // Power loss: T100 is only in the journal.
+        rig.cut(engine);
+    }
+
+    let (engine, _) = rig.open();
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:00:0100")
+            .expect("get")
+            .as_deref(),
+        Some(b"t100".as_slice()),
+        "the late-finalized commit must be replayed"
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:00:0200")
+            .expect("get")
+            .as_deref(),
+        Some(b"t200".as_slice()),
+        "the flushed newer commit must survive"
+    );
+}
+
+#[test]
+fn late_finalized_merge_is_replayed_exactly_once() {
+    // The same late-finalize order with a non-idempotent merge on the key the
+    // flushed commit also merged into: skipping it loses an edge, replaying the
+    // flushed one as well doubles it. Only exact coverage gets both right.
+    let key = b"adj:R:out:42".to_vec();
+    let first = crate::engine::merge::encode_add(1);
+    let second = crate::engine::merge::encode_add(2);
+
+    // Reference: both operands applied once each, with no crash.
+    let reference = {
+        let ref_dir = TempDir::new().expect("temp dir");
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&ref_dir), oracle.clone()).expect("open");
+        let t100 = oracle.next().as_raw();
+        let t200 = oracle.next().as_raw();
+        for (operand, ts) in [(&second, t200), (&first, t100)] {
+            write_batch_at(
+                &engine,
+                &[Mutation::Merge {
+                    partition: PartitionId::Adj,
+                    key: key.clone(),
+                    operand: operand.clone(),
+                }],
+                ts,
+            );
+        }
+        engine.persist().expect("persist");
+        engine
+            .get(Partition::Adj, &key)
+            .expect("get")
+            .map(|v| v.to_vec())
+    };
+
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let t100 = oracle.next().as_raw();
+        let t200 = oracle.next().as_raw();
+        write_batch_at(
+            &engine,
+            &[Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: key.clone(),
+                operand: second.clone(),
+            }],
+            t200,
+        );
+        engine.persist().expect("persist t200");
+        write_batch_at(
+            &engine,
+            &[Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: key.clone(),
+                operand: first.clone(),
+            }],
+            t100,
+        );
+        rig.cut(engine);
+    }
+
+    let (engine, _) = rig.open();
+    assert_eq!(
+        engine
+            .get(Partition::Adj, &key)
+            .expect("get")
+            .map(|v| v.to_vec()),
+        reference,
+        "each merge operand must be applied exactly once after recovery"
+    );
+}
+
+#[test]
+fn recovery_twice_in_a_row_applies_each_merge_once() {
+    // A recovery that replays the tail and then crashes again before any
+    // flush must not apply the tail twice on the second open.
+    let key = b"adj:R:out:77".to_vec();
+    let operand = crate::engine::merge::encode_add(5);
+    let reference = {
+        let ref_dir = TempDir::new().expect("temp dir");
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&ref_dir), oracle.clone()).expect("open");
+        write_batch(
+            &engine,
+            &oracle,
+            &[Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: key.clone(),
+                operand: operand.clone(),
+            }],
+        );
+        engine.persist().expect("persist");
+        engine
+            .get(Partition::Adj, &key)
+            .expect("get")
+            .map(|v| v.to_vec())
+    };
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        write_batch(
+            &engine,
+            &oracle,
+            &[Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: key.clone(),
+                operand: operand.clone(),
+            }],
+        );
+        rig.cut(engine);
+    }
+    for _ in 0..2 {
+        let (engine, _) = rig.open();
+        assert_eq!(
+            engine
+                .get(Partition::Adj, &key)
+                .expect("get")
+                .map(|v| v.to_vec()),
+            reference,
+            "a repeated recovery must not re-apply a covered merge"
+        );
+        rig.cut(engine);
+    }
+}
+
+#[test]
+fn late_finalized_point_and_range_batch_survives_a_crash() {
+    // One entry carrying a range delete and a put, finalized behind a flushed
+    // newer commit: after the crash the range delete must still hide the rows
+    // it covered, and the put must be back.
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let t_seed = oracle.next().as_raw();
+        write_batch_at(
+            &engine,
+            &[
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:00:r1".to_vec(),
+                    value: b"doomed".to_vec(),
+                },
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:00:r2".to_vec(),
+                    value: b"doomed".to_vec(),
+                },
+            ],
+            t_seed,
+        );
+        engine.persist().expect("persist seed");
+        let t100 = oracle.next().as_raw();
+        let t200 = oracle.next().as_raw();
+        write_batch_at(
+            &engine,
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:0200".to_vec(),
+                value: b"t200".to_vec(),
+            }],
+            t200,
+        );
+        engine.persist().expect("persist t200");
+        write_batch_at(
+            &engine,
+            &[
+                Mutation::RemoveRange {
+                    partition: PartitionId::Node,
+                    start: b"node:00:r".to_vec(),
+                    end: b"node:00:s".to_vec(),
+                },
+                Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:00:0100".to_vec(),
+                    value: b"t100".to_vec(),
+                },
+            ],
+            t100,
+        );
+        rig.cut(engine);
+    }
+
+    let (engine, _) = rig.open();
+    for key in [b"node:00:r1".as_slice(), b"node:00:r2"] {
+        assert_eq!(
+            engine.get(Partition::Node, key).expect("get"),
+            None,
+            "{}: the late-finalized range delete must be replayed",
+            String::from_utf8_lossy(key)
+        );
+    }
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:00:0100")
+            .expect("get")
+            .as_deref(),
+        Some(b"t100".as_slice()),
+        "the put in the same entry must be replayed"
+    );
+}
+
+#[test]
+fn an_entry_flushed_in_one_partition_is_replayed_only_into_the_other() {
+    // One entry merges into Adj and Counter; Adj reaches an SST on its own
+    // while Counter's memtable is lost. Recovery must re-apply the entry to
+    // Counter only: skipping it loses the delta, replaying it into Adj too
+    // doubles the edge.
+    let adj_key = b"adj:R:out:9".to_vec();
+    let counter_key = b"counter:degree:9".to_vec();
+    let entry = [
+        Mutation::Merge {
+            partition: PartitionId::Adj,
+            key: adj_key.clone(),
+            operand: crate::engine::merge::encode_add(3),
+        },
+        Mutation::Merge {
+            partition: PartitionId::Counter,
+            key: counter_key.clone(),
+            operand: crate::engine::merge::encode_counter_delta(1),
+        },
+    ];
+    let reference = {
+        let ref_dir = TempDir::new().expect("temp dir");
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&ref_dir), oracle.clone()).expect("open");
+        write_batch(&engine, &oracle, &entry);
+        (
+            engine.get(Partition::Adj, &adj_key).expect("get adj"),
+            engine
+                .get(Partition::Counter, &counter_key)
+                .expect("get counter"),
+        )
+    };
+
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        write_batch(&engine, &oracle, &entry);
+        engine
+            .tree(Partition::Adj)
+            .expect("adj tree")
+            .flush_active_memtable(0)
+            .expect("flush adj alone");
+        rig.cut(engine);
+    }
+
+    let (engine, _) = rig.open();
+    assert_eq!(
+        (
+            engine.get(Partition::Adj, &adj_key).expect("get adj"),
+            engine
+                .get(Partition::Counter, &counter_key)
+                .expect("get counter"),
+        ),
+        reference,
+        "each partition must hold the entry exactly once after recovery"
+    );
+}
+
+#[test]
+fn folded_coverage_survives_a_crash_and_later_entries_replay_once() {
+    // A purge folds the applied prefix into every tree's base and removes the
+    // markers under it. Entries below the fold are covered by the base alone;
+    // an entry after it is covered by nothing on disk and is replayed, once.
+    let key = b"counter:degree:77".to_vec();
+    let delta = |d| Mutation::Merge {
+        partition: PartitionId::Counter,
+        key: key.clone(),
+        operand: crate::engine::merge::encode_counter_delta(d),
+    };
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        for _ in 0..3 {
+            write_batch(&engine, &oracle, &[delta(1)]);
+        }
+        // Keeps every segment (inside the window) but folds and persists.
+        engine.oplog_purge_expired(0, u64::MAX).expect("purge");
+        write_batch(&engine, &oracle, &[delta(10)]);
+        rig.cut(engine);
+    }
+    for _ in 0..2 {
+        let (engine, _) = rig.open();
+        let value = engine
+            .get(Partition::Counter, &key)
+            .expect("get")
+            .expect("counter present");
+        assert_eq!(
+            crate::engine::merge::decode_counter(&value).expect("decode"),
+            13,
+            "three folded deltas and one replayed delta, each exactly once"
+        );
+        rig.cut(engine);
+    }
+}
+
+#[test]
+fn a_journal_without_a_coverage_record_is_refused_untouched() {
+    // A store whose journal holds entries but whose trees carry no coverage
+    // record (what a release before apply coverage leaves behind) cannot say
+    // which entries are on disk. Opening it must fail without writing.
+    let dir = TempDir::new().expect("temp dir");
+    {
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        write_batch(
+            &engine,
+            &oracle,
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:00:0001".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        );
+        // Strip the record the way a legacy store never had it.
+        let at = engine.next_seqno();
+        for &part in Partition::all() {
+            let tree = engine.tree(part).expect("tree");
+            tree.remove(coverage::BASE_KEY, at);
+            tree.remove_range(
+                coverage::marker_key(0).to_vec(),
+                coverage::marker_key(u64::MAX).to_vec(),
+                at,
+            );
+        }
+        engine.persist().expect("persist");
+    }
+    let oracle = Arc::new(TimestampOracle::new());
+    let refused = StorageEngine::open_embedded(&durable_cfg(&dir), oracle);
+    assert!(
+        matches!(
+            refused,
+            Err(StorageError::CoverageUnprovable { entries: 1, .. })
+        ),
+        "a journal with no coverage record must be refused, got {:?}",
+        refused.err()
+    );
+}
+
+#[test]
+fn coverage_keys_stay_out_of_user_scans() {
+    // The reserved namespace is engine state: a fresh store holds no user
+    // data, a whole-partition scan returns only user rows, and the changed-key
+    // feed neither reports the markers nor trips over the fold's tombstone.
+    let dir = TempDir::new().expect("temp dir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+    assert!(
+        !engine.holds_user_data().expect("holds_user_data"),
+        "a fresh store's coverage record is not user data"
+    );
+    let since = engine.current_seqno();
+    write_batch(
+        &engine,
+        &oracle,
+        &[Mutation::Put {
+            partition: PartitionId::Blob,
+            key: b"blob:aa".to_vec(),
+            value: b"x".to_vec(),
+        }],
+    );
+    engine.oplog_purge_expired(0, u64::MAX).expect("fold");
+    let rows: Vec<Vec<u8>> = engine
+        .prefix_scan(Partition::Blob, b"")
+        .expect("scan")
+        .map(|g| g.into_inner().expect("row").0.to_vec())
+        .collect();
+    assert_eq!(rows, vec![b"blob:aa".to_vec()]);
+    assert_eq!(
+        engine
+            .changed_keys_since(Partition::Blob, since)
+            .expect("changed keys"),
+        vec![b"blob:aa".to_vec()]
+    );
+    assert!(engine.holds_user_data().expect("holds_user_data"));
 }
 
 #[cfg(feature = "columnar")]

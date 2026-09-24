@@ -1084,28 +1084,24 @@ fn oplog_purge_collects_durable_expired_segments() {
         max_segment_entries: 2,
         ..OplogJournalConfig::default()
     };
-    let engine = StorageEngine::open_embedded_with_journal(&config, oracle, journal)
+    let engine = StorageEngine::open_embedded_with_journal(&config, oracle.clone(), journal)
         .expect("open_embedded_with_journal");
 
     for i in 0..6u64 {
         let key = format!("node:purge:{i}");
+        // Journalled and applied: the purge itself folds and persists the
+        // coverage that makes these entries durable.
         engine
-            .oplog_append(
+            .commit_journaled(
                 &[Mutation::Put {
                     partition: PartitionId::Node,
-                    key: key.clone().into_bytes(),
+                    key: key.into_bytes(),
                     value: b"applied".to_vec(),
                 }],
-                i + 1,
+                oracle.next().as_raw(),
             )
-            .expect("oplog_append")
-            .expect("journal active");
-        // Applied to the tree, then persisted below: journal + SST copies.
-        engine
-            .put(Partition::Node, key.as_bytes(), b"applied")
-            .expect("put");
+            .expect("commit_journaled");
     }
-    engine.persist().expect("persist");
 
     let far_future = 4_000_000_000u64;
     let purged = engine
@@ -1139,33 +1135,30 @@ fn power_loss_recovery_replays_journal_over_rolled_back_trees() {
     )])
     .with_fs(crash_fs.clone());
 
-    let write = |engine: &StorageEngine, i: u64, value: &[u8]| {
+    let write = |engine: &StorageEngine, oracle: &TimestampOracle, i: u64, value: &[u8]| {
         let key = format!("node:crash:{i}");
         engine
-            .oplog_append(
+            .commit_journaled(
                 &[Mutation::Put {
                     partition: PartitionId::Node,
-                    key: key.clone().into_bytes(),
+                    key: key.into_bytes(),
                     value: value.to_vec(),
                 }],
-                i + 1,
+                oracle.next().as_raw(),
             )
-            .expect("oplog_append")
-            .expect("journal active");
-        engine
-            .put(Partition::Node, key.as_bytes(), value)
-            .expect("put");
+            .expect("commit_journaled");
     };
 
     {
         let oracle = Arc::new(TimestampOracle::new());
-        let engine = StorageEngine::open_embedded(&config, oracle).expect("open before crash");
+        let engine =
+            StorageEngine::open_embedded(&config, oracle.clone()).expect("open before crash");
         for i in 0..4u64 {
-            write(&engine, i, b"flushed");
+            write(&engine, &oracle, i, b"flushed");
         }
         engine.persist().expect("persist first half");
         for i in 4..8u64 {
-            write(&engine, i, b"memtable-only");
+            write(&engine, &oracle, i, b"memtable-only");
         }
         // No persist for the second half: those rows exist only in memtables
         // and the fsynced journal when the "power" goes out.

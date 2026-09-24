@@ -588,7 +588,7 @@ fn oplog_replay_through_multi_tier_routing() {
             StorageEngine::open_embedded(&make_config(), oracle.clone()).expect("first open");
         let ts = oracle.next().as_raw();
         engine
-            .oplog_append(
+            .commit_journaled(
                 &[Mutation::Put {
                     partition: PartitionId::Node,
                     key: b"survives-multi-tier".to_vec(),
@@ -596,11 +596,7 @@ fn oplog_replay_through_multi_tier_routing() {
                 }],
                 ts,
             )
-            .expect("oplog_append")
-            .expect("journal active");
-        engine
-            .put(Partition::Node, b"survives-multi-tier", b"replay-me")
-            .expect("write");
+            .expect("commit_journaled");
         // Drop without persist — memtable NOT flushed, only the oplog on disk.
     }
 
