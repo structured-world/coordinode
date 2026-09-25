@@ -568,6 +568,10 @@ impl StorageEngine {
                             .max()
                             .unwrap_or(0),
                     );
+                    // A tree whose rebuild was cut short is left alone: its
+                    // record no longer says what it holds, and the repair that
+                    // follows rebuilds it from the checkpoint and this journal.
+                    let rebuilding = read_rebuild_intents(config.data_dir())?;
                     let mut replayed = 0usize;
                     for entry in &entries {
                         // Group the entry's data ops per partition so each
@@ -602,10 +606,11 @@ impl StorageEngine {
                                     name: part.name().to_string(),
                                 }
                             })?;
-                            let holds = covered
-                                .get(&part)
-                                .is_some_and(|c| c.contains(entry.index, 0));
-                            if !holds {
+                            let skip = rebuilding.contains(&part)
+                                || covered
+                                    .get(&part)
+                                    .is_some_and(|c| c.contains(entry.index, 0));
+                            if !skip {
                                 apply_oplog_ops_at(tree, &ops, entry.ts, entry.index)?;
                                 replayed += ops.len();
                             }
@@ -1351,7 +1356,9 @@ impl StorageEngine {
         //    `clear_partition` deletes the table files without reading their
         //    blocks; a `drop_range` here would instead run a compaction that
         //    re-reads the corrupt block we are repairing and abort with a
-        //    ChecksumMismatch.
+        //    ChecksumMismatch. The clear is on disk at once while the rebuilt
+        //    data is not, so the intent goes first.
+        self.begin_rebuild(partition)?;
         self.clear_partition(partition)?;
         let base_len = base.len();
         for (key, value) in &base {
@@ -1369,6 +1376,7 @@ impl StorageEngine {
             }
         }
         self.rebind_coverage(partition)?;
+        self.finish_rebuild(partition)?;
         Ok(base_len)
     }
 
@@ -1393,6 +1401,53 @@ impl StorageEngine {
             tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
         }
         Ok(())
+    }
+
+    /// The partitions whose rebuild started and did not finish: a crash
+    /// between clearing a tree and persisting its rebuilt data. Such a tree
+    /// holds an unknown part of its data and of its coverage record, so only
+    /// a new full rebuild restores it.
+    ///
+    /// # Errors
+    ///
+    /// The intent directory cannot be read.
+    pub fn pending_rebuilds(&self) -> StorageResult<Vec<Partition>> {
+        read_rebuild_intents(&self.data_dir)
+    }
+
+    /// Record, durably, that `partition` is about to be rebuilt. Written
+    /// before the tree is cleared and removed by [`Self::finish_rebuild`]
+    /// once the rebuilt tree is on disk.
+    fn begin_rebuild(&self, partition: Partition) -> StorageResult<()> {
+        let dir = self.data_dir.join(REBUILD_INTENT_DIR);
+        let io = |what: &str, e: std::io::Error| {
+            StorageError::Io(format!(
+                "rebuild intent for {}: {what}: {e}",
+                partition.name()
+            ))
+        };
+        // no-std: StoragePort trait, caller-injected
+        std::fs::create_dir_all(&dir).map_err(|e| io("create dir", e))?;
+        let file =
+            std::fs::File::create(dir.join(partition.name())).map_err(|e| io("create", e))?;
+        file.sync_all().map_err(|e| io("sync", e))?;
+        sync_dir(&dir)?;
+        sync_dir(&self.data_dir)
+    }
+
+    /// Persist the rebuilt tree of `partition`, then drop its intent.
+    fn finish_rebuild(&self, partition: Partition) -> StorageResult<()> {
+        use lsm_tree::AbstractTree;
+        self.tree(partition)?.flush_active_memtable(0)?;
+        let dir = self.data_dir.join(REBUILD_INTENT_DIR);
+        let io = |what: &str, e: std::io::Error| {
+            StorageError::Io(format!(
+                "rebuild intent for {}: {what}: {e}",
+                partition.name()
+            ))
+        };
+        std::fs::remove_file(dir.join(partition.name())).map_err(|e| io("remove", e))?;
+        sync_dir(&dir)
     }
 
     /// Apply one journal op during a checkpoint rebuild (shared by the full
@@ -1473,7 +1528,11 @@ impl StorageEngine {
             rows
         };
 
-        // 2. Clear the lost ranges on the live tree, reinstall the base.
+        // 2. Clear the lost ranges on the live tree, reinstall the base. A
+        //    crash part way leaves the ranges' state unknown while the
+        //    coverage record still claims the entries, so the intent turns
+        //    the next open's repair into a full rebuild.
+        self.begin_rebuild(partition)?;
         for (min, max) in ranges {
             self.remove_range(partition, min, &succ(max))?;
         }
@@ -1522,6 +1581,7 @@ impl StorageEngine {
                 }
             }
         }
+        self.finish_rebuild(partition)?;
         Ok(base_len)
     }
 
@@ -3298,6 +3358,40 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
         }
     }
     Ok(bytes)
+}
+
+/// Directory under the data dir holding one empty file per partition whose
+/// rebuild is in progress, named after the partition.
+const REBUILD_INTENT_DIR: &str = "rebuild";
+
+/// The partitions with a rebuild intent under `data_dir`.
+fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {
+    let dir = data_dir.join(REBUILD_INTENT_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(StorageError::Io(format!("read {dir:?}: {e}"))),
+    };
+    let mut pending = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| StorageError::Io(format!("entry in {dir:?}: {e}")))?;
+        let name = entry.file_name();
+        let part = Partition::all()
+            .iter()
+            .copied()
+            .find(|p| name.as_os_str() == p.name())
+            .ok_or_else(|| {
+                StorageError::Io(format!("unknown rebuild intent {name:?} in {dir:?}"))
+            })?;
+        pending.push(part);
+    }
+    Ok(pending)
+}
+
+/// Make the entries of `dir` durable.
+fn sync_dir(dir: &Path) -> StorageResult<()> {
+    lsm_tree::fs::Fs::sync_directory(&lsm_tree::fs::StdFs, dir)
+        .map_err(|e| StorageError::Io(format!("sync {dir:?}: {e}")))
 }
 
 /// A journalled `STORAGE COLUMNAR` row, held from the journal read until the

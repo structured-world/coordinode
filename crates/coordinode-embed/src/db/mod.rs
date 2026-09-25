@@ -879,13 +879,24 @@ impl Database {
         // `verify_and_repair()` to inspect.
         if engine.has_journal() {
             let root = crate::repair::checkpoint_root(engine.data_dir());
-            if crate::repair::latest_checkpoint(&root).is_some() {
+            // An interrupted rebuild is repaired, or reported, even when its
+            // checkpoint has gone since.
+            if crate::repair::latest_checkpoint(&root).is_some()
+                || !engine.pending_rebuilds()?.is_empty()
+            {
                 match crate::repair::verify_and_repair(&engine, &root) {
                     Ok(report) if !report.repaired.is_empty() => {
                         tracing::warn!(
                             repaired = ?report.repaired,
                             clean = report.clean_after,
                             "auto-repaired corrupt partitions on open"
+                        );
+                    }
+                    Ok(report) if !report.is_clean() => {
+                        tracing::error!(
+                            corrupt = ?report.corrupt_partitions,
+                            "partitions need a rebuild but no checkpoint exists; \
+                             restore from an off-device backup"
                         );
                     }
                     Ok(_) => {}

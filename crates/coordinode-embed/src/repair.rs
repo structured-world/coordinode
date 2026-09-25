@@ -133,7 +133,8 @@ impl RepairReport {
 /// Scrub every partition; rebuild each corrupt one from the latest checkpoint
 /// plus oplog replay. A partition whose tree was structurally repaired at
 /// engine open with data loss counts as corrupt too, even though it now
-/// scrubs clean. A no-op (clean report) when neither source flags anything.
+/// scrubs clean, and so does one whose previous rebuild a crash interrupted.
+/// A no-op (clean report) when no source flags anything.
 ///
 /// If corruption is found but no checkpoint exists, the report lists the
 /// corrupt partitions with `clean_after = false` and an empty `repaired` set —
@@ -144,6 +145,9 @@ pub fn verify_and_repair(
 ) -> StorageResult<RepairReport> {
     let scrub = scrub_all(engine, &ScrubConfig::default())?;
     let mut full: Vec<Partition> = scrub.errors.iter().map(|e| e.partition).collect();
+    // A rebuild cut short by a crash left its tree holding an unknown part of
+    // its data; the tree scrubs clean, so only its intent says so.
+    full.extend(engine.pending_rebuilds()?);
     full.sort_by_key(|p| coordinode_storage::placement::partition_wire_tag(*p));
     full.dedup();
 

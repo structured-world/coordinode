@@ -532,6 +532,109 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
     );
 }
 
+/// Run a full rebuild of Node with the disk refusing `op` after the first
+/// `skip` of them, cut the power, reopen and repair. Returns whether the
+/// fault stopped the rebuild; once it does not, every point inside the
+/// rebuild has been cut.
+///
+/// The journal below the checkpoint is purged first, as the scheduler does,
+/// so the checkpoint is the only copy of the base: a reopen that replayed the
+/// journal into a half-rebuilt tree could not bring it back.
+fn rebuild_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
+    use coordinode_storage::engine::oplog_journal::OplogJournalConfig;
+    use coordinode_test_fixtures::PowerRig;
+
+    let journal = OplogJournalConfig {
+        retention_secs: 1,
+        max_segment_entries: 2,
+        ..OplogJournalConfig::default()
+    };
+    let open_rig = |rig: &PowerRig| {
+        Arc::new(
+            StorageEngine::open_embedded_with_journal(
+                &rig.config(),
+                Arc::new(TimestampOracle::new()),
+                journal.clone(),
+            )
+            .expect("open"),
+        )
+    };
+    let base = |i: u32| format!("node:0:{i:04}");
+    let tail = |i: u32| format!("node:0:9{i:03}");
+
+    let rig = PowerRig::new();
+    let engine = open_rig(&rig);
+    let root = checkpoint_root(engine.data_dir());
+    for i in 0..8u32 {
+        put(
+            &engine,
+            u64::from(i) + 1,
+            PartitionId::Node,
+            base(i).as_bytes(),
+            b"base",
+        );
+    }
+    engine.persist().expect("persist base");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    let cursor = StorageEngine::checkpoint_oplog_cursor(&ckpt).expect("cursor");
+    for i in 0..4u32 {
+        put(
+            &engine,
+            100 + u64::from(i),
+            PartitionId::Node,
+            tail(i).as_bytes(),
+            b"tail",
+        );
+    }
+    engine.persist().expect("persist tail");
+    engine
+        .oplog_purge_expired(4_000_000_000, cursor)
+        .expect("purge");
+    let since = engine
+        .oplog_read_since(cursor)
+        .expect("read")
+        .expect("journal");
+
+    rig.fail_from(op, skip);
+    let stopped = engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .is_err();
+    rig.cut(engine);
+
+    let engine = open_rig(&rig);
+    let report = verify_and_repair(&engine, &root).expect("verify_and_repair");
+    assert!(report.is_clean(), "{op:?} after {skip}: {report:?}");
+    for (key, value) in (0..8u32)
+        .map(|i| (base(i), b"base"))
+        .chain((0..4u32).map(|i| (tail(i), b"tail")))
+    {
+        assert_eq!(
+            engine
+                .get(Partition::Node, key.as_bytes())
+                .expect("get")
+                .as_deref(),
+            Some(value.as_slice()),
+            "{key} after a cut at {op:?} {skip}"
+        );
+    }
+    stopped
+}
+
+/// A full rebuild clears the tree on disk before the rebuilt data reaches
+/// it. A power cut in between must not leave a tree the next open fills
+/// from the journal alone: the base lives only in the checkpoint, and the
+/// cleared tree scrubs clean, so nothing else would bring it back.
+#[test]
+fn a_power_cut_inside_a_full_rebuild_loses_nothing() {
+    use lsm_tree::fs::FaultOp;
+    for op in [FaultOp::Write, FaultOp::SyncAll, FaultOp::SyncData] {
+        let mut skip = 0;
+        while rebuild_cut_at(op, skip) {
+            skip += 1;
+        }
+    }
+}
+
 /// A lossy open repair whose lost span reaches the partition's apply-coverage
 /// record must take the FULL rebuild, even though the span is known. Every
 /// table a journalled commit flushes starts with its coverage markers, so a
