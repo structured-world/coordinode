@@ -121,5 +121,9 @@ harness = false
 name = "counter_chain_steady"
 harness = false
 
+[[bench]]
+name = "apply_coverage"
+harness = false
+
 [lints]
 workspace = true
