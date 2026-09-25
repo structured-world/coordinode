@@ -881,8 +881,12 @@ pub struct CoordinodeStateMachine {
 }
 
 /// How many applied entries accumulate as coverage markers before the state
-/// machine folds them into every tree's base.
+/// machine folds them into every tree's base. The crate's own tests fold
+/// often, so their short workloads cross fold boundaries.
+#[cfg(not(test))]
 const RAFT_FOLD_EVERY: u64 = 4096;
+#[cfg(test)]
+const RAFT_FOLD_EVERY: u64 = 5;
 
 impl CoordinodeStateMachine {
     /// Open the state machine over `engine`; see

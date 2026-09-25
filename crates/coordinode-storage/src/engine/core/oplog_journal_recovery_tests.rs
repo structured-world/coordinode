@@ -999,6 +999,165 @@ fn folded_columnar_coverage_hides_its_record_and_replays_nothing_twice() {
     }
 }
 
+/// One commit of the crash campaign: a put naming it, an edge carrying its
+/// number and a +1 on a shared counter, across three trees.
+fn campaign_commit(i: u64) -> Vec<Mutation> {
+    vec![
+        Mutation::Put {
+            partition: PartitionId::Node,
+            key: format!("node:00:c{i:04}").into_bytes(),
+            value: b"x".to_vec(),
+        },
+        Mutation::Merge {
+            partition: PartitionId::Adj,
+            key: b"adj:C:out:1".to_vec(),
+            operand: crate::engine::merge::encode_add(i),
+        },
+        Mutation::Merge {
+            partition: PartitionId::Counter,
+            key: b"counter:campaign".to_vec(),
+            operand: crate::engine::merge::encode_counter_delta(1),
+        },
+    ]
+}
+
+const CAMPAIGN_COMMITS: u64 = 24;
+
+/// Run the campaign workload until the first failure: late-finalized
+/// timestamps, a full flush, a flush of one tree alone and a fold along the
+/// way. Returns the commits acknowledged before the failure.
+fn run_campaign(engine: &StorageEngine, oracle: &TimestampOracle) -> Vec<u64> {
+    // Timestamps reserved up front and used in pairs out of order, so every
+    // other commit finalizes behind a newer one.
+    let ts: Vec<u64> = (0..CAMPAIGN_COMMITS)
+        .map(|_| oracle.next().as_raw())
+        .collect();
+    let mut acked = Vec::new();
+    for i in 0..CAMPAIGN_COMMITS {
+        let slot = if i % 2 == 0 { i + 1 } else { i - 1 };
+        if engine
+            .commit_journaled(&campaign_commit(i), ts[slot as usize])
+            .is_err()
+        {
+            return acked;
+        }
+        acked.push(i);
+        let step = match i {
+            7 => engine.persist(),
+            11 => engine
+                .tree(Partition::Adj)
+                .and_then(|t| Ok(t.flush_active_memtable(0)?)),
+            15 => engine.oplog_purge_expired(0, u64::MAX).map(|_| ()),
+            _ => Ok(()),
+        };
+        if step.is_err() {
+            return acked;
+        }
+    }
+    acked
+}
+
+/// What a recovered store must hold: every acknowledged commit, and every
+/// commit that is there at all exactly once in every tree it touched.
+fn check_campaign(engine: &StorageEngine, acked: &[u64], label: &str) {
+    let present: Vec<u64> = (0..CAMPAIGN_COMMITS)
+        .filter(|i| {
+            engine
+                .get(Partition::Node, format!("node:00:c{i:04}").as_bytes())
+                .expect("get")
+                .is_some()
+        })
+        .collect();
+    for i in acked {
+        assert!(present.contains(i), "{label}: acknowledged commit {i} lost");
+    }
+    let counter = engine
+        .get(Partition::Counter, b"counter:campaign")
+        .expect("get counter")
+        .map(|v| crate::engine::merge::decode_counter(&v).expect("decode"))
+        .unwrap_or(0);
+    assert_eq!(
+        counter,
+        present.len() as i64,
+        "{label}: the counter must count each present commit once (present {present:?})"
+    );
+    let edges: Vec<u64> = engine
+        .get(Partition::Adj, b"adj:C:out:1")
+        .expect("get adj")
+        .map(|v| {
+            coordinode_core::graph::edge::PostingList::from_bytes(&v)
+                .expect("posting list")
+                .iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        edges, present,
+        "{label}: the edges must be the present commits"
+    );
+}
+
+/// One cut point: the k-th operation of `op` fails, the power goes, and the
+/// store must reopen consistent, twice. Returns whether the workload reached
+/// the cut (it completes untouched once `k` exceeds its operations).
+fn cut_at(op: lsm_tree::fs::FaultOp, k: u64) -> bool {
+    use lsm_tree::fs::{Fault, FaultRule};
+    let rig = PowerRig::new();
+    let (engine, oracle) = rig.open();
+    rig.faults
+        .arm(FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other)).skip(k));
+    let acked = run_campaign(&engine, &oracle);
+    let reached = (acked.len() as u64) < CAMPAIGN_COMMITS;
+    rig.cut(engine);
+    for round in 0..2 {
+        let (engine, _) = rig.open();
+        check_campaign(&engine, &acked, &format!("{op:?} cut at {k}, open {round}"));
+        rig.cut(engine);
+    }
+    reached
+}
+
+/// A power cut at every operation of one kind the workload performs. The
+/// cut points are independent stores, so they run on parallel threads in
+/// windows until a whole window completes the workload untouched. Returns
+/// how many cut points the workload reached.
+fn cut_at_every(op: lsm_tree::fs::FaultOp) -> u64 {
+    let window = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
+    let mut reached = 0;
+    let mut start = 0;
+    loop {
+        let hits: Vec<bool> = std::thread::scope(|s| {
+            let handles: Vec<_> = (start..start + window)
+                .map(|k| s.spawn(move || cut_at(op, k)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("cut point thread"))
+                .collect()
+        });
+        let window_hits = hits.iter().filter(|&&hit| hit).count() as u64;
+        reached += window_hits;
+        if window_hits < window {
+            return reached;
+        }
+        start += window;
+    }
+}
+
+#[test]
+fn a_power_cut_at_any_sync_leaves_every_commit_once() {
+    // Every journal append and every table/manifest publish ends in a full
+    // sync, so this walks the whole durability order of the workload.
+    assert!(cut_at_every(lsm_tree::fs::FaultOp::SyncAll) > 0);
+}
+
+#[test]
+fn a_power_cut_at_any_write_leaves_every_commit_once() {
+    // A failed write leaves a torn record or table behind; recovery must
+    // read past it exactly as past a cut at a sync.
+    assert!(cut_at_every(lsm_tree::fs::FaultOp::Write) > 0);
+}
+
 #[test]
 fn in_memory_engine_has_no_journal() {
     // A fully volatile (in-memory) config has no oplog-eligible endpoint, so

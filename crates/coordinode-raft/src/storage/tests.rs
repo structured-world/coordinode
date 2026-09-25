@@ -477,6 +477,201 @@ async fn an_entry_one_tree_flushed_is_replayed_only_into_the_other() {
     );
 }
 
+// -- Crash campaign --
+
+const RAFT_CAMPAIGN_ENTRIES: u64 = 24;
+
+/// One campaign entry: a put naming it, an edge carrying its index and a +1
+/// on a shared counter, across three trees.
+fn raft_campaign_entry(index: u64, commit_ts: u64) -> Entry {
+    use openraft::entry::RaftEntry;
+    let proposal = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+        mutations: vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:00:c{index:04}").into_bytes(),
+                value: b"x".to_vec(),
+            },
+            Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: b"adj:C:out:1".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_add(index),
+            },
+            Mutation::Merge {
+                partition: PartitionId::Counter,
+                key: b"counter:campaign".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+            },
+        ],
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: false,
+    };
+    Entry::new_normal(log_id(1, index), Request::single(proposal))
+}
+
+/// Append and apply entries one by one until the first failure, with a full
+/// flush, a flush of one tree alone, folds (every few entries under test) and
+/// log purges on the way. Returns the entries applied.
+async fn run_raft_campaign(
+    engine: &Arc<StorageEngine>,
+    log: &mut LogStore,
+    sm: &mut CoordinodeStateMachine,
+    base_ts: u64,
+) -> Vec<u64> {
+    use lsm_tree::AbstractTree;
+    let mut applied = Vec::new();
+    for i in 1..=RAFT_CAMPAIGN_ENTRIES {
+        let entry = raft_campaign_entry(i, base_ts + i);
+        if log
+            .append(vec![entry.clone()], IOFlushed::noop())
+            .await
+            .is_err()
+        {
+            return applied;
+        }
+        let stream = futures_util::stream::iter(std::iter::once(Ok((entry, None))));
+        if sm.apply(stream).await.is_err() {
+            return applied;
+        }
+        applied.push(i);
+        let step = match i {
+            7 => engine.persist().map_err(|e| e.to_string()),
+            11 => engine
+                .tree(Partition::Adj)
+                .map_err(|e| e.to_string())
+                .and_then(|t| {
+                    t.flush_active_memtable(0)
+                        .map_err(|e| e.to_string())
+                        .map(|_| ())
+                }),
+            13 | 19 => log.purge(log_id(1, i)).await.map_err(|e| e.to_string()),
+            _ => Ok(()),
+        };
+        if step.is_err() {
+            return applied;
+        }
+    }
+    applied
+}
+
+fn check_raft_campaign(engine: &StorageEngine, applied: &[u64], label: &str) {
+    let present: Vec<u64> = (1..=RAFT_CAMPAIGN_ENTRIES)
+        .filter(|i| {
+            engine
+                .get(Partition::Node, format!("node:00:c{i:04}").as_bytes())
+                .unwrap()
+                .is_some()
+        })
+        .collect();
+    for i in applied {
+        assert!(present.contains(i), "{label}: applied entry {i} lost");
+    }
+    let counter = engine
+        .get(Partition::Counter, b"counter:campaign")
+        .unwrap()
+        .map(|v| coordinode_storage::engine::merge::decode_counter(&v).unwrap())
+        .unwrap_or(0);
+    assert_eq!(
+        counter,
+        present.len() as i64,
+        "{label}: each present entry counted once (present {present:?})"
+    );
+    let edges: Vec<u64> = engine
+        .get(Partition::Adj, b"adj:C:out:1")
+        .unwrap()
+        .map(|v| {
+            coordinode_core::graph::edge::PostingList::from_bytes(&v)
+                .unwrap()
+                .iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(edges, present, "{label}: the edges are the present entries");
+}
+
+/// Reopen after the cut the way openraft does: resume at the state
+/// machine's applied position and re-deliver every log entry after it.
+async fn recover_raft(rig: &coordinode_test_fixtures::PowerRig) -> Arc<StorageEngine> {
+    let (engine, oracle) = open_rig_engine(rig);
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle))
+        .expect("reopen state machine");
+    let (applied, _) = sm.applied_state().await.unwrap();
+    let from = applied.map_or(0, |id| id.index + 1);
+    let redelivered = log.try_get_log_entries(from..).await.unwrap();
+    let stream = futures_util::stream::iter(redelivered.into_iter().map(|e| Ok((e, None))));
+    sm.apply(stream).await.expect("re-apply");
+    drop(sm);
+    drop(log);
+    engine
+}
+
+async fn raft_cut_at(op: lsm_tree::fs::FaultOp, k: u64) -> bool {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let applied;
+    {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        let mut sm =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(Arc::clone(&oracle)))
+                .expect("open state machine");
+        let base_ts = oracle.current().as_raw() + 1_000;
+        rig.fail_from(op, k);
+        applied = run_raft_campaign(&engine, &mut log, &mut sm, base_ts).await;
+        drop(sm);
+        drop(log);
+        rig.cut(engine);
+    }
+    for round in 0..2 {
+        let engine = recover_raft(&rig).await;
+        check_raft_campaign(
+            &engine,
+            &applied,
+            &format!("{op:?} cut at {k}, open {round}"),
+        );
+        rig.cut(engine);
+    }
+    (applied.len() as u64) < RAFT_CAMPAIGN_ENTRIES
+}
+
+/// A power cut at every operation of one kind the Raft workload performs,
+/// cut points run concurrently in windows. Returns how many were reached.
+async fn raft_cut_at_every(op: lsm_tree::fs::FaultOp) -> u64 {
+    let window = std::thread::available_parallelism().map_or(4, |n| n.get() as u64);
+    let mut reached = 0;
+    let mut start = 0;
+    loop {
+        let handles: Vec<_> = (start..start + window)
+            .map(|k| tokio::spawn(raft_cut_at(op, k)))
+            .collect();
+        let mut window_hits = 0;
+        for handle in handles {
+            if handle.await.expect("cut point task") {
+                window_hits += 1;
+            }
+        }
+        reached += window_hits;
+        if window_hits < window {
+            return reached;
+        }
+        start += window;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_power_cut_at_any_sync_leaves_every_raft_entry_once() {
+    // Log appends, table and manifest publishes, folds and purges all end in
+    // a full sync, so this walks the Raft path's whole durability order.
+    assert!(raft_cut_at_every(lsm_tree::fs::FaultOp::SyncAll).await > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_power_cut_at_any_write_leaves_every_raft_entry_once() {
+    assert!(raft_cut_at_every(lsm_tree::fs::FaultOp::Write).await > 0);
+}
+
 // -- Config --
 
 #[test]

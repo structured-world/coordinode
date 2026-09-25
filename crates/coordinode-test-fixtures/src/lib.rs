@@ -259,6 +259,15 @@ impl PowerRig {
         .with_fs(Arc::clone(&self.fs))
     }
 
+    /// Make every operation of `op` after the first `skip` fail, as a disk
+    /// that stops accepting them would; pair it with [`Self::cut`] to model a
+    /// power cut at that point.
+    pub fn fail_from(&self, op: lsm_tree::fs::FaultOp, skip: u64) {
+        use lsm_tree::fs::{Fault, FaultRule};
+        self.faults
+            .arm(FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other)).skip(skip));
+    }
+
     /// Lose power under `engine`, which must be its last owner: nothing
     /// written from now on is durable, the engine goes away, and every file
     /// falls back to what was fsynced before the cut.
