@@ -136,6 +136,9 @@ async fn logstore_purge_filters_entries() {
         .append(entries, IOFlushed::noop())
         .await
         .expect("append");
+    // Every tree durably holds entries 0..=5, so openraft's purge is not cut
+    // short by the durable floor.
+    engine.reset_raft_coverage(6, &[]).expect("coverage");
 
     // Purge up to index 3 (inclusive).
     store.purge(make_log_id(3, 1)).await.expect("purge");
@@ -170,6 +173,7 @@ async fn logstore_last_purged_survives_reopen() {
             .append(entries, IOFlushed::noop())
             .await
             .expect("append");
+        engine.reset_raft_coverage(6, &[]).expect("coverage");
         store.purge(make_log_id(3, 1)).await.expect("purge");
     }
 

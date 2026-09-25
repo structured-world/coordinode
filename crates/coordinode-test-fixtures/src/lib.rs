@@ -210,6 +210,88 @@ pub fn engine_for_memory() -> EngineFixture {
     }
 }
 
+/// A durable store whose power can be cut, for crash tests.
+///
+/// Writes go through a fault injector over a crash simulator. Dropping an
+/// engine flushes its memtables, so a plain drop is a clean shutdown;
+/// [`PowerRig::cut`] first makes every write and sync fail, so that last
+/// flush never reaches the disk, then rolls every file back to its last
+/// fsync. Reopen with [`PowerRig::config`] to see what survived.
+pub struct PowerRig {
+    dir: tempfile::TempDir,
+    crash: Arc<lsm_tree::fs::CrashFs>,
+    faults: Arc<lsm_tree::fs::FaultInjector>,
+    fs: Arc<dyn lsm_tree::fs::Fs>,
+}
+
+impl PowerRig {
+    /// A fresh store in a new temporary directory.
+    ///
+    /// # Panics
+    ///
+    /// If the temporary directory cannot be created. Test-only.
+    pub fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let crash = Arc::new(lsm_tree::fs::CrashFs::new(lsm_tree::fs::StdFs));
+        let faults = Arc::new(lsm_tree::fs::FaultInjector::new());
+        let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(lsm_tree::fs::FaultFs::with_injector(
+            lsm_tree::fs::CrashFs::clone(&crash),
+            Arc::clone(&faults),
+        ));
+        Self {
+            dir,
+            crash,
+            faults,
+            fs,
+        }
+    }
+
+    /// The store's configuration: one durable endpoint on the rig's
+    /// filesystem.
+    pub fn config(&self) -> StorageConfig {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            self.dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+        .with_fs(Arc::clone(&self.fs))
+    }
+
+    /// Lose power under `engine`, which must be its last owner: nothing
+    /// written from now on is durable, the engine goes away, and every file
+    /// falls back to what was fsynced before the cut.
+    ///
+    /// # Panics
+    ///
+    /// If another handle to the engine is still alive: its drop would run
+    /// after power came back and write what the cut was meant to lose.
+    pub fn cut(&self, engine: Arc<StorageEngine>) {
+        use lsm_tree::fs::{Fault, FaultOp, FaultRule};
+        let engine = Arc::into_inner(engine).expect("the cut engine must have no other owner");
+        let refuse = Fault::Error(lsm_tree::io::ErrorKind::Other);
+        for op in [
+            FaultOp::Open,
+            FaultOp::Write,
+            FaultOp::SyncAll,
+            FaultOp::SyncData,
+            FaultOp::Rename,
+        ] {
+            self.faults.arm(FaultRule::new(op, refuse));
+        }
+        drop(engine);
+        self.faults.clear();
+        self.crash.crash();
+    }
+}
+
+impl Default for PowerRig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Ports this process has already handed out.
 ///
 /// Deliberately global: the property being enforced is that no port is

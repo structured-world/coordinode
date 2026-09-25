@@ -232,12 +232,12 @@ impl<'a> WriteBatch<'a> {
         self.commit_covered(seqno, None)
     }
 
-    /// [`Self::commit_at`] that also records journal entry `cover` as applied
-    /// in every partition the batch touches, atomically with its effects.
+    /// [`Self::commit_at`] that also writes the coverage marker `cover` into
+    /// every partition the batch touches, atomically with its effects.
     pub(crate) fn commit_covered(
         self,
         seqno: lsm_tree::SeqNo,
-        cover: Option<u64>,
+        cover: Option<coverage::Mark>,
     ) -> StorageResult<()> {
         if self.mutations.is_empty() {
             return Ok(());
@@ -308,7 +308,7 @@ fn apply_group(
     part: Partition,
     group: &[&Mutation],
     seqno: lsm_tree::SeqNo,
-    cover: Option<u64>,
+    cover: Option<coverage::Mark>,
 ) -> StorageResult<()> {
     let tree = engine.tree(part)?;
     let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
@@ -327,11 +327,8 @@ fn apply_group(
             }
         }
     }
-    if let Some(index) = cover {
-        batch.insert(
-            coverage::Domain::Journal.marker_key(index, 0).as_slice(),
-            &[][..],
-        );
+    if let Some(mark) = cover {
+        batch.insert(mark.key().as_slice(), &[][..]);
     }
     tree.apply_batch(batch, seqno)?;
     Ok(())

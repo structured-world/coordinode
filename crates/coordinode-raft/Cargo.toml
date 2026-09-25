@@ -33,6 +33,8 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 
 [dev-dependencies]
 coordinode-test-fixtures = { workspace = true }
+# Crash tests flush one partition tree on its own through the tree API.
+lsm-tree = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -411,50 +411,23 @@ impl OplogManager {
         Ok(self.sealed.len())
     }
 
-    /// Delete sealed segments whose entries are both delivered to the state
-    /// machine and durably stored in SST form.
+    /// Delete the sealed segments whose every entry is below `below`.
     ///
-    /// Two gates must hold for every entry in a segment before it can be removed:
+    /// The caller decides what `below` may be: for the Raft log, the lowest
+    /// index every partition tree durably records as applied (its coverage
+    /// base on disk), capped by what openraft asked to purge. Segment
+    /// granularity keeps a segment that straddles the bound.
     ///
-    /// 1. **Applied:** the segment's exclusive last index is at most
-    ///    `applied_index` — every entry has been passed to `apply()`. The
-    ///    check is identical in single-node and clustered deployments: the
-    ///    log store always runs under openraft (single-node uses a stub
-    ///    network with member set `{1}`, so commit and apply are immediate),
-    ///    so `applied_index` is just `state_machine.last_applied().index + 1`.
-    /// 2. **State-machine durable:** the segment's `last_ts` (HLC commit_ts
-    ///    of the last entry, recorded in the footer at seal time) is at most
-    ///    `safe_ts`, the smallest `get_highest_persisted_seqno()` across all
-    ///    LSM partitions in the engine.
-    ///
-    /// Gate (2) closes the crash-safety hole left by gate (1) alone: openraft
-    /// drives apply→save_applied→purge ordering correctly, but apply writes
-    /// land in per-partition memtables that flush independently. Without
-    /// gate (2), a partition whose flush schedule lags behind the smallest
-    /// (typically `Schema`, which fills fast because every applied entry
-    /// updates the `applied_index` key there) can lose its memtable on kernel
-    /// crash while the oplog segment that would replay those mutations has
-    /// already been removed. Holding the segment until
-    /// `min_partition_flushed_seqno ≥ last_ts` guarantees the openraft
-    /// "re-delivers missing entries on restart" contract is satisfiable.
-    ///
-    /// `safe_ts == 0` (fresh engine, no SST yet) makes the second gate
-    /// impossible to satisfy for any non-empty segment, so nothing is purged
-    /// — exactly the behavior we want during startup.
-    ///
-    /// Returns the number of segments removed. Skipping segments is not an
-    /// error: openraft retries purge on subsequent snapshots/heartbeats.
-    pub fn purge_before(&mut self, applied_index: u64, safe_ts: u64) -> StorageResult<usize> {
+    /// Returns the number of segments removed.
+    pub fn purge_before(&mut self, below: u64) -> StorageResult<usize> {
         let mut purged = 0usize;
         let mut remaining = Vec::new();
 
         for (first_idx, path) in self.sealed.drain(..) {
             let reader = SegmentReader::open(&path)?;
             // next_index is the exclusive upper bound for this segment's entries.
-            let next_index = first_idx + reader.footer.entry_count as u64;
-            let applied = next_index <= applied_index;
-            let state_durable = reader.footer.last_ts <= safe_ts;
-            if applied && state_durable {
+            let next_index = first_idx + u64::from(reader.footer.entry_count);
+            if next_index <= below {
                 std::fs::remove_file(&path).map_err(|e| {
                     StorageError::Io(format!("remove purged segment {:?}: {e}", path))
                 })?;

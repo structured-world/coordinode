@@ -1,23 +1,23 @@
-//! Integration tests: Single-fsync write path and crash recovery (R076).
+//! Integration tests: single-fsync write path and crash recovery.
 //!
 //! Tests verify that:
 //!   - `OplogManager::flush()` is a no-op when no active writer exists
 //!   - `LogStore::append()` fsyncs before calling `io_completed`
-//!   - Crash scenario: stale `applied_index` triggers oplog replay on restart
-//!   - Re-applying already-applied entries is idempotent (same seqno → same value)
+//!   - A resume point behind the applied entries re-delivers them on restart
+//!   - Every applied proposal is recorded in the trees it touched
 //!
-//! # Crash recovery model (ADR-017)
+//! # Crash recovery model
 //!
 //! The write path is:
 //!   ```text
-//!   append to oplog → fsync → io_completed → [replicate] → commit → apply → save_applied
+//!   append to oplog → fsync → io_completed → [replicate] → commit → apply
 //!   ```
 //!
-//! If the process crashes AFTER fsync but BEFORE save_applied:
-//!   - SST-persisted `applied_index` is stale (behind actual applied entries)
-//!   - On restart, openraft re-delivers committed entries after `applied_index`
-//!   - Those entries are in the oplog (durable since the fsync)
-//!   - Re-applying is idempotent: same HLC seqno → same (key, seqno, value)
+//! Each apply writes, with its effects, a coverage marker into every tree it
+//! touches. On restart the state machine resumes from the lowest prefix every
+//! tree durably covers; openraft re-delivers the committed entries after it
+//! from the oplog (durable since the fsync), and a tree that already holds a
+//! proposal is skipped.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -74,10 +74,6 @@ fn make_entry(index: u64, term: u64) -> Entry {
     let log_id = openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index);
     Entry::new_normal(log_id, Request::single(proposal))
 }
-
-// Key in Partition::Schema where the state machine persists last_applied.
-// Defined in storage.rs — hardcoded here to avoid exposing it as pub.
-const KEY_SM_APPLIED: &[u8] = b"raft:sm:applied";
 
 // ── OplogManager-level tests ──────────────────────────────────────────────────
 
@@ -168,19 +164,18 @@ async fn logstore_append_fsyncs_data_readable_immediately() {
 
 // ── Crash recovery: stale applied_index ──────────────────────────────────────
 
-/// Crash recovery: stale `applied_index` triggers oplog replay on restart.
+/// Crash recovery: a resume point behind the applied entries makes openraft
+/// re-deliver them on restart.
 ///
 /// Scenario:
 ///   1. Write 5 proposals through a RaftNode (committed + applied, data in SST)
-///   2. Overwrite `applied_index` to 2 (simulates crash where FlushManager
-///      flushed SST with applied_index=2 but entries 3-5 were lost from memtable)
-///   3. Flush the tampered value to SST
-///   4. Reopen the RaftNode
-///   5. openraft: sees applied=2 in SST, log ends at 5 → re-delivers entries 3-5
-///   6. Re-application is idempotent (same seqno, same value)
-///   7. Verify all 5 entries' data is present after recovery
+///   2. Rewind every tree's coverage base by three entries, as if they had
+///      flushed only up to there
+///   3. Reopen the RaftNode
+///   4. openraft sees the rewound position and re-delivers the last entries
+///   5. Verify all 5 entries' data is present after recovery
 #[tokio::test(flavor = "multi_thread")]
-async fn crash_recovery_stale_applied_index() {
+async fn crash_recovery_resumes_from_the_covered_prefix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
 
@@ -225,51 +220,32 @@ async fn crash_recovery_stale_applied_index() {
             );
         }
 
-        // Flush all to SST — including tree data, applied_index, and last_log_id.
+        // Flush all to SST: tree data, coverage markers and last_log_id.
         engine_read.persist().expect("persist");
 
-        // ── Tamper: overwrite applied_index to 2 ─────────────────────────────
-        // This simulates a crash where:
-        //   - SST had applied_index=2 at the last flush
-        //   - Entries 3,4,5 were applied to memtable but memtable was lost
-        //   - applied_index in memtable (=5) was also lost
-        // We reconstruct this state by overwriting the persisted applied_index.
-        //
-        // The oplog already has all 5 entries fsynced — they will be replayed.
-        let log_id_2: Option<openraft::LogId<CommittedLeaderId>> = engine_read
-            .get(Partition::Schema, KEY_SM_APPLIED)
-            .expect("read applied_index")
-            .and_then(|b| rmp_serde::from_slice(&b).ok());
-
-        // Confirm that applied_index is currently ≥ 5 (counting bootstrap at 0,
-        // membership at 1, then proposals at 2-6 or similar offset).
-        // We don't assert the exact index since openraft adds Membership entries.
+        // ── Rewind the resume point by three entries ─────────────────────────
+        // As if every tree had last flushed three entries ago: the coverage
+        // base moves back and the markers above it go. The oplog holds all
+        // entries fsynced, so they will be re-delivered.
+        let applied_up_to = engine_read
+            .raft_coverage()
+            .expect("read coverage")
+            .skip_until();
         assert!(
-            log_id_2.is_some(),
-            "applied_index must be set after 5 proposals"
+            applied_up_to >= 5,
+            "5 proposals must be recorded as applied, got up to {applied_up_to}"
         );
-        let real_applied = log_id_2.unwrap().index;
-        assert!(
-            real_applied >= 5,
-            "applied_index must be ≥ 5, got {real_applied}"
-        );
-
-        // Build a stale applied_index = real_applied - 3 (replay last 3 entries).
-        let stale_index = real_applied - 3;
-        let stale_log_id = openraft::LogId::new(
+        let rewound = applied_up_to - 3;
+        let rewound_id = openraft::LogId::new(
             openraft::vote::leader_id_adv::CommittedLeaderId {
                 term: 1,
                 node_id: 1,
             },
-            stale_index,
+            rewound - 1,
         );
-        let stale_bytes = rmp_serde::to_vec(&Some(stale_log_id)).expect("serialize");
         engine_read
-            .put(Partition::Schema, KEY_SM_APPLIED, &stale_bytes)
-            .expect("overwrite applied_index");
-
-        // Persist tampered value to SST — SST now has stale applied_index.
-        engine_read.persist().expect("persist tampered");
+            .reset_raft_coverage(rewound, &rmp_serde::to_vec(&rewound_id).expect("serialize"))
+            .expect("rewind coverage");
 
         // Graceful shutdown (simulates "crash" after which we reopen cleanly).
         // In real crash, Drop wouldn't run and oplog entries are safe (fsynced).
@@ -282,10 +258,9 @@ async fn crash_recovery_stale_applied_index() {
         let engine_read = Arc::clone(&engine);
 
         // openraft will:
-        //   1. Read applied_index=stale from SST → StateMachine::applied_state()
+        //   1. Read the rewound position → StateMachine::applied_state()
         //   2. Read last_log_id from Partition::Raft → LogStore::get_log_state()
-        //   3. Re-deliver committed entries after stale_index to StateMachine::apply()
-        //   4. apply() re-applies those mutations (idempotent: same seqno)
+        //   3. Re-deliver committed entries after it to StateMachine::apply()
         let node = RaftNode::open(1, Arc::clone(&engine))
             .await
             .expect("reopen");
@@ -301,7 +276,7 @@ async fn crash_recovery_stale_applied_index() {
             assert_eq!(
                 val.as_deref(),
                 Some(format!("crash-val-{i}").as_bytes()),
-                "crash-key-{i} data must survive crash recovery (stale applied_index replay)"
+                "crash-key-{i} data must survive crash recovery (re-delivery from the covered prefix)"
             );
         }
 
@@ -336,15 +311,10 @@ async fn crash_recovery_stale_applied_index() {
     }
 }
 
-/// Verify that the apply order fix (mutations before save_applied) is correct.
-///
-/// After the fix: if we inspect the engine state RIGHT before save_applied runs,
-/// the tree data must already be in the memtable. This test verifies the net
-/// result: data is readable after proposal completion.
-///
-/// This is a regression test for the "save_applied before apply" bug.
+/// A completed proposal is in its tree together with the record saying so:
+/// the data is readable and the tree's coverage marks the proposal.
 #[tokio::test(flavor = "multi_thread")]
-async fn apply_order_mutations_before_applied_index() {
+async fn an_applied_proposal_is_recorded_in_its_tree() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = open_engine(dir.path());
     let engine_read = Arc::clone(&engine);
@@ -371,9 +341,8 @@ async fn apply_order_mutations_before_applied_index() {
 
     pipeline.propose_and_wait(&proposal).expect("propose");
 
-    // After propose_and_wait returns, both tree mutation AND applied_index must
-    // be in memtable. Since propose_and_wait blocks until apply() returns,
-    // both writes have happened by now.
+    // propose_and_wait blocks until apply() returns, so the mutation and its
+    // coverage marker are both in the Node tree by now.
     let val = engine_read
         .get(Partition::Node, b"apply-order-key")
         .expect("read");
@@ -383,12 +352,12 @@ async fn apply_order_mutations_before_applied_index() {
         "tree mutation must be present after proposal completes"
     );
 
-    let applied_raw = engine_read
-        .get(Partition::Schema, KEY_SM_APPLIED)
-        .expect("read applied_index");
+    let coverage = engine_read.raft_coverage().expect("read coverage");
+    let last = coverage.skip_until();
+    assert!(last > 0, "the applied proposal must be recorded");
     assert!(
-        applied_raw.is_some(),
-        "applied_index must be set after proposal completes"
+        coverage.holds(Partition::Node, last - 1, 0),
+        "the Node tree records the proposal it holds"
     );
 
     node.shutdown().await.expect("shutdown");

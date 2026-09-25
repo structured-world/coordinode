@@ -1085,6 +1085,7 @@ version = "0.6.0"
 dependencies = [
  "bytes",
  "coordinode-core",
+ "coordinode-lsm-tree",
  "coordinode-storage",
  "coordinode-test-fixtures",
  "coordinode-wire",
@@ -1873,6 +1874,7 @@ dependencies = [
  "windows-numerics",
  "windows-result",
  "windows-strings",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
  "windows-sys 0.61.2",
  "windows-targets",

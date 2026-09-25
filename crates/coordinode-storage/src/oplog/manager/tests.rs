@@ -304,10 +304,9 @@ fn purge_before_removes_fully_covered_segments() {
 
     assert_eq!(mgr.sealed.len(), 2);
 
-    // purge_before(5, u64::MAX): index gate eligible, SST gate satisfied
-    // by sentinel safe_ts — seg1 next_index=5 <= 5 and last_ts=1004 <= MAX
-    // → purged; seg2 next_index=10 > 5 → kept by index gate.
-    let purged = mgr.purge_before(5, u64::MAX).expect("purge_before");
+    // Segment 1's entries (0..5) are all below 5 → purged; segment 2's are
+    // not → kept.
+    let purged = mgr.purge_before(5).expect("purge_before");
     assert_eq!(purged, 1, "only the first segment should be purged");
     assert_eq!(mgr.sealed.len(), 1, "second segment must remain");
 
@@ -319,60 +318,25 @@ fn purge_before_removes_fully_covered_segments() {
 }
 
 #[test]
-fn purge_before_defers_when_partition_flush_lags() {
-    // Regression for the cross-partition crash-safety hole: even though
-    // openraft has applied the entries and called purge, the SST flush
-    // watermark trails the segment's last_ts, so the segment must stay.
-    // Replay through openraft is the only way to reconstruct mutations
-    // still sitting in a partition memtable.
+fn purge_before_keeps_a_segment_that_straddles_the_bound() {
+    // A bound inside a segment keeps the whole segment: the entries at and
+    // above the bound are still needed, and segments are deleted whole.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 5, 86400).expect("open");
-
-    // Segment with entries ts=1000..1005.
     for i in 0..5u64 {
         mgr.append(&make_entry(i, 1000 + i)).expect("append");
     }
     mgr.rotate().expect("rotate");
-    assert_eq!(mgr.sealed.len(), 1);
 
-    // applied_index is past the segment, but the SST watermark is below
-    // the segment's last_ts (1004) — purge must skip.
-    let purged = mgr
-        .purge_before(/*applied_index*/ u64::MAX, /*safe_ts*/ 500)
-        .expect("purge_before");
+    assert_eq!(mgr.purge_before(4).expect("purge_before"), 0);
+    assert_eq!(mgr.sealed.len(), 1, "entry 4 is still needed");
     assert_eq!(
-        purged, 0,
-        "segment must be retained when min_partition_flushed_seqno < last_ts"
+        mgr.purge_before(0).expect("purge_before"),
+        0,
+        "0 purges nothing"
     );
-    assert_eq!(mgr.sealed.len(), 1, "segment still on disk");
-
-    // Once flush catches up, the same call succeeds — the segment is now
-    // safe to drop because every partition has the mutations in SST form.
-    let purged = mgr
-        .purge_before(u64::MAX, /*safe_ts*/ 1004)
-        .expect("purge_before");
-    assert_eq!(purged, 1, "segment purged after flush watermark advanced");
+    assert_eq!(mgr.purge_before(5).expect("purge_before"), 1);
     assert!(mgr.sealed.is_empty());
-}
-
-#[test]
-fn purge_before_with_zero_safe_ts_is_noop() {
-    // Cold-start invariant: no SST has been written yet, so safe_ts == 0
-    // and every non-empty segment has last_ts >= 1. Nothing must be purged
-    // during startup recovery, even if applied_index is advanced.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 5, 86400).expect("open");
-
-    for i in 0..3u64 {
-        mgr.append(&make_entry(i, 1000 + i)).expect("append");
-    }
-    mgr.rotate().expect("rotate");
-
-    let purged = mgr
-        .purge_before(/*applied_index*/ u64::MAX, /*safe_ts*/ 0)
-        .expect("purge_before");
-    assert_eq!(purged, 0, "fresh engine must never purge during startup");
-    assert_eq!(mgr.sealed.len(), 1);
 }
 
 #[test]

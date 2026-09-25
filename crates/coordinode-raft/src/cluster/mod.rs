@@ -169,7 +169,8 @@ impl RaftNode {
         // engine itself stamps writes with (see the cluster constructors
         // for why the state machine must advance it).
         let oracle = oracle.or_else(|| engine.oracle());
-        let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle);
+        let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle)
+            .map_err(|e| RaftNodeError::Init(e.to_string()))?;
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -299,7 +300,8 @@ impl RaftNode {
         // node keep drawing stale snapshots that observe none of the
         // replicated data.
         let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
@@ -451,7 +453,8 @@ impl RaftNode {
         // node keep drawing stale snapshots that observe none of the
         // replicated data.
         let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
@@ -563,7 +566,8 @@ impl RaftNode {
         // node keep drawing stale snapshots that observe none of the
         // replicated data.
         let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 
@@ -654,7 +658,8 @@ impl RaftNode {
         // node keep drawing stale snapshots that observe none of the
         // replicated data.
         let state_machine =
-            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle());
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
 

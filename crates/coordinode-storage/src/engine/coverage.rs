@@ -48,12 +48,15 @@ pub(crate) const FOLD_EVERY: u64 = 4096;
 pub(crate) enum Domain {
     /// The embedded journal's entry index.
     Journal,
+    /// The Raft log index; `sub` is the proposal's position in its entry.
+    Raft,
 }
 
 impl Domain {
     const fn tag(self) -> u8 {
         match self {
             Self::Journal => b'j',
+            Self::Raft => b'r',
         }
     }
 
@@ -73,12 +76,26 @@ impl Domain {
     }
 
     /// Exclusive end of this domain's marker range.
-    const fn marker_end(self) -> [u8; 4] {
+    pub(crate) const fn marker_end(self) -> [u8; 4] {
         [0x00, b'c', self.tag(), b'n']
     }
 }
 
 const MARKER_LEN: usize = 16;
+
+/// The coverage marker one apply writes into every tree it touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub(crate) domain: Domain,
+    pub(crate) index: u64,
+    pub(crate) sub: u32,
+}
+
+impl Mark {
+    pub(crate) fn key(self) -> [u8; MARKER_LEN] {
+        self.domain.marker_key(self.index, self.sub)
+    }
+}
 
 /// The `(index, sub)` a marker key names, or `None` for a malformed key.
 fn decode_marker(key: &[u8]) -> Option<(u64, u32)> {
@@ -141,6 +158,8 @@ pub(crate) fn user_prefix(tree: &AnyTree, prefix: &[u8], seqno: SeqNo) -> Storag
 pub(crate) struct TreeCoverage {
     /// `None` when the tree carries no coverage record at all.
     base: Option<u64>,
+    /// The source's description of the last entry the base covers.
+    base_payload: Vec<u8>,
     /// Marked `(index, sub)` pairs at or above the base.
     sparse: BTreeSet<(u64, u32)>,
 }
@@ -148,9 +167,12 @@ pub(crate) struct TreeCoverage {
 impl TreeCoverage {
     /// Read the base and the markers above it, at the latest version.
     pub(crate) fn read(tree: &AnyTree, domain: Domain) -> StorageResult<Self> {
-        let base = match tree.get(domain.base_key(), SeqNo::MAX)? {
-            Some(value) => Some(decode_base(&value)?.0),
-            None => None,
+        let (base, base_payload) = match tree.get(domain.base_key(), SeqNo::MAX)? {
+            Some(value) => {
+                let (next, payload) = decode_base(&value)?;
+                (Some(next), payload.to_vec())
+            }
+            None => (None, Vec::new()),
         };
         let from = domain.marker_key(base.unwrap_or(0), 0);
         let end = domain.marker_end();
@@ -165,7 +187,16 @@ impl TreeCoverage {
             })?;
             sparse.insert(marker);
         }
-        Ok(Self { base, sparse })
+        Ok(Self {
+            base,
+            base_payload,
+            sparse,
+        })
+    }
+
+    /// The base (every index below it covered) and its payload.
+    pub(crate) fn base(&self) -> Option<(u64, &[u8])> {
+        self.base.map(|next| (next, self.base_payload.as_slice()))
     }
 
     /// Whether the tree carries a coverage record (a base).

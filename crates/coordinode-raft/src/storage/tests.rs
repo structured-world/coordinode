@@ -16,6 +16,10 @@ fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     (dir, engine)
 }
 
+fn log_id(term: u64, index: u64) -> openraft::type_config::alias::LogIdOf<TypeConfig> {
+    openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index)
+}
+
 // -- LogStore --
 
 #[tokio::test]
@@ -86,14 +90,7 @@ async fn log_store_truncate_after() {
     store.append(entries, IOFlushed::noop()).await.unwrap();
 
     // Truncate after index 1 (keep 1, delete 2 and 3)
-    let log_id = openraft::LogId::new(
-        CommittedLeaderId {
-            term: 1,
-            node_id: 0,
-        },
-        1,
-    );
-    store.truncate_after(Some(log_id)).await.unwrap();
+    store.truncate_after(Some(log_id(1, 1))).await.unwrap();
 
     let remaining = store.try_get_log_entries(0..=10).await.unwrap();
     assert_eq!(remaining.len(), 1);
@@ -103,7 +100,7 @@ async fn log_store_truncate_after() {
 #[tokio::test]
 async fn log_store_purge() {
     let (_dir, engine) = test_engine();
-    let mut store = LogStore::open(engine).unwrap();
+    let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
 
     let entries = vec![
         make_entry(1, 1, "a"),
@@ -111,20 +108,58 @@ async fn log_store_purge() {
         make_entry(3, 1, "c"),
     ];
     store.append(entries, IOFlushed::noop()).await.unwrap();
+    // Every tree durably holds entries 0..=2.
+    engine.reset_raft_coverage(3, &[]).unwrap();
 
     // Purge up to index 2 (delete 1 and 2, keep 3)
-    let log_id = openraft::LogId::new(
-        CommittedLeaderId {
-            term: 1,
-            node_id: 0,
-        },
-        2,
-    );
-    store.purge(log_id).await.unwrap();
+    store.purge(log_id(1, 2)).await.unwrap();
 
     let remaining = store.try_get_log_entries(0..=10).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].log_id.index, 3);
+}
+
+#[tokio::test]
+async fn log_store_purge_stops_at_what_every_tree_holds() {
+    // openraft may ask to forget an entry a tree has not flushed yet; the
+    // entry is then its only copy, so the purge stops below it and records
+    // the entry it actually stopped at.
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
+    let entries = vec![
+        make_entry(1, 1, "a"),
+        make_entry(2, 1, "b"),
+        make_entry(3, 1, "c"),
+    ];
+    store.append(entries, IOFlushed::noop()).await.unwrap();
+    engine.reset_raft_coverage(2, &[]).unwrap();
+
+    store.purge(log_id(1, 3)).await.unwrap();
+
+    let remaining = store.try_get_log_entries(0..=10).await.unwrap();
+    assert_eq!(
+        remaining.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+        vec![2, 3],
+        "entries at or above the durable floor stay"
+    );
+    let state = store.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(log_id(1, 1)));
+}
+
+#[tokio::test]
+async fn log_store_purge_with_nothing_durable_keeps_everything() {
+    // A fresh record covers nothing, so no entry may go.
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
+    let entries = vec![make_entry(1, 1, "a"), make_entry(2, 1, "b")];
+    store.append(entries, IOFlushed::noop()).await.unwrap();
+    engine.reset_raft_coverage(0, &[]).unwrap();
+
+    store.purge(log_id(1, 2)).await.unwrap();
+
+    assert_eq!(store.try_get_log_entries(0..=10).await.unwrap().len(), 2);
+    let state = store.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, None);
 }
 
 #[tokio::test]
@@ -135,14 +170,7 @@ async fn log_store_committed_roundtrip() {
     // No committed initially
     assert!(store.read_committed().await.unwrap().is_none());
 
-    let log_id = openraft::LogId::new(
-        CommittedLeaderId {
-            term: 1,
-            node_id: 0,
-        },
-        5,
-    );
-    store.save_committed(Some(log_id)).await.unwrap();
+    store.save_committed(Some(log_id(1, 5))).await.unwrap();
 
     let loaded = store.read_committed().await.unwrap().unwrap();
     assert_eq!(loaded.index, 5);
@@ -153,20 +181,107 @@ async fn log_store_committed_roundtrip() {
 #[tokio::test]
 async fn state_machine_initial_state() {
     let (_dir, engine) = test_engine();
-    let mut sm = CoordinodeStateMachine::new(engine);
+    let mut sm = CoordinodeStateMachine::new(engine).expect("open state machine");
 
     let (applied, membership) = sm.applied_state().await.unwrap();
     assert!(applied.is_none());
     assert!(membership.log_id().is_none());
 }
 
+#[tokio::test]
+async fn state_machine_resumes_from_the_lowest_covered_prefix() {
+    // The applied position comes from the trees' coverage bases: the entry
+    // every tree durably holds, not a key one of them happened to flush.
+    let (_dir, engine) = test_engine();
+    let resume = log_id(3, 9);
+    engine
+        .reset_raft_coverage(10, &rmp_serde::to_vec(&resume).unwrap())
+        .unwrap();
+
+    let mut sm = CoordinodeStateMachine::new(engine).expect("open state machine");
+    let (applied, _) = sm.applied_state().await.unwrap();
+    assert_eq!(applied, Some(resume));
+    assert_eq!(sm.applied_index(), 9);
+}
+
+#[test]
+fn a_store_that_applied_entries_without_coverage_is_refused() {
+    // A release before apply coverage kept only its own applied-index key.
+    // Nothing proves which entries each tree holds, so the open refuses
+    // rather than guessing.
+    let (_dir, engine) = test_engine();
+    engine
+        .put(
+            Partition::Schema,
+            KEY_SM_APPLIED,
+            &rmp_serde::to_vec(&log_id(1, 42)).unwrap(),
+        )
+        .unwrap();
+
+    let err = CoordinodeStateMachine::new(Arc::clone(&engine))
+        .err()
+        .expect("legacy store must be refused");
+    assert!(
+        err.to_string().contains("without an apply-coverage record"),
+        "got: {err}"
+    );
+    assert!(
+        !engine.raft_coverage().unwrap().has_record(),
+        "the refused store is left untouched"
+    );
+}
+
+#[tokio::test]
+async fn installing_a_snapshot_rebinds_every_tree_to_it() {
+    // After the install every tree holds exactly the snapshot, so the
+    // resume point is the snapshot and no older marker survives.
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
+    sm.apply_proposal(&node_put(1, 1000, b"pre-snapshot"), 5, 0)
+        .unwrap();
+
+    let snapshot_id = log_id(2, 20);
+    let meta = SnapshotMeta {
+        last_log_id: Some(snapshot_id),
+        last_membership: openraft::StoredMembership::default(),
+    };
+    sm.install_snapshot(&meta, std::io::Cursor::new(Vec::new()))
+        .await
+        .unwrap();
+
+    let coverage = engine.raft_coverage().unwrap();
+    assert_eq!(
+        coverage.resume_point(),
+        Some((21, rmp_serde::to_vec(&snapshot_id).unwrap().as_slice()))
+    );
+    assert!(coverage.holds(Partition::Node, 5, 0), "below the snapshot");
+    assert_eq!(coverage.skip_until(), 21, "the pre-snapshot marker is gone");
+
+    let mut reopened = CoordinodeStateMachine::new(engine).expect("reopen");
+    assert_eq!(reopened.applied_state().await.unwrap().0, Some(snapshot_id));
+}
+
 // -- Dedup tests --
+
+fn node_put(id: u64, commit_ts: u64, value: &[u8]) -> RaftProposal {
+    RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(id),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: format!("node:1:{id}").into_bytes(),
+            value: value.to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: false,
+    }
+}
 
 #[test]
 fn dedup_skips_duplicate_proposal() {
     // Apply same proposal twice — second should be detected as duplicate
     let (_dir, engine) = test_engine();
-    let sm = CoordinodeStateMachine::new(engine);
+    let sm = CoordinodeStateMachine::new(engine).expect("open state machine");
 
     let proposal = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(42),
@@ -181,11 +296,12 @@ fn dedup_skips_duplicate_proposal() {
     };
 
     // First apply: should return 1 mutation applied
-    let r1 = sm.apply_proposal(&proposal).unwrap();
+    let r1 = sm.apply_proposal(&proposal, 1, 0).unwrap();
     assert_eq!(r1.mutations_applied, 1);
 
-    // Second apply (same id + same size): should return 0 (dedup)
-    let r2 = sm.apply_proposal(&proposal).unwrap();
+    // Second apply (same id + same size), carried by a later entry: should
+    // return 0 (dedup)
+    let r2 = sm.apply_proposal(&proposal, 2, 0).unwrap();
     assert_eq!(r2.mutations_applied, 0);
 }
 
@@ -194,7 +310,7 @@ fn dedup_allows_different_size_same_id() {
     // Same proposal ID but different payload size should re-apply
     // (represents a retry with modified payload)
     let (_dir, engine) = test_engine();
-    let sm = CoordinodeStateMachine::new(engine);
+    let sm = CoordinodeStateMachine::new(engine).expect("open state machine");
 
     let proposal_v1 = RaftProposal {
         id: coordinode_core::txn::proposal::ProposalId::from_raw(42),
@@ -221,11 +337,11 @@ fn dedup_allows_different_size_same_id() {
     };
 
     // First version applied
-    let r1 = sm.apply_proposal(&proposal_v1).unwrap();
+    let r1 = sm.apply_proposal(&proposal_v1, 1, 0).unwrap();
     assert_eq!(r1.mutations_applied, 1);
 
     // Second version with different size: should NOT be deduped
-    let r2 = sm.apply_proposal(&proposal_v2).unwrap();
+    let r2 = sm.apply_proposal(&proposal_v2, 2, 0).unwrap();
     assert_eq!(r2.mutations_applied, 1);
 }
 
@@ -233,21 +349,9 @@ fn dedup_allows_different_size_same_id() {
 fn dedup_gc_removes_old_entries() {
     // Verify that dedup GC cleans old entries
     let (_dir, engine) = test_engine();
-    let sm = CoordinodeStateMachine::new(engine);
+    let sm = CoordinodeStateMachine::new(engine).expect("open state machine");
 
-    let proposal = RaftProposal {
-        id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: vec![Mutation::Put {
-            partition: coordinode_core::txn::proposal::PartitionId::Node,
-            key: b"node:1:1".to_vec(),
-            value: b"data".to_vec(),
-        }],
-        commit_ts: Timestamp::from_raw(100),
-        start_ts: Timestamp::from_raw(99),
-        bypass_rate_limiter: false,
-    };
-
-    sm.apply_proposal(&proposal).unwrap();
+    sm.apply_proposal(&node_put(1, 100, b"data"), 1, 0).unwrap();
 
     // Verify dedup map has 1 entry
     let dedup_len = sm.dedup.lock().unwrap().len();
@@ -265,23 +369,112 @@ fn dedup_gc_removes_old_entries() {
     }
 
     // Apply another proposal to trigger GC
-    let proposal2 = RaftProposal {
-        id: coordinode_core::txn::proposal::ProposalId::from_raw(2),
-        mutations: vec![Mutation::Put {
-            partition: coordinode_core::txn::proposal::PartitionId::Node,
-            key: b"node:1:2".to_vec(),
-            value: b"data2".to_vec(),
-        }],
-        commit_ts: Timestamp::from_raw(200),
-        start_ts: Timestamp::from_raw(199),
-        bypass_rate_limiter: false,
-    };
-    sm.apply_proposal(&proposal2).unwrap();
+    sm.apply_proposal(&node_put(2, 200, b"data2"), 2, 0)
+        .unwrap();
 
     // Old entry should have been GC'd, new one remains
     let dedup = sm.dedup.lock().unwrap();
     assert!(!dedup.contains_key(&1u64), "old entry should be GC'd");
     assert!(dedup.contains_key(&2u64), "new entry should remain");
+}
+
+// -- Crash recovery --
+
+/// One Raft entry whose single proposal merges into two trees, both
+/// non-idempotent: an edge on Adj and a degree delta on Counter.
+fn two_tree_merge_entry(index: u64, commit_ts: u64) -> Entry {
+    use openraft::entry::RaftEntry;
+    let proposal = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+        mutations: vec![
+            Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: b"adj:R:out:1".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_add(7),
+            },
+            Mutation::Merge {
+                partition: PartitionId::Counter,
+                key: b"counter:degree:1".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_counter_delta(1),
+            },
+        ],
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: false,
+    };
+    Entry::new_normal(log_id(1, index), Request::single(proposal))
+}
+
+async fn apply_entries(sm: &mut CoordinodeStateMachine, entries: Vec<Entry>) {
+    let stream = futures_util::stream::iter(entries.into_iter().map(|e| Ok((e, None))));
+    sm.apply(stream).await.expect("apply");
+}
+
+fn open_rig_engine(
+    rig: &coordinode_test_fixtures::PowerRig,
+) -> (
+    Arc<StorageEngine>,
+    Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+) {
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(&rig.config(), Arc::clone(&oracle)).expect("open engine"),
+    );
+    (engine, oracle)
+}
+
+#[tokio::test]
+async fn an_entry_one_tree_flushed_is_replayed_only_into_the_other() {
+    // The entry reaches an SST in Adj while Counter's memtable is lost. On
+    // restart openraft re-delivers it: Counter must get the delta, Adj must
+    // not get the edge a second time. Resuming from a single applied-index
+    // key gets one of the two wrong whichever tree flushed it.
+    use lsm_tree::AbstractTree;
+
+    let reference = {
+        let rig = coordinode_test_fixtures::PowerRig::new();
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        let ts = oracle.current().as_raw() + 1_000;
+        apply_entries(&mut sm, vec![two_tree_merge_entry(1, ts)]).await;
+        (
+            engine.get(Partition::Adj, b"adj:R:out:1").unwrap(),
+            engine.get(Partition::Counter, b"counter:degree:1").unwrap(),
+        )
+    };
+
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let ts;
+    {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        ts = oracle.current().as_raw() + 1_000;
+        apply_entries(&mut sm, vec![two_tree_merge_entry(1, ts)]).await;
+        engine
+            .tree(Partition::Adj)
+            .unwrap()
+            .flush_active_memtable(0)
+            .unwrap();
+        drop(sm);
+        rig.cut(engine);
+    }
+
+    let (engine, oracle) = open_rig_engine(&rig);
+    let mut sm =
+        CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle)).expect("reopen");
+    let (applied, _) = sm.applied_state().await.unwrap();
+    assert_eq!(applied, None, "nothing is covered in every tree yet");
+    apply_entries(&mut sm, vec![two_tree_merge_entry(1, ts)]).await;
+    assert_eq!(
+        (
+            engine.get(Partition::Adj, b"adj:R:out:1").unwrap(),
+            engine.get(Partition::Counter, b"counter:degree:1").unwrap(),
+        ),
+        reference,
+        "each tree holds the entry exactly once after the re-delivery"
+    );
 }
 
 // -- Config --
@@ -303,8 +496,6 @@ fn default_config_values() {
     assert_eq!(config.max_payload_entries, 300);
 }
 
-// -- Helpers --
-
 // -- Purge persistence tests --
 
 #[tokio::test]
@@ -318,20 +509,14 @@ async fn log_store_purge_persists_last_purged_log_id() {
         make_entry(3, 1, "c"),
     ];
     store.append(entries, IOFlushed::noop()).await.unwrap();
+    engine.reset_raft_coverage(3, &[]).unwrap();
 
     // Initially no purge
     let state = store.get_log_state().await.unwrap();
     assert!(state.last_purged_log_id.is_none(), "no purge initially");
 
     // Purge up to index 2
-    let purge_id = openraft::LogId::new(
-        CommittedLeaderId {
-            term: 1,
-            node_id: 0,
-        },
-        2,
-    );
-    store.purge(purge_id).await.unwrap();
+    store.purge(log_id(1, 2)).await.unwrap();
 
     // Verify purge tracked in-session
     let state = store.get_log_state().await.unwrap();
@@ -346,17 +531,19 @@ async fn log_store_purge_persists_last_purged_log_id() {
 async fn log_store_purge_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-
-    // Phase 1: write + purge
-    {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let config = || {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
             &path,
             Media::Hdd,
             Durability::Durable,
             Tier::Warm,
-        )]);
-        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        )])
+    };
+
+    // Phase 1: write + purge
+    {
+        let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
         let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
 
         let entries = vec![
@@ -365,27 +552,13 @@ async fn log_store_purge_survives_reopen() {
             make_entry(3, 1, "c"),
         ];
         store.append(entries, IOFlushed::noop()).await.unwrap();
-
-        let purge_id = openraft::LogId::new(
-            CommittedLeaderId {
-                term: 1,
-                node_id: 0,
-            },
-            2,
-        );
-        store.purge(purge_id).await.unwrap();
+        engine.reset_raft_coverage(3, &[]).unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
     }
 
     // Phase 2: reopen, verify purge state persisted
     {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            &path,
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
+        let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));
         let mut store = LogStore::open(engine).unwrap();
 
         let state = store.get_log_state().await.unwrap();
@@ -414,18 +587,10 @@ async fn snapshot_build_persists_to_storage() {
         .put(Partition::Node, b"node:0:1", b"alice")
         .expect("put");
 
-    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine));
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
 
     // Set applied state so snapshot has a valid log_id
-    let log_id = openraft::LogId::new(
-        CommittedLeaderId {
-            term: 1,
-            node_id: 0,
-        },
-        5,
-    );
-    *sm.last_applied.lock().unwrap() = Some(log_id);
-    sm.save_applied(&log_id).unwrap();
+    *sm.last_applied.lock().unwrap() = Some(log_id(1, 5));
 
     // Build snapshot via the SnapshotBuilder
     let mut builder = sm.get_snapshot_builder().await;
@@ -449,31 +614,25 @@ async fn snapshot_build_persists_to_storage() {
 async fn snapshot_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
-
-    // Phase 1: build snapshot
-    {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let config = || {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
             &path,
             Media::Hdd,
             Durability::Durable,
             Tier::Warm,
-        )]);
-        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        )])
+    };
+
+    // Phase 1: build snapshot
+    {
+        let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
         engine
             .put(Partition::Node, b"node:0:1", b"alice")
             .expect("put");
 
-        let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine));
-        let log_id = openraft::LogId::new(
-            CommittedLeaderId {
-                term: 1,
-                node_id: 0,
-            },
-            10,
-        );
-        *sm.last_applied.lock().unwrap() = Some(log_id);
-        sm.save_applied(&log_id).unwrap();
+        let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
+        *sm.last_applied.lock().unwrap() = Some(log_id(1, 10));
 
         let mut builder = sm.get_snapshot_builder().await;
         let _snap = builder.build_snapshot().await.unwrap();
@@ -481,15 +640,8 @@ async fn snapshot_survives_reopen() {
 
     // Phase 2: reopen, verify snapshot is still there
     {
-        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            &path,
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        let engine = Arc::new(StorageEngine::open(&config).expect("reopen"));
-        let mut sm = CoordinodeStateMachine::new(engine);
+        let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));
+        let mut sm = CoordinodeStateMachine::new(engine).expect("reopen state machine");
 
         let snap = sm.get_current_snapshot().await.unwrap();
         assert!(snap.is_some(), "snapshot should survive reopen");
@@ -516,7 +668,6 @@ async fn snapshot_survives_reopen() {
 }
 
 fn make_entry(index: u64, term: u64, title: &str) -> Entry {
-    use coordinode_core::txn::proposal::PartitionId;
     use openraft::entry::RaftEntry;
 
     let proposal = RaftProposal {
@@ -531,13 +682,10 @@ fn make_entry(index: u64, term: u64, title: &str) -> Entry {
         bypass_rate_limiter: false,
     };
 
-    let committed_leader_id = CommittedLeaderId { term, node_id: 0 };
-    let log_id = openraft::LogId::new(committed_leader_id, index);
-
-    Entry::new_normal(log_id, Request::single(proposal))
+    Entry::new_normal(log_id(term, index), Request::single(proposal))
 }
 
-// -- R068: oracle.advance_to() during Raft apply --
+// -- oracle.advance_to() during Raft apply --
 
 #[test]
 fn apply_advances_oracle_to_commit_ts() {
@@ -553,22 +701,11 @@ fn apply_advances_oracle_to_commit_ts() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("open state machine");
 
     // Apply proposal with commit_ts=500
-    let proposal = RaftProposal {
-        id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: vec![Mutation::Put {
-            partition: PartitionId::Node,
-            key: b"node:1:1".to_vec(),
-            value: b"data".to_vec(),
-        }],
-        commit_ts: Timestamp::from_raw(500),
-        start_ts: Timestamp::from_raw(499),
-        bypass_rate_limiter: false,
-    };
-
-    let result = sm.apply_proposal(&proposal).unwrap();
+    let result = sm.apply_proposal(&node_put(1, 500, b"data"), 1, 0).unwrap();
     assert_eq!(result.mutations_applied, 1);
 
     // Oracle should have advanced to at least 500
@@ -594,22 +731,13 @@ fn apply_100_entries_oracle_monotonic() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("open state machine");
 
-    // Apply 100 proposals with increasing commit_ts
+    // Apply 100 proposals with increasing commit_ts, one per entry
     for i in 1..=100u64 {
-        let proposal = RaftProposal {
-            id: coordinode_core::txn::proposal::ProposalId::from_raw(i),
-            mutations: vec![Mutation::Put {
-                partition: PartitionId::Node,
-                key: format!("node:1:{i}").into_bytes(),
-                value: format!("v{i}").into_bytes(),
-            }],
-            commit_ts: Timestamp::from_raw(1000 + i),
-            start_ts: Timestamp::from_raw(999 + i),
-            bypass_rate_limiter: false,
-        };
-        sm.apply_proposal(&proposal).unwrap();
+        let proposal = node_put(i, 1000 + i, format!("v{i}").as_bytes());
+        sm.apply_proposal(&proposal, i, 0).unwrap();
     }
 
     // Oracle should be at least at 1100 (last commit_ts)
@@ -635,23 +763,11 @@ fn apply_100_entries_oracle_monotonic() {
 
 #[test]
 fn apply_without_oracle_still_works() {
-    // Backward compat: state machine without oracle applies normally
+    // State machine without oracle applies normally
     let (_dir, engine) = test_engine();
-    let sm = CoordinodeStateMachine::new(engine.clone());
+    let sm = CoordinodeStateMachine::new(engine.clone()).expect("open state machine");
 
-    let proposal = RaftProposal {
-        id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
-        mutations: vec![Mutation::Put {
-            partition: PartitionId::Node,
-            key: b"node:1:1".to_vec(),
-            value: b"data".to_vec(),
-        }],
-        commit_ts: Timestamp::from_raw(500),
-        start_ts: Timestamp::from_raw(499),
-        bypass_rate_limiter: false,
-    };
-
-    let result = sm.apply_proposal(&proposal).unwrap();
+    let result = sm.apply_proposal(&node_put(1, 500, b"data"), 1, 0).unwrap();
     assert_eq!(result.mutations_applied, 1);
 
     let val = engine.get(Partition::Node, b"node:1:1").unwrap();
@@ -676,7 +792,8 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("open state machine");
     // Opening re-anchored the oracle to the wall clock; the leader's commit
     // timestamps below are real HLC values inside the retention window (a
     // contrived tiny timestamp would sit below the horizon and be refused).
@@ -694,7 +811,7 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
         start_ts: Timestamp::from_raw(base + 499),
         bypass_rate_limiter: false,
     };
-    sm.apply_proposal(&proposal).unwrap();
+    sm.apply_proposal(&proposal, 1, 0).unwrap();
 
     // Apply at commit_ts=base+700
     let proposal2 = RaftProposal {
@@ -708,7 +825,7 @@ fn apply_seqnos_match_commit_ts_with_oracle() {
         start_ts: Timestamp::from_raw(base + 699),
         bypass_rate_limiter: false,
     };
-    sm.apply_proposal(&proposal2).unwrap();
+    sm.apply_proposal(&proposal2, 2, 0).unwrap();
 
     // Each entry is applied at exactly its commit_ts, so time travel by
     // commit_ts is exact in both directions: at +500 the first write is
@@ -766,7 +883,8 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
         Tier::Warm,
     )]);
     let engine = Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap());
-    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()));
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+        .expect("open state machine");
     // A real HLC commit timestamp inside the retention window (see
     // `apply_seqnos_match_commit_ts_with_oracle`).
     let commit_ts = oracle.current().as_raw() + 1_500;
@@ -788,7 +906,7 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
         start_ts: Timestamp::from_raw(commit_ts - 1),
         bypass_rate_limiter: false,
     };
-    let applied = sm.apply_proposal(&proposal).unwrap();
+    let applied = sm.apply_proposal(&proposal, 1, 0).unwrap();
     assert_eq!(applied.mutations_applied, 5);
 
     // A storage snapshot at S sees seqnos strictly below S: "as of
@@ -943,7 +1061,7 @@ async fn restart_after_crash_with_sealed_segment_recovers_last_log_id() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// R-SNAP2: MaxAssignedWatermark integration with apply_proposal.
+// MaxAssignedWatermark integration with apply_proposal.
 // ─────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::panic)]
@@ -966,19 +1084,25 @@ mod snap2_watermark_integration {
         }
     }
 
+    fn open_with_watermark(
+        engine: Arc<StorageEngine>,
+        wm: &Arc<MaxAssignedWatermark>,
+    ) -> CoordinodeStateMachine {
+        CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(wm)))
+            .expect("open state machine")
+    }
+
     #[tokio::test]
     async fn advance_applies_after_successful_proposal() {
-        // R-SNAP2 regression #1: writer bursts commit_ts=1000, reader at
-        // T=800 returns immediately after the apply has advanced the
-        // watermark past T.
+        // Writer bursts commit_ts=1000, reader at T=800 returns immediately
+        // after the apply has advanced the watermark past T.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
-        let sm =
-            CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(&wm)));
+        let sm = open_with_watermark(engine, &wm);
 
         // Apply a single proposal with commit_ts = 1000.
-        let proposal = make_proposal(42, 1000);
-        sm.apply_proposal(&proposal).expect("apply ok");
+        sm.apply_proposal(&make_proposal(42, 1000), 1, 0)
+            .expect("apply ok");
 
         // Watermark must have advanced to commit_ts.
         assert_eq!(wm.current().as_raw(), 1000);
@@ -997,12 +1121,11 @@ mod snap2_watermark_integration {
         // always equals the latest.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
-        let sm =
-            CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(&wm)));
+        let sm = open_with_watermark(engine, &wm);
 
         for (i, ts) in [(1u64, 100u64), (2, 200), (3, 350)] {
-            let p = make_proposal(i, ts);
-            sm.apply_proposal(&p).expect("apply ok");
+            sm.apply_proposal(&make_proposal(i, ts), i, 0)
+                .expect("apply ok");
             assert_eq!(wm.current().as_raw(), ts);
         }
     }
@@ -1014,26 +1137,25 @@ mod snap2_watermark_integration {
         // edge case), the watermark must not regress.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
-        let sm =
-            CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(&wm)));
+        let sm = open_with_watermark(engine, &wm);
 
-        sm.apply_proposal(&make_proposal(1, 500)).expect("ok");
+        sm.apply_proposal(&make_proposal(1, 500), 1, 0).expect("ok");
         assert_eq!(wm.current().as_raw(), 500);
 
         // Older commit_ts proposal — watermark must NOT go back.
-        sm.apply_proposal(&make_proposal(2, 300)).expect("ok");
+        sm.apply_proposal(&make_proposal(2, 300), 2, 0).expect("ok");
         assert_eq!(wm.current().as_raw(), 500);
     }
 
     #[tokio::test]
     async fn no_watermark_configured_is_noop() {
-        // The watermark is optional — legacy paths that don't need
-        // cross-modality snapshots still work without one.
+        // The watermark is optional — paths that don't need cross-modality
+        // snapshots still work without one.
         let (_dir, engine) = test_engine();
-        let sm = CoordinodeStateMachine::new(engine);
+        let sm = CoordinodeStateMachine::new(engine).expect("open state machine");
 
         // Apply should succeed even without a watermark wired in.
-        sm.apply_proposal(&make_proposal(1, 100))
+        sm.apply_proposal(&make_proposal(1, 100), 1, 0)
             .expect("apply ok without watermark");
 
         // max_assigned() getter returns None.
@@ -1042,15 +1164,11 @@ mod snap2_watermark_integration {
 
     #[tokio::test]
     async fn reader_unblocks_when_applier_catches_up() {
-        // R-SNAP2 regression #2: reader at latest T blocks, applier
-        // advances watermark, reader unblocks promptly.
+        // Reader at latest T blocks, applier advances watermark, reader
+        // unblocks promptly.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::ZERO);
-        let sm = Arc::new(CoordinodeStateMachine::with_oracle_and_watermark(
-            engine,
-            None,
-            Some(Arc::clone(&wm)),
-        ));
+        let sm = Arc::new(open_with_watermark(engine, &wm));
 
         let wm_reader = Arc::clone(&wm);
         let reader = tokio::spawn(async move {
@@ -1061,7 +1179,8 @@ mod snap2_watermark_integration {
 
         // Applier delay — ensure reader is actually blocked.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        sm.apply_proposal(&make_proposal(1, 777)).expect("apply");
+        sm.apply_proposal(&make_proposal(1, 777), 1, 0)
+            .expect("apply");
 
         let got = reader.await.expect("task").expect("reader unblocks");
         assert_eq!(got.as_raw(), 777);
@@ -1069,13 +1188,12 @@ mod snap2_watermark_integration {
 
     #[tokio::test]
     async fn reader_times_out_when_no_apply_arrives() {
-        // R-SNAP2 regression #3: timeout path returns ErrReadTimeout
-        // (not stale Ok). Apply never happens; reader must time out
-        // with the final observed watermark value.
+        // Timeout path returns ErrReadTimeout (not stale Ok). Apply never
+        // happens; reader must time out with the final observed watermark
+        // value.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::from_raw(100));
-        let _sm =
-            CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(&wm)));
+        let _sm = open_with_watermark(engine, &wm);
 
         let err = wm
             .wait_for(Timestamp::from_raw(500), Duration::from_millis(50))
@@ -1099,8 +1217,7 @@ mod snap2_watermark_integration {
         // watermark away from its initial value.
         let (_dir, engine) = test_engine();
         let wm = MaxAssignedWatermark::new(Timestamp::from_raw(50));
-        let sm =
-            CoordinodeStateMachine::with_oracle_and_watermark(engine, None, Some(Arc::clone(&wm)));
+        let sm = open_with_watermark(engine, &wm);
 
         // commit_ts = 0 — should be ignored by the guard.
         let proposal = RaftProposal {
@@ -1114,7 +1231,7 @@ mod snap2_watermark_integration {
             start_ts: Timestamp::ZERO,
             bypass_rate_limiter: false,
         };
-        sm.apply_proposal(&proposal).expect("apply");
+        sm.apply_proposal(&proposal, 1, 0).expect("apply");
 
         // Watermark unchanged.
         assert_eq!(wm.current().as_raw(), 50);

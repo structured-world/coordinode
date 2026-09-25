@@ -41,7 +41,7 @@ use openraft::{OptionalSend, RaftLogReader, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 
 use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{RaftCoverage, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
 
 /// Maximum age for dedup entries before GC (10 minutes).
@@ -748,31 +748,51 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         log_id: openraft::type_config::alias::LogIdOf<TypeConfig>,
     ) -> Result<(), io::Error> {
-        // Cross-partition flush watermark gates the purge: keep oplog segments
-        // until every LSM partition has an SST covering their mutations.
-        // Without this gate, openraft's "applied_index advanced ⇒ safe to
-        // forget the oplog entry" assumption breaks for partitions whose
-        // memtable has not yet flushed when applied_index moves on.
-        let safe_ts = self.engine.min_partition_flushed_seqno();
+        // openraft may forget an entry once applied, but the entry is the
+        // only copy of whatever a tree has not flushed yet. Purge only below
+        // the entries every tree durably records as applied, whatever openraft
+        // asked for; the rest stays and a later purge takes it.
+        let floor = self
+            .engine
+            .raft_durable_floor()
+            .map_err(|e| io::Error::other(format!("raft coverage floor: {e}")))?;
+        let below = floor.min(log_id.index + 1);
+        if below == 0 {
+            return Ok(());
+        }
+        let purged_to = if below == log_id.index + 1 {
+            log_id
+        } else {
+            // The id of the last entry actually dropped, read before it goes.
+            let last = self
+                .oplog
+                .lock()
+                .map_err(|_| io::Error::other("oplog mutex poisoned"))?
+                .read_range(below - 1, below)
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .pop()
+                .ok_or_else(|| io::Error::other(format!("raft log entry {} missing", below - 1)))?;
+            Self::oplog_to_entry(last)?.log_id
+        };
 
-        // Two-gate purge: entry must be both applied and SST-durable.
         let purged_segments = self
             .oplog
             .lock()
             .map_err(|_| io::Error::other("oplog mutex poisoned"))?
-            .purge_before(log_id.index + 1, safe_ts)
+            .purge_before(below)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Update and persist the last_purged cache.
         *self
             .last_purged
             .lock()
-            .map_err(|_| io::Error::other("last_purged mutex poisoned"))? = Some(log_id);
-        let bytes = rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(|_| io::Error::other("last_purged mutex poisoned"))? = Some(purged_to);
+        let bytes = rmp_serde::to_vec(&purged_to).map_err(|e| io::Error::other(e.to_string()))?;
         self.put(KEY_PURGED, &bytes)?;
 
         tracing::debug!(
-            purged_up_to = log_id.index,
+            requested = log_id.index,
+            purged_up_to = purged_to.index,
             segments_removed = purged_segments,
             "raft log purged"
         );
@@ -850,21 +870,35 @@ pub struct CoordinodeStateMachine {
     /// ALL partitions (hundreds of MB), so redundant rebuilds are a
     /// direct latency and leader-stability hazard worth monitoring.
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
+    /// What each partition tree held when the state machine opened. Entries
+    /// below [`Self::skip_until`] are re-delivered from the lowest covered
+    /// prefix, and a tree that already holds a proposal is left alone; past
+    /// that point nothing needs checking and this is dropped.
+    replay_skip: Option<RaftCoverage>,
+    skip_until: u64,
+    /// The coverage base last written to every tree: all entries below it.
+    folded: u64,
 }
 
+/// How many applied entries accumulate as coverage markers before the state
+/// machine folds them into every tree's base.
+const RAFT_FOLD_EVERY: u64 = 4096;
+
 impl CoordinodeStateMachine {
-    pub fn new(engine: Arc<StorageEngine>) -> Self {
+    /// Open the state machine over `engine`; see
+    /// [`Self::with_oracle_and_watermark`] for the errors.
+    pub fn new(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
         Self::with_oracle(engine, None)
     }
 
-    /// Create with a timestamp oracle for seqno advancement (R068, ADR-016).
+    /// Create with a timestamp oracle for seqno advancement (ADR-016).
     ///
     /// When oracle is set, `apply_proposal()` calls `oracle.advance_to(commit_ts)`
     /// after applying the entry at `commit_ts`, so later allocations are newer.
     pub fn with_oracle(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-    ) -> Self {
+    ) -> Result<Self, io::Error> {
         Self::with_oracle_and_watermark(engine, oracle, None)
     }
 
@@ -875,20 +909,63 @@ impl CoordinodeStateMachine {
     /// been persisted to the storage engine. Readers at snapshot_ts T can
     /// then `watermark.wait_for(T, timeout)` to block until every write
     /// with `commit_ts ≤ T` is visible on this shard.
+    ///
+    /// The applied position is read from the partition trees' Raft coverage
+    /// records, not from a key of its own: each tree flushes on its own
+    /// schedule, so the position every tree holds is the lowest of their
+    /// bases, and openraft re-delivers from there.
+    ///
+    /// # Errors
+    ///
+    /// A store that applied Raft entries under a release without coverage
+    /// records is refused: nothing in it proves which entries each tree
+    /// holds. It is moved to this release by a dump and a restore. A failed
+    /// coverage read or the first record's flush also fails the open.
     pub fn with_oracle_and_watermark(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         max_assigned: Option<Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
-    ) -> Self {
-        // Load persisted state
-        let last_applied = Self::load_log_id(&engine, KEY_SM_APPLIED);
+    ) -> Result<Self, io::Error> {
+        let coverage = engine
+            .raft_coverage()
+            .map_err(|e| io::Error::other(format!("read raft coverage: {e}")))?;
+        let (last_applied, replay_skip) = match coverage.resume_point() {
+            Some((_, payload)) => {
+                let last_applied: Option<openraft::type_config::alias::LogIdOf<TypeConfig>> =
+                    if payload.is_empty() {
+                        None
+                    } else {
+                        Some(rmp_serde::from_slice(payload).map_err(|e| {
+                            io::Error::other(format!("raft coverage base log id: {e}"))
+                        })?)
+                    };
+                (last_applied, Some(coverage))
+            }
+            None if Self::load_log_id(&engine, KEY_SM_APPLIED).is_some() => {
+                return Err(io::Error::other(
+                    "this store applied Raft entries without an apply-coverage record, so \
+                     nothing proves which of them each partition holds; dump it with the \
+                     release that wrote it and restore the dump into this one",
+                ));
+            }
+            None => {
+                engine
+                    .reset_raft_coverage(0, &[])
+                    .map_err(|e| io::Error::other(format!("establish raft coverage: {e}")))?;
+                (None, None)
+            }
+        };
+        // The trees may still hold markers below their bases; the first fold
+        // removes markers from index 0.
+        let folded = 0;
+        let skip_until = replay_skip.as_ref().map_or(0, RaftCoverage::skip_until);
         let last_membership = Self::load_membership(&engine);
 
-        // Initialize applied watermark from persisted state
+        // Initialize applied watermark from the resume point.
         let initial_index = last_applied.map(|id| id.index).unwrap_or(0);
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(initial_index);
 
-        Self {
+        Ok(Self {
             engine,
             oracle,
             last_applied: Mutex::new(last_applied),
@@ -899,7 +976,10 @@ impl CoordinodeStateMachine {
             applied_rx,
             max_assigned,
             snapshot_builds: Arc::new(core::sync::atomic::AtomicU64::new(0)),
-        }
+            replay_skip,
+            skip_until,
+            folded,
+        })
     }
 
     /// Handle to the snapshot-build counter (increments on every full
@@ -964,16 +1044,6 @@ impl CoordinodeStateMachine {
             .unwrap_or_default()
     }
 
-    fn save_applied(
-        &self,
-        log_id: &openraft::type_config::alias::LogIdOf<TypeConfig>,
-    ) -> Result<(), io::Error> {
-        let bytes = rmp_serde::to_vec(log_id).map_err(|e| io::Error::other(e.to_string()))?;
-        self.engine
-            .put(Partition::Schema, KEY_SM_APPLIED, &bytes)
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
     fn save_membership(
         &self,
         membership: &openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
@@ -992,7 +1062,12 @@ impl CoordinodeStateMachine {
     /// Includes dedup check: if this proposal ID was already applied with
     /// the same size estimate, skip re-application (idempotent Raft replay).
     /// Follows Dgraph's dedup pattern (draft.go:874-940).
-    fn apply_proposal(&self, proposal: &RaftProposal) -> Result<Response, io::Error> {
+    fn apply_proposal(
+        &self,
+        proposal: &RaftProposal,
+        index: u64,
+        sub: u32,
+    ) -> Result<Response, io::Error> {
         let proposal_key = proposal.id.as_raw();
         let proposal_size = proposal.size_estimate();
 
@@ -1025,10 +1100,25 @@ impl CoordinodeStateMachine {
         // alike. The engine advances its own generator past commit_ts; the
         // state machine's oracle is advanced too so a follower promoted to
         // leader never allocates a timestamp at or below what it applied.
-        self.engine
-            .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
+        //
+        // Each touched tree records `(index, sub)` in the same batch as the
+        // proposal's effects. Inside the replay window a tree that already
+        // holds the proposal is skipped, so a re-delivered merge is never
+        // applied twice.
+        let replay = self
+            .replay_skip
+            .as_ref()
+            .filter(|_| index < self.skip_until);
+        let count = self
+            .engine
+            .apply_raft_proposal(
+                &proposal.mutations,
+                proposal.commit_ts.as_raw(),
+                index,
+                sub,
+                |part| replay.is_some_and(|c| c.holds(part, index, sub)),
+            )
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let count = proposal.mutations.len();
         if let Some(ref oracle) = self.oracle {
             if proposal.commit_ts.as_raw() > 0 {
                 oracle.advance_to(proposal.commit_ts);
@@ -1158,27 +1248,20 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 self.save_membership(&stored)?;
             }
 
-            // Apply tree mutations BEFORE persisting applied_index.
-            //
-            // Correct crash-safety ordering (ADR-017, R076):
-            //   1. Apply mutations to trees (memtable — not yet durable)
-            //   2. Persist applied_index (also in memtable — not yet durable)
-            //   3. FlushManager eventually flushes both to SST atomically
-            //
-            // If a crash occurs between steps 1 and 2, the SST-persisted
-            // applied_index will be behind. On restart, openraft re-delivers
-            // the missing entries (they are in the oplog, which WAS fsynced
-            // before apply was called). Re-applying is idempotent: same HLC
-            // seqno → same (key, seqno, value) → LSM overwrites are harmless.
-            //
-            // The WRONG order (old code) was: save_applied BEFORE mutations.
-            // That caused data loss: crash after save_applied but before apply
-            // → applied_index ahead of actual data → openraft won't replay.
+            // Each proposal lands with its coverage marker in every tree it
+            // touches; there is no separate "applied index" key, because a
+            // key in one tree says nothing about what another tree flushed.
+            // After a crash openraft re-delivers from the lowest covered
+            // prefix and the markers keep every tree at exactly-once.
+            let index = entry.log_id.index;
             let response = match &entry.payload {
                 openraft::entry::EntryPayload::Normal(request) => {
                     let mut total = 0;
-                    for proposal in &request.proposals {
-                        let r = self.apply_proposal(proposal)?;
+                    for (sub, proposal) in request.proposals.iter().enumerate() {
+                        let sub = u32::try_from(sub).map_err(|_| {
+                            io::Error::other(format!("entry {index} carries over 2^32 proposals"))
+                        })?;
+                        let r = self.apply_proposal(proposal, index, sub)?;
                         total += r.mutations_applied;
                     }
                     Response {
@@ -1190,13 +1273,22 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 },
             };
 
-            // Persist applied_index AFTER mutations are written to memtable.
             *self
                 .last_applied
                 .lock()
                 .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? =
                 Some(entry.log_id);
-            self.save_applied(&entry.log_id)?;
+            let next = index + 1;
+            debug_assert!(self.folded <= next, "fold ahead of the applied entry");
+            if next >= self.skip_until {
+                self.replay_skip = None;
+            }
+            if next - self.folded >= RAFT_FOLD_EVERY {
+                let payload = rmp_serde::to_vec(&entry.log_id)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                self.engine.fold_raft_coverage(self.folded, next, &payload);
+                self.folded = next;
+            }
 
             // Broadcast applied watermark (ignore send error — receivers may be dropped)
             let _ = self.applied_tx.send(entry.log_id.index);
@@ -1246,14 +1338,27 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             crate::snapshot::install_full_snapshot(&self.engine, &data)?;
         }
 
-        // Update last applied and membership from snapshot metadata
+        // Every tree now holds exactly the snapshot: the entries up to its
+        // last log id, nothing above. Recorded durably before openraft is told
+        // the install finished, together with the installed data it covers.
+        let (next, payload) = match meta.last_log_id {
+            Some(log_id) => (
+                log_id.index + 1,
+                rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
+            ),
+            None => (0, Vec::new()),
+        };
+        self.engine
+            .reset_raft_coverage(next, &payload)
+            .map_err(|e| io::Error::other(format!("rebind raft coverage to snapshot: {e}")))?;
+        self.replay_skip = None;
+        self.skip_until = 0;
+        self.folded = next;
+
         *self
             .last_applied
             .lock()
             .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? = meta.last_log_id;
-        if let Some(ref log_id) = meta.last_log_id {
-            self.save_applied(log_id)?;
-        }
 
         *self
             .last_membership
