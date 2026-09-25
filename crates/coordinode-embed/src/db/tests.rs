@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn every_database_open_draws_its_own_proposal_id_range() {
+    // Proposal ids must not repeat across incarnations: the state machine
+    // re-applies the old log on restart and drops a proposal whose id and
+    // size it saw, so a generator restarting at a fixed base silently loses
+    // the first writes after every restart.
+    let bases: std::collections::HashSet<u64> = (0..64).map(|_| fresh_proposal_id_base()).collect();
+    assert_eq!(bases.len(), 64, "each draw is a fresh point");
+}
+
+#[test]
 fn plan_cache_hit_returns_same_plan() {
     // Same query string twice → second call must observe the cache
     // entry created by the first. Asserted by introspecting

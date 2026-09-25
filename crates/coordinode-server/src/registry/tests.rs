@@ -42,7 +42,7 @@ async fn registry_leaves_the_engine_window_in_force() {
     let (engine, _dir) = open_engine(Some(window_secs));
     let pipeline = pipeline_for(&engine);
 
-    let _bg = build_consumer_registry(Arc::clone(&engine), pipeline, 1, RegistryTuning::default());
+    let _bg = build_consumer_registry(Arc::clone(&engine), pipeline, RegistryTuning::default());
 
     let snap = engine.snapshot();
     let expected = snap.saturating_sub(window_secs * US_PER_SEC);
@@ -64,7 +64,6 @@ async fn short_window_keeps_higher_floor_than_default() {
     let _bg_short = build_consumer_registry(
         Arc::clone(&engine_short),
         pipeline_for(&engine_short),
-        1,
         RegistryTuning::default(),
     );
     let floor_short = engine_short.gc_watermark();
@@ -73,7 +72,6 @@ async fn short_window_keeps_higher_floor_than_default() {
     let _bg_default = build_consumer_registry(
         Arc::clone(&engine_default),
         pipeline_for(&engine_default),
-        1,
         RegistryTuning::default(),
     );
     let floor_default = engine_default.gc_watermark();
@@ -93,7 +91,6 @@ async fn cadence_overrides_reach_the_background_service() {
     let (_registry, bg) = build_consumer_registry(
         Arc::clone(&engine),
         pipeline_for(&engine),
-        1,
         RegistryTuning {
             heartbeat_window_ms: Some(250),
             eviction_interval_ms: Some(5_000),

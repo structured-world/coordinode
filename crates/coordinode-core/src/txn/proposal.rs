@@ -74,12 +74,14 @@ impl ProposalIdGenerator {
         }
     }
 
-    /// Create a generator with a base value for cluster-wide uniqueness.
+    /// Create a generator whose ids start just after `base`.
     ///
-    /// The base is typically `(node_id as u64) << 48`, giving each node
-    /// its own 48-bit counter space (~280 trillion IDs per node).
-    /// This follows the Dgraph pattern of embedding node identity in
-    /// proposal keys for O(1) dedup across the cluster.
+    /// Ids must not repeat across processes: the state machine drops a
+    /// proposal whose id and size it has already applied, and it re-applies
+    /// the log of earlier incarnations after a restart. A production
+    /// generator therefore starts at a base drawn fresh for each process (a
+    /// random 64-bit point, so two processes' ranges overlap only with
+    /// probability ids-issued / 2^64); a fixed base is for tests.
     pub fn with_base(base: u64) -> Self {
         Self {
             counter: AtomicU64::new(base),
@@ -88,7 +90,9 @@ impl ProposalIdGenerator {
 
     /// Allocate the next proposal ID.
     pub fn next(&self) -> ProposalId {
-        ProposalId(self.counter.fetch_add(1, Ordering::SeqCst) + 1)
+        // A random base may sit anywhere in the range; wrapping past the top
+        // keeps the sequence unique for all but the one wrap.
+        ProposalId(self.counter.fetch_add(1, Ordering::SeqCst).wrapping_add(1))
     }
 }
 

@@ -180,6 +180,23 @@ const ID_BATCH_SIZE: u64 = 1000;
 /// On open, the allocator resumes from this value.
 const SCHEMA_KEY_NEXT_NODE_ID: &[u8] = b"meta:next_node_id";
 
+/// A starting point for this process's proposal ids: random, so it repeats
+/// neither an earlier incarnation's ids (whose log the state machine
+/// re-applies after a restart) nor another member's.
+///
+/// `RandomState` draws its keys from OS entropy once per process and steps
+/// them per instance; hashing the wall clock through it yields a fresh 64-bit
+/// value without another dependency.
+pub fn fresh_proposal_id_base() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    hasher.write_u128(now);
+    hasher.finish()
+}
+
 /// Schema partition key for the persisted field interner.
 ///
 /// Stores the serialized FieldInterner (field name ↔ u32 ID mapping).
@@ -970,7 +987,7 @@ impl Database {
             &text_index_base,
         );
 
-        let proposal_id_gen = Arc::new(ProposalIdGenerator::new());
+        let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
 
         // Create drain buffer and background drain thread for volatile writes.
         // The pipeline is either OwnedLocalProposalPipeline (embedded) or

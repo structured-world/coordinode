@@ -646,7 +646,6 @@ pub(crate) async fn serve(
     let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
         Arc::clone(&engine),
         Arc::clone(&pipeline),
-        node_id,
         registry::RegistryTuning {
             heartbeat_window_ms: registry_heartbeat_ms,
             eviction_interval_ms: registry_eviction_ms,

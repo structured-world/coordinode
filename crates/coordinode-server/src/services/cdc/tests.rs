@@ -42,7 +42,7 @@ async fn subscribe_registers_then_unregisters_cdc_consumer() {
         Arc::new(OwnedLocalProposalPipeline::new(&engine));
     // Hold `_bg` for the test's lifetime: dropping it stops the background
     // service that flushes heartbeats and drives eviction.
-    let (registry, _bg) = build_consumer_registry(engine, pipeline, 1, RegistryTuning::default());
+    let (registry, _bg) = build_consumer_registry(engine, pipeline, RegistryTuning::default());
 
     let data_dir = tempfile::tempdir().expect("data dir");
     let service = ChangeEventServiceImpl::new(

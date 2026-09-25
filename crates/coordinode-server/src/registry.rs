@@ -42,13 +42,14 @@ pub(crate) struct RegistryTuning {
 pub(crate) fn build_consumer_registry(
     engine: Arc<StorageEngine>,
     pipeline: Arc<dyn ProposalPipeline>,
-    node_id: u64,
     tuning: RegistryTuning,
 ) -> (ShardConsumerRegistry, RegistryBackground) {
     let registry = ShardConsumerRegistry::new(
         engine,
         pipeline,
-        Arc::new(ProposalIdGenerator::with_base(node_id << 48)),
+        Arc::new(ProposalIdGenerator::with_base(
+            coordinode_embed::db::fresh_proposal_id_base(),
+        )),
         Arc::new(SystemClock),
     );
     let mut bg_cfg = BackgroundConfig::default();
