@@ -198,6 +198,9 @@ pub struct StorageEngine {
 /// rebuild ([`StorageEngine::repair_partition_ranges_from_checkpoint`]).
 pub type KeyRange = (Vec<u8>, Vec<u8>);
 
+/// Owned `(key, value)` rows, as a rebuild exports them from a checkpoint.
+type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// One `STORAGE COLUMNAR` table as a whole-store snapshot carries it: its id
 /// and its `(key, value)` rows in key order.
 pub type ColumnarTable = (String, Vec<(Vec<u8>, Vec<u8>)>);
@@ -1279,6 +1282,25 @@ impl StorageEngine {
             .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))?;
 
         let mut summary = CheckpointSummary::default();
+
+        // Fold the applied prefix into every tree first, so the checkpoint's
+        // bases, and the journal a rebuild from it needs, are as recent as
+        // they can be.
+        if let Some(coverage) = &self.coverage {
+            let mut folded = coverage.lock_folded();
+            self.fold_coverage(coverage, &mut folded);
+        }
+
+        // The journal is copied before the trees. A segment the purge drops
+        // meanwhile held only entries already persisted in the live trees,
+        // which the trees' checkpoint below then carries; copied after the
+        // trees instead, a purge could drop entries that reached the trees
+        // only after their checkpoint, and the copy would hold them nowhere.
+        let src_oplog = self.data_dir.join("oplog");
+        if src_oplog.exists() {
+            summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+        }
+
         for &part in Partition::all() {
             let tree = self.tree(part)?;
             // Flush the active memtable to an on-disk segment first: a
@@ -1300,12 +1322,26 @@ impl StorageEngine {
             summary.max_seqno = summary.max_seqno.max(info.seqno);
         }
 
-        // Copy the oplog directory verbatim — sealed segments are
-        // append-only, so a plain recursive byte copy is a consistent
-        // snapshot for replay during restore.
-        let src_oplog = self.data_dir.join("oplog");
-        if src_oplog.exists() {
-            summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+        // `STORAGE COLUMNAR` tables live outside the partition trees, under
+        // the same `tables` directory the registry reopens them from.
+        #[cfg(feature = "columnar")]
+        {
+            let tables = target.join("tables");
+            std::fs::create_dir_all(&tables)
+                .map_err(|e| StorageError::Io(format!("create {tables:?}: {e}")))?;
+            for table_id in self.columnar_tables.table_ids() {
+                let Some(tree) = self.columnar_tables.get(&table_id) else {
+                    continue;
+                };
+                tree.flush_active_memtable(0)?;
+                let info = tree
+                    .create_checkpoint(&tables.join(&table_id))
+                    .map_err(|e| {
+                        StorageError::Io(format!("checkpoint columnar table {table_id}: {e}"))
+                    })?;
+                summary.total_bytes += info.total_bytes;
+                summary.max_seqno = summary.max_seqno.max(info.seqno);
+            }
         }
 
         Ok(summary)
@@ -1333,9 +1369,10 @@ impl StorageEngine {
     ) -> StorageResult<usize> {
         use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 
-        // 1. Open the checkpoint read-only and export the partition base. The
+        // 1. Open the checkpoint read-only and export the partition base, with
+        //    the record of which journal entries the base holds. The
         //    checkpoint engine is dropped before we mutate the live engine.
-        let base: Vec<(Vec<u8>, Vec<u8>)> = {
+        let (base, held): (Rows, TreeCoverage) = {
             let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
                 "default",
                 checkpoint_dir,
@@ -1346,10 +1383,15 @@ impl StorageEngine {
             let ckpt = StorageEngine::open(&ckpt_cfg)?;
             let snapshot = ckpt.snapshot();
             let prefix = format!("{}:", partition.name());
-            ckpt.snapshot_prefix_scan(&snapshot, partition, prefix.as_bytes())?
+            let rows = ckpt
+                .snapshot_prefix_scan(&snapshot, partition, prefix.as_bytes())?
                 .into_iter()
                 .map(|(k, v)| (k, v.to_vec()))
-                .collect()
+                .collect();
+            (
+                rows,
+                TreeCoverage::read(ckpt.tree(partition)?, Domain::Journal)?,
+            )
         };
 
         // 2. Physically clear the live (corrupt) tables, reinstall the base.
@@ -1365,9 +1407,14 @@ impl StorageEngine {
             self.put(partition, key, value)?;
         }
 
-        // 3. Replay the granular oplog ops since the checkpoint for this
-        //    partition, rolling the base forward to the current state.
+        // 3. Replay the granular oplog ops the base lacks for this partition,
+        //    rolling it forward to the current state. What the base holds is
+        //    its own record, not a journal position: a commit landing while
+        //    the checkpoint was taken can be in the base or not.
         for entry in oplog_since {
+            if held.contains(entry.index, 0) {
+                continue;
+            }
             for op in &entry.ops {
                 if op_partition(op) != Some(partition) {
                     continue;
@@ -1507,9 +1554,10 @@ impl StorageEngine {
         };
 
         // 1. Open the checkpoint read-only and export the base rows inside
-        //    each lost range. The checkpoint engine is dropped before the
-        //    live engine is mutated.
-        let base: Vec<(Vec<u8>, Vec<u8>)> = {
+        //    each lost range, with the record of which journal entries the
+        //    base holds. The checkpoint engine is dropped before the live
+        //    engine is mutated.
+        let (base, held): (Rows, TreeCoverage) = {
             let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
                 "default",
                 checkpoint_dir,
@@ -1525,7 +1573,10 @@ impl StorageEngine {
                     rows.push((k.to_vec(), v.to_vec()));
                 }
             }
-            rows
+            (
+                rows,
+                TreeCoverage::read(ckpt.tree(partition)?, Domain::Journal)?,
+            )
         };
 
         // 2. Clear the lost ranges on the live tree, reinstall the base. A
@@ -1541,9 +1592,12 @@ impl StorageEngine {
             self.put(partition, key, value)?;
         }
 
-        // 3. Replay post-checkpoint ops intersecting the lost ranges, in
+        // 3. Replay the ops the base lacks that intersect the lost ranges, in
         //    journal order.
         for entry in oplog_since {
+            if held.contains(entry.index, 0) {
+                continue;
+            }
             for op in &entry.ops {
                 if op_partition(op) != Some(partition) {
                     continue;
@@ -1600,16 +1654,28 @@ impl StorageEngine {
         }
     }
 
-    /// The journal index to start replaying from for a checkpoint: one past the
-    /// last entry copied into `checkpoint_dir`'s oplog, or `0` if it has none.
-    /// The repair orchestrator feeds this to [`oplog_read_since`] to gather the
-    /// entries recorded after the checkpoint.
+    /// The journal index a rebuild from `checkpoint_dir` replays from: every
+    /// entry below it is in every tree of the checkpoint, by the trees' own
+    /// coverage bases. The repair orchestrator feeds this to
+    /// [`oplog_read_since`], and the journal purge keeps everything at or
+    /// above it. `0` for a checkpoint without coverage records.
     ///
     /// [`oplog_read_since`]: Self::oplog_read_since
-    pub fn checkpoint_oplog_cursor(checkpoint_dir: &Path) -> StorageResult<u64> {
-        let oplog_dir = checkpoint_dir.join("oplog").join("0");
-        let last = crate::engine::oplog_journal::last_index_in_dir(&oplog_dir)?;
-        Ok(last.map(|i| i + 1).unwrap_or(0))
+    pub fn checkpoint_replay_floor(checkpoint_dir: &Path) -> StorageResult<u64> {
+        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+        let ckpt = StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            checkpoint_dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))?;
+        let mut floor = u64::MAX;
+        for tree in ckpt.coordinator.trees().values() {
+            let held = TreeCoverage::read(tree, Domain::Journal)?;
+            floor = floor.min(held.base().map_or(0, |(next, _)| next));
+        }
+        Ok(if floor == u64::MAX { 0 } else { floor })
     }
 
     /// Purge journal segments outside the retention window. No-op when no
@@ -3337,7 +3403,9 @@ pub struct CheckpointSummary {
 }
 
 /// Recursively copy `src` into `dst`, returning total bytes copied.
-/// Plain file copy (no symlink following needed for oplog segments).
+/// Plain file copy (no symlink following needed for oplog segments). A file
+/// that disappears between the listing and its copy is skipped: the journal
+/// purge removed it, and it held only entries already in the trees.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
     std::fs::create_dir_all(dst)
         .map_err(|e| StorageError::Io(format!("create dir {dst:?}: {e}")))?;
@@ -3353,8 +3421,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
         if file_type.is_dir() {
             bytes += copy_dir_recursive(&entry.path(), &to)?;
         } else {
-            bytes += std::fs::copy(entry.path(), &to)
-                .map_err(|e| StorageError::Io(format!("copy {:?}: {e}", entry.path())))?;
+            match std::fs::copy(entry.path(), &to) {
+                Ok(copied) => bytes += copied,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(StorageError::Io(format!("copy {:?}: {e}", entry.path())));
+                }
+            }
         }
     }
     Ok(bytes)

@@ -497,7 +497,7 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
     }
     engine.persist().expect("persist base");
     create_checkpoint(&engine, &root).expect("checkpoint");
-    let cursor = StorageEngine::checkpoint_oplog_cursor(
+    let cursor = StorageEngine::checkpoint_replay_floor(
         &latest_checkpoint(&root).expect("checkpoint exists"),
     )
     .expect("cursor");
@@ -529,6 +529,69 @@ fn oplog_purge_keeps_entries_needed_by_checkpoint_replay() {
         replayable.iter().any(|e| e.ts >= 100),
         "post-checkpoint tail must survive the purge for replay; got {} entries",
         replayable.len()
+    );
+}
+
+/// Copy the directory tree at `from` to `to`.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir").flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
+/// A commit that lands while a checkpoint is being taken can reach the
+/// checkpoint's journal copy without reaching its trees. The rebuild must
+/// replay what the checkpoint's tree lacks, not start after the last entry
+/// its journal copy happens to hold.
+#[test]
+fn a_rebuild_replays_what_the_checkpoint_tree_lacks() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = open(&dir);
+    let root = checkpoint_root(dir.path());
+    for i in 0..4u32 {
+        let key = format!("node:0:{i:04}");
+        put(
+            &engine,
+            u64::from(i) + 1,
+            PartitionId::Node,
+            key.as_bytes(),
+            b"base",
+        );
+    }
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    // Committed after the Node tree was captured, before the journal was.
+    put(&engine, 50, PartitionId::Node, b"node:0:late", b"late");
+    std::fs::remove_dir_all(ckpt.join("oplog")).expect("drop journal copy");
+    copy_tree(&dir.path().join("oplog"), &ckpt.join("oplog"));
+
+    let from = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
+    let since = engine
+        .oplog_read_since(from)
+        .expect("read")
+        .expect("journal");
+    engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .expect("rebuild");
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:late")
+            .expect("get")
+            .as_deref(),
+        Some(b"late".as_slice())
+    );
+    assert_eq!(
+        engine
+            .get(Partition::Node, b"node:0:0002")
+            .expect("get")
+            .as_deref(),
+        Some(b"base".as_slice())
     );
 }
 
@@ -576,7 +639,7 @@ fn rebuild_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
     }
     engine.persist().expect("persist base");
     let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
-    let cursor = StorageEngine::checkpoint_oplog_cursor(&ckpt).expect("cursor");
+    let cursor = StorageEngine::checkpoint_replay_floor(&ckpt).expect("floor");
     for i in 0..4u32 {
         put(
             &engine,

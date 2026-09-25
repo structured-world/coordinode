@@ -182,14 +182,6 @@ impl EmbeddedOplog {
     }
 }
 
-/// Last entry index present in an oplog directory, or `None` if empty — used
-/// to derive a checkpoint's replay cursor (the journal copied into a
-/// checkpoint). Opened with `u64::MAX` retention so nothing is purged.
-pub(crate) fn last_index_in_dir(oplog_dir: &Path) -> StorageResult<Option<u64>> {
-    let mgr = OplogManager::open(oplog_dir, 0, 64 * 1024 * 1024, 50_000, u64::MAX)?;
-    Ok(mgr.recover_last_entry()?.map(|e| e.index))
-}
-
 /// The partition an op targets, or `None` for non-data ops (Raft framing /
 /// Noop) and unknown tags (a partition from a future version).
 pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {

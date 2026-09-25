@@ -56,6 +56,33 @@ fn page_ecc_force_on_round_trips_through_sst() {
     );
 }
 
+/// A checkpoint is documented as a complete database: `STORAGE COLUMNAR`
+/// tables live outside the partition trees, so they must be captured too, or
+/// a store served from the checkpoint silently loses every columnar row.
+#[cfg(feature = "columnar")]
+#[test]
+fn checkpoint_carries_the_columnar_tables() {
+    let src_dir = TempDir::new().expect("src tempdir");
+    let engine = disk_engine(src_dir.path());
+    let at = engine.next_seqno();
+    engine
+        .columnar_insert("metrics", b"row-1".to_vec(), b"v1".to_vec(), at)
+        .expect("insert");
+
+    let ckpt_parent = TempDir::new().expect("ckpt parent");
+    let target = ckpt_parent.path().join("snap");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    drop(engine);
+
+    let restored = disk_engine(&target);
+    assert_eq!(
+        restored
+            .columnar_scan("metrics", restored.snapshot())
+            .expect("scan"),
+        vec![(b"row-1".to_vec(), b"v1".to_vec())]
+    );
+}
+
 #[test]
 fn checkpoint_round_trips_all_partitions() {
     let src_dir = TempDir::new().expect("src tempdir");

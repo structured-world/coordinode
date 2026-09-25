@@ -196,8 +196,9 @@ pub fn verify_and_repair(
         });
     };
 
-    // One cursor + oplog slice covers every partition's replay-forward.
-    let from = StorageEngine::checkpoint_oplog_cursor(&checkpoint)?;
+    // One floor + oplog slice covers every partition's replay-forward; each
+    // rebuild skips what its checkpoint tree already holds.
+    let from = StorageEngine::checkpoint_replay_floor(&checkpoint)?;
     let oplog_since = engine.oplog_read_since(from)?.unwrap_or_default();
 
     let mut repaired = Vec::with_capacity(corrupt.len());
@@ -281,15 +282,15 @@ impl CheckpointScheduler {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        // The repair floor: keep every entry at or above the
-                        // latest checkpoint's replay cursor so a rebuild can
-                        // always roll forward from that base.
+                        // The repair floor: keep every entry the latest
+                        // checkpoint's trees may lack so a rebuild can always
+                        // roll forward from that base.
                         let keep_from = match latest_checkpoint(&root)
-                            .map(|c| StorageEngine::checkpoint_oplog_cursor(&c))
+                            .map(|c| StorageEngine::checkpoint_replay_floor(&c))
                         {
-                            Some(Ok(cursor)) => cursor,
+                            Some(Ok(floor)) => floor,
                             Some(Err(e)) => {
-                                tracing::warn!(error = %e, "checkpoint cursor unreadable; skipping oplog purge");
+                                tracing::warn!(error = %e, "checkpoint replay floor unreadable; skipping oplog purge");
                                 continue;
                             }
                             None => u64::MAX,
