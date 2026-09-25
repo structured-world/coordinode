@@ -133,23 +133,23 @@ impl StorageEngine {
         }
     }
 
-    /// Record, durably, that every tree holds exactly the entries below
-    /// `next` and nothing above: what a freshly created store and a freshly
-    /// installed snapshot both mean. Every marker is removed.
+    /// Record, durably, that every tree holds the entries below `next`: what
+    /// a freshly created store and a freshly installed snapshot both mean.
+    /// The markers below `next` are removed.
+    ///
+    /// The tombstone stops at `next`. Entries applied after the reset carry
+    /// the leader's commit_ts as their seqno, which on a follower whose clock
+    /// runs ahead can sit below this reset's seqno; a tombstone reaching past
+    /// `next` would suppress their markers (a range tombstone hides every
+    /// covered key with a lower seqno) and a crash would re-apply them.
     ///
     /// # Errors
     ///
     /// A flush failure.
     pub fn reset_raft_coverage(&self, next: u64, payload: &[u8]) -> StorageResult<()> {
         let at = self.next_seqno();
-        let domain = Domain::Raft;
         for tree in self.coordinator.trees().values() {
-            tree.insert(domain.base_key(), coverage::encode_base(next, payload), at);
-            tree.remove_range(
-                domain.marker_key(0, 0).to_vec(),
-                domain.marker_end().to_vec(),
-                at,
-            );
+            coverage::write_fold(tree, Domain::Raft, 0, next, payload, at);
         }
         for tree in self.coordinator.trees().values() {
             tree.flush_active_memtable(0)?;

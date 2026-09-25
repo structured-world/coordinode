@@ -117,15 +117,61 @@ fn a_fold_replaces_the_markers_below_it_with_a_base() {
 }
 
 #[test]
+fn a_reset_does_not_hide_markers_written_after_it_below_its_seqno() {
+    // A follower's clock can run ahead of its leader's: the reset after a
+    // snapshot install then carries a seqno above the commit_ts of the next
+    // entries it applies. A range tombstone suppresses every covered key
+    // with a lower seqno, so a reset whose tombstone reached past the
+    // snapshot would hide those entries' markers, and a crash would re-apply
+    // their merges.
+    let dir = TempDir::new().expect("dir");
+    let (engine, oracle) = open(&dir);
+    // The follower already holds flushed tables from before the snapshot.
+    engine.reset_raft_coverage(0, &[]).expect("establish");
+    engine
+        .apply_raft_proposal(&node_and_adj(), oracle.next().as_raw(), 3, 0, |_| false)
+        .expect("pre-snapshot apply");
+    engine.persist().expect("persist");
+    // The leader's next commit_ts, from before the reset drew its seqno.
+    let behind = oracle.next().as_raw();
+    engine.reset_raft_coverage(10, b"id-of-9").expect("reset");
+    engine
+        .apply_raft_proposal(&node_and_adj(), behind, 10, 0, |_| false)
+        .expect("apply the next entry");
+
+    let check = |stage: &str| {
+        let coverage = engine.raft_coverage().expect("read");
+        assert!(
+            coverage.holds(Partition::Node, 10, 0),
+            "{stage}: the entry after the snapshot is recorded"
+        );
+        assert!(coverage.holds(Partition::Adj, 10, 0), "{stage}");
+    };
+    check("in the memtable");
+    // Compaction brings the marker's table and the tombstone's together,
+    // which is where a tombstone reaching past the snapshot would bite.
+    engine.persist().expect("persist");
+    engine
+        .force_compaction(Partition::Node)
+        .expect("compact node");
+    engine
+        .force_compaction(Partition::Adj)
+        .expect("compact adj");
+    check("after compaction");
+}
+
+#[test]
 fn a_reset_is_durable_and_leaves_no_marker() {
-    // What a snapshot install leaves behind: every tree holds exactly the
-    // entries below the snapshot, whatever it marked before.
+    // What a snapshot install leaves behind: every tree holds the entries
+    // below the snapshot, recorded by the base alone. A snapshot is only
+    // installed past what the member applied, so every marker it had is
+    // below the new base and goes.
     let dir = TempDir::new().expect("dir");
     {
         let (engine, oracle) = open(&dir);
         engine.reset_raft_coverage(0, &[]).expect("establish");
         engine
-            .apply_raft_proposal(&node_and_adj(), oracle.next().as_raw(), 40, 0, |_| false)
+            .apply_raft_proposal(&node_and_adj(), oracle.next().as_raw(), 4, 0, |_| false)
             .expect("apply");
         engine.reset_raft_coverage(10, b"id-of-9").expect("reset");
         assert_eq!(engine.raft_durable_floor().expect("floor"), 10);
@@ -134,8 +180,12 @@ fn a_reset_is_durable_and_leaves_no_marker() {
     let coverage = engine.raft_coverage().expect("read");
     assert_eq!(coverage.resume_point(), Some((10, b"id-of-9".as_slice())));
     assert!(
-        !coverage.holds(Partition::Node, 40, 0),
-        "the old marker is gone"
+        coverage.holds(Partition::Counter, 9, 0),
+        "the base covers it"
     );
-    assert_eq!(coverage.skip_until(), 10);
+    assert!(
+        !coverage.holds(Partition::Node, 10, 0),
+        "nothing past the snapshot is recorded"
+    );
+    assert_eq!(coverage.skip_until(), 10, "the old marker is gone");
 }
