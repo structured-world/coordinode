@@ -160,9 +160,16 @@ pub(crate) async fn run_with(
 
             let config = admin_storage_config(config_path.as_deref(), &data_dir)?;
             let engine = admin_open_engine(&config)?;
+            let output_dir = std::path::Path::new(&output);
             let summary = engine
-                .create_checkpoint(std::path::Path::new(&output))
+                .create_checkpoint(output_dir)
                 .map_err(|e| format!("checkpoint failed: {e}"))?;
+            // Rebind the checkpoint to one directory, so `serve --data` opens
+            // it whatever endpoint layout it came from.
+            drop(
+                coordinode_storage::engine::core::StorageEngine::open_checkpoint(output_dir)
+                    .map_err(|e| format!("open the checkpoint: {e}"))?,
+            );
             info!(
                 partitions = summary.partitions,
                 copied_bytes = summary.total_bytes,

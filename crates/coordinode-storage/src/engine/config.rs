@@ -736,6 +736,13 @@ pub struct StorageConfig {
     ///
     /// When `None` (default), `w:cache` is treated identically to `w:memory`.
     pub nvme_write_buffer_path: Option<PathBuf>,
+
+    /// The store was gathered into these endpoints from a layout it was not
+    /// written under (a checkpoint collects every table into one
+    /// directory): the per-level routing it persisted names endpoints this
+    /// configuration lacks and is replaced by this configuration's default
+    /// on open. Set through the builder of the same name.
+    pub relocated: bool,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -887,7 +894,17 @@ impl StorageConfig {
             drain_batch_max: 10_000,
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,
             nvme_write_buffer_path: None,
+            relocated: false,
         }
+    }
+
+    /// Builder: open a store gathered into these endpoints from another
+    /// layout, replacing its persisted per-level routing with this
+    /// configuration's default (the `relocated` field).
+    #[must_use]
+    pub fn relocated(mut self) -> Self {
+        self.relocated = true;
+        self
     }
 
     /// Builder: attach a custom filesystem backend (e.g. `MemFs` for

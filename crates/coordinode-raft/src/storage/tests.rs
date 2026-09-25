@@ -410,6 +410,34 @@ async fn apply_entries(sm: &mut CoordinodeStateMachine, entries: Vec<Entry>) {
     sm.apply(stream).await.expect("apply");
 }
 
+#[tokio::test]
+async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
+    // openraft builds a snapshot after `get_snapshot_builder` returns, while
+    // the state machine keeps applying. A follower installs the snapshot and
+    // then receives every entry past its log id, so an effect the data
+    // already carried from a later entry would be applied twice.
+    let (_dir, leader) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&leader)).expect("open");
+    apply_entries(&mut sm, vec![two_tree_merge_entry(1, 1000)]).await;
+    let mut builder = sm.get_snapshot_builder().await;
+    apply_entries(&mut sm, vec![two_tree_merge_entry(2, 2000)]).await;
+    let snapshot = builder.build_snapshot().await.expect("build");
+    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 1)));
+
+    let (_dir2, follower) = test_engine();
+    let mut fsm = CoordinodeStateMachine::new(Arc::clone(&follower)).expect("open follower");
+    fsm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("install");
+    apply_entries(&mut fsm, vec![two_tree_merge_entry(2, 2000)]).await;
+    let key = b"counter:degree:1";
+    assert_eq!(
+        follower.get(Partition::Counter, key).expect("follower get"),
+        leader.get(Partition::Counter, key).expect("leader get"),
+        "the follower counts each entry once"
+    );
+}
+
 fn open_rig_engine(
     rig: &coordinode_test_fixtures::PowerRig,
 ) -> (

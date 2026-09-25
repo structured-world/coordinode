@@ -493,8 +493,13 @@ impl StorageEngine {
             if part == Partition::Schema {
                 continue;
             }
-            let routing =
-                load_or_init_partition_routing(&schema_tree, &seqno, &config.endpoints, part)?;
+            let routing = load_or_init_partition_routing(
+                &schema_tree,
+                &seqno,
+                &config.endpoints,
+                part,
+                config.relocated,
+            )?;
             let l0_endpoint = routing
                 .levels
                 .get(&0)
@@ -1244,43 +1249,20 @@ impl StorageEngine {
     /// hard-link checkpointed into `target/<partition>/` (zero-copy on a
     /// single filesystem, falling back to byte-copy across volumes), and
     /// the oplog directory is copied alongside. The result is a complete,
-    /// independently-openable database: restore is simply
-    /// `StorageEngine::open` against `target` (or a copy of it).
+    /// independently-openable database in one directory, whatever the
+    /// endpoint layout it came from: [`Self::open_checkpoint`] opens it.
     ///
     /// The field interner and schema metadata live in the Schema partition
     /// tree, so they are captured by that tree's checkpoint — no separate
     /// handling needed.
     ///
-    /// Scope: single-endpoint (single-node CE) layout, where every
-    /// partition and the oplog live under one `data_dir`. Multi-endpoint
-    /// (tiered placement across volumes) is rejected rather than silently
-    /// producing a checkpoint whose restored routing points at absent
-    /// source paths.
-    ///
     /// # Errors
     ///
     /// - `target` already exists, or its parent cannot be created
     /// - any partition tree's checkpoint fails (see lsm `create_checkpoint`)
-    /// - the engine uses more than one endpoint (multi-endpoint deferred)
     /// - the oplog directory cannot be copied
     pub fn create_checkpoint(&self, target: &Path) -> StorageResult<CheckpointSummary> {
-        use lsm_tree::AbstractTree;
-
-        if self.endpoints.len() > 1 {
-            return Err(StorageError::Io(format!(
-                "checkpoint of a multi-endpoint engine is not supported yet \
-                 ({} endpoints configured); single-node CE backup expects one data_dir",
-                self.endpoints.len()
-            )));
-        }
-        if target.exists() {
-            return Err(StorageError::Io(format!(
-                "checkpoint target {target:?} already exists; refusing to overwrite"
-            )));
-        }
-        std::fs::create_dir_all(target)
-            .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))?;
-
+        claim_checkpoint_dir(target)?;
         let mut summary = CheckpointSummary::default();
 
         // Fold the applied prefix into every tree first, so the checkpoint's
@@ -1296,10 +1278,45 @@ impl StorageEngine {
         // which the trees' checkpoint below then carries; copied after the
         // trees instead, a purge could drop entries that reached the trees
         // only after their checkpoint, and the copy would hold them nowhere.
-        let src_oplog = self.data_dir.join("oplog");
-        if src_oplog.exists() {
-            summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+        if let Ok(endpoint) = self.select_oplog_endpoint(0) {
+            let src_oplog = endpoint.path.join("oplog");
+            if src_oplog.exists() {
+                summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+            }
         }
+
+        self.checkpoint_trees(target, &mut summary)?;
+        Ok(summary)
+    }
+
+    /// Capture the store's data as it stands, without its journal: every
+    /// partition tree and `STORAGE COLUMNAR` table, flushed and hard-linked
+    /// into `target` (which must not exist), opened with
+    /// [`Self::open_checkpoint`].
+    ///
+    /// Taken while nothing is applied, the capture holds exactly the applied
+    /// prefix, which no MVCC snapshot does: an entry applies at its own
+    /// commit timestamp, so one applied later can carry a timestamp below a
+    /// snapshot taken earlier and show through it.
+    ///
+    /// # Errors
+    ///
+    /// `target` exists or cannot be created, or a tree's checkpoint fails.
+    pub fn capture(&self, target: &Path) -> StorageResult<CheckpointSummary> {
+        claim_checkpoint_dir(target)?;
+        let mut summary = CheckpointSummary::default();
+        self.checkpoint_trees(target, &mut summary)?;
+        Ok(summary)
+    }
+
+    /// Flush and hard-link every partition tree and columnar table into
+    /// `target`.
+    fn checkpoint_trees(
+        &self,
+        target: &Path,
+        summary: &mut CheckpointSummary,
+    ) -> StorageResult<()> {
+        use lsm_tree::AbstractTree;
 
         for &part in Partition::all() {
             let tree = self.tree(part)?;
@@ -1343,8 +1360,32 @@ impl StorageEngine {
                 summary.max_seqno = summary.max_seqno.max(info.seqno);
             }
         }
+        Ok(())
+    }
 
-        Ok(summary)
+    /// Open a checkpoint written by [`Self::create_checkpoint`] as a plain
+    /// engine over its one directory. The store's own per-level routing
+    /// names the endpoints it was written under, so it is replaced by the
+    /// single-directory default (see [`StorageConfig::relocated()`]) under
+    /// the endpoint id a single-directory server uses, `default`: once
+    /// opened here, the checkpoint also opens as that server's data
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::open`].
+    pub fn open_checkpoint(checkpoint_dir: &Path) -> StorageResult<Self> {
+        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
+        Self::open(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                checkpoint_dir,
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )])
+            .relocated(),
+        )
     }
 
     /// Rebuild a corrupt partition from a checkpoint plus oplog replay
@@ -1353,34 +1394,23 @@ impl StorageEngine {
     ///
     /// Opens `checkpoint_dir` read-only, exports the partition's base
     /// key-values, physically drops the live (corrupt) partition tables,
-    /// reinstalls the base, then replays `oplog_since` (the journal entries
-    /// recorded after the checkpoint's cursor) to roll the partition forward to
-    /// its current state. Returns the number of base entries reinstalled.
+    /// reinstalls the base, then replays the entries of `oplog_since` the
+    /// base lacks to roll the partition forward to its current state.
+    /// Returns the number of base entries reinstalled.
     ///
-    /// The checkpoint persists routing under the original single-endpoint id
-    /// `"default"`, so it is reopened with that id. Same-disk checkpoints only
-    /// protect against localized corruption; whole-device loss requires an
-    /// off-device backup (PITR).
+    /// Same-disk checkpoints only protect against localized corruption;
+    /// whole-device loss requires an off-device backup (PITR).
     pub fn repair_partition_from_checkpoint(
         &self,
         checkpoint_dir: &Path,
         oplog_since: &[OplogEntry],
         partition: Partition,
     ) -> StorageResult<usize> {
-        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
-
         // 1. Open the checkpoint read-only and export the partition base, with
         //    the record of which journal entries the base holds. The
         //    checkpoint engine is dropped before we mutate the live engine.
         let (base, held): (Rows, TreeCoverage) = {
-            let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                checkpoint_dir,
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]);
-            let ckpt = StorageEngine::open(&ckpt_cfg)?;
+            let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
             let snapshot = ckpt.snapshot();
             let prefix = format!("{}:", partition.name());
             let rows = ckpt
@@ -1538,8 +1568,6 @@ impl StorageEngine {
         partition: Partition,
         ranges: &[KeyRange],
     ) -> StorageResult<usize> {
-        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
-
         // The exclusive upper bound one past an inclusive `max` key.
         fn succ(max: &[u8]) -> Vec<u8> {
             let mut s = Vec::with_capacity(max.len() + 1);
@@ -1558,14 +1586,7 @@ impl StorageEngine {
         //    base holds. The checkpoint engine is dropped before the live
         //    engine is mutated.
         let (base, held): (Rows, TreeCoverage) = {
-            let ckpt_cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                checkpoint_dir,
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]);
-            let ckpt = StorageEngine::open(&ckpt_cfg)?;
+            let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
             let mut rows = Vec::new();
             for (min, max) in ranges {
                 for guard in ckpt.range_scan(partition, min, max)? {
@@ -1662,14 +1683,7 @@ impl StorageEngine {
     ///
     /// [`oplog_read_since`]: Self::oplog_read_since
     pub fn checkpoint_replay_floor(checkpoint_dir: &Path) -> StorageResult<u64> {
-        use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
-        let ckpt = StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            checkpoint_dir,
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]))?;
+        let ckpt = StorageEngine::open_checkpoint(checkpoint_dir)?;
         let mut floor = u64::MAX;
         for tree in ckpt.coordinator.trees().values() {
             let held = TreeCoverage::read(tree, Domain::Journal)?;
@@ -3302,18 +3316,27 @@ fn routing_key_for(partition: Partition) -> Vec<u8> {
 /// **Persistence format:** MessagePack via `rmp_serde::to_vec` /
 /// `from_slice`, matching the rest of the storage layer's serialisation
 /// conventions (oplog, WAL records, document snapshots).
+///
+/// `relocated`: the store's tables were gathered into `endpoints` from
+/// another layout, so the persisted routing is replaced by the default.
 fn load_or_init_partition_routing(
     schema_tree: &lsm_tree::AnyTree,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
     endpoints: &[EndpointConfig],
     partition: Partition,
+    relocated: bool,
 ) -> StorageResult<PartitionRouting> {
     use lsm_tree::AbstractTree;
     let key = routing_key_for(partition);
     let read_seqno = seqno.get();
-    match schema_tree.get(&key, read_seqno).map_err(|e| {
-        StorageError::Io(format!("schema get routing for {}: {e}", partition.name()))
-    })? {
+    let persisted = if relocated {
+        None
+    } else {
+        schema_tree.get(&key, read_seqno).map_err(|e| {
+            StorageError::Io(format!("schema get routing for {}: {e}", partition.name()))
+        })?
+    };
+    match persisted {
         Some(bytes) => {
             // Existing routing — decode and validate against current
             // endpoint set.
@@ -3329,8 +3352,8 @@ fn load_or_init_partition_routing(
             Ok(routing)
         }
         None => {
-            // First open against this endpoint set — compute default,
-            // persist, return.
+            // First open against this endpoint set, or a relocated store:
+            // compute default, persist, return.
             let routing = PartitionRouting::default_for_endpoints(endpoints);
             let encoded = rmp_serde::to_vec(&routing).map_err(|e| {
                 StorageError::Io(format!(
@@ -3431,6 +3454,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
         }
     }
     Ok(bytes)
+}
+
+/// Create the directory a checkpoint is written into, refusing one that
+/// already exists.
+fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
+    if target.exists() {
+        return Err(StorageError::Io(format!(
+            "checkpoint target {target:?} already exists; refusing to overwrite"
+        )));
+    }
+    std::fs::create_dir_all(target)
+        .map_err(|e| StorageError::Io(format!("create checkpoint dir {target:?}: {e}")))
 }
 
 /// Directory under the data dir holding one empty file per partition whose

@@ -878,6 +878,15 @@ pub struct CoordinodeStateMachine {
     skip_until: u64,
     /// The coverage base last written to every tree: all entries below it.
     folded: u64,
+    /// Captures taken for snapshot builds, naming each one's directory.
+    captures: u64,
+}
+
+/// Where snapshot builds capture the store, under the engine's data
+/// directory. Nothing under it outlives the build that made it; a crash
+/// leaves it behind, and the next open clears it.
+fn snapshot_capture_root(engine: &StorageEngine) -> std::path::PathBuf {
+    engine.data_dir().join("snapshot-capture")
 }
 
 /// How many applied entries accumulate as coverage markers before the state
@@ -959,6 +968,12 @@ impl CoordinodeStateMachine {
                 (None, None)
             }
         };
+        // A capture a crash left behind belongs to no build.
+        match std::fs::remove_dir_all(snapshot_capture_root(&engine)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io::Error::other(format!("clear snapshot captures: {e}"))),
+        }
         // The trees may still hold markers below their bases; the first fold
         // removes markers from index 0.
         let folded = 0;
@@ -983,6 +998,7 @@ impl CoordinodeStateMachine {
             replay_skip,
             skip_until,
             folded,
+            captures: 0,
         })
     }
 
@@ -1315,11 +1331,33 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         #[allow(clippy::unwrap_used)]
         let last_membership = self.last_membership.lock().unwrap().clone();
 
+        // openraft builds the snapshot after this returns, while entries keep
+        // applying, and the snapshot must hold exactly the entries up to
+        // `last_applied`. No entry is applied while this runs, so a capture
+        // taken now is that state; reading the live store later is not.
+        self.captures += 1;
+        let dir = snapshot_capture_root(&self.engine).join(format!("{:020}", self.captures));
+        let engine = Arc::clone(&self.engine);
+        let target = dir.clone();
+        let capture = match tokio::task::spawn_blocking(move || {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+            }
+            engine.capture(&target).map_err(|e| e.to_string())
+        })
+        .await
+        {
+            Ok(Ok(_)) => Ok(dir),
+            Ok(Err(e)) => Err(format!("capture the store for a snapshot: {e}")),
+            Err(e) => Err(format!("capture task: {e}")),
+        };
+
         CoordinodeSnapshotBuilder {
             engine: Arc::clone(&self.engine),
             last_applied,
             last_membership,
             snapshot_builds: Arc::clone(&self.snapshot_builds),
+            capture,
         }
     }
 
@@ -1431,6 +1469,20 @@ pub struct CoordinodeSnapshotBuilder {
     last_membership: openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
     /// Shared build counter from the owning state machine.
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
+    /// The store captured at `last_applied`, or why it could not be.
+    capture: Result<std::path::PathBuf, String>,
+}
+
+impl Drop for CoordinodeSnapshotBuilder {
+    fn drop(&mut self) {
+        if let Ok(dir) = &self.capture {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(?dir, %e, "could not remove a snapshot capture");
+                }
+            }
+        }
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
@@ -1448,8 +1500,16 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         self.snapshot_builds
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // Serialize all KV data from all partitions
-        let data = crate::snapshot::build_full_snapshot(&self.engine)?;
+        // Serialize the captured store: every entry up to `last_log_id`, none
+        // after it.
+        let dir = self.capture.clone().map_err(io::Error::other)?;
+        let data = tokio::task::spawn_blocking(move || {
+            let captured = StorageEngine::open_checkpoint(&dir)
+                .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
+            crate::snapshot::build_full_snapshot(&captured)
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
 
         let meta = SnapshotMeta {
             last_log_id,

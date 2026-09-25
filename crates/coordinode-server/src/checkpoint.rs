@@ -23,9 +23,8 @@ const CHECKPOINT_PREFIX: &str = "ckpt-";
 /// checkpoint just written is never pruned. Returns the new checkpoint's path.
 ///
 /// # Errors
-/// If the directory cannot be created, the engine checkpoint fails (e.g. a
-/// multi-endpoint engine, which checkpoint does not support yet), or pruning an
-/// old checkpoint fails.
+/// If the directory cannot be created, the engine checkpoint fails, or pruning
+/// an old checkpoint fails.
 pub fn run_checkpoint_cycle(
     engine: &StorageEngine,
     dir: &Path,

@@ -83,6 +83,55 @@ fn checkpoint_carries_the_columnar_tables() {
     );
 }
 
+/// A store spread over several endpoints checkpoints into one directory, and
+/// the checkpoint opens there: its persisted per-level routing names
+/// endpoints the checkpoint does not have.
+#[test]
+fn checkpoint_of_a_multi_endpoint_store_opens_in_one_directory() {
+    let hot = TempDir::new().expect("hot");
+    let cold = TempDir::new().expect("cold");
+    let config = StorageConfig::with_endpoints(vec![
+        EndpointConfig::new(
+            "hot",
+            hot.path(),
+            Media::Nvme,
+            Durability::Durable,
+            Tier::Hot,
+        ),
+        EndpointConfig::new(
+            "cold",
+            cold.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Cold,
+        ),
+    ]);
+    let engine = StorageEngine::open(&config).expect("open");
+    for i in 0..64u32 {
+        engine
+            .put(Partition::Node, format!("node:0:{i:04}").as_bytes(), b"v")
+            .expect("put");
+    }
+    engine.persist().expect("persist");
+    engine
+        .force_compaction(Partition::Node)
+        .expect("compact to the cold level");
+
+    let ckpt_parent = TempDir::new().expect("ckpt parent");
+    let target = ckpt_parent.path().join("snap");
+    engine.create_checkpoint(&target).expect("checkpoint");
+    drop(engine);
+
+    let restored = StorageEngine::open_checkpoint(&target).expect("open checkpoint");
+    assert_eq!(
+        restored
+            .prefix_scan(Partition::Node, b"node:0:")
+            .expect("scan")
+            .count(),
+        64
+    );
+}
+
 #[test]
 fn checkpoint_round_trips_all_partitions() {
     let src_dir = TempDir::new().expect("src tempdir");
