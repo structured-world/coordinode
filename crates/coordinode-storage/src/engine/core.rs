@@ -22,7 +22,7 @@ use crate::engine::compaction::CompactionScheduler;
 use crate::engine::config::EndpointConfig;
 use crate::engine::config::{FlushPolicy, StorageConfig};
 use crate::engine::coordinator::{LocalMultiModalCoordinator, MultiModalCoordinator, SnapshotPin};
-use crate::engine::coverage::{self, Coverage, TreeCoverage};
+use crate::engine::coverage::{self, Coverage, Domain, TreeCoverage};
 use crate::engine::flush::FlushManager;
 use crate::engine::oplog_journal::{
     EmbeddedOplog, OplogJournalConfig, apply_oplog_ops_at, op_partition,
@@ -197,6 +197,10 @@ pub struct StorageEngine {
 /// repair ([`OpenRepair::scoped_ranges`]) and consumed by the range-scoped
 /// rebuild ([`StorageEngine::repair_partition_ranges_from_checkpoint`]).
 pub type KeyRange = (Vec<u8>, Vec<u8>);
+
+/// One `STORAGE COLUMNAR` table as a whole-store snapshot carries it: its id
+/// and its `(key, value)` rows in key order.
+pub type ColumnarTable = (String, Vec<(Vec<u8>, Vec<u8>)>);
 
 /// The engine's cached write-pressure verdict, refreshed by the compaction
 /// monitor each poll cycle from the worst per-partition backpressure signal
@@ -530,7 +534,7 @@ impl StorageEngine {
         // built further below, so columnar ops are collected here and replayed
         // in a second pass once the registry exists.
         #[cfg(feature = "columnar")]
-        let mut columnar_replay: Vec<(String, Vec<u8>, Vec<u8>, u64)> = Vec::new();
+        let mut columnar_replay: Vec<ColumnarReplay> = Vec::new();
         // `Some(next)` when a journal exists and its store carries no coverage
         // record yet (a fresh store): the base covering every index below
         // `next` is written once the seqno is restored.
@@ -544,7 +548,7 @@ impl StorageEngine {
                     let mut covered: HashMap<Partition, TreeCoverage> =
                         HashMap::with_capacity(trees.len());
                     for (&part, tree) in &trees {
-                        covered.insert(part, TreeCoverage::read(tree)?);
+                        covered.insert(part, TreeCoverage::read(tree, Domain::Journal)?);
                     }
                     if !covered.values().any(TreeCoverage::has_record) {
                         if !entries.is_empty() {
@@ -578,12 +582,13 @@ impl StorageEngine {
                                 value,
                             } = op
                             {
-                                columnar_replay.push((
-                                    table_id.clone(),
-                                    key.clone(),
-                                    value.clone(),
-                                    entry.ts,
-                                ));
+                                columnar_replay.push(ColumnarReplay {
+                                    table_id: table_id.clone(),
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ts: entry.ts,
+                                    index: entry.index,
+                                });
                                 continue;
                             }
                             let Some(part) = op_partition(op) else {
@@ -597,7 +602,9 @@ impl StorageEngine {
                                     name: part.name().to_string(),
                                 }
                             })?;
-                            let holds = covered.get(&part).is_some_and(|c| c.contains(entry.index));
+                            let holds = covered
+                                .get(&part)
+                                .is_some_and(|c| c.contains(entry.index, 0));
                             if !holds {
                                 apply_oplog_ops_at(tree, &ops, entry.ts, entry.index)?;
                                 replayed += ops.len();
@@ -667,7 +674,7 @@ impl StorageEngine {
         if let Some(next) = establish_coverage {
             let at = seqno.next();
             for tree in trees.values() {
-                crate::engine::coverage::write_fold(tree, next, next, at);
+                coverage::write_fold(tree, Domain::Journal, next, next, &[], at);
             }
             for tree in trees.values() {
                 tree.flush_active_memtable(0)?;
@@ -826,12 +833,43 @@ impl StorageEngine {
             if let Some(max) = columnar_tables.max_highest_seqno() {
                 seqno.fetch_max(max + 1);
             }
+            // Each table's own coverage record decides, like a partition's. A
+            // table that is gone was dropped: its rows are not brought back,
+            // and a table created later under the same name starts its record
+            // past every entry journalled before it (`open_columnar_table`).
+            let mut covered: HashMap<String, TreeCoverage> = HashMap::new();
+            if let Some(coverage) = &coverage {
+                for table_id in columnar_tables.table_ids() {
+                    if let Some(tree) = columnar_tables.get(&table_id) {
+                        let c = TreeCoverage::read(&tree, Domain::Journal)?;
+                        // Markers already on disk are folded by the next fold.
+                        for index in c.marked_indices() {
+                            coverage.note_table_marker(&table_id, index);
+                        }
+                        covered.insert(table_id, c);
+                    }
+                }
+            }
             let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut replayed = 0usize;
-            for (table_id, key, value, ts) in columnar_replay {
-                let tree = columnar_tables.create_or_open(&table_id)?;
-                if ts > tree.get_highest_seqno().unwrap_or(0) {
-                    tree.insert(key, value, ts);
+            for ColumnarReplay {
+                table_id,
+                key,
+                value,
+                ts,
+                index,
+            } in columnar_replay
+            {
+                let (Some(tree), Some(c)) =
+                    (columnar_tables.get(&table_id), covered.get(&table_id))
+                else {
+                    continue;
+                };
+                if !c.contains(index, 0) {
+                    apply_columnar_row(&tree, key, value, ts, Some(index))?;
+                    if let Some(coverage) = &coverage {
+                        coverage.note_table_marker(&table_id, index);
+                    }
                     touched.insert(table_id);
                     replayed += 1;
                 }
@@ -928,7 +966,36 @@ impl StorageEngine {
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
     #[cfg(feature = "columnar")]
     pub fn create_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
-        self.columnar_tables.create_or_open(table_id)
+        self.open_columnar_table(table_id)
+    }
+
+    /// The tree of `table_id`, created on first use. A table created here
+    /// holds none of the entries journalled before it existed (those belonged
+    /// to a dropped table of the same name, if any), so on a journalled engine
+    /// it gets a coverage base at the journal's next index, made durable
+    /// before any row can reach it.
+    #[cfg(feature = "columnar")]
+    fn open_columnar_table(&self, table_id: &str) -> StorageResult<lsm_tree::AnyTree> {
+        self.columnar_tables.create_or_open_with(table_id, |tree| {
+            let Some(oplog) = &self.oplog else {
+                return Ok(());
+            };
+            // Every row for this table is journalled only after its writer got
+            // the tree, which the registry lock held here prevents, so each of
+            // them gets an index at or above `next`. Other commits appending
+            // meanwhile touch other trees.
+            let next = oplog
+                .lock()
+                .map_err(|_| StorageError::Io("oplog journal mutex poisoned".into()))?
+                .next_index();
+            tree.insert(
+                Domain::Journal.base_key(),
+                coverage::encode_base(next, &[]),
+                self.next_seqno(),
+            );
+            tree.flush_active_memtable(0)?;
+            Ok(())
+        })
     }
 
     /// Handle to an existing `STORAGE COLUMNAR` table tree, or `None` if no such
@@ -964,14 +1031,14 @@ impl StorageEngine {
         value: Vec<u8>,
         seqno: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        use lsm_tree::AbstractTree;
         // Journal the row at its commit_ts BEFORE applying it to the tree
         // memtable, so a write that reached the retained oplog survives a crash
-        // and is replayed on the next open. Mirrors the partition write path
-        // (`oplog_append`): columnar rows live outside the Partition keyspace,
-        // so they carry a table-id-tagged ColumnarInsert op routed back to the
-        // table registry on recovery. No journal (cluster mode / plain open /
-        // in-memory) → durability follows the tree's own flush, as before.
+        // and is replayed on the next open. Columnar rows live outside the
+        // Partition keyspace, so they carry a table-id-tagged ColumnarInsert op
+        // routed back to the table registry on recovery, and the table's own
+        // tree records its coverage. No journal (cluster mode / plain open /
+        // in-memory) → durability follows the tree's own flush.
+        let tree = self.open_columnar_table(table_id)?;
         let index = match &self.oplog {
             Some(oplog) => {
                 let mut guard = oplog
@@ -981,11 +1048,9 @@ impl StorageEngine {
             }
             None => None,
         };
-        let tree = self.columnar_tables.create_or_open(table_id)?;
-        tree.insert(key, value, seqno);
-        // The entry touches no partition tree, so it is covered in every one
-        // of them; leaving it unmarked would stall the applied prefix.
+        apply_columnar_row(&tree, key, value, seqno, index)?;
         if let (Some(index), Some(coverage)) = (index, &self.coverage) {
+            coverage.note_table_marker(table_id, index);
             self.note_applied(coverage, index);
         }
         Ok(())
@@ -1032,6 +1097,8 @@ impl StorageEngine {
         // projects all four intrinsic columns; a projected/predicate-pushed
         // variant narrows this list instead of decoding whole rows.
         let mut out = Vec::new();
+        // Unbounded, which keeps the engine's zero-copy path for an
+        // all-visible segment; the table's coverage record is dropped by key.
         for batch in tree.columnar_scan(
             &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
             None,
@@ -1039,9 +1106,86 @@ impl StorageEngine {
             ..,
         )? {
             let batch = batch?;
-            out.extend(crate::columnar::columnar_batch_rows(&batch)?);
+            out.extend(
+                crate::columnar::columnar_batch_rows(&batch)?
+                    .into_iter()
+                    .filter(|(key, _)| !coverage::is_reserved(key)),
+            );
         }
         Ok(out)
+    }
+
+    /// Every `STORAGE COLUMNAR` table with its rows visible at `snapshot`, in
+    /// table-id order: the columnar half of a whole-store snapshot. Empty in
+    /// a build without columnar support.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] on a block read / decode failure.
+    pub fn columnar_tables_at(
+        &self,
+        snapshot: lsm_tree::SeqNo,
+    ) -> StorageResult<Vec<ColumnarTable>> {
+        #[cfg(feature = "columnar")]
+        {
+            let mut tables = Vec::new();
+            for table_id in self.columnar_tables.table_ids() {
+                let rows = self.columnar_scan(&table_id, snapshot)?;
+                tables.push((table_id, rows));
+            }
+            Ok(tables)
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            let _ = snapshot;
+            Ok(Vec::new())
+        }
+    }
+
+    /// Make the `STORAGE COLUMNAR` tables exactly `tables`: a table not
+    /// listed is dropped, a listed one is recreated holding only its listed
+    /// rows (sorted by key, as [`Self::columnar_tables_at`] returns them).
+    /// The installing half of a whole-store snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if a tree cannot be dropped, created
+    /// or written, and [`StorageError::InvalidConfig`] when rows arrive for a
+    /// build without columnar support.
+    pub fn replace_columnar_tables(&self, tables: Vec<ColumnarTable>) -> StorageResult<()> {
+        #[cfg(feature = "columnar")]
+        {
+            let keep: std::collections::HashSet<&str> =
+                tables.iter().map(|(id, _)| id.as_str()).collect();
+            for table_id in self.columnar_tables.table_ids() {
+                if !keep.contains(table_id.as_str()) {
+                    self.columnar_tables.drop_table(&table_id)?;
+                }
+            }
+            for (table_id, rows) in &tables {
+                self.columnar_tables.drop_table(table_id)?;
+                let tree = self.open_columnar_table(table_id)?;
+                if !rows.is_empty() {
+                    let rows: Vec<crate::columnar::ColumnarRow<'_>> = rows
+                        .iter()
+                        .map(|(key, value)| crate::columnar::ColumnarRow { key, value })
+                        .collect();
+                    crate::columnar::write_columnar_rows(&tree, &rows)?;
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "columnar"))]
+        {
+            if tables.is_empty() {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidConfig(
+                    "snapshot carries STORAGE COLUMNAR tables; this build has no columnar support"
+                        .into(),
+                ))
+            }
+        }
     }
 
     /// The timestamp oracle this engine stamps writes with, when opened
@@ -1243,9 +1387,10 @@ impl StorageEngine {
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         let at = self.next_seqno();
-        tree.insert(coverage::BASE_KEY, coverage::encode_base(next), at);
+        let domain = Domain::Journal;
+        tree.insert(domain.base_key(), coverage::encode_base(next, &[]), at);
         for index in above {
-            tree.insert(coverage::marker_key(index).as_slice(), &[][..], at);
+            tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
         }
         Ok(())
     }
@@ -1434,27 +1579,17 @@ impl StorageEngine {
                     self.persist()?;
                     next
                 };
+                // The fold reached every partition tree and every columnar
+                // table tree, so one index bound covers them all. A build
+                // without columnar support cannot have applied a columnar row
+                // and keeps any entry that carries one.
                 let is_durable = |entry: &OplogEntry| -> bool {
-                    entry.ops.iter().all(|op| match op_partition(op) {
-                        Some(_) => entry.index < durable_below,
-                        // Columnar rows live outside the partition trees:
-                        // check the table's own tree when the registry knows
-                        // it, otherwise keep the entry (fail-safe).
-                        #[cfg(feature = "columnar")]
-                        None => match op {
-                            OplogOp::ColumnarInsert { table_id, .. } => self
-                                .columnar_table_tree(table_id)
-                                .and_then(|t| {
-                                    t.get_highest_persisted_seqno().map(|w| entry.ts <= w)
-                                })
-                                .unwrap_or(false),
-                            // Noop / Raft bookkeeping carries no partition
-                            // data; nothing is lost by purging it.
-                            _ => true,
-                        },
-                        #[cfg(not(feature = "columnar"))]
-                        None => !matches!(op, OplogOp::ColumnarInsert { .. }),
-                    })
+                    entry.index < durable_below
+                        && (cfg!(feature = "columnar")
+                            || !entry
+                                .ops
+                                .iter()
+                                .any(|op| matches!(op, OplogOp::ColumnarInsert { .. })))
                 };
                 let mut guard = oplog
                     .lock()
@@ -2012,7 +2147,14 @@ impl StorageEngine {
         // commit_ts from this generator before it was applied.
         let at = self.next_seqno();
         for tree in self.coordinator.trees().values() {
-            coverage::write_fold(tree, from, next, at);
+            coverage::write_fold(tree, Domain::Journal, from, next, &[], at);
+        }
+        #[cfg(feature = "columnar")]
+        for (table_id, markers) in coverage.take_table_markers_below(next) {
+            // A dropped table took its markers with it.
+            if let Some(tree) = self.columnar_tables.get(&table_id) {
+                coverage::write_table_fold(&tree, Domain::Journal, next, &markers, at);
+            }
         }
         folded.set_folded(next);
         next
@@ -2241,6 +2383,12 @@ impl StorageEngine {
     pub fn persist(&self) -> StorageResult<()> {
         for tree in self.coordinator.trees().values() {
             tree.flush_active_memtable(0)?;
+        }
+        #[cfg(feature = "columnar")]
+        for table_id in self.columnar_tables.table_ids() {
+            if let Some(tree) = self.columnar_tables.get(&table_id) {
+                tree.flush_active_memtable(0)?;
+            }
         }
         // The retained oplog journal is NOT truncated on flush — it must survive
         // for WAL-replay-repair, and crash recovery skips the entries each
@@ -3185,6 +3333,37 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
         }
     }
     Ok(bytes)
+}
+
+/// A journalled `STORAGE COLUMNAR` row, held from the journal read until the
+/// table registry exists to replay it into.
+#[cfg(feature = "columnar")]
+struct ColumnarReplay {
+    table_id: String,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    ts: u64,
+    index: u64,
+}
+
+/// Write one `STORAGE COLUMNAR` row at `seqno`, with the coverage marker of
+/// its journal entry `index` in the same lsm batch, so the table tree holds
+/// both or neither.
+#[cfg(feature = "columnar")]
+fn apply_columnar_row(
+    tree: &lsm_tree::AnyTree,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    seqno: lsm_tree::SeqNo,
+    index: Option<u64>,
+) -> StorageResult<()> {
+    let mut batch = lsm_tree::WriteBatch::with_capacity(2);
+    batch.insert(key, value);
+    if let Some(index) = index {
+        batch.insert(Domain::Journal.marker_key(index, 0).as_slice(), &[][..]);
+    }
+    tree.apply_batch(batch, seqno)?;
+    Ok(())
 }
 
 #[cfg(test)]

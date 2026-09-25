@@ -757,10 +757,11 @@ fn a_journal_without_a_coverage_record_is_refused_untouched() {
         let at = engine.next_seqno();
         for &part in Partition::all() {
             let tree = engine.tree(part).expect("tree");
-            tree.remove(coverage::BASE_KEY, at);
+            let domain = coverage::Domain::Journal;
+            tree.remove(domain.base_key(), at);
             tree.remove_range(
-                coverage::marker_key(0).to_vec(),
-                coverage::marker_key(u64::MAX).to_vec(),
+                domain.marker_key(0, 0).to_vec(),
+                domain.marker_key(u64::MAX, u32::MAX).to_vec(),
                 at,
             );
         }
@@ -886,6 +887,115 @@ fn flushed_columnar_row_not_replayed_over_newer_state() {
             vec![(b"row:0007".to_vec(), b"v2-journalled".to_vec())],
             "recovery must skip the flushed row and replay only the un-flushed overwrite"
         );
+    }
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn late_finalized_columnar_row_survives_a_crash() {
+    // The late-finalize order on a columnar table: the newer row reaches an
+    // SST, the older-timestamped one is only in the memtable when power goes.
+    // A table whose highest persisted seqno stands in for coverage skips it.
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let t100 = oracle.next().as_raw();
+        let t200 = oracle.next().as_raw();
+        engine
+            .columnar_insert("Trade", b"row:0200".to_vec(), b"t200".to_vec(), t200)
+            .expect("insert t200");
+        engine.flush_columnar_table("Trade").expect("flush t200");
+        engine
+            .columnar_insert("Trade", b"row:0100".to_vec(), b"t100".to_vec(), t100)
+            .expect("insert t100");
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    assert_eq!(
+        engine.columnar_scan("Trade", u64::MAX).expect("scan"),
+        vec![
+            (b"row:0100".to_vec(), b"t100".to_vec()),
+            (b"row:0200".to_vec(), b"t200".to_vec()),
+        ],
+        "both rows, and nothing of the table's coverage record"
+    );
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn a_dropped_columnar_table_is_not_resurrected_by_replay() {
+    // Rows journalled for a table that was then dropped belong to that table
+    // alone: replay must not recreate it, and a new table under the same name
+    // starts empty rather than inheriting them.
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        engine
+            .columnar_insert(
+                "Scratch",
+                b"row:old".to_vec(),
+                b"old".to_vec(),
+                oracle.next().as_raw(),
+            )
+            .expect("insert");
+        engine.drop_columnar_table("Scratch").expect("drop");
+        engine.persist().expect("persist");
+        rig.cut(engine);
+    }
+    {
+        let (engine, _) = rig.open();
+        assert!(
+            engine.columnar_table_tree("Scratch").is_none(),
+            "replay must not recreate a dropped table"
+        );
+        engine.create_columnar_table("Scratch").expect("recreate");
+        rig.cut(engine);
+    }
+    let (engine, _) = rig.open();
+    assert_eq!(
+        engine.columnar_scan("Scratch", u64::MAX).expect("scan"),
+        Vec::<(Vec<u8>, Vec<u8>)>::new(),
+        "a table recreated under the old name starts empty"
+    );
+}
+
+#[cfg(feature = "columnar")]
+#[test]
+fn folded_columnar_coverage_hides_its_record_and_replays_nothing_twice() {
+    // After a fold the table's markers are gone and its base covers them; a
+    // row committed after the fold and lost in a crash is replayed once, and
+    // the scan never shows the record.
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        for i in 0..3u8 {
+            engine
+                .columnar_insert(
+                    "Trade",
+                    vec![b'r', b'0' + i],
+                    vec![i],
+                    oracle.next().as_raw(),
+                )
+                .expect("insert");
+        }
+        engine.oplog_purge_expired(0, u64::MAX).expect("fold");
+        engine
+            .columnar_insert("Trade", b"r9".to_vec(), vec![9], oracle.next().as_raw())
+            .expect("insert after fold");
+        rig.cut(engine);
+    }
+    for _ in 0..2 {
+        let (engine, _) = rig.open();
+        assert_eq!(
+            engine.columnar_scan("Trade", u64::MAX).expect("scan"),
+            vec![
+                (b"r0".to_vec(), vec![0]),
+                (b"r1".to_vec(), vec![1]),
+                (b"r2".to_vec(), vec![2]),
+                (b"r9".to_vec(), vec![9]),
+            ]
+        );
+        rig.cut(engine);
     }
 }
 

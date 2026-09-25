@@ -242,7 +242,10 @@ pub(crate) fn apply_oplog_ops_at(
             | OplogOp::ColumnarInsert { .. } => {}
         }
     }
-    batch.insert(coverage::marker_key(index).as_slice(), &[][..]);
+    batch.insert(
+        coverage::Domain::Journal.marker_key(index, 0).as_slice(),
+        &[][..],
+    );
     tree.apply_batch(batch, seqno)?;
     Ok(())
 }

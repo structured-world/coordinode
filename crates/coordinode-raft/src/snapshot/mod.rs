@@ -7,11 +7,20 @@
 //!
 //! ```text
 //! [magic: 4 bytes "CNSN"]
-//! [version: 1 byte (currently 1)]
+//! [version: 1 byte (currently 2; 1 is still read)]
 //! [partition_count: 1 byte]
 //! [partition_block]*
-//! [checksum: 8 bytes (xxh3 of all preceding bytes)]
+//! [table_section]          (version 2 and later)
+//! [checksum: 8 bytes (FNV-1a 64 of all preceding bytes, little-endian)]
 //! ```
+//!
+//! The `table_section` carries every `STORAGE COLUMNAR` table, whole:
+//! ```text
+//! [table_count: 4 bytes (u32 big-endian)]
+//! ([name_len: u32][name: UTF-8][entry_count: u32][kv_entry]*)*
+//! ```
+//! A version 1 snapshot has no table section and leaves the receiver's
+//! tables as they are.
 //!
 //! Each `partition_block`:
 //! ```text
@@ -34,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{ColumnarTable, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
 
 use coordinode_core::txn::timestamp::Timestamp;
@@ -66,8 +75,13 @@ type PartitionEntries = Vec<(Vec<u8>, Vec<u8>)>;
 /// Snapshot magic bytes: "CNSN" (CoordiNode SNapshot).
 const MAGIC: &[u8; 4] = b"CNSN";
 
-/// Current snapshot format version.
-const FORMAT_VERSION: u8 = 1;
+/// Snapshot format version written. Version 2 added the columnar table
+/// section; version 1 files, as released builds wrote them, still install,
+/// since a dump taken with a released build is how a store moves to this one.
+const FORMAT_VERSION: u8 = 2;
+
+/// The version that introduced the columnar table section.
+const TABLES_SINCE: u8 = 2;
 
 /// Partition tag values. Must be stable across versions.
 ///
@@ -121,8 +135,8 @@ fn snapshot_partitions() -> impl Iterator<Item = Partition> {
 /// Build a full snapshot of all user-data storage partitions.
 ///
 /// Iterates all 7 user-data partitions (excludes `Partition::Raft` which is
-/// managed by openraft), serializes every KV pair, and returns the complete
-/// snapshot as bytes. Uses xxh3 checksum for integrity.
+/// managed by openraft) and every `STORAGE COLUMNAR` table, serializes every
+/// KV pair, and returns the complete snapshot as bytes, checksummed.
 ///
 /// This is called by `CoordinodeSnapshotBuilder::build_snapshot()`.
 pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
@@ -162,33 +176,27 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
 
         // Partition block header
         buf.push(tag);
-        let count = entries.len() as u32;
-        buf.extend_from_slice(&count.to_be_bytes());
-
-        // KV entries
-        for (key, value) in &entries {
-            let key_len = key.len() as u32;
-            buf.extend_from_slice(&key_len.to_be_bytes());
-            buf.extend_from_slice(key);
-            let value_len = value.len() as u32;
-            buf.extend_from_slice(&value_len.to_be_bytes());
-            buf.extend_from_slice(value);
-        }
+        put_entries(&mut buf, &entries)?;
 
         tracing::debug!(
             partition = part.name(),
-            entries = count,
+            entries = entries.len(),
             "snapshot: serialized partition"
         );
     }
 
-    // xxh3 checksum of everything before
-    let hash = xxh3_hash(&buf);
+    let tables = engine
+        .columnar_tables_at(engine.snapshot())
+        .map_err(|e| io::Error::other(format!("snapshot columnar tables: {e}")))?;
+    put_tables(&mut buf, &tables)?;
+
+    let hash = fnv1a_64(&buf);
     buf.extend_from_slice(&hash.to_le_bytes());
 
     tracing::info!(
         total_bytes = buf.len(),
         partitions = partitions.len(),
+        columnar_tables = tables.len(),
         "snapshot: build complete"
     );
 
@@ -207,8 +215,8 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
 ///
 /// Schema-partition keys are always included for consistency (Dgraph pattern).
 ///
-/// The binary format is identical to full snapshots (v1) but only contains
-/// the delta entries. The receiver applies these via merge-write (overwrite
+/// The binary format is identical to full snapshots but only contains the
+/// delta entries. The receiver applies these via merge-write (overwrite
 /// matching keys, no stale key cleanup).
 ///
 /// Returns `Ok(None)` if no changes exist after `since_ts` (nothing to send).
@@ -218,9 +226,10 @@ pub fn build_incremental_snapshot(
 ) -> io::Result<Option<Vec<u8>>> {
     let partitions: Vec<Partition> = snapshot_partitions().collect();
     let mut buf = Vec::with_capacity(64 * 1024);
-    let mut total_entries = 0u32;
+    let mut total_entries = 0usize;
 
-    // Header (same v1 format — receiver distinguishes via SnapshotTransfer.since_ts)
+    // Header (same format as a full snapshot; the receiver tells them apart by
+    // SnapshotTransfer.since_ts)
     buf.extend_from_slice(MAGIC);
     buf.push(FORMAT_VERSION);
     buf.push(partitions.len() as u8);
@@ -292,35 +301,31 @@ pub fn build_incremental_snapshot(
 
         // Write partition block
         buf.push(tag);
-        let count = changed.len() as u32;
-        buf.extend_from_slice(&count.to_be_bytes());
-        total_entries += count;
+        put_entries(&mut buf, &changed)?;
+        total_entries += changed.len();
 
-        for (key, value) in &changed {
-            let key_len = key.len() as u32;
-            buf.extend_from_slice(&key_len.to_be_bytes());
-            buf.extend_from_slice(key);
-            let value_len = value.len() as u32;
-            buf.extend_from_slice(&value_len.to_be_bytes());
-            buf.extend_from_slice(value);
-        }
-
-        if count > 0 {
+        if !changed.is_empty() {
             tracing::debug!(
                 partition = part.name(),
-                entries = count,
+                entries = changed.len(),
                 "incremental snapshot: partition delta"
             );
         }
     }
 
-    if total_entries == 0 {
+    // Columnar tables travel whole, like Schema: their trees keep no
+    // changed-key history to diff against.
+    let tables = engine
+        .columnar_tables_at(engine.snapshot())
+        .map_err(|e| io::Error::other(format!("incr columnar tables: {e}")))?;
+    if total_entries == 0 && tables.is_empty() {
         tracing::debug!("incremental snapshot: no changes since ts={}", since_ts);
         return Ok(None);
     }
+    put_tables(&mut buf, &tables)?;
 
     // Checksum
-    let hash = xxh3_hash(&buf);
+    let hash = fnv1a_64(&buf);
     buf.extend_from_slice(&hash.to_le_bytes());
 
     tracing::info!(
@@ -342,109 +347,9 @@ pub fn build_incremental_snapshot(
 /// - Schema partition `raft:*` keys are skipped (managed by openraft)
 ///
 /// Uses WriteBatch for atomicity: crash before commit = no partial state.
+/// The checksum is verified over the whole buffer before anything is parsed.
 pub fn install_incremental_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<()> {
-    let mut cursor = io::Cursor::new(data);
-
-    // Validate header (same format as full snapshot)
-    let mut magic = [0u8; 4];
-    cursor.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(io::Error::other("invalid snapshot magic"));
-    }
-
-    let mut version = [0u8; 1];
-    cursor.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported snapshot version: {}",
-            version[0]
-        )));
-    }
-
-    let mut part_count = [0u8; 1];
-    cursor.read_exact(&mut part_count)?;
-    let partition_count = part_count[0] as usize;
-
-    // Validate checksum
-    let checksum_offset = data
-        .len()
-        .checked_sub(8)
-        .ok_or_else(|| io::Error::other("snapshot too small for checksum"))?;
-    let payload = &data[..checksum_offset];
-    let expected_hash = u64::from_le_bytes(
-        data[checksum_offset..]
-            .try_into()
-            .map_err(|_| io::Error::other("invalid checksum bytes"))?,
-    );
-    let actual_hash = xxh3_hash(payload);
-    if expected_hash != actual_hash {
-        return Err(io::Error::other(format!(
-            "incremental snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
-        )));
-    }
-
-    // Parse and apply delta entries
-    let mut batch = WriteBatch::new(engine);
-    let mut total_written = 0usize;
-    let mut total_deleted = 0usize;
-
-    for _ in 0..partition_count {
-        let mut tag_buf = [0u8; 1];
-        cursor.read_exact(&mut tag_buf)?;
-        let partition = tag_to_partition(tag_buf[0])
-            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
-
-        let mut count_buf = [0u8; 4];
-        cursor.read_exact(&mut count_buf)?;
-        let entry_count = u32::from_be_bytes(count_buf) as usize;
-
-        for _ in 0..entry_count {
-            let mut key_len_buf = [0u8; 4];
-            cursor.read_exact(&mut key_len_buf)?;
-            let key_len = u32::from_be_bytes(key_len_buf) as usize;
-            let mut key = vec![0u8; key_len];
-            cursor.read_exact(&mut key)?;
-
-            let mut value_len_buf = [0u8; 4];
-            cursor.read_exact(&mut value_len_buf)?;
-            let value_len = u32::from_be_bytes(value_len_buf) as usize;
-            let mut value = vec![0u8; value_len];
-            cursor.read_exact(&mut value)?;
-
-            // Skip Raft partition entirely — managed by openraft, not user data.
-            if partition == Partition::Raft {
-                continue;
-            }
-
-            // Skip raft: keys in Schema partition
-            if partition == Partition::Schema
-                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
-            {
-                continue;
-            }
-
-            if value.is_empty() {
-                // Tombstone: delete this key from the receiver
-                batch.delete(partition, key);
-                total_deleted += 1;
-            } else {
-                batch.put(partition, key, value);
-                total_written += 1;
-            }
-        }
-    }
-
-    batch
-        .commit()
-        .map_err(|e| io::Error::other(format!("incremental snapshot commit failed: {e}")))?;
-
-    tracing::info!(
-        total_written,
-        total_deleted,
-        "incremental snapshot install complete"
-    );
-
-    Ok(())
+    apply_incremental(engine, parse_verified_slice(data)?)
 }
 
 /// Install a full snapshot: deserialize and write all KV pairs to CoordiNode storage.
@@ -464,171 +369,282 @@ pub fn install_incremental_snapshot(engine: &StorageEngine, data: &[u8]) -> io::
 /// **Important:** Raft keys (`raft:*`) in the Schema partition are
 /// always preserved — they're managed by openraft, not application data.
 pub fn install_full_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<()> {
-    let mut cursor = io::Cursor::new(data);
+    apply_full(engine, parse_verified_slice(data)?)
+}
 
-    // Validate header
+/// A parsed snapshot, checksum already verified, with the entries a
+/// receiver must never overwrite (the Raft partition, Schema `raft:` and
+/// `meta:` keys) left out.
+struct ParsedSnapshot {
+    partitions: Vec<(Partition, PartitionEntries)>,
+    /// `None` for a version 1 snapshot, which says nothing about tables.
+    tables: Option<Vec<ColumnarTable>>,
+}
+
+/// Whether a receiver installs `key` of `partition` from a snapshot. Raft
+/// state is openraft's and routing (`meta:`) is per node.
+fn installable(partition: Partition, key: &[u8]) -> bool {
+    partition != Partition::Raft
+        && !(partition == Partition::Schema
+            && (key.starts_with(b"raft:") || key.starts_with(b"meta:")))
+}
+
+/// Verify `data`'s trailing checksum, then parse the body. The whole buffer
+/// is in hand, so a corrupt header is reported as the checksum failure it is
+/// rather than as whatever the parser tripped on first.
+fn parse_verified_slice(data: &[u8]) -> io::Result<ParsedSnapshot> {
+    // Something that is not a snapshot at all says so before any checksum.
+    if !data.starts_with(MAGIC) {
+        return Err(io::Error::other("invalid snapshot magic"));
+    }
+    let (payload, checksum) = data
+        .split_last_chunk::<8>()
+        .ok_or_else(|| io::Error::other("snapshot too small for checksum"))?;
+    let expected = u64::from_le_bytes(*checksum);
+    let actual = fnv1a_64(payload);
+    if expected != actual {
+        return Err(io::Error::other(format!(
+            "snapshot checksum mismatch: expected {expected:#x}, got {actual:#x}"
+        )));
+    }
+    let mut cursor = io::Cursor::new(payload);
+    let parsed = parse_body(&mut cursor)?;
+    if cursor.position() != payload.len() as u64 {
+        return Err(io::Error::other("snapshot has bytes past its last section"));
+    }
+    Ok(parsed)
+}
+
+/// Parse a snapshot from a stream, hashing it as it goes, and verify the
+/// checksum that follows before returning: nothing is applied from a stream
+/// whose checksum fails.
+fn parse_verified_stream(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
+    let mut hashing = HashingReader {
+        inner: &mut *reader,
+        hash: FNV_OFFSET,
+    };
+    let parsed = parse_body(&mut hashing)?;
+    let actual = hashing.hash;
+    let mut checksum = [0u8; 8];
+    reader.read_exact(&mut checksum)?;
+    let expected = u64::from_le_bytes(checksum);
+    if expected != actual {
+        return Err(io::Error::other(format!(
+            "snapshot checksum mismatch: expected {expected:#x}, got {actual:#x}"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_body(reader: &mut impl IoRead) -> io::Result<ParsedSnapshot> {
     let mut magic = [0u8; 4];
-    cursor.read_exact(&mut magic)?;
+    reader.read_exact(&mut magic)?;
     if &magic != MAGIC {
         return Err(io::Error::other("invalid snapshot magic"));
     }
-
     let mut version = [0u8; 1];
-    cursor.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
+    reader.read_exact(&mut version)?;
+    let version = version[0];
+    if version == 0 || version > FORMAT_VERSION {
         return Err(io::Error::other(format!(
-            "unsupported snapshot version: {}",
-            version[0]
+            "unsupported snapshot version: {version}"
         )));
     }
-
     let mut part_count = [0u8; 1];
-    cursor.read_exact(&mut part_count)?;
-    let partition_count = part_count[0] as usize;
+    reader.read_exact(&mut part_count)?;
 
-    // Validate checksum before applying anything
-    let checksum_offset = data
-        .len()
-        .checked_sub(8)
-        .ok_or_else(|| io::Error::other("snapshot too small for checksum"))?;
-    let payload = &data[..checksum_offset];
-    let expected_hash = u64::from_le_bytes(
-        data[checksum_offset..]
-            .try_into()
-            .map_err(|_| io::Error::other("invalid checksum bytes"))?,
-    );
-    let actual_hash = xxh3_hash(payload);
-    if expected_hash != actual_hash {
-        return Err(io::Error::other(format!(
-            "snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
-        )));
-    }
-
-    // ── Parse all entries first (before mutating anything) ───────────
-    // Collect entries per partition so we can do atomic Phase 1 + Phase 2.
-    let mut parsed_partitions: Vec<(Partition, PartitionEntries)> = Vec::new();
-
-    for _ in 0..partition_count {
-        let mut tag_buf = [0u8; 1];
-        cursor.read_exact(&mut tag_buf)?;
-        let partition = tag_to_partition(tag_buf[0])
-            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
-
-        let mut count_buf = [0u8; 4];
-        cursor.read_exact(&mut count_buf)?;
-        let entry_count = u32::from_be_bytes(count_buf) as usize;
-
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let mut key_len_buf = [0u8; 4];
-            cursor.read_exact(&mut key_len_buf)?;
-            let key_len = u32::from_be_bytes(key_len_buf) as usize;
-            let mut key = vec![0u8; key_len];
-            cursor.read_exact(&mut key)?;
-
-            let mut value_len_buf = [0u8; 4];
-            cursor.read_exact(&mut value_len_buf)?;
-            let value_len = u32::from_be_bytes(value_len_buf) as usize;
-            let mut value = vec![0u8; value_len];
-            cursor.read_exact(&mut value)?;
-
-            // Skip Raft partition entirely — managed by openraft, not user data.
-            if partition == Partition::Raft {
-                continue;
-            }
-
-            // Skip raft: keys in Schema partition — managed by openraft
-            if partition == Partition::Schema
-                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
-            {
-                continue;
-            }
-
-            entries.push((key, value));
-        }
-
-        // Don't accumulate Raft partition entries into parsed_partitions
+    let mut partitions = Vec::with_capacity(usize::from(part_count[0]));
+    for _ in 0..part_count[0] {
+        let mut tag = [0u8; 1];
+        reader.read_exact(&mut tag)?;
+        let partition = tag_to_partition(tag[0])
+            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag[0])))?;
+        let mut entries = read_entries(reader)?;
+        entries.retain(|(key, _)| installable(partition, key));
         if partition != Partition::Raft {
-            parsed_partitions.push((partition, entries));
+            partitions.push((partition, entries));
         }
     }
 
-    // ── Phase 1: Atomic write of ALL snapshot entries ────────────────
-    // WriteBatch uses the storage write_tx internally — all-or-nothing.
-    // Crash before commit() = no writes visible, old data intact.
+    let tables = if version >= TABLES_SINCE {
+        let count = read_u32(reader)?;
+        let mut tables = Vec::new();
+        for _ in 0..count {
+            let name = String::from_utf8(read_bytes(reader)?)
+                .map_err(|_| io::Error::other("snapshot table name is not UTF-8"))?;
+            tables.push((name, read_entries(reader)?));
+        }
+        Some(tables)
+    } else {
+        None
+    };
+    Ok(ParsedSnapshot { partitions, tables })
+}
+
+fn read_u32(reader: &mut impl IoRead) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+/// A length-prefixed byte string. The length comes from the stream, so the
+/// buffer grows with the bytes actually read instead of trusting it up front:
+/// a corrupt length ends in an EOF error, not in a huge allocation.
+fn read_bytes(reader: &mut impl IoRead) -> io::Result<Vec<u8>> {
+    let len = read_u32(reader)?;
+    let mut bytes = Vec::new();
+    reader.take(u64::from(len)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != u64::from(len) {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    }
+    Ok(bytes)
+}
+
+fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
+    let count = read_u32(reader)?;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let key = read_bytes(reader)?;
+        let value = read_bytes(reader)?;
+        entries.push((key, value));
+    }
+    Ok(entries)
+}
+
+/// Replace the receiver's state with a full snapshot.
+///
+/// **Phase 1 (atomic via WriteBatch):** every snapshot entry in one batch;
+/// a crash before it commits leaves the old data intact.
+///
+/// **Phase 2 (idempotent cleanup):** delete keys the engine holds and the
+/// snapshot does not; a crash midway leaves stale keys that the next install
+/// removes.
+///
+/// **Columnar tables** are then made exactly the snapshot's, when it lists
+/// them.
+fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
     let mut batch = WriteBatch::new(engine);
     let mut total_written = 0usize;
-
-    for (partition, entries) in &parsed_partitions {
+    for (partition, entries) in &parsed.partitions {
         for (key, value) in entries {
             batch.put(*partition, key.clone(), value.clone());
             total_written += 1;
         }
     }
-
     batch
         .commit()
         .map_err(|e| io::Error::other(format!("snapshot phase 1 (atomic write) failed: {e}")))?;
 
-    tracing::info!(
-        entries = total_written,
-        "snapshot phase 1 complete: atomic write committed"
-    );
-
-    // ── Phase 2: Idempotent cleanup of stale keys ────────────────────
-    // Delete keys present in engine but absent in snapshot.
-    // Crash during Phase 2 = stale keys remain (harmless, cleaned on
-    // next snapshot install or next full snapshot from leader).
     let mut stale_deleted = 0usize;
-
-    for (partition, snap_entries) in &parsed_partitions {
-        // Build a set of snapshot keys for fast lookup
+    for (partition, snap_entries) in &parsed.partitions {
         let snap_keys: std::collections::HashSet<&[u8]> =
             snap_entries.iter().map(|(k, _)| k.as_slice()).collect();
-
         let iter = engine
             .prefix_scan(*partition, &[])
             .map_err(|e| io::Error::other(format!("cleanup scan {}: {e}", partition.name())))?;
-
         let mut keys_to_delete = Vec::new();
         for guard in iter {
             let key = guard
                 .key()
                 .map_err(|e| io::Error::other(format!("cleanup iter {}: {e}", partition.name())))?;
-
-            // Preserve raft: keys in Schema partition
-            if *partition == Partition::Schema
-                && (key.as_ref().starts_with(b"raft:") || key.as_ref().starts_with(b"meta:"))
-            {
-                continue;
-            }
-
-            if !snap_keys.contains(key.as_ref()) {
+            if installable(*partition, &key) && !snap_keys.contains(key.as_ref()) {
                 keys_to_delete.push(key.to_vec());
             }
         }
-
         for key in &keys_to_delete {
             engine.delete(*partition, key).map_err(|e| {
                 io::Error::other(format!("cleanup delete {}: {e}", partition.name()))
             })?;
         }
-
-        if !keys_to_delete.is_empty() {
-            tracing::debug!(
-                partition = partition.name(),
-                stale_keys = keys_to_delete.len(),
-                "snapshot phase 2: cleaned stale keys"
-            );
-        }
         stale_deleted += keys_to_delete.len();
     }
 
+    let tables = install_tables(engine, parsed.tables)?;
     tracing::info!(
         total_written,
         stale_deleted,
+        tables,
         "snapshot install complete (two-phase)"
     );
+    Ok(())
+}
+
+/// Merge-write an incremental snapshot: entries overwrite matching keys, an
+/// empty value deletes its key, and nothing else is removed. One batch, so a
+/// crash before it commits leaves no partial state.
+fn apply_incremental(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
+    let mut batch = WriteBatch::new(engine);
+    let mut total_written = 0usize;
+    let mut total_deleted = 0usize;
+    for (partition, entries) in parsed.partitions {
+        for (key, value) in entries {
+            if value.is_empty() {
+                batch.delete(partition, key);
+                total_deleted += 1;
+            } else {
+                batch.put(partition, key, value);
+                total_written += 1;
+            }
+        }
+    }
+    batch
+        .commit()
+        .map_err(|e| io::Error::other(format!("incremental snapshot commit failed: {e}")))?;
+    let tables = install_tables(engine, parsed.tables)?;
+    tracing::info!(
+        total_written,
+        total_deleted,
+        tables,
+        "incremental snapshot install complete"
+    );
+    Ok(())
+}
+
+/// Make the receiver's columnar tables the snapshot's; a version 1 snapshot
+/// leaves them alone. Returns how many tables were installed.
+fn install_tables(engine: &StorageEngine, tables: Option<Vec<ColumnarTable>>) -> io::Result<usize> {
+    let Some(tables) = tables else {
+        return Ok(0);
+    };
+    let count = tables.len();
+    engine
+        .replace_columnar_tables(tables)
+        .map_err(|e| io::Error::other(format!("snapshot columnar tables: {e}")))?;
+    Ok(count)
+}
+
+/// Append `entries` as `[count: u32][kv_entry]*`.
+fn put_entries(buf: &mut Vec<u8>, entries: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    put_u32(buf, entries.len())?;
+    for (key, value) in entries {
+        put_bytes(buf, key)?;
+        put_bytes(buf, value)?;
+    }
+    Ok(())
+}
+
+/// Append the columnar table section.
+fn put_tables(buf: &mut Vec<u8>, tables: &[ColumnarTable]) -> io::Result<()> {
+    put_u32(buf, tables.len())?;
+    for (name, rows) in tables {
+        put_bytes(buf, name.as_bytes())?;
+        put_entries(buf, rows)?;
+    }
+    Ok(())
+}
+
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+    put_u32(buf, bytes.len())?;
+    buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// A length or count as the format's u32; anything larger is refused rather
+/// than written truncated.
+fn put_u32(buf: &mut Vec<u8>, n: usize) -> io::Result<()> {
+    let n = u32::try_from(n)
+        .map_err(|_| io::Error::other(format!("snapshot field of {n} exceeds the u32 format")))?;
+    buf.extend_from_slice(&n.to_be_bytes());
     Ok(())
 }
 
@@ -691,168 +707,13 @@ pub fn chunk_snapshot_data(data: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// Install a full snapshot from a reader (file or buffer).
 ///
 /// Identical to `install_full_snapshot` but reads from `impl Read` instead
-/// of `&[u8]`, avoiding the need to hold the entire snapshot in memory.
-///
-/// Uses a **two-phase crash-safe** approach:
-/// - Phase 1 (atomic WriteBatch): Write ALL snapshot entries.
-/// - Phase 2 (idempotent cleanup): Delete stale keys.
+/// of `&[u8]`, avoiding the need to hold the serialized snapshot in memory.
+/// The checksum is verified after the parse and before any write.
 pub fn install_full_snapshot_from_reader(
     engine: &StorageEngine,
     reader: &mut impl IoRead,
 ) -> io::Result<()> {
-    // Read and validate header
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(io::Error::other("invalid snapshot magic"));
-    }
-
-    let mut version = [0u8; 1];
-    reader.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported snapshot version: {}",
-            version[0]
-        )));
-    }
-
-    let mut part_count = [0u8; 1];
-    reader.read_exact(&mut part_count)?;
-    let partition_count = part_count[0] as usize;
-
-    // Parse all entries (accumulates in memory for WriteBatch atomicity).
-    // Note: individual entries are small (KV pairs). The OOM issue was
-    // holding the entire serialized CNSN blob; here we parse incrementally.
-    let mut parsed_partitions: Vec<(Partition, PartitionEntries)> = Vec::new();
-
-    for _ in 0..partition_count {
-        let mut tag_buf = [0u8; 1];
-        reader.read_exact(&mut tag_buf)?;
-        let partition = tag_to_partition(tag_buf[0])
-            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
-
-        let mut count_buf = [0u8; 4];
-        reader.read_exact(&mut count_buf)?;
-        let entry_count = u32::from_be_bytes(count_buf) as usize;
-
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let mut key_len_buf = [0u8; 4];
-            reader.read_exact(&mut key_len_buf)?;
-            let key_len = u32::from_be_bytes(key_len_buf) as usize;
-            let mut key = vec![0u8; key_len];
-            reader.read_exact(&mut key)?;
-
-            let mut value_len_buf = [0u8; 4];
-            reader.read_exact(&mut value_len_buf)?;
-            let value_len = u32::from_be_bytes(value_len_buf) as usize;
-            let mut value = vec![0u8; value_len];
-            reader.read_exact(&mut value)?;
-
-            if partition == Partition::Raft {
-                continue;
-            }
-            if partition == Partition::Schema
-                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
-            {
-                continue;
-            }
-
-            entries.push((key, value));
-        }
-
-        if partition != Partition::Raft {
-            parsed_partitions.push((partition, entries));
-        }
-    }
-
-    // Read and validate checksum (last 8 bytes after partition data).
-    // For reader-based install, we cannot random-access the checksum
-    // at the end before reading entries. Instead, we verify it after
-    // reading all partition data but BEFORE applying any writes.
-    let mut checksum_buf = [0u8; 8];
-    reader.read_exact(&mut checksum_buf)?;
-    let expected_hash = u64::from_le_bytes(checksum_buf);
-
-    // Recompute hash over the data we parsed (reconstruct the CNSN payload).
-    // This is necessary because we read streaming — we couldn't validate
-    // the checksum upfront like the &[u8] version does.
-    let reconstructed = reconstruct_cnsn_payload(&parsed_partitions, partition_count);
-    let actual_hash = xxh3_hash(&reconstructed);
-    if expected_hash != actual_hash {
-        return Err(io::Error::other(format!(
-            "snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
-        )));
-    }
-
-    // Phase 1: Atomic write
-    let mut batch = WriteBatch::new(engine);
-    let mut total_written = 0usize;
-
-    for (partition, entries) in &parsed_partitions {
-        for (key, value) in entries {
-            batch.put(*partition, key.clone(), value.clone());
-            total_written += 1;
-        }
-    }
-
-    batch
-        .commit()
-        .map_err(|e| io::Error::other(format!("snapshot phase 1 (atomic write) failed: {e}")))?;
-
-    tracing::info!(
-        entries = total_written,
-        "snapshot phase 1 complete: atomic write committed"
-    );
-
-    // Phase 2: Stale key cleanup
-    let mut stale_deleted = 0usize;
-    for (partition, snap_entries) in &parsed_partitions {
-        let snap_keys: std::collections::HashSet<&[u8]> =
-            snap_entries.iter().map(|(k, _)| k.as_slice()).collect();
-
-        let iter = engine
-            .prefix_scan(*partition, &[])
-            .map_err(|e| io::Error::other(format!("cleanup scan {}: {e}", partition.name())))?;
-
-        let mut keys_to_delete = Vec::new();
-        for guard in iter {
-            let key = guard
-                .key()
-                .map_err(|e| io::Error::other(format!("cleanup iter {}: {e}", partition.name())))?;
-
-            if *partition == Partition::Schema
-                && (key.as_ref().starts_with(b"raft:") || key.as_ref().starts_with(b"meta:"))
-            {
-                continue;
-            }
-            if !snap_keys.contains(key.as_ref()) {
-                keys_to_delete.push(key.to_vec());
-            }
-        }
-
-        for key in &keys_to_delete {
-            engine.delete(*partition, key).map_err(|e| {
-                io::Error::other(format!("cleanup delete {}: {e}", partition.name()))
-            })?;
-        }
-
-        if !keys_to_delete.is_empty() {
-            tracing::debug!(
-                partition = partition.name(),
-                stale_keys = keys_to_delete.len(),
-                "snapshot phase 2: cleaned stale keys"
-            );
-        }
-        stale_deleted += keys_to_delete.len();
-    }
-
-    tracing::info!(
-        total_written,
-        stale_deleted,
-        "snapshot install complete (two-phase, reader)"
-    );
-    Ok(())
+    apply_full(engine, parse_verified_stream(reader)?)
 }
 
 /// Install an incremental snapshot from a reader (file or buffer).
@@ -862,155 +723,38 @@ pub fn install_incremental_snapshot_from_reader(
     engine: &StorageEngine,
     reader: &mut impl IoRead,
 ) -> io::Result<()> {
-    // Read and validate header
-    let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(io::Error::other("invalid snapshot magic"));
-    }
-
-    let mut version = [0u8; 1];
-    reader.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported snapshot version: {}",
-            version[0]
-        )));
-    }
-
-    let mut part_count = [0u8; 1];
-    reader.read_exact(&mut part_count)?;
-    let partition_count = part_count[0] as usize;
-
-    // Parse delta entries and apply via WriteBatch
-    let mut batch = WriteBatch::new(engine);
-    let mut total_written = 0usize;
-    let mut total_deleted = 0usize;
-
-    // Track parsed entries for checksum verification
-    let mut parsed_partitions: Vec<(Partition, PartitionEntries)> = Vec::new();
-
-    for _ in 0..partition_count {
-        let mut tag_buf = [0u8; 1];
-        reader.read_exact(&mut tag_buf)?;
-        let partition = tag_to_partition(tag_buf[0])
-            .ok_or_else(|| io::Error::other(format!("unknown partition tag: {}", tag_buf[0])))?;
-
-        let mut count_buf = [0u8; 4];
-        reader.read_exact(&mut count_buf)?;
-        let entry_count = u32::from_be_bytes(count_buf) as usize;
-
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let mut key_len_buf = [0u8; 4];
-            reader.read_exact(&mut key_len_buf)?;
-            let key_len = u32::from_be_bytes(key_len_buf) as usize;
-            let mut key = vec![0u8; key_len];
-            reader.read_exact(&mut key)?;
-
-            let mut value_len_buf = [0u8; 4];
-            reader.read_exact(&mut value_len_buf)?;
-            let value_len = u32::from_be_bytes(value_len_buf) as usize;
-            let mut value = vec![0u8; value_len];
-            reader.read_exact(&mut value)?;
-
-            entries.push((key, value));
-        }
-
-        parsed_partitions.push((partition, entries));
-    }
-
-    // Validate checksum
-    let mut checksum_buf = [0u8; 8];
-    reader.read_exact(&mut checksum_buf)?;
-    let expected_hash = u64::from_le_bytes(checksum_buf);
-    let reconstructed = reconstruct_cnsn_payload(&parsed_partitions, partition_count);
-    let actual_hash = xxh3_hash(&reconstructed);
-    if expected_hash != actual_hash {
-        return Err(io::Error::other(format!(
-            "incremental snapshot checksum mismatch: expected {expected_hash:#x}, got {actual_hash:#x}"
-        )));
-    }
-
-    // Apply entries
-    for (partition, entries) in &parsed_partitions {
-        for (key, value) in entries {
-            if *partition == Partition::Raft {
-                continue;
-            }
-            if *partition == Partition::Schema
-                && (key.starts_with(b"raft:") || key.starts_with(b"meta:"))
-            {
-                continue;
-            }
-
-            if value.is_empty() {
-                batch.delete(*partition, key.clone());
-                total_deleted += 1;
-            } else {
-                batch.put(*partition, key.clone(), value.clone());
-                total_written += 1;
-            }
-        }
-    }
-
-    batch
-        .commit()
-        .map_err(|e| io::Error::other(format!("incremental snapshot commit failed: {e}")))?;
-
-    tracing::info!(
-        total_written,
-        total_deleted,
-        "incremental snapshot install complete (reader)"
-    );
-
-    Ok(())
+    apply_incremental(engine, parse_verified_stream(reader)?)
 }
 
-/// Reconstruct the CNSN binary payload (without checksum) from parsed partitions.
-///
-/// Used by reader-based installers to verify the checksum after streaming
-/// parse, since they can't random-access the checksum before reading.
-fn reconstruct_cnsn_payload(
-    parsed_partitions: &[(Partition, PartitionEntries)],
-    partition_count: usize,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64 * 1024);
-    buf.extend_from_slice(MAGIC);
-    buf.push(FORMAT_VERSION);
-    buf.push(partition_count as u8);
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-    for (partition, entries) in parsed_partitions {
-        buf.push(partition_tag(*partition));
-        let count = entries.len() as u32;
-        buf.extend_from_slice(&count.to_be_bytes());
-
-        for (key, value) in entries {
-            let key_len = key.len() as u32;
-            buf.extend_from_slice(&key_len.to_be_bytes());
-            buf.extend_from_slice(key);
-            let value_len = value.len() as u32;
-            buf.extend_from_slice(&value_len.to_be_bytes());
-            buf.extend_from_slice(value);
-        }
-    }
-
-    buf
+/// The snapshot checksum: FNV-1a 64. Fixed by the format, which released
+/// builds already wrote; a stronger hash would be a new format version.
+fn fnv1a_64(data: &[u8]) -> u64 {
+    fnv1a_fold(FNV_OFFSET, data)
 }
 
-/// xxh3 hash (64-bit) using the standard library-compatible algorithm.
-///
-/// We use a simple FNV-like hash here for now. In production, replace
-/// with xxhash-rust crate for SIMD-accelerated xxh3.
-fn xxh3_hash(data: &[u8]) -> u64 {
-    // Use FNV-1a as a placeholder. R134 is pre-alpha; we'll switch to
-    // xxhash-rust (xxh3) when the crate is added to workspace deps.
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+fn fnv1a_fold(mut hash: u64, data: &[u8]) -> u64 {
     for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// Hands `inner`'s bytes through, folding each into the snapshot checksum.
+struct HashingReader<'a, R> {
+    inner: &'a mut R,
+    hash: u64,
+}
+
+impl<R: IoRead> IoRead for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash = fnv1a_fold(self.hash, &buf[..n]);
+        Ok(n)
+    }
 }
 
 #[cfg(test)]

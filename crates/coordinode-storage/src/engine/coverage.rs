@@ -25,7 +25,7 @@
 //! marker exists.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use lsm_tree::{AbstractTree, AnyTree, Guard, SeqNo};
 
@@ -36,40 +36,78 @@ use crate::error::{StorageError, StorageResult};
 /// above it; every coverage key sorts below it.
 pub(crate) const USER_KEYSPACE_START: &[u8] = &[0x01];
 
-/// The fold record: every index below the stored value is covered.
-pub(crate) const BASE_KEY: &[u8] = b"\x00cov-base";
-
-/// Prefix of the per-index markers.
-const MARKER_PREFIX: &[u8] = b"\x00cov:";
-
-/// Exclusive end of the marker range (`:` + 1).
-const MARKER_END: &[u8] = b"\x00cov;";
-
 /// How many applied indices accumulate as markers before the commit path
 /// folds them into the base.
 pub(crate) const FOLD_EVERY: u64 = 4096;
 
-/// The marker key for journal `index`.
-pub(crate) fn marker_key(index: u64) -> [u8; 13] {
-    let mut key = [0u8; 13];
-    key[..5].copy_from_slice(MARKER_PREFIX);
-    key[5..].copy_from_slice(&index.to_be_bytes());
-    key
+/// The index space a coverage record is kept in. Each source of applied
+/// entries numbers them its own way, so each keeps its own record: a store
+/// that moved from one to the other must never read one's indices as the
+/// other's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Domain {
+    /// The embedded journal's entry index.
+    Journal,
 }
 
-/// The base value covering every index below `next`.
-pub(crate) fn encode_base(next: u64) -> [u8; 8] {
-    next.to_be_bytes()
+impl Domain {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Journal => b'j',
+        }
+    }
+
+    /// The fold record: every index below the stored value is covered.
+    pub(crate) const fn base_key(self) -> [u8; 4] {
+        [0x00, b'c', self.tag(), b'b']
+    }
+
+    /// The marker for `(index, sub)`; `sub` orders the several applies one
+    /// source entry can carry and is 0 when an entry is one apply.
+    pub(crate) fn marker_key(self, index: u64, sub: u32) -> [u8; MARKER_LEN] {
+        let mut key = [0u8; MARKER_LEN];
+        key[..4].copy_from_slice(&[0x00, b'c', self.tag(), b'm']);
+        key[4..12].copy_from_slice(&index.to_be_bytes());
+        key[12..].copy_from_slice(&sub.to_be_bytes());
+        key
+    }
+
+    /// Exclusive end of this domain's marker range.
+    const fn marker_end(self) -> [u8; 4] {
+        [0x00, b'c', self.tag(), b'n']
+    }
 }
 
-fn decode_base(value: &[u8]) -> StorageResult<u64> {
-    let bytes: [u8; 8] = value.try_into().map_err(|_| {
+const MARKER_LEN: usize = 16;
+
+/// The `(index, sub)` a marker key names, or `None` for a malformed key.
+fn decode_marker(key: &[u8]) -> Option<(u64, u32)> {
+    if key.len() != MARKER_LEN {
+        return None;
+    }
+    let (index, sub) = key.get(4..)?.split_first_chunk::<8>()?;
+    let sub: [u8; 4] = sub.try_into().ok()?;
+    Some((u64::from_be_bytes(*index), u32::from_be_bytes(sub)))
+}
+
+/// The base value covering every index below `next`, followed by the
+/// source's own description of its last covered entry (empty when the source
+/// needs none).
+pub(crate) fn encode_base(next: u64, payload: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(8 + payload.len());
+    value.extend_from_slice(&next.to_be_bytes());
+    value.extend_from_slice(payload);
+    value
+}
+
+fn decode_base(value: &[u8]) -> StorageResult<(u64, &[u8])> {
+    let (next, payload) = value.split_first_chunk::<8>().ok_or_else(|| {
         StorageError::Serialization(format!(
-            "coverage base holds {} bytes, expected 8",
+            "coverage base holds {} bytes, expected at least 8",
             value.len()
         ))
     })?;
-    Ok(u64::from_be_bytes(bytes))
+    Ok((u64::from_be_bytes(*next), payload))
 }
 
 /// Whether `key` belongs to the engine-reserved namespace.
@@ -98,33 +136,34 @@ pub(crate) fn user_prefix(tree: &AnyTree, prefix: &[u8], seqno: SeqNo) -> Storag
     }
 }
 
-/// The durable coverage of one tree, read when the engine opens.
+/// The durable coverage of one tree in one domain, read when it opens.
 #[derive(Debug, Default)]
 pub(crate) struct TreeCoverage {
     /// `None` when the tree carries no coverage record at all.
     base: Option<u64>,
-    /// Marker indices at or above the base.
-    sparse: BTreeSet<u64>,
+    /// Marked `(index, sub)` pairs at or above the base.
+    sparse: BTreeSet<(u64, u32)>,
 }
 
 impl TreeCoverage {
     /// Read the base and the markers above it, at the latest version.
-    pub(crate) fn read(tree: &AnyTree) -> StorageResult<Self> {
-        let base = tree
-            .get(BASE_KEY, SeqNo::MAX)?
-            .map(|v| decode_base(&v))
-            .transpose()?;
-        let from = marker_key(base.unwrap_or(0));
+    pub(crate) fn read(tree: &AnyTree, domain: Domain) -> StorageResult<Self> {
+        let base = match tree.get(domain.base_key(), SeqNo::MAX)? {
+            Some(value) => Some(decode_base(&value)?.0),
+            None => None,
+        };
+        let from = domain.marker_key(base.unwrap_or(0), 0);
+        let end = domain.marker_end();
         let mut sparse = BTreeSet::new();
-        for guard in tree.range(from.as_slice()..MARKER_END, SeqNo::MAX, None) {
+        for guard in tree.range(from.as_slice()..end.as_slice(), SeqNo::MAX, None) {
             let (key, _) = guard.into_inner()?;
-            let index: [u8; 8] = key[MARKER_PREFIX.len()..].try_into().map_err(|_| {
+            let marker = decode_marker(&key).ok_or_else(|| {
                 StorageError::Serialization(format!(
-                    "coverage marker key holds {} bytes, expected 13",
+                    "coverage marker key holds {} bytes, expected {MARKER_LEN}",
                     key.len()
                 ))
             })?;
-            sparse.insert(u64::from_be_bytes(index));
+            sparse.insert(marker);
         }
         Ok(Self { base, sparse })
     }
@@ -134,15 +173,20 @@ impl TreeCoverage {
         self.base.is_some()
     }
 
+    /// The indices this tree holds markers for above its base.
+    pub(crate) fn marked_indices(&self) -> impl Iterator<Item = u64> + '_ {
+        self.sparse.iter().map(|&(index, _)| index)
+    }
+
     /// One past the highest index this tree records as covered.
     pub(crate) fn next_uncovered(&self) -> u64 {
-        let above = self.sparse.last().map_or(0, |&i| i + 1);
+        let above = self.sparse.last().map_or(0, |&(i, _)| i + 1);
         self.base.unwrap_or(0).max(above)
     }
 
-    /// Whether journal entry `index` is physically in this tree.
-    pub(crate) fn contains(&self, index: u64) -> bool {
-        index < self.base.unwrap_or(0) || self.sparse.contains(&index)
+    /// Whether apply `sub` of source entry `index` is physically in this tree.
+    pub(crate) fn contains(&self, index: u64, sub: u32) -> bool {
+        index < self.base.unwrap_or(0) || self.sparse.contains(&(index, sub))
     }
 }
 
@@ -198,6 +242,9 @@ pub(crate) struct Coverage {
     folded: parking_lot::Mutex<u64>,
     /// Lock-free copy of `folded` for the commit path's "is a fold due" test.
     folded_hint: AtomicU64,
+    /// Per `STORAGE COLUMNAR` table, the indices marked in its tree and not
+    /// folded yet: a table fold removes them by name.
+    table_markers: parking_lot::Mutex<HashMap<String, Vec<u64>>>,
 }
 
 impl Coverage {
@@ -209,7 +256,35 @@ impl Coverage {
             // first fold removes markers from index 0.
             folded: parking_lot::Mutex::new(0),
             folded_hint: AtomicU64::new(0),
+            table_markers: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record that `table`'s tree now holds the marker for `index`.
+    pub(crate) fn note_table_marker(&self, table: &str, index: u64) {
+        let mut markers = self.table_markers.lock();
+        match markers.get_mut(table) {
+            Some(indices) => indices.push(index),
+            None => {
+                markers.insert(table.to_owned(), vec![index]);
+            }
+        }
+    }
+
+    /// Take, per table, the unfolded markers below `next`; the ones at or
+    /// above it stay for a later fold.
+    pub(crate) fn take_table_markers_below(&self, next: u64) -> Vec<(String, Vec<u64>)> {
+        let mut markers = self.table_markers.lock();
+        let mut taken = Vec::new();
+        markers.retain(|table, indices| {
+            let (below, above): (Vec<u64>, Vec<u64>) = indices.iter().partition(|&&i| i < next);
+            if !below.is_empty() {
+                taken.push((table.clone(), below));
+            }
+            *indices = above;
+            !indices.is_empty()
+        });
+        taken
     }
 
     /// Record `index` as applied; returns whether a fold is due.
@@ -275,13 +350,41 @@ impl FoldGuard<'_> {
     }
 }
 
-/// Write the fold of every index below `next` into `tree`: the base first,
-/// then the tombstone over the markers from `from`. `seqno` must exceed the
-/// seqno of every marker below `next`.
-pub(crate) fn write_fold(tree: &AnyTree, from: u64, next: u64, seqno: SeqNo) {
-    tree.insert(BASE_KEY, encode_base(next), seqno);
+/// Write the fold of every index below `next` into a partition tree: the base
+/// first, then the tombstone over the markers from `from`. `seqno` must
+/// exceed the seqno of every marker below `next`.
+pub(crate) fn write_fold(
+    tree: &AnyTree,
+    domain: Domain,
+    from: u64,
+    next: u64,
+    payload: &[u8],
+    seqno: SeqNo,
+) {
+    tree.insert(domain.base_key(), encode_base(next, payload), seqno);
     if from < next {
-        tree.remove_range(marker_key(from).to_vec(), marker_key(next).to_vec(), seqno);
+        tree.remove_range(
+            domain.marker_key(from, 0).to_vec(),
+            domain.marker_key(next, 0).to_vec(),
+            seqno,
+        );
+    }
+}
+
+/// [`write_fold`] for a `STORAGE COLUMNAR` table tree. A columnar table is
+/// written only by its own rows, so its markers are few and known, and each
+/// is removed by a point tombstone rather than a range one: `markers` are the
+/// indices below `next` marked in this table since its last fold.
+pub(crate) fn write_table_fold(
+    tree: &AnyTree,
+    domain: Domain,
+    next: u64,
+    markers: &[u64],
+    seqno: SeqNo,
+) {
+    tree.insert(domain.base_key(), encode_base(next, &[]), seqno);
+    for &index in markers {
+        tree.remove(domain.marker_key(index, 0), seqno);
     }
 }
 

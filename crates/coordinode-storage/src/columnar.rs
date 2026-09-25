@@ -162,7 +162,25 @@ impl ColumnarTableRegistry {
     /// # Errors
     ///
     /// Returns [`StorageError::Engine`] if the tree cannot be opened.
-    pub fn create_or_open(&self, table_id: &str) -> StorageResult<AnyTree> {
+    #[cfg(test)]
+    pub(crate) fn create_or_open(&self, table_id: &str) -> StorageResult<AnyTree> {
+        self.create_or_open_with(table_id, |_| Ok(()))
+    }
+
+    /// [`Self::create_or_open`] that runs `on_create` on a tree it had to
+    /// create, before any other caller can reach the table: the registry lock
+    /// is held throughout, so whatever `on_create` records about the new table
+    /// is in place before its first write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Engine`] if the tree cannot be opened, or the
+    /// error `on_create` returns (the table is then not registered).
+    pub(crate) fn create_or_open_with(
+        &self,
+        table_id: &str,
+        on_create: impl FnOnce(&AnyTree) -> StorageResult<()>,
+    ) -> StorageResult<AnyTree> {
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tree) = trees.get(table_id) {
             return Ok(tree.clone());
@@ -173,6 +191,7 @@ impl ColumnarTableRegistry {
             &self.seqno,
             &self.cache,
         )?;
+        on_create(&tree)?;
         trees.insert(table_id.to_owned(), tree.clone());
         Ok(tree)
     }

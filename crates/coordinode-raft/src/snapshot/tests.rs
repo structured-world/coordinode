@@ -974,57 +974,149 @@ fn test_chunked_full_snapshot_roundtrip() {
     );
 }
 
+/// A snapshot in the version 1 layout, as released builds write it: one Node
+/// entry, no table section.
+fn version_1_snapshot(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MAGIC);
+    buf.push(1);
+    buf.push(1);
+    buf.push(partition_tag(Partition::Node));
+    put_entries(&mut buf, &[(key.to_vec(), value.to_vec())]).unwrap();
+    let hash = fnv1a_64(&buf);
+    buf.extend_from_slice(&hash.to_le_bytes());
+    buf
+}
+
+fn table(name: &str, rows: &[(&[u8], &[u8])]) -> ColumnarTable {
+    (
+        name.to_owned(),
+        rows.iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect(),
+    )
+}
+
 #[test]
-fn test_reconstruct_cnsn_payload_matches_original() {
-    // Verify that reconstruct_cnsn_payload produces the same bytes as
-    // build_full_snapshot (minus the 8-byte checksum at end)
+fn a_version_1_snapshot_installs_and_leaves_tables_alone() {
+    // A dump taken with a released build is how a store reaches this one, so
+    // the older layout must still install; it says nothing about columnar
+    // tables, so the receiver's stay as they are.
     let dir = tempdir().unwrap();
     let engine = open_engine(dir.path());
-    engine.put(Partition::Node, b"node:1", b"test").unwrap();
-    engine.put(Partition::Adj, b"adj:X:out:1", b"adj").unwrap();
+    engine
+        .replace_columnar_tables(vec![table("Kept", &[(b"k1", b"v1")])])
+        .unwrap();
+    let data = version_1_snapshot(b"node:1", b"from-v1");
 
-    let snapshot_data = build_full_snapshot(&engine).unwrap();
+    install_full_snapshot(&engine, &data).unwrap();
+    assert_eq!(
+        engine.get(Partition::Node, b"node:1").unwrap().as_deref(),
+        Some(b"from-v1".as_slice())
+    );
+    assert_eq!(
+        engine.columnar_tables_at(u64::MAX).unwrap(),
+        vec![table("Kept", &[(b"k1", b"v1")])]
+    );
 
-    // Parse the snapshot to get partitions
-    let payload_without_checksum = &snapshot_data[..snapshot_data.len() - 8];
+    let mut cursor = std::io::Cursor::new(&data);
+    install_full_snapshot_from_reader(&engine, &mut cursor).unwrap();
+}
 
-    // Parse manually for reconstruct
-    let partitions: Vec<Partition> = snapshot_partitions().collect();
-    let partition_count = partitions.len();
+#[test]
+fn columnar_tables_travel_with_full_and_incremental_snapshots() {
+    // The receiver ends with exactly the sender's tables: a table only the
+    // receiver had is dropped, a shared name takes the sender's rows.
+    let dir = tempdir().unwrap();
+    let sender = open_engine(dir.path());
+    sender
+        .replace_columnar_tables(vec![
+            table("Trade", &[(b"t1", b"AAPL"), (b"t2", b"MSFT")]),
+            table("Quote", &[(b"q1", b"1.0")]),
+        ])
+        .unwrap();
+    let expected = sender.columnar_tables_at(u64::MAX).unwrap();
+    assert_eq!(expected.len(), 2, "sender holds both tables");
 
-    let mut cursor = std::io::Cursor::new(&snapshot_data);
-    let mut magic = [0u8; 4];
-    cursor.read_exact(&mut magic).unwrap();
-    let mut version = [0u8; 1];
-    cursor.read_exact(&mut version).unwrap();
-    let mut pcount = [0u8; 1];
-    cursor.read_exact(&mut pcount).unwrap();
+    let full = build_full_snapshot(&sender).unwrap();
+    let dir2 = tempdir().unwrap();
+    let receiver = open_engine(dir2.path());
+    receiver
+        .replace_columnar_tables(vec![
+            table("Trade", &[(b"old", b"stale")]),
+            table("Gone", &[(b"g", b"x")]),
+        ])
+        .unwrap();
+    install_full_snapshot(&receiver, &full).unwrap();
+    assert_eq!(receiver.columnar_tables_at(u64::MAX).unwrap(), expected);
 
-    let mut parsed = Vec::new();
-    for _ in 0..pcount[0] {
-        let mut tag = [0u8; 1];
-        cursor.read_exact(&mut tag).unwrap();
-        let part = tag_to_partition(tag[0]).unwrap();
-        let mut count_buf = [0u8; 4];
-        cursor.read_exact(&mut count_buf).unwrap();
-        let count = u32::from_be_bytes(count_buf) as usize;
-        let mut entries = Vec::new();
-        for _ in 0..count {
-            let mut kl = [0u8; 4];
-            cursor.read_exact(&mut kl).unwrap();
-            let klen = u32::from_be_bytes(kl) as usize;
-            let mut key = vec![0u8; klen];
-            cursor.read_exact(&mut key).unwrap();
-            let mut vl = [0u8; 4];
-            cursor.read_exact(&mut vl).unwrap();
-            let vlen = u32::from_be_bytes(vl) as usize;
-            let mut val = vec![0u8; vlen];
-            cursor.read_exact(&mut val).unwrap();
-            entries.push((key, val));
-        }
-        parsed.push((part, entries));
-    }
+    let dir3 = tempdir().unwrap();
+    let streamed = open_engine(dir3.path());
+    let mut cursor = std::io::Cursor::new(&full);
+    install_full_snapshot_from_reader(&streamed, &mut cursor).unwrap();
+    assert_eq!(streamed.columnar_tables_at(u64::MAX).unwrap(), expected);
 
-    let reconstructed = reconstruct_cnsn_payload(&parsed, partition_count);
-    assert_eq!(reconstructed, payload_without_checksum);
+    let since = coordinode_core::txn::timestamp::Timestamp::from_raw(sender.snapshot());
+    let delta = build_incremental_snapshot(&sender, since)
+        .unwrap()
+        .expect("tables make the delta non-empty");
+    let dir4 = tempdir().unwrap();
+    let incremental = open_engine(dir4.path());
+    install_incremental_snapshot(&incremental, &delta).unwrap();
+    assert_eq!(incremental.columnar_tables_at(u64::MAX).unwrap(), expected);
+}
+
+#[test]
+fn bytes_after_the_last_section_are_refused() {
+    // A valid checksum over a body with trailing bytes means the producer
+    // wrote something this parser does not know how to read.
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    let data = build_full_snapshot(&engine).unwrap();
+    let mut body = data[..data.len() - 8].to_vec();
+    body.extend_from_slice(b"extra");
+    let hash = fnv1a_64(&body);
+    body.extend_from_slice(&hash.to_le_bytes());
+
+    let err = install_full_snapshot(&engine, &body).unwrap_err();
+    assert!(
+        err.to_string().contains("bytes past its last section"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn a_corrupt_length_ends_in_eof_not_a_huge_allocation() {
+    // The streaming parser cannot check the checksum first; a length field
+    // claiming ~4 GiB must fail on the bytes that are not there instead of
+    // allocating that much up front.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MAGIC);
+    buf.push(FORMAT_VERSION);
+    buf.push(1);
+    buf.push(partition_tag(Partition::Node));
+    buf.extend_from_slice(&1u32.to_be_bytes());
+    buf.extend_from_slice(&u32::MAX.to_be_bytes());
+    buf.extend_from_slice(b"short");
+
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    let mut cursor = std::io::Cursor::new(&buf);
+    let err = install_full_snapshot_from_reader(&engine, &mut cursor).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn a_version_newer_than_this_build_is_refused() {
+    let mut data = version_1_snapshot(b"node:1", b"v");
+    data[4] = FORMAT_VERSION + 1;
+    let body_len = data.len() - 8;
+    let hash = fnv1a_64(&data[..body_len]);
+    data[body_len..].copy_from_slice(&hash.to_le_bytes());
+
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    let err = install_full_snapshot(&engine, &data).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported snapshot version"),
+        "got: {err}"
+    );
 }

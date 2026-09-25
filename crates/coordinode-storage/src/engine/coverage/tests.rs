@@ -21,28 +21,54 @@ fn applied_set_advances_over_out_of_order_marks() {
 #[test]
 fn marker_keys_sort_by_index_inside_the_reserved_namespace() {
     // Big-endian indices keep the marker range contiguous and ordered, so a
-    // range tombstone over [marker(a), marker(b)) removes exactly a..b.
-    assert!(marker_key(1) < marker_key(2));
-    assert!(marker_key(255) < marker_key(256));
-    assert!(marker_key(u64::MAX).as_slice() < MARKER_END);
-    assert!(BASE_KEY < marker_key(0).as_slice());
-    for key in [BASE_KEY, marker_key(0).as_slice(), MARKER_END] {
+    // range tombstone over [marker(a, 0), marker(b, 0)) removes exactly a..b,
+    // every sub of an index included.
+    let d = Domain::Journal;
+    assert!(d.marker_key(1, 0) < d.marker_key(1, 1));
+    assert!(d.marker_key(1, u32::MAX) < d.marker_key(2, 0));
+    assert!(d.marker_key(255, 0) < d.marker_key(256, 0));
+    let end = d.marker_end();
+    assert!(d.marker_key(u64::MAX, u32::MAX).as_slice() < end.as_slice());
+    let base = d.base_key();
+    assert!(base.as_slice() < d.marker_key(0, 0).as_slice());
+    for key in [
+        base.as_slice(),
+        d.marker_key(0, 0).as_slice(),
+        end.as_slice(),
+    ] {
         assert!(is_reserved(key));
         assert!(key < USER_KEYSPACE_START);
     }
     assert!(!is_reserved(b"node:00:0001"));
+    assert_eq!(decode_marker(&d.marker_key(7, 3)), Some((7, 3)));
+    assert_eq!(
+        decode_marker(b"\x00cjm"),
+        None,
+        "a truncated marker is rejected"
+    );
 }
 
 #[test]
 fn clamp_keeps_user_range_deletes_out_of_the_reserved_namespace() {
     assert_eq!(clamp_user_start(b""), USER_KEYSPACE_START);
-    assert_eq!(clamp_user_start(BASE_KEY), USER_KEYSPACE_START);
+    assert_eq!(
+        clamp_user_start(&Domain::Journal.base_key()),
+        USER_KEYSPACE_START
+    );
     assert_eq!(clamp_user_start(b"node:"), b"node:");
 }
 
 #[test]
-fn base_round_trips_and_rejects_a_wrong_width() {
-    assert_eq!(decode_base(&encode_base(42)).expect("decode"), 42);
+fn base_round_trips_with_its_payload_and_rejects_a_short_value() {
+    let value = encode_base(42, b"last-log-id");
+    assert_eq!(
+        decode_base(&value).expect("decode"),
+        (42, b"last-log-id".as_slice())
+    );
+    assert_eq!(
+        decode_base(&encode_base(9, &[])).expect("decode"),
+        (9, &[][..])
+    );
     assert!(decode_base(&[1, 2, 3]).is_err());
 }
 
