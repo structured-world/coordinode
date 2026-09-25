@@ -46,27 +46,20 @@ use coordinode_storage::engine::batch::WriteBatch;
 use coordinode_storage::engine::core::{ColumnarTable, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
 
-use coordinode_core::txn::timestamp::Timestamp;
-
 use crate::storage::{SnapshotMeta, Vote};
 
 /// Transfer message for sending a snapshot from leader to follower over gRPC.
 ///
 /// Contains the leader's vote (for validation), snapshot metadata, and the
-/// full or incremental binary snapshot data.
+/// whole-store binary snapshot data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotTransfer {
     /// Leader's current vote (follower validates leadership).
     pub vote: Vote,
     /// Snapshot metadata: last_log_id and membership.
     pub meta: SnapshotMeta,
-    /// Snapshot data (binary format v1 full or v2 incremental).
+    /// Snapshot data in the binary format above.
     pub data: Vec<u8>,
-    /// If set, this is an incremental snapshot containing only changes
-    /// after this timestamp. The receiver must already have data up to
-    /// this point. `None` = full snapshot.
-    #[serde(default)]
-    pub since_ts: Option<u64>,
 }
 
 /// A list of KV entries for a single partition.
@@ -201,155 +194,6 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
     );
 
     Ok(buf)
-}
-
-/// Build an incremental snapshot containing only KV pairs modified after `since_ts`.
-///
-/// Uses native seqno MVCC (ADR-016): the lsm-tree `scan_since_seqno` surfaces
-/// only the keys whose version history advanced past `since_ts` (O(delta), not
-/// a 2× full-partition scan), and each changed key's merged current value is
-/// re-read. Entries that are new, changed, or deleted since `since_ts` are
-/// included (a key now absent → tombstone). The GC watermark is pinned at
-/// `since_ts` for the build so concurrent compaction cannot drop needed
-/// history.
-///
-/// Schema-partition keys are always included for consistency (Dgraph pattern).
-///
-/// The binary format is identical to full snapshots but only contains the
-/// delta entries. The receiver applies these via merge-write (overwrite
-/// matching keys, no stale key cleanup).
-///
-/// Returns `Ok(None)` if no changes exist after `since_ts` (nothing to send).
-pub fn build_incremental_snapshot(
-    engine: &StorageEngine,
-    since_ts: Timestamp,
-) -> io::Result<Option<Vec<u8>>> {
-    let partitions: Vec<Partition> = snapshot_partitions().collect();
-    let mut buf = Vec::with_capacity(64 * 1024);
-    let mut total_entries = 0usize;
-
-    // Header (same format as a full snapshot; the receiver tells them apart by
-    // SnapshotTransfer.since_ts)
-    buf.extend_from_slice(MAGIC);
-    buf.push(FORMAT_VERSION);
-    buf.push(partitions.len() as u8);
-
-    // The caller passes `since_ts = engine.snapshot()` which already returns
-    // `seqno_counter.get()` — a value strictly greater than the last write's
-    // seqno. Combined with lsm-tree's strict `<` filter, `prefix_scan_at(ts)`
-    // sees exactly the writes up to and including the snapshot boundary.
-    let old_seqno = since_ts.as_raw();
-
-    // Pin the GC watermark at `old_seqno` for the duration of the build so a
-    // concurrent compaction cannot collect version history the `scan_since`
-    // pass still needs. Released when `_pin` drops at function end. A base
-    // already below the watermark cannot be pinned: the delta would be
-    // computed against collected history, so the caller must send a full
-    // snapshot instead.
-    let Some(_pin) = engine.pin_snapshot_at(old_seqno) else {
-        return Err(io::Error::other(format!(
-            "incremental snapshot base {old_seqno} is below the MVCC retention \
-             horizon {}; a full snapshot is required",
-            engine.gc_watermark()
-        )));
-    };
-
-    for part in partitions {
-        let tag = partition_tag(part);
-        let mut changed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        if part == Partition::Schema {
-            // Schema partition: always include ALL keys regardless of since_ts.
-            // Dgraph pattern: schema/type keys are always sent for consistency.
-            // Skip `meta:*` keys (engine-internal per-node routing
-            // configuration, never replicated). `raft:*` keys stay in to
-            // preserve hash invariant — apply paths filter them on receive.
-            let iter = engine
-                .prefix_scan(part, &[])
-                .map_err(|e| io::Error::other(format!("incr scan {}: {e}", part.name())))?;
-            for guard in iter {
-                let (raw_key, raw_value) = guard
-                    .into_inner()
-                    .map_err(|e| io::Error::other(format!("incr iter {}: {e}", part.name())))?;
-                if raw_key.starts_with(b"meta:") {
-                    continue;
-                }
-                changed.push((raw_key.to_vec(), raw_value.to_vec()));
-            }
-        } else {
-            // O(delta): the lsm-tree surfaces only the keys whose version
-            // history advanced past `old_seqno` (vs. the former 2× full-scan +
-            // merge-diff). Re-read each changed key's merged current value —
-            // this resolves accumulated merge operands for the adj / counter
-            // partitions, so the wire format stays state-based (Put resolved
-            // value / tombstone), and the receiver's merge-write apply is
-            // unchanged. A key now absent is a tombstone (empty value),
-            // matching the deletion case of the old diff.
-            let changed_keys = engine
-                .changed_keys_since(part, old_seqno)
-                .map_err(|e| io::Error::other(format!("incr scan_since {}: {e}", part.name())))?;
-            for key in changed_keys {
-                match engine
-                    .get(part, &key)
-                    .map_err(|e| io::Error::other(format!("incr get {}: {e}", part.name())))?
-                {
-                    Some(value) => changed.push((key, value.to_vec())),
-                    None => changed.push((key, Vec::new())),
-                }
-            }
-        }
-
-        // Write partition block
-        buf.push(tag);
-        put_entries(&mut buf, &changed)?;
-        total_entries += changed.len();
-
-        if !changed.is_empty() {
-            tracing::debug!(
-                partition = part.name(),
-                entries = changed.len(),
-                "incremental snapshot: partition delta"
-            );
-        }
-    }
-
-    // Columnar tables travel whole, like Schema: their trees keep no
-    // changed-key history to diff against.
-    let tables = engine
-        .columnar_tables_at(engine.snapshot())
-        .map_err(|e| io::Error::other(format!("incr columnar tables: {e}")))?;
-    if total_entries == 0 && tables.is_empty() {
-        tracing::debug!("incremental snapshot: no changes since ts={}", since_ts);
-        return Ok(None);
-    }
-    put_tables(&mut buf, &tables)?;
-
-    // Checksum
-    let hash = fnv1a_64(&buf);
-    buf.extend_from_slice(&hash.to_le_bytes());
-
-    tracing::info!(
-        total_bytes = buf.len(),
-        total_entries,
-        since_ts = %since_ts,
-        "incremental snapshot: build complete"
-    );
-
-    Ok(Some(buf))
-}
-
-/// Install an incremental snapshot: merge-write delta KV pairs into CoordiNode storage.
-///
-/// Unlike full snapshot installation, incremental install:
-/// - Writes only the entries present in the snapshot (merge-write)
-/// - Does NOT delete stale keys (receiver already has base data)
-/// - Tombstones (empty values) cause key deletion
-/// - Schema partition `raft:*` keys are skipped (managed by openraft)
-///
-/// Uses WriteBatch for atomicity: crash before commit = no partial state.
-/// The checksum is verified over the whole buffer before anything is parsed.
-pub fn install_incremental_snapshot(engine: &StorageEngine, data: &[u8]) -> io::Result<()> {
-    apply_incremental(engine, parse_verified_slice(data)?)
 }
 
 /// Install a full snapshot: deserialize and write all KV pairs to CoordiNode storage.
@@ -569,37 +413,6 @@ fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> 
     Ok(())
 }
 
-/// Merge-write an incremental snapshot: entries overwrite matching keys, an
-/// empty value deletes its key, and nothing else is removed. One batch, so a
-/// crash before it commits leaves no partial state.
-fn apply_incremental(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
-    let mut batch = WriteBatch::new(engine);
-    let mut total_written = 0usize;
-    let mut total_deleted = 0usize;
-    for (partition, entries) in parsed.partitions {
-        for (key, value) in entries {
-            if value.is_empty() {
-                batch.delete(partition, key);
-                total_deleted += 1;
-            } else {
-                batch.put(partition, key, value);
-                total_written += 1;
-            }
-        }
-    }
-    batch
-        .commit()
-        .map_err(|e| io::Error::other(format!("incremental snapshot commit failed: {e}")))?;
-    let tables = install_tables(engine, parsed.tables)?;
-    tracing::info!(
-        total_written,
-        total_deleted,
-        tables,
-        "incremental snapshot install complete"
-    );
-    Ok(())
-}
-
 /// Make the receiver's columnar tables the snapshot's; a version 1 snapshot
 /// leaves them alone. Returns how many tables were installed.
 fn install_tables(engine: &StorageEngine, tables: Option<Vec<ColumnarTable>>) -> io::Result<usize> {
@@ -654,7 +467,7 @@ fn put_u32(buf: &mut Vec<u8>, n: usize) -> io::Result<()> {
 // gRPC message causes OOM on both sender and receiver. The chunked
 // protocol splits the transfer into:
 //
-//   Message 1: SnapshotTransferHeader (vote, meta, since_ts, data_size)
+//   Message 1: SnapshotTransferHeader (vote, meta, data_size)
 //   Messages 2..N: Raw CNSN data chunks (up to SNAPSHOT_CHUNK_SIZE each)
 //
 // The receiver writes chunks to a temp file, then installs from the file
@@ -678,10 +491,6 @@ pub struct SnapshotTransferHeader {
     pub meta: SnapshotMeta,
     /// Total size of the CNSN data that follows in subsequent chunks.
     pub data_size: u64,
-    /// If set, this is an incremental snapshot containing only changes
-    /// after this timestamp. `None` = full snapshot.
-    #[serde(default)]
-    pub since_ts: Option<u64>,
 }
 
 /// A single message in the chunked snapshot transfer stream.
@@ -714,16 +523,6 @@ pub fn install_full_snapshot_from_reader(
     reader: &mut impl IoRead,
 ) -> io::Result<()> {
     apply_full(engine, parse_verified_stream(reader)?)
-}
-
-/// Install an incremental snapshot from a reader (file or buffer).
-///
-/// Identical to `install_incremental_snapshot` but reads from `impl Read`.
-pub fn install_incremental_snapshot_from_reader(
-    engine: &StorageEngine,
-    reader: &mut impl IoRead,
-) -> io::Result<()> {
-    apply_incremental(engine, parse_verified_stream(reader)?)
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

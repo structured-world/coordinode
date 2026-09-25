@@ -53,9 +53,6 @@ pub enum Command {
         format: BackupFormat,
         /// Optional namespace filter (export only this namespace).
         namespace: Option<String>,
-        /// Incremental snapshot boundary: with `--format snapshot`, export
-        /// only changes after this seqno (from a prior backup's report).
-        since: Option<u64>,
     },
     /// Restore database from a backup file.
     Restore {
@@ -233,12 +230,6 @@ pub fn parse_args_from(args: &[String]) -> Command {
             };
             let format = parse_format(args);
             let namespace = find_flag(args, "--namespace");
-            let since = find_flag(args, "--since").map(|s| {
-                s.parse::<u64>().unwrap_or_else(|_| {
-                    eprintln!("error: --since must be a non-negative integer seqno");
-                    std::process::exit(1);
-                })
-            });
             let config_path = find_flag(args, "--config");
             Command::Backup {
                 data_dir,
@@ -246,7 +237,6 @@ pub fn parse_args_from(args: &[String]) -> Command {
                 output,
                 format,
                 namespace,
-                since,
             }
         }
         "restore" => {
@@ -315,7 +305,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  (fine tunables — cache/buffer sizes, timeouts, scrub/checkpoint, retention,\n          \
                  registry, CDC, interactive-txn, wire compression, triggers — are config-file keys;\n          \
                  see docs/guide/configuration.md)\n  \
-                 coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS] [--since SEQNO]\n  \
+                 coordinode backup --output FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot] [--namespace NS]\n  \
                  coordinode restore --input FILE [--data DIR | --config FILE] [--format json|cypher|binary|snapshot|apoc-json|apoc-cypher|hetio-json] [--namespace NS] [--only-labels L1,L2] [--force]\n  \
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \
                  coordinode compact [--data DIR | --config FILE]\n  \

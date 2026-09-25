@@ -356,7 +356,7 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
         let incoming =
             tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server =
@@ -500,7 +500,7 @@ impl RaftNode {
 
         // Build the gRPC handler — caller registers it into the main tonic router.
         // No internal gRPC server is started here.
-        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft));
 
         let snap_handle =
             spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
@@ -585,7 +585,7 @@ impl RaftNode {
         let raft = Arc::new(raft);
 
         // Build the gRPC handler — caller registers it into the main tonic router.
-        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft));
 
         let snap_handle =
             spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
@@ -685,7 +685,7 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
         let incoming =
             tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let handler = RaftGrpcHandler::new(Arc::clone(&raft), Arc::clone(&engine));
+        let handler = RaftGrpcHandler::new(Arc::clone(&raft));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server =

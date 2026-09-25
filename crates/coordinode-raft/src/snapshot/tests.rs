@@ -231,443 +231,21 @@ fn test_snapshot_replaces_existing_data() {
     );
 }
 
-// -- Incremental snapshot tests (R135 / G057: native seqno MVCC) --
-
-#[test]
-fn test_incremental_no_changes_returns_none() {
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    // Snapshot boundary after write — incremental since this point finds nothing.
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    let result = build_incremental_snapshot(&engine, since).unwrap();
-    assert!(result.is_none(), "no changes after snapshot boundary");
-}
-
-#[test]
-fn test_incremental_captures_recent_changes() {
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    // Phase 1: baseline
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine.put(Partition::Node, b"node:0:2", b"bob").unwrap();
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    // Phase 2: changes after baseline
-    engine
-        .put(Partition::Node, b"node:0:1", b"alice-updated")
-        .unwrap();
-    engine
-        .put(Partition::Node, b"node:0:3", b"charlie")
-        .unwrap();
-
-    let data = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("should have changes");
-
-    // Install into target with baseline data
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine2.put(Partition::Node, b"node:0:2", b"bob").unwrap();
-
-    install_incremental_snapshot(&engine2, &data).unwrap();
-
-    // node:0:1 updated
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:1")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"alice-updated".to_vec())
-    );
-
-    // node:0:3 new
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:3")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"charlie".to_vec())
-    );
-
-    // node:0:2 unchanged (not in delta)
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:2")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"bob".to_vec())
-    );
-}
-
-#[test]
-fn test_incremental_schema_always_included() {
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    engine
-        .put(Partition::Schema, b"schema:label:User", b"{name:string}")
-        .unwrap();
-    engine
-        .put(Partition::Schema, b"raft:vote", b"raft-data")
-        .unwrap();
-
-    // Incremental with a future since_ts should still include schema keys
-    let data = build_incremental_snapshot(&engine, Timestamp::from_raw(999999))
-        .unwrap()
-        .expect("schema keys should always be included");
-
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2
-        .put(Partition::Schema, b"raft:vote", b"target-raft")
-        .unwrap();
-
-    install_incremental_snapshot(&engine2, &data).unwrap();
-
-    // Schema key installed
-    assert_eq!(
-        engine2
-            .get(Partition::Schema, b"schema:label:User")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"{name:string}".to_vec())
-    );
-    // Raft key preserved (not overwritten by incremental install)
-    assert_eq!(
-        engine2
-            .get(Partition::Schema, b"raft:vote")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"target-raft".to_vec())
-    );
-}
-
-#[test]
-fn test_incremental_checksum_validation() {
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    // The snapshot taken before the write is the incremental base: the
-    // write lands above it and is captured as a change. (A base below the
-    // GC watermark, such as 0, is refused: that history may be collected.)
-    let since = engine.snapshot();
-    engine.put(Partition::Node, b"node:0:1", b"data").unwrap();
-    let mut data = build_incremental_snapshot(&engine, Timestamp::from_raw(since))
-        .unwrap()
-        .expect("should have data");
-
-    // Corrupt payload
-    if data.len() > 10 {
-        data[8] ^= 0xFF;
-    }
-
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    let result = install_incremental_snapshot(&engine2, &data);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch")
-    );
-}
-
-#[test]
-fn test_incremental_detects_deleted_key() {
-    // With native seqno MVCC, a key present in old snapshot but absent in
-    // current state is detected as a deletion (empty value = tombstone).
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    // Delete the key after the snapshot boundary
-    engine.delete(Partition::Node, b"node:0:1").unwrap();
-
-    let data = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("deletion should be a change");
-
-    // Target has the key
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2
-        .put(Partition::Node, b"node:0:1", b"to-be-deleted")
-        .unwrap();
-
-    install_incremental_snapshot(&engine2, &data).unwrap();
-
-    // Key should be deleted
-    assert!(
-        engine2.get(Partition::Node, b"node:0:1").unwrap().is_none(),
-        "tombstone should delete key on receiver"
-    );
-}
-
-#[test]
-fn test_incremental_multiple_partitions() {
-    // Write data across Node, Adj, EdgeProp at different seqno phases,
-    // build incremental, install on fresh engine, verify.
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    // Phase 1: baseline
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"\x92\x02\x03")
-        .unwrap();
-    engine
-        .put(Partition::EdgeProp, b"edgeprop:KNOWS:1:2", b"since=2020")
-        .unwrap();
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    // Phase 2: changes after baseline
-    engine
-        .put(Partition::Node, b"node:0:1", b"alice-v2")
-        .unwrap();
-    engine
-        .put(Partition::Node, b"node:0:5", b"new-node")
-        .unwrap();
-    engine
-        .put(Partition::Adj, b"adj:LIKES:out:5", b"\x92\x01")
-        .unwrap();
-    // EdgeProp unchanged
-
-    // Schema always included
-    engine
-        .put(Partition::Schema, b"schema:label:User", b"{}")
-        .unwrap();
-
-    let data = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("should have changes");
-
-    // Target: has phase 1 data
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine2
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"\x92\x02\x03")
-        .unwrap();
-    engine2
-        .put(Partition::EdgeProp, b"edgeprop:KNOWS:1:2", b"since=2020")
-        .unwrap();
-
-    install_incremental_snapshot(&engine2, &data).unwrap();
-
-    // Node updated
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:1")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"alice-v2".to_vec())
-    );
-    // New node added
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:5")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"new-node".to_vec())
-    );
-    // New adj added
-    assert!(
-        engine2
-            .get(Partition::Adj, b"adj:LIKES:out:5")
-            .unwrap()
-            .is_some()
-    );
-    // Unchanged EdgeProp still exists
-    assert!(
-        engine2
-            .get(Partition::EdgeProp, b"edgeprop:KNOWS:1:2")
-            .unwrap()
-            .is_some()
-    );
-    // Schema installed
-    assert_eq!(
-        engine2
-            .get(Partition::Schema, b"schema:label:User")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"{}".to_vec())
-    );
-}
-
-#[test]
-fn test_incremental_is_smaller_than_full() {
-    // Verify incremental snapshot is smaller than full when most data is unchanged.
-    let dir = tempdir().unwrap();
-    let engine = open_engine(dir.path());
-
-    // Write 100 nodes
-    for i in 0..100u64 {
-        engine
-            .put(
-                Partition::Node,
-                format!("node:0:{i:03}").as_bytes(),
-                format!("value-{i}-with-some-payload-data").as_bytes(),
-            )
-            .unwrap();
-    }
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    // Update only 3
-    engine
-        .put(Partition::Node, b"node:0:007", b"updated-7")
-        .unwrap();
-    engine
-        .put(Partition::Node, b"node:0:042", b"updated-42")
-        .unwrap();
-    engine
-        .put(Partition::Node, b"node:0:099", b"updated-99")
-        .unwrap();
-
-    let full = build_full_snapshot(&engine).unwrap();
-    let incr = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("should have changes");
-
-    assert!(
-        incr.len() < full.len(),
-        "incremental ({} bytes) should be smaller than full ({} bytes)",
-        incr.len(),
-        full.len()
-    );
-    // With 100 nodes and only 3 changed, incremental should be much smaller
-    assert!(
-        incr.len() < full.len() / 5,
-        "incremental ({} bytes) should be <20% of full ({} bytes)",
-        incr.len(),
-        full.len()
-    );
-}
-
-#[test]
-fn test_incremental_with_oracle_engine() {
-    // Production path: engine opened with TimestampOracle (HLC-like seqnos).
-    // Verifies two-snapshot diff works when seqnos are large, non-contiguous
-    // values (e.g., microsecond timestamps) instead of small sequential ints.
-    use coordinode_core::txn::timestamp::TimestampOracle;
-    use std::sync::Arc;
-
-    let dir = tempdir().unwrap();
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let oracle = Arc::new(TimestampOracle::resume_from(
-        coordinode_core::txn::timestamp::Timestamp::from_raw(1_000_000),
-    ));
-    let engine = StorageEngine::open_with_oracle(&config, oracle).unwrap();
-
-    // Phase 1: baseline writes (oracle seqnos ~1_000_001+)
-    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine.put(Partition::Node, b"node:0:2", b"bob").unwrap();
-    engine
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"\x92\x02")
-        .unwrap();
-    let since = Timestamp::from_raw(engine.snapshot());
-
-    // Phase 2: changes
-    engine
-        .put(Partition::Node, b"node:0:1", b"alice-v2")
-        .unwrap();
-    engine
-        .put(Partition::Node, b"node:0:3", b"charlie")
-        .unwrap();
-    engine.delete(Partition::Node, b"node:0:2").unwrap();
-
-    let data = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("should have changes");
-
-    // Install into fresh engine
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2.put(Partition::Node, b"node:0:1", b"alice").unwrap();
-    engine2.put(Partition::Node, b"node:0:2", b"bob").unwrap();
-    engine2
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"\x92\x02")
-        .unwrap();
-
-    install_incremental_snapshot(&engine2, &data).unwrap();
-
-    // node:0:1 updated
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:1")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"alice-v2".to_vec())
-    );
-    // node:0:2 deleted
-    assert!(
-        engine2.get(Partition::Node, b"node:0:2").unwrap().is_none(),
-        "node:0:2 should be deleted"
-    );
-    // node:0:3 new
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:0:3")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"charlie".to_vec())
-    );
-    // adj unchanged (not in delta)
-    assert!(
-        engine2
-            .get(Partition::Adj, b"adj:KNOWS:out:1")
-            .unwrap()
-            .is_some()
-    );
-}
-
 #[test]
 fn test_snapshot_transfer_serde_roundtrip() {
-    // Verify SnapshotTransfer with since_ts serializes/deserializes correctly
     use crate::storage::Vote;
 
-    let vote = Vote::new(1, 1);
-
     let transfer = SnapshotTransfer {
-        vote,
+        vote: Vote::new(1, 1),
         meta: openraft::storage::SnapshotMeta {
             last_log_id: None,
             last_membership: openraft::StoredMembership::default(),
         },
         data: vec![1, 2, 3],
-        since_ts: Some(42000),
     };
     let bytes = rmp_serde::to_vec(&transfer).expect("serialize");
     let decoded: SnapshotTransfer = rmp_serde::from_slice(&bytes).expect("deserialize");
-    assert_eq!(decoded.since_ts, Some(42000));
     assert_eq!(decoded.data, vec![1, 2, 3]);
-
-    // Full snapshot (since_ts = None)
-    let full_transfer = SnapshotTransfer {
-        vote,
-        meta: openraft::storage::SnapshotMeta {
-            last_log_id: None,
-            last_membership: openraft::StoredMembership::default(),
-        },
-        data: vec![4, 5],
-        since_ts: None,
-    };
-    let bytes2 = rmp_serde::to_vec(&full_transfer).expect("serialize");
-    let decoded2: SnapshotTransfer = rmp_serde::from_slice(&bytes2).expect("deserialize");
-    assert_eq!(decoded2.since_ts, None);
 }
 
 // ── Chunked Transfer Protocol Tests ────────────────────────────
@@ -733,7 +311,6 @@ fn test_snapshot_chunk_message_serde_roundtrip() {
             last_membership: openraft::StoredMembership::default(),
         },
         data_size: 12345,
-        since_ts: Some(42000),
     };
     let msg = SnapshotChunkMessage::Header(header);
     let bytes = rmp_serde::to_vec(&msg).expect("serialize header");
@@ -741,7 +318,6 @@ fn test_snapshot_chunk_message_serde_roundtrip() {
     match decoded {
         SnapshotChunkMessage::Header(h) => {
             assert_eq!(h.data_size, 12345);
-            assert_eq!(h.since_ts, Some(42000));
             let log_id = h.meta.last_log_id.expect("last_log_id survives round-trip");
             assert_eq!(log_id.index, 42);
             assert_eq!(log_id.committed_leader_id().term, 7);
@@ -823,74 +399,6 @@ fn test_install_full_snapshot_from_reader_cleans_stale() {
     );
     // Snapshot key present
     assert!(engine2.get(Partition::Node, b"node:1").unwrap().is_some());
-}
-
-#[test]
-fn test_install_incremental_snapshot_from_reader() {
-    use coordinode_core::txn::timestamp::Timestamp;
-
-    let dir = tempdir().unwrap();
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-        "default",
-        dir.path(),
-        Media::Hdd,
-        Durability::Durable,
-        Tier::Warm,
-    )]);
-    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine =
-        StorageEngine::open_with_oracle(&config, oracle.clone()).expect("open oracle engine");
-
-    // Write initial data
-    engine.put(Partition::Node, b"node:1", b"v1").unwrap();
-    engine
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"adj1")
-        .unwrap();
-
-    let since = Timestamp::from_raw(oracle.next().as_raw());
-
-    // Write changes after snapshot point
-    engine.put(Partition::Node, b"node:1", b"v2").unwrap();
-    engine.put(Partition::Node, b"node:2", b"new").unwrap();
-
-    let incr_data = build_incremental_snapshot(&engine, since)
-        .unwrap()
-        .expect("should have changes");
-
-    // Install to fresh engine via reader
-    let dir2 = tempdir().unwrap();
-    let engine2 = open_engine(dir2.path());
-    engine2.put(Partition::Node, b"node:1", b"v1").unwrap();
-    engine2
-        .put(Partition::Adj, b"adj:KNOWS:out:1", b"adj1")
-        .unwrap();
-
-    let mut cursor = std::io::Cursor::new(&incr_data);
-    install_incremental_snapshot_from_reader(&engine2, &mut cursor).unwrap();
-
-    // node:1 updated to v2
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:1")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"v2".to_vec())
-    );
-    // node:2 added
-    assert_eq!(
-        engine2
-            .get(Partition::Node, b"node:2")
-            .unwrap()
-            .map(|b| b.to_vec()),
-        Some(b"new".to_vec())
-    );
-    // adj unchanged
-    assert!(
-        engine2
-            .get(Partition::Adj, b"adj:KNOWS:out:1")
-            .unwrap()
-            .is_some()
-    );
 }
 
 #[test]
@@ -1022,7 +530,7 @@ fn a_version_1_snapshot_installs_and_leaves_tables_alone() {
 }
 
 #[test]
-fn columnar_tables_travel_with_full_and_incremental_snapshots() {
+fn columnar_tables_travel_with_snapshots() {
     // The receiver ends with exactly the sender's tables: a table only the
     // receiver had is dropped, a shared name takes the sender's rows.
     let dir = tempdir().unwrap();
@@ -1053,15 +561,6 @@ fn columnar_tables_travel_with_full_and_incremental_snapshots() {
     let mut cursor = std::io::Cursor::new(&full);
     install_full_snapshot_from_reader(&streamed, &mut cursor).unwrap();
     assert_eq!(streamed.columnar_tables_at(u64::MAX).unwrap(), expected);
-
-    let since = coordinode_core::txn::timestamp::Timestamp::from_raw(sender.snapshot());
-    let delta = build_incremental_snapshot(&sender, since)
-        .unwrap()
-        .expect("tables make the delta non-empty");
-    let dir4 = tempdir().unwrap();
-    let incremental = open_engine(dir4.path());
-    install_incremental_snapshot(&incremental, &delta).unwrap();
-    assert_eq!(incremental.columnar_tables_at(u64::MAX).unwrap(), expected);
 }
 
 #[test]

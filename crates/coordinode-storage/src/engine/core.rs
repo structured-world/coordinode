@@ -2731,10 +2731,10 @@ impl StorageEngine {
     /// convention (a snapshot at `S` sees versions strictly below `S`): the
     /// seqno a snapshot or cursor was taken at is exactly the first one it has
     /// not seen, so resuming from it misses nothing; a consumer that has
-    /// processed a commit landed at `T` resumes from `T + 1`. The O(delta)
-    /// basis for incremental snapshots: the lsm-tree surfaces only the keys
-    /// whose version history reached `since_seqno`, instead of scanning the
-    /// whole partition twice and diffing.
+    /// processed a commit landed at `T` resumes from `T + 1`. O(delta): the
+    /// lsm-tree surfaces only the keys whose version history reached
+    /// `since_seqno`, instead of scanning the whole partition twice and
+    /// diffing.
     ///
     /// Values are intentionally NOT returned — the caller re-reads the merged
     /// current value per key, so a key that accumulated merge operands (adj
@@ -2804,7 +2804,6 @@ impl StorageEngine {
     /// Scan key-value pairs visible at a specific sequence number.
     ///
     /// Like [`Self::prefix_scan`], but reads at an arbitrary point-in-time.
-    /// Used by incremental snapshots to compare old vs current state.
     pub fn prefix_scan_at(
         &self,
         part: Partition,

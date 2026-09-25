@@ -539,7 +539,7 @@ ignored.
 
 | Command | Required flags | Notable options |
 |---------|----------------|-----------------|
-| `coordinode backup` | `--output FILE` | `--config FILE` (multi-endpoint); `--format json\|cypher\|binary\|snapshot`, `--namespace NS`, `--since SEQNO` (incremental snapshot) |
+| `coordinode backup` | `--output FILE` | `--config FILE` (multi-endpoint); `--format json\|cypher\|binary\|snapshot`, `--namespace NS`; always the whole database |
 | `coordinode restore` | `--input FILE` | `--config FILE` (multi-endpoint); `--format ...` (plus import-only `apoc-json`, `apoc-cypher`, `hetio-json`), `--namespace NS`, `--only-labels L1,L2`, `--force` |
 | `coordinode checkpoint` | `--output DIR` | `--config FILE` (multi-endpoint); hard-linked physical checkpoint gathered into one directory, whatever the endpoint layout; restore by pointing `serve --data` at it |
 | `coordinode compact` | (none) | `--config FILE` (multi-endpoint); offline major-compaction folding merge operands |

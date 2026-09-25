@@ -4,12 +4,10 @@
 //! local openraft instance. Uses msgpack for type serialization.
 
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
-
-use coordinode_storage::engine::core::StorageEngine;
 
 use crate::proto::replication::raft_service_server::RaftService;
 use crate::proto::replication::{RaftEmpty, RaftPayload};
@@ -20,17 +18,11 @@ type RaftInstance = openraft::Raft<TypeConfig, CoordinodeStateMachine>;
 /// gRPC server handler for Raft consensus RPCs.
 pub struct RaftGrpcHandler {
     raft: Arc<RaftInstance>,
-    /// Weak ref to engine for incremental snapshots.
-    /// Weak avoids preventing engine drop during node shutdown.
-    engine: Weak<StorageEngine>,
 }
 
 impl RaftGrpcHandler {
-    pub fn new(raft: Arc<RaftInstance>, engine: Arc<StorageEngine>) -> Self {
-        Self {
-            raft,
-            engine: Arc::downgrade(&engine),
-        }
+    pub fn new(raft: Arc<RaftInstance>) -> Self {
+        Self { raft }
     }
 }
 
@@ -151,14 +143,11 @@ impl RaftService for RaftGrpcHandler {
             }
         };
 
-        let is_incremental = header.since_ts.is_some();
         let expected_data_size = header.data_size as usize;
 
         tracing::info!(
             data_size = expected_data_size,
             last_log_index = header.meta.last_log_id.map(|id| id.index),
-            incremental = is_incremental,
-            since_ts = ?header.since_ts,
             "receiving chunked snapshot from leader"
         );
 
@@ -212,28 +201,14 @@ impl RaftService for RaftGrpcHandler {
             .seek(std::io::SeekFrom::Start(0))
             .map_err(|e| Status::internal(format!("seek temp file: {e}")))?;
 
-        // Install snapshot from temp file
-        let raft_data = if is_incremental {
-            let engine = self.engine.upgrade().ok_or_else(|| {
-                Status::unavailable("engine dropped during incremental snapshot install")
-            })?;
-            let mut reader = std::io::BufReader::new(temp_file);
-            crate::snapshot::install_incremental_snapshot_from_reader(&engine, &mut reader)
-                .map_err(|e| Status::internal(format!("incremental snapshot install: {e}")))?;
-            // Empty data — state machine's install_snapshot will skip data apply
-            Vec::new()
-        } else {
-            // For full snapshots, openraft needs the data for its state machine.
-            // Read from temp file into memory — this is the data that openraft
-            // will pass to install_snapshot() on the state machine.
-            let mut data = Vec::with_capacity(expected_data_size);
+        // openraft passes the data to the state machine's install_snapshot.
+        let mut raft_data = Vec::with_capacity(expected_data_size);
+        {
             use std::io::Read;
-            let mut reader = std::io::BufReader::new(temp_file);
-            reader
-                .read_to_end(&mut data)
+            std::io::BufReader::new(temp_file)
+                .read_to_end(&mut raft_data)
                 .map_err(|e| Status::internal(format!("read snapshot from temp file: {e}")))?;
-            data
-        };
+        }
 
         let snapshot_cursor = std::io::Cursor::new(raft_data);
         let snapshot = openraft::storage::Snapshot {

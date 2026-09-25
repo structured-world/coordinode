@@ -211,9 +211,8 @@ pub(crate) async fn run_with(
             output,
             format,
             namespace: _namespace,
-            since,
         } => {
-            admin::run_backup(data_dir, config_path, output, format, since)?;
+            admin::run_backup(data_dir, config_path, output, format)?;
         }
 
         cli::Command::Restore {

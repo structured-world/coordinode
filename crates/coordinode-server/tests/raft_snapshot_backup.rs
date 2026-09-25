@@ -53,55 +53,30 @@ fn raft_snapshot_round_trips_data_and_interner() {
     assert_eq!(all.len(), 2, "both users restored");
 }
 
+/// 0.6 could also write a delta of the changes after a seqno. A delta cannot
+/// stand alone, and a seqno does not bound what changed after it (an entry
+/// can apply later at a lower commit timestamp), so restore refuses one and
+/// says why rather than installing part of a database.
 #[test]
-fn raft_snapshot_incremental_round_trips_changes_after_seqno() {
-    use coordinode_core::txn::timestamp::Timestamp;
-
-    let src_dir = tempfile::tempdir().expect("src tmpdir");
-    let mut src = Database::open(src_dir.path()).expect("open src");
-    src.execute_cypher("CREATE (a:User {name: 'Alice', age: 30})")
-        .expect("create alice");
-
-    // Full backup point: capture the seqno and the full snapshot here.
-    let seqno0: u64 = src.engine().snapshot();
-    let full = coordinode_raft::snapshot::build_full_snapshot(src.engine()).expect("full");
-    let interner0 = src.interner().to_bytes();
-
-    // A change after the boundary.
-    src.execute_cypher("CREATE (b:User {name: 'Bob', age: 25})")
-        .expect("create bob");
-    let delta = coordinode_raft::snapshot::build_incremental_snapshot(
-        src.engine(),
-        Timestamp::from_raw(seqno0),
-    )
-    .expect("build incremental")
-    .expect("incremental has changes after seqno0");
-    let interner1 = src.interner().to_bytes();
-
-    // Restore the full backup into a fresh database: only Alice.
-    let dst_dir = tempfile::tempdir().expect("dst tmpdir");
-    let mut dst = Database::open(dst_dir.path()).expect("open dst");
-    dst.persist_field_interner_bytes(&interner0)
-        .expect("interner0");
-    coordinode_raft::snapshot::install_full_snapshot(dst.engine(), &full).expect("install full");
-    assert_eq!(
-        dst.execute_cypher("MATCH (n:User) RETURN n.name")
-            .expect("after full")
-            .len(),
-        1,
-        "full restore has only Alice"
-    );
-
-    // Apply the incremental on top: Bob appears, total is two.
-    dst.persist_field_interner_bytes(&interner1)
-        .expect("interner1");
-    coordinode_raft::snapshot::install_incremental_snapshot(dst.engine(), &delta)
-        .expect("install incremental");
-    assert_eq!(
-        dst.execute_cypher("MATCH (n:User) RETURN n.name")
-            .expect("after incremental")
-            .len(),
-        2,
-        "incremental restore added Bob"
+fn an_incremental_backup_is_refused_by_restore() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let input = dir.path().join("delta.snap");
+    // [mode 1][interner length 0][no interner][no snapshot]
+    std::fs::write(&input, [1u8, 0, 0, 0, 0]).expect("write delta");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coordinode"))
+        .arg("restore")
+        .arg("--data")
+        .arg(dir.path().join("store"))
+        .arg("--input")
+        .arg(&input)
+        .arg("--format")
+        .arg("raft-snapshot")
+        .output()
+        .expect("run coordinode restore");
+    assert!(!output.status.success(), "a delta must not restore");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incremental raft-snapshot backup"),
+        "the refusal names the reason, got: {stderr}"
     );
 }

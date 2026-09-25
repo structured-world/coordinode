@@ -287,7 +287,6 @@ impl NetSnapshot<C> for GrpcNetwork {
             vote,
             meta: snapshot.meta.clone(),
             data_size,
-            since_ts: None, // Full snapshot; incremental uses Some(ts)
         };
 
         let header_msg = crate::snapshot::SnapshotChunkMessage::Header(header);
