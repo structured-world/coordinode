@@ -1047,7 +1047,8 @@ impl CoordinodeStateMachine {
                 return Err(io::Error::other(
                     "this store applied Raft entries without an apply-coverage record, so \
                      nothing proves which of them each partition holds; dump it with the \
-                     release that wrote it and restore the dump into this one",
+                     release that wrote it (`coordinode backup --format raft-snapshot`) and \
+                     restore the dump with this one (`coordinode restore --format raft-snapshot`)",
                 ));
             }
             None => {

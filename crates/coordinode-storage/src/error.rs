@@ -78,7 +78,9 @@ pub enum StorageError {
     /// predates apply coverage; the store is left untouched.
     #[error(
         "store at {path} holds {entries} journal entries with no apply-coverage \
-         record; refusing to guess which of them are on disk"
+         record; refusing to guess which of them are on disk. Dump it with the \
+         release that wrote it (`coordinode backup --format raft-snapshot`) and \
+         restore the dump with this one (`coordinode restore --format raft-snapshot`)"
     )]
     CoverageUnprovable { path: String, entries: usize },
 

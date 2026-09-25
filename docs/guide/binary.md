@@ -76,6 +76,29 @@ This keeps traversal reads fast. The server must be stopped first.
 coordinode compact --data /var/lib/coordinode
 ```
 
+## Upgrade a Store Written by 0.6
+
+A data directory written by 0.6.x does not open with this release. Each
+partition now records which committed writes it physically holds, and 0.6
+kept no such record, so recovery could not tell which journalled writes to
+replay without risking a lost or doubled one. The server refuses the
+directory with an error saying so and leaves it byte for byte as it was.
+
+Move the data across with a dump, with the server stopped:
+
+```bash
+# With the 0.6 binary: dump the old directory.
+coordinode backup --data /var/lib/coordinode --output coordinode-0.6.snap --format raft-snapshot
+
+# With this release: restore into a new directory, then serve from it.
+coordinode restore --data /var/lib/coordinode-new --input coordinode-0.6.snap --format raft-snapshot
+coordinode serve --data /var/lib/coordinode-new
+```
+
+For a cluster, restore the dump into one node, start it, and add the other
+nodes with empty data directories, as for a new cluster; they receive the
+data from it.
+
 ## systemd Service (Linux)
 
 ```ini

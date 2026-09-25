@@ -105,7 +105,7 @@ the key is unset.
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
 | `checkpoint_enabled` | `true` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). |
-| `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. |
+| `checkpoint_interval_secs` | `3600` (1 hour) | restart | Seconds between periodic checkpoints. A rebuild from the latest checkpoint replays the Raft log from the oldest entry the checkpoint lacks, so the log is kept from there: a longer interval keeps more log on disk. |
 | `checkpoint_dir` | `<data_dir>/checkpoints` | restart | Directory checkpoints are written under. |
 | `checkpoint_keep` | `3` | restart | Number of recent checkpoints to retain; older ones are pruned. |
 | `trigger_max_cascade_depth` | `10` | live (setParameter) | Async AFTER COMMIT cascade-depth cap. A self- or mutually-triggering chain deeper than this is dead-lettered as a cascade overflow rather than looping. Per-trigger `CASCADE_LIMIT n` overrides it. |
