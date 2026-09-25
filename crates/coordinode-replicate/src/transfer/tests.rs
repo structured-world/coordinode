@@ -33,8 +33,10 @@ async fn round_trips_each_encoding() {
         let (manifest, wire) = split_segment(&data, 1024, enc).expect("split");
         let frames = build_frames(SegmentId(5), &manifest, &wire);
 
-        let sink = CollectingSink::default();
-        let ack = receive(frame_stream(frames), &sink).await.expect("receive");
+        let sink = Arc::new(CollectingSink::default());
+        let ack = receive(frame_stream(frames), Arc::clone(&sink))
+            .await
+            .expect("receive");
 
         assert!(ack.ok, "ack ok for enc={enc:?}: {}", ack.error);
         assert_eq!(ack.pieces_received as usize, wire.len());
@@ -51,8 +53,10 @@ async fn corrupt_piece_yields_failed_ack_and_stores_nothing() {
     if let Some(Frame::Piece(p)) = frames[2].frame.as_mut() {
         p.wire[0] ^= 0xFF;
     }
-    let sink = CollectingSink::default();
-    let ack = receive(frame_stream(frames), &sink).await.expect("receive");
+    let sink = Arc::new(CollectingSink::default());
+    let ack = receive(frame_stream(frames), Arc::clone(&sink))
+        .await
+        .expect("receive");
 
     assert!(!ack.ok, "corruption must fail the ack");
     assert!(
@@ -72,8 +76,10 @@ async fn source_frames_round_trip_to_target() {
         .expect("insert");
 
     let frames = frames_for(&store, SegmentId(9)).expect("frames_for");
-    let sink = CollectingSink::default();
-    let ack = receive(frame_stream(frames), &sink).await.expect("receive");
+    let sink = Arc::new(CollectingSink::default());
+    let ack = receive(frame_stream(frames), Arc::clone(&sink))
+        .await
+        .expect("receive");
 
     assert!(ack.ok, "round-trip ack: {}", ack.error);
     assert_eq!(sink.stored.lock().get(&9), Some(&data));
@@ -87,8 +93,8 @@ async fn missing_header_is_protocol_error() {
             wire: vec![1, 2, 3],
         })),
     };
-    let sink = CollectingSink::default();
-    let result = receive(frame_stream(vec![piece]), &sink).await;
+    let sink = Arc::new(CollectingSink::default());
+    let result = receive(frame_stream(vec![piece]), sink).await;
     assert!(
         result.is_err(),
         "a leading piece (no header) must be rejected"

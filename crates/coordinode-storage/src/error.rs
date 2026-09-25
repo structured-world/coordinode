@@ -81,6 +81,20 @@ pub enum StorageError {
          record; refusing to guess which of them are on disk"
     )]
     CoverageUnprovable { path: String, entries: usize },
+
+    /// A copy of a partition stands behind this node's Raft applies:
+    /// installing it would lose the entries in between, which this node
+    /// has applied already and will not apply again. A peer further along,
+    /// or the same one a moment later, serves a usable copy.
+    #[error(
+        "the copy of {partition} holds the Raft log up to {source_next}, behind this \
+         node's {local_next}"
+    )]
+    PositionBehind {
+        partition: String,
+        source_next: u64,
+        local_next: u64,
+    },
 }
 
 impl From<lsm_tree::Error> for StorageError {

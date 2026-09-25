@@ -103,7 +103,7 @@ fn a_fold_replaces_the_markers_below_it_with_a_base() {
             .apply_raft_proposal(&node_and_adj(), oracle.next().as_raw(), index, 0, |_| false)
             .expect("apply");
     }
-    engine.fold_raft_coverage(0, 2, b"id-of-1");
+    engine.fold_raft_coverage(0, 2, b"id-of-1", |_| false);
 
     let coverage = engine.raft_coverage().expect("read");
     assert_eq!(coverage.resume_point(), Some((2, b"id-of-1".as_slice())));

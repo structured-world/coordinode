@@ -4014,13 +4014,12 @@ async fn decommission_pruning_flag_sets_operator_cleanup_required() {
     );
 }
 
-/// `read_oplog_since` returns the granular ops committed after a checkpoint
-/// cursor and excludes ops the checkpoint already captured — the exact input
-/// WAL-replay repair replays on top of the checkpoint base.
+/// A partition rebuilt from a local checkpoint and the Raft log holds what
+/// it held before, each entry once: the checkpoint's rows, and the entries
+/// its tree lacks replayed from the log. The merge operands make a doubled
+/// or lost entry visible in the value.
 #[tokio::test(flavor = "multi_thread")]
-async fn read_oplog_since_returns_post_checkpoint_ops() {
-    use coordinode_storage::oplog::OplogOp;
-
+async fn a_partition_rebuilt_from_a_checkpoint_holds_each_entry_once() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let p1 = alloc_port();
         let n1 = create_leader(1, p1).await;
@@ -4029,69 +4028,48 @@ async fn read_oplog_since_returns_post_checkpoint_ops() {
 
         let pipeline = n1.node.pipeline();
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let edge = |uid: u64, ts: u64| RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: b"adj:R:out:1".to_vec(),
+                operand: coordinode_storage::engine::merge::encode_add(uid),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts - 1),
+            bypass_rate_limiter: false,
+        };
 
-        // Pre-checkpoint write.
-        pipeline
-            .propose_and_wait(&RaftProposal {
-                id: id_gen.next(),
-                mutations: vec![Mutation::Put {
-                    partition: PartitionId::Node,
-                    key: b"node:0:pre".to_vec(),
-                    value: b"preval".to_vec(),
-                }],
-                commit_ts: Timestamp::from_raw(100),
-                start_ts: Timestamp::from_raw(99),
-                bypass_rate_limiter: false,
-            })
-            .expect("propose pre");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Checkpoint captures everything up to here.
+        pipeline.propose_and_wait(&edge(7, 100)).expect("pre");
         let ckpt_root = tempfile::tempdir().expect("ckpt tempdir");
         let ckpt = ckpt_root.path().join("c1");
         n1.engine.create_checkpoint(&ckpt).expect("checkpoint");
-        let cursor = coordinode_raft::storage::checkpoint_oplog_last_index(&ckpt).unwrap_or(0);
-
-        // Post-checkpoint write.
-        pipeline
-            .propose_and_wait(&RaftProposal {
-                id: id_gen.next(),
-                mutations: vec![Mutation::Put {
-                    partition: PartitionId::Node,
-                    key: b"node:0:post".to_vec(),
-                    value: b"postval".to_vec(),
-                }],
-                commit_ts: Timestamp::from_raw(200),
-                start_ts: Timestamp::from_raw(199),
-                bypass_rate_limiter: false,
-            })
-            .expect("propose post");
+        pipeline.propose_and_wait(&edge(8, 200)).expect("post");
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let entries = n1
-            .node
-            .read_oplog_since(cursor + 1)
-            .expect("read oplog since checkpoint");
-        let inserted = |k: &[u8]| {
-            entries
-                .iter()
-                .flat_map(|e| &e.ops)
-                .any(|op| matches!(op, OplogOp::Insert { key, .. } if key.as_slice() == k))
-        };
-        assert!(
-            inserted(b"node:0:post"),
-            "post-checkpoint op must be in read_oplog_since(cursor+1)"
+        let before = n1.engine.get(Partition::Adj, b"adj:R:out:1").expect("get");
+        tokio::task::block_in_place(|| {
+            n1.node
+                .rebuild_partition_from_checkpoint(&ckpt, Partition::Adj)
+                .expect("rebuild")
+        });
+        assert_eq!(
+            n1.engine.get(Partition::Adj, b"adj:R:out:1").expect("get"),
+            before,
+            "both edges, each once"
         );
+        let coverage = n1.engine.raft_coverage().expect("coverage");
+        let applied = n1.node.applied_index();
         assert!(
-            !inserted(b"node:0:pre"),
-            "pre-checkpoint op must be excluded by the cursor"
+            coverage.holds(Partition::Adj, applied, 0),
+            "the rebuilt tree records every applied entry"
         );
 
         n1.node.shutdown().await.expect("shutdown");
     })
     .await;
 
-    assert!(result.is_ok(), "read_oplog_since test TIMED OUT");
+    assert!(result.is_ok(), "rebuild test TIMED OUT");
 }
 
 /// A node whose listen port is already taken must fail at open, not come up

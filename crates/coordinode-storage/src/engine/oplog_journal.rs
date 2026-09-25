@@ -5,8 +5,7 @@
 //! configurable window so it can serve WAL-replay-repair — rebuild a corrupt
 //! partition from the last checkpoint then replay the oplog forward — in
 //! addition to ordinary crash recovery. It reuses the same [`OplogManager`]
-//! segment format the cluster Raft log uses, so the repair routine
-//! (`wal_replay_repair`) is shared between cluster and embedded.
+//! segment format the cluster Raft log uses.
 //!
 //! ## What recovery replays
 //!

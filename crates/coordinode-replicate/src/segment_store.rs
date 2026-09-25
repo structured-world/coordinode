@@ -21,10 +21,9 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::core::{PartitionCopy, RaftPosition, StorageEngine};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
-use coordinode_storage::oplog::OplogEntry;
 use coordinode_storage::placement::{
     KeyRange, SegmentDescriptor, partition_from_wire_tag, partition_wire_tag,
 };
@@ -125,23 +124,83 @@ pub fn export_range(
     part: Partition,
     range: &KeyRange,
 ) -> StorageResult<Vec<u8>> {
-    // Scan the partition at a stable snapshot and keep only entries the half-open
-    // `[start, end)` range actually contains (an unbounded-above range is the
-    // whole partition).
-    let snapshot = engine.snapshot();
-    let prefix = format!("{}:", part.name());
-    let scanned = engine.snapshot_prefix_scan(&snapshot, part, prefix.as_bytes())?;
+    // The partition's replicated rows, captured at the exact Raft position
+    // they stand at when the engine runs Raft, narrowed to the half-open
+    // `[start, end)` range (an unbounded range is the whole partition).
+    let copy = engine.copy_partition(part)?;
+    let entries: Vec<KvEntry> = copy
+        .rows
+        .into_iter()
+        .filter(|(key, _)| range.contains(key))
+        .collect();
+    let whole = range.start.is_empty() && range.end.is_empty();
 
-    let mut entries = Vec::with_capacity(scanned.len());
-    for (key, value) in scanned {
-        if range.contains(&key) {
-            entries.push((key, value.to_vec()));
-        }
+    let mut blob = vec![partition_wire_tag(part)];
+    let mut flags = 0u8;
+    if copy.position.is_some() {
+        flags |= FLAG_POSITION;
     }
-    let mut blob = Vec::new();
-    blob.push(partition_wire_tag(part));
+    if whole {
+        flags |= FLAG_WHOLE;
+    }
+    blob.push(flags);
+    if let Some(position) = &copy.position {
+        let payload_len = u32::try_from(position.payload.len())
+            .map_err(|_| StorageError::Serialization("position payload exceeds u32".into()))?;
+        blob.extend_from_slice(&position.next.to_be_bytes());
+        blob.extend_from_slice(&payload_len.to_le_bytes());
+        blob.extend_from_slice(&position.payload);
+    }
     blob.extend_from_slice(&encode_kv_blob(&entries)?);
     Ok(blob)
+}
+
+/// Segment header flag: a Raft log position follows the flags.
+const FLAG_POSITION: u8 = 1;
+/// Segment header flag: the segment holds the whole partition.
+const FLAG_WHOLE: u8 = 2;
+
+/// A received segment, decoded.
+struct Segment {
+    partition: Partition,
+    whole: bool,
+    copy: PartitionCopy,
+}
+
+/// Parse a segment blob produced by [`export_range`].
+fn decode_segment(data: &[u8]) -> Result<Segment, String> {
+    let (&tag, rest) = data
+        .split_first()
+        .ok_or_else(|| "empty segment blob (missing partition tag)".to_string())?;
+    let partition =
+        partition_from_wire_tag(tag).ok_or_else(|| format!("unknown partition wire tag {tag}"))?;
+    let (&flags, mut rest) = rest
+        .split_first()
+        .ok_or_else(|| "segment blob truncated in its flags".to_string())?;
+    if flags & !(FLAG_POSITION | FLAG_WHOLE) != 0 {
+        return Err(format!("unknown segment flags {flags:#04x}"));
+    }
+    let position = if flags & FLAG_POSITION == 0 {
+        None
+    } else {
+        let next = rest
+            .get(..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes)
+            .ok_or_else(|| "segment blob truncated in its position".to_string())?;
+        let mut pos = 8;
+        let payload = read_chunk(rest, &mut pos)?;
+        rest = &rest[pos..];
+        Some(RaftPosition { next, payload })
+    };
+    Ok(Segment {
+        partition,
+        whole: flags & FLAG_WHOLE != 0,
+        copy: PartitionCopy {
+            rows: decode_kv_blob(rest)?,
+            position,
+        },
+    })
 }
 
 /// Failure modes of [`drain_segment_to_peer`].
@@ -287,6 +346,7 @@ impl SegmentSource for SegmentInstaller {
         range: &KeyRange,
         piece_size: usize,
         encoding: PieceEncoding,
+        fresh: bool,
     ) -> Result<Arc<BuiltSegment>, String> {
         let (enc_disc, _) = encoding.to_wire();
         let key: BuildKey = (
@@ -299,7 +359,7 @@ impl SegmentSource for SegmentInstaller {
 
         // Tolerate a poisoned lock: a panic in a prior holder left the cache
         // readable; the data is a rebuildable cache, never corrupt-on-panic.
-        {
+        if !fresh {
             let cache = self
                 .build_cache
                 .lock()
@@ -332,18 +392,20 @@ impl SegmentSink for SegmentInstaller {
         _segment: coordinode_swarm::SegmentId,
         data: &[u8],
     ) -> Result<(), String> {
-        let (&tag, rest) = data
-            .split_first()
-            .ok_or_else(|| "empty segment blob (missing partition tag)".to_string())?;
-        let partition = partition_from_wire_tag(tag)
-            .ok_or_else(|| format!("unknown partition wire tag {tag}"))?;
-        let entries = decode_kv_blob(rest)?;
-        for (key, value) in entries {
-            self.engine
-                .put(partition, &key, &value)
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        self.install(data).map_err(|e| e.to_string())
+    }
+}
+
+impl SegmentInstaller {
+    /// Install a received segment ([`StorageEngine::install_partition`]).
+    fn install(&self, data: &[u8]) -> Result<(), RepairError> {
+        let segment = decode_segment(data).map_err(RepairError::Install)?;
+        self.engine
+            .install_partition(segment.partition, &segment.copy, segment.whole)
+            .map_err(|e| match e {
+                StorageError::PositionBehind { .. } => RepairError::Behind(e.to_string()),
+                e => RepairError::Install(e.to_string()),
+            })
     }
 }
 
@@ -361,10 +423,19 @@ pub enum RepairError {
     /// Installing the reconstructed segment into local storage failed.
     #[error("install: {0}")]
     Install(String),
-    /// Opening or reading the checkpoint base for WAL-replay repair failed.
-    #[error("checkpoint: {0}")]
-    Checkpoint(String),
+    /// Every copy served stood behind this node's Raft applies, so none of
+    /// them holds the entries this node applied last.
+    #[error("behind: {0}")]
+    Behind(String),
 }
+
+/// Pulls of a partition copy tried before [`RepairError::Behind`] is given
+/// up on. A healthy peer is at most a few entries behind the commit index,
+/// so a pull a moment later normally stands past this node.
+const REPAIR_ATTEMPTS: u32 = 5;
+
+/// Wait before the second pull; doubled for each later one.
+const REPAIR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl SegmentInstaller {
     /// Repair a (possibly corrupt) partition by pulling a fresh copy from healthy
@@ -374,17 +445,48 @@ impl SegmentInstaller {
     /// localization is EE). Connects a [`GrpcPieceSource`] to each reachable peer
     /// (TLS when inter-node TLS is configured), runs the rarest-first,
     /// multi-source [`swarm_download`], and installs the reconstructed segment,
-    /// overwriting local data. Peers that are unreachable or do not hold the
-    /// segment are skipped; the pull proceeds from whoever answers. Returns the
-    /// number of bytes installed.
+    /// replacing the local partition. Peers that are unreachable or do not hold
+    /// the segment are skipped; the pull proceeds from whoever answers. Returns
+    /// the number of bytes installed.
+    ///
+    /// Each peer serves the partition at its own Raft position, so pieces are
+    /// pulled only from peers whose copy is byte-identical to the first one's.
+    /// A copy standing behind this node's applies is refused and the pull
+    /// retried, up to [`REPAIR_ATTEMPTS`] times.
     ///
     /// Must be called from within a tokio runtime; the synchronous download loop
-    /// runs on a blocking thread.
+    /// and the install run on blocking threads.
     ///
     /// # Errors
     /// [`RepairError`] if no peer serves the segment, the download fails its
-    /// checksums, or the install fails.
+    /// checksums, every copy stands behind this node, or the install fails.
     pub async fn repair_partition(
+        self: &Arc<Self>,
+        peers: &[String],
+        partition: Partition,
+        piece_size: usize,
+        encoding: PieceEncoding,
+    ) -> Result<usize, RepairError> {
+        let mut backoff = REPAIR_BACKOFF;
+        let mut attempt = 1;
+        loop {
+            match self
+                .pull_and_install(peers, partition, piece_size, encoding)
+                .await
+            {
+                Err(RepairError::Behind(reason)) if attempt < REPAIR_ATTEMPTS => {
+                    tracing::debug!(partition = partition.name(), %reason, attempt, "copy behind; pulling again");
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    /// One pull of `partition` from `peers`, installed on success.
+    async fn pull_and_install(
         self: &Arc<Self>,
         peers: &[String],
         partition: Partition,
@@ -433,8 +535,12 @@ impl SegmentInstaller {
             if let Ok((source, m)) =
                 GrpcPieceSource::connect(node, channel, descriptor.clone(), candidate).await
             {
-                manifest.get_or_insert(m);
-                sources.push(source);
+                // A peer at another position built other bytes; its pieces
+                // would fail the chosen manifest's checksums.
+                let chosen = manifest.get_or_insert_with(|| m.clone());
+                if chosen.total_hash == m.total_hash && chosen.total_len == m.total_len {
+                    sources.push(source);
+                }
             }
         }
 
@@ -454,55 +560,15 @@ impl SegmentInstaller {
 
         let bytes = assembled.len();
 
-        // Physically clear the partition's existing tables before reinstalling.
-        // Done only AFTER the download succeeded, so a fetch failure never leaves
-        // the partition empty. This is a true replace, not an upsert over
-        // corruption: `clear_partition` deletes the table files without reading
-        // their blocks, so the corrupt SST is removed rather than shadowed by
-        // newer versions (a shadowed corrupt block would still break compaction
-        // and re-trip the scrub). A full-range `drop_range` cannot be used here:
-        // it runs a compaction that re-reads the corrupt block and aborts.
-        self.engine
-            .clear_partition(partition)
-            .map_err(|e| RepairError::Install(format!("clear partition before reinstall: {e}")))?;
-
-        self.store_segment(
-            coordinode_swarm::SegmentId(descriptor.segment_id),
-            &assembled,
-        )
-        .map_err(RepairError::Install)?;
+        // The install replaces the partition only after the download
+        // verified, so a failed fetch never leaves it empty; it clears the
+        // tables without reading their blocks, so the corrupt SST goes
+        // rather than being shadowed by newer versions.
+        let installer = Arc::clone(self);
+        tokio::task::spawn_blocking(move || installer.install(&assembled))
+            .await
+            .map_err(|e| RepairError::Install(e.to_string()))??;
         Ok(bytes)
-    }
-
-    /// Repair a corrupt partition with no healthy replica by rebuilding it from a
-    /// local checkpoint plus oplog replay (the "WAL replay repair" fallback after
-    /// [`Self::repair_partition`] returns [`RepairError::NoSource`]).
-    ///
-    /// Opens `checkpoint_dir` read-only, exports the partition as of the
-    /// checkpoint, drops the live (corrupt) tables, installs the checkpoint base,
-    /// then replays the granular ops of `oplog_since` (the oplog entries with
-    /// index after the checkpoint's cursor) for this partition to roll the data
-    /// forward to current. `RaftEntry` / `Noop` / membership ops are skipped — the
-    /// granular `Insert` / `Delete` / `Merge` / `RemoveRange` carry the mutations.
-    /// The corrupt block is physically removed (table-level drop, not shadowed).
-    ///
-    /// # Errors
-    /// [`RepairError::Checkpoint`] if the checkpoint cannot be opened/read,
-    /// [`RepairError::Install`] if dropping, installing, or replaying fails.
-    pub fn wal_replay_repair(
-        &self,
-        checkpoint_dir: &std::path::Path,
-        oplog_since: &[OplogEntry],
-        partition: Partition,
-    ) -> Result<usize, RepairError> {
-        // The rebuild-from-local-checkpoint-plus-oplog-replay logic is a
-        // storage-level capability shared with the embedded (no-Raft) repair
-        // path; the canonical implementation lives on the engine. The cluster
-        // path reaches it here after a swarm-fetch source is unavailable
-        // (`repair_partition` → `NoSource`).
-        self.engine
-            .repair_partition_from_checkpoint(checkpoint_dir, oplog_since, partition)
-            .map_err(|e| RepairError::Checkpoint(e.to_string()))
     }
 }
 

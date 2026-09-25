@@ -191,6 +191,17 @@ pub struct StorageEngine {
     /// the compaction monitor each poll cycle so the commit-path check is a
     /// single relaxed atomic load.
     write_pressure: Arc<AtomicU8>,
+    /// Pauses this node's Raft applies, when a Raft state machine runs over
+    /// the engine; read by whatever replaces or copies a partition at an
+    /// exact log position. Written once per state machine open.
+    raft_fence: parking_lot::RwLock<Option<Arc<dyn raft_coverage::RaftApplyFence>>>,
+    /// The lowest Raft log index the latest local checkpoint's trees may
+    /// lack, which a partition rebuild from that checkpoint replays from;
+    /// the log keeps it. `u64::MAX` when no checkpoint needs any.
+    raft_log_keep_from: AtomicU64,
+    /// Partition captures taken for copies to other nodes, naming each
+    /// one's directory.
+    partition_captures: AtomicU64,
 }
 
 /// An inclusive `[min, max]` user-key range, as reported by a lossy open
@@ -329,7 +340,7 @@ impl StorageEngine {
     /// journalled to a retained oplog (at the oplog-eligible endpoint), so the
     /// engine survives a crash by replaying the un-flushed tail and can repair
     /// a corrupt partition from a checkpoint plus oplog replay
-    /// (`SegmentInstaller::wal_replay_repair`).
+    /// ([`Self::repair_partition_from_checkpoint`]).
     ///
     /// In-memory configs (every endpoint `Volatile`) get no journal — there is
     /// no durable place to keep it; durability there is best-effort by design.
@@ -900,6 +911,14 @@ impl StorageEngine {
             }
         }
 
+        // A capture a crash left behind belongs to no copy.
+        let captures = config.data_dir().join(raft_coverage::PARTITION_CAPTURE_DIR);
+        match std::fs::remove_dir_all(&captures) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StorageError::Io(format!("clear {captures:?}: {e}"))),
+        }
+
         let coordinator = LocalMultiModalCoordinator::new(
             trees,
             Arc::clone(&seqno),
@@ -934,6 +953,9 @@ impl StorageEngine {
             columnar_tables,
             open_repairs,
             write_pressure,
+            raft_fence: parking_lot::RwLock::new(None),
+            raft_log_keep_from: AtomicU64::new(u64::MAX),
+            partition_captures: AtomicU64::new(0),
         })
     }
 
@@ -3534,7 +3556,10 @@ fn apply_columnar_row(
 }
 
 mod raft_coverage;
-pub use raft_coverage::RaftCoverage;
+pub use raft_coverage::{
+    PartitionCopy, RaftApplyFence, RaftApplyState, RaftCoverage, RaftHeld, RaftPosition,
+    is_node_local,
+};
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

@@ -325,10 +325,10 @@ pub(crate) async fn serve(
                                 .set(report.blocks_checked as f64);
                             metrics::counter!("coordinode_scrub_pages_scanned_total")
                                 .increment(report.blocks_checked);
+                            let mut corrupt = std::collections::HashSet::new();
                             if report.has_errors() {
                                 metrics::counter!("coordinode_scrub_errors_total")
                                     .increment(report.errors.len() as u64);
-                                let mut corrupt = std::collections::HashSet::new();
                                 for err in &report.errors {
                                     tracing::error!(
                                         partition = err.partition.name(),
@@ -337,6 +337,23 @@ pub(crate) async fn serve(
                                     );
                                     corrupt.insert(err.partition);
                                 }
+                            }
+                            // A rebuild a crash interrupted left its tree with
+                            // an unknown part of its data; the tree scrubs
+                            // clean, so only its intent says so.
+                            match scrub_engine.pending_rebuilds() {
+                                Ok(pending) => {
+                                    for part in pending {
+                                        tracing::error!(
+                                            partition = part.name(),
+                                            "partition rebuild was interrupted"
+                                        );
+                                        corrupt.insert(part);
+                                    }
+                                }
+                                Err(e) => tracing::warn!(%e, "reading rebuild intents failed"),
+                            }
+                            if !corrupt.is_empty() {
                                 // Basic replica-fetch repair: re-pull each
                                 // affected partition from healthy peers over
                                 // the swarm transport and re-install it. A
@@ -384,14 +401,12 @@ pub(crate) async fn serve(
                                         }
                                     }
 
-                                    // 2) WAL-replay repair: rebuild from the latest local
-                                    // checkpoint + Raft oplog replay (needs the Raft oplog —
-                                    // cluster mode; a standalone node has neither replica nor
-                                    // oplog, see the single-node gap).
+                                    // 2) Rebuild from the latest local checkpoint and
+                                    // the Raft log, with the applies paused.
                                     let Some(raft) = scrub_raft.get() else {
                                         tracing::warn!(
                                             partition = part.name(),
-                                            "no replica and no Raft oplog (standalone) — cannot repair"
+                                            "no replica and no Raft log yet — cannot repair"
                                         );
                                         continue;
                                     };
@@ -403,31 +418,17 @@ pub(crate) async fn serve(
                                         );
                                         continue;
                                     };
-                                    let from =
-                                        coordinode_raft::storage::checkpoint_oplog_last_index(
-                                            &ckpt,
-                                        )
-                                        .map_or(0, |i| i + 1);
-                                    let oplog_since = match raft.read_oplog_since(from) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            tracing::warn!(partition = part.name(), %e, "read oplog for WAL-replay failed");
-                                            continue;
-                                        }
-                                    };
-                                    let inst = Arc::clone(&repair_installer);
-                                    let ckpt2 = ckpt.clone();
+                                    let raft = Arc::clone(raft);
                                     match tokio::task::spawn_blocking(move || {
-                                        inst.wal_replay_repair(&ckpt2, &oplog_since, part)
+                                        raft.rebuild_partition_from_checkpoint(&ckpt, part)
                                     })
                                     .await
                                     {
-                                        Ok(Ok(bytes)) => {
+                                        Ok(Ok(())) => {
                                             metrics::counter!("coordinode_scrub_wal_repairs_total")
                                                 .increment(1);
                                             tracing::info!(
                                                 partition = part.name(),
-                                                bytes,
                                                 "repaired partition by WAL replay from checkpoint"
                                             );
                                         }
@@ -480,7 +481,21 @@ pub(crate) async fn serve(
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     match tokio::task::spawn_blocking(move || {
-                        checkpoint::run_checkpoint_cycle(&eng, &dir, checkpoint_keep, now_secs)
+                        let path = checkpoint::run_checkpoint_cycle(
+                            &eng,
+                            &dir,
+                            checkpoint_keep,
+                            now_secs,
+                        )?;
+                        // A rebuild from this checkpoint replays the Raft log
+                        // from what its trees lack; the log keeps that.
+                        let floor =
+                            coordinode_storage::engine::core::StorageEngine::checkpoint_raft_floor(
+                                &path,
+                            )
+                            .map_err(|e| format!("read the checkpoint's raft floor: {e}"))?;
+                        eng.set_raft_log_keep_from(floor);
+                        Ok::<_, String>(path)
                     })
                     .await
                     {

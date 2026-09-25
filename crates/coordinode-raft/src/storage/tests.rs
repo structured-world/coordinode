@@ -410,6 +410,54 @@ async fn apply_entries(sm: &mut CoordinodeStateMachine, entries: Vec<Entry>) {
     sm.apply(stream).await.expect("apply");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partition_installed_ahead_is_left_alone_until_the_applies_pass_it() {
+    // A peer's copy of Counter standing at entry 6 replaces the local one
+    // while the applies stand at 1. Entries 2..=6 are already in the copy:
+    // applying them again would count them twice, and a fold at 5 must not
+    // lower the copy's base below 7.
+    use coordinode_storage::engine::core::{PartitionCopy, RaftPosition};
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    apply_entries(&mut sm, vec![two_tree_merge_entry(1, 1000)]).await;
+
+    let key = b"counter:degree:1".to_vec();
+    let copy = PartitionCopy {
+        rows: vec![(key.clone(), 6i64.to_le_bytes().to_vec())],
+        position: Some(RaftPosition {
+            next: 7,
+            payload: rmp_serde::to_vec(&log_id(1, 6)).expect("payload"),
+        }),
+    };
+    let installer = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        installer.install_partition(Partition::Counter, &copy, true)
+    })
+    .await
+    .expect("install task")
+    .expect("install");
+
+    apply_entries(
+        &mut sm,
+        (2..=8).map(|i| two_tree_merge_entry(i, 1000 * i)).collect(),
+    )
+    .await;
+    assert_eq!(
+        engine
+            .get(Partition::Counter, &key)
+            .expect("get")
+            .as_deref(),
+        Some(8i64.to_le_bytes().as_slice()),
+        "six from the copy, then entries 7 and 8"
+    );
+    let coverage = engine.raft_coverage().expect("coverage");
+    assert!(
+        coverage.holds(Partition::Counter, 6, 0),
+        "the fold at 5 kept the copy's base"
+    );
+    assert!(coverage.holds(Partition::Counter, 8, 0));
+}
+
 #[tokio::test]
 async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
     // openraft builds a snapshot after `get_snapshot_builder` returns, while

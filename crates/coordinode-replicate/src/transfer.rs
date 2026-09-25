@@ -45,7 +45,8 @@ pub mod proto {
 /// how they land in local storage (replace a corrupt segment, install a migrated
 /// one, fill a resync gap).
 pub trait SegmentSink: Send + Sync {
-    /// Persist the assembled raw segment bytes under `segment`.
+    /// Persist the assembled raw segment bytes under `segment`. May block;
+    /// the transport calls it off the async runtime.
     ///
     /// # Errors
     /// Implementation-defined storage failure, surfaced to the source in the
@@ -68,8 +69,12 @@ pub struct BuiltSegment {
 /// yields byte-identical pieces on every node, so a piece pulled from one peer
 /// interleaves with pieces from another.
 pub trait SegmentSource: Send + Sync {
-    /// Build (or return a cached) [`BuiltSegment`] for the segment in `partition`
-    /// covering `range`, split into `piece_size`-byte pieces under `encoding`.
+    /// Build (or, unless `fresh`, return a cached) [`BuiltSegment`] for the
+    /// segment in `partition` covering `range`, split into `piece_size`-byte
+    /// pieces under `encoding`. A manifest request builds fresh, so a pull
+    /// gets the store as it stands; the piece requests that follow read the
+    /// build the manifest described. May block; the transport calls it off
+    /// the async runtime.
     ///
     /// # Errors
     /// A storage / split failure, surfaced to the requesting peer.
@@ -79,6 +84,7 @@ pub trait SegmentSource: Send + Sync {
         range: &KeyRange,
         piece_size: usize,
         encoding: PieceEncoding,
+        fresh: bool,
     ) -> Result<Arc<BuiltSegment>, String>;
 }
 
@@ -133,15 +139,16 @@ pub fn frames_for(store: &dyn PieceStore, segment: SegmentId) -> SwarmResult<Vec
 
 /// Receive one segment from a frame stream: read the header, assemble the pieces
 /// through a [`SegmentWriter`] (verify + decode each), and hand the result to
-/// `sink`. A checksum / decode / storage failure yields an ack with `ok = false`
-/// (corrupt data is never stored); a malformed stream (no header, stray header)
-/// is a protocol error ([`Status`]).
+/// `sink` on a blocking thread. A checksum / decode / storage failure yields an
+/// ack with `ok = false` (corrupt data is never stored); a malformed stream (no
+/// header, stray header) is a protocol error ([`Status`]).
 ///
 /// # Errors
 /// [`Status`] for a transport error or a malformed frame sequence.
-pub async fn receive<St>(mut stream: St, sink: &dyn SegmentSink) -> Result<TransferAck, Status>
+pub async fn receive<St, S>(mut stream: St, sink: Arc<S>) -> Result<TransferAck, Status>
 where
     St: Stream<Item = Result<PieceData, Status>> + Unpin,
+    S: SegmentSink + ?Sized + 'static,
 {
     let header = match stream.next().await.transpose()?.and_then(|pd| pd.frame) {
         Some(Frame::Header(h)) => h,
@@ -175,7 +182,10 @@ where
         Ok(d) => d,
         Err(e) => return Ok(fail(received, e.to_string())),
     };
-    match sink.store_segment(segment, &data) {
+    let stored = tokio::task::spawn_blocking(move || sink.store_segment(segment, &data))
+        .await
+        .map_err(|e| Status::internal(format!("store task: {e}")))?;
+    match stored {
         Ok(()) => Ok(TransferAck {
             ok: true,
             error: String::new(),
@@ -206,10 +216,12 @@ fn manifest_from_header(h: &SegmentTransferHeader) -> Result<SegmentManifest, St
 
 /// Maps a wire [`SegmentDescriptorRef`] to a built segment via a
 /// [`SegmentSource`]: decodes the partition tag, key range, and split parameters,
-/// then builds (or fetches cached) the pieces.
-fn build_from_ref<Src: SegmentSource>(
-    source: &Src,
+/// then builds (fresh when `fresh`, else from the cache) the pieces on a
+/// blocking thread.
+async fn build_from_ref<Src: SegmentSource + 'static>(
+    source: Arc<Src>,
     seg: &SegmentDescriptorRef,
+    fresh: bool,
 ) -> Result<Arc<BuiltSegment>, Status> {
     let tag = u8::try_from(seg.partition).map_err(|_| {
         Status::invalid_argument(format!("partition tag {} out of range", seg.partition))
@@ -222,9 +234,13 @@ fn build_from_ref<Src: SegmentSource>(
     };
     let encoding = PieceEncoding::from_wire(seg.encoding, seg.zstd_level)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
-    source
-        .build_segment(partition, &range, seg.piece_size as usize, encoding)
-        .map_err(Status::internal)
+    let piece_size = seg.piece_size as usize;
+    tokio::task::spawn_blocking(move || {
+        source.build_segment(partition, &range, piece_size, encoding, fresh)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("build task: {e}")))?
+    .map_err(Status::internal)
 }
 
 /// The target-side tonic service: assembles inbound transfers into the injected
@@ -250,7 +266,7 @@ impl<S: SegmentSink + SegmentSource + 'static>
         &self,
         request: Request<Streaming<PieceData>>,
     ) -> Result<Response<TransferAck>, Status> {
-        receive(request.into_inner(), self.store.as_ref())
+        receive(request.into_inner(), Arc::clone(&self.store))
             .await
             .map(Response::new)
     }
@@ -263,7 +279,7 @@ impl<S: SegmentSink + SegmentSource + 'static>
             .into_inner()
             .segment
             .ok_or_else(|| Status::invalid_argument("missing segment descriptor"))?;
-        let built = build_from_ref(self.store.as_ref(), &seg)?;
+        let built = build_from_ref(Arc::clone(&self.store), &seg, true).await?;
         let (encoding, zstd_level) = built.manifest.encoding.to_wire();
         // A node serving from local storage built every piece, so it can serve
         // all of them: a full bitfield.
@@ -290,7 +306,7 @@ impl<S: SegmentSink + SegmentSource + 'static>
         let seg = req
             .segment
             .ok_or_else(|| Status::invalid_argument("missing segment descriptor"))?;
-        let built = build_from_ref(self.store.as_ref(), &seg)?;
+        let built = build_from_ref(Arc::clone(&self.store), &seg, false).await?;
         let wire = built
             .wire
             .get(req.index as usize)

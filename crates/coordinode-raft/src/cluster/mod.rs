@@ -1067,24 +1067,28 @@ impl RaftNode {
         *self.applied_rx.borrow()
     }
 
-    /// Read committed oplog entries with index in `[from_index, applied]` — the
-    /// changes since a checkpoint cursor, for WAL-replay repair. Reads serialize
-    /// against Raft appends via the oplog manager's lock.
+    /// Rebuild `partition` from the local checkpoint at `checkpoint_dir` and
+    /// this node's Raft log, with the applies paused: the repair path when
+    /// no healthy replica serves the partition. See
+    /// [`crate::storage::rebuild_partition_from_checkpoint`].
+    ///
+    /// Blocks; call it off the async runtime.
     ///
     /// # Errors
-    /// [`RaftNodeError::Init`] if the oplog lock is poisoned or the read fails.
-    pub fn read_oplog_since(
+    ///
+    /// [`RaftNodeError::Init`] with the rebuild's reason.
+    pub fn rebuild_partition_from_checkpoint(
         &self,
-        from_index: u64,
-    ) -> Result<Vec<coordinode_storage::oplog::OplogEntry>, RaftNodeError> {
-        let to = self.applied_index().saturating_add(1);
-        let mut oplog = self
-            .oplog
-            .lock()
-            .map_err(|_| RaftNodeError::Init("oplog mutex poisoned".into()))?;
-        oplog
-            .read_range(from_index, to)
-            .map_err(|e| RaftNodeError::Init(e.to_string()))
+        checkpoint_dir: &std::path::Path,
+        partition: coordinode_storage::engine::partition::Partition,
+    ) -> Result<(), RaftNodeError> {
+        crate::storage::rebuild_partition_from_checkpoint(
+            &self.engine,
+            &self.oplog,
+            checkpoint_dir,
+            partition,
+        )
+        .map_err(|e| RaftNodeError::Init(e.to_string()))
     }
 
     /// Number of full snapshot builds this node has performed. Every

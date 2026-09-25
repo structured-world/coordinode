@@ -41,8 +41,11 @@ use openraft::{OptionalSend, RaftLogReader, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 
 use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
-use coordinode_storage::engine::core::{RaftCoverage, StorageEngine};
+use coordinode_storage::engine::core::{
+    RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
+};
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::error::{StorageError, StorageResult};
 
 /// Maximum age for dedup entries before GC (10 minutes).
 /// Matches Dgraph's `maxAge` in processApplyCh (draft.go:942).
@@ -149,26 +152,80 @@ const RAFT_OPLOG_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MB per segment
 const RAFT_OPLOG_MAX_ENTRIES: u32 = 50_000;
 const RAFT_OPLOG_RETENTION_SECS: u64 = 7 * 24 * 3600; // 7 days (index-based purge is primary)
 
-/// The last committed oplog index captured in a checkpoint (its copied oplog at
-/// `<checkpoint_dir>/oplog/0`), or `None` if the checkpoint carries no oplog or
-/// it is empty. The WAL-replay-repair cursor: replay live oplog entries with
-/// index after this on top of the checkpoint base.
-#[must_use]
-pub fn checkpoint_oplog_last_index(checkpoint_dir: &std::path::Path) -> Option<u64> {
-    let oplog_dir = checkpoint_dir.join("oplog").join("0");
-    if !oplog_dir.exists() {
-        return None;
-    }
-    let mgr = OplogManager::open_multi(
-        &oplog_dir,
-        &[],
-        0,
-        RAFT_OPLOG_MAX_BYTES,
-        RAFT_OPLOG_MAX_ENTRIES,
-        RAFT_OPLOG_RETENTION_SECS,
-    )
-    .ok()?;
-    mgr.recover_last_entry().ok().flatten().map(|e| e.index)
+/// Rebuild `partition` from the checkpoint at `checkpoint_dir` and this
+/// node's Raft log `log`, with the applies paused: the checkpoint's rows,
+/// then every proposal of the log the checkpoint's tree lacks, up to where
+/// the applies stand. The rebuilt tree then holds exactly what the other
+/// trees do.
+///
+/// Proposals replay through the state machine's own rules: a repeated
+/// proposal id with the same size is skipped, as far back as the replay
+/// reaches (a restarted state machine starts its dedup empty the same way).
+///
+/// # Errors
+///
+/// No Raft state machine runs over `engine`, the log no longer holds an
+/// entry the checkpoint lacks, or the checkpoint or a write fails. Nothing
+/// is changed unless the log holds every entry needed.
+pub fn rebuild_partition_from_checkpoint(
+    engine: &StorageEngine,
+    log: &Mutex<OplogManager>,
+    checkpoint_dir: &std::path::Path,
+    partition: Partition,
+) -> Result<(), io::Error> {
+    let fence = engine
+        .raft_fence()
+        .ok_or_else(|| io::Error::other("no Raft state machine runs over this store"))?;
+    fence
+        .with_applies_paused(&mut |applies, payload| {
+            let (rows, held) = StorageEngine::checkpoint_raft_partition(checkpoint_dir, partition)?;
+            let (from, to) = (held.base_next(), applies.next());
+            let entries = if from < to {
+                log.lock()
+                    .map_err(|_| StorageError::Io("raft log mutex poisoned".into()))?
+                    .read_range(from, to)?
+            } else {
+                Vec::new()
+            };
+            let complete = entries.first().is_none_or(|e| e.index == from)
+                && u64::try_from(entries.len()).is_ok_and(|n| n == to.saturating_sub(from));
+            if !complete {
+                return Err(StorageError::Io(format!(
+                    "the Raft log no longer holds entries {from}..{to} the checkpoint \
+                     lacks; repair {} from a peer",
+                    partition.name()
+                )));
+            }
+            engine.begin_partition_rebuild(partition, &rows)?;
+            let mut seen: HashMap<u64, usize> = HashMap::new();
+            for oplog_entry in entries {
+                let index = oplog_entry.index;
+                let entry = LogStore::oplog_to_entry(oplog_entry)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+                let openraft::entry::EntryPayload::Normal(request) = &entry.payload else {
+                    continue;
+                };
+                for (sub, proposal) in request.proposals.iter().enumerate() {
+                    let sub = u32::try_from(sub).map_err(|_| {
+                        StorageError::Io(format!("entry {index} carries over 2^32 proposals"))
+                    })?;
+                    let size = proposal.size_estimate();
+                    let repeated = seen.insert(proposal.id.as_raw(), size) == Some(size);
+                    if repeated || held.holds(index, sub) {
+                        continue;
+                    }
+                    engine.apply_raft_proposal(
+                        &proposal.mutations,
+                        proposal.commit_ts.as_raw(),
+                        index,
+                        sub,
+                        |p| p != partition,
+                    )?;
+                }
+            }
+            engine.finish_raft_rebuild(partition, to, payload)
+        })
+        .map_err(|e| io::Error::other(format!("rebuild {}: {e}", partition.name())))
 }
 
 // ── Log Store ─────────────────────────────────────────────────
@@ -880,6 +937,38 @@ pub struct CoordinodeStateMachine {
     folded: u64,
     /// Captures taken for snapshot builds, naming each one's directory.
     captures: u64,
+    /// Where the applies stand, held while applying; registered with the
+    /// engine as its Raft apply fence.
+    gate: Arc<RaftApplyGate>,
+}
+
+/// This node's Raft apply position, locked by the state machine for every
+/// batch it applies, so a partition can be copied or replaced at an exact
+/// log position with the applies paused.
+pub struct RaftApplyGate {
+    state: tokio::sync::Mutex<GateState>,
+}
+
+struct GateState {
+    applies: RaftApplyState,
+    /// The last applied entry, whose log id a coverage base carries.
+    last: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
+}
+
+impl RaftApplyFence for RaftApplyGate {
+    fn with_applies_paused(
+        &self,
+        work: &mut dyn FnMut(&mut RaftApplyState, &[u8]) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let mut state = self.state.blocking_lock();
+        let payload = match &state.last {
+            Some(id) => {
+                rmp_serde::to_vec(id).map_err(|e| StorageError::Serialization(e.to_string()))?
+            }
+            None => Vec::new(),
+        };
+        work(&mut state.applies, &payload)
+    }
 }
 
 /// Where snapshot builds capture the store, under the engine's data
@@ -984,6 +1073,14 @@ impl CoordinodeStateMachine {
         let initial_index = last_applied.map(|id| id.index).unwrap_or(0);
         let (applied_tx, applied_rx) = tokio::sync::watch::channel(initial_index);
 
+        let gate = Arc::new(RaftApplyGate {
+            state: tokio::sync::Mutex::new(GateState {
+                applies: RaftApplyState::new(last_applied.map_or(0, |id| id.index + 1)),
+                last: last_applied,
+            }),
+        });
+        engine.register_raft_fence(Arc::clone(&gate) as Arc<dyn RaftApplyFence>);
+
         Ok(Self {
             engine,
             oracle,
@@ -999,6 +1096,7 @@ impl CoordinodeStateMachine {
             skip_until,
             folded,
             captures: 0,
+            gate,
         })
     }
 
@@ -1082,11 +1180,15 @@ impl CoordinodeStateMachine {
     /// Includes dedup check: if this proposal ID was already applied with
     /// the same size estimate, skip re-application (idempotent Raft replay).
     /// Follows Dgraph's dedup pattern (draft.go:874-940).
-    fn apply_proposal(
+    ///
+    /// A partition `applies` says is already past `index` (installed from a
+    /// peer further along) is left alone.
+    fn apply_proposal_under(
         &self,
         proposal: &RaftProposal,
         index: u64,
         sub: u32,
+        applies: &RaftApplyState,
     ) -> Result<Response, io::Error> {
         let proposal_key = proposal.id.as_raw();
         let proposal_size = proposal.size_estimate();
@@ -1136,7 +1238,9 @@ impl CoordinodeStateMachine {
                 proposal.commit_ts.as_raw(),
                 index,
                 sub,
-                |part| replay.is_some_and(|c| c.holds(part, index, sub)),
+                |part| {
+                    applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub))
+                },
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
         if let Some(ref oracle) = self.oracle {
@@ -1178,6 +1282,17 @@ impl CoordinodeStateMachine {
         Ok(Response {
             mutations_applied: count,
         })
+    }
+
+    /// [`Self::apply_proposal_under`] with no partition installed ahead.
+    #[cfg(test)]
+    fn apply_proposal(
+        &self,
+        proposal: &RaftProposal,
+        index: u64,
+        sub: u32,
+    ) -> Result<Response, io::Error> {
+        self.apply_proposal_under(proposal, index, sub, &RaftApplyState::default())
     }
 
     /// Run dedup GC if enough time has passed since last run.
@@ -1252,6 +1367,10 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             + OptionalSend,
     {
         let mut stream = entries;
+        // Held for the batch: a partition copied or replaced with the applies
+        // paused sees none of it half done.
+        let gate = Arc::clone(&self.gate);
+        let mut gate = gate.state.lock().await;
         while let Some(item) = stream.next().await {
             let (entry, responder) = item?;
 
@@ -1281,7 +1400,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                         let sub = u32::try_from(sub).map_err(|_| {
                             io::Error::other(format!("entry {index} carries over 2^32 proposals"))
                         })?;
-                        let r = self.apply_proposal(proposal, index, sub)?;
+                        let r = self.apply_proposal_under(proposal, index, sub, &gate.applies)?;
                         total += r.mutations_applied;
                     }
                     Response {
@@ -1298,6 +1417,8 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 .lock()
                 .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? =
                 Some(entry.log_id);
+            gate.applies.applied(index);
+            gate.last = Some(entry.log_id);
             let next = index + 1;
             debug_assert!(self.folded <= next, "fold ahead of the applied entry");
             if next >= self.skip_until {
@@ -1306,7 +1427,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             if next - self.folded >= RAFT_FOLD_EVERY {
                 let payload = rmp_serde::to_vec(&entry.log_id)
                     .map_err(|e| io::Error::other(e.to_string()))?;
-                self.engine.fold_raft_coverage(self.folded, next, &payload);
+                let applies = &gate.applies;
+                self.engine
+                    .fold_raft_coverage(self.folded, next, &payload, |part| {
+                        applies.floor(part) >= next
+                    });
                 self.folded = next;
             }
 
@@ -1374,6 +1499,11 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             "installing snapshot"
         );
 
+        // No partition copy or replacement runs across the install; after
+        // it, every partition stands at the snapshot.
+        let gate = Arc::clone(&self.gate);
+        let mut gate = gate.state.lock().await;
+
         // Apply snapshot data to storage partitions (if non-empty).
         // Empty snapshots are valid (metadata-only, e.g., from tests).
         if !data.is_empty() {
@@ -1396,6 +1526,8 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         self.replay_skip = None;
         self.skip_until = 0;
         self.folded = next;
+        gate.applies.reset(next);
+        gate.last = meta.last_log_id;
 
         *self
             .last_applied

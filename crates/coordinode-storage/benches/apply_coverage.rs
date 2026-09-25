@@ -116,7 +116,7 @@ fn main() {
             .expect("apply");
         let next = i + 1;
         if next % FOLD_EVERY == 0 {
-            engine.fold_raft_coverage(next - FOLD_EVERY, next, &next.to_be_bytes());
+            engine.fold_raft_coverage(next - FOLD_EVERY, next, &next.to_be_bytes(), |_| false);
         }
     });
     line("apply, no marker", plain);
@@ -150,7 +150,7 @@ fn main() {
                 .expect("apply");
         }
         let start = Instant::now();
-        engine.fold_raft_coverage(0, 4096, &round.to_be_bytes());
+        engine.fold_raft_coverage(0, 4096, &round.to_be_bytes(), |_| false);
         folds.push(start.elapsed());
     }
     line("fold of 4096 markers", folds);

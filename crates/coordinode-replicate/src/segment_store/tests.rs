@@ -150,7 +150,7 @@ fn segment_source_builds_and_caches_servable_pieces() {
     };
 
     let built = installer
-        .build_segment(Partition::Node, &range, 64, PieceEncoding::None)
+        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, false)
         .expect("build segment");
 
     // The served pieces assemble back to exactly the exported blob, and each
@@ -169,12 +169,19 @@ fn segment_source_builds_and_caches_servable_pieces() {
 
     // A second build for the same parameters is served from cache (same Arc).
     let again = installer
-        .build_segment(Partition::Node, &range, 64, PieceEncoding::None)
+        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, false)
         .expect("build again");
     assert!(
         std::sync::Arc::ptr_eq(&built, &again),
         "repeated build must hit the serve-side cache"
     );
+
+    // A manifest request builds fresh: a new pull sees the store as it
+    // stands, not a build an earlier pull cached.
+    let fresh = installer
+        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, true)
+        .expect("build fresh");
+    assert!(!std::sync::Arc::ptr_eq(&built, &fresh));
 }
 
 #[tokio::test]
@@ -533,121 +540,221 @@ async fn repair_heals_corrupt_partition_so_rescrub_is_clean() {
     assert_eq!(v.as_ref(), b"value-42");
 }
 
-#[test]
-fn wal_replay_repair_rebuilds_from_checkpoint_plus_oplog() {
-    use coordinode_storage::oplog::{OplogEntry, OplogOp};
-    use coordinode_storage::placement::partition_wire_tag;
+/// Stands in for the Raft state machine's fence: applies standing at a
+/// chosen position, with the payload a coverage base would carry.
+struct TestFence {
+    state: parking_lot::Mutex<coordinode_storage::engine::core::RaftApplyState>,
+    payload: Vec<u8>,
+}
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = std::sync::Arc::new(test_engine(dir.path()));
-    for i in 0..40u32 {
-        engine
-            .put(
-                Partition::Node,
-                format!("node:0:{i:08}").as_bytes(),
-                format!("v{i}").as_bytes(),
-            )
-            .expect("put");
+impl coordinode_storage::engine::core::RaftApplyFence for TestFence {
+    fn with_applies_paused(
+        &self,
+        work: &mut dyn FnMut(
+            &mut coordinode_storage::engine::core::RaftApplyState,
+            &[u8],
+        ) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        work(&mut self.state.lock(), &self.payload)
     }
-    engine.persist().expect("persist");
+}
 
-    // Checkpoint outside the data dir (avoid the largest-file walk + keep it a
-    // distinct location). This is the WAL-replay-repair base.
-    let ckpt_root = tempfile::tempdir().expect("ckpt tempdir");
-    let ckpt_path = ckpt_root.path().join("c1");
-    engine.create_checkpoint(&ckpt_path).expect("checkpoint");
+/// An engine whose Raft applies stand at `next`.
+fn raft_engine(dir: &std::path::Path, next: u64) -> (Arc<StorageEngine>, Arc<TestFence>) {
+    let engine = Arc::new(test_engine(dir));
+    let fence = Arc::new(TestFence {
+        state: parking_lot::Mutex::new(coordinode_storage::engine::core::RaftApplyState::new(next)),
+        payload: format!("id-{}", next.saturating_sub(1)).into_bytes(),
+    });
+    engine.register_raft_fence(Arc::clone(&fence) as _);
+    (engine, fence)
+}
 
-    // Post-checkpoint writes — these must be restored from the oplog, not the
-    // checkpoint (which predates them).
-    engine
-        .put(Partition::Node, b"node:0:00000005", b"v5-updated")
+/// Serve `engine`'s segments on a local port; returns the peer URI.
+async fn serve(engine: &Arc<StorageEngine>) -> String {
+    use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    let handler = SegmentTransferHandler::new(Arc::new(SegmentInstaller::new(Arc::clone(engine))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+    format!("http://{addr}")
+}
+
+/// A copy from a peer further along replaces the partition at the peer's
+/// position: the tree records it, and the local applies leave the partition
+/// alone until they pass it, so the entries in between are not applied twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_ahead_installs_at_its_position_and_raises_the_floor() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer, _) = raft_engine(peer_dir.path(), 20);
+    peer.put(Partition::Node, b"node:0:00000001", b"peer")
         .expect("put");
-    engine
-        .put(Partition::Node, b"node:0:00000099", b"v99-new")
+    let uri = serve(&peer).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, fence) = raft_engine(local_dir.path(), 10);
+    local
+        .put(Partition::Node, b"node:0:00000002", b"stale")
         .expect("put");
-    engine
-        .delete(Partition::Node, b"node:0:00000007")
-        .expect("delete");
-    engine.persist().expect("persist");
-
-    let tag = partition_wire_tag(Partition::Node);
-    let oplog_since = vec![OplogEntry {
-        ts: 0,
-        term: 1,
-        index: 41,
-        shard: 0,
-        ops: vec![
-            OplogOp::Insert {
-                partition: tag,
-                key: b"node:0:00000005".to_vec(),
-                value: b"v5-updated".to_vec(),
-            },
-            OplogOp::Insert {
-                partition: tag,
-                key: b"node:0:00000099".to_vec(),
-                value: b"v99-new".to_vec(),
-            },
-            OplogOp::Delete {
-                partition: tag,
-                key: b"node:0:00000007".to_vec(),
-            },
-            // An op for a different partition must be ignored when repairing Node.
-            OplogOp::Insert {
-                partition: partition_wire_tag(Partition::Schema),
-                key: b"schema:should-not-apply".to_vec(),
-                value: b"x".to_vec(),
-            },
-        ],
-        is_migration: false,
-        pre_images: None,
-    }];
-
-    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&engine)));
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
     installer
-        .wal_replay_repair(&ckpt_path, &oplog_since, Partition::Node)
-        .expect("wal replay repair");
+        .repair_partition(&[uri], Partition::Node, 256, PieceEncoding::None)
+        .await
+        .expect("repair");
 
-    // Checkpoint base (40 keys) rolled forward by the oplog replay.
     assert_eq!(
-        engine
-            .get(Partition::Node, b"node:0:00000000")
+        local
+            .get(Partition::Node, b"node:0:00000001")
             .expect("get")
-            .expect("base key present")
-            .as_ref(),
-        b"v0",
-        "checkpoint base restored"
-    );
-    assert_eq!(
-        engine
-            .get(Partition::Node, b"node:0:00000005")
-            .expect("get")
-            .expect("updated key present")
-            .as_ref(),
-        b"v5-updated",
-        "post-checkpoint update replayed from oplog"
-    );
-    assert_eq!(
-        engine
-            .get(Partition::Node, b"node:0:00000099")
-            .expect("get")
-            .expect("new key present")
-            .as_ref(),
-        b"v99-new",
-        "post-checkpoint insert replayed from oplog"
+            .as_deref(),
+        Some(b"peer".as_slice())
     );
     assert!(
-        engine
-            .get(Partition::Node, b"node:0:00000007")
+        local
+            .get(Partition::Node, b"node:0:00000002")
             .expect("get")
             .is_none(),
-        "post-checkpoint delete replayed from oplog"
+        "the partition is replaced, not written over"
     );
+    let coverage = local.raft_coverage().expect("coverage");
     assert!(
-        engine
-            .get(Partition::Schema, b"schema:should-not-apply")
+        coverage.holds(Partition::Node, 19, 0),
+        "the peer's position"
+    );
+    assert!(!coverage.holds(Partition::Node, 20, 0));
+    assert_eq!(fence.state.lock().floor(Partition::Node), 20);
+    assert!(fence.state.lock().skips(Partition::Node, 15));
+}
+
+/// A copy behind this node's applies lacks entries this node applied and
+/// will not apply again: it is refused, and the partition left as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_behind_the_local_applies_is_refused() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer, _) = raft_engine(peer_dir.path(), 5);
+    peer.put(Partition::Node, b"node:0:00000001", b"peer")
+        .expect("put");
+    let uri = serve(&peer).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, _) = raft_engine(local_dir.path(), 10);
+    local
+        .put(Partition::Node, b"node:0:00000002", b"local")
+        .expect("put");
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
+    let err = installer
+        .repair_partition(&[uri], Partition::Node, 256, PieceEncoding::None)
+        .await
+        .expect_err("a copy behind is refused");
+    assert!(matches!(err, RepairError::Behind(_)), "{err:?}");
+    assert_eq!(
+        local
+            .get(Partition::Node, b"node:0:00000002")
             .expect("get")
-            .is_none(),
-        "a different partition's oplog op must not be applied"
+            .as_deref(),
+        Some(b"local".as_slice())
+    );
+}
+
+/// Schema carries this node's own records (per-node routing, the state
+/// machine's membership and snapshot metadata): they neither travel nor
+/// get replaced by a peer's copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_copy_keeps_the_node_local_records() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer, _) = raft_engine(peer_dir.path(), 20);
+    peer.put(Partition::Schema, b"schema:label:A", b"peer")
+        .expect("put");
+    peer.put(Partition::Schema, b"raft:sm:membership", b"peer-membership")
+        .expect("put");
+    let uri = serve(&peer).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, _) = raft_engine(local_dir.path(), 10);
+    local
+        .put(
+            Partition::Schema,
+            b"raft:sm:membership",
+            b"local-membership",
+        )
+        .expect("put");
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
+    installer
+        .repair_partition(&[uri], Partition::Schema, 256, PieceEncoding::None)
+        .await
+        .expect("repair");
+
+    assert_eq!(
+        local
+            .get(Partition::Schema, b"schema:label:A")
+            .expect("get")
+            .as_deref(),
+        Some(b"peer".as_slice())
+    );
+    assert_eq!(
+        local
+            .get(Partition::Schema, b"raft:sm:membership")
+            .expect("get")
+            .as_deref(),
+        Some(b"local-membership".as_slice())
+    );
+}
+
+/// The Raft partition is this node's vote and log metadata; another node's
+/// copy of it would make this node vote and log as the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_raft_partition_is_never_copied() {
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let (peer, _) = raft_engine(peer_dir.path(), 20);
+    let uri = serve(&peer).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, _) = raft_engine(local_dir.path(), 10);
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
+    installer
+        .repair_partition(&[uri], Partition::Raft, 256, PieceEncoding::None)
+        .await
+        .expect_err("the peer refuses to export it");
+}
+
+/// A Raft store records one log position per partition; a key range from a
+/// peer would leave the rest of the partition at another one.
+#[test]
+fn a_key_range_does_not_install_into_a_raft_store() {
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let (src, _) = raft_engine(src_dir.path(), 20);
+    src.put(Partition::Node, b"node:0:00000001", b"v")
+        .expect("put");
+    let blob = export_range(
+        &src,
+        Partition::Node,
+        &KeyRange {
+            start: b"node:".to_vec(),
+            end: Vec::new(),
+        },
+    )
+    .expect("export");
+
+    let tgt_dir = tempfile::tempdir().expect("tempdir");
+    let (tgt, _) = raft_engine(tgt_dir.path(), 10);
+    let installer = SegmentInstaller::new(Arc::clone(&tgt));
+    installer
+        .store_segment(SegmentId(1), &blob)
+        .expect_err("a key range is refused");
+    assert!(
+        tgt.get(Partition::Node, b"node:0:00000001")
+            .expect("get")
+            .is_none()
     );
 }
 
