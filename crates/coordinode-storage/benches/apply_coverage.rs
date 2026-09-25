@@ -170,4 +170,67 @@ fn main() {
         })
         .collect();
     line("commit_journaled (fsync)", commits);
+
+    pauses();
+}
+
+/// How long the Raft applies stand still for a copy of a partition to
+/// another node, a snapshot capture, and a partition install on the node
+/// being repaired: the unrelated writes a repair or snapshot stalls. The
+/// store holds `ROWS` flushed rows per tree plus a memtable of `DIRTY`
+/// applies at each capture, so the flush the capture begins with has work.
+fn pauses() {
+    use coordinode_storage::engine::partition::Partition;
+    const ROWS: u64 = 200_000;
+    const DIRTY: u64 = 10_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(&config(&dir), Arc::clone(&oracle)).expect("open");
+    engine.reset_raft_coverage(0, &[]).expect("establish");
+    let mut index = 0u64;
+    let mut apply = |engine: &StorageEngine, n: u64| {
+        for _ in 0..n {
+            engine
+                .apply_raft_proposal(&proposal(index), oracle.next().as_raw(), index, 0, |_| {
+                    false
+                })
+                .expect("apply");
+            index += 1;
+        }
+    };
+    apply(&engine, ROWS);
+    engine.persist().expect("persist");
+
+    let captures = tempfile::tempdir().expect("captures");
+    let mut copy_pauses = Vec::new();
+    let mut snapshot_pauses = Vec::new();
+    for round in 0..10 {
+        apply(&engine, DIRTY);
+        let start = Instant::now();
+        engine
+            .capture_partition(Partition::Node, &captures.path().join(format!("p{round}")))
+            .expect("capture partition");
+        copy_pauses.push(start.elapsed());
+
+        apply(&engine, DIRTY);
+        let start = Instant::now();
+        engine
+            .capture(&captures.path().join(format!("s{round}")))
+            .expect("capture");
+        snapshot_pauses.push(start.elapsed());
+    }
+    line("pause: partition copy", copy_pauses);
+    line("pause: snapshot capture", snapshot_pauses);
+
+    let copy = engine.copy_partition(Partition::Node).expect("copy");
+    let rows = copy.rows.len();
+    let mut installs = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        engine
+            .install_partition(Partition::Node, &copy, true)
+            .expect("install");
+        installs.push(start.elapsed());
+    }
+    line(&format!("pause: install of {rows} rows"), installs);
 }
