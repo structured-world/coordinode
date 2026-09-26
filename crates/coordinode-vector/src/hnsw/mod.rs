@@ -1056,6 +1056,12 @@ impl HnswIndex {
     /// publishes the new node and its neighbour edges.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
         if let Some(&idx) = self.id_to_idx.get(&id) {
+            // The same vector again (a write maintained by more than one
+            // path, or re-delivered): the node already sits where it
+            // belongs, and reconnecting it only puts its edges at risk.
+            if self.read_node_f32(idx) == Some(vector.as_slice()) {
+                return;
+            }
             // Node already indexed — update vector and reconnect in graph.
             self.update_existing_node(idx, vector);
             return;
@@ -2493,10 +2499,16 @@ impl HnswIndex {
                 self.config.m
             };
 
+            // The node is still reachable through edges other nodes keep to
+            // it, so the search finds it first, at distance zero. Taken as its
+            // own neighbour it would become a self-loop and the entry point
+            // of the next layer down, where its edges are already cleared:
+            // the descent would find nothing else and leave it unreachable.
             let selected: Vec<usize> = neighbours
                 .into_iter()
-                .take(max_conn)
                 .map(|c| c.idx as usize)
+                .filter(|&n| n != idx)
+                .take(max_conn)
                 .collect();
 
             // Connect this node to its new neighbours. Store internal
