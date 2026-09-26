@@ -10,7 +10,7 @@
 //! - **Edge properties** (`Partition::EdgeProp`): keyed by
 //!   `(edge_type, src, tgt)`. Optional per-edge.
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Transaction threading
 //!
 //! Every method takes an explicit `&mut Transaction` (writes) or
 //! `&Transaction` (reads). Writes buffer on the transaction and are
@@ -21,7 +21,7 @@
 //! transaction's pending merge operands (read-your-own-writes) on the
 //! committed posting list.
 //!
-//! ## Temporal edges (ADR-027)
+//! ## Temporal edges
 //!
 //! [`EdgeStore::put_edge_temporal`] writes one version per
 //! `valid_from_ms` via [`encode_temporal_edgeprop_key`], so every
@@ -30,7 +30,7 @@
 //! prefix and returns the version whose `valid_from_ms <= at_ms` is
 //! largest. Adjacency entries are written by the temporal path too.
 //! Adjacency versioning itself (tombstone markers vs. per-version
-//! posting lists) is a separate ADR and intentionally NOT decided here.
+//! posting lists) is a separate design and intentionally NOT decided here.
 
 use coordinode_core::graph::edge::{
     EdgeProperties, PostingList, decode_discriminated_edgeprop_key, decode_temporal_edgeprop_key,
@@ -81,7 +81,7 @@ pub trait EdgeStore {
     /// Snapshot-aware read of edge properties for `(edge_type, src, tgt)`,
     /// for callers that hold an MVCC [`StorageSnapshot`] rather than a
     /// [`Transaction`] — backup export takes one consistent snapshot up front
-    /// and reads every edge through it (ADR-040). Same semantics as
+    /// and reads every edge through it. Same semantics as
     /// [`Self::get_props`]: `None` when the edge carries no property body.
     fn get_props_snapshot(
         &self,
@@ -94,7 +94,7 @@ pub trait EdgeStore {
 
     /// Direct, non-transactional write of the edge property body for
     /// `(edge_type, src, tgt)`, for the backup restore path that applies writes
-    /// straight to the engine (ADR-016: the oracle auto-stamps the seqno) rather
+    /// straight to the engine (the oracle auto-stamps the seqno) rather
     /// than through a [`Transaction`]. Writes ONLY the edgeprop body — adjacency
     /// is restored separately — and encodes through the single canonical
     /// edge-property codec, so restored bytes are identical to a put_edge write.
@@ -139,7 +139,7 @@ pub trait EdgeStore {
     ) -> StoreResult<Vec<NodeId>>;
 
     /// Per-version write of edge properties for `(edge_type, src, tgt)`
-    /// (ADR-027 temporal edges). Stores `props` under the temporal
+    /// (temporal edges). Stores `props` under the temporal
     /// edgeprop key suffixed with `valid_from_ms`; multiple versions
     /// coexist. Adjacency entries are written too (same merge as the
     /// non-temporal path) so the edge is visible to neighbour scans.
@@ -176,7 +176,7 @@ pub trait EdgeStore {
 
     /// Tombstone one specific temporal version. Idempotent on a missing
     /// version. Adjacency entries are NOT touched — removing the last
-    /// version of an edge needs the adj-versioning ADR.
+    /// version of an edge needs versioned adjacency.
     fn delete_edge_temporal(
         &self,
         txn: &mut Transaction,
@@ -186,11 +186,11 @@ pub trait EdgeStore {
         valid_from_ms: i64,
     ) -> StoreResult<()>;
 
-    /// Write one instance of a `DISCRIMINATED BY (col)` edge (ADR-029): the
+    /// Write one instance of a `DISCRIMINATED BY (col)` edge: the
     /// edgeprop body is keyed by the discriminator value, and the adjacency
     /// posting gets a set-semantics add (a target appears iff at least one
-    /// instance exists for the pair). `discriminator` must be an ADR-029
-    /// supported type (Int / Timestamp / Float / Bool / String / Blob); a
+    /// instance exists for the pair). `discriminator` must be a supported
+    /// discriminator type (Int / Timestamp / Float / Bool / String / Blob); a
     /// non-supported value is a [`StoreError::Invariant`] — the schema validates
     /// the column type at DDL time, so this cannot happen for correct callers.
     fn put_edge_discriminated(
@@ -232,7 +232,7 @@ pub trait EdgeStore {
     // shape) ──────────────────────────────────────────────────────────────
     // The query layer reads/writes edge properties as a flat
     // `Vec<(interned_field_id, Value)>` (no HashMap), matching the on-disk
-    // codec (ADR-040). `valid_from_ms: Some(vf)` selects the per-version
+    // codec. `valid_from_ms: Some(vf)` selects the per-version
     // temporal key; `None` the non-temporal key. These own both key encoding
     // and the value codec (Layer-4 responsibility).
 
@@ -443,7 +443,7 @@ pub trait EdgeStore {
 
 /// CE single-shard implementation of [`EdgeStore`]. Stateless — all
 /// storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// method.
 pub struct LocalEdgeStore;
 
 impl LocalEdgeStore {

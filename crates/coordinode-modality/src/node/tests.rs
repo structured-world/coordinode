@@ -319,7 +319,7 @@ fn scan_versions_on_empty_node_returns_empty() {
 
 #[test]
 fn get_at_boundary_i64_min_max() {
-    // Per ADR-027 valid_from_ms is i64. Test we can write at the
+    // valid_from_ms is i64. Test we can write at the
     // extreme boundaries and the sortable encoding still works.
     let db = open();
     let id = NodeId::from_raw(41);

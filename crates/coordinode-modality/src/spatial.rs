@@ -49,12 +49,12 @@
 //!   exact-distance post-filter, bbox containment check.
 //! - **Doesn't:** compound spatial+property indexes (that surface lives
 //!   in [`IndexStore`](crate::IndexStore)), bitemporal `valid_from`
-//!   index keys (ADR-027 follow-up), polygon containment (needs S2
+//!   index keys, polygon containment (needs S2
 //!   covering), spatial histograms / cardinality estimates (planner
 //!   concern). 3D Hilbert and proper S2 cells land as follow-up; the
 //!   trait surface is already shaped for them.
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Transaction threading
 //!
 //! Spatial point entries are a secondary index in [`Partition::Idx`].
 //! Writes (`insert` / `delete`) take `&mut Transaction` and buffer the
@@ -167,7 +167,7 @@ pub struct Bbox {
 /// `(label_id, crs)` — one logical index per `(label, property)` pair
 /// in the higher schema layer.
 ///
-/// ## Transaction threading (ADR-041)
+/// ## Transaction threading
 ///
 /// Writes ([`Self::insert`] / [`Self::delete`]) take `&mut Transaction`
 /// and buffer the point-index `Partition::Idx` mutation on it, so the
@@ -232,7 +232,7 @@ pub trait SpatialStore {
 
 /// CE single-shard `SpatialStore` implementation. Stateless — all
 /// storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// method.
 pub struct LocalSpatialStore;
 
 fn encode_spatial_prefix(label_id: u32, crs: Crs) -> Vec<u8> {
@@ -682,7 +682,7 @@ fn hilbert_quad_range(cx_min: u64, cy_min: u64, size: u64) -> (u64, u64) {
 fn hilbert_2d_decompose(bx_min: u32, bx_max: u32, by_min: u32, by_max: u32) -> Vec<(u64, u64)> {
     // Hilbert boundary leaves emit the WHOLE quad (not a tight intersection, which
     // isn't a contiguous Hilbert range), so resolve boundaries finely (deep cap)
-    // and bound the count with the output cap. The G101 seekable skip-scan makes
+    // and bound the count with the output cap. The seekable skip-scan makes
     // many intervals cheap (in-place reseek), so a generous interval budget pays.
     // Recursion work is O(bbox perimeter), not O(depth) — only boundary quads
     // recurse — so a deep cap buys tight boundary leaves for small bboxes; the
@@ -909,7 +909,7 @@ fn encode_curve(point: &Point) -> u64 {
         }
         Crs::Cartesian2d => {
             // Hilbert (not Morton): better spatial locality for flat Cartesian
-            // spaces, per arch/core/spatial.md. WGS-84 keeps Morton until the S2
+            // spaces. WGS-84 keeps Morton until the S2
             // swap; Cartesian-3D keeps Morton (3D Hilbert is a follow-up).
             let x = quantise_u32(point.coords[0], -1e9, 1e9);
             let y = quantise_u32(point.coords[1], -1e9, 1e9);

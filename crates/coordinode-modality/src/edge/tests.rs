@@ -121,7 +121,7 @@ fn edge_without_props_returns_none_from_get_props() {
 
 #[test]
 fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
-    // Snapshot-aware read (backup export path, ADR-040): an edge written
+    // Snapshot-aware read (backup export path): an edge written
     // with a property body is returned through a plain engine snapshot,
     // and a property-less edge returns None (not "missing edge").
     let db = open();
@@ -152,7 +152,7 @@ fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
 
 #[test]
 fn put_props_direct_writes_canonical_body_readable_via_snapshot() {
-    // Direct engine write (backup restore path, ADR-016 — no transaction).
+    // Direct engine write (backup restore path, no transaction).
     // The body must be readable through a plain snapshot and byte-identical
     // to a transactional put_edge write (single canonical codec).
     let db = open();
@@ -650,7 +650,7 @@ fn posting_at_snapshot_returns_empty_present_list_not_none() {
     assert!(got.expect("some").is_empty());
 }
 
-// -- Discriminated edges (ADR-029) --
+// -- Discriminated edges --
 
 #[test]
 fn discriminated_put_get_roundtrip_and_absent_is_none() {

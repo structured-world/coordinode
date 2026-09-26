@@ -19,7 +19,7 @@
 //! `delete_chunk` directly — the only safe way to drop a chunk is
 //! through the GC.
 //!
-//! ## Data plane vs metadata plane (ADR-011)
+//! ## Data plane vs metadata plane
 //!
 //! Blobs follow the object-store separation that lets Ceph/MinIO scale:
 //! bulk object **data** is placed directly on storage, **never** routed

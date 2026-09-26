@@ -7,7 +7,7 @@ use coordinode_storage::engine::transaction::CommitContext;
 
 #[test]
 fn morton_intervals_decomposes_equatorial_band() {
-    // Regression lock for the G101 seekable skip-scan win: the equatorial
+    // Regression lock for the seekable skip-scan win: the equatorial
     // band (full lon, ±0.5° lat) has broad/decomposed ratio = 3, so it must
     // take the decomposed (multi-interval) path. If a future GAIN_THRESHOLD
     // bump pushes it back to the broad scan, the 85%-faster band path

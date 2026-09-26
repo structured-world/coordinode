@@ -43,7 +43,7 @@
 //! - **Late-arrival routing** (Tier 1 in-buffer / Tier 2 bucket re-
 //!   open / Tier 3 overflow) — the catalog decides which method to
 //!   call; this store implements the actual writes.
-//! - **Bitemporal axes** (`__ingestion_ts__` field, ADR-027) — added
+//! - **Bitemporal axes** (`__ingestion_ts__` field) — added
 //!   per measurement at the catalog layer before the bucket is
 //!   written via [`TimeSeriesStore::put_bucket`].
 //!
@@ -62,7 +62,7 @@
 //! ally deletes its overflow set via
 //! [`TimeSeriesStore::compact_overflow`].
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Transaction threading
 //!
 //! Every method threads the active [`Transaction`]. Writes
 //! (`put_bucket` / `delete_bucket` / `put_overflow` /
@@ -158,7 +158,7 @@ impl BucketControl {
 
 /// Single time-series measurement: one event-time + N named float
 /// fields, with an optional **engine-assigned** ingestion-time
-/// stamp (the second axis of the bitemporal model from ADR-027).
+/// stamp (the second axis of the bitemporal model).
 ///
 /// ## Bitemporal axes
 ///
@@ -392,7 +392,7 @@ pub trait TimeSeriesStore {
     ) -> StoreResult<bool>;
 
     /// Re-open a previously closed bucket so the catalog's late-arrival
-    /// Tier-2 path can append into it (ADR-027). Returns:
+    /// Tier-2 path can append into it. Returns:
     ///
     /// - `Ok(true)` — bucket existed and `closed` flipped from `true`
     ///   to `false` (or was already `false`).
@@ -456,7 +456,7 @@ pub trait TimeSeriesStore {
 
 /// CE single-shard implementation of [`TimeSeriesStore`]. Stateless —
 /// all storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// method.
 ///
 /// Buckets land in [`Partition::Node`] keyed by the standard node
 /// shard+id encoder; overflow entries live in [`Partition::Idx`]

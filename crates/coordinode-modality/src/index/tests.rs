@@ -252,7 +252,7 @@ fn scan_exact_missing_returns_empty() {
 
 #[test]
 fn sortable_type_ordering_null_lt_bool_lt_int_lt_string() {
-    // ADR contract: Value ordering Null < Bool < Int < Float <
+    // Index key contract: Value ordering Null < Bool < Int < Float <
     // String < Timestamp. scan_all walks in encoded-key order so
     // we can read the type ordering off directly. One entry per
     // type, all under the same index name and node_id 1.
@@ -274,7 +274,7 @@ fn sortable_type_ordering_null_lt_bool_lt_int_lt_string() {
     let all = store.scan_all("mix").expect("scan");
     assert_eq!(all.len(), 4);
     // The keys themselves carry the encoded value bytes — verify
-    // their order matches the ADR contract by comparing prefixes
+    // their order matches that contract by comparing prefixes
     // pairwise (each later key sorts >= the previous one).
     for pair in all.windows(2) {
         assert!(

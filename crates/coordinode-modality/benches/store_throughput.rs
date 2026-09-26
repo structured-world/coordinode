@@ -42,7 +42,7 @@ fn mk_engine() -> (TempDir, StorageEngine) {
 
 /// Buffer store writes on one MVCC transaction and commit — bench
 /// setup helper for the engine-backed stores now threaded through a
-/// transaction (ADR-041).
+/// transaction.
 fn bench_write(engine: &StorageEngine, body: impl FnOnce(&mut Transaction)) {
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let read_ts = oracle.next();

@@ -1,6 +1,5 @@
 //! Document store — path-targeted partial updates on DOCUMENT
-//! properties of [`NodeRecord`] via the [`DocumentMerge`] operator
-//! (ADR-015).
+//! properties of [`NodeRecord`] via the [`DocumentMerge`] operator.
 //!
 //! Document-typed properties (Mongo-like nested maps + arrays) are
 //! mutated through commutative [`DocDelta`] operands rather than
@@ -9,7 +8,7 @@
 //! merge function replays operands in seqno order against the base
 //! `NodeRecord` during reads and compaction.
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Transaction threading
 //!
 //! Every method takes an explicit `&mut Transaction`. The encoded
 //! [`DocDelta`] operand is buffered via
@@ -141,7 +140,7 @@ pub trait DocumentStore {
 
 /// CE single-shard implementation of [`DocumentStore`]. Stateless — all
 /// storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// method.
 pub struct LocalDocumentStore;
 
 impl LocalDocumentStore {

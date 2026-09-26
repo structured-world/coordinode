@@ -1,7 +1,7 @@
 //! Node store — typed read/write of [`NodeRecord`] in
 //! [`Partition::Node`], with first-class support for both
-//! non-temporal labels (one row per node id, ADR pre-027) and
-//! temporal labels (one row per `valid_from` version, ADR-027).
+//! non-temporal labels (one row per node id) and
+//! temporal labels (one row per `valid_from` version).
 //!
 //! The store hides:
 //!
@@ -12,7 +12,7 @@
 //! - Shard-scoped scans (prefix walks over a known shard).
 //! - Per-id temporal version walks (prefix walks over a known id).
 //!
-//! ## Transaction threading (ADR-041)
+//! ## Transaction threading
 //!
 //! Every method takes an explicit `&mut Transaction` (writes) or
 //! `&Transaction` (reads). Writes buffer on the transaction and apply
@@ -315,7 +315,7 @@ pub trait NodeStore {
 
 /// CE single-shard implementation of [`NodeStore`]. Stateless — all
 /// storage access flows through the [`Transaction`] passed to each
-/// method (ADR-041).
+/// method.
 pub struct LocalNodeStore;
 
 impl LocalNodeStore {

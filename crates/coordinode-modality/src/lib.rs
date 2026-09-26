@@ -27,7 +27,7 @@
 //!
 //! The **Threading** column records how each store reaches Layer 3.
 //! `Transaction` stores thread the active transaction through every
-//! method (ADR-041): writes buffer on it and commit atomically with the
+//! method: writes buffer on it and commit atomically with the
 //! surrounding graph mutation; reads go through its MVCC snapshot. The
 //! exceptions: [`IndexStore`] is a hybrid whose secondary-index entry
 //! writes stay engine-direct while DDL definition writes thread a
@@ -41,17 +41,14 @@
 //! | Modality | Trait | CE impl | Threading |
 //! |----------|-------|---------|-----------|
 //! | Schema (label / edge-type / migration / chunk-assignment DDL state) | [`SchemaStore`] | [`LocalSchemaStore`] | `Transaction` |
-//! | Node (incl. temporal versioning, ADR-027) | [`NodeStore`] | [`LocalNodeStore`] | `Transaction` |
+//! | Node (incl. temporal versioning) | [`NodeStore`] | [`LocalNodeStore`] | `Transaction` |
 //! | Edge (adjacency + properties, non-temporal) | [`EdgeStore`] | [`LocalEdgeStore`] | `Transaction` |
-//! | Document (path-targeted DOCUMENT merge deltas, ADR-015) | [`DocumentStore`] | [`LocalDocumentStore`] | `Transaction` |
+//! | Document (path-targeted DOCUMENT merge deltas) | [`DocumentStore`] | [`LocalDocumentStore`] | `Transaction` |
 //! | Spatial (CRS point index) | [`SpatialStore`] | [`LocalSpatialStore`] | `Transaction` |
 //! | TimeSeries (bucket + overflow) | [`TimeSeriesStore`] | [`LocalTimeSeriesStore`] | `Transaction` |
 //! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] | split (chunks `engine` data-plane, refs `Transaction`) |
 //! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] | hybrid (entries `engine`, DDL `Transaction`) |
 //! | Vector (HNSW KNN index) | [`VectorStore`] | [`LocalVectorStore`] | `engine` (in-memory graph) |
-//!
-//! See the storage stack architecture document for the full Layer 4
-//! contract.
 //!
 //! ## Error model
 //!

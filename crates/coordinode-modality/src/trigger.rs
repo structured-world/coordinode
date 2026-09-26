@@ -12,7 +12,7 @@
 //!
 //! This store owns ONLY the key encoding and the `Partition::Schema` binding;
 //! it hands raw bytes back and forth so the query layer keeps the value codec
-//! (`rmp_serde`) and its diagnostic error messages (ADR-041 raw-bytes pattern).
+//! (`rmp_serde`) and its diagnostic error messages (the raw-bytes pattern).
 
 use coordinode_core::schema::triggers::{
     encode_trigger_index_key, encode_trigger_key, encode_trigger_pending_key, trigger_scan_prefix,
@@ -68,7 +68,7 @@ pub trait TriggerStore {
     fn scan_definitions(&self, txn: &mut Transaction) -> StoreResult<Vec<KvPair>>;
 
     /// Buffer a queued AFTER COMMIT event write at
-    /// `trigger_pending:<name>:<seq>` (the trigger architecture, ADR-026). Called
+    /// `trigger_pending:<name>:<seq>`. Called
     /// inside the committing transaction so the enqueue is atomic with the user
     /// mutation that triggered it; the dispatcher consumes the queue afterwards.
     fn put_pending(

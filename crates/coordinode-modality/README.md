@@ -17,9 +17,9 @@ encoders, and physical placement from the query layer.
 | Schema (label / edge-type / migration DDL) | `SchemaStore` | `LocalSchemaStore` |
 | Blob (content-addressed chunks + blob refs) | `BlobStore` | `LocalBlobStore` |
 | Index (secondary B-tree, compound, full-text) | `IndexStore` | `LocalIndexStore` |
-| Node (CRUD + temporal versioning ADR-027) | `NodeStore` | `LocalNodeStore` |
-| Edge (adjacency + properties; temporal ADR-027) | `EdgeStore` | `LocalEdgeStore` |
-| Document (path-targeted partial updates ADR-015) | `DocumentStore` | `LocalDocumentStore` |
+| Node (CRUD + temporal versioning) | `NodeStore` | `LocalNodeStore` |
+| Edge (adjacency + properties; temporal) | `EdgeStore` | `LocalEdgeStore` |
+| Document (path-targeted partial updates) | `DocumentStore` | `LocalDocumentStore` |
 | Vector (HNSW approximate nearest neighbour) | `VectorStore` | `LocalVectorStore` |
 | TimeSeries (bucket persistence + overflow) | `TimeSeriesStore` | `LocalTimeSeriesStore` |
 | Spatial (4 CRS: WGS-84 2D/3D, Cartesian 2D/3D) | `SpatialStore` | `LocalSpatialStore` |

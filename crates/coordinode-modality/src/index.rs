@@ -306,7 +306,7 @@ impl IndexStore for LocalIndexStore<'_> {
         if removed == 0 {
             return Ok(0);
         }
-        // Drop the whole `idx:name:` prefix with a single range tombstone (G096)
+        // Drop the whole `idx:name:` prefix with a single range tombstone
         // instead of `removed` point tombstones — the index keyspace is a dense
         // contiguous prefix. Falls back to per-key only for the degenerate
         // all-0xFF prefix (never produced by `index_prefix`).
