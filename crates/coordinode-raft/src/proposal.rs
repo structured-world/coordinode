@@ -1,8 +1,8 @@
 //! Proposal pipeline implementations.
 //!
 //! - [`LocalProposalPipeline`]: single-node CE / embedded mode. Applies
-//!   mutations directly to StorageEngine without Raft replication.
-//!   ADR-016: uses plain engine.put()/delete() — oracle auto-stamps seqno.
+//!   mutations directly to StorageEngine without Raft replication, the
+//!   whole proposal at one seqno equal to its `commit_ts`.
 //! - [`RaftProposalPipeline`]: 3-node HA cluster mode. Replicates mutations
 //!   via openraft before applying. Includes rate limiting, retry with
 //!   exponential backoff, and dedup tracking.
@@ -127,7 +127,7 @@ impl<'a> LocalProposalPipeline<'a> {
 
 impl ProposalPipeline for LocalProposalPipeline<'_> {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
-        // The whole proposal lands at one seqno, its commit_ts (ADR-016), so a
+        // The whole proposal lands at one seqno, its commit_ts, so a
         // snapshot at commit_ts sees all of it and one tick earlier none.
         self.engine
             .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
@@ -356,6 +356,53 @@ impl RaftProposalPipeline {
             })
     }
 
+    /// Rate-limiter permits for one attempt at `proposal`, weighted by
+    /// `attempt`, or none when the proposal bypasses the limiter. Every write
+    /// concern admits through here, so the bypass holds for all of them.
+    async fn admit(
+        &self,
+        proposal: &RaftProposal,
+        attempt: u32,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ProposalError> {
+        if proposal.bypass_rate_limiter {
+            metrics::counter!("coordinode_raft_proposals_bypassed_total").increment(1);
+            return Ok(None);
+        }
+        self.rate_limiter.acquire(attempt).await.map(Some)
+    }
+
+    /// Submit `proposal` without waiting for any member to hold it (`w:0`).
+    ///
+    /// Fire-and-forget: the write goes through the leader and the log like
+    /// any other; only the waiting is skipped. A member that is not the
+    /// leader still refuses, so the caller can route.
+    async fn propose_unacked(
+        &self,
+        proposal: &RaftProposal,
+    ) -> Result<ProposalOutcome, ProposalError> {
+        {
+            use openraft::rt::watch::WatchReceiver;
+            let rx = self.raft.metrics();
+            let m = rx.borrow_watched();
+            if !m.state.is_leader() {
+                return Err(ProposalError::NotLeader {
+                    leader_id: m.current_leader,
+                });
+            }
+        }
+        let _permit = self.admit(proposal, 0).await?;
+        let raft = Arc::clone(&self.raft);
+        let request = Request::single(proposal.clone());
+        let id = proposal.id;
+        self.spawn_handle()?.spawn(async move {
+            if let Err(e) = raft.client_write(request).await {
+                tracing::warn!(proposal_id = %id, error = %e, "w:0 write did not commit");
+            }
+        });
+        metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
+        Ok(ProposalOutcome::local())
+    }
+
     /// Submit `proposal` and return once `n` members hold it durably, the
     /// leader counted first.
     ///
@@ -393,7 +440,7 @@ impl RaftProposalPipeline {
         // Subscribe before submitting: the append may fire before the future
         // below is even polled.
         let mut appended = notifier.subscribe(proposal.id);
-        let _permit = self.rate_limiter.acquire(0).await?;
+        let _permit = self.admit(proposal, 0).await?;
         let raft = Arc::clone(&self.raft);
         let request = Request::single(proposal.clone());
         let mut commit = self
@@ -499,12 +546,7 @@ impl RaftProposalPipeline {
             // Delta/membership proposals bypass the limiter entirely —
             // they are latency-sensitive and must not be delayed by
             // backpressure from regular mutation proposals.
-            let _permit = if proposal.bypass_rate_limiter {
-                metrics::counter!("coordinode_raft_proposals_bypassed_total").increment(1);
-                None
-            } else {
-                Some(self.rate_limiter.acquire(attempt).await?)
-            };
+            let _permit = self.admit(proposal, attempt).await?;
 
             // Submit to Raft with timeout
             let result =
@@ -630,32 +672,7 @@ impl ProposalPipeline for RaftProposalPipeline {
             WriteAck::Acks(n) => n,
         };
         if n == 0 {
-            // Fire-and-forget: the write goes through the leader and the log
-            // like any other; only the waiting is skipped. A member that is
-            // not the leader still refuses, so the caller can route.
-            return self.block_on_runtime(async {
-                {
-                    use openraft::rt::watch::WatchReceiver;
-                    let rx = self.raft.metrics();
-                    let m = rx.borrow_watched();
-                    if !m.state.is_leader() {
-                        return Err(ProposalError::NotLeader {
-                            leader_id: m.current_leader,
-                        });
-                    }
-                }
-                let _permit = self.rate_limiter.acquire(0).await?;
-                let raft = Arc::clone(&self.raft);
-                let request = Request::single(proposal.clone());
-                let id = proposal.id;
-                self.spawn_handle()?.spawn(async move {
-                    if let Err(e) = raft.client_write(request).await {
-                        tracing::warn!(proposal_id = %id, error = %e, "w:0 write did not commit");
-                    }
-                });
-                metrics::counter!("coordinode_raft_proposals_total", "status" => "ok").increment(1);
-                Ok(ProposalOutcome::local())
-            });
+            return self.block_on_runtime(self.propose_unacked(proposal));
         }
         let Some(notifier) = self.append_notifier.as_ref() else {
             // No way to see the leader's own append: wait for the majority,

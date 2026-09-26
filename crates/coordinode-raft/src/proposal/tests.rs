@@ -259,8 +259,8 @@ async fn rate_limiter_timeout_on_exhaustion() {
     assert!(result.is_err(), "should timeout when all permits taken");
 }
 
-/// G035: bypass_rate_limiter=true skips semaphore acquisition.
-/// Proposal succeeds even when rate limiter is fully exhausted.
+/// bypass_rate_limiter=true skips semaphore acquisition: with the only
+/// permit held, a normal proposal waits while a bypass proposal commits.
 #[tokio::test(flavor = "multi_thread")]
 async fn rate_limiter_bypass_succeeds_when_exhausted() {
     let (_dir, engine) = test_engine();
@@ -268,16 +268,16 @@ async fn rate_limiter_bypass_succeeds_when_exhausted() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Create pipeline with capacity=1
     let pipeline = RaftProposalPipeline::with_max_pending(Arc::clone(node.raft()), 1);
     let id_gen = ProposalIdGenerator::new();
 
-    // Exhaust the rate limiter by holding a permit
-    // (We can't directly exhaust it from outside, so we test via
-    // proposal behavior: a normal proposal uses the semaphore,
-    // a bypass proposal doesn't.)
+    // Exhaust the limiter: hold its only permit for the rest of the test.
+    let _held = pipeline
+        .rate_limiter
+        .acquire(0)
+        .await
+        .expect("take the permit");
 
-    // Normal proposal — should succeed (uses 1 of 1 permits)
     let normal = RaftProposal {
         id: id_gen.next(),
         mutations: vec![Mutation::Put {
@@ -289,9 +289,13 @@ async fn rate_limiter_bypass_succeeds_when_exhausted() {
         start_ts: Timestamp::from_raw(99),
         bypass_rate_limiter: false,
     };
-    pipeline.propose_and_wait(&normal).expect("normal propose");
+    let blocked =
+        tokio::time::timeout(Duration::from_millis(200), pipeline.propose_async(&normal)).await;
+    assert!(
+        blocked.is_err(),
+        "a normal proposal must wait while the limiter is exhausted"
+    );
 
-    // Bypass proposal — should also succeed (skips semaphore entirely)
     let bypass = RaftProposal {
         id: id_gen.next(),
         mutations: vec![Mutation::Put {
@@ -303,9 +307,61 @@ async fn rate_limiter_bypass_succeeds_when_exhausted() {
         start_ts: Timestamp::from_raw(199),
         bypass_rate_limiter: true,
     };
-    pipeline
-        .propose_and_wait(&bypass)
-        .expect("G035: bypass proposal should succeed regardless of rate limiter state");
+    tokio::time::timeout(Duration::from_secs(5), pipeline.propose_async(&bypass))
+        .await
+        .expect("a bypass proposal must not wait on the exhausted limiter")
+        .expect("bypass proposal commits");
+
+    node.shutdown().await.expect("shutdown");
+}
+
+/// The bypass flag belongs to the proposal, so it holds for every write
+/// concern: `w:0` and `w:1` must not wait on an exhausted limiter either.
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limiter_bypass_holds_below_majority() {
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(engine).await.expect("bootstrap");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let notifier = Arc::clone(node.append_notifier());
+    let pipeline = RaftProposalPipeline {
+        rate_limiter: RateLimiter::new(1),
+        ..RaftProposalPipeline::with_append_notifier(Arc::clone(node.raft()), Arc::clone(&notifier))
+    };
+    let id_gen = ProposalIdGenerator::new();
+    let _held = pipeline
+        .rate_limiter
+        .acquire(0)
+        .await
+        .expect("take the permit");
+
+    let bypass = |key: &[u8], ts: u64| RaftProposal {
+        id: id_gen.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.to_vec(),
+            value: b"delta".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: true,
+    };
+
+    let unacked = bypass(b"node:1:w0", 100);
+    tokio::time::timeout(Duration::from_secs(5), pipeline.propose_unacked(&unacked))
+        .await
+        .expect("a w:0 bypass proposal must not wait on the exhausted limiter")
+        .expect("w:0 bypass proposal is accepted");
+
+    let acked = bypass(b"node:1:w1", 200);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        pipeline.propose_acks(&acked, 1, &notifier),
+    )
+    .await
+    .expect("a w:1 bypass proposal must not wait on the exhausted limiter")
+    .expect("w:1 bypass proposal is held by the leader");
 
     node.shutdown().await.expect("shutdown");
 }
@@ -347,7 +403,7 @@ fn node_scoped_id_high_bits_preserved() {
     assert_eq!(id.as_raw() >> 48, node_id);
 }
 
-// ── propose_with_timeout tests (G048) ────────────────────────
+// ── propose_with_timeout tests ───────────────────────────────
 
 /// LocalProposalPipeline: propose_with_timeout delegates to propose_and_wait
 /// (ignores timeout). Proposals complete in µs, timeout irrelevant.
