@@ -1,16 +1,7 @@
-//! Server startup and response-header integration tests (R150).
+//! Server startup and response-header integration tests.
 //!
 //! These tests exercise the multi-protocol handler, `NodeInfoLayer` response
 //! headers, and CE/EE mode validation against a real `coordinode` binary.
-//!
-//! ## Test matrix
-//!
-//! | Test | Gap | Scenario |
-//! |------|-----|---------|
-//! | `node_info_headers_present_in_grpc_response` | R150 | `x-coordinode-node/hops/load` injected by NodeInfoLayer |
-//! | `x_coordinode_node_value_matches_default_node_id` | R150 | node_id=1 (default) reflected in `x-coordinode-node` header |
-//! | `ee_mode_compute_rejected_at_startup` | R150 | `--mode=compute` exits non-zero with "coordinode-ee" message |
-//! | `ee_mode_storage_rejected_at_startup` | R150 | `--mode=storage` exits non-zero with "coordinode-ee" message |
 //!
 //! ## Running
 //!
@@ -58,8 +49,8 @@ async fn cypher_raw(
 ///
 /// CE invariants tested:
 /// - All three headers are present on every response
-/// - `x-coordinode-hops` is "0" (CE has no routing — always local)
-/// - `x-coordinode-load` is "0" (load tracking deferred to R151)
+/// - `x-coordinode-hops` is "0" for a request this node served itself
+/// - `x-coordinode-load` is "0": the server does not track load yet
 /// - EE-only header `x-coordinode-shard-hint` must NOT be present
 #[tokio::test]
 async fn node_info_headers_present_in_grpc_response() {
@@ -82,13 +73,13 @@ async fn node_info_headers_present_in_grpc_response() {
         "x-coordinode-load header must be present"
     );
 
-    // CE hops must be 0 (no routing layer)
+    // A single node serves the request itself: no forwarding hop.
     let hops = meta.get("x-coordinode-hops").unwrap().to_str().unwrap();
-    assert_eq!(hops, "0", "CE must always report 0 hops (local execution)");
+    assert_eq!(hops, "0", "a locally served request must report 0 hops");
 
-    // CE load must be 0 (tracking deferred to R151)
+    // Load is not tracked yet, so the header is always 0.
     let load = meta.get("x-coordinode-load").unwrap().to_str().unwrap();
-    assert_eq!(load, "0", "CE load tracking not yet implemented (R151)");
+    assert_eq!(load, "0", "load is not tracked, the header must be 0");
 
     // EE-only shard-hint must NOT be present in CE binary
     assert!(

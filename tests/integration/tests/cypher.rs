@@ -1,20 +1,8 @@
 //! CypherService gRPC integration tests.
 //!
 //! These tests exercise `CypherService` endpoints against a real `coordinode`
-//! binary spawned in a temp directory.
-//!
-//! ## Test matrix
-//!
-//! | Test | Gap | Scenario |
-//! |------|-----|---------|
-//! | `g088_causal_write_without_concern_uses_the_majority_default` | G088 | Write + after_index > 0 + no write_concern → OK (default is majority) |
-//! | `g088_causal_write_with_w1_rejected` | G088 | Write + after_index > 0 + w:1 → FAILED_PRECONDITION |
-//! | `g088_causal_write_with_majority_accepted` | G088 | Write + after_index > 0 + MAJORITY → OK |
-//! | `write_concern_volatile_journal_above_leader_rejected` | | w:majority + j:memory → INVALID_ARGUMENT with INVALID_WRITE_CONCERN |
-//! | `g088_causal_read_without_majority_accepted` | G088 | Read + after_index > 0 + no write_concern → OK (gate skipped) |
-//! | `bug5_match_set_persists_across_queries` | Bug5 | MATCH+SET change must be visible in subsequent MATCH RETURN (no index) |
-//! | `bug5_match_set_persists_with_btree_index` | Bug5 | MATCH+SET change must be visible in subsequent MATCH RETURN (with B-tree index) |
-//! | `bug_latent_set_after_delete_must_not_show_unwritten_value` | LatentBug | DELETE+SET: RETURN must not show value when write was not applied (out_row.insert outside if-let block) |
+//! binary spawned in a temp directory: write-concern validation in causal
+//! sessions, MATCH+SET persistence, and temporal edges end to end.
 //!
 //! ## Running
 //!
@@ -82,7 +70,7 @@ fn int_val(row: &HashMap<String, PropertyValue>, col: &str) -> Option<i64> {
     }
 }
 
-// ── G088: write-concern validation in causal sessions ─────────────────────────
+// ── Write-concern validation in causal sessions ───────────────────────────────
 
 /// Causal write without write_concern is accepted end-to-end (gRPC path):
 /// the default is majority with the write journaled, which is exactly what
@@ -93,13 +81,13 @@ fn int_val(row: &HashMap<String, PropertyValue>, col: &str) -> Option<i64> {
 ///     → after_index > 0, is_write() == true, write_concern == None
 ///       → the majority default → OK
 #[tokio::test]
-async fn g088_causal_write_without_concern_uses_the_majority_default() {
+async fn causal_write_without_concern_uses_the_majority_default() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
     let result = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "CREATE (n:G088Test {x: 1})".to_string(),
+            query: "CREATE (n:CausalWrite {x: 1})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
             read_concern: Some(ReadConcern {
@@ -124,13 +112,13 @@ async fn g088_causal_write_without_concern_uses_the_majority_default() {
 /// The leader alone is insufficient for causal sessions: the write may never
 /// replicate, making the returned applied_index a dangling dependency.
 #[tokio::test]
-async fn g088_causal_write_with_w1_rejected() {
+async fn causal_write_with_w1_rejected() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
     let result = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "MERGE (n:G088Test {x: 2})".to_string(),
+            query: "MERGE (n:CausalWrite {x: 2})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
             read_concern: Some(ReadConcern {
@@ -162,15 +150,15 @@ async fn g088_causal_write_with_w1_rejected() {
 /// MAJORITY is the minimum required durability — the server accepts and
 /// executes the write normally in standalone mode.
 #[tokio::test]
-async fn g088_causal_write_with_majority_accepted() {
+async fn causal_write_with_majority_accepted() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
-    // after_index: 1 — triggers G088 gate (after_index > 0) but is immediately
+    // after_index: 1 triggers the causal write-concern gate (after_index > 0) but is immediately
     // satisfied because standalone Raft has applied_index >= 1 after election.
     let result = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "CREATE (n:G088Test {x: 3})".to_string(),
+            query: "CREATE (n:CausalWrite {x: 3})".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
             read_concern: Some(ReadConcern {
@@ -237,15 +225,15 @@ async fn write_concern_volatile_journal_above_leader_rejected() {
 /// The write-concern gate is only entered for mutating statements. MATCH
 /// queries bypass the gate regardless of write_concern value.
 #[tokio::test]
-async fn g088_causal_read_without_majority_accepted() {
+async fn causal_read_without_majority_accepted() {
     let server = CoordinodeProcess::start().await;
     let mut client = server.cypher_client().await;
 
-    // after_index: 1 — triggers G088 gate check (after_index > 0) and is
+    // after_index: 1 reaches the causal write-concern gate (after_index > 0) and is
     // immediately satisfied on standalone (applied_index >= 1 after election).
     let result = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "MATCH (n:G088Test) RETURN n".to_string(),
+            query: "MATCH (n:CausalWrite) RETURN n".to_string(),
             parameters: HashMap::new(),
             read_preference: 0,
             read_concern: Some(ReadConcern {
@@ -265,31 +253,31 @@ async fn g088_causal_read_without_majority_accepted() {
     );
 }
 
-// ── Bug5: MATCH+SET property change must persist across query boundaries ──────
+// ── MATCH+SET property change must persist across query boundaries ────────────
 
-/// Regression test (Bug5): MATCH+SET must be visible in a subsequent query.
+/// Regression test: MATCH+SET must be visible in a subsequent query.
 ///
-/// Exact reproduction of the production bug report (v0.3.14/0.3.15):
+/// Exact reproduction of the v0.3.14/0.3.15 bug report:
 ///   Step 1: MERGE (p:Project {id: "x"}) SET p.status = "active"  → creates node
 ///   Step 2: MATCH (p:Project {id: "x"}) SET p.status = "removed" RETURN p.status → "removed" ✓
 ///   Step 3: MATCH (p:Project {id: "x"}) RETURN p.status → must return "removed" (bug: returned "active")
 ///
 /// Uses NodeScan path (no B-tree index).
 #[tokio::test]
-async fn bug5_match_set_persists_across_queries() {
+async fn match_set_persists_across_queries() {
     let server = CoordinodeProcess::start().await;
 
     // Step 1: create node via MERGE+SET.
     cypher_q(
         &server,
-        "MERGE (p:Bug5Test {id: 'x'}) SET p.status = 'active'",
+        "MERGE (p:SetPersist {id: 'x'}) SET p.status = 'active'",
     )
     .await;
 
     // Step 2: update via MATCH+SET — must return "removed" within the same query.
     let step2 = cypher_q(
         &server,
-        "MATCH (p:Bug5Test {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
+        "MATCH (p:SetPersist {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
     )
     .await;
     assert_eq!(step2.len(), 1, "step2 must return exactly one row");
@@ -300,7 +288,11 @@ async fn bug5_match_set_persists_across_queries() {
     );
 
     // Step 3: new query — the change must persist.
-    let step3 = cypher_q(&server, "MATCH (p:Bug5Test {id: 'x'}) RETURN p.status AS s").await;
+    let step3 = cypher_q(
+        &server,
+        "MATCH (p:SetPersist {id: 'x'}) RETURN p.status AS s",
+    )
+    .await;
     assert_eq!(step3.len(), 1, "step3 must return exactly one row");
     assert_eq!(
         str_val(&step3[0], "s").as_deref(),
@@ -311,9 +303,9 @@ async fn bug5_match_set_persists_across_queries() {
     );
 }
 
-// ── Latent bug: RETURN must not show value when write was not applied ─────────
+// ── RETURN must not show a value when the write was not applied ───────────────
 
-/// Regression test (latent): RETURN must not expose a SET value that was never written.
+/// Regression test: RETURN must not expose a SET value that was never written.
 ///
 /// Exact reproduction path:
 ///   1. CREATE a node.
@@ -328,13 +320,13 @@ async fn bug5_match_set_persists_across_queries() {
 ///
 /// Invariant tested: RETURN must only reflect writes that were actually committed to storage.
 #[tokio::test]
-async fn bug_latent_set_after_delete_must_not_show_unwritten_value() {
+async fn set_after_delete_must_not_show_unwritten_value() {
     let server = CoordinodeProcess::start().await;
 
     // Step 1: create node.
     cypher_q(
         &server,
-        "MERGE (n:LatentBug {id: 'x'}) SET n.status = 'original'",
+        "MERGE (n:SetAfterDelete {id: 'x'}) SET n.status = 'original'",
     )
     .await;
 
@@ -344,7 +336,7 @@ async fn bug_latent_set_after_delete_must_not_show_unwritten_value() {
     let mut client = server.cypher_client().await;
     let result = client
         .execute_cypher(ExecuteCypherRequest {
-            query: "MATCH (n:LatentBug {id: 'x'}) \
+            query: "MATCH (n:SetAfterDelete {id: 'x'}) \
                     DELETE n \
                     SET n.status = 'ghost' \
                     RETURN n.status AS s"
@@ -387,7 +379,7 @@ async fn bug_latent_set_after_delete_must_not_show_unwritten_value() {
     // Step 3: node must not exist — DELETE must have been applied.
     let after = cypher_q(
         &server,
-        "MATCH (n:LatentBug {id: 'x'}) RETURN n.status AS s",
+        "MATCH (n:SetAfterDelete {id: 'x'}) RETURN n.status AS s",
     )
     .await;
     assert_eq!(
@@ -398,30 +390,34 @@ async fn bug_latent_set_after_delete_must_not_show_unwritten_value() {
     );
 }
 
-/// Regression test (Bug5): MATCH+SET must persist when a B-tree index is present.
+/// Regression test: MATCH+SET must persist when a B-tree index is present.
 ///
-/// Same as `bug5_match_set_persists_across_queries` but with an index on :Bug5Idx(id),
+/// Same as `match_set_persists_across_queries` but with an index on :SetPersistIdx(id),
 /// forcing the executor to use the IndexScan path instead of NodeScan.
 /// The B-tree index write in `on_property_changed` (Partition::Idx) must not
 /// interfere with the Node partition write buffered in the MVCC write buffer.
 #[tokio::test]
-async fn bug5_match_set_persists_with_btree_index() {
+async fn match_set_persists_with_btree_index() {
     let server = CoordinodeProcess::start().await;
 
     // Create a B-tree index to force the IndexScan path.
-    cypher_q(&server, "CREATE INDEX idx_bug5_id ON :Bug5Idx(id)").await;
+    cypher_q(
+        &server,
+        "CREATE INDEX idx_set_persist_id ON :SetPersistIdx(id)",
+    )
+    .await;
 
     // Step 1: create node (index entry is also created).
     cypher_q(
         &server,
-        "MERGE (p:Bug5Idx {id: 'x'}) SET p.status = 'active'",
+        "MERGE (p:SetPersistIdx {id: 'x'}) SET p.status = 'active'",
     )
     .await;
 
     // Step 2: update via MATCH+SET using the index.
     let step2 = cypher_q(
         &server,
-        "MATCH (p:Bug5Idx {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
+        "MATCH (p:SetPersistIdx {id: 'x'}) SET p.status = 'removed' RETURN p.status AS s",
     )
     .await;
     assert_eq!(step2.len(), 1, "step2 must return exactly one row");
@@ -432,7 +428,11 @@ async fn bug5_match_set_persists_with_btree_index() {
     );
 
     // Step 3: new query via IndexScan — the change must persist.
-    let step3 = cypher_q(&server, "MATCH (p:Bug5Idx {id: 'x'}) RETURN p.status AS s").await;
+    let step3 = cypher_q(
+        &server,
+        "MATCH (p:SetPersistIdx {id: 'x'}) RETURN p.status AS s",
+    )
+    .await;
     assert_eq!(step3.len(), 1, "step3 must return exactly one row");
     assert_eq!(
         str_val(&step3[0], "s").as_deref(),
@@ -443,13 +443,13 @@ async fn bug5_match_set_persists_with_btree_index() {
     );
 }
 
-// ── R171: Temporal Edges ─────────────────────────────────────────────────────
+// ── Temporal edges ───────────────────────────────────────────────────────────
 
 /// Alice WORKS_AT three companies over three time periods. Verifies the full
 /// temporal stack: CREATE EDGE TYPE TEMPORAL → multi-version CREATE → version
 /// fan-out on read → temporal_active_at point-in-time filtering.
 #[tokio::test]
-async fn r171_temporal_edge_alice_works_at_three_companies() {
+async fn temporal_edge_alice_works_at_three_companies() {
     let server = CoordinodeProcess::start().await;
 
     // Declare the temporal edge type.
@@ -552,7 +552,7 @@ async fn r171_temporal_edge_alice_works_at_three_companies() {
 /// CREATE on a TEMPORAL edge type without a `valid_from` property must fail
 /// with a clear message — temporal edges have no defined version without it.
 #[tokio::test]
-async fn r171_temporal_create_without_valid_from_rejected() {
+async fn temporal_create_without_valid_from_rejected() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -596,7 +596,7 @@ async fn r171_temporal_create_without_valid_from_rejected() {
 /// every edge type, not specific to temporal), so closing an existing version
 /// in-place is not yet supported.
 #[tokio::test]
-async fn r171_temporal_closed_version_inactive_after_valid_to() {
+async fn temporal_closed_version_inactive_after_valid_to() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -654,7 +654,7 @@ async fn r171_temporal_closed_version_inactive_after_valid_to() {
 /// overlaps `[t0, t1)`. Three versions on the same pair: only the ones whose
 /// validity touches the query window are returned.
 #[tokio::test]
-async fn r171_temporal_overlaps_filters_by_window() {
+async fn temporal_overlaps_filters_by_window() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -706,7 +706,7 @@ async fn r171_temporal_overlaps_filters_by_window() {
 /// remains in the graph and answers true to temporal_active_at before the
 /// close time, false after.
 #[tokio::test]
-async fn r171_temporal_set_valid_to_soft_closes_version() {
+async fn temporal_set_valid_to_soft_closes_version() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -780,7 +780,7 @@ async fn r171_temporal_set_valid_to_soft_closes_version() {
 /// DELETE r on a temporal edge is a hard delete: every version of the
 /// matched (src, tgt) pair vanishes and adj-posting is cleared.
 #[tokio::test]
-async fn r171_temporal_delete_removes_all_versions() {
+async fn temporal_delete_removes_all_versions() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -832,7 +832,7 @@ async fn r171_temporal_delete_removes_all_versions() {
 /// SET r.<prop> on a non-temporal edge updates the single edgeprop entry.
 /// Baseline test: this MUST work for any edge type, not only temporal ones.
 #[tokio::test]
-async fn r171_set_on_non_temporal_edge_property() {
+async fn set_on_non_temporal_edge_property() {
     let server = CoordinodeProcess::start().await;
     cypher_q(&server, "CREATE (:User {id: 'u1'}), (:User {id: 'u2'})").await;
     cypher_q(
@@ -866,7 +866,7 @@ async fn r171_set_on_non_temporal_edge_property() {
 /// SET r.valid_to = NULL re-opens a closed temporal version: the row goes back
 /// to being active for all timestamps >= valid_from. Mirror of soft-close.
 #[tokio::test]
-async fn r171_temporal_set_valid_to_null_reopens_version() {
+async fn temporal_set_valid_to_null_reopens_version() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -929,7 +929,7 @@ async fn r171_temporal_set_valid_to_null_reopens_version() {
 /// SET r.valid_from on a temporal edge is rejected with a clear message —
 /// valid_from is part of the storage key and cannot be mutated in place.
 #[tokio::test]
-async fn r171_temporal_set_valid_from_rejected() {
+async fn temporal_set_valid_from_rejected() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -969,7 +969,7 @@ async fn r171_temporal_set_valid_from_rejected() {
 
 /// Temporal CREATE with valid_to <= valid_from is rejected.
 #[tokio::test]
-async fn r171_temporal_invalid_interval_rejected() {
+async fn temporal_invalid_interval_rejected() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1001,7 +1001,7 @@ async fn r171_temporal_invalid_interval_rejected() {
 /// DETACH DELETE on a node with temporal edges removes every version of every
 /// temporal edge connected to that node — no orphan EdgeProp entries.
 #[tokio::test]
-async fn r171_detach_delete_cascades_temporal_versions() {
+async fn detach_delete_cascades_temporal_versions() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1046,7 +1046,7 @@ async fn r171_detach_delete_cascades_temporal_versions() {
 /// MERGE on a temporal edge type is rejected with a clear message pointing to
 /// CREATE — multi-version semantics don't fit MERGE's match-or-create model.
 #[tokio::test]
-async fn r171_temporal_merge_rejected() {
+async fn temporal_merge_rejected() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1077,7 +1077,7 @@ async fn r171_temporal_merge_rejected() {
 
 /// temporal_overlaps with bound parameter still pushes down (after substitution).
 #[tokio::test]
-async fn r171_temporal_overlaps_with_parameters() {
+async fn temporal_overlaps_with_parameters() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1134,7 +1134,7 @@ async fn r171_temporal_overlaps_with_parameters() {
 /// Self-loop temporal edge: same node as src and tgt. Adjacency, prefix scan,
 /// and DELETE all behave correctly.
 #[tokio::test]
-async fn r171_temporal_self_loop() {
+async fn temporal_self_loop() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1170,7 +1170,7 @@ async fn r171_temporal_self_loop() {
 /// Calling `temporal_active_at` on a non-temporal edge returns false rather
 /// than erroring — the row has no `r.valid_from`, function gracefully fails.
 #[tokio::test]
-async fn r171_temporal_active_at_on_non_temporal_edge_returns_false() {
+async fn temporal_active_at_on_non_temporal_edge_returns_false() {
     let server = CoordinodeProcess::start().await;
     cypher_q(&server, "CREATE (:U {id: 'a'}), (:U {id: 'b'})").await;
     cypher_q(
@@ -1194,7 +1194,7 @@ async fn r171_temporal_active_at_on_non_temporal_edge_returns_false() {
 /// Two overlapping open versions on the same pair: engine accepts; reads
 /// return both; `temporal_active_at` returns both as active.
 #[tokio::test]
-async fn r171_temporal_overlapping_open_versions_engine_permissive() {
+async fn temporal_overlapping_open_versions_engine_permissive() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1228,7 +1228,7 @@ async fn r171_temporal_overlapping_open_versions_engine_permissive() {
 /// MATCH without binding the relationship variable must NOT fan out across
 /// versions: the result is per-pair existence, not per-version multiplicity.
 #[tokio::test]
-async fn r171_match_without_edge_variable_does_not_fan_out() {
+async fn temporal_match_without_edge_variable_does_not_fan_out() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1265,7 +1265,7 @@ async fn r171_match_without_edge_variable_does_not_fan_out() {
 /// behave correctly per type: temporal yields one row per version, non-temporal
 /// yields one row per pair.
 #[tokio::test]
-async fn r171_wildcard_mixed_temporal_and_non_temporal() {
+async fn wildcard_mixed_temporal_and_non_temporal() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1303,7 +1303,7 @@ async fn r171_wildcard_mixed_temporal_and_non_temporal() {
 /// Backward traversal `(a)<-[r:T]-(b)` enumerates temporal versions like the
 /// forward direction.
 #[tokio::test]
-async fn r171_temporal_backward_traversal() {
+async fn temporal_backward_traversal() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1335,7 +1335,7 @@ async fn r171_temporal_backward_traversal() {
 /// Two temporal traversals in one query, each with their own time predicate.
 /// Push-down may or may not lift; correctness must hold regardless.
 #[tokio::test]
-async fn r171_multiple_temporal_traversals() {
+async fn multiple_temporal_traversals() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1375,7 +1375,7 @@ async fn r171_multiple_temporal_traversals() {
 
 /// SET multiple properties in a single SET clause on a temporal edge.
 #[tokio::test]
-async fn r171_temporal_set_multi_property() {
+async fn temporal_set_multi_property() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1409,7 +1409,7 @@ async fn r171_temporal_set_multi_property() {
 /// doesn't lift it (chain isn't a direct FunctionCall) but execution must
 /// still produce the correct result via the row-level Filter.
 #[tokio::test]
-async fn r171_temporal_predicate_in_and_chain() {
+async fn temporal_predicate_in_and_chain() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1449,7 +1449,7 @@ async fn r171_temporal_predicate_in_and_chain() {
 
 /// temporal_active_at(r, NULL) returns false rather than erroring.
 #[tokio::test]
-async fn r171_temporal_active_at_with_null_returns_false() {
+async fn temporal_active_at_with_null_returns_false() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1475,7 +1475,7 @@ async fn r171_temporal_active_at_with_null_returns_false() {
 /// write overwrites the first (engine permissive, value-blob "last wins").
 /// Documented as overwrite semantics, not a duplicate-key violation.
 #[tokio::test]
-async fn r171_duplicate_valid_from_overwrites() {
+async fn temporal_duplicate_valid_from_overwrites() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1509,7 +1509,7 @@ async fn r171_duplicate_valid_from_overwrites() {
 
 /// Negative valid_from (pre-epoch) round-trips and orders correctly.
 #[tokio::test]
-async fn r171_negative_valid_from_works() {
+async fn temporal_negative_valid_from_works() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1544,7 +1544,7 @@ async fn r171_negative_valid_from_works() {
 /// Temporal edges survive process restart (graceful kill + respawn against
 /// same data directory).
 #[tokio::test]
-async fn r171_temporal_survives_restart() {
+async fn temporal_survives_restart() {
     let mut server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1599,7 +1599,7 @@ async fn r171_temporal_survives_restart() {
 /// encoding without overflow. Upper-bound key uses `saturating_add(1)` so the
 /// extreme case doesn't wrap.
 #[tokio::test]
-async fn r171_temporal_boundary_valid_from() {
+async fn temporal_boundary_valid_from() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1634,7 +1634,7 @@ async fn r171_temporal_boundary_valid_from() {
 /// temporal_overlaps with an inverted window (t0 > t1) yields no matches —
 /// no version's interval can overlap an empty window.
 #[tokio::test]
-async fn r171_temporal_overlaps_inverted_window_returns_empty() {
+async fn temporal_overlaps_inverted_window_returns_empty() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,
@@ -1660,7 +1660,7 @@ async fn r171_temporal_overlaps_inverted_window_returns_empty() {
 /// valid-time filter. After deleting all versions, AS OF still surfaces the
 /// pre-delete state, and temporal_active_at on that historical state works.
 #[tokio::test]
-async fn r171_as_of_timestamp_composes_with_temporal_active_at() {
+async fn as_of_timestamp_composes_with_temporal_active_at() {
     let server = CoordinodeProcess::start().await;
     cypher_q(
         &server,

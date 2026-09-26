@@ -1,4 +1,4 @@
-//! coordinode-client causal session API integration tests (G089).
+//! coordinode-client causal session API integration tests.
 //!
 //! These tests exercise the `coordinode-client` Rust driver's causal session
 //! API against a real `coordinode` binary. They verify that:
@@ -22,7 +22,7 @@
 use coordinode_client::{CausalToken, CoordinodeClient, Value};
 use coordinode_integration::harness::CoordinodeProcess;
 
-// ── G089: causal session API round-trip ───────────────────────────────────────
+// ── Causal session API round-trip ─────────────────────────────────────────────
 
 /// `execute_causal_write` sends write with MAJORITY concern and returns a
 /// `CausalToken`.  In standalone mode applied_index is non-zero after the
@@ -34,7 +34,7 @@ use coordinode_integration::harness::CoordinodeProcess;
 ///   - A subsequent causal read (fenced by the token) succeeds and returns the
 ///     written node.
 #[tokio::test]
-async fn g089_causal_write_returns_token_and_causal_read_sees_write() {
+async fn causal_write_returns_token_and_causal_read_sees_write() {
     let server = CoordinodeProcess::start().await;
 
     let mut client = CoordinodeClient::connect(server.endpoint())
@@ -44,7 +44,7 @@ async fn g089_causal_write_returns_token_and_causal_read_sees_write() {
     // Causal write: CREATE a node with a unique marker.
     let (rows, token) = client
         .execute_causal_write(
-            "CREATE (n:G089Test {marker: 'causal_round_trip'}) RETURN n.marker AS m",
+            "CREATE (n:CausalTest {marker: 'causal_round_trip'}) RETURN n.marker AS m",
         )
         .await
         .expect("causal write must succeed");
@@ -67,7 +67,7 @@ async fn g089_causal_write_returns_token_and_causal_read_sees_write() {
     // Causal read: fenced by the token — must observe the write we just made.
     let read_rows = client
         .execute_causal_read(
-            "MATCH (n:G089Test {marker: 'causal_round_trip'}) RETURN n.marker AS m",
+            "MATCH (n:CausalTest {marker: 'causal_round_trip'}) RETURN n.marker AS m",
             token,
         )
         .await
@@ -87,7 +87,7 @@ async fn g089_causal_write_returns_token_and_causal_read_sees_write() {
 /// `execute_causal_write_with_params` exercises the parameterised variant.
 /// Verifies that parameters are correctly forwarded through the causal write path.
 #[tokio::test]
-async fn g089_causal_write_with_params_round_trip() {
+async fn causal_write_with_params_round_trip() {
     let server = CoordinodeProcess::start().await;
 
     let mut client = CoordinodeClient::connect(server.endpoint())
@@ -99,7 +99,7 @@ async fn g089_causal_write_with_params_round_trip() {
 
     let (rows, token) = client
         .execute_causal_write_with_params(
-            "CREATE (n:G089Param {id: $id}) RETURN n.id AS id",
+            "CREATE (n:CausalParam {id: $id}) RETURN n.id AS id",
             params,
         )
         .await
@@ -115,7 +115,7 @@ async fn g089_causal_write_with_params_round_trip() {
 
     let read_rows = client
         .execute_causal_read_with_params(
-            "MATCH (n:G089Param {id: $id}) RETURN n.id AS id",
+            "MATCH (n:CausalParam {id: $id}) RETURN n.id AS id",
             read_params,
             token,
         )
@@ -135,7 +135,7 @@ async fn g089_causal_write_with_params_round_trip() {
 /// (no fence). This is the graceful degradation path for code that runs in
 /// both standalone and cluster configurations.
 #[tokio::test]
-async fn g089_zero_token_causal_read_is_accepted() {
+async fn zero_token_causal_read_is_accepted() {
     let server = CoordinodeProcess::start().await;
 
     let mut client = CoordinodeClient::connect(server.endpoint())

@@ -1,19 +1,10 @@
 //! Standalone restart regression tests.
 //!
-//! Each test exercises a bug that was reported against the gRPC/standalone
-//! code path (NOT reproducible via coordinode-embed because the embed API
-//! bypasses proto serialisation for schema creation).
-//!
-//! ## Test matrix
-//!
-//! | Test | Bug | Scenario |
-//! |------|-----|---------|
-//! | `bug2_vector_write_before_restart_also_works` | Bug2 | VECTOR schema created via gRPC gets dimensions=0. Writing a vector fails with "dimension mismatch: expected 0, got N". |
-//! | `bug2_vector_zero_dimensions_survives_restart` | Bug2 | After restart, vector write still fails with the same dimension mismatch. |
-//! | `bug1_merge_unique_no_restart` | Bug1 | MERGE on existing unique node must not throw a unique constraint error. |
-//! | `bug1_merge_unique_after_restart` | Bug1 | Same, but the node was created before a restart. |
-//! | `bug3_hnsw_flexible_rebuilt_after_restart` | Bug3 | After restart, vector similarity queries on Flexible-mode labels return correct results. |
-//! | `bug4_flexible_match_invisible_after_restart` | Bug4 | After restart, MATCH with property filter returns 0 in FLEXIBLE mode even though the node exists (unique constraint rejects duplicate CREATE). Label scan also returns 0. |
+//! Each test covers the gRPC/standalone path, which the embedded API cannot
+//! reproduce because it bypasses proto serialisation for schema creation:
+//! vector writes against a gRPC-declared VECTOR property, MERGE on a unique
+//! key, vector search on a FLEXIBLE label, MATCH visibility in FLEXIBLE mode,
+//! and startup after an unclean shutdown, each before and after a restart.
 //!
 //! ## Running
 //!
@@ -93,17 +84,12 @@ fn pv_string(s: &str) -> PropertyValue {
     }
 }
 
-// ── Bug2: vector dimension mismatch ──────────────────────────────────────────
+// ── Vector property declared over gRPC ────────────────────────────────────────
 
-/// Bug2 — first write fails (no restart needed).
-///
-/// Root cause: `proto_type_to_property_type(PROPERTY_TYPE_VECTOR=7)` hardcodes
-/// `dimensions = 0`. Validation then rejects any vector write because
-/// `vec.len() != 0`.
-///
-/// Fix: treat `dimensions = 0` as "unset/any" sentinel — skip the check.
+/// A VECTOR property declared over gRPC carries no dimensions, so the schema
+/// records 0 ("unset") and a vector of any length must be accepted.
 #[tokio::test]
-async fn bug2_vector_write_before_restart_also_works() {
+async fn vector_write_to_grpc_declared_property_succeeds() {
     let proc = CoordinodeProcess::start().await;
 
     // Create label with VECTOR property via gRPC SchemaService.
@@ -128,18 +114,16 @@ async fn bug2_vector_write_before_restart_also_works() {
     let result = cypher(&proc, "CREATE (n:VecNode {emb: $vec}) RETURN n", params).await;
     assert!(
         result.is_ok(),
-        "Bug2: vector write must succeed when schema has dimensions=0. Got: {:?}",
+        "vector write must succeed when schema has dimensions=0. Got: {:?}",
         result.err()
     );
     assert_eq!(result.unwrap().len(), 1, "should return 1 created node");
 }
 
-/// Bug2 — vector write fails AFTER restart.
-///
-/// The dimensions=0 schema persists to msgpack on disk. After restart, the
-/// schema is reloaded with dimensions=0 and the same validation failure occurs.
+/// The dimensions=0 schema persists on disk; after a restart it is reloaded
+/// as-is and a vector write must still be accepted.
 #[tokio::test]
-async fn bug2_vector_zero_dimensions_survives_restart() {
+async fn vector_zero_dimensions_survives_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // Step 1: create schema + write initial vector BEFORE restart.
@@ -173,7 +157,7 @@ async fn bug2_vector_zero_dimensions_survives_restart() {
     let result = cypher(&proc, "CREATE (n:VecRestart {emb: $vec})", params).await;
     assert!(
         result.is_ok(),
-        "Bug2: vector write after restart must succeed. Got: {:?}",
+        "vector write after restart must succeed. Got: {:?}",
         result.err()
     );
 
@@ -184,12 +168,12 @@ async fn bug2_vector_zero_dimensions_survives_restart() {
     assert_eq!(rows.len(), 2, "both nodes must survive restart");
 }
 
-// ── Bug1: MERGE unique constraint ─────────────────────────────────────────────
+// ── MERGE on a unique key ─────────────────────────────────────────────────────
 
-/// Bug1 — MERGE on an existing unique node throws a unique constraint error
-/// instead of performing an ON MATCH update.
+/// MERGE on an existing unique node must take the ON MATCH branch, not raise
+/// a unique constraint violation.
 #[tokio::test]
-async fn bug1_merge_unique_no_restart() {
+async fn merge_on_existing_unique_key_matches() {
     let proc = CoordinodeProcess::start().await;
 
     let mut sc = proc.schema_client().await;
@@ -225,15 +209,15 @@ async fn bug1_merge_unique_no_restart() {
     .await;
     assert!(
         result.is_ok(),
-        "Bug1: MERGE on existing unique node must succeed (ON MATCH). Got: {:?}",
+        "MERGE on existing unique node must succeed (ON MATCH). Got: {:?}",
         result.err()
     );
     assert_eq!(result.unwrap().len(), 1, "should return 1 matched node");
 }
 
-/// Bug1 — same as above but after a restart (tests schema reload path).
+/// Same as above across a restart, through the schema reload path.
 #[tokio::test]
-async fn bug1_merge_unique_after_restart() {
+async fn merge_on_existing_unique_key_matches_after_restart() {
     let proc = CoordinodeProcess::start().await;
 
     let mut sc = proc.schema_client().await;
@@ -272,29 +256,19 @@ async fn bug1_merge_unique_after_restart() {
     .await;
     assert!(
         result.is_ok(),
-        "Bug1: MERGE on existing unique node after restart must succeed. Got: {:?}",
+        "MERGE on existing unique node after restart must succeed. Got: {:?}",
         result.err()
     );
     assert_eq!(result.unwrap().len(), 1, "should return 1 matched node");
 }
 
-// ── Bug3: HNSW not rebuilt for Flexible mode after restart ────────────────────
+// ── Vector search on a FLEXIBLE label across a restart ────────────────────────
 
-/// Bug3 — after restart, vector similarity search on Flexible-mode labels
-/// returns no results.
-///
-/// Root cause (diagnosed via this test): the gRPC server path uses
-/// `LocalProposalPipeline` which has no WAL. When the process was killed via
-/// SIGKILL the LSM memtable was never flushed to SST files → nodes disappeared
-/// entirely after restart. The symptom looked like an HNSW rebuild failure,
-/// but the data itself was gone.
-///
-/// Fix: added SIGTERM handler (`serve_with_shutdown`) to the server so that
-/// graceful shutdown flushes memtables via `StorageEngine::Drop`. The test
-/// harness now sends SIGTERM and waits for the process to exit before
-/// restarting.
+/// Vector similarity search on a FLEXIBLE label must return the same number
+/// of results after a graceful restart as before it: the nodes survive and
+/// their vectors are readable and searchable again.
 #[tokio::test]
-async fn bug3_hnsw_flexible_rebuilt_after_restart() {
+async fn flexible_vector_search_survives_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // Create a Flexible-mode label with a VECTOR property.
@@ -335,7 +309,7 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
     .expect("vector search before restart");
     assert!(
         !rows_before.is_empty(),
-        "Bug3: vector search must return results before restart"
+        "vector search must return results before restart"
     );
 
     // Restart.
@@ -355,7 +329,7 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
         coordinode_integration::proto::common::PropertyValue {
             value: Some(coordinode_integration::proto::common::property_value::Value::IntValue(5))
         },
-        "Bug3 diagnostic: 5 nodes must still exist after restart, got {node_count:?}"
+        "5 nodes must still exist after restart, got {node_count:?}"
     );
 
     // Diagnostic: verify n.emb is readable after restart.
@@ -364,7 +338,7 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
         .expect("emb read after restart");
     assert!(
         !emb_rows.is_empty(),
-        "Bug3 diagnostic: MATCH FlexVec must return at least 1 row after restart"
+        "MATCH FlexVec must return at least 1 row after restart"
     );
 
     // Vector search must still return results after restart.
@@ -379,7 +353,7 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
     .expect("vector search after restart");
     assert!(
         !rows_after.is_empty(),
-        "Bug3: vector search must return results after restart (HNSW must be rebuilt). Got 0 rows.\
+        "vector search must return results after restart (HNSW must be rebuilt). Got 0 rows.\
          \nNote: 5 nodes exist (checked above), n.emb readable (checked above).\
          \nFailing in VectorTopK or vector_similarity evaluation."
     );
@@ -390,28 +364,19 @@ async fn bug3_hnsw_flexible_rebuilt_after_restart() {
     );
 }
 
-// ── Bug4: MATCH invisible after restart in FLEXIBLE mode ──────────────────────
-
 // ── SIGKILL restart: crash recovery (no graceful shutdown) ───────────────────
 
-/// Verify that CoordiNode survives an unclean shutdown (SIGKILL) and restarts
-/// without crashing.
+/// A server killed with SIGKILL must start again and accept queries.
 ///
-/// Root cause of the crash: after an unclean shutdown the Raft oplog segment
-/// file exists on disk but the LSM key `raft:oplog:last_log_id` was not
-/// flushed before process death.  On restart, `LogStore::open()` saw
-/// `last_log_id = None`, openraft treated the log as empty, called
-/// `initialize()`, and tried to create `oplog-0000.bin` with `create_new`
-/// semantics — failing with EEXIST (os error 17).
+/// After an unclean shutdown the Raft oplog segment can be on disk while the
+/// LSM key `raft:oplog:last_log_id` is not, so `LogStore::open()` has to
+/// recover the last log id from the segment files; treating the log as empty
+/// would re-initialise it and fail creating a segment that already exists.
 ///
-/// Fix: `LogStore::open()` now reconstructs `last_log_id` from existing oplog
-/// segment files when the LSM key is absent.
-///
-/// This test exercises the end-to-end path: write data → SIGKILL → restart.
-/// Because SIGKILL may lose in-flight memtable data, we don't assert on the
-/// node count after restart — only that the server starts and accepts queries.
+/// The node count is not asserted: whether the last writes reached the log
+/// before the kill is not under the test's control.
 #[tokio::test]
-async fn bug5_sigkill_restart_survives_without_crash() {
+async fn sigkill_restart_survives_without_crash() {
     let proc = CoordinodeProcess::start().await;
 
     // Write several nodes to ensure the Raft log has entries fsynced.
@@ -435,27 +400,14 @@ async fn bug5_sigkill_restart_survives_without_crash() {
     );
 }
 
-/// Bug4 — after restart, `MATCH (n:Label {prop: $val})` returns 0 results in
-/// FLEXIBLE schema mode, even though the node demonstrably exists.
-///
-/// Evidence of existence:
-///   - `CREATE (n:Label {prop: $val})` → unique constraint violation (index sees it)
-///   - `MERGE (n:Label {prop: $val})` → succeeds and returns the node (MERGE uses
-///     the unique-index lookup path)
-///
-/// Full label scan `MATCH (n:Label) DETACH DELETE n` also returns 0 → indicates
-/// the label-level node roster is not rebuilt on restart, leaving nodes
-/// "constraint-visible" but "query-invisible".
-///
-/// Workaround (cxbr-common): use `MERGE … ON MATCH SET … ON CREATE SET …`
-/// instead of `MATCH … SET` / `CREATE`.
-///
-/// Root cause hypothesis: the in-memory label scan index is not repopulated from
-/// LSM on server startup in FLEXIBLE mode (STRICT mode is unaffected because
-/// Bug1/Bug2 are already fixed there). The unique constraint index is stored
-/// durably in LSM and rebuilt correctly; the label scan uses a different path.
+// ── MATCH visibility in FLEXIBLE mode across a restart ────────────────────────
+
+/// After a restart, a node on a FLEXIBLE label must be visible to every read
+/// path at once: MATCH with a property filter, a full label scan, and the
+/// unique constraint (a duplicate CREATE is refused). A node the constraint
+/// sees but MATCH does not is the failure this guards.
 #[tokio::test]
-async fn bug4_flexible_match_invisible_after_restart() {
+async fn flexible_match_visible_after_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // 1. Create a FLEXIBLE label with one unique declared property.
@@ -521,7 +473,7 @@ async fn bug4_flexible_match_invisible_after_restart() {
         Some(PropertyValue {
             value: Some(PvKind::IntValue(1))
         }),
-        "Bug4: MATCH with property filter must find node after restart in FLEXIBLE mode. \
+        "MATCH with property filter must find node after restart in FLEXIBLE mode. \
          Got: {:?}",
         match_rows
     );
@@ -535,7 +487,7 @@ async fn bug4_flexible_match_invisible_after_restart() {
         Some(PropertyValue {
             value: Some(PvKind::IntValue(1))
         }),
-        "Bug4: full label scan must find node after restart. Got: {:?}",
+        "full label scan must find node after restart. Got: {:?}",
         scan_rows
     );
 
@@ -545,7 +497,7 @@ async fn bug4_flexible_match_invisible_after_restart() {
     let dup = cypher(&proc, "CREATE (s:FlexPersist {key: $k})", params).await;
     assert!(
         dup.is_err(),
-        "Bug4: CREATE with same unique key must fail after restart (unique constraint). \
+        "CREATE with same unique key must fail after restart (unique constraint). \
          Got: Ok — node is query-invisible AND constraint-invisible (data lost entirely)"
     );
 }

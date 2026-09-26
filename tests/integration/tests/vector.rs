@@ -1,10 +1,5 @@
-//! Vector index regression tests.
-//!
-//! ## Test matrix
-//!
-//! | Test | Bug | Scenario |
-//! |------|-----|---------|
-//! | `g082_set_updates_hnsw_graph_position` | G082 | `MATCH (n) SET n.emb = $vec` must update the indexed vector so that subsequent vector similarity searches reflect the new value. |
+//! Vector index regression tests: `MATCH (n) SET n.emb = $vec` must update
+//! the indexed vector so later similarity searches see the new value.
 //!
 //! ## Running
 //!
@@ -66,9 +61,9 @@ fn pv_vector(values: Vec<f32>) -> PropertyValue {
     }
 }
 
-// ── G082: SET updates vector index ────────────────────────────────────────────
+// ── SET updates vector index ──────────────────────────────────────────────────
 
-/// G082 — `MATCH (n) SET n.emb = $vec` must update the stored vector so that
+/// `MATCH (n) SET n.emb = $vec` must update the stored vector so that
 /// subsequent `vector_similarity()` queries reflect the new value.
 ///
 /// Root cause: `HnswIndex::insert()` returned early ("Already indexed") when
@@ -88,7 +83,7 @@ fn pv_vector(values: Vec<f32>) -> PropertyValue {
 ///   query "right": cos(A_new)=1.0, cos(B)=0, cos(C)=0  → A wins ✓
 ///   query "up":    cos(A_new)=0,   cos(B)≈0.8, cos(C)=0 → B wins, not A ✓
 #[tokio::test]
-async fn g082_set_updates_hnsw_graph_position() {
+async fn set_updates_hnsw_graph_position() {
     let proc = CoordinodeProcess::start().await;
 
     let mut sc = proc.schema_client().await;
@@ -176,7 +171,7 @@ async fn g082_set_updates_hnsw_graph_position() {
     assert_eq!(
         top_right.as_deref(),
         Some("A"),
-        "G082: after SET n.emb to 'right', 'right' query must return A (cos=1.0). \
+        "after SET n.emb to 'right', 'right' query must return A (cos=1.0). \
          Got: {:?}",
         top_right
     );
@@ -203,7 +198,7 @@ async fn g082_set_updates_hnsw_graph_position() {
     assert_ne!(
         top_up.as_deref(),
         Some("A"),
-        "G082: after SET n.emb to 'right', 'up' query must NOT return A \
+        "after SET n.emb to 'right', 'up' query must NOT return A \
          (B scores cos≈0.8 vs A's cos=0). Got: {:?}",
         top_up
     );

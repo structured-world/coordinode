@@ -48,7 +48,7 @@ use tonic::transport::Channel;
 /// This exercises the full production path:
 ///   standalone binary → gRPC → ClusterService::decommission_node()
 ///     → RaftNode::decommission_node(1, false, false)
-///       → Phase 0: quorum check → FAILED_PRECONDITION
+///       → quorum gate → FAILED_PRECONDITION
 ///
 /// A 1-node cluster with node_id=1 cannot remove its only voter — that
 /// would leave zero voters and permanently lose the cluster.
@@ -129,7 +129,7 @@ async fn get_cluster_status_standalone_reports_single_leader() {
 ///   DecommissionNode(self) on the leader
 ///     → find_transfer_target() → transfer_leadership_to(peer)
 ///       → gRPC forward DecommissionNode to the new leader
-///         → Phase 0 quorum gate + Phase 2 change_membership (remove node 1)
+///         → quorum gate + change_membership (remove node 1)
 ///
 /// Needs a real 3-node cluster across three processes, since the forward is a
 /// genuine gRPC call to the peer's advertised address.
