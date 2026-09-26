@@ -1037,6 +1037,115 @@ fn multi_hop_pattern_predicate_unbound_intermediate() {
     assert_eq!(names, vec!["Alice".to_string()]);
 }
 
+/// An inline edge property map inside a pattern predicate filters the edge:
+/// only the source whose edge carries the matching value passes, a wrong
+/// value excludes it. Guards the documented pattern-predicate scope.
+#[test]
+fn pattern_predicate_inline_edge_property_filter() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    for stmt in [
+        "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob'}), (:User {name: 'Carol'})",
+        "MATCH (a:User {name: 'Alice'}), (b:User {name: 'Bob'}) \
+         CREATE (a)-[:RATES {weight: 5}]->(b)",
+        "MATCH (c:User {name: 'Carol'}), (b:User {name: 'Bob'}) \
+         CREATE (c)-[:RATES {weight: 1}]->(b)",
+    ] {
+        run_cypher_with_alloc(stmt, engine, &mut interner, &allocator);
+    }
+
+    // The predicate, its EXISTS spelling and the plain MATCH must agree.
+    let mut wrong = Vec::new();
+    for query in [
+        "MATCH (a:User), (b:User {name: 'Bob'}) \
+         WHERE (a)-[:RATES {weight: 5}]->(b) RETURN a.name AS name",
+        "MATCH (a:User), (b:User {name: 'Bob'}) \
+         WHERE EXISTS { MATCH (a)-[:RATES {weight: 5}]->(b) } RETURN a.name AS name",
+        "MATCH (a:User)-[:RATES {weight: 5}]->(b:User {name: 'Bob'}) RETURN a.name AS name",
+        "MATCH (a:User)-[r:RATES {weight: 5}]->(b:User {name: 'Bob'}) RETURN a.name AS name",
+        "MATCH (a:User)-[r:RATES]->(b:User {name: 'Bob'}) WHERE r.weight = 5 RETURN a.name AS name",
+    ] {
+        let rows = run_cypher_with_alloc(query, engine, &mut interner, &allocator);
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if names != ["Alice"] {
+            wrong.push(format!("{query} -> {names:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "expected only Alice from: {wrong:#?}");
+
+    let none = run_cypher_with_alloc(
+        "MATCH (a:User), (b:User {name: 'Bob'}) \
+         WHERE (a)-[:RATES {weight: 7}]->(b) RETURN a.name AS name",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert!(none.is_empty(), "no edge has weight 7, got {none:?}");
+
+    // The binding the filter runs through is internal: RETURN * shows only
+    // the query's own variables.
+    let star = run_cypher_with_alloc(
+        "MATCH (a:User)-[:RATES {weight: 5}]->(b:User) RETURN *",
+        engine,
+        &mut interner,
+        &allocator,
+    );
+    assert_eq!(star.len(), 1);
+    let leaked: Vec<&String> = star[0]
+        .keys()
+        .filter(|k| !(k.starts_with('a') || k.starts_with('b')))
+        .collect();
+    assert!(leaked.is_empty(), "internal columns leaked: {leaked:?}");
+}
+
+/// A property map on a variable-length relationship applies to every hop:
+/// a path through an edge without the value does not match.
+#[test]
+fn variable_length_inline_edge_property_filter_applies_to_every_hop() {
+    let fx = test_engine();
+    let engine = &fx.engine;
+    let mut interner = FieldInterner::new();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
+
+    for stmt in [
+        "CREATE (:Stop {name: 'A'}), (:Stop {name: 'B'}), (:Stop {name: 'C'}), (:Stop {name: 'D'})",
+        "MATCH (a:Stop {name: 'A'}), (b:Stop {name: 'B'}) CREATE (a)-[:ROAD {open: true}]->(b)",
+        "MATCH (b:Stop {name: 'B'}), (c:Stop {name: 'C'}) CREATE (b)-[:ROAD {open: true}]->(c)",
+        "MATCH (c:Stop {name: 'C'}), (d:Stop {name: 'D'}) CREATE (c)-[:ROAD {open: false}]->(d)",
+    ] {
+        run_cypher_with_alloc(stmt, engine, &mut interner, &allocator);
+    }
+
+    let mut wrong = Vec::new();
+    for query in [
+        "MATCH (:Stop {name: 'A'})-[:ROAD*1..3 {open: true}]->(t:Stop) RETURN t.name AS name",
+        "MATCH (:Stop {name: 'A'})-[r:ROAD*1..3 {open: true}]->(t:Stop) RETURN t.name AS name",
+    ] {
+        let rows = run_cypher_with_alloc(query, engine, &mut interner, &allocator);
+        let mut names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| match r.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        if names != ["B", "C"] {
+            wrong.push(format!("{query} -> {names:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "expected B and C only from: {wrong:#?}");
+}
+
 // ── Correlated inline property filter (regression) ──────────────────────
 
 #[test]

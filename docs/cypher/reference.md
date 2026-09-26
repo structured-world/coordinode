@@ -48,7 +48,7 @@ WHERE NOT (a)-[:BLOCKED]->(b)             -- negated pattern predicate
 WHERE n.score > 0 XOR n.featured = true
 ```
 
-**Pattern-predicate scope (current vs planned).** Today single-hop pattern predicates with bound endpoints work; multi-hop predicates with an unbound intermediate (`WHERE (a)-[:R]->(x)-[:R]->(b)`) and inline edge property filters (`WHERE (a)-[:R {weight: 5}]->(b)`) parse but evaluate to `false`. Both shapes are scheduled to land together via the `EXISTS { MATCH … }` subquery executor (R525) which the parser/planner will use as the desugar target for any non-trivial pattern predicate — multi-hop chains, edge property filters, and variable-length paths reuse the existing MATCH planner uniformly.
+**Pattern-predicate scope.** A pattern predicate is planned exactly like `EXISTS { MATCH <pattern> }`, so every shape MATCH accepts works here: multi-hop chains with an unbound intermediate (`WHERE (a)-[:R]->()-[:R]->(b)`), inline edge property filters (`WHERE (a)-[:R {weight: 5}]->(b)`, whether or not the relationship is named) and variable-length relationships, where a property map must hold on every hop.
 
 #### RETURN ✅
 
@@ -269,7 +269,7 @@ CREATE NODE TYPE Person TEMPORAL WITH (
   valid_to:   TIMESTAMP
 )
 
--- Edge counterpart, established earlier (R171a).
+-- Edge counterpart: one stored version per valid_from.
 CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
   role: STRING,
   valid_from: TIMESTAMP NOT NULL,

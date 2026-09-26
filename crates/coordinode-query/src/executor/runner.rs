@@ -2412,6 +2412,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 edge_temporal.push(lookup_edge_type_temporal(et, ctx)?);
             }
 
+            // Edge properties are only materialised under an edge binding, so
+            // an anonymous relationship with an inline property map
+            // (`-[:R {w: 5}]->`) binds one no query can name, filters through
+            // it, and drops its columns before the rows leave this operator.
+            let anonymous_edge_filtered = edge_variable.is_none() && !edge_filters.is_empty();
             let params = TraverseParams {
                 source,
                 edge_types: effective_types,
@@ -2419,14 +2424,27 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 target_variable,
                 target_labels,
                 length: *length,
-                edge_variable: edge_variable.as_deref(),
+                edge_variable: if anonymous_edge_filtered {
+                    Some(ANONYMOUS_EDGE_BINDING)
+                } else {
+                    edge_variable.as_deref()
+                },
                 target_filters,
                 edge_filters,
                 edge_temporal: &edge_temporal,
                 temporal_filter: temporal_filter.as_ref(),
                 path_variable: path_variable.as_deref(),
             };
-            execute_traverse(&input_rows, &params, ctx)
+            let mut rows = execute_traverse(&input_rows, &params, ctx)?;
+            if anonymous_edge_filtered {
+                for row in &mut rows {
+                    row.retain(|k, _| {
+                        k.strip_prefix(ANONYMOUS_EDGE_BINDING)
+                            .is_none_or(|rest| !rest.is_empty() && !rest.starts_with('.'))
+                    });
+                }
+            }
+            Ok(rows)
         }
 
         LogicalOp::Filter { input, predicate } => {
@@ -3810,6 +3828,11 @@ fn execute_hnsw_scan(
     }
     Ok(results)
 }
+
+/// Edge binding a traversal uses for an anonymous relationship that carries an
+/// inline property map. The leading NUL keeps it out of reach of any Cypher
+/// identifier, so it never shadows or correlates with a query variable.
+const ANONYMOUS_EDGE_BINDING: &str = "\u{0}edge";
 
 /// Parameters for edge traversal.
 struct TraverseParams<'a> {

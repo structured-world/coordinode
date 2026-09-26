@@ -74,14 +74,14 @@ Specifics per mutation surface:
 - `REMOVE n.<flat>` / `REMOVE n.<nested.path>` / `REMOVE n:Label` — close+open with the property / label dropped on the clone. Multi-item REMOVE in one clause = one new version.
 - `REMOVE n.valid_from` / `REMOVE n.valid_to` — **rejected**: bitemporal axes are engine-managed.
 - `DELETE n` — **positive bitemporal fact**: the current open version is closed at `valid_to = NOW` and a tombstone version is appended at `valid_from = NOW` carrying `__deleted__: true`. History before NOW remains queryable. No edge cascade for temporal nodes (deferred until the cross-version edge ownership model lands).
-- `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open with the property removed on the clone; promotion of the property into a new node uses the standard temporal-aware CREATE path. `TRANSFER EDGES` on a temporal source is rejected (Phase 4).
+- `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open with the property removed on the clone; promotion of the property into a new node uses the standard temporal-aware CREATE path. `TRANSFER EDGES` on a temporal source is rejected: edges would need an owner per `(node_id, valid_from)` version, so add the desired edges to the new target explicitly.
 - `ATTACH (s:Source)-[:E]->(t:Temp) INTO t.<path>` — close+open on the target with the source's properties set at `<path>` on the clone. Temporal source on ATTACH (which cascade-deletes the source) is rejected.
 
 ## Reading temporal nodes
 
 `MATCH (n:Person)` and `MATCH (a)-[:E]->(n:Person)` both materialise **every version** of each matched node by default — one row per version, with `n.valid_from`, `n.valid_to`, and any user props on that version. Pattern predicates `WHERE (a)-[:E]->(:Person)` match if **any** version of the candidate carries the label.
 
-Filter to the current state with `WHERE n.valid_to IS NULL AND coalesce(n.__deleted__, false) = false`; for a point in time, use a literal comparison on `n.valid_from` / `n.valid_to`. The dedicated `AS OF VALID_TIME <ts>` clause that pushes the time slice down into the prefix scan is planned (see arch decisions on R172d).
+Filter to the current state with `WHERE n.valid_to IS NULL AND coalesce(n.__deleted__, false) = false`; for a point in time, use a literal comparison on `n.valid_from` / `n.valid_to`. There is no `AS OF VALID_TIME <ts>` clause yet; the literal comparison is the way to take a time slice.
 
 ## Writing temporal edges
 
