@@ -164,19 +164,20 @@ async fn create_label_persists_schema() {
             properties: vec![
                 graph::PropertyDefinition {
                     name: "title".to_string(),
-                    r#type: 3, // STRING
+                    r#type: graph::PropertyType::String as i32,
                     required: true,
                     unique: false,
                 },
                 graph::PropertyDefinition {
                     name: "slug".to_string(),
-                    r#type: 3, // STRING
+                    r#type: graph::PropertyType::String as i32,
                     required: false,
                     unique: true,
                 },
             ],
             computed_properties: vec![],
-            schema_mode: 0, // UNSPECIFIED → STRICT
+            // Unspecified means STRICT.
+            schema_mode: graph::SchemaMode::Unspecified as i32,
         }))
         .await
         .expect("create_label should succeed");
@@ -216,12 +217,13 @@ async fn create_label_unique_property_enforces_constraint() {
         name: "Customer".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "email".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: true,
         }],
         computed_properties: vec![],
-        schema_mode: 0, // UNSPECIFIED → STRICT
+        // Unspecified means STRICT.
+        schema_mode: graph::SchemaMode::Unspecified as i32,
     }))
     .await
     .expect("create_label");
@@ -258,12 +260,12 @@ async fn merge_on_existing_unique_node_does_not_error() {
         name: "TestNode".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "id".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: true,
             unique: true,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label");
@@ -302,7 +304,7 @@ async fn create_edge_type_persists_schema() {
             name: "FOLLOWS".to_string(),
             properties: vec![graph::PropertyDefinition {
                 name: "since".to_string(),
-                r#type: 6, // TIMESTAMP
+                r#type: graph::PropertyType::Timestamp as i32,
                 required: true,
                 unique: false,
             }],
@@ -341,19 +343,20 @@ async fn list_labels_returns_schema_properties() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "title".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: true,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "views".to_string(),
-                r#type: 1, // INT64
+                r#type: graph::PropertyType::Int64 as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 0, // UNSPECIFIED → STRICT
+        // Unspecified means STRICT.
+        schema_mode: graph::SchemaMode::Unspecified as i32,
     }))
     .await
     .expect("create_label");
@@ -403,20 +406,22 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
         name: "Session".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "started_at".to_string(),
-            r#type: 6, // TIMESTAMP
+            r#type: graph::PropertyType::Timestamp as i32,
             required: true,
             unique: false,
         }],
         computed_properties: vec![graph::ComputedPropertyDefinition {
             name: "_ttl".to_string(),
-            computed_type: 1,  // TTL
-            formula_type: 0,   // unspecified (not used for TTL)
+            computed_type: graph::ComputedType::Ttl as i32,
+            // A TTL does not use the formula.
+            formula_type: graph::DecayFormulaType::Unspecified as i32,
             duration_secs: 60, // 60 seconds lifetime
             anchor_field: "started_at".to_string(),
-            scope: 3, // NODE
+            scope: graph::TtlScopeType::Node as i32,
             ..Default::default()
         }],
-        schema_mode: 3, // FLEXIBLE — test exercises TTL reaper, not schema enforcement
+        // The test exercises the TTL reaper, not schema enforcement.
+        schema_mode: graph::SchemaMode::Flexible as i32,
     }))
     .await
     .expect("create_label with TTL should succeed");
@@ -427,20 +432,21 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
             name: "Session2".to_string(),
             properties: vec![graph::PropertyDefinition {
                 name: "started_at".to_string(),
-                r#type: 6, // TIMESTAMP
+                r#type: graph::PropertyType::Timestamp as i32,
                 required: true,
                 unique: false,
             }],
             computed_properties: vec![graph::ComputedPropertyDefinition {
                 name: "_ttl".to_string(),
-                computed_type: 1,
-                formula_type: 0,
+                computed_type: graph::ComputedType::Ttl as i32,
+                formula_type: graph::DecayFormulaType::Unspecified as i32,
                 duration_secs: 60,
                 anchor_field: "started_at".to_string(),
-                scope: 3,
+                scope: graph::TtlScopeType::Node as i32,
                 ..Default::default()
             }],
-            schema_mode: 3, // FLEXIBLE — test exercises TTL reaper, not schema enforcement
+            // The test exercises the TTL reaper, not schema enforcement.
+            schema_mode: graph::SchemaMode::Flexible as i32,
         }))
         .await
         .expect("create_label should succeed");
@@ -452,7 +458,10 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
         "response must echo computed_properties"
     );
     assert_eq!(label.computed_properties[0].name, "_ttl");
-    assert_eq!(label.computed_properties[0].computed_type, 1); // TTL
+    assert_eq!(
+        label.computed_properties[0].computed_type,
+        graph::ComputedType::Ttl as i32
+    );
     assert_eq!(label.computed_properties[0].duration_secs, 60);
     assert_eq!(label.computed_properties[0].anchor_field, "started_at");
 
@@ -544,21 +553,22 @@ async fn create_label_with_decay_computed_property_list_labels_returns_it() {
         name: "Article".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "published_at".to_string(),
-            r#type: 6, // TIMESTAMP
+            r#type: graph::PropertyType::Timestamp as i32,
             required: true,
             unique: false,
         }],
         computed_properties: vec![graph::ComputedPropertyDefinition {
             name: "relevance".to_string(),
-            computed_type: 2, // DECAY
-            formula_type: 1,  // LINEAR
+            computed_type: graph::ComputedType::Decay as i32,
+            formula_type: graph::DecayFormulaType::Linear as i32,
             initial: 1.0,
             target: 0.0,
             duration_secs: 604800, // 7 days
             anchor_field: "published_at".to_string(),
             ..Default::default()
         }],
-        schema_mode: 0, // UNSPECIFIED → STRICT
+        // Unspecified means STRICT.
+        schema_mode: graph::SchemaMode::Unspecified as i32,
     }))
     .await
     .expect("create_label with DECAY should succeed");
@@ -590,8 +600,8 @@ async fn create_label_with_decay_computed_property_list_labels_returns_it() {
 
     let cp = &article.computed_properties[0];
     assert_eq!(cp.name, "relevance");
-    assert_eq!(cp.computed_type, 2); // DECAY
-    assert_eq!(cp.formula_type, 1); // LINEAR
+    assert_eq!(cp.computed_type, graph::ComputedType::Decay as i32);
+    assert_eq!(cp.formula_type, graph::DecayFormulaType::Linear as i32);
     assert!((cp.initial - 1.0).abs() < f64::EPSILON);
     assert!((cp.target - 0.0).abs() < f64::EPSILON);
     assert_eq!(cp.duration_secs, 604800);
@@ -609,12 +619,12 @@ async fn create_label_computed_type_unspecified_returns_error() {
             properties: vec![],
             computed_properties: vec![graph::ComputedPropertyDefinition {
                 name: "broken".to_string(),
-                computed_type: 0, // UNSPECIFIED
+                computed_type: graph::ComputedType::Unspecified as i32,
                 duration_secs: 60,
                 anchor_field: "ts".to_string(),
                 ..Default::default()
             }],
-            schema_mode: 0,
+            schema_mode: graph::SchemaMode::Unspecified as i32,
         }))
         .await;
 
@@ -635,12 +645,12 @@ async fn create_label_computed_empty_anchor_field_returns_error() {
             properties: vec![],
             computed_properties: vec![graph::ComputedPropertyDefinition {
                 name: "ttl".to_string(),
-                computed_type: 1, // TTL
+                computed_type: graph::ComputedType::Ttl as i32,
                 duration_secs: 60,
                 anchor_field: String::new(), // empty — must be rejected
                 ..Default::default()
             }],
-            schema_mode: 0,
+            schema_mode: graph::SchemaMode::Unspecified as i32,
         }))
         .await;
 
@@ -649,7 +659,7 @@ async fn create_label_computed_empty_anchor_field_returns_error() {
 
 // ── SchemaMode via gRPC: CREATE/SET enforcement ─────────────────────────
 
-/// create_label with schema_mode=STRICT (1) persists the mode; SET of an
+/// create_label with schema_mode=STRICT persists the mode; SET of an
 /// unknown property on a STRICT label is rejected.
 ///
 /// Regression: schema_mode field must flow from proto → LabelSchema → executor
@@ -663,12 +673,12 @@ async fn strict_mode_set_unknown_property_rejected() {
         name: "User".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "name".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -718,7 +728,7 @@ async fn strict_mode_set_unknown_property_rejected() {
     }
 }
 
-/// create_label with schema_mode=FLEXIBLE (3) — SET of any property is allowed.
+/// create_label with schema_mode=FLEXIBLE — SET of any property is allowed.
 ///
 /// Regression: FLEXIBLE mode must pass through all properties without enforcement.
 #[tokio::test]
@@ -730,12 +740,12 @@ async fn flexible_mode_set_unknown_property_allowed() {
         name: "Device".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "id".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 3, // FLEXIBLE
+        schema_mode: graph::SchemaMode::Flexible as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -767,20 +777,21 @@ async fn schema_mode_echoed_in_response_and_list() {
             name: "Event".to_string(),
             properties: vec![graph::PropertyDefinition {
                 name: "ts".to_string(),
-                r#type: 6, // TIMESTAMP
+                r#type: graph::PropertyType::Timestamp as i32,
                 required: false,
                 unique: false,
             }],
             computed_properties: vec![],
-            schema_mode: 2, // VALIDATED
+            schema_mode: graph::SchemaMode::Validated as i32,
         }))
         .await
         .expect("create_label should succeed");
 
     let label = resp.into_inner();
     assert_eq!(
-        label.schema_mode, 2,
-        "create_label response must echo schema_mode=VALIDATED(2)"
+        label.schema_mode,
+        graph::SchemaMode::Validated as i32,
+        "create_label response must echo schema_mode=VALIDATED"
     );
 
     // list_labels must return the persisted mode.
@@ -797,8 +808,9 @@ async fn schema_mode_echoed_in_response_and_list() {
         .expect("Event label must be in list");
 
     assert_eq!(
-        event.schema_mode, 2,
-        "list_labels must return schema_mode=VALIDATED(2) for Event"
+        event.schema_mode,
+        graph::SchemaMode::Validated as i32,
+        "list_labels must return schema_mode=VALIDATED for Event"
     );
 }
 
@@ -814,12 +826,12 @@ async fn strict_mode_create_type_mismatch_rejected() {
         name: "Sensor".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "reading".to_string(),
-            r#type: 2, // FLOAT64
+            r#type: graph::PropertyType::Float64 as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -845,12 +857,12 @@ async fn validated_mode_type_mismatch_rejected_but_extra_accepted() {
         name: "Log".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "level".to_string(),
-            r#type: 1, // INT64
+            r#type: graph::PropertyType::Int64 as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -884,12 +896,12 @@ async fn strict_mode_create_with_unknown_property_rejected() {
         name: "Product".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "sku".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -927,12 +939,12 @@ async fn validated_mode_set_extra_accepted_mismatch_rejected() {
         name: "Metric".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "value".to_string(),
-            r#type: 2, // FLOAT64
+            r#type: graph::PropertyType::Float64 as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -972,19 +984,19 @@ async fn strict_mode_create_missing_required_property_rejected() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "title".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: true,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "priority".to_string(),
-                r#type: 1, // INT64
+                r#type: graph::PropertyType::Int64 as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -1031,12 +1043,12 @@ async fn multi_update_strict_node_fails_whole_query() {
         name: "Monitored".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "host".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label should succeed");
@@ -1077,19 +1089,19 @@ async fn strict_mode_merge_on_create_set_rejected_for_unknown_property() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "sku".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "price".to_string(),
-                r#type: 2, // FLOAT64
+                r#type: graph::PropertyType::Float64 as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Product");
@@ -1123,19 +1135,19 @@ async fn strict_mode_replace_properties_rejects_unknown_key() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "host".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "port".to_string(),
-                r#type: 1, // INT64
+                r#type: graph::PropertyType::Int64 as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Config");
@@ -1175,19 +1187,19 @@ async fn strict_mode_merge_properties_rejects_unknown_key() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "name".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "version".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label AppService");
@@ -1228,19 +1240,19 @@ async fn on_violation_skip_excludes_violating_nodes() {
         properties: vec![
             graph::PropertyDefinition {
                 name: "name".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
             graph::PropertyDefinition {
                 name: "status".to_string(),
-                r#type: 3, // STRING
+                r#type: graph::PropertyType::String as i32,
                 required: false,
                 unique: false,
             },
         ],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Gadget");
@@ -1300,12 +1312,12 @@ async fn strict_mode_property_path_rejects_unknown_root() {
         name: "Device".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "serial".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: true,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Device");
@@ -1334,12 +1346,12 @@ async fn strict_mode_doc_function_rejects_unknown_root() {
         name: "Shelf".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "name".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: true,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Shelf");
@@ -1369,12 +1381,12 @@ async fn validated_mode_replace_properties_allows_unknown_key() {
         name: "Server".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "host".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Server");
@@ -1409,12 +1421,12 @@ async fn validated_mode_merge_properties_allows_unknown_key() {
         name: "Cache".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "size".to_string(),
-            r#type: 1, // INT64
+            r#type: graph::PropertyType::Int64 as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Cache");
@@ -1470,12 +1482,12 @@ async fn validated_mode_property_path_allows_unknown_root() {
         name: "Sensor".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "id".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Sensor");
@@ -1504,12 +1516,12 @@ async fn validated_mode_doc_function_allows_unknown_root() {
         name: "Bin".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "tag".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Bin");
@@ -1538,12 +1550,12 @@ async fn on_violation_skip_with_property_path() {
         name: "Relay".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "state".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 1, // STRICT
+        schema_mode: graph::SchemaMode::Strict as i32,
     }))
     .await
     .expect("create_label Relay");
@@ -1593,7 +1605,7 @@ async fn on_violation_skip_with_property_path() {
 /// Verifies that N PropertyPath items targeting the same node in a single SET
 /// clause all succeed. This exercises the `schema_label_cache` path: the first
 /// item reads + caches the label; subsequent items hit the cache (O(1), no I/O).
-/// Also guards against the RYOW merge-delta materialization bug (g064): each
+/// Also guards against the read-your-own-writes merge-delta bug: each
 /// DocDelta must land independently when multiple paths target the same node.
 #[tokio::test]
 async fn schema_label_cache_multiple_paths_same_node() {
@@ -1602,12 +1614,14 @@ async fn schema_label_cache_multiple_paths_same_node() {
         name: "Config".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "cfg".to_string(),
-            r#type: 3, // STRING (DOCUMENT will be inferred at runtime)
+            // DOCUMENT is inferred at runtime.
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED — extra paths allowed
+        // Extra paths are allowed.
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Config");
@@ -1660,12 +1674,13 @@ async fn schema_label_cache_multiple_doc_functions_same_node() {
         name: "Queue".to_string(),
         properties: vec![graph::PropertyDefinition {
             name: "jobs".to_string(),
-            r#type: 3, // STRING
+            r#type: graph::PropertyType::String as i32,
             required: false,
             unique: false,
         }],
         computed_properties: vec![],
-        schema_mode: 2, // VALIDATED — extra roots allowed
+        // Extra roots are allowed.
+        schema_mode: graph::SchemaMode::Validated as i32,
     }))
     .await
     .expect("create_label Queue");
