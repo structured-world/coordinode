@@ -99,13 +99,16 @@ impl VectorBuild<'_> {
     /// scan's snapshot holds every one that landed before.
     ///
     /// While an index rebuilds, writers leave it to the build, which inserts
-    /// in batches far cheaper per vector than a write at a time. Once the tap
-    /// runs dry the indexes are marked ready and writers insert for
-    /// themselves; a transaction opened before that may still leave its
-    /// vector to the build, so the tap stays open until every transaction
-    /// opened at or before the handover's boundary has ended (the wait
-    /// PostgreSQL's concurrent index build makes for older snapshots) and
-    /// what they wrote is folded in. The writers are never paused.
+    /// the scan in batches far cheaper per vector than a write at a time.
+    /// Once the scan is in, the indexes are marked ready and writers insert
+    /// for themselves; the build folds what landed during the scan, and a
+    /// transaction opened before the handover may still leave its vector to
+    /// the build, so the tap stays open until every transaction opened at or
+    /// before the handover's boundary has ended (the wait PostgreSQL's
+    /// concurrent index build makes for older snapshots), and one more fold
+    /// takes what they wrote. Nothing waits for the tap to run dry, which
+    /// under writes that never pause it would not. The writers are never
+    /// paused, and the freshness watermark is published only at the end.
     ///
     /// Blocks until done, and on a Raft store pauses the applies for an
     /// instant at the start: call it off the async runtime, and never from a
@@ -125,17 +128,33 @@ impl VectorBuild<'_> {
         );
         let mut outcome = self.scan(at)?;
         tracing::debug!(?outcome, "vector build: scanned");
-        // Taken when the writers take over, after marking the indexes ready:
-        // a transaction opened past it inserts its own vectors.
-        let mut handover: Option<u64> = None;
+        if outcome == BuildOutcome::Cancelled {
+            return Ok(outcome);
+        }
+        // The scan is in the graphs: hand them to the writers, who insert
+        // what they write from here on. What landed during the scan, and what
+        // the transactions opened before this point leave, stays with the
+        // build through the tap. Handing over later would not make the index
+        // more complete (writes keep landing) but would leave every write in
+        // between to the build's folds, which under steady load grow with
+        // each other.
+        for target in self.targets {
+            target.health.mark_ready();
+        }
+        // A transaction opened past this boundary inserts its own vectors.
+        let boundary = self.engine.snapshot_boundary();
+        tracing::debug!(boundary, "vector build: handed over to the writers");
         // Set once the transactions opened before the handover have ended:
         // the snapshot every write at or below which is in the graphs after
-        // one more empty take.
+        // one more fold.
         let mut settled: Option<u64> = None;
         loop {
             if outcome == BuildOutcome::Cancelled || self.token.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled);
             }
+            // Fold what the tap holds. It never has to run dry: under writes
+            // that do not pause it would not, and the writers insert for
+            // themselves.
             match tap.take() {
                 // The partition was cleared or range-deleted: what it lost is
                 // not listed, so start over from a fresh snapshot.
@@ -148,13 +167,15 @@ impl VectorBuild<'_> {
                     settled = None;
                     continue;
                 }
-                Tapped::Keys(keys) if !keys.is_empty() => {
-                    tracing::debug!(keys = keys.len(), "vector build: folding tapped writes");
-                    self.fold(&keys)?;
-                    continue;
+                Tapped::Keys(keys) => {
+                    if !keys.is_empty() {
+                        tracing::debug!(keys = keys.len(), "vector build: folding tapped writes");
+                        self.fold(&keys)?;
+                    }
                 }
-                Tapped::Keys(_) => {}
             }
+            // The fold after the older transactions ended took everything
+            // they wrote: whatever lands from here on, its writer inserts.
             if let Some(fresh) = settled {
                 drop(tap);
                 for target in self.targets {
@@ -162,28 +183,16 @@ impl VectorBuild<'_> {
                 }
                 return Ok(outcome);
             }
-            match handover {
-                None => {
-                    for target in self.targets {
-                        target.health.mark_ready();
-                    }
-                    let boundary = self.engine.snapshot_boundary();
-                    tracing::debug!(boundary, "vector build: handed over to the writers");
-                    handover = Some(boundary);
-                }
-                Some(boundary) => {
-                    if self
-                        .engine
-                        .await_transactions_through(
-                            boundary,
-                            OLDER_TRANSACTIONS_POLL,
-                            OLDER_TRANSACTIONS_SLICE,
-                        )
-                        .is_ok()
-                    {
-                        settled = Some(self.engine.snapshot());
-                    }
-                }
+            if self
+                .engine
+                .await_transactions_through(
+                    boundary,
+                    OLDER_TRANSACTIONS_POLL,
+                    OLDER_TRANSACTIONS_SLICE,
+                )
+                .is_ok()
+            {
+                settled = Some(self.engine.snapshot());
             }
         }
     }

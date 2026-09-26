@@ -271,6 +271,59 @@ fn a_build_with_nothing_to_wait_for_ends_ready_and_fresh() {
     );
 }
 
+/// A build finishes while writes never stop. Waiting for the write tap to
+/// run dry before handing over, or before closing, would wait forever when
+/// the partition is written without pause, and the index would stay
+/// rebuilding for as long as the load lasted. The writer here maintains the
+/// index the way the write path does: it inserts its own vector, which the
+/// registry leaves to the build while the index is rebuilding.
+#[test]
+fn a_build_finishes_under_writes_that_never_pause() {
+    let fx = fixture();
+    // Directions spread over the sphere: under cosine, vectors along one
+    // growing coordinate are near-duplicates, and every insert degenerates.
+    let spread = |id: u64| {
+        [
+            (id % 97) as f32 + 1.0,
+            (id % 89) as f32 - 44.0,
+            (id % 83) as f32 - 41.0,
+        ]
+    };
+    for id in 1..=2000u64 {
+        fx.apply_doc_at(id, spread(id), fx.oracle.next().as_raw());
+    }
+    let done = std::sync::atomic::AtomicBool::new(false);
+    // Only a guard against a test that never ends: the property is that the
+    // build finishes while the writer is still writing, which a build waiting
+    // for a quiet tap never does, however long the writer is given.
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    let (outcome, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut id = 1_000_000u64;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+                let vector = spread(id);
+                fx.apply_doc_at(id, vector, fx.oracle.next().as_raw());
+                fx.registry
+                    .on_vector_written("Doc", NodeId::from_raw(id), "embedding", &vector);
+                id += 1;
+            }
+            id - 1_000_000
+        });
+        let outcome = fx.build_while(|_| {});
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        (outcome, writer.join().expect("writer"))
+    });
+
+    assert!(
+        Instant::now() < deadline,
+        "the build ran until the writer gave up: it never finished under load"
+    );
+    assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
+    assert!(written > 0, "the writer never ran beside the build");
+    assert!(fx.health().snapshot().is_ready());
+}
+
 /// Thousands of writes landing after the handover are folded in more than one
 /// chunk: every one of them is a member when the build ends, beside every
 /// scanned node.

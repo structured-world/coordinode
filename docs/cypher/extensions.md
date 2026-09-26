@@ -71,7 +71,7 @@ governed by `online_during_build`:
 
 | Value | Behaviour |
 |-------|-----------|
-| `"block"` (default) | Reader waits until the index on the member serving it is complete, then proceeds; if the wait runs out first it gets an error. The caller decides how long (see below). Matches the legacy synchronous semantic for callers that just want "do the right thing". |
+| `"block"` (default) | Reader waits until the index on the member serving it holds everything the store held when its build began, then proceeds; if the wait runs out first it gets an error. The caller decides how long (see below). Writes that landed during the build are folded in right after; a reader that must see its own write compares the index's `indexed_hlc` with that write's timestamp. |
 | `"partial-recall"` | Reader hits the partial HNSW graph immediately. Recall improves as the backfill writes more vectors; useful when search latency matters more than completeness. |
 | `"offline"` | Reader gets an error so it can pick a fallback path (e.g. brute force, alternative index, or queueing). |
 
