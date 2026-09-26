@@ -1,4 +1,4 @@
-//! Time-series above-store catalog (G103, Slice A).
+//! Time-series above-store catalog.
 //!
 //! **no-std tier:** `std-only`. The catalog uses `std::sync::RwLock`
 //! (striped concurrency), `std::time::SystemTime` (rollover decisions,
@@ -16,7 +16,7 @@
 //! flush as whole-bucket [`coordinode_modality::Bucket`] writes when
 //! a rollover trigger fires (size / count / time / schema change).
 //!
-//! ## What this crate is (Slice A scope)
+//! ## What this crate is
 //!
 //! - **In-memory open-bucket map** keyed by `(label_id, meta_hash)`,
 //!   sharded across 32 stripes for concurrent writes.
@@ -35,7 +35,7 @@
 //! - **`flush_all`** — explicit drain hook (test harnesses, graceful
 //!   shutdown, time-tick driver).
 //!
-//! ## What this crate is NOT yet (deferred to Slices B and C)
+//! ## What this crate is NOT yet
 //!
 //! - **Tier 2 bucket re-open** — needs the catalog's `recently_closed`
 //!   LRU + Raft-CAS-equivalent re-open serialisation.
@@ -48,8 +48,8 @@
 //!   `TimeSeriesStore::compact_overflow` once the overflow set
 //!   exceeds the configured count / age threshold.
 //!
-//! These all build on top of the foundation here — the public
-//! catalog surface stays stable across the slices.
+//! These all build on top of the foundation here; the public
+//! catalog surface stays stable as they land.
 //!
 //! ## Multi-instance positioning
 //!

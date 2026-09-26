@@ -1,12 +1,12 @@
-//! Storage tier trait for the vector indexes (ADR-033 revised).
+//! Storage tier trait for the vector indexes.
 //!
 //! Single persistent tier holding f32 originals:
 //!
 //! - **Truth tier** (`Partition::VectorF32` on the storage side) — every
 //!   inserted vector's f32 bytes. Lets the index regenerate in-RAM
 //!   codecs (RaBitQ default, optional SQ8 / PolarQuant / PQ) on
-//!   calibration without re-ingest. Phase 1.5 cross-shard rerank
-//!   fetches f32 directly here — no intermediate quantized disk tier
+//!   calibration without re-ingest. Cross-shard rerank
+//!   fetches f32 directly here: no intermediate quantized disk tier
 //!   (matches Qdrant / Weaviate / ES BBQ pattern).
 //!
 //! Addressed by `(label_id, property_id, node_id)`. The
@@ -62,7 +62,7 @@ pub trait VectorTierStorage: Send + Sync {
     /// Batched fetch of f32 vectors. Returns one slot per requested
     /// `node_id`, in the same order; `None` for nodes whose f32 truth
     /// tier doesn't have the key (e.g. between Raft commit and HNSW
-    /// worker apply). Used by Phase 1.5 cross-shard rerank,
+    /// worker apply). Used by cross-shard rerank,
     /// application-side rerank with custom metrics, and in-RAM codec
     /// (re)calibration.
     fn multi_get_f32(

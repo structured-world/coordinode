@@ -43,7 +43,7 @@ pub type AppliedFrontier = Arc<dyn Fn() -> u64 + Send + Sync>;
 ///
 /// Each subscription registers as an `oplog_events` consumer in the
 /// [`ShardConsumerRegistry`] so the oplog retention floor never purges below
-/// a live reader's position (ADR-028).
+/// a live reader's position.
 pub struct ChangeEventServiceImpl {
     /// The shard whose Raft log the service streams.
     shard_id: u32,
@@ -195,8 +195,8 @@ impl ChangeStreamService for ChangeEventServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("resume token: {e}")))?;
 
         // Register this stream as an oplog-events consumer so the oplog
-        // retention floor is held at (and advanced with) its read position
-        // (ADR-028). `FromEarliestRetained` pins conservatively until the first
+        // retention floor is held at (and advanced with) its read position.
+        // `FromEarliestRetained` pins conservatively until the first
         // checkpoint advances the floor to what the consumer has actually read.
         let n = self.next_consumer.fetch_add(1, Ordering::Relaxed);
         let consumer_id = format!("cdc-{shard_id}-{n}");

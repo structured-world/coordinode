@@ -40,10 +40,9 @@ fn open_engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
 }
 
 /// A CDC subscription registers an `oplog_events` consumer for its shard so the
-/// oplog retention floor is held at the reader's position (ADR-028), and the
+/// oplog retention floor is held at the reader's position, and the
 /// registration is released when the stream is dropped (client disconnect).
-/// This is the per-consumer retention contract R137d wires; without it the
-/// registry would only enforce the static time-travel window.
+/// Without it the registry would only enforce the static time-travel window.
 #[tokio::test]
 async fn subscribe_registers_then_unregisters_cdc_consumer() {
     let (engine, _engine_dir) = open_engine();
