@@ -353,7 +353,7 @@ streamvbyte64 = { version = "0.2", default-features = false }
 stringprep = { version = "0.1", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-proxy = { version = "4" }
-structured-zstd = { version = "0.0.55" }
+structured-zstd = { version = "0.0.56" }
 subtle = { version = "2", default-features = false, features = ["i128"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 sysinfo = { version = "0.39" }
@@ -825,7 +825,7 @@ streamvbyte64 = { version = "0.2", default-features = false }
 stringprep = { version = "0.1", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-proxy = { version = "4" }
-structured-zstd = { version = "0.0.55" }
+structured-zstd = { version = "0.0.56" }
 subtle = { version = "2", default-features = false, features = ["i128"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
@@ -1170,9 +1170,8 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
@@ -1203,9 +1202,8 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
-windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }

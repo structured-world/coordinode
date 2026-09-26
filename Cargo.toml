@@ -46,7 +46,7 @@ publish = false
 # composes_operands, and manifests with more than 255 runs per level), not the
 # major: a consumer with its own lockfile otherwise keeps an older 5.x that
 # satisfies "5" and fails to build or to reopen a store.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.2", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.4", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.25", features = ["serde"] }
