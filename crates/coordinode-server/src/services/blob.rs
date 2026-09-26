@@ -182,36 +182,30 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
     ) -> Result<Response<graph::DeleteBlobResponse>, Status> {
         let blob_id = request.into_inner().blob_id;
 
-        // Load blob metadata
         let meta_key = encode_blobmeta_key(&blob_id);
-        let meta_bytes = self
+        if self
             .engine
             .get(Partition::BlobRef, &meta_key)
             .map_err(|e| storage_err_to_status("blob storage", e))?
-            .ok_or_else(|| Status::not_found(format!("blob {blob_id} not found")))?;
-
-        let blob_ref = BlobRef::from_msgpack(&meta_bytes)
-            .map_err(|e| Status::internal(format!("deserialize error: {e}")))?;
-
-        // Delete each chunk (in Phase 2 with replication, this needs reference counting)
-        let mut deleted = 0u32;
-        for chunk_id in &blob_ref.chunks {
-            let key = encode_blob_key(chunk_id);
-            self.engine
-                .delete(Partition::Blob, &key)
-                .map_err(|e| storage_err_to_status("blob storage", e))?;
-            deleted += 1;
+            .is_none()
+        {
+            return Err(Status::not_found(format!("blob {blob_id} not found")));
         }
 
-        // Delete blob metadata
+        // Only the metadata goes. Chunks are content-addressed and shared
+        // with every other blob, object or property holding the same bytes,
+        // so one owner cannot tell whether a chunk is still referenced; and
+        // an upload racing this delete skips writing a chunk it sees
+        // present. Unreferenced chunks are reclaimed by chunk GC instead,
+        // so no chunk is deleted here.
         self.engine
             .delete(Partition::BlobRef, &meta_key)
             .map_err(|e| storage_err_to_status("blob storage", e))?;
 
-        info!(blob_id = %blob_id, chunks_deleted = deleted, "blob deleted");
+        info!(blob_id = %blob_id, "blob deleted");
 
         Ok(Response::new(graph::DeleteBlobResponse {
-            chunks_deleted: deleted,
+            chunks_deleted: 0,
         }))
     }
 
@@ -239,3 +233,7 @@ impl graph::blob_service_server::BlobService for BlobServiceImpl {
         }))
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests;

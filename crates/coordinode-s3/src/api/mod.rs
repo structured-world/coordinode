@@ -195,22 +195,16 @@ fn get_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>
 /// `DELETE /<bucket>/<key>`: delete an object.
 fn delete_object(engine: &StorageEngine, path: &str) -> Result<Response<Full<Bytes>>, String> {
     let meta_key = s3_meta_key(path);
-    let meta_bytes = engine
+    let exists = engine
         .get(Partition::BlobRef, &meta_key)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .is_some();
 
-    if let Some(meta_bytes) = meta_bytes {
-        let blob_ref = BlobRef::from_msgpack(&meta_bytes).map_err(|e| e.to_string())?;
-
-        // Delete chunks
-        for chunk_id in &blob_ref.chunks {
-            let key = encode_blob_key(chunk_id);
-            engine
-                .delete(Partition::Blob, &key)
-                .map_err(|e| e.to_string())?;
-        }
-
-        // Delete metadata
+    if exists {
+        // Only the metadata goes. Chunks are content-addressed and shared
+        // with every other object, blob or property holding the same bytes,
+        // so this object cannot tell whether a chunk is still referenced;
+        // unreferenced chunks are reclaimed by chunk GC instead.
         engine
             .delete(Partition::BlobRef, &meta_key)
             .map_err(|e| e.to_string())?;
@@ -243,3 +237,7 @@ fn xml_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
             )))
         })
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests;
