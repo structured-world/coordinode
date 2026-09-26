@@ -64,24 +64,7 @@ fn put(engine: &StorageEngine, commit_ts: u64, part: PartitionId, key: &[u8], va
 ///   footer (which the block scrub does not checksum) on a small table; flipping
 ///   bytes at 1/8, 1/4, 1/2, 3/4 guarantees at least one hits a data block.
 fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> usize {
-    use std::os::unix::fs::MetadataExt;
-
-    // Inodes the checkpoint holds via its hard links.
-    let mut ckpt_inodes = std::collections::HashSet::new();
-    let mut stack = vec![checkpoint_root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let meta = entry.metadata().expect("metadata");
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                ckpt_inodes.insert(meta.ino());
-            }
-        }
-    }
+    let ckpt_tables = checkpoint_table_names(tables_dir, checkpoint_root);
 
     let mut corrupted = 0;
     let mut stack = vec![tables_dir.to_path_buf()];
@@ -96,7 +79,7 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
                 stack.push(p);
                 continue;
             }
-            if ckpt_inodes.contains(&meta.ino()) {
+            if ckpt_tables.contains(&entry.file_name()) {
                 continue;
             }
             let mut bytes = std::fs::read(&p).expect("read table");
@@ -112,6 +95,41 @@ fn corrupt_post_checkpoint_tables(tables_dir: &Path, checkpoint_root: &Path) -> 
         }
     }
     corrupted
+}
+
+/// The names of the tables some checkpoint under `checkpoint_root` holds for
+/// the partition whose live tables are in `tables_dir`. A checkpoint
+/// hard-links a table under the name it has in the live tree, and a tree
+/// never reuses a table id, so a live table with one of these names shares
+/// its blocks with a checkpoint. Portable where inode numbers are not.
+fn checkpoint_table_names(
+    tables_dir: &Path,
+    checkpoint_root: &Path,
+) -> std::collections::HashSet<std::ffi::OsString> {
+    let partition = tables_dir
+        .parent()
+        .and_then(Path::file_name)
+        .expect("tables dir inside a partition dir")
+        .to_os_string();
+    let mut names = std::collections::HashSet::new();
+    let mut stack = vec![checkpoint_root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        let in_tables = d.file_name().is_some_and(|n| n == "tables")
+            && d.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == partition);
+        for entry in rd.flatten() {
+            if entry.file_type().expect("file type").is_dir() {
+                stack.push(entry.path());
+            } else if in_tables {
+                names.insert(entry.file_name());
+            }
+        }
+    }
+    names
 }
 
 #[test]
@@ -886,22 +904,7 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
     let ckpt = latest_checkpoint(&root).expect("checkpoint exists");
     let mut obliterated = 0usize;
     {
-        use std::os::unix::fs::MetadataExt;
-        let mut ckpt_inodes = std::collections::HashSet::new();
-        let mut stack = vec![ckpt.clone()];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let meta = entry.metadata().expect("metadata");
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    ckpt_inodes.insert(meta.ino());
-                }
-            }
-        }
+        let ckpt_tables = checkpoint_table_names(&tables_dir, &ckpt);
         let mut stack = vec![tables_dir.clone()];
         while let Some(d) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&d) else {
@@ -914,7 +917,7 @@ fn unscopable_loss_falls_back_to_full_rebuild() {
                     stack.push(p);
                     continue;
                 }
-                if ckpt_inodes.contains(&meta.ino()) {
+                if ckpt_tables.contains(&entry.file_name()) {
                     continue;
                 }
                 let len = meta.len() as usize;
