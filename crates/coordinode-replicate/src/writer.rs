@@ -33,8 +33,8 @@ const SET_REQUIRES_EXCLUSIVE: &str = "SET commands require exclusive Database ac
 ///    instead of the caller having to sample the node's current applied
 ///    index (which is not this write's index; the operationTime inaccuracy).
 ///
-/// It is also the home for the upcoming `SeqnoConsumerRegistry` checkpoint
-/// hook (ADR-028, R137a): a committed write advances the per-shard floor
+/// It is also the home for the `SeqnoConsumerRegistry` checkpoint
+/// hook: a committed write advances the per-shard floor
 /// here, with no change to the executor or the consensus engine.
 pub struct ReplicatedWriter {
     database: Arc<RwLock<Database>>,

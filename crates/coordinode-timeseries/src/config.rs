@@ -1,5 +1,5 @@
-//! Configuration for the [`crate::BucketCatalog`]. Defaults match
-//! `arch/core/timeseries.md` §Rollover triggers.
+//! Configuration for the [`crate::BucketCatalog`]: the rollover
+//! triggers and their defaults.
 
 use std::time::Duration;
 
@@ -10,16 +10,16 @@ use crate::error::{CatalogError, CatalogResult};
 /// two so the mod-reduction is a single mask.
 pub const STRIPE_COUNT: usize = 32;
 
-/// Tuneable parameters for the catalog. Arch defaults are sized for
+/// Tuneable parameters for the catalog. The defaults are sized for
 /// IoT-style workloads (high-cardinality meta, small measurements).
 #[derive(Debug, Clone)]
 pub struct CatalogConfig {
     /// Force a rollover once a bucket holds this many measurements.
-    /// Arch default: 10_000.
+    /// Default: 10_000.
     pub max_count: u32,
 
     /// Force a rollover once the serialised bucket exceeds this size
-    /// in bytes. Arch default: 4 MiB (BlobStore threshold —
+    /// in bytes. Default: 4 MiB (BlobStore threshold —
     /// individual nodes above this go through BlobStore indirection,
     /// which is a different storage path).
     pub max_size_bytes: u32,
@@ -32,16 +32,6 @@ pub struct CatalogConfig {
 }
 
 impl CatalogConfig {
-    /// Arch-default configuration: 10 000 measurements / 4 MiB /
-    /// 1 hour granularity span (matches SECONDS-granularity series).
-    pub fn arch_defaults() -> Self {
-        Self {
-            max_count: 10_000,
-            max_size_bytes: 4 * 1024 * 1024,
-            granularity_span: Duration::from_secs(3_600),
-        }
-    }
-
     /// Validate the config. Returns [`CatalogError::InvalidConfig`]
     /// if any field would cause a degenerate catalog (zero count
     /// limit, zero size limit, zero granularity span).
@@ -60,7 +50,13 @@ impl CatalogConfig {
 }
 
 impl Default for CatalogConfig {
+    /// 10 000 measurements / 4 MiB / 1 hour granularity span (matches
+    /// SECONDS-granularity series).
     fn default() -> Self {
-        Self::arch_defaults()
+        Self {
+            max_count: 10_000,
+            max_size_bytes: 4 * 1024 * 1024,
+            granularity_span: Duration::from_secs(3_600),
+        }
     }
 }

@@ -22,9 +22,9 @@
 //!   sharded across 32 stripes for concurrent writes.
 //! - **Rollover detection** — produces a flush + close when:
 //!     - measurement count in the bucket exceeds `Config.max_count`
-//!       (arch default 10_000), OR
+//!       (default 10_000), OR
 //!     - serialised bucket size exceeds `Config.max_size_bytes`
-//!       (arch default 4 MiB, the BlobStore threshold), OR
+//!       (default 4 MiB, the BlobStore threshold), OR
 //!     - time span (max_ts − min_ts) exceeds the granularity's span
 //!       (`Config.granularity_span`), OR
 //!     - schema change — incoming measurement has fields that don't
@@ -32,24 +32,19 @@
 //! - **Tier 1 in-buffer late-arrival absorption** — measurements
 //!   whose `timestamp_us` falls within the open bucket's time
 //!   window are sorted on flush; no Raft re-open round-trip.
+//! - **Tier 2 bucket re-open** — a measurement that falls inside a
+//!   recently closed bucket's window reopens that bucket through the
+//!   per-stripe `recently_closed` LRU.
+//! - **Tier 3 overflow segments** — a measurement for a bucket past
+//!   its re-open window goes to that bucket's overflow segment via
+//!   `TimeSeriesStore::put_overflow`.
+//! - **Bitemporal `__ingestion_ts__` axis** — engine-assigned per
+//!   measurement for labels declared bitemporal.
+//! - **Overflow compaction** — `compact_all_pending` folds overflow
+//!   sets past the threshold back into their base buckets; the
+//!   catalog's owner drives it on its own schedule.
 //! - **`flush_all`** — explicit drain hook (test harnesses, graceful
 //!   shutdown, time-tick driver).
-//!
-//! ## What this crate is NOT yet
-//!
-//! - **Tier 2 bucket re-open** — needs the catalog's `recently_closed`
-//!   LRU + Raft-CAS-equivalent re-open serialisation.
-//! - **Tier 3 overflow segment routing** — needs an "is the targeted
-//!   bucket compacted-and-closed" check before falling back to
-//!   `TimeSeriesStore::put_overflow`.
-//! - **Bitemporal `__ingestion_ts__` axis** — needs the HLC source
-//!   plumbed in (engine-assigned per measurement).
-//! - **Background overflow compactor** — periodic job that calls
-//!   `TimeSeriesStore::compact_overflow` once the overflow set
-//!   exceeds the configured count / age threshold.
-//!
-//! These all build on top of the foundation here; the public
-//! catalog surface stays stable as they land.
 //!
 //! ## Multi-instance positioning
 //!
@@ -57,9 +52,9 @@
 //! `BucketCatalog` instance is the single writer for its shard's
 //! open buckets. In CE 3-node HA the catalog runs on the shard's
 //! Raft leader; on failover a fresh catalog is built from the
-//! recovered open-bucket state (a future task will persist the
-//! catalog's reverse-lookup table; today it rebuilds lazily on
-//! first write per `(label_id, meta_hash)`).
+//! recovered open-bucket state. The catalog's reverse-lookup table is
+//! not persisted: it rebuilds lazily on the first write per
+//! `(label_id, meta_hash)`.
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![warn(missing_docs)]

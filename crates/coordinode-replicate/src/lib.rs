@@ -18,7 +18,7 @@
 //!   same write-set through the state machine; standalone mode is a
 //!   pass-through with no committed index.
 //!
-//! - [`SeqnoConsumerRegistry`] (ADR-028, R137a) — the per-shard,
+//! - [`SeqnoConsumerRegistry`] — the per-shard,
 //!   Raft-replicated retention registry that feeds the lsm-tree
 //!   `gc_watermark`, oplog segment retention, and the tiering-DDL validator.
 //!   It lives here because storage / oplog / tiering all consume its

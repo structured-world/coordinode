@@ -62,7 +62,7 @@ impl Clock for SystemClock {
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundConfig {
     /// Drain window for buffered heartbeats. One coalesced proposal per
-    /// window regardless of consumer count (ADR-028 S4b).
+    /// window regardless of consumer count.
     pub heartbeat_window_ms: u64,
     /// How often to sweep and evict registrations past their TTL.
     pub eviction_interval_ms: u64,
@@ -347,7 +347,7 @@ impl ShardConsumerRegistry {
         self.core.oplog_index_floor.load(Ordering::Acquire)
     }
 
-    /// Lagging-consumer guard (ADR-028): verify the consumer's checkpoint has
+    /// Lagging-consumer guard: verify the consumer's checkpoint has
     /// not fallen below what the engine has already GC'd. A seqno-space
     /// consumer's read path calls this before reading-from-checkpoint; it
     /// returns the safe checkpoint, or [`RegistryError::RetentionLost`] when

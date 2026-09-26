@@ -3,7 +3,7 @@
 //! Builds rustls server and client configs for the inter-node wire from PEM
 //! certificate material, with optional mutual TLS. The crypto provider is
 //! chosen once at startup: the stock server picks the pure-Rust
-//! [`rustls_rustcrypto`] one (no C FFI, ADR-013), and a downstream distribution
+//! [`rustls_rustcrypto`] one (no C FFI), and a downstream distribution
 //! may select another, `aws-lc-rs` being the reason the seam exists. Every
 //! builder here pins the selected provider explicitly via `*_with_provider`
 //! rather than reading rustls' process default, so a stray `install_default`

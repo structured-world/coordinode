@@ -17,7 +17,7 @@ use super::token::{SEARCH_TOKEN_LEN, SearchToken};
 /// Each (label, field) pair has its own namespace in the `Idx` partition.
 /// Tokens are stored as hex-encoded keys for safe binary-to-key conversion.
 ///
-/// ## Transaction threading (ADR-041)
+/// ## Transaction threading
 ///
 /// The index is a typed handle scoped to one `(label, field)` pair; it
 /// holds no engine reference. Every method threads the active

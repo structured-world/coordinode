@@ -1,6 +1,6 @@
 //! Searchable Symmetric Encryption (SSE) for equality queries on encrypted fields.
 //!
-//! Implements the Song-Wagner-Perrig 2000 base scheme (ADR-012 patent constraint):
+//! Implements the Song-Wagner-Perrig 2000 base scheme:
 //! - **AES-256-GCM** for per-field value encryption (client-side)
 //! - **HMAC-SHA256** for search token generation (deterministic equality matching)
 //! - Server compares tokens without seeing plaintext
@@ -28,7 +28,7 @@
 //! - Per-field key pairs (field_key for encryption, search_key for tokens)
 //! - SSE leaks access patterns (which documents match a query)
 //!
-//! # Patent Safety (ADR-012)
+//! # Patent Safety
 //! - Song-Wagner-Perrig 2000 base scheme only
 //! - No dynamic-update techniques from US 8,533,489
 //! - Simple HMAC token store + lookup, no fancy index structures

@@ -306,7 +306,7 @@ fn prefix_query_via_api() {
     );
 }
 
-// -- G012: Wildcard prefix `word*` via search() --
+// -- Wildcard prefix `word*` via search() --
 
 #[test]
 fn prefix_wildcard_via_search() {

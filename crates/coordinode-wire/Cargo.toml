@@ -16,7 +16,7 @@ bytes = { workspace = true }
 # version and `cargo update` never moves it.
 structured-zstd = "^0"
 # Inter-node TLS/mTLS. CE crypto provider is pure-Rust rustls-rustcrypto (no C
-# FFI, ADR-013); EE swaps the process-default CryptoProvider to aws-lc-rs.
+# FFI); EE swaps the process-default CryptoProvider to aws-lc-rs.
 rustls = { version = "0.23", default-features = false }
 rustls-rustcrypto = "0.0.2-alpha"
 # PEM parsing lives in rustls-pki-types now (rustls-pemfile is unmaintained).

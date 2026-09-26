@@ -1,7 +1,7 @@
 //! Multi-source swarm download: fetch a segment's pieces from several peers at
 //! once, rarest-first, choosing the best source per piece.
 //!
-//! This is the receiver side of the BitTorrent-inspired transfer (ADR-005): a
+//! This is the receiver side of the BitTorrent-inspired transfer: a
 //! node that needs a segment (replication repair, resync, the target of a
 //! migration) pulls each piece from whichever peer scores best for it, verifies
 //! the piece on arrival, and — as pieces verify — becomes a holder itself, so in

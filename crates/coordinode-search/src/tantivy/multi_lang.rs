@@ -1,7 +1,7 @@
 //! Multi-language text index with per-document language resolution.
 //!
 //! `MultiLanguageTextIndex` wraps [`TextIndex`] and provides the 4-level
-//! language cascade described in `arch/search/fulltext.md`:
+//! language cascade:
 //!
 //! 1. **Explicit per-field analyzer** (from index config) — highest priority
 //! 2. **Per-node `_language` property** (opt-in override) — mid priority

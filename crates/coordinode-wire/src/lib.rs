@@ -1,8 +1,8 @@
 //! Inter-node wire transport codec: pure-Rust zstd compression for gRPC.
 //!
 //! [`ZstdCodec`] is a drop-in [`tonic::codec::Codec`] that compresses every gRPC
-//! message body on the wire with pure-Rust zstd ([`structured_zstd`], no C FFI
-//! per ADR-013), independent of any node's on-disk storage codec. Wire it into
+//! message body on the wire with pure-Rust zstd ([`structured_zstd`], no C
+//! FFI), independent of any node's on-disk storage codec. Wire it into
 //! an inter-node service through tonic-build `codec_path = "coordinode_wire::ZstdCodec"`;
 //! both ends use it symmetrically, so a service's payloads travel compressed
 //! between replicas — most valuable on a bandwidth-constrained geo link. Shared

@@ -29,6 +29,6 @@ default = []
 test-clock = []
 
 [lints.clippy]
-# The ADR-041 partition guard (clippy.toml `disallowed-types`) is global and
+# The storage-partition guard (clippy.toml `disallowed-types`) is global and
 # warn-by-default; only coordinode-query opts into it. Keep it inert here.
 disallowed_types = "allow"

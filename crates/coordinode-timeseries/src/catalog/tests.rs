@@ -89,7 +89,7 @@ fn invalid_config_rejected_at_construction() {
 fn single_measurement_appends_without_flush() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,
@@ -312,7 +312,7 @@ fn time_rollover_when_measurement_outside_granularity() {
 fn schema_rollover_when_new_field_introduced() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,
@@ -349,7 +349,7 @@ fn schema_rollover_when_new_field_introduced() {
 fn distinct_meta_values_open_distinct_buckets() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,
@@ -385,7 +385,7 @@ fn distinct_meta_values_open_distinct_buckets() {
 fn flush_all_drains_every_stripe() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,
@@ -771,7 +771,7 @@ fn tier3_skipped_when_handle_time_range_does_not_contain_measurement() {
 fn compact_if_needed_no_op_below_threshold() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,
@@ -1022,14 +1022,14 @@ fn write_measurement_stamps_ingestion_ts_via_clock() {
 
 #[test]
 fn write_measurement_ignores_caller_supplied_ingestion_ts() {
-    // Per ADR-027: `__ingestion_ts__` is engine-assigned, NEVER
+    // `__ingestion_ts__` is engine-assigned, NEVER
     // user-supplied. Even if the caller pre-sets `ingestion_ts_us`
     // on the Measurement struct, the catalog MUST overwrite it
     // with the clock value — otherwise a malicious client could
     // backdate writes and break `AS OF INGESTION_TIME` semantics.
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![999]));
     let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
     let meta = rmpv::Value::String("sensor".into());
@@ -1064,7 +1064,7 @@ fn non_bitemporal_writes_leave_ingestion_column_empty_for_storage_saving() {
     // pay zero per-measurement overhead for the bitemporal axis.
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let clock = std::sync::Arc::new(crate::clock::ScriptedClock::new(vec![1, 2, 3]));
     let catalog = BucketCatalog::new(cfg, 0, &store, &engine, 1, clock).unwrap();
     let meta = rmpv::Value::String("iot-sensor".into());
@@ -1423,7 +1423,7 @@ fn overflow_path_preserves_ingestion_stamp() {
 fn compact_all_pending_no_op_when_overflow_set_empty() {
     let (_dir, engine) = mk_engine();
     let store = LocalTimeSeriesStore;
-    let cfg = CatalogConfig::arch_defaults();
+    let cfg = CatalogConfig::default();
     let catalog = BucketCatalog::new(
         cfg,
         0,

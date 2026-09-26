@@ -1,5 +1,5 @@
 //! Ingestion clock — engine-assigned `__ingestion_ts__` stamp source
-//! for time-series measurements (bitemporal axis #2 per ADR-027).
+//! for time-series measurements (the second bitemporal axis).
 //!
 //! ## Why a trait
 //!

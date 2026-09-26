@@ -24,7 +24,7 @@
 //!    [`lsm_tree::fs::MemFs`] (in-memory FS) for 2–5× speed-up and
 //!    cleaner isolation.
 //! 2. **Persistence tests** — verify behaviour that *requires* a
-//!    real disk: WAL recovery (R076a / R091a), Tier-2 bucket reopen,
+//!    real disk: WAL recovery, Tier-2 bucket reopen,
 //!    SST flush + reopen round-trips, crash safety. These must run
 //!    on a tempdir-backed [`lsm_tree::fs::StdFs`] because they
 //!    exercise the actual durability path.

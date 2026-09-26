@@ -1,4 +1,4 @@
-//! R-SNAP3 regression tests — FTS `segment_registry` snapshot filter.
+//! Regression tests for the FTS `segment_registry` snapshot filter.
 //!
 //! Three mandatory regression cases per task spec:
 //!

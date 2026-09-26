@@ -22,34 +22,13 @@ pub enum CatalogError {
     #[error("time-series store: {0}")]
     Store(#[from] StoreError),
 
-    /// The incoming measurement's `timestamp_us` is far enough in the
-    /// past that even the catalog's recently-closed LRU cannot
-    /// absorb it (Tier-3 territory — falls through to overflow once
-    /// the routing tier lands).
-    ///
-    /// Slice A returns this error rather than silently dropping the
-    /// measurement; callers can detect it and either retry against
-    /// the overflow path (when Slice B lands) or surface a write
-    /// rejection to the client.
-    #[error(
-        "measurement timestamp {timestamp_us} predates bucket window for ({label_id}, meta_hash {meta_hash:#x})"
-    )]
-    LateBeyondTier1 {
-        /// Label of the time-series series.
-        label_id: u16,
-        /// Hash of the meta-field value identifying the series.
-        meta_hash: u64,
-        /// The rejected measurement's event-time timestamp (μs).
-        timestamp_us: i64,
-    },
-
     /// The catalog config was invalid (e.g. zero granularity span,
     /// zero count or size limit).
     #[error("invalid catalog configuration: {0}")]
     InvalidConfig(&'static str),
 
     /// A short-lived bucket transaction failed to commit. The catalog
-    /// owns its own transaction boundaries (ADR-041) — each logical
+    /// owns its own transaction boundaries: each logical
     /// bucket operation opens, writes, and commits one transaction;
     /// this variant carries the underlying commit failure.
     #[error("time-series transaction commit: {0}")]

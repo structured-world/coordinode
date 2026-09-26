@@ -1,5 +1,5 @@
 //! `SeqnoConsumerRegistry` — the single source of truth for "what is the
-//! oldest seqno still needed by any active consumer" on a shard (ADR-028).
+//! oldest seqno still needed by any active consumer" on a shard.
 //!
 //! The registry unifies three previously-independent retention drivers (the
 //! lsm-tree compaction `gc_watermark`, oplog segment retention, and the EE

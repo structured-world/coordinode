@@ -3,15 +3,15 @@
 //! These describe what a consumer registers, how its retention reach is
 //! scoped across the topology, and what the registry reports back. The
 //! registration record replicates through the shard's Raft group, so the
-//! wire-relevant types derive `Serialize`/`Deserialize`; their layout
-//! stabilises in the pre-public-release window (ADR-028 consequence 8).
+//! wire-relevant types derive `Serialize`/`Deserialize`; their layout may
+//! still change before the first public release.
 
 use serde::{Deserialize, Serialize};
 
 /// What kind of consumer a registration represents.
 ///
-/// The kind selects which read API the consumer uses; it does **not** affect
-/// retention math (`shard_floor = min(checkpoint_seqno)` regardless of kind).
+/// The kind selects which read API the consumer uses and which retention
+/// floor its checkpoint feeds (see [`ConsumerKind::is_seqno_space`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsumerKind {
     /// Reads the ordered event stream via `OplogTailer::tail_from`
@@ -34,11 +34,10 @@ impl ConsumerKind {
     /// oplog segment retention (feed b).
     ///
     /// The two are physically distinct counters — the MVCC oracle stamps
-    /// wall-clock microseconds (ADR-007) while the oplog `ResumeToken` is a
+    /// wall-clock microseconds while the oplog `ResumeToken` is a
     /// Raft log index — so a single cluster-wide `min(checkpoint)` across
     /// both would be meaningless. Retention math is split by space; the
-    /// `kind` selects which floor a registration contributes to. (This
-    /// refines ADR-028, which described a single kind-agnostic floor.)
+    /// `kind` selects which floor a registration contributes to.
     pub fn is_seqno_space(self) -> bool {
         match self {
             // Read at an MVCC seqno (scan_since_seqno / read-at-seqno / the

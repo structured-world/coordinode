@@ -1,8 +1,7 @@
 //! [`BucketCatalog`] — per-shard in-memory open-bucket map.
 //!
 //! Sits above [`coordinode_modality::TimeSeriesStore`] and turns
-//! single-measurement INSERTs into batched whole-bucket writes. See
-//! the crate-level docs for the wider Slice A / B / C scope.
+//! single-measurement INSERTs into batched whole-bucket writes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
@@ -40,8 +39,8 @@ struct OpenBucket {
     meta: rmpv::Value,
     /// Running byte-size estimate (see [`crate::measurement_router::route`]).
     size_estimate: u32,
-    /// Wall-clock time the bucket was opened. Drives future age-
-    /// based flushes (Slice C).
+    /// Wall-clock time the bucket was opened, kept for age-based
+    /// flushes.
     #[allow(dead_code)]
     created_at: SystemTime,
 }
@@ -74,7 +73,7 @@ struct ClosedBucketHandle {
     /// Inclusive event-time bounds the bucket covered when flushed.
     /// Used to decide whether an incoming late measurement falls
     /// within the bucket's window (Tier 2 candidate) or beyond it
-    /// (Tier 3 territory, deferred to Slice C).
+    /// (Tier 3 territory, the overflow segment).
     time_range: (i64, i64),
     /// Meta-field value the bucket was keyed by. Carried so a
     /// re-open can pass it to subsequent [`Bucket::from_measurements`].
@@ -88,10 +87,9 @@ struct ClosedBucketHandle {
 /// Bounded, TTL-pruned map of recently-closed buckets — the catalog's
 /// Tier-2 fast-path lookup.
 ///
-/// **Capacity.** Hard cap at `MAX_RECENTLY_CLOSED` per stripe (the
-/// arch spec sets the catalog-wide LRU at 10_000; with 32 stripes a
-/// per-stripe cap of 512 gives the same total while keeping the
-/// eviction scan bounded).
+/// **Capacity.** Hard cap at `MAX_RECENTLY_CLOSED` per stripe (a
+/// catalog-wide LRU of about 10_000; with 32 stripes a per-stripe cap
+/// of 512 gives that total while keeping the eviction scan bounded).
 ///
 /// **TTL.** Entries expire at `closed_at + 2 × granularity_span` so
 /// late-arrival absorption shrinks gracefully as a series falls
@@ -108,14 +106,13 @@ struct RecentlyClosedLru {
 }
 
 /// Per-stripe LRU capacity. 32 stripes × 512 = 16_384 entries
-/// catalog-wide (slightly above the arch 10K target — slightly over
-/// is harmless, slightly under means a hot series can lose Tier-2
+/// catalog-wide (slightly above the 10K target: slightly over is
+/// harmless, slightly under means a hot series can lose Tier-2
 /// eligibility under bursty churn).
 const MAX_RECENTLY_CLOSED: usize = 512;
 
 /// Overflow count above which [`BucketCatalog::compact_if_needed`]
-/// triggers a [`TimeSeriesStore::compact_overflow`] call. Matches
-/// the arch §Background merge default.
+/// triggers a [`TimeSeriesStore::compact_overflow`] call.
 const OVERFLOW_COMPACT_THRESHOLD: usize = 50;
 
 impl RecentlyClosedLru {
@@ -187,7 +184,7 @@ impl RecentlyClosedLru {
 /// coordination — so 32-way parallel writers see near-linear
 /// scaling provided their bucket keys spread across stripes.
 ///
-/// **Flush model (Slice A).** A rollover trigger inside
+/// **Flush model.** A rollover trigger inside
 /// `write_measurement` causes the catalog to:
 /// 1. Sort the bucket's buffer by `timestamp_us` (Tier-1 in-buffer
 ///    late-arrival absorption — out-of-order writes within the
@@ -202,7 +199,7 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     shard_id: u16,
     store: &'store S,
     /// Engine the catalog opens its short-lived bucket transactions
-    /// against (ADR-041). The `store` is a stateless typed handle; the
+    /// against. The `store` is a stateless typed handle; the
     /// engine is what its buffered writes commit through.
     engine: &'store StorageEngine,
     stripes: [RwLock<Stripe>; STRIPE_COUNT],
@@ -219,8 +216,8 @@ pub struct BucketCatalog<'store, S: TimeSeriesStore> {
     /// monotonic so a compactor that races a writer can't see
     /// duplicate seqnos.
     next_overflow_seqno: std::sync::atomic::AtomicU64,
-    /// Engine-assigned ingestion-time stamp source (bitemporal axis
-    /// per ADR-027). The catalog stamps every incoming measurement
+    /// Engine-assigned ingestion-time stamp source (the bitemporal
+    /// axis). The catalog stamps every incoming measurement
     /// via `clock.next()` before buffering — production replicas
     /// share a Raft-leader-stamped clock; CE single-node uses
     /// [`crate::clock::MonotonicHlcClock`]; tests use `ScriptedClock`.
@@ -269,7 +266,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// Open a short-lived MVCC transaction against the catalog's
     /// engine, run `body` (the store reads/writes for one logical
     /// bucket operation), then commit it. The catalog owns its bucket
-    /// transaction boundaries (ADR-041): bucket bodies are
+    /// transaction boundaries: bucket bodies are
     /// point-overwrites, so a fresh per-operation transaction
     /// reproduces the prior immediate-write semantics while keeping
     /// multi-step operations atomic (e.g. compaction's base rewrite +
@@ -302,7 +299,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// and sorted on flush. Out-of-window measurements trigger a
     /// time-based rollover.
     ///
-    /// **Tier 2 re-open** (Slice B): when no open bucket exists for
+    /// **Tier 2 re-open**: when no open bucket exists for
     /// `(label_id, meta)` but a recently-closed handle is still in
     /// the stripe's LRU AND the measurement's `timestamp_us` falls
     /// within the handle's time range AND the measurement's fields
@@ -321,7 +318,7 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// Storage payoff: `Bucket::from_measurements` sees an all-None
     /// vec, clears the `ingestion_timestamps` column, and the
     /// per-measurement +8B overhead drops to ~1B msgpack tag per
-    /// bucket. Per ADR-027 + ε-policy this is the default.
+    /// bucket. This is the default.
     ///
     /// Returns `Ok(())` on append (most paths); errors propagate
     /// from the downstream store.
@@ -337,8 +334,8 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// **Bitemporal ingest** — engine stamps `__ingestion_ts__` via
     /// the catalog's clock. Use this for labels declared as
     /// `CREATE LABEL X TIMESERIES WITH BITEMPORAL` (compliance,
-    /// financial replay, ML reproducibility). Per ADR-027 the stamp
-    /// is engine-assigned, never user-supplied — any caller value
+    /// financial replay, ML reproducibility). The stamp is
+    /// engine-assigned, never user-supplied — any caller value
     /// is overwritten.
     ///
     /// Resolves to the same write path as
@@ -383,8 +380,8 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         mut measurement: Measurement,
         now: SystemTime,
     ) -> CatalogResult<()> {
-        // Engine-assigned stamp — overwrites caller value per
-        // ADR-027 "never user-supplied".
+        // Engine-assigned stamp: overwrites any caller value, the
+        // ingestion time is never user-supplied.
         measurement.ingestion_ts_us = Some(self.clock.next());
 
         self.write_measurement_inner(label_id, meta, measurement, now)
@@ -503,9 +500,8 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
         // offline for hours / retroactive corrections) — too old
         // for a cheap re-open, but identifiable by the LRU's
         // surviving `(BucketKey → node_id)` mapping. Truly orphaned
-        // late data (LRU evicted the handle entirely) still surfaces
-        // as [`CatalogError::LateBeyondTier1`] for the caller to
-        // route or reject.
+        // late data (LRU evicted the handle entirely) opens a fresh
+        // bucket below.
         if !stripe.open_buckets.contains_key(&key) {
             let overflow_target = stripe.recently_closed.get_any(&key).and_then(|h| {
                 if measurement_fits_recently_closed(h, &measurement, self.config.granularity_span) {
@@ -705,9 +701,8 @@ impl<'store, S: TimeSeriesStore> BucketCatalog<'store, S> {
     /// of buckets that actually compacted (i.e. were above
     /// `OVERFLOW_COMPACT_THRESHOLD`).
     ///
-    /// Production wires this into a periodic loop above the catalog
-    /// (a `tokio::time::interval` task per shard owns the schedule;
-    /// the catalog itself never spawns threads). Tests invoke
+    /// The catalog never spawns threads: its owner drives this on its
+    /// own schedule (a periodic task per shard). Tests invoke it
     /// directly to verify the discover + compact cycle end to end.
     ///
     /// The discover step uses

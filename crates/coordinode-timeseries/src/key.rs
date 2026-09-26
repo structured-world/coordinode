@@ -1,5 +1,5 @@
 //! Bucket key — the identifier the catalog uses to look up an open
-//! bucket. Mirrors `arch/core/timeseries.md` §BucketCatalog:
+//! bucket:
 //!
 //! ```text
 //! struct BucketKey { label_id: u16, meta_hash: u64 }
