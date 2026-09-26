@@ -197,6 +197,41 @@ fn ee_mode_storage_rejected_at_startup() {
     );
 }
 
+/// A server whose gRPC port is taken must refuse to start before it opens
+/// storage: the data directory stays untouched and the error names the
+/// address, instead of the store being opened (and possibly recovered) only
+/// to be abandoned when the late bind fails.
+#[test]
+fn busy_grpc_port_fails_the_start_before_storage_opens() {
+    let taken = std::net::TcpListener::bind("[::1]:0").expect("hold a port");
+    let addr = taken.local_addr().expect("held address");
+    let root = tempfile::tempdir().expect("tempdir");
+    let data_dir = root.path().join("data");
+
+    let output = std::process::Command::new(binary_path())
+        .args(["serve", "--ops-addr", "[::1]:0", "--addr"])
+        .arg(addr.to_string())
+        .arg("--data")
+        .arg(&data_dir)
+        .output()
+        .expect("failed to spawn coordinode binary");
+
+    assert!(
+        !output.status.success(),
+        "a taken gRPC port must fail the start, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&addr.to_string()),
+        "the error must name the taken address {addr}. Got stderr: {stderr}"
+    );
+    assert!(
+        !data_dir.exists(),
+        "storage must not be opened when the gRPC port is taken"
+    );
+}
+
 /// `--mode=full` must start normally (default mode, CE-supported).
 ///
 /// Regression guard: ensures we don't accidentally reject the default mode.

@@ -226,6 +226,14 @@ pub(crate) async fn serve(
     }
 
     let addr: SocketAddr = grpc_addr.parse()?;
+    // Bind the gRPC port before opening storage: a port already in use fails
+    // the start at once, rather than after the store has been opened (and
+    // possibly recovered) only to be abandoned. A client that connects before
+    // the services are wired waits in the accept backlog. TCP_NODELAY is the
+    // value `serve_with_shutdown(addr)` would have applied.
+    let grpc_incoming = tonic::transport::server::TcpIncoming::bind(addr)
+        .map_err(|e| format!("cannot bind the gRPC address {addr}: {e}"))?
+        .with_nodelay(Some(true));
     // Advertise address is what peers use to connect to this node.
     // Falls back to grpc_addr when not explicitly set.
     let effective_advertise = advertise_addr.unwrap_or_else(|| grpc_addr.clone());
@@ -1203,7 +1211,9 @@ pub(crate) async fn serve(
     let mut server = server.layer(grpc::NodeInfoLayer::new(node_id));
     let router = server.add_routes(routes.routes());
 
-    router.serve_with_shutdown(addr, shutdown).await?;
+    router
+        .serve_with_incoming_shutdown(grpc_incoming, shutdown)
+        .await?;
 
     Ok(())
 }
