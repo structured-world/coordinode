@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 /// the caller can route to a fallback path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnlineDuringBuild {
-    /// Reader waits (up to a deadline) for the index to reach `Ready`
-    /// before proceeding. Matches the legacy synchronous semantic.
+    /// Reader waits (up to a deadline) until the build on the member serving
+    /// it has made the index complete, then proceeds.
     #[default]
     Block,
     /// Reader uses the partial index immediately. Recall improves as the

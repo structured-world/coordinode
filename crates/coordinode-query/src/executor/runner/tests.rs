@@ -287,7 +287,6 @@ fn make_ctx<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
-        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 1,
@@ -301,7 +300,7 @@ fn make_ctx<'a>(
         write_stats: WriteStats::default(),
         text_index: None,
         text_index_registry: None,
-        vector_index_registry: None,
+        vector_indexes: None,
         btree_index_registry: None,
         extensions: None,
         vector_loader: None,

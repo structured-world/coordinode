@@ -28,7 +28,6 @@ pub fn make_ctx_legacy<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
-        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 1,
@@ -42,7 +41,7 @@ pub fn make_ctx_legacy<'a>(
         write_stats: WriteStats::default(),
         text_index: None,
         text_index_registry: None,
-        vector_index_registry: None,
+        vector_indexes: None,
         btree_index_registry: None,
         extensions: None,
         vector_loader: None,
@@ -96,7 +95,6 @@ pub fn make_ctx_mvcc<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
-        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 0,
@@ -110,7 +108,7 @@ pub fn make_ctx_mvcc<'a>(
         write_stats: WriteStats::default(),
         text_index: None,
         text_index_registry: None,
-        vector_index_registry: None,
+        vector_indexes: None,
         btree_index_registry: None,
         extensions: None,
         vector_loader: None,
@@ -165,7 +163,6 @@ pub fn make_ctx_with_pipeline<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
-        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 0,
@@ -179,7 +176,7 @@ pub fn make_ctx_with_pipeline<'a>(
         write_stats: WriteStats::default(),
         text_index: None,
         text_index_registry: None,
-        vector_index_registry: None,
+        vector_indexes: None,
         btree_index_registry: None,
         extensions: None,
         vector_loader: None,

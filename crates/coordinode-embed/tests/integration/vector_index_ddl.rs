@@ -1030,11 +1030,11 @@ fn create_vector_index_ef_search_option_recovers_adversarial_recall() {
     }
 }
 
-// ── R858b-pre3 Step 3: online_during_build policy tests ──────────────────
+// ── online_during_build policy tests ──────────────────
 
 /// Default policy ("block") must let CREATE-then-SEARCH succeed: the gate
-/// polls until the background backfill completes before letting the query
-/// hit the HNSW graph, matching the legacy synchronous semantic.
+/// waits until the background build has made the index complete before
+/// letting the query hit the HNSW graph.
 #[test]
 fn online_during_build_default_block_waits_for_backfill() {
     let (mut db, _dir) = open_db();

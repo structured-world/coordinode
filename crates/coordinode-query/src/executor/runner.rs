@@ -440,17 +440,21 @@ pub struct ScanPaging {
     pub exhausted: bool,
 }
 
+/// The vector indexes a statement searches and maintains, together with the
+/// engine a `CREATE VECTOR INDEX` builds from in the background.
+///
+/// Held as one value so a context that can define a vector index can always
+/// build it: the build outlives the statement and needs an owned engine.
+#[derive(Clone, Copy)]
+pub struct VectorIndexes<'a> {
+    /// The registered indexes.
+    pub registry: &'a crate::index::VectorIndexRegistry,
+    /// The engine the indexes are built from, the one the context reads.
+    pub engine: &'a Arc<StorageEngine>,
+}
+
 pub struct ExecutionContext<'a> {
     pub engine: &'a StorageEngine,
-    /// Optional `Arc` handle to the same engine the borrow above points at.
-    ///
-    /// Set by callers that already own an `Arc<StorageEngine>` (the embed /
-    /// server stack) and want to enable execution paths that need owned
-    /// engine handles for background work — first consumer is the HNSW
-    /// backfill task spawned by `CREATE VECTOR INDEX`. Construction sites
-    /// that build an ExecutionContext from a borrowed-only test engine
-    /// leave this `None`, which forces the legacy synchronous backfill.
-    pub engine_arc: Option<Arc<StorageEngine>>,
     pub interner: &'a mut FieldInterner,
     /// Node ID allocator for CREATE operations.
     pub id_allocator: &'a NodeIdAllocator,
@@ -496,10 +500,11 @@ pub struct ExecutionContext<'a> {
     /// When set, `execute_text_filter` resolves the text index by (label, property).
     /// Write operations auto-maintain text indexes via `on_text_written`/`on_text_deleted`.
     pub text_index_registry: Option<&'a crate::index::TextIndexRegistry>,
-    /// Vector index registry for HNSW-accelerated vector search.
-    /// When set, VectorFilter checks for applicable HNSW indexes
-    /// before falling back to brute-force distance computation.
-    pub vector_index_registry: Option<&'a crate::index::VectorIndexRegistry>,
+    /// Vector indexes for HNSW-accelerated vector search and `CREATE VECTOR
+    /// INDEX`. When set, VectorFilter checks for applicable HNSW indexes
+    /// before falling back to brute-force distance computation; read the
+    /// registry through [`Self::vector_index_registry`].
+    pub vector_indexes: Option<VectorIndexes<'a>>,
     /// B-tree index registry for unique constraint enforcement.
     /// When set, `execute_create_node` calls `on_node_created` to check
     /// unique constraints and maintain B-tree index entries.
@@ -693,6 +698,11 @@ pub struct ExecutionContext<'a> {
 }
 
 impl<'a> ExecutionContext<'a> {
+    /// The vector index registry, when this context has vector indexes.
+    pub fn vector_index_registry(&self) -> Option<&'a crate::index::VectorIndexRegistry> {
+        self.vector_indexes.map(|v| v.registry)
+    }
+
     /// Drain buffered HNSW inserts and apply them in one batched
     /// write per (label, property) index. The CREATE-row hot path
     /// inside `execute_create_node` appends to
@@ -706,7 +716,7 @@ impl<'a> ExecutionContext<'a> {
         if self.pending_vector_writes.is_empty() {
             return;
         }
-        let Some(registry) = self.vector_index_registry else {
+        let Some(registry) = self.vector_index_registry() else {
             self.pending_vector_writes.clear();
             return;
         };
@@ -3700,9 +3710,9 @@ fn execute_hnsw_scan(
     index_name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let Some(registry) = ctx.vector_index_registry else {
+    let Some(registry) = ctx.vector_index_registry() else {
         return Err(ExecutionError::Unsupported(format!(
-            "HnswScan({index_name}) requires vector_index_registry in ExecutionContext"
+            "HnswScan({index_name}) requires vector indexes in ExecutionContext"
         )));
     };
     refuse_current_only_index(ctx, HistoricalIndexKind::Vector, label, property)?;
@@ -4933,7 +4943,7 @@ fn try_hnsw_vector_top_k(
         return Ok(None);
     }
 
-    let registry = match ctx.vector_index_registry {
+    let registry = match ctx.vector_index_registry() {
         Some(r) => r,
         None => return Ok(None),
     };
@@ -5403,7 +5413,7 @@ fn resolve_rank_fuse_method(
 
     // Prefer typed registry hits keyed by the variable's label.
     if let Some(label) = label_opt.as_deref() {
-        if let Some(reg) = ctx.vector_index_registry {
+        if let Some(reg) = ctx.vector_index_registry() {
             if let Some(def) = reg.get_definition(label, &property) {
                 if let Some(cfg) = def.vector_config.as_ref() {
                     return Ok(RankFuseMethodKind::VectorHnsw {
@@ -8975,7 +8985,7 @@ fn execute_create_node(
         // index is still resolved here so we only buffer writes that
         // would actually land somewhere — the registry lookup itself
         // is cheap (RwLock::read on a HashMap).
-        if let Some(registry) = ctx.vector_index_registry {
+        if let Some(registry) = ctx.vector_index_registry() {
             if let Some(primary_label) = labels.first() {
                 for (prop_name, expr) in properties {
                     if !registry.has_index(primary_label, prop_name) {
@@ -9960,7 +9970,7 @@ fn execute_update(
                         ctx.write_stats.properties_set += 1;
 
                         // Notify vector index registry if setting a vector property.
-                        if let Some(registry) = ctx.vector_index_registry {
+                        if let Some(registry) = ctx.vector_index_registry() {
                             if let Some(vec_data) = try_extract_vector(&val) {
                                 let label = record.primary_label().to_string();
                                 registry.on_vector_written(&label, node_id, property, &vec_data);
@@ -10296,7 +10306,7 @@ fn execute_update(
                         }
 
                         // Notify vector index registry for any vector properties in the replacement map.
-                        if let Some(registry) = ctx.vector_index_registry {
+                        if let Some(registry) = ctx.vector_index_registry() {
                             let label = record.primary_label().to_string();
                             if let Value::Map(ref map) = map_val {
                                 for (k, v) in map {
@@ -10424,7 +10434,7 @@ fn execute_update(
                         }
 
                         // Notify vector index registry for any vector properties in the merged map.
-                        if let Some(registry) = ctx.vector_index_registry {
+                        if let Some(registry) = ctx.vector_index_registry() {
                             let label = record.primary_label().to_string();
                             if let Value::Map(ref map) = map_val {
                                 for (k, v) in map {
@@ -10830,7 +10840,7 @@ fn execute_remove(
                             }
 
                             // Notify vector index if removing a vector property.
-                            if let Some(registry) = ctx.vector_index_registry {
+                            if let Some(registry) = ctx.vector_index_registry() {
                                 if old_value
                                     .as_ref()
                                     .is_some_and(|v| try_extract_vector(v).is_some())
@@ -11295,7 +11305,7 @@ fn execute_delete(
                     .map(|rec| snapshot_node_record(&rec, ctx));
 
             let needs_index_cleanup = ctx.btree_index_registry.is_some()
-                || ctx.vector_index_registry.is_some()
+                || ctx.vector_indexes.is_some()
                 || ctx.text_index_registry.is_some();
             if needs_index_cleanup {
                 if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
@@ -11322,7 +11332,7 @@ fn execute_delete(
 
                         for (&field_id, value) in &record.props {
                             if let Some(prop_name) = ctx.interner.resolve(field_id) {
-                                if let Some(registry) = ctx.vector_index_registry {
+                                if let Some(registry) = ctx.vector_index_registry() {
                                     if try_extract_vector(value).is_some() {
                                         registry.on_vector_deleted(&label, node_id, prop_name);
                                     }
@@ -12223,7 +12233,7 @@ fn notify_indexes_for_target_change(
                 )
                 .map_err(ExecutionError::Storage)?;
         }
-        if let Some(registry) = ctx.vector_index_registry {
+        if let Some(registry) = ctx.vector_index_registry() {
             if try_extract_vector(old_val).is_some() {
                 registry.on_vector_deleted(label, target_id, &name);
             }
@@ -12259,7 +12269,7 @@ fn notify_indexes_for_target_change(
                     ))
                 })?;
         }
-        if let Some(registry) = ctx.vector_index_registry {
+        if let Some(registry) = ctx.vector_index_registry() {
             if let Some(vec_data) = try_extract_vector(new_val) {
                 registry.on_vector_written(label, target_id, &name, &vec_data);
             }
@@ -12553,7 +12563,7 @@ fn detach_delete_node(
             }
             for (&field_id, value) in &record.props {
                 if let Some(prop_name) = ctx.interner.resolve(field_id) {
-                    if let Some(registry) = ctx.vector_index_registry {
+                    if let Some(registry) = ctx.vector_index_registry() {
                         if try_extract_vector(value).is_some() {
                             registry.on_vector_deleted(&label, node_id, prop_name);
                         }
@@ -13836,7 +13846,7 @@ fn cascade_delete_source_node(
         .mvcc_get_node(ctx.shard_id, source_id)?
         .map(|rec| snapshot_node_record(&rec, ctx));
     let needs_index_cleanup = ctx.btree_index_registry.is_some()
-        || ctx.vector_index_registry.is_some()
+        || ctx.vector_indexes.is_some()
         || ctx.text_index_registry.is_some();
     if needs_index_cleanup {
         if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
@@ -13858,7 +13868,7 @@ fn cascade_delete_source_node(
                 }
                 for (&fid, value) in &record.props {
                     if let Some(prop_name) = ctx.interner.resolve(fid) {
-                        if let Some(registry) = ctx.vector_index_registry {
+                        if let Some(registry) = ctx.vector_index_registry() {
                             if try_extract_vector(value).is_some() {
                                 registry.on_vector_deleted(&label, source_id, prop_name);
                             }
@@ -15445,11 +15455,11 @@ fn execute_drop_encrypted_index(
 
 /// Execute `CREATE VECTOR INDEX idx ON :Label(property) OPTIONS {m, ef_construction, metric, dimensions}`.
 ///
-/// 1. Validates vector_index_registry is available.
+/// 1. Validates the context carries vector indexes.
 /// 2. Builds a `VectorIndexConfig` from the OPTIONS.
 /// 3. Persists the `IndexDefinition` to the `Schema` partition.
-/// 4. Registers the empty HNSW graph in the registry.
-/// 5. Backfills existing nodes that have the indexed vector property.
+/// 4. Registers the empty HNSW graph in the registry, rebuilding.
+/// 5. Starts the background build that fills it, owned by the registry.
 #[allow(clippy::too_many_arguments)]
 fn execute_create_vector_index(
     name: &str,
@@ -15465,9 +15475,13 @@ fn execute_create_vector_index(
     rerank_candidates: Option<usize>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let Some(registry) = ctx.vector_index_registry else {
+    let Some(VectorIndexes {
+        registry,
+        engine: engine_arc,
+    }) = ctx.vector_indexes
+    else {
         return Err(ExecutionError::Unsupported(
-            "CREATE VECTOR INDEX requires vector_index_registry in ExecutionContext".into(),
+            "CREATE VECTOR INDEX requires vector indexes in ExecutionContext".into(),
         ));
     };
 
@@ -15544,184 +15558,119 @@ fn execute_create_vector_index(
     let tier = registry.tier_handle(label_id, property_id);
     registry.register_for_build(def.clone(), tier);
 
-    let field_id = ctx.interner.lookup(property);
     let shard_id = ctx.shard_id;
 
-    // Snapshot the live HNSW handle BEFORE deciding sync vs background.
-    // The handle is `Arc<RwLock<HnswIndex>>`, cheap to clone, and stays
-    // valid for the lifetime of the registry entry.
-    let hnsw_handle = registry.get(label, property);
+    // The live HNSW handle, `Arc<RwLock<HnswIndex>>`: cheap to clone and
+    // valid for the lifetime of the registry entry the build fills.
+    let hnsw = registry.get(label, property).ok_or_else(|| {
+        ExecutionError::Unsupported(format!(
+            "vector index '{name}' was not registered: its definition carries no vector config"
+        ))
+    })?;
 
-    // Pick the execution mode based on whether the caller plumbed an
-    // owned engine handle. With `engine_arc = Some(...)` we move the
-    // backfill into a background thread and return immediately; with
-    // None (test paths that build ExecutionContext with only a borrowed
-    // engine) we keep the legacy synchronous loop.
-    let (final_state, nodes_indexed): (IndexState, i64) = match (
-        &ctx.engine_arc,
-        hnsw_handle,
-        field_id,
-    ) {
-        (Some(engine_arc), Some(hnsw), Some(fid)) => {
-            // Publish the Building state so concurrent readers and the
-            // crash-recovery path see "backfill in progress" before the
-            // thread starts touching SSTs.
-            let initial_state = IndexState::Building {
-                written: 0,
-                estimated_total: 0,
-            };
-            if let Err(e) =
-                crate::index::ops::save_index_state(ctx.engine, name, initial_state.clone())
-            {
-                // Only the crash-recovery marker is lost: a reopen then
-                // finds the index Ready and rebuilds it all the same.
-                tracing::warn!(index = %name, error = %e, "could not persist the building state");
-            }
+    // The build runs on its own thread, owned by the registry, and the
+    // statement returns once it has started. Publish the Building state
+    // first, so concurrent readers and the crash-recovery path see
+    // "backfill in progress" before the thread starts touching SSTs.
+    let initial_state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    if let Err(e) = crate::index::ops::save_index_state(ctx.engine, name, initial_state) {
+        // Only the crash-recovery marker is lost: a reopen then
+        // finds the index Ready and rebuilds it all the same.
+        tracing::warn!(index = %name, error = %e, "could not persist the building state");
+    }
 
-            let engine = Arc::clone(engine_arc);
-            let label_owned = label.to_string();
-            let name_owned = name.to_string();
-            let token = registry.new_build_token();
-            let build_token = token.clone();
-            // The build publishes through the index's health signal, not
-            // the registry: the signal is atomic and `Arc`-shared, so the
-            // thread needs neither a borrow of the registry nor a lock on
-            // the search path to report where it is.
-            let health = registry.health_handle(label, property).ok_or_else(|| {
-                ExecutionError::Unsupported(format!(
-                    "vector index '{name}' has no health signal to publish build progress on"
-                ))
-            })?;
-            let unbuilt = Arc::clone(&health);
+    let engine = Arc::clone(engine_arc);
+    let label_owned = label.to_string();
+    let name_owned = name.to_string();
+    let token = registry.new_build_token();
+    let build_token = token.clone();
+    // The build publishes through the index's health signal, not
+    // the registry: the signal is atomic and `Arc`-shared, so the
+    // thread needs neither a borrow of the registry nor a lock on
+    // the search path to report where it is.
+    let health = registry.health_handle(label, property).ok_or_else(|| {
+        ExecutionError::Unsupported(format!(
+            "vector index '{name}' has no health signal to publish build progress on"
+        ))
+    })?;
+    let unbuilt = Arc::clone(&health);
 
-            let thread = std::thread::Builder::new()
-                .name(format!("vec-backfill-{name}"))
-                .spawn(move || {
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::index::VectorBuild {
-                            engine: engine.as_ref(),
-                            token: &build_token,
-                            shard_id,
-                            targets: &[crate::index::BuildTarget {
-                                hnsw: hnsw.as_ref(),
-                                health: health.as_ref(),
-                                label: &label_owned,
-                                field_id: fid,
-                            }],
-                        }
-                        .run()
-                    }));
-                    let terminal = match outcome {
-                        Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
-                            tracing::info!(
-                                index = %name_owned,
-                                scanned,
-                                "vector index backfill complete"
-                            );
-                            IndexState::Ready
-                        }
-                        // Cancelled: the index is being dropped or replaced
-                        // by whoever cancelled us. Writing anything now —
-                        // state or progress — would land under their
-                        // statement and conflict with a write they never
-                        // saw. They own the index from here.
-                        Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
-                        Ok(Err(e)) => IndexState::Failed { reason: e },
-                        Err(panic) => {
-                            let reason = panic
-                                .downcast_ref::<&'static str>()
-                                .map(|s| (*s).to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "panic in backfill thread".to_string());
-                            IndexState::Failed { reason }
-                        }
-                    };
-                    match &terminal {
-                        IndexState::Failed { reason } => health.mark_offline(reason.clone()),
-                        _ => health.mark_ready(),
-                    }
-                    if let Err(e) =
-                        crate::index::ops::save_index_state(engine.as_ref(), &name_owned, terminal)
-                    {
-                        tracing::warn!(
-                            index = %name_owned,
-                            error = %e,
-                            "could not persist the build's terminal state"
-                        );
-                    }
-                })
-                .map_err(|e| {
-                    // Registered rebuilding with no build behind it, the
-                    // index would hold a blocked reader until its timeout.
-                    unbuilt.mark_offline(format!("could not start the build: {e}"));
-                    ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
-                })?;
-            registry.register_build(name, label, property, &token, thread);
-
-            (initial_state, 0)
-        }
-        _ => {
-            // Synchronous fallback (legacy path / tests): the statement
-            // inserts through the writer path, which a rebuilding index
-            // leaves to a build, so the index is handed over first.
-            if let Some(health) = registry.health_handle(label, property) {
-                health.mark_ready();
-            }
-            let written = match field_id {
-                Some(fid) => {
-                    run_backfill_sync(ctx.engine, registry, label, property, fid, shard_id)
+    let thread = std::thread::Builder::new()
+        .name(format!("vec-backfill-{name}"))
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::index::VectorBuild {
+                    engine: engine.as_ref(),
+                    token: &build_token,
+                    shard_id,
+                    targets: &[crate::index::BuildTarget {
+                        hnsw: hnsw.as_ref(),
+                        health: health.as_ref(),
+                        label: &label_owned,
+                        field_id: property_id,
+                    }],
                 }
-                None => 0,
+                .run()
+            }));
+            let terminal = match outcome {
+                Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
+                    tracing::info!(
+                        index = %name_owned,
+                        scanned,
+                        "vector index backfill complete"
+                    );
+                    IndexState::Ready
+                }
+                // Cancelled: the index is being dropped or replaced
+                // by whoever cancelled us. Writing anything now —
+                // state or progress — would land under their
+                // statement and conflict with a write they never
+                // saw. They own the index from here.
+                Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
+                Ok(Err(e)) => IndexState::Failed { reason: e },
+                Err(panic) => {
+                    let reason = panic
+                        .downcast_ref::<&'static str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panic in backfill thread".to_string());
+                    IndexState::Failed { reason }
+                }
             };
-            (IndexState::Ready, written as i64)
-        }
-    };
+            match &terminal {
+                IndexState::Failed { reason } => health.mark_offline(reason.clone()),
+                _ => health.mark_ready(),
+            }
+            if let Err(e) =
+                crate::index::ops::save_index_state(engine.as_ref(), &name_owned, terminal)
+            {
+                tracing::warn!(
+                    index = %name_owned,
+                    error = %e,
+                    "could not persist the build's terminal state"
+                );
+            }
+        })
+        .map_err(|e| {
+            // Registered rebuilding with no build behind it, the
+            // index would hold a blocked reader until its timeout.
+            unbuilt.mark_offline(format!("could not start the build: {e}"));
+            ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
+        })?;
+    registry.register_build(name, label, property, &token, thread);
 
-    let state_label = match &final_state {
-        IndexState::Building { .. } => "building",
-        IndexState::Ready => "ready",
-        IndexState::Failed { .. } => "failed",
-    };
-
+    // The build has only started: nothing is indexed yet, and the state
+    // reported is the one persisted above.
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("property".to_string(), Value::String(property.to_string()));
-    row.insert("nodes_indexed".to_string(), Value::Int(nodes_indexed));
-    row.insert("state".to_string(), Value::String(state_label.to_string()));
+    row.insert("nodes_indexed".to_string(), Value::Int(0));
+    row.insert("state".to_string(), Value::String("building".to_string()));
     Ok(vec![row])
-}
-
-/// Synchronous backfill: scans every node in shard, extracts the indexed
-/// vector property, inserts into the registry's HNSW handle. Returns the
-/// number of nodes inserted. Used by the legacy non-Arc test path.
-fn run_backfill_sync(
-    engine: &StorageEngine,
-    registry: &crate::index::VectorIndexRegistry,
-    label: &str,
-    property: &str,
-    field_id: u32,
-    shard_id: u16,
-) -> u64 {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let mut backfilled = 0u64;
-    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
-        engine,
-        None,
-        shard_id,
-        &mut |node_id, _key, record| {
-            if record.primary_label() == label {
-                if let Some(val) = record.props.get(&field_id) {
-                    if let Some(vec_data) = try_extract_vector(val) {
-                        registry.on_vector_written(label, node_id, property, &vec_data);
-                        backfilled += 1;
-                    }
-                }
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        },
-    );
-    backfilled
 }
 
 /// Execute `DROP VECTOR INDEX idx`: removes an HNSW vector index by name.
@@ -15733,9 +15682,9 @@ fn execute_drop_vector_index(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let Some(registry) = ctx.vector_index_registry else {
+    let Some(registry) = ctx.vector_index_registry() else {
         return Err(ExecutionError::Unsupported(
-            "DROP VECTOR INDEX requires vector_index_registry in ExecutionContext".into(),
+            "DROP VECTOR INDEX requires vector indexes in ExecutionContext".into(),
         ));
     };
 

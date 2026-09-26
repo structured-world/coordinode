@@ -32,7 +32,6 @@ fn make_test_ctx<'a>(
 ) -> ExecutionContext<'a> {
     ExecutionContext {
         engine,
-        engine_arc: None,
         interner,
         id_allocator: allocator,
         shard_id: 1,
@@ -46,7 +45,7 @@ fn make_test_ctx<'a>(
         write_stats: WriteStats::default(),
         text_index: None,
         text_index_registry: None,
-        vector_index_registry: None,
+        vector_indexes: None,
         btree_index_registry: None,
         extensions: None,
         vector_loader: None,
@@ -10015,7 +10014,7 @@ fn test_merge_all_on_match_set() {
 /// registry wired into the execution context. Used by rrf_score tests.
 fn run_cypher_with_registries(
     query: &str,
-    engine: &StorageEngine,
+    engine: &std::sync::Arc<StorageEngine>,
     interner: &mut FieldInterner,
     vector_reg: Option<&VectorIndexRegistry>,
     text_reg: Option<&TextIndexRegistry>,
@@ -10024,7 +10023,8 @@ fn run_cypher_with_registries(
     let plan = build_logical_plan(&ast).map_err(|e| format!("plan error: {e}"))?;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let mut ctx = make_test_ctx(engine, interner, &allocator);
-    ctx.vector_index_registry = vector_reg;
+    ctx.vector_indexes = vector_reg
+        .map(|registry| coordinode_query::executor::runner::VectorIndexes { registry, engine });
     ctx.text_index_registry = text_reg;
     execute(&plan, &mut ctx).map_err(|e| format!("execute error: {e}"))
 }
@@ -11779,7 +11779,10 @@ fn hnsw_scan_executor_returns_index_top_k() {
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
     };
     let mut ctx = make_test_ctx(engine, &mut interner, &allocator);
-    ctx.vector_index_registry = Some(&registry);
+    ctx.vector_indexes = Some(coordinode_query::executor::runner::VectorIndexes {
+        registry: &registry,
+        engine,
+    });
     let rows = execute(&plan, &mut ctx).expect("HnswScan must execute");
 
     assert_eq!(rows.len(), 2, "top-2 of 4 points: {rows:?}");

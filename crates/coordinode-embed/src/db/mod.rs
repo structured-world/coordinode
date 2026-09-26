@@ -2573,7 +2573,6 @@ impl Database {
         let interner_len_before = interner_guard.len();
         let mut ctx = ExecutionContext {
             engine: &self.engine,
-            engine_arc: Some(Arc::clone(&self.engine)),
             interner: &mut interner_guard,
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
@@ -2587,7 +2586,10 @@ impl Database {
             write_stats: WriteStats::default(),
             text_index: None,
             text_index_registry: Some(&self.text_index_registry),
-            vector_index_registry: Some(&self.vector_index_registry),
+            vector_indexes: Some(coordinode_query::executor::runner::VectorIndexes {
+                registry: &self.vector_index_registry,
+                engine: &self.engine,
+            }),
             btree_index_registry: Some(&self.index_registry),
             // Extension-op handlers for this Database (empty by default). An
             // enterprise layer / integration test populates it via
