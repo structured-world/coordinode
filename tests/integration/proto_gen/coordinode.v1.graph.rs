@@ -70,9 +70,12 @@ pub struct Label {
     /// Regular (non-computed) property definitions.
     #[prost(message, repeated, tag = "2")]
     pub properties: ::prost::alloc::vec::Vec<PropertyDefinition>,
-    /// Schema version, incremented on each change.
+    /// Schema revision (DDL snapshot identity). Advances on ALTER operations
+    /// that change write-path semantics (placement, shard_keys, mode). Distinct
+    /// from data-side versioning (MVCC commit_ts, future per-row OCC `_v`) —
+    /// "revision" always means DDL identity, never a data version.
     #[prost(uint64, tag = "3")]
-    pub version: u64,
+    pub schema_revision: u64,
     /// COMPUTED property specifications declared for this label.
     #[prost(message, repeated, tag = "4")]
     pub computed_properties: ::prost::alloc::vec::Vec<ComputedPropertyDefinition>,
@@ -87,8 +90,9 @@ pub struct EdgeType {
     pub name: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "2")]
     pub properties: ::prost::alloc::vec::Vec<PropertyDefinition>,
+    /// Schema revision (DDL snapshot identity). See `Label.schema_revision`.
     #[prost(uint64, tag = "3")]
-    pub version: u64,
+    pub schema_revision: u64,
 }
 /// A property definition within a label or edge type.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

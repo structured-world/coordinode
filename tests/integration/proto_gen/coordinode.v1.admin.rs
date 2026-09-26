@@ -107,7 +107,7 @@ pub struct DecommissionNodeRequest {
     /// If true, the decommissioned node's data should be wiped after removal.
     /// In CE, this is advisory — operator must delete data on node_id manually.
     /// The response will set operator_cleanup_required=true as a reminder.
-    /// In EE, storage is freed progressively as each shard move completes (Phase 1).
+    /// In EE, storage is freed progressively as each shard move completes.
     #[prost(bool, tag = "2")]
     pub pruning: bool,
     /// Emergency decommission: skip quorum gate and drain, force membership remove
@@ -133,7 +133,7 @@ pub struct DecommissionNodeResponse {
     pub message: ::prost::alloc::string::String,
     /// Set when pruning=true was requested.
     /// In CE, operator must manually delete data on the decommissioned node.
-    /// In EE, storage is freed automatically during Phase 1 shard moves.
+    /// In EE, storage is freed automatically as shard moves complete.
     #[prost(bool, tag = "3")]
     pub operator_cleanup_required: bool,
 }
@@ -494,18 +494,19 @@ pub mod cluster_service_client {
         }
         /// Gracefully decommission a node from the cluster.
         ///
-        /// Implements the Phase 0-2 decommission protocol:
-        /// Phase 0: Quorum gate — verify removing node_id still leaves ≥ 2 voters.
-        /// Aborts with FAILED_PRECONDITION if quorum would be lost.
-        /// Phase 1: Leadership transfer — if node_id is the current Raft leader,
-        /// leadership is transferred to a peer before removal.
-        /// For self-decommission (leader removing itself), the request is
-        /// internally forwarded to the new leader after transfer.
-        /// Phase 2: Membership remove — change_membership(remove: node_id).
-        /// Node stops receiving log replication and is removed from quorum.
+        /// Steps, in order:
         ///
-        /// CE behaviour: single Raft group, all nodes hold full data. Pruning (Phase 3)
-        /// is advisory — operator must delete data on the decommissioned node manually.
+        /// * Quorum gate: verify removing node_id still leaves at least 2 voters.
+        ///  Aborts with FAILED_PRECONDITION if quorum would be lost.
+        /// * Leadership transfer: if node_id is the current Raft leader,
+        ///  leadership is transferred to a peer before removal.
+        ///  For self-decommission (leader removing itself), the request is
+        ///  internally forwarded to the new leader after transfer.
+        /// * Membership remove: change_membership(remove: node_id).
+        ///  Node stops receiving log replication and is removed from quorum.
+        ///
+        /// CE behaviour: single Raft group, all nodes hold full data. Pruning is
+        /// advisory: the operator deletes data on the decommissioned node manually.
         ///
         /// Must be called on the current Raft leader, or on the node being decommissioned
         /// when that node is the leader (self-decommission path).

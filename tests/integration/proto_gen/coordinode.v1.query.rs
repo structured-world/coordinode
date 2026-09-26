@@ -23,20 +23,27 @@ pub struct ExecuteCypherRequest {
     pub read_concern: ::core::option::Option<super::replication::ReadConcern>,
     /// Durability guarantee for write statements (CREATE / MERGE / SET / DELETE).
     ///
-    /// UNSPECIFIED / omitted defaults to W1 (leader-acknowledged, not replicated).
-    /// Use MAJORITY for production writes that must survive a single node failure.
+    /// Omitted, or present with `w` unset, defaults to MAJORITY with the write
+    /// journaled on each counted member: an acknowledged write survives the loss
+    /// of a minority. Ask for a weaker concern explicitly, per request (`acks: 1`,
+    /// `acks: 0`, `journal: MEMORY`), for writes that may be lost with their
+    /// leader.
     ///
-    /// Causal sessions (read_concern.after_index > 0) require write_concern.level
-    ///
-    /// >
-    /// > = MAJORITY. The server rejects writes with lower durability in causal
-    /// > sessions because a non-majority write may never be replicated: if the leader
-    /// > crashes before drain, the returned applied_index becomes a dangling causal
-    /// > dependency that can never be satisfied by a follower read.
+    /// Causal sessions (read_concern.after_index > 0) require write_concern
+    /// MAJORITY. The server rejects writes with lower durability in causal
+    /// sessions because a non-majority write may never be replicated: if the leader
+    /// crashes before drain, the returned applied_index becomes a dangling causal
+    /// dependency that can never be satisfied by a follower read.
     ///
     /// Read-only queries ignore this field.
     #[prost(message, optional, tag = "5")]
     pub write_concern: ::core::option::Option<super::replication::WriteConcern>,
+    /// Interactive transaction handle (from BeginTransaction). When non-zero,
+    /// this statement runs inside that transaction: it reads the transaction's
+    /// pinned snapshot and its writes buffer until CommitTransaction. When zero
+    /// (omitted), the statement auto-commits on its own (the default).
+    #[prost(uint64, tag = "6")]
+    pub transaction_id: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteCypherResponse {
@@ -67,7 +74,7 @@ pub struct QueryStats {
     #[prost(int64, tag = "6")]
     pub execution_time_ms: i64,
     /// Raft log index applied on the serving node at query time.
-    /// Clients use this as `after_index` in subsequent causal reads (R142).
+    /// Clients use this as `after_index` in subsequent causal reads.
     /// 0 means the node is not part of a Raft cluster (embedded mode).
     #[prost(uint64, tag = "7")]
     pub applied_index: u64,
@@ -75,6 +82,17 @@ pub struct QueryStats {
     /// False for follower reads (read_preference = SECONDARY or NEAREST).
     #[prost(bool, tag = "8")]
     pub served_by_leader: bool,
+    /// The HLC timestamp this statement's writes landed at, for a statement that
+    /// committed on its own. Zero for a read, and for a statement inside an
+    /// interactive transaction, whose timestamp belongs to the commit that ends
+    /// it (CommitTransactionResponse.commit_ts).
+    ///
+    /// This is the version of what the statement wrote: the same number
+    /// Node.version reports and CommitTransactionRequest.expect is stated
+    /// against. A client that writes and then means to write again
+    /// conditionally already holds what to state, with no read in between.
+    #[prost(uint64, tag = "9")]
+    pub commit_ts: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExplainCypherRequest {
@@ -105,6 +123,67 @@ pub struct QueryPlan {
     #[prost(double, tag = "4")]
     pub estimated_rows: f64,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BeginTransactionRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BeginTransactionResponse {
+    /// Handle for subsequent ExecuteCypher / CommitTransaction /
+    /// RollbackTransaction calls. Always non-zero.
+    #[prost(uint64, tag = "1")]
+    pub transaction_id: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CommitTransactionRequest {
+    #[prost(uint64, tag = "1")]
+    pub transaction_id: u64,
+    /// Commit only while these nodes are still at these versions. An empty list
+    /// is the ordinary unconditional commit.
+    ///
+    /// The condition is checked when the transaction commits, against the state
+    /// at that moment, so it protects the window between the read the caller
+    /// built on and the write it is making. A mismatch refuses the whole
+    /// transaction with ABORTED and reason REVISION_MISMATCH, carrying
+    /// `expected_version` and `current_version` in the error metadata: the
+    /// caller decides what to do next from those rather than reading the node
+    /// again and racing a second time.
+    #[prost(message, repeated, tag = "2")]
+    pub expect: ::prost::alloc::vec::Vec<ExpectedNodeVersion>,
+}
+/// A node and the version the caller believes it is at.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExpectedNodeVersion {
+    #[prost(uint64, tag = "1")]
+    pub node_id: u64,
+    /// The version read earlier (Node.version). Unset requires the node NOT to
+    /// exist, which is the create-if-absent form of the same condition; it is
+    /// `optional` rather than a zero sentinel because zero is not a version a
+    /// node can have, and a field that means "absent" must be able to say so.
+    #[prost(uint64, optional, tag = "2")]
+    pub version: ::core::option::Option<u64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommitTransactionResponse {
+    /// Raft log index the commit was applied at on the serving node — the causal
+    /// token clients pass as `after_index` on later reads. 0 in embedded mode.
+    #[prost(uint64, tag = "1")]
+    pub applied_index: u64,
+    /// HLC commit timestamp (microseconds since the Unix epoch) every mutation of
+    /// the transaction was applied at. Server-assigned. Commit timestamps are the
+    /// storage sequence numbers, so this value is the exact snapshot anchor for
+    /// the write: `AS OF TIMESTAMP <commit_ts>` (or `ReadConcern.at_timestamp`)
+    /// sees this transaction and nothing committed later, and a change-stream
+    /// consumer that has processed it resumes from `commit_ts + 1`. Present in
+    /// every mode; a read-only transaction reports its pinned read timestamp.
+    #[prost(uint64, tag = "2")]
+    pub commit_ts: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackTransactionRequest {
+    #[prost(uint64, tag = "1")]
+    pub transaction_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackTransactionResponse {}
 /// Generated client implementations.
 pub mod cypher_service_client {
     #![allow(
@@ -248,6 +327,100 @@ pub mod cypher_service_client {
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new("coordinode.v1.query.CypherService", "ExplainCypher"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Begin an interactive multi-statement transaction. Returns a
+        /// transaction_id; pass it on ExecuteCypherRequest for each statement, then
+        /// CommitTransaction or RollbackTransaction. All statements read the same
+        /// pinned snapshot (repeatable read) and writes commit atomically at commit.
+        pub async fn begin_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BeginTransactionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BeginTransactionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/coordinode.v1.query.CypherService/BeginTransaction",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "coordinode.v1.query.CypherService",
+                        "BeginTransaction",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Commit an interactive transaction: validate the read-set, then persist
+        /// every buffered statement's writes in a single proposal.
+        pub async fn commit_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CommitTransactionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CommitTransactionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/coordinode.v1.query.CypherService/CommitTransaction",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "coordinode.v1.query.CypherService",
+                        "CommitTransaction",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Roll back an interactive transaction: discard all buffered writes.
+        pub async fn rollback_transaction(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RollbackTransactionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RollbackTransactionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/coordinode.v1.query.CypherService/RollbackTransaction",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "coordinode.v1.query.CypherService",
+                        "RollbackTransaction",
+                    ),
                 );
             self.inner.unary(req, path, codec).await
         }

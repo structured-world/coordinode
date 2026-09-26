@@ -22,7 +22,7 @@ pub struct HlcTimestamp {
 /// A typed property value (oneof for all supported types).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PropertyValue {
-    #[prost(oneof = "property_value::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "property_value::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub value: ::core::option::Option<property_value::Value>,
 }
 /// Nested message and enum types in `PropertyValue`.
@@ -47,6 +47,10 @@ pub mod property_value {
         ListValue(super::PropertyList),
         #[prost(message, tag = "9")]
         MapValue(super::PropertyMap),
+        #[prost(message, tag = "10")]
+        MultiVectorValue(super::MultiVector),
+        #[prost(message, tag = "11")]
+        PathValue(super::Path),
     }
 }
 /// A dense float vector for vector search.
@@ -69,4 +73,42 @@ pub struct PropertyMap {
         ::prost::alloc::string::String,
         PropertyValue,
     >,
+}
+/// An ordered set of equal-width vectors representing one item, as produced by
+/// late-interaction retrieval models (ColBERT v2, MaxSim) where a document is
+/// several token-level embeddings rather than one pooled vector.
+///
+/// Every row carries the same number of dimensions; the sender enforces that
+/// invariant, so a receiver may read `rows\[0\]` for the width.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MultiVector {
+    #[prost(message, repeated, tag = "1")]
+    pub rows: ::prost::alloc::vec::Vec<Vector>,
+}
+/// A graph path: the alternating node/relationship sequence produced by
+/// `shortestPath(...)` and by a variable-length `MATCH p = (a)-\[*\]->(b)`.
+///
+/// `rels` has exactly one fewer entry than `nodes` on a non-empty path, and the
+/// n-th hop connects `nodes\[n\]` to `nodes\[n+1\]`. An empty path (a single node,
+/// zero hops) carries one node and no relationships.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Path {
+    /// Node ids along the path, start to end.
+    #[prost(uint64, repeated, tag = "1")]
+    pub nodes: ::prost::alloc::vec::Vec<u64>,
+    /// Relationship hops, in the same order.
+    #[prost(message, repeated, tag = "2")]
+    pub rels: ::prost::alloc::vec::Vec<PathRel>,
+}
+/// One relationship hop inside a Path: its type and endpoint node ids.
+/// Relationship properties are not carried; fetch them by endpoint pair when
+/// they are needed.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PathRel {
+    #[prost(string, tag = "1")]
+    pub edge_type: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub source: u64,
+    #[prost(uint64, tag = "3")]
+    pub target: u64,
 }
