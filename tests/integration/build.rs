@@ -28,7 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shallow clones without --recurse-submodules, CI without submodule init, etc.).
     let out_dir = std::env::var("OUT_DIR")?;
     let fallback_dir = std::path::Path::new(&manifest_dir).join("proto_gen");
+    // Declaring any rerun trigger replaces cargo's default, so every input
+    // is named: the proto tree (scanned recursively), the committed fallback,
+    // and the refresh switch.
     println!("cargo:rerun-if-env-changed={UPDATE_PROTO_GEN}");
+    println!("cargo:rerun-if-changed={}", proto_root_path.display());
+    println!("cargo:rerun-if-changed={}", fallback_dir.display());
 
     let sentinel = proto_root_path.join("coordinode/v1/query/cypher.proto");
     if !sentinel.exists() {

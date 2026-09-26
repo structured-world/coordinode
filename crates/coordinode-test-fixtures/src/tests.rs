@@ -227,6 +227,46 @@ fn allocated_ports_lie_outside_the_ephemeral_range() {
     }
 }
 
+fn reservation_lock(port: u16) -> std::fs::File {
+    let path = std::env::temp_dir()
+        .join("coordinode-test-ports")
+        .join(port.to_string());
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("open the reservation file")
+}
+
+/// An allocated port stays reserved against every other test process until
+/// this one exits, so a neighbour cannot be handed a port this process has
+/// not bound yet (a cluster starting its members one by one).
+#[test]
+fn an_allocated_port_stays_reserved_against_other_processes() {
+    let port = alloc_port();
+    assert!(
+        matches!(
+            reservation_lock(port).try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "port {port} was allocated but another holder could still reserve it"
+    );
+}
+
+/// A port another process holds is skipped, even while nothing listens on it.
+#[test]
+fn a_port_reserved_elsewhere_is_not_handed_out() {
+    let port = 31_999;
+    let held = reservation_lock(port);
+    match held.try_lock() {
+        Ok(()) => assert!(!reserve_port(port), "a held reservation was taken again"),
+        // Some other test process holds it: the property holds all the same.
+        Err(std::fs::TryLockError::WouldBlock) => assert!(!reserve_port(port)),
+        Err(std::fs::TryLockError::Error(e)) => panic!("lock the reservation: {e}"),
+    }
+}
+
 /// The IPv6 loopback variant probes the address the integration harness's
 /// servers bind, and keeps the same range.
 #[test]

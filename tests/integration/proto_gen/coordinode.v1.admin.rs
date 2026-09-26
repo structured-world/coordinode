@@ -494,16 +494,16 @@ pub mod cluster_service_client {
         }
         /// Gracefully decommission a node from the cluster.
         ///
-        /// Steps, in order:
+        /// First the quorum gate: removing node_id must still leave at least 2
+        /// voters, otherwise the call aborts with FAILED_PRECONDITION.
         ///
-        /// * Quorum gate: verify removing node_id still leaves at least 2 voters.
-        ///  Aborts with FAILED_PRECONDITION if quorum would be lost.
-        /// * Leadership transfer: if node_id is the current Raft leader,
-        ///  leadership is transferred to a peer before removal.
-        ///  For self-decommission (leader removing itself), the request is
-        ///  internally forwarded to the new leader after transfer.
-        /// * Membership remove: change_membership(remove: node_id).
-        ///  Node stops receiving log replication and is removed from quorum.
+        /// Then the leadership transfer: if node_id is the current Raft leader,
+        /// leadership moves to a peer before removal. For self-decommission (the
+        /// leader removing itself) the request is forwarded to the new leader after
+        /// the transfer.
+        ///
+        /// Last the membership remove, change_membership(remove: node_id): the node
+        /// stops receiving log replication and leaves the quorum.
         ///
         /// CE behaviour: single Raft group, all nodes hold full data. Pruning is
         /// advisory: the operator deletes data on the decommissioned node manually.

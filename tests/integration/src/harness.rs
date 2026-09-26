@@ -38,15 +38,38 @@ impl CoordinodeProcess {
     /// Waits up to 15 seconds for the gRPC port to become available.
     pub async fn start() -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
-        let port = free_port();
-        let child = spawn_binary(port, data_dir.path().to_path_buf());
-        let proc = Self {
-            child,
-            port,
-            data_dir: Some(data_dir),
-        };
-        proc.wait_for_grpc(Duration::from_secs(15)).await;
-        proc
+        Self::spawn_on_free_port(data_dir, spawn_binary).await
+    }
+
+    /// Spawn on a port the harness picks, retrying on a fresh port when the
+    /// process exits during startup.
+    ///
+    /// Other test processes cannot take a port [`free_port`] handed out, but
+    /// anything outside the test allocator still can, and the server then
+    /// exits at its bind. Retrying on another port turns that into a restart
+    /// instead of a timeout or a test that talks to someone else's server.
+    async fn spawn_on_free_port(
+        data_dir: tempfile::TempDir,
+        spawn: impl Fn(u16, PathBuf) -> Child,
+    ) -> Self {
+        const ATTEMPTS: u32 = 5;
+        let mut last_exit = None;
+        for _ in 0..ATTEMPTS {
+            let port = free_port();
+            let mut proc = Self {
+                child: spawn(port, data_dir.path().to_path_buf()),
+                port,
+                data_dir: None,
+            };
+            match proc.wait_for_grpc(Duration::from_secs(15)).await {
+                Ok(()) => {
+                    proc.data_dir = Some(data_dir);
+                    return proc;
+                }
+                Err(status) => last_exit = Some((port, status)),
+            }
+        }
+        panic!("coordinode exited during startup on {ATTEMPTS} ports; last: {last_exit:?}");
     }
 
     /// Spawn a cluster member: `serve --node-id N --addr [::1]:port
@@ -68,12 +91,16 @@ impl CoordinodeProcess {
             .map(|p| format!("http://[::1]:{p}"))
             .collect();
         let child = spawn_cluster_binary(node_id, port, &peers, data_dir.path().to_path_buf());
-        let proc = Self {
+        let mut proc = Self {
             child,
             port,
             data_dir: Some(data_dir),
         };
-        proc.wait_for_grpc(Duration::from_secs(15)).await;
+        // The port is fixed by the caller (peers already name it), so a
+        // process that lost it cannot move to another one.
+        if let Err(status) = proc.wait_for_grpc(Duration::from_secs(15)).await {
+            panic!("cluster member {node_id} exited during startup on port {port}: {status}");
+        }
         proc
     }
 
@@ -97,17 +124,8 @@ impl CoordinodeProcess {
             .take()
             .expect("data_dir missing — restart called twice?");
 
-        let port = free_port();
-        let data_path = data_dir.path().to_path_buf();
-        // `self` drops here: child already waited, data_dir is None.
-
-        let child = spawn_binary(port, data_path);
-        let proc = Self {
-            child,
-            port,
-            data_dir: Some(data_dir),
-        };
-        proc.wait_for_grpc(Duration::from_secs(15)).await;
+        // `self` drops at the end of this call: child already waited, data_dir is None.
+        let proc = Self::spawn_on_free_port(data_dir, spawn_binary).await;
         // After SIGKILL the Raft node must re-elect itself as leader.
         // wait_for_leader retries PRIMARY reads until election completes.
         proc.wait_for_leader(Duration::from_secs(10)).await;
@@ -144,19 +162,9 @@ impl CoordinodeProcess {
             .take()
             .expect("data_dir missing — restart called twice?");
 
-        // Pick a NEW port — the old one may still be in TIME_WAIT.
-        let port = free_port();
-        let data_path = data_dir.path().to_path_buf();
-        // `self` drops here: child is already killed, data_dir is None → no cleanup.
-
-        let child = spawn_binary(port, data_path);
-        let proc = Self {
-            child,
-            port,
-            data_dir: Some(data_dir),
-        };
-        proc.wait_for_grpc(Duration::from_secs(15)).await;
-        proc
+        // A NEW port: the old one may still be in TIME_WAIT. `self` drops at
+        // the end of this call: child is already killed, data_dir is None.
+        Self::spawn_on_free_port(data_dir, spawn_binary).await
     }
 
     /// Stop the process and bring the SAME data directory back up as a cluster
@@ -178,21 +186,14 @@ impl CoordinodeProcess {
             .data_dir
             .take()
             .expect("data_dir missing: restart called twice?");
-        let port = free_port();
-        let data_path = data_dir.path().to_path_buf();
         let peers: Vec<String> = peer_ports
             .iter()
             .map(|p| format!("http://[::1]:{p}"))
             .collect();
-
-        let child = spawn_cluster_binary(node_id, port, &peers, data_path);
-        let proc = Self {
-            child,
-            port,
-            data_dir: Some(data_dir),
-        };
-        proc.wait_for_grpc(Duration::from_secs(15)).await;
-        proc
+        Self::spawn_on_free_port(data_dir, |port, data| {
+            spawn_cluster_binary(node_id, port, &peers, data)
+        })
+        .await
     }
 
     /// gRPC endpoint URL for use with tonic.
@@ -230,14 +231,26 @@ impl CoordinodeProcess {
         ClusterServiceClient::new(channel)
     }
 
-    /// Block (async) until the gRPC port accepts TCP connections or `timeout` elapses.
-    async fn wait_for_grpc(&self, timeout: Duration) {
+    /// Block (async) until this process's gRPC port accepts TCP connections,
+    /// or return the exit status if the process ended first.
+    ///
+    /// A connection alone does not prove the port is ours: another holder may
+    /// answer while this process fails its bind. The server binds before
+    /// opening storage and exits at once when the port is taken, so the
+    /// process still running a moment after the port answers is the check.
+    async fn wait_for_grpc(&mut self, timeout: Duration) -> Result<(), std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(status);
+            }
             if std::net::TcpStream::connect(format!("[::1]:{}", self.port)).is_ok() {
                 // Small extra sleep to let gRPC handshake initialise.
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                return;
+                return match self.child.try_wait() {
+                    Ok(Some(status)) => Err(status),
+                    _ => Ok(()),
+                };
             }
             if Instant::now() >= deadline {
                 panic!(
@@ -527,3 +540,6 @@ fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: Pat
 pub fn free_port() -> u16 {
     coordinode_test_fixtures::alloc_port_on(std::net::Ipv6Addr::LOCALHOST.into())
 }
+
+#[cfg(test)]
+mod tests;

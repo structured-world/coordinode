@@ -327,8 +327,11 @@ static NEXT_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// itself and concurrent processes start far apart; a probe bind skips any
 /// port something already holds.
 ///
-/// The port is still only free, not held, until the code under test binds
-/// it, so bind as early as that code allows.
+/// Only test processes draw from this range, so a port is also reserved
+/// against them for the rest of this process: a lock file per port, which
+/// the OS releases when the process exits. A neighbour can therefore not be
+/// handed a port this process allocated but has not bound yet, such as the
+/// ports of a cluster whose members start one after another.
 pub fn alloc_port() -> u16 {
     alloc_port_on(std::net::Ipv4Addr::LOCALHOST.into())
 }
@@ -349,7 +352,7 @@ pub fn alloc_port_on(ip: std::net::IpAddr) -> u16 {
         // The remainder is below PORT_SPAN, so the sum stays below 32000.
         let offset = start.wrapping_add(step) % u32::from(PORT_SPAN);
         let port = PORT_BASE + u16::try_from(offset).expect("offset below the span");
-        if std::net::TcpListener::bind((ip, port)).is_ok() {
+        if reserve_port(port) && std::net::TcpListener::bind((ip, port)).is_ok() {
             return port;
         }
     }
@@ -357,6 +360,35 @@ pub fn alloc_port_on(ip: std::net::IpAddr) -> u16 {
         "no free port on {ip} in {PORT_BASE}..{} after {ATTEMPTS} attempts",
         PORT_BASE + PORT_SPAN
     );
+}
+
+/// Take the cross-process reservation of `port`, or report another test
+/// process holds it. The lock lives until this process exits: its file is
+/// never closed, so a port stays reserved exactly as long as any server this
+/// process may still start on it.
+fn reserve_port(port: u16) -> bool {
+    let dir = std::env::temp_dir().join("coordinode-test-ports");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        panic!("create the port reservation dir {}: {e}", dir.display());
+    }
+    let path = dir.join(port.to_string());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open the port reservation {}: {e}", path.display()));
+    match file.try_lock() {
+        Ok(()) => {
+            // Held for the life of the process; the OS drops the lock at exit.
+            std::mem::forget(file);
+            true
+        }
+        Err(std::fs::TryLockError::WouldBlock) => false,
+        Err(std::fs::TryLockError::Error(e)) => {
+            panic!("lock the port reservation {}: {e}", path.display())
+        }
+    }
 }
 
 /// Reserve `N` distinct loopback ports at once, for tests that read better
