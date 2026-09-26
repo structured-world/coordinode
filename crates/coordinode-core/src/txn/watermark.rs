@@ -22,14 +22,12 @@
 //! specific shard consult that shard's watermark; cross-shard reads wait
 //! on every participating shard's watermark concurrently.
 //!
-//! ## Comparison to Dgraph's central Oracle
+//! ## Waiting without a per-timestamp registry
 //!
-//! Dgraph (`posting/oracle.go:197-351`) keeps a central `maxAssigned` in
-//! the Zero group with per-startTs `waiters map[uint64][]chan`. We adopt
-//! the wait-and-notify pattern but localise it per shard and replace the
-//! per-ts channel map with a single `tokio::sync::watch::channel<u64>` —
-//! memory O(1) regardless of concurrent waiters, and every waiter re-reads
-//! the current value on each `changed()` tick.
+//! A central oracle would keep one wait list per requested timestamp. Here
+//! the wait is per shard, on a single `tokio::sync::watch::channel<u64>`:
+//! memory is O(1) regardless of how many readers wait, and every waiter
+//! re-reads the current value on each `changed()` tick.
 //!
 //! ## Multi-instance safety
 //!

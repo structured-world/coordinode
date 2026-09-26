@@ -7,11 +7,10 @@
 //!
 //! ## Design
 //!
-//! Adapted from MongoDB's `WaitForMajorityService`
-//! (`wait_for_majority_service.cpp:162-294`), but applied at the proposal
-//! coalescing level. MongoDB separates local write from replication wait;
-//! openraft bundles propose+commit+apply in `client_write()`, so we batch
-//! at the entry level instead.
+//! A system that separates the local write from the replication wait can
+//! share one wait among many writers. openraft bundles propose + commit +
+//! apply in `client_write()`, so the sharing happens one level earlier: the
+//! writers' proposals are coalesced into one entry.
 //!
 //! ```text
 //! Writer 1 ──┐                       ┌── oneshot::send(Ok)

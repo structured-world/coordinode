@@ -1,6 +1,6 @@
 //! Edge storage: posting list key encoding and adjacency list management.
 //!
-//! Edges are stored as posting lists per edge type, following the Dgraph pattern:
+//! Edges are stored as posting lists per edge type and direction:
 //!
 //! ```text
 //! Forward:  adj:<EDGE_TYPE>:out:<source_id u64 BE>  → sorted [target_id, ...]

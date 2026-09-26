@@ -73,9 +73,8 @@ use visited::VisitedPool;
 
 /// Software prefetch hint: request CPU to load `ptr` into L1 cache.
 /// This is a performance hint — no effect on correctness.
-/// No-op on unsupported platforms.
-///
-/// Donor: hnswlib `hnswalg.h:370-383` — `_mm_prefetch` with `_MM_HINT_T0`
+/// No-op on unsupported platforms. `_MM_HINT_T0` targets every cache
+/// level, the hint the next neighbour's vector needs before it is scored.
 #[inline(always)]
 fn prefetch_read_data(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
@@ -2379,8 +2378,7 @@ impl HnswIndex {
 
     /// Generate a random level for a new element.
     fn random_level(&self) -> usize {
-        // Xorshift64 RNG for proper exponential level distribution.
-        // Donor: hnswlib hnswalg.h:207-211 uses std::uniform_real_distribution.
+        // Xorshift64 RNG feeding the exponential level distribution.
         let mut state = self.rng_state.load(std::sync::atomic::Ordering::Relaxed);
         state ^= state << 13;
         state ^= state >> 7;

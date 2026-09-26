@@ -58,10 +58,10 @@ impl std::fmt::Display for ProposalId {
 
 /// Monotonic proposal ID generator.
 ///
-/// Thread-safe, lock-free. Each call to `next()` returns a unique ID.
-/// Format follows Dgraph pattern: monotonically increasing u64.
-/// In distributed mode, the format extends to include node_id
-/// to guarantee cluster-wide uniqueness.
+/// Thread-safe, lock-free. Each call to `next()` returns a unique ID: a
+/// monotonically increasing u64 counting up from the generator's base. A
+/// process draws a random base, so two processes (or one restarted) do not
+/// hand out the same ids.
 pub struct ProposalIdGenerator {
     counter: AtomicU64,
 }
@@ -266,8 +266,8 @@ pub struct RaftProposal {
     /// - Membership changes (add/remove node)
     /// - Delta proposals (commit/abort oracle decisions)
     ///
-    /// Follows Dgraph pattern: delta proposals bypass the IOU-based
-    /// rate limiter entirely (worker/proposal.go:287-290).
+    /// Throttling these would stall the very commits that release the
+    /// limiter's permits, so they skip it entirely.
     #[serde(default)]
     pub bypass_rate_limiter: bool,
 }

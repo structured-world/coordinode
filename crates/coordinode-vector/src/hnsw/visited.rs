@@ -6,9 +6,8 @@
 //! Reset between searches = increment epoch (O(1)). Only `fill(0)` when epoch
 //! wraps around (every 255 searches). Pool recycles lists across searches.
 //!
-//! # Donor references
-//! - hnswlib `visited_list_pool.h:8-31` — epoch counter pattern
-//! - Qdrant `lib/segment/src/index/visited_pool.rs:19-84` — Rust adaptation with RAII
+//! The epoch counter is the same technique as hnswlib's visited list pool
+//! and Qdrant's visited pool.
 
 use std::cell::RefCell;
 

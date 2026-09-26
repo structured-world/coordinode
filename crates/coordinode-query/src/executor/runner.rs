@@ -4608,8 +4608,6 @@ fn expand_frontier(
 /// Semantics: finds all nodes reachable from source within [min_hops..max_hops]
 /// via the specified edge types. Uses relationship-uniqueness (same edge cannot
 /// be traversed twice in a single BFS from one source).
-///
-/// Inspired by Dgraph's `recurse.go` level-synchronous BFS with `reachMap`.
 fn execute_varlen_traverse(
     input_rows: &[Row],
     params: &TraverseParams<'_>,
@@ -6950,11 +6948,6 @@ fn collect_introduced_variables(op: &LogicalOp) -> Vec<String> {
     }
 }
 
-/// BFS-based shortest path between two bound nodes.
-///
-/// Finds the shortest (unweighted) path from source to target, traversing
-/// the specified edge types. Returns path length as an integer.
-///
 /// Parameters for shortest path computation.
 struct ShortestPathParams<'a> {
     source: &'a str,
@@ -6965,8 +6958,11 @@ struct ShortestPathParams<'a> {
     path_variable: &'a str,
 }
 
-/// Inspired by Dgraph's `shortest.go` Dijkstra/BFS hybrid, simplified
-/// for unweighted single-pair shortest path.
+/// BFS shortest path between two bound nodes.
+///
+/// Finds the shortest (unweighted) route from source to target over the
+/// given edge types and binds it to the path variable as a path value, or
+/// NULL when the target is not reachable within the depth bound.
 fn execute_shortest_path(
     rows: &[Row],
     sp: &ShortestPathParams<'_>,
@@ -8273,8 +8269,6 @@ fn execute_merge_relationship_standalone_create(
 /// 2. If match found → ON MATCH: re-read nodes, compare bytes (CAS). If changed → ErrConflict.
 ///    Apply SET items.
 /// 3. If no match → ON CREATE: create nodes and edges from patterns (two-pass).
-///
-/// Inspired by Dgraph's atomic query+mutate (edgraph/server.go do→processQuery→doMutate).
 fn execute_upsert(
     pattern: &LogicalOp,
     on_match: &[crate::plan::SetItem],

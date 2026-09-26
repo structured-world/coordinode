@@ -16,8 +16,6 @@
 //! **Migration note:** V4 data used LEB128 encoding in `deltas`. Any V4
 //! data must be re-encoded via a migration tool before reading with this
 //! decoder.
-//!
-//! Inspired by Dgraph's `codec/codec.go` Encoder/Decoder pattern.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +38,7 @@ fn match_32msb(a: u64, b: u64) -> bool {
 pub struct UidBlock {
     /// First UID in the block (absolute).
     pub base: u64,
-    /// Varint-encoded u32 deltas for subsequent UIDs.
+    /// StreamVByte-encoded u32 deltas for subsequent UIDs.
     pub deltas: Vec<u8>,
     /// Total number of UIDs in this block (including base).
     pub num_uids: u32,
@@ -81,8 +79,8 @@ impl UidPack {
 
     /// Check if this pack should be split (exceeds size threshold and has >1 block).
     ///
-    /// Follows Dgraph's `shouldSplit()` pattern:
-    /// split only when serialized size >= threshold AND multiple blocks exist.
+    /// Split only when the serialized size reaches the threshold AND there is
+    /// more than one block: a single block cannot be divided further.
     pub fn should_split(&self) -> bool {
         self.should_split_at(DEFAULT_SPLIT_THRESHOLD)
     }

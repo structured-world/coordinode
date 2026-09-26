@@ -234,9 +234,9 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
 /// Feedback-based rate limiter for Raft proposals.
 ///
 /// Uses a tokio Semaphore with weighted acquisition. Each retry attempt
-/// acquires exponentially more permits (`1 << retry`), implementing
-/// backpressure on retried proposals. Based on Dgraph's IOU-based
-/// rate limiter pattern (worker/proposal.go:42-99).
+/// acquires exponentially more permits (`1 << retry`), so a proposal that
+/// keeps timing out claims a growing share of the budget and retries back
+/// off under load instead of piling onto a struggling leader.
 ///
 /// The limiter prevents overwhelming the Raft leader with unbounded
 /// proposal volume. Delta/schema proposals can bypass the limiter.

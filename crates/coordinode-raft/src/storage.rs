@@ -47,12 +47,13 @@ use coordinode_storage::engine::core::{
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
 
-/// Maximum age for dedup entries before GC (10 minutes).
-/// Matches Dgraph's `maxAge` in processApplyCh (draft.go:942).
+/// Maximum age for dedup entries before GC (10 minutes): far longer than
+/// any proposal retry window, so an entry this old can no longer meet a
+/// retry of its proposal.
 const DEDUP_MAX_AGE_SECS: u64 = 600;
 
-/// GC interval for dedup map (5 minutes = maxAge / 2).
-/// Matches Dgraph's `tick` interval (draft.go:943).
+/// GC interval for dedup map (5 minutes = max age / 2), so no entry outlives
+/// its age by more than half of it.
 const DEDUP_GC_INTERVAL_SECS: u64 = 300;
 
 // ── Type Configuration ──────────────────────────────────────────────
@@ -898,7 +899,6 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 ///
 /// Stores the proposal size estimate and last-seen timestamp.
 /// Used to detect duplicate proposals from Raft replay after leader change.
-/// Follows Dgraph's `P` struct pattern (draft.go:866-871).
 #[derive(Debug)]
 struct DedupEntry {
     /// Approximate proposal size (for double-checking retried proposals).
@@ -943,7 +943,6 @@ pub struct CoordinodeStateMachine {
     last_dedup_gc: Mutex<Instant>,
     /// Applied watermark: broadcasts the latest applied log index.
     /// Subscribers can wait for a specific index to be applied.
-    /// Follows Dgraph's `Applied.Done(index)` pattern (draft.go:101).
     applied_tx: tokio::sync::watch::Sender<u64>,
     /// Receiver side kept to prevent channel closure.
     applied_rx: tokio::sync::watch::Receiver<u64>,
@@ -1287,7 +1286,6 @@ impl CoordinodeStateMachine {
     ///
     /// Includes dedup check: if this proposal ID was already applied with
     /// the same size estimate, skip re-application (idempotent Raft replay).
-    /// Follows Dgraph's dedup pattern (draft.go:874-940).
     ///
     /// A partition `applies` says is already past `index` (installed from a
     /// peer further along) is left alone.
@@ -1723,13 +1721,12 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 
 /// Builds a full snapshot of all storage partitions for Raft log compaction.
 ///
-/// The snapshot captures every KV pair across all 7 partitions (Node, Adj,
-/// EdgeProp, Blob, BlobRef, Schema, Idx) in a binary format with xxh3
-/// checksum. This data is then sent to followers via the Snapshot gRPC RPC.
+/// The snapshot captures every KV pair of the replicated partitions (see
+/// `snapshot::snapshot_partitions`) in a binary format with xxh3 checksum.
+/// This data is then sent to followers via the Snapshot gRPC RPC.
 ///
-/// Follows Dgraph's content separation pattern: openraft manages snapshot
-/// metadata (index, term, membership), while the actual data transfer uses
-/// our binary format (not pushed through the Raft log).
+/// openraft manages the snapshot metadata (index, term, membership); the
+/// data itself travels in this binary format, never through the Raft log.
 pub struct CoordinodeSnapshotBuilder {
     /// Engine reference for iterating all storage partitions.
     engine: Arc<StorageEngine>,

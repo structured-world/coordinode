@@ -1375,9 +1375,9 @@ impl RaftNode {
             .await
             .map_err(|e| RaftNodeError::Shutdown(format!("transfer_leader: {e}")))?;
 
-        // Allow time for the transfer to complete (Dgraph pattern: 1s sleep).
-        // In practice, TimeoutNow election completes in <1ms, but we need to
-        // wait for the full election round-trip + log catchup.
+        // Allow time for the transfer to complete. The TimeoutNow election
+        // itself takes under a millisecond, but the full election round-trip
+        // and log catch-up take longer.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         if self.is_leader().await {
@@ -1422,7 +1422,7 @@ impl RaftNode {
 
     /// Graceful shutdown with leadership transfer.
     ///
-    /// Orchestrates the shutdown sequence (Dgraph `checkpointAndClose` pattern):
+    /// Orchestrates the shutdown sequence:
     /// 1. Force a checkpoint snapshot (persist current state)
     /// 2. If leader: find a peer and transfer leadership (TimeoutNow)
     /// 3. Stop the Raft instance
