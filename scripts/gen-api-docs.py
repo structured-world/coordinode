@@ -162,7 +162,11 @@ HTTP_LINE_RE = re.compile(
 
 
 def _collect_comments(lines: list[str], start: int) -> str:
-    """Collect // comment lines immediately before position `start`."""
+    """Collect // comment lines immediately before position `start`.
+
+    Line breaks are kept so paragraphs and lists survive into the prose;
+    table cells flatten the text with `_one_line`.
+    """
     comments: list[str] = []
     i = start - 1
     while i >= 0:
@@ -174,7 +178,7 @@ def _collect_comments(lines: list[str], start: int) -> str:
             break
         else:
             break
-    return " ".join(reversed(comments)).strip()
+    return "\n".join(reversed(comments)).strip()
 
 
 def _brace_end(lines: list[str], start: int) -> int:
@@ -371,7 +375,7 @@ def parse_proto_file(path: Path) -> ParsedProto:
                 cm = COMMENT_RE.match(sline)
                 if cm:
                     if rpc_pending_comment:
-                        rpc_pending_comment += " " + cm.group(1)
+                        rpc_pending_comment += "\n" + cm.group(1)
                     else:
                         rpc_pending_comment = cm.group(1)
                     j += 1
@@ -447,6 +451,16 @@ def _escape_md(text: str) -> str:
     return text
 
 
+def _one_line(text: str) -> str:
+    """Flatten a multi-line comment for a table cell or a YAML string."""
+    return " ".join(text.split())
+
+
+def _prose(text: str) -> str:
+    """Render a comment as a markdown block, keeping paragraphs and lists."""
+    return _escape_md(text.strip())
+
+
 def _field_table(fields: list[ProtoField], messages: dict, link_prefix: str = "") -> str:
     if not fields:
         return "_No fields._\n"
@@ -476,7 +490,7 @@ def _message_section(msg: ProtoMessage, messages: dict, heading: str = "###") ->
     anchor = _anchor(msg.name)
     parts.append(f"{heading} {msg.name} {{#{anchor}}}\n")
     if msg.comment:
-        parts.append(f"{_escape_md(msg.comment)}\n")
+        parts.append(f"{_prose(msg.comment)}\n")
 
     if msg.nested_enums:
         for ne in msg.nested_enums:
@@ -540,14 +554,14 @@ def generate_service_page(
     # frontmatter — YAML: escape only double quotes (no HTML entities needed)
     lines.append("---")
     if svc.comment:
-        safe_desc = svc.comment.replace('"', '\\"')
+        safe_desc = _one_line(svc.comment).replace('"', '\\"')
         lines.append(f'description: "{svc.name} — {safe_desc}"')
     lines.append("---\n")
 
     # Title
     lines.append(f"# {svc.name}\n")
     if svc.comment:
-        lines.append(f"{_escape_md(svc.comment)}\n")
+        lines.append(f"{_prose(svc.comment)}\n")
     if svc.name in INTERNAL_SERVICES:
         lines.append(
             "::: warning Internal API\n"
@@ -618,7 +632,7 @@ def generate_service_page(
         for rpc in svc.methods:
             lines.append(f"### {rpc.name}\n")
             if rpc.comment:
-                lines.append(f"{_escape_md(rpc.comment)}\n")
+                lines.append(f"{_prose(rpc.comment)}\n")
 
             if rpc.http_method and rpc.http_path:
                 lines.append(
@@ -705,7 +719,7 @@ def generate_service_page(
             anchor = _anchor(ename)
             lines.append(f"### {ename} {{#{anchor}}}\n")
             if enum.comment:
-                lines.append(f"{_escape_md(enum.comment)}\n")
+                lines.append(f"{_prose(enum.comment)}\n")
             lines.append(_enum_table(enum))
             lines.append("")
 
@@ -764,7 +778,7 @@ def generate_common_types_page(all_messages: dict, all_enums: dict) -> str:
                 anchor = _anchor(name)
                 lines.append(f"### {name} {{#{anchor}}}\n")
                 if enum.comment:
-                    lines.append(f"{enum.comment}\n")
+                    lines.append(f"{_prose(enum.comment)}\n")
                 lines.append(_enum_table(enum))
                 lines.append("")
 
@@ -789,7 +803,7 @@ def generate_index_page(services: list[ProtoService]) -> str:
 
     for svc in services:
         slug = SERVICE_SLUG.get(svc.name, svc.name.lower())
-        desc = svc.comment or "—"
+        desc = _escape_md(_one_line(svc.comment)) if svc.comment else "—"
         lines.append(f"| [{svc.name}](./{slug}) | {desc} | — |")
 
     lines.append("")
