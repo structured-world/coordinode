@@ -8,13 +8,13 @@
 //!   | 512  vectors     |  64.4 ms  |  6.76 ms  |  9.5×   |
 //!   | 2048 vectors     | 286.6 ms  |  19.6 ms  |  14.6×  |
 //!
-//! Progression across the phases:
-//!   * **C2 day 3** (parallel planning + serial apply): ~3× on 2K.
-//!   * **C3 day 4** (+ parallel apply with lossy back-edges + serial
-//!     prune-pass that restores recall): ~6-8× expected.
-//!   * **C3 day 5b** (+ dedupe + parallel prune-pass): **14.6× on 2K**.
+//! How the batch path got there:
+//!   * parallel planning + serial apply: ~3× on 2K;
+//!   * adding parallel apply with lossy back-edges and a serial
+//!     prune-pass that restores recall: ~6-8×;
+//!   * adding dedupe and a parallel prune-pass: **14.6× on 2K**
+//!     (target 14-18×).
 //!
-//! The 14.6× number lands in the C3 arch-doc target range (14-18×).
 //! Each iteration starts from a fresh index so the bench measures
 //! end-to-end build time, not steady-state insert throughput.
 

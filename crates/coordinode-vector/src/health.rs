@@ -3,8 +3,7 @@
 //! fully-built index from one being rebuilt after segment migration, and can
 //! gauge how far the index has caught up with committed writes.
 //!
-//! See `arch/distribution/live-rebalance.md § HNSW under rebalance` for the
-//! contract; this module is the canonical type definition that every layer
+//! This module is the canonical type definition that every layer
 //! (vector engine, gRPC handlers, EXPLAIN renderer, metrics exporter) imports
 //! and dispatches on.
 //!
@@ -14,7 +13,7 @@
 //!
 //! # Freshness watermark (read-your-writes)
 //!
-//! `indexed_hlc` is the HLC (wall-clock-microsecond commit timestamp, ADR-007)
+//! `indexed_hlc` is the HLC (wall-clock-microsecond commit timestamp)
 //! of the last oplog entry the index-maintenance worker has applied to the
 //! local graph. A client that just wrote at HLC `W` can carry `W` into a
 //! follow-up query; comparing it against the served `indexed_hlc` tells the

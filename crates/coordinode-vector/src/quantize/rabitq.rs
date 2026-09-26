@@ -15,8 +15,8 @@
 //! ~50× faster than f32 AVX2 FMA at D=1024.
 //!
 //! **Cross-shard caveat.** `R` is per-shard. Codes are NOT comparable across
-//! shards; cluster-wide top-K is recovered via the Phase 1.5 SQ8 rerank pool
-//! (separate task). Inside a single shard, codes are fully comparable.
+//! shards; cluster-wide top-K is recovered via the SQ8 rerank pool. Inside a
+//! single shard, codes are fully comparable.
 //
 // no-std: rotation matrix storage uses `alloc::Vec<f32>` — clean. Internal RNG
 //         is a self-contained xorshift64* (no `rand` dep), keeps this module
@@ -1199,7 +1199,7 @@ impl RaBitQParams {
     }
 }
 
-/// Extended-RaBitQ `bits`-per-dimension code (R862, SIGMOD 2025).
+/// Extended-RaBitQ `bits`-per-dimension code (SIGMOD 2025).
 ///
 /// Each dimension is uniformly scalar-quantized into `2^bits` levels
 /// (cut points at the quantiles of N(0, 1) — rotated isotropic data
@@ -1232,7 +1232,7 @@ pub struct RaBitQExtCode {
     /// `‖x‖₂` — L2 norm of the original (pre-rotation) vector.
     pub norm: f32,
     /// `<x', e>` for the asymmetric correction. Same identity as the
-    /// 1-bit code — feeds Phase 1.5 rerank fallback when bit-width is
+    /// 1-bit code — feeds the SQ8 rerank fallback when bit-width is
     /// low enough that operator opts in.
     pub cross_term: f32,
 }

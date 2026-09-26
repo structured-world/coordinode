@@ -1,7 +1,7 @@
 //! Criterion benchmarks for HNSW search performance.
 //!
 //! Measures search QPS at different index sizes.
-//! Baseline for R850 (visited pool) + R851 (prefetch) optimization tracking.
+//! Baseline for tracking the visited-pool and prefetch optimizations.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 

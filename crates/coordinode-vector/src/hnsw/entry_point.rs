@@ -2,9 +2,8 @@
 //!
 //! Stores `Option<(level, idx)>` in a single `AtomicU64`. The classical
 //! HNSW entry-point is the highest-layer node; concurrent inserts that
-//! happen to land on novel max-layers race to promote it. Per
-//! `arch/search/vector-parallel-insert.md` §"Layer-promotion race" the
-//! correct primitive is a CAS-loop on a single atomic.
+//! happen to land on novel max-layers race to promote it. The correct
+//! primitive for that layer-promotion race is a CAS-loop on a single atomic.
 //!
 //! # Wire format
 //!

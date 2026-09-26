@@ -128,7 +128,7 @@ impl HnswIndex {
             old_of_new[new] = old;
         }
 
-        // --- Phase A: snapshot per-old payload (neighbours remapped) ---
+        // --- Step A: snapshot per-old payload (neighbours remapped) ---
         // Layer-0 f32 + neighbours, indexed by OLD idx.
         let mut l0_vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut l0_nbrs: Vec<Vec<u32>> = Vec::with_capacity(n);
@@ -172,7 +172,7 @@ impl HnswIndex {
             .load()
             .map(|(level, idx)| (level, new_of_old[idx as usize] as u64));
 
-        // --- Phase B: rebuild every store in new order ---
+        // --- Step B: rebuild every store in new order ---
 
         // SoA arrays: pure index shuffle (payload is per-node, no remap).
         let nodes = std::mem::take(&mut self.nodes);

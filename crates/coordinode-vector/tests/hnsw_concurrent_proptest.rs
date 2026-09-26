@@ -1,6 +1,6 @@
 //! Concurrent-insert proptest stress for `HnswIndex::insert_batch`.
 //!
-//! Verifies the C3 lock-free parallel apply path under randomised batch
+//! Verifies the lock-free parallel apply path under randomised batch
 //! shapes — varying dimension, batch size, fan-out (M), and a mix of
 //! fresh and update ids. After every batch the following invariants
 //! must hold:

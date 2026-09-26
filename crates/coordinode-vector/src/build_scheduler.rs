@@ -1,7 +1,6 @@
 //! Per-node CPU throttle for HNSW (re)builds.
 //!
-//! See `arch/distribution/live-rebalance.md § Build throttle` for the
-//! contract. The scheduler is a counting semaphore with FIFO ordering plus
+//! The scheduler is a counting semaphore with FIFO ordering plus
 //! a priority hint that lets emergency re-replication jump the queue when
 //! the cluster is recovering from a node loss.
 //!
@@ -12,7 +11,7 @@
 //! 16-core box with N=50, foreground search latency P99 spikes by orders of
 //! magnitude until the rebuild storm drains. The token bucket bounds
 //! parallelism to `max(1, cores/4)` by default so foreground query traffic
-//! keeps headroom. The R858b-pre1 migration planner queries
+//! keeps headroom. The migration planner queries
 //! [`HnswBuildScheduler::queue_depth`] when scoring a candidate target so
 //! it can spread rebuild load across the cluster.
 //!
@@ -33,8 +32,8 @@
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 
-/// Priority hint for build requests. Emergency re-replication (DC failure
-/// scenario in `live-rebalance.md`) preempts the FIFO; normal rebuilds do
+/// Priority hint for build requests. Emergency re-replication (after a DC
+/// failure) preempts the FIFO; normal rebuilds do
 /// not. Within the same priority class, ordering is strict FIFO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
@@ -87,7 +86,7 @@ impl HnswBuildScheduler {
     /// Construct a scheduler with the given concurrent-build capacity.
     /// The recommended default at `coordinode-server` boot is
     /// `max(1, num_cpus / 4)` — leaves 75% of cores for foreground search
-    /// traffic and parallel insert work from R858a-d.
+    /// traffic and parallel insert work.
     pub fn new(capacity: usize) -> std::sync::Arc<Self> {
         let capacity = capacity.max(1);
         std::sync::Arc::new(Self {
@@ -177,7 +176,7 @@ impl HnswBuildScheduler {
     }
 
     /// Number of pending waiters across all priority classes. Read by the
-    /// R858b-pre1 migration planner to penalise targets with deep build
+    /// migration planner to penalise targets with deep build
     /// queues when scoring candidate destinations.
     pub fn queue_depth(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

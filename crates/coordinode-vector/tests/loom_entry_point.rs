@@ -1,9 +1,8 @@
 //! Loom model-check for [`EntryPoint`] CAS-loop promotion.
 //!
 //! Exhaustively enumerates every legal interleaving of two concurrent
-//! `try_promote` callers and asserts the post-condition spelled out in
-//! `arch/search/vector-parallel-insert.md` §"Layer-promotion
-//! linearisability":
+//! `try_promote` callers and asserts the layer-promotion
+//! linearisability post-condition:
 //!
 //! > Concurrent inserts at the same novel max-level produce one
 //! > entry-point; the loser's level becomes the highest-level

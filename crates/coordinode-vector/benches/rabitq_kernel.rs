@@ -1,6 +1,6 @@
 //! Criterion benches for the RaBitQ popcount distance kernel.
 //!
-//! Validates the speed claim in [ADR-032](../../arch/DECISIONS.md):
+//! Validates the kernel's speed claim:
 //!   ~10× faster than SQ8 dequant+dot, ~50× faster than f32 AVX2 dot at D=1024.
 //!
 //! Each iteration scans all `N` database entries against a fixed query,

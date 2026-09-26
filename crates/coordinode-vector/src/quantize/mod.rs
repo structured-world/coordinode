@@ -1,9 +1,9 @@
 //! Vector quantization codecs.
 //!
 //! - [`Sq8Params`] / [`QuantizedVector`] — scalar quantization (u8 per dim, 4× compression).
-//!   Used for the Phase 1.5 disk rerank pool where cross-shard comparability matters.
+//!   Used for the disk rerank pool where cross-shard comparability matters.
 //! - [`rabitq`] — RaBitQ 1-bit-per-dim with popcount distance kernel. Primary in-RAM
-//!   codec per ADR-032 (per-shard rotation, ~30× compression, ~10× kernel speedup vs SQ8).
+//!   codec (per-shard rotation, ~30× compression, ~10× kernel speedup vs SQ8).
 //! - [`popcount`] — XOR + popcount kernel with runtime SIMD dispatch shared by RaBitQ
 //!   and any future binary codec.
 //!

@@ -73,7 +73,7 @@ fn cas_append_writer_vs_snapshot_reader() {
 
 /// Two concurrent writers each calling `cas_append` once. The final list
 /// must contain exactly both ids, never duplicates, never missing one.
-/// This is the core C3 multi-writer correctness property.
+/// This is the core multi-writer correctness property.
 #[test]
 fn concurrent_cas_append_no_lost_writes() {
     loom::model(|| {

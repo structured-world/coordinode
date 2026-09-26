@@ -1,9 +1,9 @@
 //! Criterion + custom-driver benchmarks for **parallel** HNSW search QPS.
 //!
-//! Headline metric for the C1 lock-free read path (R858a):
+//! Headline metric for the lock-free read path:
 //! `QPS(N threads) / QPS(1 thread)` should approach `N` on the SIFT1M-class
 //! workload as long as no shared-state mutex stands in the way. The search
-//! hot path itself is wait-free since C1 day 3b; the remaining
+//! hot path itself is wait-free; the remaining
 //! single-shared-state surface is [`hnsw::visited::VisitedPool`], which
 //! takes a `Mutex<Vec<VisitedList>>` lock per search to recycle scratch
 //! buffers. This bench measures both: pure search QPS (criterion) AND a
@@ -110,7 +110,7 @@ fn bench_parallel_search(c: &mut Criterion) {
 ///
 /// Criterion's machine-readable format is great for regression detection
 /// but lousy for narrative; this complementary output answers the question
-/// "is C1 actually scaling?" without parsing JSON.
+/// "does parallel search actually scale?" without parsing JSON.
 fn bench_scaling_report(c: &mut Criterion) {
     let mut group = c.benchmark_group("hnsw/scaling_report");
     group.sample_size(10); // Single-shot summary; not for regression detection.

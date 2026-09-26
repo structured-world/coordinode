@@ -1,7 +1,8 @@
 //! LSM-backed implementation of [`VectorTierStorage`].
 //!
 //! Wraps an [`Arc<StorageEngine>`] and routes truth-tier traffic to
-//! the dedicated [`Partition::VectorF32`] partition per ADR-033.
+//! the dedicated [`Partition::VectorF32`] partition, so f32 truth
+//! vectors live on disk while the in-RAM graph keeps only codes.
 //! Keys built by the
 //! [`vector_keys`][coordinode_storage::engine::vector_keys] module so
 //! the layout stays consistent with what the storage layer's own

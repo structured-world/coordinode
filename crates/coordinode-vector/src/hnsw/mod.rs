@@ -61,7 +61,7 @@ use entry_point::EntryPoint;
 /// Runtime configurations with `config.m_max0 > M_MAX0` are rejected at
 /// [`HnswIndex::new`]. Cluster-wide homogeneity (every replica compiled
 /// with the same `M_MAX0`) is also a precondition for the ship-graph-bytes
-/// transfer mode (ADR-030).
+/// transfer mode.
 pub const M_MAX0: usize = 64;
 
 use std::collections::BinaryHeap;
@@ -110,9 +110,9 @@ use crate::quantize::rabitq::{RaBitQCode, RaBitQExtCode, RaBitQParams, RaBitQQue
 /// shapes, no shared comparison semantics).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RabitqEncoded {
-    /// 1-bit sign-bit code, popcount distance kernel (R860). Default codec.
+    /// 1-bit sign-bit code, popcount distance kernel. Default codec.
     OneBit(RaBitQCode),
-    /// 2/3/4-bit Extended-RaBitQ code, centroid-LUT distance kernel (R862).
+    /// 2/3/4-bit Extended-RaBitQ code, centroid-LUT distance kernel.
     /// `bits` is carried inside the [`RaBitQExtCode`].
     Multi(RaBitQExtCode),
 }
@@ -161,8 +161,8 @@ const SQ8_MIN_VECTORS: usize = 1000;
 
 /// In-RAM quantization codec selector.
 ///
-/// Per ADR-032, RaBitQ supersedes SQ8 as the primary in-RAM codec; SQ8 is
-/// retained for the Phase 1.5 cross-shard disk rerank pool. `None` means
+/// RaBitQ supersedes SQ8 as the primary in-RAM codec; SQ8 is retained for
+/// the cross-shard disk rerank pool. `None` means
 /// search runs entirely on f32 originals — appropriate for small indexes
 /// where quantization overhead exceeds savings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -421,9 +421,7 @@ pub struct HnswIndex {
     /// `AtomicU64` with `u64::MAX` as the "empty index" sentinel.
     /// Multiple inserts that land on novel max-layers race through
     /// [`EntryPoint::try_promote`] (CAS-loop on a single atomic, max
-    /// two iterations under realistic contention — see
-    /// `arch/search/vector-parallel-insert.md` §"Layer-promotion
-    /// race"). Replaces the previous `(Option<usize>, usize)` pair
+    /// two iterations under realistic contention). Replaces the previous `(Option<usize>, usize)` pair
     /// that was mutated under `&mut self` in the batch allocation
     /// phase, the last serialisation point on the lock-free insert
     /// path before this commit.
@@ -452,15 +450,15 @@ pub struct HnswIndex {
     )]
     search_scratch_pool: SearchScratchPool,
     /// RNG state for random level selection (xorshift64).
-    /// Proper RNG gives correct exponential layer distribution (R852 fix).
-    /// AtomicU64 for future concurrent insert support (R858).
+    /// Proper RNG gives correct exponential layer distribution.
+    /// AtomicU64 so concurrent inserts can draw levels.
     rng_state: std::sync::atomic::AtomicU64,
-    /// Optional persistent vector tier backing per ADR-033 (truth tier
+    /// Optional persistent vector tier backing (truth tier
     /// f32 + quantized rerank tier). `None` for in-memory-only indexes
     /// (tests, ad-hoc analytics); `Some` when the caller has wired up
     /// LSM-backed storage. Writes through this handle log f32 on insert
     /// and quantized bytes on (re)calibration; reads through it power
-    /// Phase 1.5 cross-shard rerank and application-side custom rerank.
+    /// cross-shard rerank and application-side custom rerank.
     vector_tier: Option<crate::storage::VectorTierHandle>,
     /// Contiguous per-node store covering layer-0 neighbours, f32 vector,
     /// RaBitQ code and external label in a single stride-addressable
@@ -488,7 +486,7 @@ pub struct HnswIndex {
     data_level0: Option<data_level0::DataLevel0Block>,
 }
 
-/// Read-only result of the planning phase of an insert (C2, R858b).
+/// Read-only result of the planning phase of an insert.
 ///
 /// Produced by [`HnswIndex::compute_insert_plan`] (takes `&self`) and
 /// consumed by [`HnswIndex::apply_insert_plan`] (takes `&mut self`). The
@@ -619,7 +617,7 @@ enum RabitqQuery {
     /// 1-bit data × 4-bit-plane query (asymmetric, paper §3.3.2).
     OneBit(RaBitQQuery),
     /// 2/3/4-bit Extended-RaBitQ — query has the same packed shape as
-    /// stored codes (symmetric LUT kernel from R862).
+    /// stored codes (symmetric LUT kernel).
     Multi(RaBitQExtCode),
 }
 
@@ -779,13 +777,13 @@ impl HnswIndex {
         }
     }
 
-    /// Wire a persistent vector tier backend (truth f32 + quantized rerank
-    /// per ADR-033). After this call every successful insert writes the
+    /// Wire a persistent vector tier backend (truth f32 + quantized
+    /// rerank). After this call every successful insert writes the
     /// f32 bytes to the truth tier, and every (re)calibration writes
     /// quantized codes to the rerank tier. Failures during tier writes
     /// are logged through `tracing::warn` but do NOT roll back the
     /// in-RAM insert — the in-RAM graph is authoritative; the tier is
-    /// rebuilt from data on recovery (per ADR-018 + replication.md).
+    /// rebuilt from data on recovery.
     /// Pass `None` to disable (default state for in-memory tests).
     pub fn set_vector_tier(&mut self, tier: Option<crate::storage::VectorTierHandle>) {
         self.vector_tier = tier;
@@ -959,7 +957,7 @@ impl HnswIndex {
     /// The rotation matrix is deterministic in `(dims, seed)` where `seed`
     /// is derived from the index's configured `max_dimensions` to give a
     /// stable identity across restarts without requiring callers to provide
-    /// one (R860 starting point; a per-shard seed comes with R-PUSH chains).
+    /// one.
     fn auto_calibrate_rabitq(&mut self) {
         // Need at least one vector to infer D.
         let dims = match (0..self.nodes.len()).find_map(|idx| self.read_node_f32(idx)) {
@@ -1071,10 +1069,10 @@ impl HnswIndex {
         self.apply_insert_plan(plan, vector);
     }
 
-    /// Batched insert (C2, R858b). For `items.len() ≥ BATCH_PARALLEL_THRESHOLD`,
-    /// planning runs across the rayon thread pool while apply remains
-    /// single-threaded — composes with the wait-free C1 search hot path that
-    /// the planning phase relies on.
+    /// Batched insert. For `items.len() ≥ BATCH_PARALLEL_THRESHOLD`,
+    /// planning runs across the rayon thread pool and apply runs the
+    /// parallel path; the planning phase relies on the wait-free search
+    /// hot path.
     ///
     /// IDs already present in the index are routed through the sequential
     /// `update_existing_node` path after the parallel batch is applied;
@@ -1160,9 +1158,9 @@ impl HnswIndex {
                 .collect()
         };
 
-        // C3 day 4: the parallel apply path now runs a post-batch prune-
-        // pass that backfills any back-edges dropped on capacity, so its
-        // resulting graph holds the C2 recall contract (≥ 0.7 vs serial).
+        // The parallel apply path runs a post-batch prune-pass that
+        // backfills any back-edges dropped on capacity, so its resulting
+        // graph holds the batch recall contract (≥ 0.7 vs serial).
         // Dispatch to it for large batches; sequential apply for small.
         if plans.len() >= BATCH_PARALLEL_THRESHOLD {
             self.apply_insert_plans_parallel(plans);
@@ -1258,7 +1256,7 @@ impl HnswIndex {
         };
         let mut current_ep = start_idx;
 
-        // Phase 1: greedy descent down to new_level + 1.
+        // Step 1: greedy descent down to new_level + 1.
         //
         // Use the BUILD variant so neighbour selection runs on exact
         // f32 distance, not the RaBitQ popcount estimate. With RaBitQ
@@ -1273,12 +1271,12 @@ impl HnswIndex {
             current_ep = self.search_layer_greedy_query_for_build(vector, current_ep, level);
         }
 
-        // Phase 2: select neighbours at every layer from new_level down to 0.
+        // Step 2: select neighbours at every layer from new_level down to 0.
         let lowest_planning_layer = new_level.min(top_level);
         let mut per_layer = Vec::with_capacity(lowest_planning_layer + 1);
         for level in (0..=lowest_planning_layer).rev() {
             let ef = self.config.ef_construction;
-            // Same f32-build rationale as Phase 1 above.
+            // Same f32-build rationale as step 1 above.
             let candidates = self.search_layer_query_for_build(vector, current_ep, ef, level);
 
             let max_conn = if level == 0 {
@@ -1646,12 +1644,11 @@ impl HnswIndex {
             .as_ref()
             .and_then(|p| self.encode_rabitq(p, &vector));
 
-        // Persist f32 truth tier per ADR-033. Quantized codes (SQ8 /
-        // RaBitQ / PolarQuant / PQ) stay in RAM only — Phase 1.5
-        // cross-shard rerank reads f32 directly from the truth tier.
-        // Tier writes never roll back the in-RAM insert — the in-RAM
-        // graph is authoritative; the truth tier regenerates from
-        // data on recovery (replication.md HNSW rebuild path).
+        // Persist the f32 truth tier. Quantized codes (SQ8 / RaBitQ /
+        // PolarQuant / PQ) stay in RAM only; cross-shard rerank reads
+        // f32 directly from the truth tier. Tier writes never roll back
+        // the in-RAM insert: the in-RAM graph is authoritative, and the
+        // truth tier regenerates from data on recovery.
         if let Some(tier) = self.vector_tier.as_ref() {
             if let Err(e) = tier.put_f32(id, &vector) {
                 warn!(node_id = id, error = %e, "vector_tier put_f32 failed");
@@ -1732,8 +1729,8 @@ impl HnswIndex {
         self.maybe_calibrate_and_offload(idx);
     }
 
-    /// Parallel apply phase for C3 — applies many plans through a
-    /// (serial allocation, parallel edge-write) two-step.
+    /// Parallel apply phase: applies many plans through a (serial
+    /// allocation, parallel edge-write) two-step.
     ///
     /// Step 1 (serial, `&mut self`):
     ///   * push each new node into `nodes` + allocate matching atomic
@@ -1747,9 +1744,9 @@ impl HnswIndex {
     ///     `set_outgoing` for the new node (conflict-free across distinct
     ///     `idx`) plus `cas_add_neighbour_to` for each chosen back-edge
     ///     (multi-writer-safe through `AtomicNeighbourList::cas_append`).
-    ///   * if a back-edge target is at capacity, this commit drops the
-    ///     edge silently — the prune-pass that fills these in is C3
-    ///     day 4. Recall hit is the standard hnswlib batch trade-off.
+    ///   * if a back-edge target is at capacity, the edge is dropped
+    ///     here; the post-batch prune-pass run by the caller backfills
+    ///     it.
     ///
     /// Step 3 (serial): call `maybe_calibrate_and_offload` once for the
     /// last-allocated node; SQ8 calibration sees the post-batch state.
@@ -1769,7 +1766,7 @@ impl HnswIndex {
                 .and_then(|p| self.encode_rabitq(p, &vec));
             let new_level = plan.new_level;
 
-            // Persist f32 truth tier per ADR-033 (mirrors apply_insert_plan).
+            // Persist the f32 truth tier (mirrors apply_insert_plan).
             if let Some(tier) = self.vector_tier.as_ref() {
                 if let Err(e) = tier.put_f32(plan.id, &vec) {
                     warn!(node_id = plan.id, error = %e, "vector_tier put_f32 failed");
@@ -1803,8 +1800,8 @@ impl HnswIndex {
             // The first insert (`nodes.len() == 1`) hits an empty
             // EntryPoint and unconditionally installs; every later
             // plan only wins when its `new_level` strictly exceeds the
-            // current top. Either way the post-condition matches the
-            // arch doc's layer-promotion linearisability invariant:
+            // current top. Either way the post-condition holds the
+            // layer-promotion linearisability invariant:
             // entry-point sits at the global max layer after the call
             // returns. Still runs serially within this batch's
             // allocation phase so the parallel writers below observe
@@ -2382,7 +2379,7 @@ impl HnswIndex {
 
     /// Generate a random level for a new element.
     fn random_level(&self) -> usize {
-        // Xorshift64 RNG for proper exponential level distribution (R852).
+        // Xorshift64 RNG for proper exponential level distribution.
         // Donor: hnswlib hnswalg.h:207-211 uses std::uniform_real_distribution.
         let mut state = self.rng_state.load(std::sync::atomic::Ordering::Relaxed);
         state ^= state << 13;
@@ -2397,9 +2394,8 @@ impl HnswIndex {
 
     /// Update an already-indexed node's vector and rebuild its graph connections.
     ///
-    /// Called by `insert()` when the node ID already exists.  Implements the
-    /// G082 fix: prior code returned early ("Already indexed"), leaving the
-    /// node at its old position after a SET operation.
+    /// Called by `insert()` when the node ID already exists, so a SET moves
+    /// the node to its new position rather than leaving it at the old one.
     ///
     /// Algorithm:
     /// 1. Remove this node from all neighbors' connection lists.
@@ -2436,7 +2432,7 @@ impl HnswIndex {
             .and_then(|p| self.encode_rabitq(p, &vector));
 
         // Overwrite f32 truth tier on existing-node update so the
-        // tier reflects the latest write (ADR-033).
+        // tier reflects the latest write.
         if let Some(tier) = self.vector_tier.as_ref() {
             if let Err(e) = tier.put_f32(id, &vector) {
                 warn!(node_id = id, error = %e, "vector_tier put_f32 on update failed");
@@ -2483,12 +2479,12 @@ impl HnswIndex {
         let node_level = self.nodes[idx].max_layer;
         let mut current_ep = ep_idx;
 
-        // Phase 1: Greedy descent from top layer down to node_level+1.
+        // Step 4a: Greedy descent from top layer down to node_level+1.
         for level in (node_level + 1..=top_level).rev() {
             current_ep = self.search_layer_greedy(idx, current_ep, level);
         }
 
-        // Phase 2: Reconnect at layers node_level down to 0.
+        // Step 4b: Reconnect at layers node_level down to 0.
         for level in (0..=node_level.min(top_level)).rev() {
             let ef = self.config.ef_construction;
             let neighbours = self.search_layer(idx, current_ep, ef, level);
@@ -3286,17 +3282,16 @@ impl HnswIndex {
         self.set_outgoing(node_idx, level, &kept);
     }
 
-    // ── Atomic neighbour write helpers (C1 day 5, refined C3 day 2) ────────
+    // ── Atomic neighbour write helpers ─────────────────────────────────────
     //
-    // Single source of truth: `neighbours_l0` + `neighbours_upper`. The
-    // legacy `node.connections` is gone.
+    // Single source of truth: `neighbours_l0` + `neighbours_upper`.
     //
-    // **C3 day 2:** helpers that touch only the atomic neighbour storage now take
-    // `&self` instead of `&mut self`. The new node's atomic layer Vec is
+    // Helpers that touch only the atomic neighbour storage take `&self`
+    // instead of `&mut self`. The new node's atomic layer Vec is
     // append-only at slot-creation time (`apply_insert_plan` pushes once),
     // and once the layers exist their internal state mutates through atomic
     // APIs that need only `&self`. This unlocks parallel apply for distinct
-    // node indices in the C3 concurrent insert path:
+    // node indices in the concurrent insert path:
     //
     // * `set_outgoing(&self, idx, …)` is conflict-free across distinct
     //   `idx` because the new-node's atomic list is freshly created by
@@ -3307,7 +3302,7 @@ impl HnswIndex {
     //   each other's updates.
     //
     // The legacy `&mut self` `add_neighbour_to` / `remove_neighbour_from`
-    // / `clear_outgoing` paths are kept for the sequential C1/C2 callers
+    // / `clear_outgoing` paths serve the sequential callers
     // (update_existing_node's rebuild, prune fallback).
 
     /// Resolve `(node, layer >= 1)` to the underlying [`AtomicNeighbourList`]
@@ -3412,15 +3407,14 @@ impl HnswIndex {
         self.layer_set(idx, level, &ids[..n]);
     }
 
-    /// Multi-writer append-edge primitive (C3). Tries to append `id` to
+    /// Multi-writer append-edge primitive. Tries to append `id` to
     /// `(neighbour_idx, level)` via [`AtomicNeighbourList::cas_append`].
     /// Returns `true` on success, `false` if the neighbour list is at
     /// capacity (`m_max0`/`m`) and the caller must fall back to a single-
     /// writer prune protocol.
     ///
-    /// Today the only caller is C3's parallel apply path (next day's
-    /// commit). C2's serial apply continues to use [`add_neighbour_to`].
-    #[allow(dead_code)] // Wired into parallel apply in C3 day 3.
+    /// Used by the parallel apply path; the serial apply uses
+    /// [`add_neighbour_to`].
     fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
         self.layer_cas_append(neighbour_idx, level, id)
     }
@@ -3429,7 +3423,7 @@ impl HnswIndex {
     /// exceeds `max_conn`, run `prune_connections` to shrink back to the
     /// nearest `max_conn` neighbours.
     ///
-    /// Single-writer (C1/C2 path). The new node case uses `cas_append`
+    /// Single-writer path. The new node case uses `cas_append`
     /// internally so cas-based callers can race with this safely on the
     /// `len` counter, but the prune branch needs `&mut self` because
     /// `prune_connections` reads vectors + reorders the list.

@@ -16,16 +16,16 @@
 //!   cache-line-friendly memcpy on the read path. `N` is chosen to match
 //!   `m_max0` (e.g. `64` for the default `M = 32`).
 //!
-//! # Where this lives in the C1 → C4 plan
+//! # Writers
 //!
-//! * **C1** — single-writer `set`. Caller holds `&mut HnswIndex` while
-//!   mutating; concurrent search reads via [`snapshot`] without locking.
-//! * **C3 (now)** — multi-writer [`cas_append`] for incoming-edge add
-//!   under concurrent inserters; [`replace`] for the prune protocol
-//!   (single-writer per-list, gated by HnswIndex). `set` remains the
-//!   bulk-replace primitive both helpers ultimately call.
-//! * **C4 (later)** — `loom` interleaving + `miri` UB scan campaign over
-//!   these primitives.
+//! * Single-writer `set` — the bulk-replace primitive. The caller holds
+//!   exclusive write access to the list; concurrent search reads via
+//!   [`snapshot`] without locking.
+//! * Multi-writer [`cas_append`] — incoming-edge add under concurrent
+//!   inserters.
+//!
+//! The `loom` model-check campaign in `tests/loom_neighbours.rs` covers
+//! both.
 
 // Atomics are routed through `loom` when the `--cfg loom` build flag is set,
 // so the model-checker can permute every observable interleaving. Under a
@@ -48,11 +48,11 @@ pub(crate) const EMPTY: u64 = u64::MAX;
 /// fetch for nodes with the common-case small degree, and at most a couple
 /// of cache lines for the dense layer-0 case.
 ///
-/// # Concurrency contract (C1)
+/// # Concurrency contract
 ///
 /// * Multiple concurrent readers are safe (`snapshot` is wait-free).
-/// * Exactly **one** writer at a time — enforced externally today by the
-///   `&mut HnswIndex` borrow on insert. C3 will relax this via CAS.
+/// * [`set`](Self::set) needs exclusive write access to the list;
+///   [`cas_append`](Self::cas_append) is safe under concurrent writers.
 /// * No `Drop` side-effects — the type is a plain POD over atomics.
 #[doc(hidden)]
 pub struct AtomicNeighbourList<const N: usize> {
@@ -90,8 +90,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     }
 
     /// Capacity of the list (compile-time constant `N`).
-    #[inline]
-    #[allow(dead_code)] // Wired into HnswIndex in the next C1 step.
+    #[cfg(test)]
     pub(crate) const fn capacity(&self) -> usize {
         N
     }
@@ -114,8 +113,8 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// Wait-free, O(len). Returns the number of neighbours written.
     ///
     /// The snapshot is *consistent for the read epoch* — under concurrent
-    /// writers (C3), the returned set is a valid intermediate state of the
-    /// list at some point during the call. C1 callers see the single-writer
+    /// writers, the returned set is a valid intermediate state of the list
+    /// at some point during the call; with a single writer it is the
     /// committed state.
     pub fn snapshot_into(&self, out: &mut Vec<u64>) {
         out.clear();
@@ -137,15 +136,15 @@ impl<const N: usize> AtomicNeighbourList<N> {
         out
     }
 
-    /// Single-writer publish (C1 entry point).
+    /// Single-writer publish.
     ///
     /// Overwrites the current neighbour set with `new` and publishes the new
     /// length. `new.len()` must be ≤ `N`; longer slices are truncated with a
     /// debug-only assertion (release builds silently truncate to `N`).
     ///
-    /// Callers MUST hold exclusive write access — e.g. via `&mut HnswIndex`.
-    /// Concurrent calls to `set` are UB under C1 semantics; C3 introduces
-    /// [`AtomicNeighbourList::replace`] for the multi-writer case.
+    /// Callers MUST hold exclusive write access to this list: concurrent
+    /// calls to `set` race. [`AtomicNeighbourList::cas_append`] is the
+    /// multi-writer primitive.
     pub fn set(&self, new: &[u64]) {
         debug_assert!(
             new.len() <= N,
@@ -155,22 +154,22 @@ impl<const N: usize> AtomicNeighbourList<N> {
         );
         let n = new.len().min(N);
 
-        // Phase 1: write slots (Relaxed — the Release on `len` orders them).
+        // Step 1: write slots (Relaxed — the Release on `len` orders them).
         for (slot, &id) in self.slots.iter().zip(new.iter()).take(n) {
             slot.store(id, Ordering::Relaxed);
         }
         // Wipe the tail so a later snapshot doesn't see stale ids past `len`.
-        // Belt-and-braces: snapshot already truncates by `len`, but a future
-        // reader of `cas_append` (C3) walks past `len` and must see `EMPTY`.
+        // Belt-and-braces: snapshot already truncates by `len`, but a slot
+        // `cas_append` reserved and has not yet written must read `EMPTY`.
         for slot in self.slots.iter().skip(n) {
             slot.store(EMPTY, Ordering::Relaxed);
         }
-        // Phase 2: publish length. Release ensures the slot stores are visible
+        // Step 2: publish length. Release ensures the slot stores are visible
         // before any reader observing this length sees them.
         self.len.store(n as u32, Ordering::Release);
     }
 
-    // ─── C3 lock-free write primitives (R858c day 1) ──────────────────────
+    // ─── Lock-free write primitives ───────────────────────────────────────
 
     /// Append `id` to the list under concurrent writers. Returns `true` on
     /// success, `false` if the list is full (caller must run a shrink/prune
@@ -202,7 +201,6 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// makes the over-capacity case messy: the bumped `len` is observable
     /// before we know we can't actually store there. The CAS-loop keeps
     /// `len` monotonic AND never above `N`.
-    #[allow(dead_code)] // Wired into HnswIndex concurrent insert path in C3 day 2.
     pub fn cas_append(&self, id: u64) -> bool {
         loop {
             let current = self.len.load(Ordering::Acquire) as usize;
@@ -229,20 +227,10 @@ impl<const N: usize> AtomicNeighbourList<N> {
         }
     }
 
-    /// Atomically replace the entire list contents.
-    ///
-    /// **Caller contract (C3 prune path):** this method is single-writer at
-    /// the per-list granularity. The HNSW prune protocol acquires a per-node
-    /// "prune-in-progress" gate before calling `replace`, so no other
-    /// `cas_append` or `replace` runs concurrently on the same list. Within
-    /// that gate, concurrent readers ([`snapshot_into`] etc) are still safe
-    /// — they observe either the pre-replace or post-replace contents, with
-    /// no torn intermediate (sequencing identical to [`set`]).
-    ///
-    /// For full multi-writer replace, this would need a per-list version
-    /// counter + reader retry loop — deferred until a workload actually
-    /// requires it.
-    #[allow(dead_code)] // Wired into prune protocol in C3 day 2.
+    /// Replace the entire list contents: [`set`](Self::set) under a
+    /// single-writer gate. Concurrent readers observe either the
+    /// pre-replace or post-replace contents, with no torn intermediate.
+    #[cfg(test)]
     pub fn replace(&self, new: &[u64]) {
         self.set(new);
     }

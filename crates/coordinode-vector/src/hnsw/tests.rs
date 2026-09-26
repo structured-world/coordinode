@@ -547,7 +547,7 @@ fn recall_test_l2() {
     );
 }
 
-/// Verify that random_level produces proper exponential distribution (R852 regression).
+/// Verify that random_level produces proper exponential distribution.
 /// With M=16, level_mult = 1/ln(16) ≈ 0.36:
 ///   - ~64% of nodes at level 0 only
 ///   - ~23% at level 1
@@ -606,7 +606,7 @@ fn random_level_distribution() {
 
 /// Integration test: multiple sequential searches correctly reuse visited pool.
 /// Verifies that epoch-based reset doesn't leak state between searches
-/// (regression test for R850 HashSet→epoch visited refactor).
+/// (regression test for the HashSet→epoch visited-list refactor).
 #[test]
 fn sequential_searches_reuse_visited_pool() {
     let mut index = HnswIndex::new(HnswConfig {
@@ -1145,7 +1145,7 @@ fn rabitq_recall_cosine_dim_100_with_padding() {
 
 #[test]
 fn extended_rabitq_recall_sanity_cosine_2bit() {
-    // Wires-up test for 2-bit Extended-RaBitQ (R862): same shape as the
+    // Wires-up test for 2-bit Extended-RaBitQ: same shape as the
     // 1-bit recall sanity check, but `quantization = RaBitQ { bits: 2 }`.
     // Exercises the RabitqEncoded::Multi search path end-to-end:
     // calibration → encode_ext → estimate_cosine_distance_ext → top-K.
@@ -1294,7 +1294,7 @@ fn vector_tier_persists_f32_on_insert() {
     }
 
     // Truth tier: every insert persisted byte-exact (f32 only;
-    // SQ8 / RaBitQ codes stay in RAM per ADR-033 revised).
+    // SQ8 / RaBitQ codes stay in RAM).
     let got_f32 = mock.multi_get_f32(7, 13, &[0, 1, 2, 3]).unwrap();
     for (i, slot) in got_f32.iter().enumerate() {
         assert_eq!(
@@ -1604,15 +1604,15 @@ fn sq8_small_index_still_calibrates() {
 
 #[test]
 fn sq8_large_index_no_warning_threshold() {
-    // Verify the SQ8_MIN_VECTORS constant matches the architecture spec.
+    // Below 1000 vectors SQ8 calibration overhead is not worth it.
     assert_eq!(
         super::SQ8_MIN_VECTORS,
         1000,
-        "SQ8_MIN_VECTORS should be 1000 per arch/operations/compression.md"
+        "SQ8_MIN_VECTORS should be 1000"
     );
 }
 
-// ── G009: Offloaded f32 vectors to disk ────────────────────────────
+// ── Offloaded f32 vectors to disk ──────────────────────────────────
 
 fn make_offload_config(metric: VectorMetric) -> HnswConfig {
     HnswConfig {
@@ -1809,7 +1809,7 @@ fn offload_memory_savings() {
     let _ = (n, dims);
 }
 
-/// Regression test for G082: HNSW must update the graph when a vector
+/// Regression test: HNSW must update the graph when a vector
 /// property is overwritten via SET (e.g. `MATCH (n) SET n.emb = $new_vec`).
 ///
 /// Previously `insert()` returned early ("Already indexed") so the node
@@ -1861,7 +1861,7 @@ fn insert_updates_existing_node_vector_and_graph_position() {
 
 #[test]
 fn atomic_neighbours_track_inserts_and_updates() {
-    // C1 day 5: atomic neighbour storage is the sole source of truth.
+    // Atomic neighbour storage is the sole source of truth.
     // Insert a fan of vectors, then mutate one via update_existing_node;
     // verify every neighbour list (a) tracks the layer count of the
     // node, (b) is bounded by m_max0, (c) only references node IDs
@@ -2350,11 +2350,11 @@ fn insert_batch_handles_mixed_new_and_existing_ids() {
 
 #[test]
 fn apply_insert_plans_parallel_ingests_every_item() {
-    // C3 day 3: explicit parallel-apply variant. Until the prune-pass
-    // (day 4) backfills dropped back-edges, recall agreement vs serial
-    // hovers in the 0.5-0.6 range; the property we assert here is
-    // weaker: every plan must result in a present, self-recoverable
-    // node (search for own vector returns it as top-1).
+    // Explicit parallel-apply variant without the prune-pass that
+    // backfills dropped back-edges, so recall agreement vs serial is
+    // not asserted; the property checked is weaker: every plan must
+    // result in a present, self-recoverable node (search for own
+    // vector returns it as top-1).
     let cfg = HnswConfig {
         m: 8,
         m_max0: 16,
@@ -2380,7 +2380,7 @@ fn apply_insert_plans_parallel_ingests_every_item() {
         idx.insert(i, v);
     }
     // Pre-compute plans against the seeded graph, then apply in
-    // parallel via the C3 day 3 entry point.
+    // parallel.
     let plans: Vec<(InsertPlan, Vec<f32>)> = (64..200u64)
         .map(|i| {
             let v: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();

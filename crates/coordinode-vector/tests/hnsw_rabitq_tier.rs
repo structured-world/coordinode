@@ -1,11 +1,10 @@
 //! End-to-end RaBitQ + LSM truth tier wiring.
 //!
-//! Closes the R861 coverage gap: HNSW unit tests exercised RaBitQ
-//! without a tier (in-RAM only); LSM tier tests exercised put/get
-//! without HNSW. Neither proved the two work together — that the
-//! same HnswIndex configured with `QuantizationCodec::RaBitQ` and a
-//! `VectorTierHandle` both calibrates RaBitQ and persists every
-//! original f32 vector through the tier per ADR-033.
+//! HNSW unit tests exercise RaBitQ without a tier (in-RAM only); LSM
+//! tier tests exercise put/get without HNSW. This suite proves the two
+//! work together: the same HnswIndex configured with
+//! `QuantizationCodec::RaBitQ` and a `VectorTierHandle` both calibrates
+//! RaBitQ and persists every original f32 vector through the tier.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -97,8 +96,8 @@ fn rabitq_inserts_persist_originals_through_tier() {
 
     // Tier side: every inserted f32 vector must round-trip
     // through the LSM exactly — bit-for-bit, not just close.
-    // This is the load-bearing claim of ADR-033: the tier is
-    // the truth, not the quantized in-RAM codec.
+    // This is the load-bearing claim: the tier is the truth,
+    // not the quantized in-RAM codec.
     let ids: Vec<u64> = (0..N).collect();
     let got = tier_backend
         .multi_get_f32(42, 7, &ids)

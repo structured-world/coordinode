@@ -375,7 +375,7 @@ impl DataLevel0Block {
 
         // SAFETY: idx/j bounds per the asserts above.
         unsafe {
-            // Phase 1: write the live slots (Relaxed; the count Release orders them).
+            // Step 1: write the live slots (Relaxed; the count Release orders them).
             for (j, &id) in ids.iter().take(n).enumerate() {
                 self.slot_atomic(idx, j).store(id, Ordering::Relaxed);
             }
@@ -383,7 +383,7 @@ impl DataLevel0Block {
             for j in n..self.m_max0 {
                 self.slot_atomic(idx, j).store(EMPTY_ID, Ordering::Relaxed);
             }
-            // Phase 2: publish the count (Release makes the slot stores visible).
+            // Step 2: publish the count (Release makes the slot stores visible).
             self.count_atomic(idx).store(n as u32, Ordering::Release);
         }
     }

@@ -64,7 +64,7 @@ fn set_truncates_to_capacity_in_release() {
 
 #[test]
 fn concurrent_readers_safe_under_single_writer() {
-    // C1 contract: single writer + many readers. Run a stress test
+    // Single writer + many readers. Run a stress test
     // that interleaves writes and reads to verify no torn snapshots.
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -127,7 +127,7 @@ fn cas_append_returns_false_when_full() {
 
 #[test]
 fn cas_append_concurrent_writers_keep_len_consistent() {
-    // C3 stress test: many threads call cas_append concurrently. Each
+    // Stress test: many threads call cas_append concurrently. Each
     // appended id is unique. Final list size must equal (a) the number
     // of attempted appends if that's ≤ capacity, or (b) capacity
     // exactly with a stable subset of attempted ids.
@@ -211,7 +211,7 @@ fn cas_append_concurrent_overflow_caps_at_capacity() {
 
 #[test]
 fn replace_overwrites_existing() {
-    // C3 day 1: replace is set() under the per-list single-writer gate.
+    // replace is set() under the per-list single-writer gate.
     // Tested as an alias here; concurrency contract documented on the
     // method itself.
     let list: AtomicNeighbourList<8> = AtomicNeighbourList::new();

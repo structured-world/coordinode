@@ -287,7 +287,7 @@ fn code_serde_round_trip_is_bit_identical() {
     assert_eq!(code, code2);
 }
 
-// ── Extended-RaBitQ (R862) ──────────────────────────────────────
+// ── Extended-RaBitQ ─────────────────────────────────────────────
 
 #[test]
 fn ext_encode_layout_2_3_4_bit() {
@@ -326,7 +326,7 @@ fn ext_code_size_matches_spec() {
     //   bits=2 → 256 B packed + 13 B scalars (dims:u32 + bits:u8 + 2×f32) = 269 B
     //   bits=3 → 384 B + 13 = 397 B
     //   bits=4 → 512 B + 13 = 525 B
-    // The arch doc quotes the packed body only (256/384/512); the
+    // The paper quotes the packed body only (256/384/512); the
     // extra 13 B per code is scalar metadata + dims field for safe
     // decoding when dims × bits doesn't fit cleanly in a byte.
     let p = RaBitQParams::calibrate(1024, 7);
