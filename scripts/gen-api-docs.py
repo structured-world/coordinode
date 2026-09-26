@@ -227,7 +227,11 @@ def _parse_enum_block(lines: list[str], start: int) -> ProtoEnum:
         line = lines[i]
         cm = COMMENT_RE.match(line)
         if cm:
-            pending_comment = cm.group(1)
+            # A value's comment may span several lines; keep all of them.
+            if pending_comment:
+                pending_comment += " " + cm.group(1)
+            else:
+                pending_comment = cm.group(1)
             continue
         vm = ENUM_VALUE_RE.match(line)
         if vm:
