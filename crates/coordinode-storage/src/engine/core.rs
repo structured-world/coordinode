@@ -1791,7 +1791,7 @@ impl StorageEngine {
         if eligible.is_empty() {
             return Err(StorageError::Io(
                 "no oplog-eligible endpoint configured (need Durable or Degraded \
-                 durability — INV-D1: oplog must survive process restart)"
+                 durability: the oplog must survive a process restart)"
                     .to_string(),
             ));
         }
@@ -2169,7 +2169,7 @@ impl StorageEngine {
     ///
     /// Pre-write capacity gate applies: a delete writes a tombstone
     /// that still consumes memtable bytes (and eventually SST bytes
-    /// after flush). Under INV-D3 the gate must fire here too;
+    /// after flush), so the hard-limit gate must fire here too;
     /// operators evict via cascade or by reducing `hard_limit_bytes`,
     /// not by stuffing more tombstones onto a Full endpoint.
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {

@@ -39,7 +39,7 @@ pub enum Media {
 /// Operator-marked at config time. NEVER inferred from media kind — the same
 /// SSD can be `Durable` (in RAID-1), `Degraded` (single drive primary
 /// storage), or `Volatile` (cache file). The placement engine reads this
-/// flag to enforce the invariants listed on each variant (INV-D1..D4).
+/// flag to enforce the invariants listed on each variant.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
@@ -50,14 +50,14 @@ pub enum Durability {
     #[default]
     Durable,
     /// Single drive without hardware redundancy. Drive death = data loss
-    /// unless protected by another mechanism. INV-D2: MUST have EITHER
-    /// segment EC OR cluster replica configured. Page-level ECC is enabled
+    /// unless protected by another mechanism, so data here MUST have EITHER
+    /// segment EC OR a cluster replica configured. Page-level ECC is enabled
     /// by default to catch media read errors when no array-level recovery
     /// is available.
     Degraded,
     /// Volatile storage — any failure (power loss, process restart) erases
-    /// the data. RAM, NVMe-as-cache, write-buffer NVMe. INV-D1: MUST have
-    /// a `Durable` copy at cluster level. INV-D4: cluster survives loss of
+    /// the data. RAM, NVMe-as-cache, write-buffer NVMe. Data here MUST have
+    /// a `Durable` copy at cluster level, so the cluster survives loss of
     /// ALL `Volatile` endpoints without data loss. Segment EC NEVER applied
     /// to `Volatile` (chunks all on volatile = useless: power-off erases
     /// all chunks simultaneously).
@@ -123,17 +123,17 @@ pub struct EndpointConfig {
     pub path: PathBuf,
     /// Physical media kind — metadata only, does not determine durability.
     pub media: Media,
-    /// Durability class — operator-marked, drives invariants D1..D4.
+    /// Durability class — operator-marked, drives the durability invariants.
     pub durability: Durability,
     /// Storage tier — drives placement preference.
     pub tier: Tier,
     /// Physical capacity in bytes. `0` means "untracked" — the placement
-    /// engine cannot enforce INV-D3 without this. Optional in config:
+    /// engine cannot enforce the hard limit without this. Optional in config:
     /// omitting it leaves the endpoint untracked.
     #[serde(default)]
     pub capacity_bytes: u64,
     /// Hard-limit in bytes — placement engine NEVER writes past this point
-    /// (INV-D3). `0` means "no hard limit" (placement engine still observes
+    /// (`used ≤ hard_limit` always). `0` means "no hard limit" (placement engine still observes
     /// filesystem capacity if known). When both `capacity_bytes` and
     /// `hard_limit_bytes` are non-zero, `hard_limit_bytes` MUST be
     /// `<= capacity_bytes` — validated in [`StorageConfig::with_endpoints`].
@@ -349,7 +349,7 @@ impl EndpointConfig {
         fast && non_volatile
     }
 
-    /// Oplog eligibility predicate (INV-D1): endpoint is eligible to host oplog segments iff its durability class
+    /// Oplog eligibility predicate: endpoint is eligible to host oplog segments iff its durability class
     /// guarantees survival of a process restart. `Volatile` is rejected
     /// (segments lost on restart = consensus log lost = data loss). Both
     /// `Durable` and `Degraded` are eligible — `Degraded` is acceptable
@@ -949,7 +949,7 @@ impl StorageConfig {
     }
 
     /// Select the endpoint that hosts oplog segments for `shard_id`
-    /// (INV-D1: a non-volatile endpoint).
+    /// (a non-volatile endpoint, so the log survives a restart).
     ///
     /// Round-robin within the oplog-eligible set, keyed by `shard_id`.
     /// CE single-shard with a single oplog-eligible endpoint always

@@ -81,9 +81,9 @@ impl PartitionRouting {
     /// definition. If the pool ends up empty (e.g., `with_endpoints_no_persistence`
     /// MemFs config), the Volatile endpoints are used as the last resort.
     pub fn default_for_endpoints(endpoints: &[EndpointConfig]) -> Self {
-        // Persistent SST placement excludes Volatile by INV-D1 spirit
-        // (oplog/WAL invariant generalises: any byte that must survive
-        // restart cannot live solely on Volatile media).
+        // Persistent SST placement excludes Volatile for the same reason
+        // the oplog and WAL do: any byte that must survive a restart
+        // cannot live solely on Volatile media.
         let persistent: Vec<&EndpointConfig> = endpoints
             .iter()
             .filter(|e| e.durability != Durability::Volatile)

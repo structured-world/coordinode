@@ -525,7 +525,7 @@ fn select_oplog_endpoint_round_robin_by_shard() {
 fn select_oplog_endpoint_errors_when_none_eligible() {
     // All-volatile config — must go through the explicit
     // `with_endpoints_no_persistence` escape hatch because
-    // `with_endpoints` would now panic per INV-D1.
+    // `with_endpoints` refuses a config with no oplog-eligible endpoint.
     let cache = EndpointConfig::new(
         "cache",
         "/cache",

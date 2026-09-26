@@ -1,7 +1,6 @@
 //! Per-endpoint capacity tracking + hard-limit enforcement.
 //!
-//! Implements INV-D3 (`used ≤ hard_limit always`) from the storage
-//! stack design. For each [`crate::engine::config::EndpointConfig`]
+//! Enforces `used ≤ hard_limit` at all times. For each [`crate::engine::config::EndpointConfig`]
 //! with a non-zero `hard_limit_bytes`, this module:
 //!
 //! 1. Periodically scans the endpoint's per-partition `tables/`

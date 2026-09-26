@@ -40,7 +40,7 @@ pub enum StorageError {
         context: String,
     },
 
-    /// Endpoint capacity exhausted (INV-D3 hard-limit gate). The named
+    /// Endpoint capacity exhausted (hard-limit gate). The named
     /// endpoint's `used_bytes` is at or above its `hard_limit_bytes`
     /// and its `is_writable` flag is currently `false`. Coordinator
     /// may retry on a different endpoint or surface the error to the
