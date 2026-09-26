@@ -17,7 +17,9 @@ use tonic::Request;
 
 use super::ChangeEventServiceImpl;
 use crate::proto::replication::cdc::change_stream_service_server::ChangeStreamService;
-use crate::proto::replication::cdc::{CdcFilters as ProtoCdcFilters, SubscribeRequest};
+use crate::proto::replication::cdc::{
+    CdcFilters as ProtoCdcFilters, ResumeToken as ProtoResumeToken, SubscribeRequest,
+};
 use crate::registry::{RegistryTuning, build_consumer_registry};
 
 /// Open a fresh single-endpoint engine in a temp directory, mirroring the
@@ -102,6 +104,140 @@ async fn subscribe_registers_then_unregisters_cdc_consumer() {
         released,
         "cdc consumer must be unregistered after the stream is dropped"
     );
+}
+
+/// A token that names no position of this stream is refused up front, and
+/// no consumer is left registered for it: one for another shard, and one
+/// whose parts overflow a log index.
+#[tokio::test]
+async fn subscribe_refuses_a_token_it_cannot_resume() {
+    let (engine, _engine_dir) = open_engine();
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(OwnedLocalProposalPipeline::new(&engine));
+    let (registry, _bg) = build_consumer_registry(engine, pipeline, RegistryTuning::default());
+    let service = ChangeEventServiceImpl::new(
+        0,
+        Vec::new(),
+        registry.clone(),
+        super::DEFAULT_CONSUMER_TTL_MS,
+        Arc::new(|| 0),
+    );
+
+    for (token, what) in [
+        (
+            ProtoResumeToken {
+                shard_id: 7,
+                segment_id: 0,
+                entry_offset: 0,
+            },
+            "another shard",
+        ),
+        (
+            ProtoResumeToken {
+                shard_id: 0,
+                segment_id: u64::MAX,
+                entry_offset: 1,
+            },
+            "past the last log index",
+        ),
+    ] {
+        let status = match service
+            .subscribe(Request::new(SubscribeRequest {
+                resume_token: Some(token),
+                filters: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("a token for {what} was accepted"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{what}");
+    }
+    assert!(
+        registry
+            .list_consumers()
+            .iter()
+            .all(|c| !c.consumer_id.starts_with("cdc-")),
+        "a refused subscription holds no retention"
+    );
+}
+
+/// An idle stream heartbeats once per poll, so a poll interval that reaches
+/// the consumer TTL would let a connected reader expire; the tuning refuses it.
+#[test]
+fn a_poll_interval_must_be_shorter_than_the_consumer_ttl() {
+    let at = |ms| super::CdcStreamTuning {
+        poll_interval: Duration::from_millis(ms),
+        ..super::CdcStreamTuning::default()
+    };
+    assert!(at(100).check(30_000).is_ok());
+    assert!(at(29_999).check(30_000).is_ok());
+    assert!(at(30_000).check(30_000).is_err());
+    assert!(at(60_000).check(30_000).is_err());
+    assert!(
+        super::CdcStreamTuning::default()
+            .check(super::DEFAULT_CONSUMER_TTL_MS)
+            .is_ok()
+    );
+}
+
+/// A reader that is connected but slower than the log keeps its registration:
+/// while the stream waits for the reader to take more events it still
+/// heartbeats, so the TTL reclaims only readers that are gone.
+#[tokio::test]
+async fn a_slow_reader_is_not_evicted() {
+    let (engine, _engine_dir) = open_engine();
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(OwnedLocalProposalPipeline::new(&engine));
+    let (registry, _bg) = build_consumer_registry(
+        engine,
+        pipeline,
+        RegistryTuning {
+            heartbeat_window_ms: Some(20),
+            eviction_interval_ms: Some(50),
+        },
+    );
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    write_oplog(oplog_dir.path(), 300);
+
+    let ttl_ms = 400;
+    let service = ChangeEventServiceImpl::new(
+        0,
+        vec![oplog_dir.path().to_path_buf()],
+        registry.clone(),
+        ttl_ms,
+        Arc::new(|| 300),
+    )
+    .with_tuning(super::CdcStreamTuning {
+        poll_interval: Duration::from_millis(50),
+        batch_size: std::num::NonZeroUsize::new(256).expect("nonzero"),
+    });
+    let mut stream = service
+        .subscribe(Request::new(SubscribeRequest {
+            resume_token: None,
+            filters: None,
+        }))
+        .await
+        .expect("subscribe")
+        .into_inner();
+
+    // The reader takes nothing for several TTLs; the stream fills its buffer
+    // and waits.
+    tokio::time::sleep(Duration::from_millis(4 * ttl_ms)).await;
+    assert!(
+        registry
+            .list_consumers()
+            .iter()
+            .any(|c| c.consumer_id.starts_with("cdc-")),
+        "a connected reader was evicted while the stream waited on it"
+    );
+
+    for expected in 0..300 {
+        assert_eq!(
+            next_index(&mut stream, Duration::from_secs(5)).await,
+            Some(expected)
+        );
+    }
 }
 
 /// Write `count` node-write entries as oplog segments into `dir`.

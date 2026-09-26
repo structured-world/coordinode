@@ -141,6 +141,8 @@ pub(crate) async fn serve(
         registry_heartbeat_ms,
         registry_eviction_ms,
         cdc_consumer_ttl_secs,
+        cdc_poll_interval_ms,
+        cdc_batch_size,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
         peers: peers_vec,
@@ -186,6 +188,25 @@ pub(crate) async fn serve(
             "error: node_id={node_id} requires peers. \
                      Single-node deployments always use node-id=1."
         );
+        std::process::exit(1);
+    }
+
+    // Operator-tunable CDC consumer TTL (seconds → ms); saturating so an
+    // absurdly large window means "effectively never reclaim".
+    let cdc_ttl_ms = cdc_consumer_ttl_secs
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS);
+    let cdc_tuning = {
+        let default = services::cdc::CdcStreamTuning::default();
+        services::cdc::CdcStreamTuning {
+            poll_interval: cdc_poll_interval_ms.map_or(default.poll_interval, |ms| {
+                std::time::Duration::from_millis(ms.get())
+            }),
+            batch_size: cdc_batch_size.unwrap_or(default.batch_size),
+        }
+    };
+    if let Err(e) = cdc_tuning.check(cdc_ttl_ms) {
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 
@@ -813,11 +834,6 @@ pub(crate) async fn serve(
     let health_service = services::health::HealthServiceImpl;
     // CDC service: tails the Raft log up to the entries this node applied.
     // Empty stream in embedded mode: there is no Raft log.
-    // Operator-tunable CDC consumer TTL (seconds → ms); saturating so an
-    // absurdly large window means "effectively never reclaim".
-    let cdc_ttl_ms = cdc_consumer_ttl_secs
-        .map(|s| s.saturating_mul(1000))
-        .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS);
     let cdc_service = match raft_node_shared {
         Some(ref rn) => services::cdc::ChangeEventServiceImpl::for_raft_node(
             &database.read().engine_shared(),
@@ -832,7 +848,8 @@ pub(crate) async fn serve(
             cdc_ttl_ms,
             Arc::new(|| 0),
         ),
-    };
+    }
+    .with_tuning(cdc_tuning);
 
     // ClusterService: cluster join/leave lifecycle.
     // Available only in cluster mode (requires a RaftNode).

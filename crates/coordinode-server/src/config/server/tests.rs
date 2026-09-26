@@ -79,6 +79,28 @@ fn vector_build_wait_parses_from_the_config_file() {
     assert_eq!(c.vector_build_wait_ms, Some(1500));
 }
 
+/// The change-stream pacing is a config-file setting; zero is refused at
+/// parse, since a zero batch never reads and a zero poll interval spins.
+#[test]
+fn cdc_stream_pacing_parses_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(d.cdc_poll_interval_ms.is_none() && d.cdc_batch_size.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "cdc_poll_interval_ms: 25\ncdc_batch_size: 64\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.cdc_poll_interval_ms.map(|v| v.get()), Some(25));
+    assert_eq!(c.cdc_batch_size.map(|v| v.get()), Some(64));
+
+    for zero in ["cdc_poll_interval_ms: 0\n", "cdc_batch_size: 0\n"] {
+        std::fs::write(&path, zero).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "accepted {zero:?}"
+        );
+    }
+}
+
 #[test]
 fn cli_overrides_beat_the_config_file() {
     // The CLI carries only bootstrap-critical knobs now; a fine tunable

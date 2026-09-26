@@ -11,8 +11,8 @@
 //!
 //! So the command line overrides the config file, which overrides the defaults.
 //!
-//! Not every knob gets a CLI flag. Per CLAUDE.md "Configuration Surface", the
-//! CLI carries only bootstrap-critical settings (bind addresses, node id, data
+//! Not every knob gets a CLI flag. The CLI carries only bootstrap-critical
+//! settings (bind addresses, node id, data
 //! dir, mode, peers, `--config`) — the argv length is OS-bounded (`ARG_MAX`).
 //! Fine tunables live in the YAML config file only: add such a knob to
 //! `ServerConfig` (+ its default) and the packaged `coordinode.conf`, and skip
@@ -20,6 +20,7 @@
 //! bootstrap-critical ones) is the one added in all three places.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use serde::Deserialize;
@@ -148,6 +149,12 @@ pub struct ServerConfig {
     /// floor before it is TTL-reclaimed; connected readers heartbeat each poll
     /// and are never evicted.
     pub cdc_consumer_ttl_secs: Option<u64>,
+    /// How often an idle CDC change stream polls for newly applied entries,
+    /// in ms (`None` = 100): the delivery latency of an idle stream and its
+    /// heartbeat period, so it must stay below `cdc_consumer_ttl_secs`.
+    pub cdc_poll_interval_ms: Option<NonZeroU64>,
+    /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
+    pub cdc_batch_size: Option<NonZeroUsize>,
     /// Interactive-transaction idle timeout in seconds (ADR-042).
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction (ADR-042).
@@ -192,8 +199,7 @@ pub struct ServerConfig {
     /// Number of recent checkpoints to retain; older ones are pruned. Default 3.
     pub checkpoint_keep: usize,
     // ── AFTER COMMIT trigger dispatch (R192) ─────────────────────────────────
-    // Fine tunables: config-file only (NOT CLI — see CLAUDE.md "Configuration
-    // Surface"). The first three also have a runtime seam
+    // Fine tunables: config-file only, no CLI flag. The first three also have a runtime seam
     // (`Database::set_trigger_dispatch_config`) the future `setParameters` admin
     // command drives; `trigger_dispatch_interval_ms` is restart-only.
     /// AFTER COMMIT trigger cascade-depth cap (the trigger architecture L1). An
@@ -256,6 +262,8 @@ impl Default for ServerConfig {
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
             cdc_consumer_ttl_secs: None,
+            cdc_poll_interval_ms: None,
+            cdc_batch_size: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             wire_compression_level: 3,

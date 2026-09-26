@@ -8,6 +8,7 @@
 //! In embedded mode (no Raft) nothing is applied from a Raft log and the
 //! stream is empty — no error.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,6 +57,8 @@ pub struct ChangeEventServiceImpl {
     consumer_ttl_ms: u64,
     /// Bound of the entries a stream may send.
     applied: AppliedFrontier,
+    /// Read pacing of every stream.
+    tuning: CdcStreamTuning,
 }
 
 impl ChangeEventServiceImpl {
@@ -75,7 +78,14 @@ impl ChangeEventServiceImpl {
             next_consumer: Arc::new(AtomicU64::new(0)),
             consumer_ttl_ms,
             applied,
+            tuning: CdcStreamTuning::default(),
         }
+    }
+
+    /// The same service pacing its streams by `tuning`.
+    pub fn with_tuning(mut self, tuning: CdcStreamTuning) -> Self {
+        self.tuning = tuning;
+        self
     }
 
     /// A service streaming shard 0's Raft log of `node`, whose store is
@@ -101,17 +111,56 @@ impl ChangeEventServiceImpl {
     }
 }
 
-/// Default TTL for a CDC consumer registration (`--cdc-consumer-ttl-secs`,
-/// 30s). The stream heartbeats every poll (`POLL_INTERVAL`), so a
-/// connected-but-idle reader is never evicted; a reader that vanishes without
-/// unregistering (crash) is reclaimed after this.
+/// Default TTL for a CDC consumer registration (`cdc_consumer_ttl_secs`,
+/// 30s). The stream heartbeats every poll ([`CdcStreamTuning::poll_interval`]),
+/// so a connected-but-idle reader is never evicted; a reader that vanishes
+/// without unregistering (crash) is reclaimed after this.
 pub const DEFAULT_CONSUMER_TTL_MS: u64 = 30_000;
 
-/// How long to sleep between polls when caught up to the last applied entry.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How a change stream paces its reads (`cdc_poll_interval_ms`,
+/// `cdc_batch_size`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdcStreamTuning {
+    /// Wait between polls once caught up to the last applied entry: the
+    /// delivery latency of an idle stream, and its heartbeat period.
+    pub poll_interval: Duration,
+    /// Most entries read and sent per poll (back-pressure).
+    pub batch_size: NonZeroUsize,
+}
 
-/// Maximum entries streamed per poll iteration (back-pressure).
-const BATCH_SIZE: usize = 256;
+impl Default for CdcStreamTuning {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(100),
+            batch_size: const {
+                match NonZeroUsize::new(256) {
+                    Some(n) => n,
+                    None => unreachable!(),
+                }
+            },
+        }
+    }
+}
+
+impl CdcStreamTuning {
+    /// Check the tuning against the consumer TTL.
+    ///
+    /// # Errors
+    ///
+    /// The poll interval is not shorter than `consumer_ttl_ms`: an idle stream
+    /// heartbeats once per poll, so its registration would expire and release
+    /// the oplog it still reads.
+    pub fn check(&self, consumer_ttl_ms: u64) -> Result<(), String> {
+        if self.poll_interval >= Duration::from_millis(consumer_ttl_ms) {
+            return Err(format!(
+                "cdc_poll_interval_ms ({} ms) must be shorter than cdc_consumer_ttl_secs \
+                 ({consumer_ttl_ms} ms): an idle change stream heartbeats once per poll",
+                self.poll_interval.as_millis()
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[tonic::async_trait]
 impl ChangeStreamService for ChangeEventServiceImpl {
@@ -166,6 +215,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
         let registry = self.registry.clone();
         let applied = Arc::clone(&self.applied);
+        let tuning = self.tuning;
         tokio::spawn(async move {
             'stream: loop {
                 // Client cancelled (channel closed).
@@ -185,7 +235,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 }
 
                 let read_from = tailer.next_index();
-                let batch = match tailer.read_next(BATCH_SIZE, &filters, applied()) {
+                let batch = match tailer.read_next(tuning.batch_size.get(), &filters, applied()) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
@@ -195,11 +245,21 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 let caught_up = batch.is_empty();
 
                 for (entry, token) in batch {
-                    let event = oplog_entry_to_proto(entry, token);
-                    if tx.send(Ok(event)).await.is_err() {
-                        // Client disconnected mid-batch.
-                        break 'stream;
-                    }
+                    // A slow reader leaves no room in the channel; keep its
+                    // registration alive while waiting, as an idle poll does.
+                    let permit = loop {
+                        match tokio::time::timeout(tuning.poll_interval, tx.reserve()).await {
+                            Ok(Ok(permit)) => break permit,
+                            // Client disconnected mid-batch.
+                            Ok(Err(_)) => break 'stream,
+                            Err(_) => {
+                                if let Err(e) = registry.heartbeat(&handle) {
+                                    tracing::warn!(error = %e, "change stream heartbeat failed");
+                                }
+                            }
+                        }
+                    };
+                    permit.send(Ok(oplog_entry_to_proto(entry, token)));
                 }
                 // Advance the retention floor past everything read, the
                 // entries the filters dropped included: a stream whose filters
@@ -217,7 +277,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                     if let Err(e) = registry.heartbeat(&handle) {
                         tracing::warn!(error = %e, "change stream heartbeat failed");
                     }
-                    tokio::time::sleep(POLL_INTERVAL).await;
+                    tokio::time::sleep(tuning.poll_interval).await;
                 }
             }
 
