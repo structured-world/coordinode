@@ -629,7 +629,7 @@ pub(crate) async fn serve(
         std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
     ));
 
-    // Interactive-transaction tunables (ADR-042). Always resolved (the
+    // Interactive-transaction tunables. Always resolved (the
     // config gate carries the built-in defaults: 30s idle timeout,
     // 256 MiB buffered-write ceiling per open transaction).
     {
@@ -638,7 +638,7 @@ pub(crate) async fn serve(
             interactive_txn_idle_timeout_secs,
         ));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
-        // AFTER COMMIT trigger dispatch knobs (R192) from the config file.
+        // AFTER COMMIT trigger dispatch knobs from the config file.
         // The same setter is the runtime `setParameters` seam.
         db.set_trigger_dispatch_config(trigger_dispatch_cfg);
         // Let SHOW SESSIONS / SHOW TRANSACTIONS read the live registry.
@@ -657,21 +657,15 @@ pub(crate) async fn serve(
         }
     }
 
-    // Idle reaper: periodically drop interactive transactions left
+    // Idle reaper: periodically roll back interactive transactions left
     // untouched past the idle timeout, so an abandoned client cannot pin
-    // a transaction (and its snapshot) forever. The countdown surfaced by
-    // SHOW TRANSACTIONS hits zero exactly when a transaction is reaped
-    // here.
-    {
-        let reaper_registry = Arc::clone(&session_registry);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                tick.tick().await;
-                let _ = reaper_registry.reap_idle();
-            }
-        });
-    }
+    // a transaction (and its snapshot) forever.
+    crate::txn_reaper::spawn(
+        Arc::clone(&database),
+        Arc::clone(&session_registry),
+        std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
+        std::time::Duration::from_secs(1),
+    );
 
     // Per-shard consumer-retention registry (ADR-028). Once CDC / backup
     // consumers register, it holds older MVCC versions / oplog segments
