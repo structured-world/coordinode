@@ -117,6 +117,13 @@ impl BuildToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Ask the build to stop, for a test driving a build without the thread
+    /// the registry would own.
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl VectorIndexRegistry {
@@ -183,6 +190,24 @@ impl VectorIndexRegistry {
     ///
     /// Uses interior mutability — safe to call via `&self`.
     pub fn register_with_tier(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) {
+        self.insert_index(def, tier, HealthSignal::new_ready());
+    }
+
+    /// [`Self::register_with_tier`] for an index a build is about to fill:
+    /// published already rebuilding, so neither a reader nor a writer ever
+    /// takes the empty graph for a finished one.
+    pub fn register_for_build(&self, def: IndexDefinition, tier: Option<VectorTierHandle>) {
+        let health = HealthSignal::new_ready();
+        health.report_rebuild_progress(0.0, 0);
+        self.insert_index(def, tier, health);
+    }
+
+    fn insert_index(
+        &self,
+        def: IndexDefinition,
+        tier: Option<VectorTierHandle>,
+        health: Arc<HealthSignal>,
+    ) {
         let Some(config) = def.vector_config.as_ref() else {
             tracing::error!(
                 "register called with non-vector IndexDefinition: {}",
@@ -206,7 +231,7 @@ impl VectorIndexRegistry {
         self.health
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), HealthSignal::new_ready());
+            .insert(key.clone(), health);
         self.definitions
             .write()
             .unwrap_or_else(|e| e.into_inner())

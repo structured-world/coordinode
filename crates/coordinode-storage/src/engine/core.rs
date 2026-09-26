@@ -202,6 +202,11 @@ pub struct StorageEngine {
     /// Partition captures taken for copies to other nodes, naming each
     /// one's directory.
     partition_captures: AtomicU64,
+    /// Consumers watching the writes a partition receives (see
+    /// [`Self::tap_writes`]).
+    write_taps: Arc<crate::engine::tap::WriteTaps>,
+    /// The transactions open here (see [`Self::await_transactions_through`]).
+    open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
 }
 
 /// An inclusive `[min, max]` user-key range, as reported by a lossy open
@@ -956,6 +961,8 @@ impl StorageEngine {
             raft_fence: parking_lot::RwLock::new(None),
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
+            write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
+            open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
         })
     }
 
@@ -1838,6 +1845,15 @@ impl StorageEngine {
         self.pin_new_snapshot(|| self.snapshot())
     }
 
+    /// Record a transaction as open until the returned marker drops.
+    /// [`Self::await_transactions_through`] waits for the ones opened before
+    /// a boundary.
+    pub(crate) fn open_transaction(&self) -> crate::engine::open_txns::OpenTransaction {
+        use crate::engine::coordinator::MultiModalCoordinator as _;
+        self.open_transactions
+            .open(|| self.coordinator.current_seqno())
+    }
+
     /// Choose a snapshot that is not behind the present and pin it in the same
     /// step: the latest complete snapshot, or a timestamp freshly allocated
     /// from the clock.
@@ -2082,6 +2098,7 @@ impl StorageEngine {
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
         self.coordinator.put_no_capacity_check(part, key, value)?;
+        self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -2154,6 +2171,7 @@ impl StorageEngine {
     pub fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
         self.coordinator.delete(part, key)?;
+        self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -2171,6 +2189,7 @@ impl StorageEngine {
     /// Not capacity-gated — deleting frees space.
     pub fn remove_range(&self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
         self.coordinator.remove_range(part, start, end)?;
+        self.write_taps.replaced(part);
         if let Some(cache) = &self.tiered_cache {
             cache.clear_partition(part);
         }
@@ -2190,6 +2209,7 @@ impl StorageEngine {
         self.check_partition_capacity(part)?;
         self.coordinator
             .merge_no_capacity_check(part, key, operand)?;
+        self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
         }
@@ -2392,6 +2412,7 @@ impl StorageEngine {
     ) -> StorageResult<()> {
         let tree = self.tree(part)?;
         tree.drop_range(range)?;
+        self.write_taps.replaced(part);
         // Note: tiered cache entries for dropped keys become stale.
         // They will miss on next read (key gone from tree) and naturally evict.
         // Per-partition cache clear is not implemented — drop_range is rare
@@ -2411,6 +2432,7 @@ impl StorageEngine {
     pub fn clear_partition(&self, part: Partition) -> StorageResult<()> {
         let tree = self.tree(part)?;
         tree.clear()?;
+        self.write_taps.replaced(part);
         if let Some(cache) = &self.tiered_cache {
             cache.clear_partition(part);
         }
@@ -2899,6 +2921,99 @@ impl StorageEngine {
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         )
+    }
+
+    /// Open a tap on `partition` and return it with a snapshot: every write
+    /// to the partition is either visible at the snapshot or delivered by
+    /// the tap, whatever timestamp it lands at.
+    ///
+    /// A write finishing before the tap opens is at or below the returned
+    /// seqno. On a Raft store an apply lands at the leader's timestamp,
+    /// which can be above this node's clock until the apply advances it, so
+    /// the snapshot is read while no entry applies.
+    ///
+    /// Pin the snapshot (with [`Self::pin_snapshot_at`]) before reading at
+    /// it. Blocks on a Raft store; call it off the async runtime.
+    ///
+    /// # Errors
+    ///
+    /// The errors of pausing the Raft applies.
+    pub fn tap_writes(
+        &self,
+        partition: Partition,
+    ) -> StorageResult<(crate::engine::tap::WriteTap, lsm_tree::SeqNo)> {
+        let tap = self.write_taps.open(partition);
+        let at = self.tap_snapshot()?;
+        Ok((tap, at))
+    }
+
+    /// Start `tap` over after it reported
+    /// [`Tapped::Replaced`](crate::engine::tap::Tapped::Replaced): discard
+    /// what it holds and return a fresh snapshot with the guarantee of
+    /// [`Self::tap_writes`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of pausing the Raft applies.
+    pub fn rebase_tap(&self, tap: &crate::engine::tap::WriteTap) -> StorageResult<lsm_tree::SeqNo> {
+        tap.reset();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        self.tap_snapshot()
+    }
+
+    fn tap_snapshot(&self) -> StorageResult<lsm_tree::SeqNo> {
+        use crate::engine::coordinator::MultiModalCoordinator as _;
+        let Some(fence) = self.raft_fence() else {
+            return Ok(self.coordinator.snapshot());
+        };
+        let mut at = 0;
+        fence.with_applies_paused(&mut |_, _| {
+            at = self.coordinator.snapshot();
+            Ok(())
+        })?;
+        Ok(at)
+    }
+
+    /// Allocate a seqno and return it: every snapshot taken before this
+    /// call is at or below it, every one taken after is above it. Pair with
+    /// [`Self::await_transactions_through`] to wait for the transactions
+    /// already running when something changed.
+    pub fn snapshot_boundary(&self) -> lsm_tree::SeqNo {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let boundary = self.next_seqno();
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        boundary
+    }
+
+    /// Wait until no transaction opened at or before `boundary` (a value of
+    /// [`Self::snapshot_boundary`]) is still open, polling every `poll`, for
+    /// at most `timeout`. Returns how many are still open when the time ran
+    /// out.
+    ///
+    /// Only transactions are waited for: a long-lived reader (a backup, a
+    /// CDC consumer) writes nothing and is not one.
+    pub fn await_transactions_through(
+        &self,
+        boundary: lsm_tree::SeqNo,
+        poll: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Result<(), usize> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let open = self.open_transactions.open_through(boundary);
+            if open == 0 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(open);
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// The taps open on this engine, for the write paths outside this file.
+    pub(crate) fn write_taps(&self) -> &crate::engine::tap::WriteTaps {
+        &self.write_taps
     }
 
     /// How long a snapshot waits for the commits still landing.

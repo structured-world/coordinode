@@ -71,6 +71,90 @@ fn seed_node_record(engine: &StorageEngine, shard_id: u16, node_id: NodeId, reco
     txn.commit(&ctx).expect("commit node");
 }
 
+/// A reader under the `Block` policy is served as soon as the build hands the
+/// index over. The build then keeps its tap open until every transaction
+/// opened before the handover has ended, the reader's own among them, so a
+/// reader waiting for the persisted `Ready` would wait for itself.
+#[test]
+fn a_blocked_reader_is_served_once_the_build_hands_over() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_with_oracle(
+        &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]),
+        std::sync::Arc::clone(&oracle),
+    )
+    .expect("open engine");
+    let def = crate::index::IndexDefinition::hnsw(
+        "emb",
+        "Doc",
+        "embedding",
+        crate::index::VectorIndexConfig {
+            dimensions: 3,
+            metric: coordinode_core::graph::types::VectorMetric::Cosine,
+            m: 16,
+            ef_construction: 200,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+            offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
+        },
+    );
+    crate::index::ops::save_index_definition(&engine, &def).expect("persist definition");
+    crate::index::ops::save_index_state(
+        &engine,
+        "emb",
+        IndexState::Building {
+            written: 0,
+            estimated_total: 0,
+        },
+    )
+    .expect("persist building");
+    let registry = crate::index::VectorIndexRegistry::new();
+    registry.register_for_build(def, None);
+    let hnsw = registry.get("Doc", "embedding").expect("hnsw");
+    let health = registry.health_handle("Doc", "embedding").expect("health");
+    let field = FieldInterner::new().intern("embedding");
+    let token = registry.new_build_token();
+
+    // The reader's statement is running, its transaction open.
+    let reader = coordinode_storage::engine::transaction::Transaction::begin(
+        &engine,
+        Some(&oracle),
+        oracle.next(),
+    );
+    std::thread::scope(|scope| {
+        let build = scope.spawn(|| {
+            crate::index::VectorBuild {
+                engine: &engine,
+                token: &token,
+                shard_id: 0,
+                targets: &[crate::index::BuildTarget {
+                    hnsw: hnsw.as_ref(),
+                    health: health.as_ref(),
+                    label: "Doc",
+                    field_id: field,
+                }],
+            }
+            .run()
+        });
+        let started = std::time::Instant::now();
+        gate_vector_index_read(&engine, &registry, "Doc", "embedding")
+            .expect("the reader is served once the index is handed over");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "served at the handover, not after a timeout"
+        );
+        drop(reader);
+        build.join().expect("build thread").expect("build");
+    });
+}
+
 /// Commit a temporal node version in its own MVCC transaction.
 fn seed_node_temporal(
     engine: &StorageEngine,

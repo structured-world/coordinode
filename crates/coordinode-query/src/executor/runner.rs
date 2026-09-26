@@ -8601,9 +8601,28 @@ fn gate_vector_index_read(
     // to backfill completion that happened after registry registration.
     // Block polls until the backfill completes (matching the legacy
     // synchronous-build semantic), Offline returns an error immediately.
+    //
+    // This node's own graph is what the read uses, and its health turns
+    // ready when the build hands maintenance to the writers. The persisted
+    // state lags behind that: the build then keeps folding in the writes of
+    // the transactions opened before the handover, this one among them, so a
+    // reader waiting for the persisted state would wait for itself.
+    let local = registry.health_handle(label, property);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let poll_step = std::time::Duration::from_millis(25);
     loop {
+        if let Some(health) = &local {
+            let state = health.snapshot();
+            if state.is_ready() {
+                return Ok(());
+            }
+            if state.is_offline() {
+                return Err(ExecutionError::Unsupported(format!(
+                    "vector index '{}' failed to build on this node",
+                    def.name
+                )));
+            }
+        }
         let live_state = crate::index::ops::load_index_definition(engine, &def.name)
             .ok()
             .flatten()
@@ -15523,7 +15542,7 @@ fn execute_create_vector_index(
     let label_id = ctx.interner.intern(label);
     let property_id = ctx.interner.intern(property);
     let tier = registry.tier_handle(label_id, property_id);
-    registry.register_with_tier(def.clone(), tier);
+    registry.register_for_build(def.clone(), tier);
 
     let field_id = ctx.interner.lookup(property);
     let shard_id = ctx.shard_id;
@@ -15565,73 +15584,30 @@ fn execute_create_vector_index(
                         "vector index '{name}' has no health signal to publish build progress on"
                     ))
                 })?;
-                // Published before the thread exists: from here writers leave
-                // this index to the build, so there is no window in which a
-                // write is neither applied by a writer nor owned by a drain.
-                health.report_rebuild_progress(0.0, 0);
 
                 let thread = std::thread::Builder::new()
                     .name(format!("vec-backfill-{name}"))
                     .spawn(move || {
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                // Scan phase, then drain: the scan covers
-                                // history as of its start, the drain folds in
-                                // everything written since, repeating until it
-                                // has nothing left to fold. Only then does the
-                                // index count as built.
-                                let start_seqno = engine.current_seqno();
-                                let scanned = backfill_vector_index(
-                                    engine.as_ref(),
-                                    hnsw.as_ref(),
-                                    health.as_ref(),
-                                    &build_token,
-                                    &label_owned,
-                                    fid,
+                                crate::index::VectorBuild {
+                                    engine: engine.as_ref(),
+                                    token: &build_token,
                                     shard_id,
-                                )?;
-                                if matches!(scanned, BackfillOutcome::Cancelled) {
-                                    return Ok(scanned);
+                                    targets: &[crate::index::BuildTarget {
+                                        hnsw: hnsw.as_ref(),
+                                        health: health.as_ref(),
+                                        label: &label_owned,
+                                        field_id: fid,
+                                    }],
                                 }
-                                let watermark = drain_vector_index(
-                                    engine.as_ref(),
-                                    hnsw.as_ref(),
-                                    health.as_ref(),
-                                    &build_token,
-                                    &label_owned,
-                                    fid,
-                                    start_seqno,
-                                )?;
-                                if build_token.is_cancelled() {
-                                    return Ok(BackfillOutcome::Cancelled);
-                                }
-                                // Hand maintenance back to the writers BEFORE
-                                // the last pass, then drain once more from the
-                                // watermark that pass started at. A write
-                                // landing in between is therefore either
-                                // folded by the pass or applied by the writer,
-                                // and a vector covered twice costs nothing:
-                                // an insert of a known id is an upsert. Doing
-                                // it the other way round would leave exactly
-                                // that window unowned.
-                                health.mark_ready();
-                                let watermark = drain_vector_index(
-                                    engine.as_ref(),
-                                    hnsw.as_ref(),
-                                    health.as_ref(),
-                                    &build_token,
-                                    &label_owned,
-                                    fid,
-                                    watermark,
-                                )?;
-                                health.advance_indexed_hlc(watermark);
-                                Ok(scanned)
+                                .run()
                             }));
                         let terminal = match outcome {
-                            Ok(Ok(BackfillOutcome::Complete { written })) => {
+                            Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
                                 tracing::info!(
                                     index = %name_owned,
-                                    written,
+                                    scanned,
                                     "vector index backfill complete"
                                 );
                                 IndexState::Ready
@@ -15641,7 +15617,7 @@ fn execute_create_vector_index(
                             // state or progress — would land under their
                             // statement and conflict with a write they never
                             // saw. They own the index from here.
-                            Ok(Ok(BackfillOutcome::Cancelled)) => return,
+                            Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
                             Ok(Err(e)) => IndexState::Failed { reason: e },
                             Err(panic) => {
                                 let reason = panic
@@ -15670,7 +15646,12 @@ fn execute_create_vector_index(
                 (initial_state, 0)
             }
             _ => {
-                // Synchronous fallback (legacy path / tests).
+                // Synchronous fallback (legacy path / tests): the statement
+                // inserts through the writer path, which a rebuilding index
+                // leaves to a build, so the index is handed over first.
+                if let Some(health) = registry.health_handle(label, property) {
+                    health.mark_ready();
+                }
                 let written = match field_id {
                     Some(fid) => {
                         run_backfill_sync(ctx.engine, registry, label, property, fid, shard_id)
@@ -15726,179 +15707,6 @@ fn run_backfill_sync(
         },
     );
     backfilled
-}
-
-/// Background backfill: same scan + extract + insert as the sync path,
-/// but writes directly into the cloned HNSW handle without going through
-/// the registry (registry isn't Arc-shared, but the handle is). Persists
-/// progress every PROGRESS_INTERVAL nodes so a crash mid-build resumes
-/// from the last checkpoint instead of starting over.
-/// How a backfill ended: it finished the shard, or it was asked to stop.
-enum BackfillOutcome {
-    /// Scanned the whole shard; `written` vectors went into the graph.
-    Complete { written: u64 },
-    /// Stopped early on a cancellation. The graph keeps whatever was already
-    /// inserted — HNSW insert is an upsert, so a later build re-covers the
-    /// same nodes without duplicating them.
-    Cancelled,
-}
-
-/// Scan a shard and insert every vector of `(label, property)` into `hnsw`.
-///
-/// Progress is published to the index's [`HealthSignal`], never to the
-/// persisted definition: the definition key belongs to DDL, and a background
-/// writer on it turns any later statement touching that index into a write
-/// conflict against a write the statement could not have seen. The signal is
-/// atomic and lock-free, which is also what lets the search path read progress
-/// without contending with the build.
-///
-/// The denominator behind `progress` is the partition's approximate item
-/// count, so the fraction is an under-estimate that snaps to 1.0 at the end —
-/// honest for a progress bar, never a row count.
-fn backfill_vector_index(
-    engine: &StorageEngine,
-    hnsw: &std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>,
-    health: &coordinode_vector::health::HealthSignal,
-    token: &crate::index::BuildToken,
-    label: &str,
-    field_id: u32,
-    shard_id: u16,
-) -> std::result::Result<BackfillOutcome, String> {
-    const PROGRESS_INTERVAL: u64 = 1000;
-
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let started = std::time::Instant::now();
-    // Upper bound over every version and tombstone the levels hold, for the
-    // whole partition rather than this label — deliberately generous, since a
-    // progress bar that overshoots and stalls at 100% reads as a hang.
-    let estimated_total = LocalNodeStore.approximate_count(engine).unwrap_or(0).max(1) as f64;
-    let mut written = 0u64;
-    let mut since_checkpoint = 0u64;
-    let mut scanned = 0u64;
-    let mut cancelled = false;
-    LocalNodeStore
-        .for_each_in_shard_at_snapshot(engine, None, shard_id, &mut |node_id, _key, record| {
-            scanned += 1;
-            if record.primary_label() == label {
-                if let Some(val) = record.props.get(&field_id) {
-                    if let Some(vec_data) = try_extract_vector(val) {
-                        if let Ok(mut graph) = hnsw.write() {
-                            graph.insert(node_id.as_raw(), vec_data);
-                        }
-                        written += 1;
-                    }
-                }
-            }
-            since_checkpoint += 1;
-            if since_checkpoint >= PROGRESS_INTERVAL {
-                since_checkpoint = 0;
-                if token.is_cancelled() {
-                    cancelled = true;
-                    return Ok(std::ops::ControlFlow::Break(()));
-                }
-                let fraction = ((scanned as f64) / estimated_total).min(0.99) as f32;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                let eta_ms = if fraction > 0.0 {
-                    ((elapsed_ms as f64) * ((1.0 - fraction as f64) / fraction as f64)) as u64
-                } else {
-                    0
-                };
-                health.report_rebuild_progress(fraction, eta_ms);
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        })
-        .map_err(|e| format!("shard scan: {e}"))?;
-    if cancelled || token.is_cancelled() {
-        return Ok(BackfillOutcome::Cancelled);
-    }
-    Ok(BackfillOutcome::Complete { written })
-}
-
-/// Fold every write that landed since `since_seqno` into the index, repeating
-/// until there is nothing left to fold.
-///
-/// This is the drain phase of the scan-drain-commit build. MongoDB needs a
-/// side-writes table for it because WiredTiger cannot enumerate what changed
-/// since a point; our LSM can, so storage IS the side-writes table and
-/// `changed_keys_since` is the drain's input.
-///
-/// Each candidate is reconciled rather than merely inserted: membership can be
-/// LOST while the node lives (its vector property removed, its label changed),
-/// and that is decidable from the current record alone, so no before-image is
-/// needed. A node that is still a member is upserted; one that is not is
-/// counted as a tombstone and left in the graph, which is what every engine in
-/// this space does — physical removal from an HNSW is a rebuild, not an
-/// operation, and correctness at read comes from re-validating the candidate.
-///
-/// Returns the watermark reached, so the caller can hand it to the steady-state
-/// maintainer.
-fn drain_vector_index(
-    engine: &StorageEngine,
-    hnsw: &std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>,
-    health: &coordinode_vector::health::HealthSignal,
-    token: &crate::index::BuildToken,
-    label: &str,
-    field_id: u32,
-    since_seqno: u64,
-) -> std::result::Result<u64, String> {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-
-    let mut watermark = since_seqno;
-    loop {
-        if token.is_cancelled() {
-            return Ok(watermark);
-        }
-        // Read the watermark BEFORE collecting, so a write racing this pass is
-        // caught by the next one instead of falling between two passes.
-        let next_watermark = engine.current_seqno();
-        let changed = LocalNodeStore
-            .changed_since(engine, watermark)
-            .map_err(|e| format!("drain scan: {e}"))?;
-        if changed.is_empty() {
-            return Ok(next_watermark);
-        }
-
-        // Group by shard so each group resolves through one batched multi_get
-        // rather than a lookup per candidate.
-        let mut by_shard: std::collections::HashMap<
-            u16,
-            Vec<coordinode_core::graph::node::NodeId>,
-        > = std::collections::HashMap::new();
-        for (shard, node_id) in changed {
-            by_shard.entry(shard).or_default().push(node_id);
-        }
-
-        let read_txn = coordinode_storage::engine::transaction::Transaction::new(
-            engine,
-            None,
-            coordinode_core::txn::timestamp::Timestamp::ZERO,
-            None,
-        );
-        let mut batch: Vec<(u64, Vec<f32>)> = Vec::new();
-        for (shard, ids) in by_shard {
-            let records = LocalNodeStore
-                .get_many(&read_txn, shard, &ids)
-                .map_err(|e| format!("drain read: {e}"))?;
-            for (node_id, record) in ids.iter().zip(records) {
-                let member = record
-                    .filter(|r| r.primary_label() == label)
-                    .and_then(|r| r.props.get(&field_id).and_then(try_extract_vector));
-                match member {
-                    Some(vec_data) => batch.push((node_id.as_raw(), vec_data)),
-                    // Deleted, relabelled, or stripped of its vector: the
-                    // graph keeps the stale entry and the read path filters
-                    // it, the same trade every HNSW in this space makes.
-                    None => health.record_tombstone(),
-                }
-            }
-        }
-        if !batch.is_empty() {
-            if let Ok(mut graph) = hnsw.write() {
-                graph.insert_batch(batch);
-            }
-        }
-        watermark = next_watermark;
-    }
 }
 
 /// Execute `DROP VECTOR INDEX idx`: removes an HNSW vector index by name.

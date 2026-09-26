@@ -40,6 +40,7 @@ use crate::engine::StorageSnapshot;
 use crate::engine::coordinator::{MultiModalCoordinator, OccScope, SnapshotPin};
 use crate::engine::core::StorageEngine;
 use crate::engine::merge::{encode_add_batch, encode_counter_delta, encode_remove};
+use crate::engine::open_txns::OpenTransaction;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 
@@ -280,6 +281,10 @@ pub struct Transaction<'a> {
     /// snapshot but after the reads, so validating from the snapshot alone
     /// would forgive exactly the writes this transaction missed.
     validate_from: Option<StorageSnapshot>,
+    /// This transaction's entry among the engine's open transactions, from
+    /// creation until its last state drops. `None` only once
+    /// [`Self::take_state`] has moved it to the parked state.
+    open: Option<OpenTransaction>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -311,6 +316,8 @@ pub struct TransactionState {
     schema_changed: bool,
     snapshot_pin: Option<SnapshotPin>,
     validate_from: Option<StorageSnapshot>,
+    /// Parked with the rest: the transaction stays open between statements.
+    open: Option<OpenTransaction>,
 }
 
 /// One staged adjacency operand. Kept as a sequence rather than as two sets
@@ -459,6 +466,7 @@ impl<'a> Transaction<'a> {
             schema_changed: false,
             snapshot_pin,
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
+            open: Some(engine.open_transaction()),
         }
     }
 
@@ -507,6 +515,7 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: self.merge_counter_deltas,
             snapshot_pin: self.snapshot_pin,
             validate_from: self.validate_from,
+            open: self.open,
         }
     }
 
@@ -533,6 +542,7 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: std::mem::take(&mut self.merge_counter_deltas),
             snapshot_pin: self.snapshot_pin.take(),
             validate_from: self.validate_from,
+            open: self.open.take(),
         }
     }
 
@@ -564,6 +574,7 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: state.merge_counter_deltas,
             snapshot_pin: state.snapshot_pin,
             validate_from: state.validate_from,
+            open: state.open,
         }
     }
 

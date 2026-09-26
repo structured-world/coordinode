@@ -208,6 +208,16 @@ const SCHEMA_KEY_FIELD_INTERNER: &[u8] = b"meta:field_interner";
 /// keep resolving; the single definition lives in `coordinode-core`.
 pub(crate) use coordinode_core::graph::types::try_extract_vector;
 
+/// How a set of vector indexes is populated once registered.
+#[derive(Debug, Clone, Copy)]
+enum PopulateMode {
+    /// Until whole, before the database serves anything: the open path.
+    Blocking,
+    /// One background build per index, owned by the registry: a replica
+    /// bringing up an index another member defined, from the async runtime.
+    Background,
+}
+
 /// One-line human description of a vector index's serving health, for EXPLAIN
 /// output.
 fn describe_index_health(state: &coordinode_vector::health::IndexHealthState) -> String {
@@ -1128,7 +1138,8 @@ impl Database {
         // touches a shared interner lock and stays reentrancy-safe.
         let registry =
             coordinode_query::index::VectorIndexRegistry::with_vector_tier(engine.clone());
-        let engine = engine.as_ref();
+        let engine_arc = engine;
+        let engine = engine_arc.as_ref();
 
         // Step 1: Scan schema:idx:* for HNSW index definitions.
         let iter = match engine.prefix_scan(Partition::Schema, b"schema:idx:") {
@@ -1157,7 +1168,14 @@ impl Database {
             return registry;
         }
 
-        Self::register_and_populate_hnsw(&registry, interner_arc, engine, shard_id, &hnsw_defs);
+        Self::register_and_populate_hnsw(
+            &registry,
+            interner_arc,
+            &engine_arc,
+            shard_id,
+            &hnsw_defs,
+            PopulateMode::Blocking,
+        );
         registry
     }
 
@@ -1185,132 +1203,122 @@ impl Database {
             &self.engine,
             self.shard_id,
             &new_defs,
+            PopulateMode::Background,
         );
         Ok(new_defs.len())
     }
 
-    /// Register the given HNSW definitions in `registry` and populate
-    /// them by scanning stored node records (shared by the open-time
-    /// loader and the cluster refresh path).
+    /// Register the given HNSW definitions in `registry` and build them
+    /// beside whatever writes are landing (shared by the open-time loader
+    /// and the cluster refresh path).
+    ///
+    /// On open the build blocks until the indexes are whole, one scan for
+    /// all of them. A replica bringing up an index another member defined
+    /// builds each one in the background, owned by the registry so a drop
+    /// cancels it; the caller runs on the async runtime and must not block.
     fn register_and_populate_hnsw(
         registry: &coordinode_query::index::VectorIndexRegistry,
         interner_arc: &Arc<RwLock<FieldInterner>>,
-        engine: &StorageEngine,
+        engine: &Arc<StorageEngine>,
         shard_id: u16,
         hnsw_defs: &[coordinode_query::index::IndexDefinition],
+        mode: PopulateMode,
     ) {
-        use coordinode_core::graph::node::NodeRecord;
-
-        // Step 2: Resolve (label, property) → interned ids in one short
+        // Resolve (label, property) → interned ids in one short
         // write-locked pass, build per-index tier handles, then register
-        // each HNSW with its tier bound. Lock scope is the for-loop body
-        // only; released before step 3's read pass.
+        // each HNSW with its tier bound.
+        let mut field_ids = Vec::with_capacity(hnsw_defs.len());
         {
             let mut g = interner_arc.write();
             for def in hnsw_defs {
                 let label_id = g.intern(&def.label);
                 let property_id = g.intern(def.property());
                 let tier = registry.tier_handle(label_id, property_id);
-                registry.register_with_tier(def.clone(), tier);
+                registry.register_for_build(def.clone(), tier);
+                field_ids.push(property_id);
             }
         }
 
-        // Step 3: Scan node: partition once, populating all HNSW indexes.
-        // Build a lookup: label → [(property, label)] for efficient matching.
-        let mut label_props: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for def in hnsw_defs {
-            label_props
-                .entry(def.label.clone())
-                .or_default()
-                .push(def.property().to_string());
+        let mut members = Vec::with_capacity(hnsw_defs.len());
+        for (def, field_id) in hnsw_defs.iter().zip(field_ids) {
+            let (Some(hnsw), Some(health)) = (
+                registry.get(&def.label, def.property()),
+                registry.health_handle(&def.label, def.property()),
+            ) else {
+                tracing::warn!(index = %def.name, "registered vector index has no graph to build");
+                continue;
+            };
+            members.push((def, field_id, hnsw, health));
         }
 
-        let node_prefix = {
-            let mut p = Vec::with_capacity(5 + 2 + 1);
-            p.extend_from_slice(b"node:");
-            p.extend_from_slice(&shard_id.to_be_bytes());
-            p.push(b':');
-            p
-        };
-
-        let node_iter = match engine.prefix_scan(Partition::Node, &node_prefix) {
-            Ok(it) => it,
-            Err(e) => {
-                tracing::warn!("failed to scan nodes for HNSW rebuild: {e}");
-                return;
-            }
-        };
-
-        // Track per-index vector counts for structured logging.
-        let mut per_index_counts: std::collections::HashMap<(String, String), usize> =
-            std::collections::HashMap::new();
-
-        // Step 3 takes the read guard for property-id lookups. Safe to
-        // co-exist with previous step because the write guard from
-        // step 2 was released at the end of its block scope above.
-        let interner = interner_arc.read();
-
-        for guard in node_iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-
-            // Check if this node's label has any vector indexes.
-            let primary_label = record.primary_label();
-            let Some(props) = label_props.get(primary_label) else {
-                continue;
-            };
-
-            // Decode node ID from key.
-            let node_id = match coordinode_core::graph::node::decode_node_key(&_key) {
-                Some((_shard, nid)) => nid,
-                None => continue,
-            };
-
-            // Extract each indexed vector property.
-            for prop_name in props {
-                if let Some(field_id) = interner.lookup(prop_name) {
-                    if let Some(value) = record.props.get(&field_id) {
-                        if let Some(vec_data) = try_extract_vector(value) {
-                            registry.on_vector_written(
-                                primary_label,
-                                node_id,
-                                prop_name,
-                                &vec_data,
-                            );
-                            *per_index_counts
-                                .entry((primary_label.to_string(), prop_name.clone()))
-                                .or_insert(0) += 1;
+        match mode {
+            PopulateMode::Blocking => {
+                let targets: Vec<coordinode_query::index::BuildTarget<'_>> = members
+                    .iter()
+                    .map(
+                        |(def, field_id, hnsw, health)| coordinode_query::index::BuildTarget {
+                            hnsw: hnsw.as_ref(),
+                            health: health.as_ref(),
+                            label: &def.label,
+                            field_id: *field_id,
+                        },
+                    )
+                    .collect();
+                let token = registry.new_build_token();
+                // On its own thread: the build may pause the Raft applies,
+                // which blocks, and the caller can be on the async runtime.
+                let outcome = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            coordinode_query::index::VectorBuild {
+                                engine,
+                                token: &token,
+                                shard_id,
+                                targets: &targets,
+                            }
+                            .run()
+                        })
+                        .join()
+                });
+                match outcome {
+                    Ok(Ok(outcome)) => tracing::info!(
+                        indexes = targets.len(),
+                        ?outcome,
+                        "rebuilt HNSW indexes on open"
+                    ),
+                    Ok(Err(reason)) => {
+                        for (def, _, _, health) in &members {
+                            tracing::warn!(index = %def.name, %reason, "HNSW rebuild on open failed");
+                            health.mark_offline(reason.clone());
                         }
+                        return;
+                    }
+                    Err(_) => {
+                        for (def, _, _, health) in &members {
+                            tracing::warn!(index = %def.name, "HNSW rebuild on open panicked");
+                            health.mark_offline("panic in the rebuild on open".to_string());
+                        }
+                        return;
                     }
                 }
             }
+            PopulateMode::Background => {
+                for (def, field_id, hnsw, health) in members {
+                    Self::spawn_replica_build(
+                        registry, engine, shard_id, def, field_id, hnsw, health,
+                    );
+                }
+                return;
+            }
         }
 
-        // Log per-index rebuild counts for observability.
         for def in hnsw_defs {
-            let count = per_index_counts
-                .get(&(def.label.clone(), def.property().to_string()))
-                .copied()
-                .unwrap_or(0);
-            tracing::info!(
-                index = %def.name,
-                label = %def.label,
-                property = %def.property(),
-                vectors = count,
-                "rebuilt HNSW index on reopen"
-            );
-
             // Crash-recovery cleanup: a backfill that was interrupted (state
             // == Building) or that aborted (state == Failed) leaves stale
-            // markers in schema. The full-scan rebuild above already
-            // repopulated the in-memory HNSW from every node record, so the
-            // index is consistent with on-disk data; flip the persisted
-            // state back to Ready to match.
+            // markers in schema. The rebuild above repopulated the
+            // in-memory HNSW from every node record, so the index is
+            // consistent with on-disk data; flip the persisted state back to
+            // Ready to match.
             let needs_state_reset =
                 !matches!(def.state, coordinode_query::index::IndexState::Ready);
             if needs_state_reset {
@@ -1341,12 +1349,64 @@ impl Database {
                 );
             }
         }
+    }
 
-        // The eager rebuild folded every node record committed before open
-        // into the in-memory graphs, so each index is current as of the
-        // engine's snapshot seqno. Seed the freshness watermark there; the
-        // oplog-tailing worker advances it further as live writes arrive.
-        registry.advance_indexed_hlc_all(engine.snapshot());
+    /// Build `def` on a replica in the background, the way a `CREATE VECTOR
+    /// INDEX` does on the member that ran it: the registry owns the thread,
+    /// so dropping the index cancels and joins it.
+    fn spawn_replica_build(
+        registry: &coordinode_query::index::VectorIndexRegistry,
+        engine: &Arc<StorageEngine>,
+        shard_id: u16,
+        def: &coordinode_query::index::IndexDefinition,
+        field_id: u32,
+        hnsw: Arc<std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>>,
+        health: Arc<coordinode_vector::health::HealthSignal>,
+    ) {
+        let token = registry.new_build_token();
+        let build_token = token.clone();
+        let engine = Arc::clone(engine);
+        let name = def.name.clone();
+        let label = def.label.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("vec-replica-{name}"))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    coordinode_query::index::VectorBuild {
+                        engine: engine.as_ref(),
+                        token: &build_token,
+                        shard_id,
+                        targets: &[coordinode_query::index::BuildTarget {
+                            hnsw: hnsw.as_ref(),
+                            health: health.as_ref(),
+                            label: &label,
+                            field_id,
+                        }],
+                    }
+                    .run()
+                }));
+                match outcome {
+                    Ok(Ok(outcome)) => {
+                        tracing::info!(index = %name, ?outcome, "vector index built on replica");
+                    }
+                    Ok(Err(reason)) => {
+                        tracing::warn!(index = %name, %reason, "vector index build on replica failed");
+                        health.mark_offline(reason);
+                    }
+                    Err(_) => {
+                        tracing::warn!(index = %name, "vector index build on replica panicked");
+                        health.mark_offline("panic in the replica build".to_string());
+                    }
+                }
+            });
+        match spawned {
+            Ok(thread) => {
+                registry.register_build(&def.name, &def.label, def.property(), &token, thread);
+            }
+            Err(e) => {
+                tracing::warn!(index = %def.name, error = %e, "could not spawn the replica build");
+            }
+        }
     }
 
     /// Load persisted text index definitions from `schema:idx:*` and

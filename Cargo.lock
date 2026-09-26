@@ -1268,6 +1268,7 @@ dependencies = [
  "rayon",
  "rmp-serde",
  "rmpv",
+ "rustc-hash",
  "serde",
  "serde_bytes",
  "serde_json",

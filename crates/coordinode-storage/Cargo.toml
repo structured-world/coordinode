@@ -38,6 +38,9 @@ coordinode-core = { workspace = true }
 # rather than std's ~40-byte futex-backed one.
 parking_lot = { workspace = true }
 
+# Key sets of the write taps: internal keys, no attacker-chosen hash input.
+rustc-hash = { workspace = true }
+
 # LSM engine — permanent fork (ADR-018), crates.io dependency
 lsm-tree = { workspace = true }
 

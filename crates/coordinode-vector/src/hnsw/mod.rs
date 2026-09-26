@@ -1034,6 +1034,11 @@ impl HnswIndex {
         self.nodes.len()
     }
 
+    /// Whether a vector for `id` is in the graph.
+    pub fn contains(&self, id: u64) -> bool {
+        self.id_to_idx.contains_key(&id)
+    }
+
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()

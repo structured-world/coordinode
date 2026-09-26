@@ -562,15 +562,16 @@ impl GcWatermarkController {
     /// Pin the current snapshot seqno so the watermark cannot advance past it
     /// until the returned guard drops. Returns the pinned seqno.
     pub fn pin(self: &Arc<Self>) -> (u64, SnapshotPin) {
-        let seqno = self.seqno.get();
         // The current seqno is never below the watermark, so the pin is
-        // always granted; the fallback exists only to keep the type honest.
-        // Built lazily: an eagerly built guard would drop at once and release
-        // the pin just registered.
-        let pin = self.pin_at(seqno).unwrap_or_else(|| SnapshotPin {
+        // granted without the check: read under the lock that publishes the
+        // watermark, it cannot fall behind a republish either.
+        let mut pins = self.pins.lock();
+        let seqno = self.seqno.get();
+        *pins.entry(seqno).or_insert(0) += 1;
+        let pin = SnapshotPin {
             controller: Arc::clone(self),
             seqno,
-        });
+        };
         (seqno, pin)
     }
 

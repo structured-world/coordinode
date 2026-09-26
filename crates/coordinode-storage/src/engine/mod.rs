@@ -10,12 +10,14 @@ pub mod core;
 pub(crate) mod coverage;
 pub(crate) mod flush;
 pub mod merge;
+pub mod open_txns;
 pub mod oplog_journal;
 pub mod partition;
 pub mod pending;
 pub mod retention_stats;
 pub mod routing;
 pub mod stats;
+pub mod tap;
 pub mod transaction;
 pub mod vector_keys;
 

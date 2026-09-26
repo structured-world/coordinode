@@ -10,6 +10,7 @@ pub mod registry;
 pub mod ttl;
 pub mod ttl_reaper;
 
+pub mod vector_build;
 pub mod vector_registry;
 
 pub mod text_registry;
@@ -25,4 +26,5 @@ pub use ops::{
 };
 pub use registry::{IndexRegistry, UniqueViolation};
 pub use text_registry::TextIndexRegistry;
+pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};
 pub use vector_registry::{BuildToken, VectorIndexRegistry};

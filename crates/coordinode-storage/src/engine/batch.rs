@@ -331,6 +331,7 @@ fn apply_group(
         batch.insert(mark.key().as_slice(), &[][..]);
     }
     tree.apply_batch(batch, seqno)?;
+    engine.write_taps().applied(part, group);
     Ok(())
 }
 
