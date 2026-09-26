@@ -1216,6 +1216,29 @@ impl RaftNode {
             .unwrap_or(0)
     }
 
+    /// One past the last log entry this node has applied, `0` when none.
+    ///
+    /// The exclusive bound for a reader of the Raft log that must see only
+    /// applied entries: the log also holds entries that are not committed
+    /// yet, which a later leader may truncate and replace.
+    pub fn applied_through(&self) -> u64 {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        // The state machine publishes each index as it applies it, before the
+        // proposer hears back; openraft's metrics follow later. Only `0` is
+        // ambiguous there (nothing applied, or entry 0), and the metrics tell.
+        let applied = *self.applied_rx.borrow();
+        if applied > 0 {
+            return applied + 1;
+        }
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map_or(0, |lid| lid.index + 1)
+    }
+
     /// Get the current Raft term.
     pub fn current_term(&self) -> u64 {
         use openraft::async_runtime::watch::WatchReceiver;

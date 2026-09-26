@@ -298,6 +298,39 @@ pub struct LogStore {
     last_purged: Arc<Mutex<Option<LogId>>>,
 }
 
+/// Where a shard's Raft log lives on disk.
+pub struct RaftOplogDirs {
+    /// The directory new segments are written to.
+    pub active: std::path::PathBuf,
+    /// Every directory that may hold segments of the log, `active` among
+    /// them: a change of endpoint routing leaves older segments where they
+    /// were written. Some may not exist.
+    pub all: Vec<std::path::PathBuf>,
+}
+
+/// The directories of `shard_id`'s Raft log: `<endpoint>/oplog/<shard_id>/`
+/// on the oplog endpoint chosen for the shard, and on every other
+/// oplog-eligible endpoint for segments written under an earlier routing.
+///
+/// # Errors
+///
+/// No endpoint is eligible to hold the oplog.
+pub fn raft_oplog_dirs(engine: &StorageEngine, shard_id: u32) -> Result<RaftOplogDirs, io::Error> {
+    let shard_dir = |path: &std::path::Path| path.join("oplog").join(format!("{shard_id}"));
+    let active = shard_dir(
+        &engine
+            .select_oplog_endpoint(shard_id)
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .path,
+    );
+    let all = engine
+        .all_oplog_eligible_endpoints()
+        .iter()
+        .map(|ep| shard_dir(&ep.path))
+        .collect();
+    Ok(RaftOplogDirs { active, all })
+}
+
 impl LogStore {
     /// A shared handle to the Raft oplog manager. Cloned out before the
     /// `LogStore` is moved into `openraft::Raft` so a subsystem (e.g. WAL-replay
@@ -327,21 +360,10 @@ impl LogStore {
         // open one LogStore per shard, each routing to its own
         // select_oplog_endpoint(shard_id).
         let shard_id: u32 = 0;
-        let oplog_endpoint = engine
-            .select_oplog_endpoint(shard_id)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let active_dir = oplog_endpoint
-            .path
-            .join("oplog")
-            .join(format!("{shard_id}"));
-        // Recovery scan dirs: every oplog-eligible endpoint's
-        // oplog/<shard_id>/ directory. Some may not exist yet — open_multi
-        // skips missing dirs without error.
-        let recovery_dirs: Vec<std::path::PathBuf> = engine
-            .all_oplog_eligible_endpoints()
-            .iter()
-            .map(|ep| ep.path.join("oplog").join(format!("{shard_id}")))
-            .collect();
+        let RaftOplogDirs {
+            active: active_dir,
+            all: recovery_dirs,
+        } = raft_oplog_dirs(&engine, shard_id)?;
         let oplog = OplogManager::open_multi(
             &active_dir,
             &recovery_dirs,
@@ -530,9 +552,21 @@ impl LogStore {
         // RaftEntry is always first — oplog_to_entry() relies on ops[0] being RaftEntry.
         ops.insert(0, raft_op);
 
+        // A batched entry commits every proposal; its latest commit
+        // timestamp is the entry's. Membership entries carry none.
+        let ts = match &entry.payload {
+            openraft::entry::EntryPayload::Normal(request) => request
+                .proposals
+                .iter()
+                .map(|p| p.commit_ts.as_raw())
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        };
+
         Ok(OplogEntry {
-            ts: 0,
-            term: 0,
+            ts,
+            term: entry.log_id.committed_leader_id().term,
             index: entry.log_id.index,
             shard: 0,
             ops,

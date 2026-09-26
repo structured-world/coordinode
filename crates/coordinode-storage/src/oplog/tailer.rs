@@ -1,19 +1,20 @@
 //! [`OplogTailer`]: read-only oplog cursor for CDC consumers.
 //!
-//! The tailer reads sealed segment files directly from the oplog directory
-//! without acquiring any lock on the `OplogManager`. Sealed segments are
-//! immutable once written, so concurrent reads are safe.
+//! The tailer reads segment files directly from the oplog directories without
+//! acquiring any lock on the `OplogManager`. Sealed segments are immutable
+//! once written and the active one is read up to its last complete entry,
+//! so concurrent reads are safe.
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
 //! let token = ResumeToken { shard_id: 0, segment_id: 0, entry_offset: 0 };
-//! let mut tailer = OplogTailer::new(&data_dir.join("oplog/0"), token);
+//! let mut tailer = OplogTailer::new(&[data_dir.join("oplog/0")], token)?;
 //!
 //! loop {
-//!     let batch = tailer.read_next(256, &filters)?;
+//!     let batch = tailer.read_next(256, &filters, applied_index + 1)?;
 //!     if batch.is_empty() {
-//!         // Caught up — wait for new sealed segments.
+//!         // Caught up — wait for new entries.
 //!         std::thread::sleep(Duration::from_millis(100));
 //!     } else {
 //!         for (entry, token) in batch {
@@ -26,13 +27,26 @@
 //!
 //! ## Resume token
 //!
-//! [`ResumeToken`] identifies a position as `(segment_id, entry_offset)`:
+//! [`ResumeToken`] names a position as `(segment_id, entry_offset)`:
 //! - `segment_id` = the `first_index` encoded in the filename
 //!   (`oplog-<segment_id:020>.bin`)
 //! - `entry_offset` = number of entries already consumed from that segment
 //!
+//! A segment is named by the index of its first entry and holds consecutive
+//! indexes, so the pair stands for one log index, the next one to read:
+//! `segment_id + entry_offset`. The tailer resolves a token by that index,
+//! never by the file: a truncation of the log rewrites its segments under
+//! other names, and a position into a file that is gone would otherwise
+//! point nowhere or at another entry.
+//!
 //! A zero token (`segment_id=0, entry_offset=0`) means "start from the oldest
 //! available segment".
+//!
+//! ## Upper bound
+//!
+//! [`OplogTailer::read_next`] reads below a caller-given index. A consumer
+//! of a Raft log passes one past the last applied entry: the log also holds
+//! entries that are not committed yet and that a truncation may replace.
 //!
 //! ## Filters
 //!
@@ -44,7 +58,7 @@
 //! Note: label-based server-side filtering is not yet supported because node
 //! keys do not embed the label. Client-side filtering is recommended.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
@@ -77,6 +91,23 @@ impl ResumeToken {
     pub fn is_start(&self) -> bool {
         self.segment_id == 0 && self.entry_offset == 0
     }
+
+    /// The log index this token resumes at: the next entry to read.
+    ///
+    /// # Errors
+    ///
+    /// A token whose parts overflow a log index cannot have been issued by
+    /// a tailer.
+    pub fn next_index(&self) -> StorageResult<u64> {
+        self.segment_id
+            .checked_add(self.entry_offset)
+            .ok_or_else(|| {
+                StorageError::Io(format!(
+                    "resume token {}+{} is past the last log index",
+                    self.segment_id, self.entry_offset
+                ))
+            })
+    }
 }
 
 /// Server-side filters applied before delivering events to the CDC client.
@@ -93,88 +124,81 @@ pub struct CdcFilters {
 
 // ── OplogTailer ───────────────────────────────────────────────────────────────
 
-/// Read-only cursor over sealed oplog segments.
+/// Read-only cursor over oplog segments.
 ///
 /// Reads directly from segment files on disk — no lock on `OplogManager`.
-/// Safe to run concurrently with the write path.
+/// Safe to run concurrently with the write path, including a truncation
+/// that rewrites the segments: the cursor is a log index, resolved afresh
+/// on every read.
 pub struct OplogTailer {
-    /// Path to the oplog directory for one shard (`<data_dir>/oplog/<shard_id>/`).
-    oplog_dir: PathBuf,
+    /// Directories holding one shard's segments (`<endpoint>/oplog/<shard_id>/`
+    /// on each endpoint that may hold them). Missing ones are skipped.
+    oplog_dirs: Vec<PathBuf>,
     shard_id: ShardId,
-    /// Current position within the stream.
-    position: ResumeToken,
+    /// The next log index to read.
+    next: u64,
 }
 
 impl OplogTailer {
-    /// Create a new tailer starting from `token`.
+    /// Create a new tailer over the segments in `oplog_dirs`, starting from
+    /// `token`.
     ///
     /// Pass `ResumeToken::from_start(shard_id)` to start from the oldest
     /// available segment.
-    pub fn new(oplog_dir: &Path, token: ResumeToken) -> Self {
-        let shard_id = token.shard_id;
-        Self {
-            oplog_dir: oplog_dir.to_path_buf(),
-            shard_id,
-            position: token,
-        }
+    ///
+    /// # Errors
+    ///
+    /// A token that names no log index (see [`ResumeToken::next_index`]).
+    pub fn new(oplog_dirs: &[PathBuf], token: ResumeToken) -> StorageResult<Self> {
+        Ok(Self {
+            oplog_dirs: oplog_dirs.to_vec(),
+            shard_id: token.shard_id,
+            next: token.next_index()?,
+        })
     }
 
-    /// Current position (last acked token + 1 entry consumed).
-    pub fn position(&self) -> &ResumeToken {
-        &self.position
+    /// The next log index the tailer reads.
+    pub fn next_index(&self) -> u64 {
+        self.next
     }
 
-    /// Move the cursor past every entry currently in the oplog and
-    /// return the resulting position. Consumers whose history is
-    /// covered by another mechanism (e.g. a bootstrap index rebuild)
-    /// start tailing from here instead of replaying the whole log.
-    pub fn seek_to_end(&mut self) -> StorageResult<ResumeToken> {
-        if let Some((seg_first_index, seg_path)) = self.list_segments()?.into_iter().next_back() {
-            let reader =
-                SegmentReader::open(&seg_path).or_else(|_| SegmentReader::open_active(&seg_path));
-            if let Ok(reader) = reader {
-                self.position = ResumeToken {
-                    shard_id: self.shard_id,
-                    segment_id: seg_first_index,
-                    entry_offset: reader.entries().len() as u64,
-                };
-            }
-        }
-        Ok(self.position.clone())
-    }
-
-    /// Read up to `max_entries` entries from the current position, applying
-    /// `filters`.
+    /// Read up to `max_entries` entries at or past the current position and
+    /// below log index `until`, applying `filters`.
     ///
     /// Returns a list of `(entry, token)` pairs. Each `token` identifies the
-    /// position AFTER this entry — store it for reconnect.
+    /// position AFTER this entry — store it for reconnect. The position
+    /// advances past every entry read, whether or not it passed the filters.
     ///
-    /// Returns an **empty vec** when caught up (no new sealed segments).
-    /// The caller should sleep and retry.
+    /// Returns an **empty vec** when caught up. The caller should sleep and
+    /// retry. A segment that cannot be read right now (a truncation is
+    /// rewriting it, or the newest one is mid-write) ends the read where it
+    /// stands; nothing past it is read, so no entry is skipped.
     ///
-    /// Side-effect: internal position advances as entries are consumed.
+    /// # Errors
+    ///
+    /// The oplog directory cannot be listed.
     pub fn read_next(
         &mut self,
         max_entries: usize,
         filters: &CdcFilters,
+        until: u64,
     ) -> StorageResult<Vec<(OplogEntry, ResumeToken)>> {
         let segments = self.list_segments()?;
         let mut result = Vec::new();
 
-        for (seg_first_index, seg_path) in &segments {
-            if result.len() >= max_entries {
+        for (position, (seg_first_index, seg_path)) in segments.iter().enumerate() {
+            if result.len() >= max_entries || self.next >= until {
                 break;
             }
-
-            // Skip segments we've already passed.
-            if *seg_first_index < self.position.segment_id {
+            // A segment the cursor has passed ends where the next one begins.
+            if segments
+                .get(position + 1)
+                .is_some_and(|(next_first, _)| *next_first <= self.next)
+            {
                 continue;
             }
 
-            let is_last = segments
-                .last()
-                .map(|(idx, _)| idx == seg_first_index)
-                .unwrap_or(false);
+            let is_last = position + 1 == segments.len();
             let reader = match SegmentReader::open(seg_path) {
                 Ok(r) => r,
                 // The newest segment is usually still being written (no
@@ -190,69 +214,38 @@ impl OplogTailer {
                             error = %e,
                             "active segment not yet readable"
                         );
-                        continue;
+                        break;
                     }
                 },
                 Err(e) => {
-                    // A non-final unreadable segment is real corruption or
-                    // a mid-write straggler; skip and let later calls retry.
+                    // Rewritten by a truncation since the listing, or not
+                    // readable yet: stop here and resolve the position again
+                    // on the next call rather than skip what it holds.
                     tracing::debug!(
                         segment = %seg_path.display(),
                         error = %e,
-                        "skipping unreadable segment"
+                        "segment not readable; the read resumes here"
                     );
-                    continue;
-                }
-            };
-
-            // Skip entries already consumed in this segment.
-            let skip = if *seg_first_index == self.position.segment_id {
-                self.position.entry_offset as usize
-            } else {
-                0
-            };
-
-            let entries_in_seg = reader.entries();
-            let to_read = entries_in_seg.iter().skip(skip);
-
-            for (local_idx, entry) in to_read.enumerate() {
-                if result.len() >= max_entries {
                     break;
                 }
+            };
 
+            for entry in reader.entries() {
+                if entry.index < self.next {
+                    continue;
+                }
+                if entry.index >= until || result.len() >= max_entries {
+                    return Ok(result);
+                }
+                self.next = entry.index + 1;
                 if passes_filter(entry, filters) {
-                    let next_offset = (skip + local_idx + 1) as u64;
                     let token = ResumeToken {
                         shard_id: self.shard_id,
                         segment_id: *seg_first_index,
-                        entry_offset: next_offset,
+                        entry_offset: self.next - seg_first_index,
                     };
                     result.push((entry.clone(), token));
                 }
-            }
-
-            // Advance position past this segment if we consumed all its entries.
-            let seg_entry_count = entries_in_seg.len() as u64;
-            let new_offset = if *seg_first_index == self.position.segment_id {
-                self.position.entry_offset + (entries_in_seg.len().saturating_sub(skip)) as u64
-            } else {
-                entries_in_seg.len() as u64
-            };
-
-            if new_offset >= seg_entry_count {
-                // Move to the next segment on the next call.
-                self.position = ResumeToken {
-                    shard_id: self.shard_id,
-                    segment_id: *seg_first_index,
-                    entry_offset: seg_entry_count,
-                };
-            } else {
-                self.position = ResumeToken {
-                    shard_id: self.shard_id,
-                    segment_id: *seg_first_index,
-                    entry_offset: new_offset,
-                };
-                break; // Partial segment read — stop here.
             }
         }
 
@@ -261,24 +254,28 @@ impl OplogTailer {
 
     // ── private ───────────────────────────────────────────────────────────────
 
-    /// List sealed segment files in the oplog directory, sorted by first_index.
+    /// List the segment files in every oplog directory, sorted by first_index.
     fn list_segments(&self) -> StorageResult<Vec<(u64, PathBuf)>> {
-        if !self.oplog_dir.exists() {
-            return Ok(vec![]);
-        }
-
-        let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.oplog_dir)
-            .map_err(|e| StorageError::Io(format!("list oplog dir {:?}: {e}", self.oplog_dir)))?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
+        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+        for dir in &self.oplog_dirs {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(StorageError::Io(format!("list oplog dir {dir:?}: {e}")));
+                }
+            };
+            segments.extend(entries.filter_map(|e| e.ok()).filter_map(|e| {
                 let p = e.path();
-                let stem = p.file_stem()?.to_str()?;
-                let idx_str = stem.strip_prefix("oplog-")?;
-                let idx: u64 = idx_str.parse().ok()?;
+                let idx = p
+                    .file_stem()?
+                    .to_str()?
+                    .strip_prefix("oplog-")?
+                    .parse()
+                    .ok()?;
                 Some((idx, p))
-            })
-            .collect();
-
+            }));
+        }
         segments.sort_by_key(|&(idx, _)| idx);
         Ok(segments)
     }

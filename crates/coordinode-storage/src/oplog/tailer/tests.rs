@@ -43,12 +43,21 @@ fn seal_manager(mgr: &mut OplogManager) {
     mgr.rotate().expect("seal");
 }
 
+fn tailer(dir: &std::path::Path, token: ResumeToken) -> OplogTailer {
+    OplogTailer::new(&[dir.to_path_buf()], token).expect("tailer")
+}
+
+fn indexes(batch: &[(OplogEntry, ResumeToken)]) -> Vec<u64> {
+    batch.iter().map(|(e, _)| e.index).collect()
+}
+
 #[test]
 fn tailer_empty_dir_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
     assert!(batch.is_empty(), "empty dir = empty batch");
 }
 
@@ -65,9 +74,10 @@ fn tailer_reads_active_segment_incrementally() {
     mgr.flush().expect("flush");
     // NO seal: the segment is still active.
 
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
     assert_eq!(batch.len(), 3, "active segment entries must be visible");
     assert_eq!(batch[2].0.index, 2);
 
@@ -77,10 +87,10 @@ fn tailer_reads_active_segment_incrementally() {
         mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
     }
     mgr.flush().expect("flush");
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
-    assert_eq!(batch.len(), 2, "newly appended entries must be visible");
-    assert_eq!(batch[0].0.index, 3);
-    assert_eq!(batch[1].0.index, 4);
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![3, 4], "newly appended entries");
 }
 
 /// A torn write at the tail of the active segment must not break the
@@ -118,9 +128,10 @@ fn tailer_active_segment_ignores_torn_tail() {
     f.write_all(&[0x07, 0xde, 0xad, 0xbe]).expect("torn bytes");
     drop(f);
 
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
     assert_eq!(batch.len(), 3, "complete prefix must survive a torn tail");
 }
 
@@ -134,9 +145,10 @@ fn tailer_reads_sealed_segment() {
     }
     seal_manager(&mut mgr);
 
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
 
     assert_eq!(batch.len(), 5, "all 5 entries must be returned");
     assert_eq!(batch[0].0.index, 0);
@@ -156,20 +168,217 @@ fn tailer_resumes_from_token() {
     seal_manager(&mut mgr);
 
     // First batch: consume entries 0-2
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch1 = tailer.read_next(3, &CdcFilters::default()).expect("read");
+    let mut tailer1 = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch1 = tailer1
+        .read_next(3, &CdcFilters::default(), u64::MAX)
+        .expect("read");
     assert_eq!(batch1.len(), 3);
     let resume = batch1[2].1.clone();
 
     // Second batch from resume token: entries 3-5
-    let mut tailer2 = OplogTailer::new(dir.path(), resume);
+    let mut tailer2 = tailer(dir.path(), resume);
     let batch2 = tailer2
-        .read_next(100, &CdcFilters::default())
+        .read_next(100, &CdcFilters::default(), u64::MAX)
         .expect("read");
-    assert_eq!(batch2.len(), 3, "must get 3 remaining entries");
-    assert_eq!(batch2[0].0.index, 3);
-    assert_eq!(batch2[2].0.index, 5);
+    assert_eq!(indexes(&batch2), vec![3, 4, 5], "the 3 remaining entries");
+}
+
+/// A Raft log truncation deletes every segment and re-appends the kept
+/// prefix under new file boundaries. A token issued before it still names
+/// the same log index, and the stream resumes there: nothing below it is
+/// sent again and nothing above it is skipped.
+#[test]
+fn tailer_resumes_by_index_across_a_log_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(dir.path());
+    for i in 0..5u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    for i in 5..10u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+
+    let mut first = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = first
+        .read_next(8, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), (0..8).collect::<Vec<_>>());
+    let token = batch[7].1.clone();
+    assert_eq!((token.segment_id, token.entry_offset), (5, 3));
+
+    // Truncate after index 8 the way the Raft log store does: wipe every
+    // segment, re-append the kept prefix, then new entries follow.
+    mgr.truncate_all().expect("truncate");
+    for i in 0..=8u64 {
+        mgr.append(&make_entry(i, 1000 + i, false))
+            .expect("re-append");
+    }
+    for i in 9..12u64 {
+        mgr.append(&make_entry(i, 2000 + i, false)).expect("append");
+    }
+    mgr.flush().expect("flush");
+
+    let mut resumed = tailer(dir.path(), token);
+    let batch = resumed
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![8, 9, 10, 11], "resumes at index 8");
+    assert_eq!(batch[1].0.ts, 2009, "the entry written after the rewrite");
+
+    // The live cursor carries on the same way.
+    let batch = first
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![8, 9, 10, 11]);
+}
+
+/// Entries at or above the bound are not read: a Raft log holds entries
+/// that are not committed yet, and a consumer must not see them.
+#[test]
+fn tailer_stops_below_the_bound() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(dir.path());
+    for i in 0..6u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    mgr.flush().expect("flush");
+
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), 4)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![0, 1, 2, 3]);
+    assert_eq!(tailer.next_index(), 4, "the cursor stays at the bound");
+    assert!(
+        tailer
+            .read_next(100, &CdcFilters::default(), 4)
+            .expect("read")
+            .is_empty(),
+        "nothing more until the bound moves"
+    );
+
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), 6)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![4, 5], "the bound moved");
+}
+
+/// A sealed segment that cannot be read ends the read before it: the
+/// entries it holds are not skipped for the ones in the next segment.
+#[test]
+fn tailer_does_not_skip_an_unreadable_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(dir.path());
+    for i in 0..3u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    for i in 3..6u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    for i in 6..9u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+
+    // Corrupt the middle segment, the one starting at index 3.
+    let middle = std::fs::read_dir(dir.path())
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("oplog-"))
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(3)
+        })
+        .expect("middle segment");
+    let good = std::fs::read(&middle).expect("read segment");
+    std::fs::write(&middle, b"not a segment").expect("corrupt");
+
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(
+        indexes(&batch),
+        vec![0, 1, 2],
+        "stops before the bad segment"
+    );
+    assert!(
+        tailer
+            .read_next(100, &CdcFilters::default(), u64::MAX)
+            .expect("read")
+            .is_empty(),
+        "still waits there"
+    );
+
+    // Once readable again, the stream carries on in order.
+    std::fs::write(&middle, good).expect("restore");
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), (3..9).collect::<Vec<_>>());
+}
+
+#[test]
+fn resume_token_names_a_log_index() {
+    let token = ResumeToken {
+        shard_id: 0,
+        segment_id: 5,
+        entry_offset: 3,
+    };
+    assert_eq!(token.next_index().expect("index"), 8);
+    let overflow = ResumeToken {
+        shard_id: 0,
+        segment_id: u64::MAX,
+        entry_offset: 1,
+    };
+    assert!(overflow.next_index().is_err());
+    assert!(OplogTailer::new(&[], overflow).is_err());
+}
+
+/// A change of endpoint routing leaves the older segments of a log in the
+/// directory they were written to; the tailer reads the log across every
+/// directory in index order, and a directory that does not exist is skipped.
+#[test]
+fn tailer_reads_a_log_spread_over_directories() {
+    let old = tempfile::tempdir().expect("tempdir");
+    let new = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(old.path());
+    for i in 0..3u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    drop(mgr);
+    let mut mgr = OplogManager::open_multi(
+        new.path(),
+        &[old.path().to_path_buf(), new.path().to_path_buf()],
+        0,
+        64 * 1024 * 1024,
+        50_000,
+        7 * 24 * 3600,
+    )
+    .expect("open over both");
+    for i in 3..6u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    mgr.flush().expect("flush");
+
+    let missing = old.path().join("never-created");
+    let mut tailer = OplogTailer::new(
+        &[new.path().to_path_buf(), missing, old.path().to_path_buf()],
+        ResumeToken::from_start(0),
+    )
+    .expect("tailer");
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), (0..6).collect::<Vec<_>>());
 }
 
 #[test]
@@ -183,16 +392,16 @@ fn tailer_filter_is_migration() {
     mgr.append(&make_entry(3, 1003, true)).expect("append");
     seal_manager(&mut mgr);
 
-    let token = ResumeToken::from_start(0);
     let filters = CdcFilters {
         is_migration: Some(false),
         ..Default::default()
     };
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &filters).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer.read_next(100, &filters, u64::MAX).expect("read");
 
     assert_eq!(batch.len(), 2, "only non-migration entries");
     assert!(batch.iter().all(|(e, _)| !e.is_migration));
+    assert_eq!(tailer.next_index(), 4, "filtered entries are passed too");
 }
 
 #[test]
@@ -206,17 +415,14 @@ fn tailer_filter_edge_type() {
     mgr.append(&make_entry(3, 1003, false)).expect("append"); // non-adj
     seal_manager(&mut mgr);
 
-    let token = ResumeToken::from_start(0);
     let filters = CdcFilters {
         edge_types: vec!["FOLLOWS".to_string()],
         ..Default::default()
     };
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &filters).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer.read_next(100, &filters, u64::MAX).expect("read");
 
-    assert_eq!(batch.len(), 2, "only FOLLOWS entries");
-    assert_eq!(batch[0].0.index, 0);
-    assert_eq!(batch[1].0.index, 2);
+    assert_eq!(indexes(&batch), vec![0, 2], "only FOLLOWS entries");
 }
 
 #[test]
@@ -236,13 +442,12 @@ fn tailer_reads_across_multiple_segments() {
     }
     seal_manager(&mut mgr);
 
-    let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
 
-    assert_eq!(batch.len(), 10, "all 10 entries across 2 segments");
-    assert_eq!(batch[0].0.index, 0);
-    assert_eq!(batch[9].0.index, 9);
+    assert_eq!(indexes(&batch), (0..10).collect::<Vec<_>>());
 }
 
 #[test]

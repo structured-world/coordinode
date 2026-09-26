@@ -97,6 +97,24 @@ async fn log_store_truncate_after() {
     assert_eq!(remaining[0].log_id.index, 1);
 }
 
+/// A change stream reports each entry's commit timestamp and the term of the
+/// leader that wrote it; both come from the oplog record, so a record that
+/// left them at zero sent every CDC event with `ts = 0, term = 0`.
+#[tokio::test]
+async fn oplog_record_carries_commit_ts_and_term() {
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(engine).unwrap();
+    store
+        .append(vec![make_entry(5, 3, "a")], IOFlushed::noop())
+        .await
+        .unwrap();
+
+    let records = store.oplog.lock().unwrap().read_range(5, 6).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].ts, 1005, "the proposal's commit timestamp");
+    assert_eq!(records[0].term, 3, "the term of the entry's leader");
+}
+
 #[tokio::test]
 async fn log_store_purge() {
     let (_dir, engine) = test_engine();

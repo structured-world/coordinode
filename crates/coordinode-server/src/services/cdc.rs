@@ -1,10 +1,12 @@
 //! gRPC ChangeStreamService: CE oplog CDC consumer.
 //!
-//! Tails sealed oplog segments from `data_dir/oplog/<shard_id>/`, streams
-//! [`ChangeEvent`] messages to the client. Polls every 100ms when caught up.
+//! Tails the Raft log's oplog segments and streams [`ChangeEvent`] messages
+//! to the client, only for entries this node has applied: the log also holds
+//! entries that are not committed yet, which a later leader may truncate and
+//! replace. Polls every 100ms when caught up.
 //!
-//! In embedded mode (no Raft, no oplog) the stream is empty — no error.
-//! In Raft mode the oplog dir is populated by `LogStore::append`.
+//! In embedded mode (no Raft) nothing is applied from a Raft log and the
+//! stream is empty — no error.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -16,10 +18,13 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_replicate::{
     ConsumerKind, ConsumerRegistration, InitialSeqno, SeqnoConsumerRegistry, ShardConsumerRegistry,
     TopologyScope,
 };
+use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::oplog::entry::OplogOp;
 use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 
@@ -29,36 +34,70 @@ use crate::proto::replication::cdc::{
     change_stream_service_server::ChangeStreamService,
 };
 
+/// One past the last Raft log entry this node has applied, `0` when none:
+/// the exclusive bound of what a change stream may send.
+pub type AppliedFrontier = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// gRPC CDC service for one shard.
 ///
-/// `data_dir` is the root data directory; the oplog lives at
-/// `data_dir/oplog/<shard_id>/`. Each subscription registers as an
-/// `oplog_events` consumer in the [`ShardConsumerRegistry`] so the oplog
-/// retention floor never purges below a live reader's position (ADR-028).
+/// Each subscription registers as an `oplog_events` consumer in the
+/// [`ShardConsumerRegistry`] so the oplog retention floor never purges below
+/// a live reader's position (ADR-028).
 pub struct ChangeEventServiceImpl {
-    data_dir: PathBuf,
+    /// The shard whose Raft log the service streams.
+    shard_id: u32,
+    /// Every directory holding segments of that log.
+    oplog_dirs: Vec<PathBuf>,
     registry: ShardConsumerRegistry,
     /// Per-process counter for unique CDC consumer ids.
     next_consumer: Arc<AtomicU64>,
     /// TTL (ms) applied to each CDC consumer registration
     /// (`--cdc-consumer-ttl-secs`). A crashed reader is reclaimed after this.
     consumer_ttl_ms: u64,
+    /// Bound of the entries a stream may send.
+    applied: AppliedFrontier,
 }
 
 impl ChangeEventServiceImpl {
-    pub fn new(data_dir: PathBuf, registry: ShardConsumerRegistry, consumer_ttl_ms: u64) -> Self {
+    /// A service streaming shard `shard_id`'s Raft log from `oplog_dirs`
+    /// (see `coordinode_raft::storage::raft_oplog_dirs`).
+    pub fn new(
+        shard_id: u32,
+        oplog_dirs: Vec<PathBuf>,
+        registry: ShardConsumerRegistry,
+        consumer_ttl_ms: u64,
+        applied: AppliedFrontier,
+    ) -> Self {
         Self {
-            data_dir,
+            shard_id,
+            oplog_dirs,
             registry,
             next_consumer: Arc::new(AtomicU64::new(0)),
             consumer_ttl_ms,
+            applied,
         }
     }
 
-    fn oplog_dir_for_shard(&self, _shard_id: u32) -> PathBuf {
-        // LogStore stores the Raft oplog at `data_dir/raft_oplog/` (shard 0).
-        // Multi-shard support (Phase 3 EE) will map shard_id to separate dirs.
-        self.data_dir.join("raft_oplog")
+    /// A service streaming shard 0's Raft log of `node`, whose store is
+    /// `engine`, as the node applies it.
+    ///
+    /// # Errors
+    ///
+    /// No endpoint of `engine` is eligible to hold the oplog.
+    pub fn for_raft_node(
+        engine: &StorageEngine,
+        node: Arc<RaftNode>,
+        registry: ShardConsumerRegistry,
+        consumer_ttl_ms: u64,
+    ) -> std::io::Result<Self> {
+        let dirs = raft_oplog_dirs(engine, 0)?.all;
+        Ok(Self::new(
+            0,
+            dirs,
+            registry,
+            consumer_ttl_ms,
+            Arc::new(move || node.applied_through()),
+        ))
     }
 }
 
@@ -68,7 +107,7 @@ impl ChangeEventServiceImpl {
 /// unregistering (crash) is reclaimed after this.
 pub const DEFAULT_CONSUMER_TTL_MS: u64 = 30_000;
 
-/// How long to sleep between polls when caught up to the last sealed segment.
+/// How long to sleep between polls when caught up to the last applied entry.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum entries streamed per poll iteration (back-pressure).
@@ -92,12 +131,19 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 segment_id: t.segment_id,
                 entry_offset: t.entry_offset,
             },
-            None => ResumeToken::from_start(0),
+            None => ResumeToken::from_start(self.shard_id),
         };
 
-        let shard_id = token.shard_id;
+        let shard_id = self.shard_id;
+        if token.shard_id != shard_id {
+            return Err(Status::invalid_argument(format!(
+                "resume token is for shard {}, this stream serves shard {shard_id}",
+                token.shard_id
+            )));
+        }
         let filters = proto_filters_to_cdc(req.filters);
-        let oplog_dir = self.oplog_dir_for_shard(shard_id);
+        let mut tailer = OplogTailer::new(&self.oplog_dirs, token)
+            .map_err(|e| Status::invalid_argument(format!("resume token: {e}")))?;
 
         // Register this stream as an oplog-events consumer so the oplog
         // retention floor is held at (and advanced with) its read position
@@ -119,9 +165,8 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         // Spawn a task that tails the oplog and sends events into a channel.
         let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
         let registry = self.registry.clone();
+        let applied = Arc::clone(&self.applied);
         tokio::spawn(async move {
-            let mut tailer = OplogTailer::new(&oplog_dir, token);
-
             'stream: loop {
                 // Client cancelled (channel closed).
                 if tx.is_closed() {
@@ -139,37 +184,47 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                     break;
                 }
 
-                let batch = match tailer.read_next(BATCH_SIZE, &filters) {
+                let read_from = tailer.next_index();
+                let batch = match tailer.read_next(BATCH_SIZE, &filters, applied()) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                         break;
                     }
                 };
+                let caught_up = batch.is_empty();
 
-                if batch.is_empty() {
-                    // Caught up — heartbeat so an idle-but-connected reader is not
-                    // TTL-evicted, then wait for new sealed segments.
-                    let _ = registry.heartbeat(&handle);
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
-                }
-
-                let mut last_index = 0u64;
                 for (entry, token) in batch {
-                    last_index = entry.index;
                     let event = oplog_entry_to_proto(entry, token);
                     if tx.send(Ok(event)).await.is_err() {
                         // Client disconnected mid-batch.
                         break 'stream;
                     }
                 }
-                // Advance the retention floor to what the consumer has now read.
-                let _ = registry.checkpoint(&handle, last_index);
+                // Advance the retention floor past everything read, the
+                // entries the filters dropped included: a stream whose filters
+                // match nothing must not hold the oplog forever.
+                let read_to = tailer.next_index();
+                if read_to > read_from {
+                    if let Err(e) = registry.checkpoint(&handle, read_to - 1) {
+                        tracing::warn!(error = %e, "change stream checkpoint failed");
+                    }
+                }
+
+                if caught_up {
+                    // Heartbeat so an idle-but-connected reader is not
+                    // TTL-evicted, then wait for new applied entries.
+                    if let Err(e) = registry.heartbeat(&handle) {
+                        tracing::warn!(error = %e, "change stream heartbeat failed");
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
             }
 
             // Release the retention hold when the stream ends for any reason.
-            let _ = registry.unregister(handle);
+            if let Err(e) = registry.unregister(handle) {
+                tracing::warn!(error = %e, "change stream consumer unregister failed");
+            }
         });
 
         let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeEvent, Status>> + Send>> =

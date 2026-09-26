@@ -18,6 +18,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
@@ -71,8 +72,10 @@ fn tailer_delivers_all_entries_from_oplog() {
     mgr.rotate().expect("seal");
 
     let token = ResumeToken::from_start(0);
-    let mut tailer = OplogTailer::new(dir.path(), token);
-    let batch = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer = OplogTailer::new(&[dir.path().to_path_buf()], token).expect("tailer");
+    let batch = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
 
     assert_eq!(batch.len(), 5, "all 5 entries must be delivered");
     for (i, (entry, _)) in batch.iter().enumerate() {
@@ -92,16 +95,19 @@ fn tailer_resume_continues_from_last_position() {
     mgr.rotate().expect("seal");
 
     // First consumer: read 3 entries
-    let mut tailer = OplogTailer::new(dir.path(), ResumeToken::from_start(0));
-    let first = tailer.read_next(3, &CdcFilters::default()).expect("read");
+    let dirs = [dir.path().to_path_buf()];
+    let mut tailer = OplogTailer::new(&dirs, ResumeToken::from_start(0)).expect("tailer");
+    let first = tailer
+        .read_next(3, &CdcFilters::default(), u64::MAX)
+        .expect("read");
     assert_eq!(first.len(), 3);
     let resume = first[2].1.clone();
     assert_eq!(resume.entry_offset, 3, "token should point past 3rd entry");
 
     // Second consumer from resume: should get entries 3-7 (5 remaining)
-    let mut tailer2 = OplogTailer::new(dir.path(), resume);
+    let mut tailer2 = OplogTailer::new(&dirs, resume).expect("tailer");
     let second = tailer2
-        .read_next(100, &CdcFilters::default())
+        .read_next(100, &CdcFilters::default(), u64::MAX)
         .expect("read");
     assert_eq!(second.len(), 5, "resume delivers remaining 5 entries");
     assert_eq!(second[0].0.index, 3, "first remaining entry is index 3");
@@ -124,8 +130,9 @@ fn tailer_filter_skips_migration_entries() {
         is_migration: Some(false),
         ..Default::default()
     };
-    let mut tailer = OplogTailer::new(dir.path(), ResumeToken::from_start(0));
-    let batch = tailer.read_next(100, &filters).expect("read");
+    let mut tailer =
+        OplogTailer::new(&[dir.path().to_path_buf()], ResumeToken::from_start(0)).expect("tailer");
+    let batch = tailer.read_next(100, &filters, u64::MAX).expect("read");
 
     assert_eq!(batch.len(), 2, "only 2 non-migration entries");
     assert!(batch.iter().all(|(e, _)| !e.is_migration));
@@ -180,8 +187,9 @@ fn tailer_filter_edge_type_delivers_only_matching() {
         edge_types: vec!["FOLLOWS".to_string()],
         ..Default::default()
     };
-    let mut tailer = OplogTailer::new(dir.path(), ResumeToken::from_start(0));
-    let batch = tailer.read_next(100, &filters).expect("read");
+    let mut tailer =
+        OplogTailer::new(&[dir.path().to_path_buf()], ResumeToken::from_start(0)).expect("tailer");
+    let batch = tailer.read_next(100, &filters, u64::MAX).expect("read");
 
     assert_eq!(batch.len(), 1, "only FOLLOWS entry delivered");
     assert_eq!(batch[0].0.index, 0);
@@ -205,8 +213,11 @@ fn tailer_reads_across_rotation_boundary() {
     }
     mgr.rotate().expect("seal segment 2");
 
-    let mut tailer = OplogTailer::new(dir.path(), ResumeToken::from_start(0));
-    let all = tailer.read_next(100, &CdcFilters::default()).expect("read");
+    let mut tailer =
+        OplogTailer::new(&[dir.path().to_path_buf()], ResumeToken::from_start(0)).expect("tailer");
+    let all = tailer
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
 
     assert_eq!(all.len(), 10, "all 10 entries across 2 segments");
     assert_eq!(all[0].0.index, 0);
@@ -218,9 +229,10 @@ fn tailer_reads_across_rotation_boundary() {
 /// After committing proposals through RaftNode, OplogTailer delivers the
 /// corresponding oplog entries.
 ///
-/// The oplog for shard 0 lives at `data_dir/oplog/0/`. After write proposals
-/// are committed, the active segment is sealed (either via rotation or on
-/// shutdown). The tailer then reads back all entries.
+/// The oplog for shard 0 lives in the directories `raft_oplog_dirs` names.
+/// After write proposals are committed, the active segment is sealed (either
+/// via rotation or on shutdown). The tailer then reads back every applied
+/// entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn cdc_tailer_delivers_raft_proposals() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -254,20 +266,19 @@ async fn cdc_tailer_delivers_raft_proposals() {
     }
 
     // Shutdown flushes and seals the active oplog segment.
+    let applied = node.applied_through();
     node.shutdown().await.expect("shutdown");
 
-    // The oplog dir for shard 0.
-    let oplog_dir = data_dir.join("oplog").join("0");
-
+    let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs");
     assert!(
-        oplog_dir.exists(),
-        "oplog/0 directory must exist after Raft writes"
+        dirs.active.exists(),
+        "the active oplog directory must exist after Raft writes"
     );
 
     // Tail the oplog from the start.
-    let mut tailer = OplogTailer::new(&oplog_dir, ResumeToken::from_start(0));
+    let mut tailer = OplogTailer::new(&dirs.all, ResumeToken::from_start(0)).expect("tailer");
     let batch = tailer
-        .read_next(1000, &CdcFilters::default())
+        .read_next(1000, &CdcFilters::default(), applied)
         .expect("read oplog entries");
 
     assert!(
@@ -296,6 +307,17 @@ async fn cdc_tailer_delivers_raft_proposals() {
         raft_entry_count >= n_proposals as usize,
         "expected ≥{n_proposals} RaftEntry ops in oplog, got {raft_entry_count}"
     );
+
+    // Each proposal's entry carries its commit timestamp and a real term.
+    let proposal_ts: Vec<u64> = batch
+        .iter()
+        .filter(|(e, _)| e.ts > 2000)
+        .map(|(e, _)| {
+            assert!(e.term >= 1, "entry {} has term {}", e.index, e.term);
+            e.ts
+        })
+        .collect();
+    assert_eq!(proposal_ts, (2001..=2000 + n_proposals).collect::<Vec<_>>());
 
     // All entries must have monotonically increasing Raft indices.
     let indices: Vec<u64> = batch.iter().map(|(e, _)| e.index).collect();
@@ -335,14 +357,15 @@ async fn cdc_tailer_resume_after_partial_read() {
         pipeline.propose_and_wait(&proposal).expect("propose");
     }
 
+    let applied = node.applied_through();
     node.shutdown().await.expect("shutdown");
 
-    let oplog_dir = data_dir.join("oplog").join("0");
+    let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs").all;
 
     // First read: get all entries and find a midpoint.
-    let mut tailer = OplogTailer::new(&oplog_dir, ResumeToken::from_start(0));
+    let mut tailer = OplogTailer::new(&dirs, ResumeToken::from_start(0)).expect("tailer");
     let all = tailer
-        .read_next(1000, &CdcFilters::default())
+        .read_next(1000, &CdcFilters::default(), applied)
         .expect("full read");
     assert!(!all.is_empty(), "must have entries");
 
@@ -350,9 +373,9 @@ async fn cdc_tailer_resume_after_partial_read() {
     let resume_token = all[mid - 1].1.clone();
 
     // Second read from resume: must get exactly the second half.
-    let mut tailer2 = OplogTailer::new(&oplog_dir, resume_token);
+    let mut tailer2 = OplogTailer::new(&dirs, resume_token).expect("tailer");
     let second_half = tailer2
-        .read_next(1000, &CdcFilters::default())
+        .read_next(1000, &CdcFilters::default(), applied)
         .expect("resume read");
 
     assert_eq!(
@@ -436,12 +459,13 @@ async fn cdc_filter_edge_type_through_raft() {
         })
         .expect("propose node write");
 
+    let applied = node.applied_through();
     node.shutdown().await.expect("shutdown");
 
-    let oplog_dir = data_dir.join("oplog").join("0");
+    let dirs = raft_oplog_dirs(&engine, 0).expect("oplog dirs").all;
 
     // Filter: only FOLLOWS edges
-    let mut tailer = OplogTailer::new(&oplog_dir, ResumeToken::from_start(0));
+    let mut tailer = OplogTailer::new(&dirs, ResumeToken::from_start(0)).expect("tailer");
     let follows_only = tailer
         .read_next(
             1000,
@@ -449,6 +473,7 @@ async fn cdc_filter_edge_type_through_raft() {
                 edge_types: vec!["FOLLOWS".to_string()],
                 ..Default::default()
             },
+            applied,
         )
         .expect("read with FOLLOWS filter");
 

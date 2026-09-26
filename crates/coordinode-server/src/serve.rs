@@ -811,17 +811,28 @@ pub(crate) async fn serve(
     let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
     let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
     let health_service = services::health::HealthServiceImpl;
-    // CDC service: tails oplog/<shard>/ dir. Empty stream in embedded mode
-    // (no oplog); populated in Raft cluster mode (LogStore writes oplog).
-    let cdc_service = services::cdc::ChangeEventServiceImpl::new(
-        std::path::PathBuf::from(&data_dir),
-        consumer_registry,
-        // Operator-tunable CDC consumer TTL (seconds → ms); saturating
-        // so an absurdly large window means "effectively never reclaim".
-        cdc_consumer_ttl_secs
-            .map(|s| s.saturating_mul(1000))
-            .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS),
-    );
+    // CDC service: tails the Raft log up to the entries this node applied.
+    // Empty stream in embedded mode: there is no Raft log.
+    // Operator-tunable CDC consumer TTL (seconds → ms); saturating so an
+    // absurdly large window means "effectively never reclaim".
+    let cdc_ttl_ms = cdc_consumer_ttl_secs
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS);
+    let cdc_service = match raft_node_shared {
+        Some(ref rn) => services::cdc::ChangeEventServiceImpl::for_raft_node(
+            &database.read().engine_shared(),
+            Arc::clone(rn),
+            consumer_registry,
+            cdc_ttl_ms,
+        )?,
+        None => services::cdc::ChangeEventServiceImpl::new(
+            0,
+            Vec::new(),
+            consumer_registry,
+            cdc_ttl_ms,
+            Arc::new(|| 0),
+        ),
+    };
 
     // ClusterService: cluster join/leave lifecycle.
     // Available only in cluster mode (requires a RaftNode).
