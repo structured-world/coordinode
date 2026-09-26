@@ -11,8 +11,8 @@
 //! | Header | CE value | Notes |
 //! |--------|----------|-------|
 //! | `x-coordinode-node` | node_id (decimal) | Always set |
-//! | `x-coordinode-hops` | `0` | No routing in CE; always served locally |
-//! | `x-coordinode-load` | `0` | Load tracking deferred to R151 |
+//! | `x-coordinode-hops` | `0` or `1` | `1` when the node forwarded the request to the leader |
+//! | `x-coordinode-load` | `0` | No load tracking |
 //!
 //! EE header `x-coordinode-shard-hint` is **not** added by CE code.
 
@@ -122,13 +122,13 @@ where
                     headers.insert(http::header::HeaderName::from_static(HEADER_NODE), v);
                 }
 
-                // x-coordinode-hops: 0 (CE has no routing — always local)
-                headers.insert(
-                    http::header::HeaderName::from_static(HEADER_HOPS),
-                    http::HeaderValue::from_static("0"),
-                );
+                // x-coordinode-hops: 0 unless the handler already counted
+                // hops (a request forwarded to the leader sets it to 1).
+                headers
+                    .entry(http::header::HeaderName::from_static(HEADER_HOPS))
+                    .or_insert(http::HeaderValue::from_static("0"));
 
-                // x-coordinode-load: 0 (load tracking deferred to R151)
+                // x-coordinode-load: 0 (no load tracking)
                 headers.insert(
                     http::header::HeaderName::from_static(HEADER_LOAD),
                     http::HeaderValue::from_static("0"),
@@ -140,3 +140,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests;
