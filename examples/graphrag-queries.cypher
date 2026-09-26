@@ -3,25 +3,18 @@
 // Document-as-Graph pattern: segmented documents stored as graph of chunks,
 // entities, and semantic relationships.
 //
-// Enablement map (which ROADMAP tasks enable each query):
+// What each query exercises:
 //
-//   GQ-1  Hybrid vector+BM25           R037 ✅, R044 ✅, R023 ✅
-//   GQ-2  Context expansion            R023 ✅ (OPTIONAL MATCH, graph traversal)
-//   GQ-3  Entity-aware RAG             R023 ✅ (collect, graph traversal)
-//   GQ-4  Cross-document via entities  R023 ✅ (multi-hop, count DISTINCT)
-//   GQ-5  Document-level scoring       R023 ✅ (GROUP BY, max, avg, collect)
-//   GQ-6  Centroid two-stage           R680 (centroid maintenance), R681 (planner)
-//   GQ-7  Edge vector traversal        R106b (edge HNSW partitioned)
-//   GQ-8  Multi-hop KG RAG            R528 (variable-length paths *1..N)
-//   GQ-9  Temporal RAG (AS OF)         R028 ✅ (MVCC), adj: seqno-aware reads
-//   GQ-10 Full pipeline                All of the above
-//
-// Status: GQ-1 through GQ-5 work TODAY (all deps ✅)
-//         GQ-6 needs R680-R681 (Phase 5.9)
-//         GQ-7 needs R106b (edge HNSW, Phase 2)
-//         GQ-8 needs R528 (variable-length paths, Phase 5.2)
-//         GQ-9 blocked by MVCC redesign (R064-R067, fork v4.1)
-//         GQ-10 needs all above
+//   GQ-1  Hybrid vector+BM25           vector similarity + full-text score
+//   GQ-2  Context expansion            OPTIONAL MATCH over the chunk chain
+//   GQ-3  Entity-aware RAG             collect + map projection
+//   GQ-4  Cross-document via entities  multi-hop, count(DISTINCT)
+//   GQ-5  Document-level scoring       grouping with max / avg / collect
+//   GQ-6  Centroid two-stage           document-level then chunk-level vectors
+//   GQ-7  Edge vector traversal        vector property on a relationship
+//   GQ-8  Multi-hop KG RAG             variable-length path *1..N
+//   GQ-9  Temporal RAG                 AS OF TIMESTAMP time-travel read
+//   GQ-10 Full pipeline                all of the above in one query
 // ============================================================================
 
 // --- Schema ---
@@ -68,7 +61,7 @@
 //   (:Chunk)-[:MENTIONS]->(:Entity)              -- entity extraction
 //   (:Entity)-[:RELATED_TO]->(:Entity)           -- knowledge graph layer
 //   (:Chunk)-[:SIMILAR_TO {similarity: FLOAT, embedding: VECTOR(384)}]->(:Chunk)
-//     ^^ vector on edge — unique to CoordiNode
+//     ^^ the relationship carries its own embedding
 
 
 // ============================================================================
@@ -196,8 +189,8 @@ LIMIT 20;
 
 // ============================================================================
 // GQ-7. SEMANTIC EDGE TRAVERSAL: Navigate via vector-weighted edges
-// Find chunks related through semantic similarity edges.
-// Unique to CoordiNode — no other DB supports vector indexes on edges.
+// Find chunks related through semantic similarity edges, ranking each edge
+// by how close its own embedding is to the question.
 // ============================================================================
 
 MATCH (start:Chunk)
@@ -229,7 +222,7 @@ WITH c LIMIT 5
 MATCH (c)-[:MENTIONS]->(e1:Entity)
 
 // Expand 1-2 hops through entity relationships
-MATCH (e1)-[:RELATED_TO*1..2]->(e2:Entity)
+MATCH path = (e1)-[:RELATED_TO*1..2]->(e2:Entity)
 
 // Find chunks that mention these connected entities
 MATCH (e2)<-[:MENTIONS]-(context:Chunk)
@@ -246,14 +239,16 @@ LIMIT 30;
 // ============================================================================
 // GQ-9. TEMPORAL RAG: Search across document versions (time-travel)
 // "What did the contract say about liability BEFORE the amendment?"
+// A full-text index holds only the current state, so a time-travel read
+// filters the snapshot directly instead of scoring through the index.
+// The timestamp must fall inside the retention window (7 days by default).
 // ============================================================================
 
-MATCH (d:Document {title: "Service Agreement v2"})
-  -[:HAS_CHUNK]->(c:Chunk)
-  AS OF TIMESTAMP '2025-06-15T00:00:00Z'
-WHERE text_score(c.text, "liability indemnification") > 0.3
-RETURN c.text, c.position, text_score(c.text, "liability indemnification") AS relevance
-ORDER BY relevance DESC;
+MATCH (d:Document {title: "Service Agreement v2"})-[:HAS_CHUNK]->(c:Chunk)
+WHERE toLower(c.text) CONTAINS 'liability'
+RETURN c.text, c.position
+ORDER BY c.position
+AS OF TIMESTAMP '2026-03-15T10:00:00Z';
 
 
 // ============================================================================

@@ -102,7 +102,7 @@ pub enum Crs {
 }
 
 impl Crs {
-    /// SRID code as used in arch docs and the index key encoding.
+    /// SRID code, as stored in the index key encoding.
     pub fn srid(self) -> u16 {
         self as u16
     }

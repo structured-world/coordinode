@@ -136,7 +136,7 @@ pub enum Value {
     /// Arbitrary nested document (recursive map/array, any depth).
     /// No schema type validation — accepts any MessagePack structure.
     /// Used for semi-structured data that doesn't fit a flat property model.
-    /// 4MB size limit (configurable). See document-operations arch doc.
+    /// Serialized size is capped at [`Value::DOCUMENT_MAX_SIZE`] (4 MiB).
     Document(rmpv::Value),
 
     /// Multi-vector value: ordered list of per-token f32 vectors with
