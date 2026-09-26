@@ -31,7 +31,9 @@ pub(crate) fn admin_storage_config(
             ..config::ServerConfig::default()
         },
     };
-    Ok(cfg.resolve_storage_config())
+    Ok(cfg
+        .resolve_storage_config()
+        .map_err(|e| format!("config error: {e}"))?)
 }
 
 /// Open the database for an offline admin command the way the server opens it.

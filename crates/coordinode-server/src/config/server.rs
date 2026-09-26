@@ -22,7 +22,9 @@
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::config::{
+    Durability, EndpointConfig, EndpointConfigError, Media, StorageConfig, Tier,
+};
 use serde::Deserialize;
 
 /// Storage topology: the physical endpoints this node manages.
@@ -455,9 +457,12 @@ impl ServerConfig {
     /// topology ([`Self::storage_endpoints`]). This is the single place the
     /// server turns operator config into a storage-engine config; every
     /// subcommand that opens the engine routes through it.
-    #[must_use]
-    pub fn resolve_storage_config(&self) -> StorageConfig {
-        let mut cfg = StorageConfig::with_endpoints(self.storage_endpoints());
+    ///
+    /// # Errors
+    /// When the endpoint topology cannot host the engine (see
+    /// [`StorageConfig::try_with_endpoints`]).
+    pub fn resolve_storage_config(&self) -> Result<StorageConfig, EndpointConfigError> {
+        let mut cfg = StorageConfig::try_with_endpoints(self.storage_endpoints())?;
         cfg.backpressure = self.storage.backpressure;
         // The MVCC time-travel window is an engine setting: the engine holds
         // its GC watermark back by it on every node, registry or not.
@@ -478,7 +483,7 @@ impl ServerConfig {
         if let Some(shard) = self.node_shard {
             cfg.node_shard = shard;
         }
-        cfg
+        Ok(cfg)
     }
 
     /// Whether any configured endpoint's effective ECC policy is "on".

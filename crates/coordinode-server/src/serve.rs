@@ -99,7 +99,13 @@ pub(crate) async fn serve(
     // the single-endpoint `data_dir` desugar) and the page-ECC request
     // once, while the config is still whole — the destructure below
     // moves it field-by-field.
-    let mut storage_config = cfg.resolve_storage_config();
+    let mut storage_config = match cfg.resolve_storage_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: storage endpoints: {e}");
+            std::process::exit(1);
+        }
+    };
     let page_ecc_requested = cfg.page_ecc_requested();
 
     // Bind the resolved settings into the local names the rest of the

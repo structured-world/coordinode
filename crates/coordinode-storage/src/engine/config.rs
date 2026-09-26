@@ -756,47 +756,56 @@ impl std::fmt::Debug for StorageConfig {
 }
 
 impl StorageConfig {
-    /// Construct from an explicit list of endpoints. This is the **only**
-    /// `StorageConfig` constructor — pre-public-release-window storage
-    /// format forces every caller to declare endpoints explicitly. No
-    /// `::new(path)` convenience shim, no `::with_memfs(path)` shortcut:
-    /// tests live below this layer, exercising the real API; production
-    /// code declares production endpoints.
+    /// Construct from an explicit list of endpoints, rejecting a topology
+    /// the engine cannot run on. Every caller declares endpoints explicitly:
+    /// there is no `::new(path)` shortcut.
     ///
-    /// Validation (panics on violation — config errors are caller bugs):
-    /// - `endpoints` MUST be non-empty.
-    /// - Endpoint `id` strings MUST be non-empty and unique within the
-    ///   list. Duplicate IDs reject because metrics and placement rules
-    ///   key by `id`.
-    /// - Endpoint `path`s MUST be unique within the list — endpoints own
-    ///   their directory trees exclusively.
-    /// - When both `capacity_bytes` and `hard_limit_bytes` are non-zero on
-    ///   the same endpoint, `hard_limit_bytes <= capacity_bytes` MUST
-    ///   hold.
+    /// Use this for endpoints that come from outside the program (an
+    /// operator's config file); [`Self::with_endpoints`] is the infallible
+    /// form for endpoints the code builds itself.
+    ///
+    /// # Errors
+    /// - [`EndpointConfigError::NoEndpoints`]: the list is empty.
+    /// - [`EndpointConfigError::EmptyId`] / [`EndpointConfigError::DuplicateId`]:
+    ///   ids must be non-empty and unique, because metrics and placement
+    ///   rules key by id.
+    /// - [`EndpointConfigError::DuplicatePath`]: an endpoint owns its
+    ///   directory tree exclusively.
+    /// - [`EndpointConfigError::HardLimitAboveCapacity`]: when both are
+    ///   set, `hard_limit_bytes <= capacity_bytes` must hold.
+    /// - [`EndpointConfigError::NoOplogEndpoint`]: the oplog is the Raft
+    ///   log, WAL and CDC source, so it must survive a process restart; at
+    ///   least one endpoint must be `Durable` or `Degraded`.
     ///
     /// All other config fields receive their defaults; chain `.with_*`
     /// builders or assign fields directly to customise.
-    pub fn with_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
-        Self::validate_common(&endpoints);
-        // INV-D1 (config-time): at least one oplog-eligible endpoint.
-        // Oplog = Raft log = WAL = CDC source, so it MUST survive
-        // process restart, so a config with no durable/degraded endpoints
-        // cannot host a production storage engine. Tests that genuinely
-        // need an all-volatile (MemFs) config must use
-        // [`Self::with_endpoints_no_persistence`].
-        assert!(
-            endpoints.iter().any(EndpointConfig::is_oplog_eligible),
-            "StorageConfig requires at least one oplog-eligible endpoint \
-             (durability ∈ {{Durable, Degraded}}) — got only Volatile \
-             endpoints. Use `with_endpoints_no_persistence` for in-memory \
-             test configs that don't open Raft/WAL."
-        );
-        Self::build(endpoints)
+    pub fn try_with_endpoints(endpoints: Vec<EndpointConfig>) -> Result<Self, EndpointConfigError> {
+        Self::validate_common(&endpoints)?;
+        if !endpoints.iter().any(EndpointConfig::is_oplog_eligible) {
+            return Err(EndpointConfigError::NoOplogEndpoint);
+        }
+        Ok(Self::build(endpoints))
     }
 
-    /// Construct a StorageConfig **without** the INV-D1 persistence
-    /// check — caller asserts the engine will NOT open Raft (`LogStore`)
-    /// or the standalone WAL (`StorageEngine::open_with_wal`).
+    /// Infallible form of [`Self::try_with_endpoints`] for endpoints the
+    /// code builds itself, where an invalid list is a programming error.
+    ///
+    /// # Panics
+    /// On any [`EndpointConfigError`]. Configs with only `Volatile`
+    /// endpoints (in-memory tests) use
+    /// [`Self::with_endpoints_no_persistence`].
+    #[expect(
+        clippy::panic,
+        reason = "endpoints built by the program itself; operator input goes through try_with_endpoints"
+    )]
+    pub fn with_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
+        Self::try_with_endpoints(endpoints)
+            .unwrap_or_else(|e| panic!("invalid StorageConfig endpoints: {e}"))
+    }
+
+    /// Construct a StorageConfig **without** the oplog-durability check:
+    /// the caller asserts the engine will NOT open Raft (`LogStore`) or the
+    /// standalone WAL (`StorageEngine::open_with_wal`).
     ///
     /// Intended for `MemFs`-backed in-memory engines used in unit tests,
     /// migration tools, and pure read-path benchmarks. All other config
@@ -805,54 +814,56 @@ impl StorageConfig {
     /// If a caller created via this constructor later opens `LogStore`
     /// or `open_with_wal`, those calls return an
     /// [`EndpointSelectionError`] — the runtime guard catches misuse.
+    ///
+    /// # Panics
+    /// On any [`EndpointConfigError`] other than
+    /// [`EndpointConfigError::NoOplogEndpoint`].
+    #[expect(
+        clippy::panic,
+        reason = "in-memory configs built by the program itself, never from operator input"
+    )]
     pub fn with_endpoints_no_persistence(endpoints: Vec<EndpointConfig>) -> Self {
-        Self::validate_common(&endpoints);
+        if let Err(e) = Self::validate_common(&endpoints) {
+            panic!("invalid StorageConfig endpoints: {e}");
+        }
         Self::build(endpoints)
     }
 
-    fn validate_common(endpoints: &[EndpointConfig]) {
-        assert!(
-            !endpoints.is_empty(),
-            "StorageConfig requires at least one endpoint"
-        );
-        // ID uniqueness + non-empty.
+    fn validate_common(endpoints: &[EndpointConfig]) -> Result<(), EndpointConfigError> {
+        if endpoints.is_empty() {
+            return Err(EndpointConfigError::NoEndpoints);
+        }
         let mut seen_ids: std::collections::HashSet<&str> =
             std::collections::HashSet::with_capacity(endpoints.len());
-        for ep in endpoints {
-            assert!(
-                !ep.id.is_empty(),
-                "EndpointConfig.id must be non-empty (path: {:?})",
-                ep.path,
-            );
-            assert!(
-                seen_ids.insert(ep.id.as_str()),
-                "duplicate EndpointConfig.id: {:?}",
-                ep.id,
-            );
-        }
-        // Path uniqueness.
         let mut seen_paths: std::collections::HashSet<&Path> =
             std::collections::HashSet::with_capacity(endpoints.len());
         for ep in endpoints {
-            assert!(
-                seen_paths.insert(ep.path.as_path()),
-                "duplicate EndpointConfig.path: {:?} (id: {:?})",
-                ep.path,
-                ep.id,
-            );
-        }
-        // hard_limit ≤ capacity when both > 0.
-        for ep in endpoints {
-            if ep.capacity_bytes > 0 && ep.hard_limit_bytes > 0 {
-                assert!(
-                    ep.hard_limit_bytes <= ep.capacity_bytes,
-                    "EndpointConfig.hard_limit_bytes ({}) > capacity_bytes ({}) on {:?}",
-                    ep.hard_limit_bytes,
-                    ep.capacity_bytes,
-                    ep.id,
-                );
+            if ep.id.is_empty() {
+                return Err(EndpointConfigError::EmptyId {
+                    path: ep.path.clone(),
+                });
+            }
+            if !seen_ids.insert(ep.id.as_str()) {
+                return Err(EndpointConfigError::DuplicateId { id: ep.id.clone() });
+            }
+            if !seen_paths.insert(ep.path.as_path()) {
+                return Err(EndpointConfigError::DuplicatePath {
+                    path: ep.path.clone(),
+                    id: ep.id.clone(),
+                });
+            }
+            if ep.capacity_bytes > 0
+                && ep.hard_limit_bytes > 0
+                && ep.hard_limit_bytes > ep.capacity_bytes
+            {
+                return Err(EndpointConfigError::HardLimitAboveCapacity {
+                    id: ep.id.clone(),
+                    hard_limit: ep.hard_limit_bytes,
+                    capacity: ep.capacity_bytes,
+                });
             }
         }
+        Ok(())
     }
 
     fn build(endpoints: Vec<EndpointConfig>) -> Self {
@@ -990,6 +1001,54 @@ impl StorageConfig {
             .filter(|ep| ep.is_oplog_eligible())
             .collect()
     }
+}
+
+/// Why a list of endpoints cannot form a [`StorageConfig`]; returned by
+/// [`StorageConfig::try_with_endpoints`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EndpointConfigError {
+    /// No endpoint was given.
+    #[error("StorageConfig requires at least one endpoint")]
+    NoEndpoints,
+    /// An endpoint has an empty id.
+    #[error("EndpointConfig.id must be non-empty (path: {path:?})")]
+    EmptyId {
+        /// Path of the endpoint without an id.
+        path: PathBuf,
+    },
+    /// Two endpoints share an id.
+    #[error("duplicate EndpointConfig.id: {id:?}")]
+    DuplicateId {
+        /// The repeated id.
+        id: String,
+    },
+    /// Two endpoints share a directory.
+    #[error("duplicate EndpointConfig.path: {path:?} (id: {id:?})")]
+    DuplicatePath {
+        /// The repeated path.
+        path: PathBuf,
+        /// Id of the second endpoint using it.
+        id: String,
+    },
+    /// An endpoint's hard limit exceeds its declared capacity.
+    #[error(
+        "EndpointConfig.hard_limit_bytes ({hard_limit}) > capacity_bytes ({capacity}) on {id:?}"
+    )]
+    HardLimitAboveCapacity {
+        /// Id of the endpoint.
+        id: String,
+        /// Its `hard_limit_bytes`.
+        hard_limit: u64,
+        /// Its `capacity_bytes`.
+        capacity: u64,
+    },
+    /// Every endpoint is `Volatile`, so none can hold the oplog.
+    #[error(
+        "StorageConfig requires at least one oplog-eligible endpoint (durability \
+         Durable or Degraded): every endpoint is Volatile, and the oplog must \
+         survive a process restart"
+    )]
+    NoOplogEndpoint,
 }
 
 /// Errors returned by [`StorageConfig::select_wal_endpoint`] /

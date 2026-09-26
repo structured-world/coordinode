@@ -311,10 +311,34 @@ fn resolve_storage_config_carries_endpoints() {
         },
         ..ServerConfig::default()
     };
-    let sc = c.resolve_storage_config();
+    let sc = c.resolve_storage_config().expect("valid topology");
     assert_eq!(sc.endpoints.len(), 2);
     assert_eq!(sc.endpoints[0].id, "a");
     assert_eq!(sc.endpoints[1].id, "b");
+}
+
+/// An endpoint topology the engine cannot run on comes from the operator's
+/// file, so it is reported as a configuration error, never a panic.
+#[test]
+fn an_unusable_endpoint_topology_is_an_error_not_a_panic() {
+    let volatile_only = ServerConfig {
+        storage: StorageTopology {
+            endpoints: vec![EndpointConfig::new(
+                "ram",
+                "/mnt/ram",
+                Media::Nvme,
+                Durability::Volatile,
+                Tier::Hot,
+            )],
+            ..StorageTopology::default()
+        },
+        ..ServerConfig::default()
+    };
+    let outcome = std::panic::catch_unwind(|| volatile_only.resolve_storage_config());
+    assert!(
+        matches!(outcome, Ok(Err(EndpointConfigError::NoOplogEndpoint))),
+        "a volatile-only topology must be a NoOplogEndpoint error, got {outcome:?}"
+    );
 }
 
 #[test]
@@ -399,7 +423,7 @@ fn backpressure_thresholds_parse_and_reach_the_storage_config() {
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
-    let sc = c.resolve_storage_config();
+    let sc = c.resolve_storage_config().expect("valid topology");
     assert_eq!(sc.backpressure.l0_stop, 12);
     assert_eq!(sc.backpressure.bytes_stop, 1024);
     // Unset keys stay at their defaults.
