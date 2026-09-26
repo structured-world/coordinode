@@ -19,6 +19,35 @@ fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     (dir, engine)
 }
 
+/// A snapshot capture still running when the node shuts down holds the
+/// engine on its blocking thread. Shutdown waits for it, so the caller that
+/// reopens the directory right after finds it free rather than locked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_reopens_right_after_a_shutdown_during_a_snapshot() {
+    let (dir, engine) = test_engine();
+    let node = RaftNode::single_node(Arc::clone(&engine))
+        .await
+        .expect("bootstrap");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    crate::storage::CAPTURE_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
+    node.raft().trigger().snapshot().await.expect("trigger");
+    // Let the state machine start the capture before the shutdown.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    node.shutdown().await.expect("shutdown");
+    drop(node);
+    drop(engine);
+
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    StorageEngine::open(&config).expect("the directory is free after shutdown");
+}
+
 #[tokio::test]
 async fn single_node_bootstrap_becomes_leader() {
     let (_dir, engine) = test_engine();

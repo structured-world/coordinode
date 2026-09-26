@@ -940,6 +940,66 @@ pub struct CoordinodeStateMachine {
     /// Where the applies stand, held while applying; registered with the
     /// engine as its Raft apply fence.
     gate: Arc<RaftApplyGate>,
+    /// Snapshot work holding the engine off the async runtime, which a
+    /// shutdown waits out.
+    engine_work: EngineWork,
+}
+
+/// Work the state machine runs outside openraft's tasks that holds the
+/// engine: a snapshot capture on a blocking thread, a snapshot build.
+///
+/// Shutting openraft down stops its tasks, but a blocking thread they were
+/// waiting on runs to its end, and a build task can outlive the core. Until
+/// both finish they hold the engine, so the directory stays locked and a
+/// restart in the same process cannot open it. The node waits for this to
+/// go idle after the consensus stops.
+#[derive(Clone, Default)]
+pub struct EngineWork(Arc<EngineWorkInner>);
+
+#[derive(Default)]
+struct EngineWorkInner {
+    running: core::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// One piece of [`EngineWork`] under way; finishes on drop.
+pub(crate) struct EngineWorkGuard(Arc<EngineWorkInner>);
+
+impl EngineWork {
+    pub(crate) fn start(&self) -> EngineWorkGuard {
+        self.0
+            .running
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        EngineWorkGuard(Arc::clone(&self.0))
+    }
+
+    /// Wait until no work holds the engine, for at most `timeout`. `false`
+    /// when some was still running at the deadline.
+    pub async fn wait_idle(&self, timeout: std::time::Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.0.idle.notified();
+                if self.0.running.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
+
+impl Drop for EngineWorkGuard {
+    fn drop(&mut self) {
+        if self
+            .0
+            .running
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
 }
 
 /// This node's Raft apply position, locked by the state machine for every
@@ -970,6 +1030,12 @@ impl RaftApplyFence for RaftApplyGate {
         work(&mut state.applies, &payload)
     }
 }
+
+/// How long a snapshot capture sleeps before it starts, so a test can shut a
+/// node down while one is under way.
+#[cfg(test)]
+pub(crate) static CAPTURE_DELAY_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Where snapshot builds capture the store, under the engine's data
 /// directory. Nothing under it outlives the build that made it; a crash
@@ -1098,6 +1164,7 @@ impl CoordinodeStateMachine {
             folded,
             captures: 0,
             gate,
+            engine_work: EngineWork::default(),
         })
     }
 
@@ -1106,6 +1173,12 @@ impl CoordinodeStateMachine {
     /// metrics and tests.
     pub fn snapshot_builds_handle(&self) -> Arc<core::sync::atomic::AtomicU64> {
         Arc::clone(&self.snapshot_builds)
+    }
+
+    /// Handle to the snapshot work holding the engine, which a node's
+    /// shutdown waits out.
+    pub fn engine_work_handle(&self) -> EngineWork {
+        self.engine_work.clone()
     }
 
     /// Handle to the per-shard `maxAssigned` watermark, if one was wired
@@ -1463,13 +1536,27 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         // taken now is that state; reading the live store later is not.
         self.captures += 1;
         let dir = snapshot_capture_root(&self.engine).join(format!("{:020}", self.captures));
+        // Counted from before the capture to the builder's end, so the work
+        // never reads idle between the two.
+        let builder_work = self.engine_work.start();
         let engine = Arc::clone(&self.engine);
         let target = dir.clone();
+        let work = self.engine_work.start();
         let capture = match tokio::task::spawn_blocking(move || {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
-            }
-            engine.capture(&target).map_err(|e| e.to_string())
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(
+                CAPTURE_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
+            ));
+            let captured = match target.parent() {
+                Some(parent) => std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {parent:?}: {e}"))
+                    .and_then(|()| engine.capture(&target).map_err(|e| e.to_string())),
+                None => engine.capture(&target).map_err(|e| e.to_string()),
+            };
+            // The engine is released before the work is counted done.
+            drop(engine);
+            drop(work);
+            captured
         })
         .await
         {
@@ -1484,6 +1571,8 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             last_membership,
             snapshot_builds: Arc::clone(&self.snapshot_builds),
             capture,
+            engine_work: self.engine_work.clone(),
+            _work: builder_work,
         }
     }
 
@@ -1604,6 +1693,11 @@ pub struct CoordinodeSnapshotBuilder {
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
     /// The store captured at `last_applied`, or why it could not be.
     capture: Result<std::path::PathBuf, String>,
+    /// Where the build's blocking work is counted.
+    engine_work: EngineWork,
+    /// Counts this builder as work holding the engine. Declared last, so it
+    /// is dropped after `engine`.
+    _work: EngineWorkGuard,
 }
 
 impl Drop for CoordinodeSnapshotBuilder {
@@ -1636,7 +1730,11 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         // Serialize the captured store: every entry up to `last_log_id`, none
         // after it.
         let dir = self.capture.clone().map_err(io::Error::other)?;
+        // The capture's tables are hard links into the store's; the build
+        // counts as work on the store until it has closed them.
+        let work = self.engine_work.start();
         let data = tokio::task::spawn_blocking(move || {
+            let _work = work;
             let captured = StorageEngine::open_checkpoint(&dir)
                 .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
             crate::snapshot::build_full_snapshot(&captured)

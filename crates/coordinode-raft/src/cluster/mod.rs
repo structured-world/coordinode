@@ -80,6 +80,11 @@ impl Default for SnapshotTriggerConfig {
     }
 }
 
+/// How long a shutdown waits for snapshot work still holding the engine: a
+/// full build of a large store takes minutes, and cutting it short would
+/// leave the directory locked for the caller that reopens it.
+const SNAPSHOT_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
+
 pub struct RaftNode {
     /// The openraft instance.
     raft: Arc<RaftInstance>,
@@ -88,6 +93,8 @@ pub struct RaftNode {
     /// Snapshot-build counter (from state machine); see
     /// [`RaftNode::snapshot_builds`].
     snapshot_builds: Arc<core::sync::atomic::AtomicU64>,
+    /// Snapshot work holding the engine, which `shutdown()` waits out.
+    engine_work: crate::storage::EngineWork,
     /// This node's ID.
     node_id: u64,
     /// Address peers dial to reach this node. `None` for a standalone node and
@@ -174,6 +181,7 @@ impl RaftNode {
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
+        let engine_work = state_machine.engine_work_handle();
 
         let network = StubNetworkFactory;
 
@@ -226,6 +234,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            engine_work,
             node_id,
             advertise_addr: None,
             engine,
@@ -304,6 +313,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
+        let engine_work = state_machine.engine_work_handle();
 
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
@@ -381,6 +391,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            engine_work,
             node_id,
             advertise_addr: Some(advertise_addr),
             engine,
@@ -457,6 +468,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
+        let engine_work = state_machine.engine_work_handle();
 
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
@@ -509,6 +521,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            engine_work,
             node_id,
             advertise_addr: Some(advertise_addr),
             engine,
@@ -570,6 +583,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
+        let engine_work = state_machine.engine_work_handle();
 
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
@@ -599,6 +613,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            engine_work,
             node_id,
             advertise_addr: None,
             engine,
@@ -662,6 +677,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
+        let engine_work = state_machine.engine_work_handle();
 
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
@@ -709,6 +725,7 @@ impl RaftNode {
             raft,
             applied_rx,
             snapshot_builds,
+            engine_work,
             node_id,
             advertise_addr: None,
             engine,
@@ -1455,6 +1472,18 @@ impl RaftNode {
             {
                 task.abort();
             }
+        }
+
+        // A snapshot capture or build started before the consensus stopped
+        // keeps running on its blocking thread and holds the engine, so the
+        // directory stays locked until it ends. Wait for it: a caller that
+        // reopens the directory after this returns must find it free.
+        if !self.engine_work.wait_idle(SNAPSHOT_WORK_DRAIN).await {
+            tracing::warn!(
+                node_id = self.node_id,
+                ?SNAPSHOT_WORK_DRAIN,
+                "snapshot work still holds the engine after shutdown"
+            );
         }
 
         // Flush active memtables to SST so Phase 2 (reopen) sees all writes.

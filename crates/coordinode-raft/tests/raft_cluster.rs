@@ -1108,11 +1108,17 @@ async fn cluster_snapshot_build_and_purge() {
             .await
             .expect("trigger snapshot");
 
-        // Wait for snapshot to complete
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-
-        // Verify snapshot exists via get_snapshot
-        let snap = n1.node.raft().get_snapshot().await.expect("get_snapshot");
+        // The build captures the store (a flush of every partition) before
+        // it serializes, which on a slow disk takes seconds: wait for it
+        // rather than for a fixed time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let snap = loop {
+            let snap = n1.node.raft().get_snapshot().await.expect("get_snapshot");
+            if snap.is_some() || std::time::Instant::now() >= deadline {
+                break snap;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         assert!(snap.is_some(), "snapshot should exist after trigger");
 
         let snap = snap.expect("snap");
@@ -3274,6 +3280,41 @@ async fn cluster_join_monitor_and_promote() {
     assert!(
         result.is_ok(),
         "TIMED OUT — cluster_join_monitor_and_promote"
+    );
+}
+
+/// The last voter of a group shuts down after its peer is gone. Whether it
+/// leads is read from its own state: confirming leadership needs a quorum
+/// once the lease has run out, and there is none left, so a shutdown that
+/// asked for confirmation would wait forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_voter_shuts_down_after_its_peer_is_gone() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add node 2");
+        n1.node
+            .change_membership(vec![1, 2])
+            .await
+            .expect("membership");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Node 1 hands leadership to node 2 and leaves.
+        n1.node.shutdown().await.expect("n1 shutdown");
+        // Past any leadership lease node 2 holds.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        n2.node.shutdown().await.expect("n2 shutdown");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: the last voter never finished shutting down"
     );
 }
 
