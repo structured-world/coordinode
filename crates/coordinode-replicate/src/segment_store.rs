@@ -452,7 +452,7 @@ impl SegmentInstaller {
     /// Each peer serves the partition at its own Raft position, so pieces are
     /// pulled only from peers whose copy is byte-identical to the first one's.
     /// A copy standing behind this node's applies is refused and the pull
-    /// retried, up to [`REPAIR_ATTEMPTS`] times.
+    /// retried, up to `REPAIR_ATTEMPTS` (5) times.
     ///
     /// Must be called from within a tokio runtime; the synchronous download loop
     /// and the install run on blocking threads.
