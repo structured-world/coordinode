@@ -1931,6 +1931,58 @@ fn hint_double_quoted_value() {
     );
 }
 
+/// `vector_build_wait` takes a whole number with its unit.
+#[test]
+fn hint_vector_build_wait() {
+    use std::time::Duration;
+    for (text, expected) in [
+        ("250ms", Duration::from_millis(250)),
+        ("5s", Duration::from_secs(5)),
+        ("2m", Duration::from_secs(120)),
+        ("0s", Duration::ZERO),
+    ] {
+        let q = parse_ok(&format!(
+            "MATCH (n) RETURN n /*+ vector_build_wait('{text}') */"
+        ));
+        assert_eq!(
+            q.hints,
+            vec![QueryHint::VectorBuildWait(expected)],
+            "{text}"
+        );
+    }
+}
+
+/// A known hint with a value it cannot take is refused, not dropped: the
+/// caller would otherwise run with a bound or mode it never asked for.
+#[test]
+fn hint_known_key_with_bad_value_is_refused() {
+    for query in [
+        "MATCH (n) RETURN n /*+ vector_build_wait('5') */",
+        "MATCH (n) RETURN n /*+ vector_build_wait('1.5s') */",
+        "MATCH (n) RETURN n /*+ vector_build_wait('-1s') */",
+        "MATCH (n) RETURN n /*+ vector_build_wait('five seconds') */",
+        "MATCH (n) RETURN n /*+ vector_build_wait('99999999999999999999m') */",
+        "MATCH (n) RETURN n /*+ vector_consistency('sometimes') */",
+        "MATCH (n) RETURN n /*+ read_consistency('eventual') */",
+    ] {
+        assert!(crate::cypher::parse(query).is_err(), "accepted: {query}");
+    }
+}
+
+/// The wait parser refuses what does not fit rather than wrapping it.
+#[test]
+fn parse_wait_refuses_overflow() {
+    assert_eq!(
+        crate::cypher::parse_wait(&format!("{}m", u64::MAX)),
+        None,
+        "minutes past u64 milliseconds"
+    );
+    assert_eq!(
+        crate::cypher::parse_wait(&format!("{}ms", u64::MAX)),
+        Some(std::time::Duration::from_millis(u64::MAX))
+    );
+}
+
 // --- CREATE TEXT INDEX DDL (G016) ---
 
 #[test]

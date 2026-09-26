@@ -10023,8 +10023,14 @@ fn run_cypher_with_registries(
     let plan = build_logical_plan(&ast).map_err(|e| format!("plan error: {e}"))?;
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(1000));
     let mut ctx = make_test_ctx(engine, interner, &allocator);
-    ctx.vector_indexes = vector_reg
-        .map(|registry| coordinode_query::executor::runner::VectorIndexes { registry, engine });
+    ctx.vector_indexes =
+        vector_reg.map(
+            |registry| coordinode_query::executor::runner::VectorIndexes {
+                registry,
+                engine,
+                build_wait: std::time::Duration::from_secs(30),
+            },
+        );
     ctx.text_index_registry = text_reg;
     execute(&plan, &mut ctx).map_err(|e| format!("execute error: {e}"))
 }
@@ -11782,6 +11788,7 @@ fn hnsw_scan_executor_returns_index_top_k() {
     ctx.vector_indexes = Some(coordinode_query::executor::runner::VectorIndexes {
         registry: &registry,
         engine,
+        build_wait: std::time::Duration::from_secs(30),
     });
     let rows = execute(&plan, &mut ctx).expect("HnswScan must execute");
 

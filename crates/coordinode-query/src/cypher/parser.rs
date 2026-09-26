@@ -17,7 +17,7 @@ struct CypherParser;
 /// Parse a Cypher query string into a typed AST.
 pub fn parse(input: &str) -> Result<Query, ParseError> {
     // Extract /*+ hint */ comments before PEG parsing (PEG strips all /* */ as COMMENT).
-    let (cleaned, hints) = extract_query_hints(input);
+    let (cleaned, hints) = extract_query_hints(input)?;
 
     let pairs = CypherParser::parse(Rule::query, &cleaned).map_err(|e| {
         let (line, col) = match e.line_col {
@@ -47,8 +47,10 @@ pub fn parse(input: &str) -> Result<Query, ParseError> {
 /// Extract `/*+ key('value') */` hints from a query string.
 ///
 /// Returns the cleaned query (hints replaced with whitespace) and a list
-/// of parsed hints. Unknown hint keys are silently ignored.
-fn extract_query_hints(input: &str) -> (String, Vec<QueryHint>) {
+/// of parsed hints. Unknown hint keys are ignored, so a query stays portable
+/// to a server that does not know them; a known key with a value it cannot
+/// take is an error rather than a hint silently not applied.
+fn extract_query_hints(input: &str) -> Result<(String, Vec<QueryHint>), ParseError> {
     let mut hints = Vec::new();
     let mut result = input.to_string();
 
@@ -58,7 +60,7 @@ fn extract_query_hints(input: &str) -> (String, Vec<QueryHint>) {
             let end = start + rel_end + 2;
             let body = result[start + 3..start + rel_end].trim();
 
-            if let Some(hint) = parse_single_hint(body) {
+            if let Some(hint) = parse_single_hint(body)? {
                 hints.push(hint);
             }
 
@@ -70,39 +72,73 @@ fn extract_query_hints(input: &str) -> (String, Vec<QueryHint>) {
         }
     }
 
-    (result, hints)
+    Ok((result, hints))
 }
 
 /// Parse a single hint body like `vector_consistency('snapshot')`.
-fn parse_single_hint(body: &str) -> Option<QueryHint> {
-    // Split on '(' to get key and value
-    let (key, rest) = body.split_once('(')?;
+fn parse_single_hint(body: &str) -> Result<Option<QueryHint>, ParseError> {
+    // Split on '(' to get key and value; a body of another shape is not a
+    // hint this parser knows.
+    let Some((key, rest)) = body.split_once('(') else {
+        return Ok(None);
+    };
     let key = key.trim();
-    let value = rest.strip_suffix(')')?.trim();
+    let Some(value) = rest.strip_suffix(')') else {
+        return Ok(None);
+    };
+    let value = value.trim();
 
     // Strip quotes from value
-    let unquoted = if (value.starts_with('\'') && value.ends_with('\''))
-        || (value.starts_with('"') && value.ends_with('"'))
+    let unquoted = if value.len() >= 2
+        && ((value.starts_with('\'') && value.ends_with('\''))
+            || (value.starts_with('"') && value.ends_with('"')))
     {
         &value[1..value.len() - 1]
     } else {
         value
     };
+    let invalid = |expected: &str| {
+        ParseError::Invalid(format!("hint {key}('{unquoted}'): expected {expected}"))
+    };
 
     match key {
         "vector_consistency" => {
-            let mode =
-                coordinode_core::graph::types::VectorConsistencyMode::from_str_opt(unquoted)?;
-            Some(QueryHint::VectorConsistency(mode))
+            let mode = coordinode_core::graph::types::VectorConsistencyMode::from_str_opt(unquoted)
+                .ok_or_else(|| invalid("'current', 'snapshot' or 'exact'"))?;
+            Ok(Some(QueryHint::VectorConsistency(mode)))
         }
         "read_consistency" => {
-            let mode = coordinode_core::txn::read_consistency::ReadConsistencyMode::from_str_opt(
-                unquoted,
-            )?;
-            Some(QueryHint::ReadConsistency(mode))
+            let mode =
+                coordinode_core::txn::read_consistency::ReadConsistencyMode::from_str_opt(unquoted)
+                    .ok_or_else(|| invalid("'current', 'snapshot' or 'exact'"))?;
+            Ok(Some(QueryHint::ReadConsistency(mode)))
         }
-        _ => None, // Unknown hint — silently ignored
+        "vector_build_wait" => {
+            let wait = parse_wait(unquoted)
+                .ok_or_else(|| invalid("a duration such as '500ms', '5s' or '2m'"))?;
+            Ok(Some(QueryHint::VectorBuildWait(wait)))
+        }
+        _ => Ok(None), // Unknown hint: ignored
     }
+}
+
+/// Parse a wait such as `500ms`, `5s` or `2m`: a whole number followed by its
+/// unit. `None` for any other text, or a value that does not fit.
+pub fn parse_wait(text: &str) -> Option<core::time::Duration> {
+    let text = text.trim();
+    let (digits, millis_per_unit) = if let Some(n) = text.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = text.strip_suffix('s') {
+        (n, 1_000)
+    } else {
+        (text.strip_suffix('m')?, 60_000)
+    };
+    let digits = digits.trim_end();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let millis = digits.parse::<u64>().ok()?.checked_mul(millis_per_unit)?;
+    Some(core::time::Duration::from_millis(millis))
 }
 
 fn build_query(pairs: Pairs<'_, Rule>) -> Result<Query, ParseError> {

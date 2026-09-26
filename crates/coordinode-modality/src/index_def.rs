@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 /// the caller can route to a fallback path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnlineDuringBuild {
-    /// Reader waits (up to a deadline) until the build on the member serving
-    /// it has made the index complete, then proceeds.
+    /// Reader waits, up to the bound its caller chose (`vector_build_wait`),
+    /// until the build on the member serving it has made the index
+    /// complete, then proceeds.
     #[default]
     Block,
     /// Reader uses the partial index immediately. Recall improves as the

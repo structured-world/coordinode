@@ -146,6 +146,7 @@ pub(crate) async fn serve(
         peers: peers_vec,
         membership_change_timeout_secs,
         planner_stats_ttl_secs,
+        vector_build_wait_ms,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -590,6 +591,9 @@ pub(crate) async fn serve(
     .map_err(|e| format!("failed to open database: {e}"))?;
     if let Some(secs) = planner_stats_ttl_secs {
         database.set_stats_ttl(std::time::Duration::from_secs(secs));
+    }
+    if let Some(ms) = vector_build_wait_ms {
+        database.set_vector_build_wait(std::time::Duration::from_millis(ms));
     }
     // no-std: spin::RwLock (drop-in).
     let database = Arc::new(parking_lot::RwLock::new(database));

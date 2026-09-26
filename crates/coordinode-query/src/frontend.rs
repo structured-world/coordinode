@@ -29,6 +29,9 @@ pub struct ParsedQuery {
     /// [`LogicalPlan::vector_consistency`] is what it asked for and a session
     /// setting must not replace it.
     pub vector_consistency_hinted: bool,
+    /// How long the query itself asked to wait for a vector index still
+    /// being built; `None` leaves it to the session.
+    pub vector_build_wait: Option<core::time::Duration>,
 }
 
 /// Why a [`QueryFrontend`] could not turn surface text into a [`ParsedQuery`].
@@ -109,11 +112,17 @@ impl QueryFrontend for CypherFrontend {
             .hints
             .iter()
             .any(|h| matches!(h, crate::cypher::ast::QueryHint::VectorConsistency(_)));
+        // The last one wins when a query names it twice, as for every hint.
+        let vector_build_wait = ast.hints.iter().rev().find_map(|h| match h {
+            crate::cypher::ast::QueryHint::VectorBuildWait(wait) => Some(*wait),
+            _ => None,
+        });
         Ok(ParsedQuery {
             plan,
             canonical,
             fingerprint,
             vector_consistency_hinted,
+            vector_build_wait,
         })
     }
 

@@ -649,6 +649,15 @@ RETURN n
 |------|--------|---------|
 | `vector_consistency` | `'current'`, `'snapshot'`, `'exact'` | follows `read_consistency` |
 | `read_consistency` | `'current'`, `'snapshot'`, `'exact'` | `'current'` single-modality, auto-promoted to `'snapshot'` for cross-modality |
+| `vector_build_wait` | a whole number with `ms`, `s` or `m`, e.g. `'5s'` | the session's `SET vector_build_wait`, else the server's `vector_build_wait_ms` (30 s) |
+
+A hint key the server does not know is ignored, so a query stays portable; a
+known key with a value it cannot take is refused with a parse error rather than
+silently dropped.
+
+`vector_build_wait` bounds how long the query waits for a vector index still
+being built under the `block` online-during-build policy; see
+[Online-during-build policy](./extensions.md#online-during-build-policy).
 
 ### `read_consistency`
 

@@ -451,6 +451,9 @@ pub struct VectorIndexes<'a> {
     pub registry: &'a crate::index::VectorIndexRegistry,
     /// The engine the indexes are built from, the one the context reads.
     pub engine: &'a Arc<StorageEngine>,
+    /// How long a reader under the `block` policy waits for an index still
+    /// being built before it fails: the query's hint, else the session's.
+    pub build_wait: std::time::Duration,
 }
 
 pub struct ExecutionContext<'a> {
@@ -3710,15 +3713,16 @@ fn execute_hnsw_scan(
     index_name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let Some(registry) = ctx.vector_index_registry() else {
+    let Some(indexes) = ctx.vector_indexes else {
         return Err(ExecutionError::Unsupported(format!(
             "HnswScan({index_name}) requires vector indexes in ExecutionContext"
         )));
     };
+    let registry = indexes.registry;
     refuse_current_only_index(ctx, HistoricalIndexKind::Vector, label, property)?;
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
-    gate_vector_index_read(ctx.engine, registry, label, property)?;
+    gate_vector_index_read(indexes, label, property)?;
 
     let qv_val = eval_neutral(query_vector, &Row::new())?;
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
@@ -4943,10 +4947,10 @@ fn try_hnsw_vector_top_k(
         return Ok(None);
     }
 
-    let registry = match ctx.vector_index_registry() {
-        Some(r) => r,
-        None => return Ok(None),
+    let Some(indexes) = ctx.vector_indexes else {
+        return Ok(None);
     };
+    let registry = indexes.registry;
 
     // Extract variable name and property from vector_expr (e.g. n.embedding).
     let (variable, property) = match vector_expr {
@@ -5019,7 +5023,7 @@ fn try_hnsw_vector_top_k(
     // Capped at 10_000 to prevent excessive memory for massive result sets.
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
-    gate_vector_index_read(ctx.engine, registry, &label_str, &property_str)?;
+    gate_vector_index_read(indexes, &label_str, &property_str)?;
 
     // ACORN-style filtered search: when the planner pushed a predicate down,
     // pass it as a visibility closure so the HNSW traversal prunes branches
@@ -8577,24 +8581,24 @@ fn execute_create_from_pattern(
     }
 }
 
-/// Try to extract f32 vector data from a Value.
-///
-/// Handles both `Value::Vector` (native) and `Value::Array` containing
-/// only Float/Int elements (Cypher array literals like `[1.0, 0.0]`).
 /// Gate a vector search against the index's persisted build state and
 /// online-during-build policy. Returns `Ok(())` when the caller can use
 /// the in-memory HNSW handle, `Err(...)` when the caller must abort.
+///
+/// Under `Block` the reader waits at most `indexes.build_wait`, the bound
+/// its caller chose (query hint, else session setting).
 ///
 /// Cost: when the in-memory registry policy is `PartialRecall` this is a
 /// single map lookup with no schema read — the dominant common case.
 /// `Block` and `Offline` policies plus the rarely-hit `Failed` recovery
 /// path consult the persisted schema for a fresh state.
 fn gate_vector_index_read(
-    engine: &StorageEngine,
-    registry: &crate::index::VectorIndexRegistry,
+    indexes: VectorIndexes<'_>,
     label: &str,
     property: &str,
 ) -> Result<(), ExecutionError> {
+    let registry = indexes.registry;
+    let engine: &StorageEngine = indexes.engine;
     let Some(def) = registry.get_definition(label, property) else {
         // No registered def — caller will fall back to brute-force or
         // return an empty result. Not our gate to enforce.
@@ -8618,7 +8622,9 @@ fn gate_vector_index_read(
     // the transactions opened before the handover, this one among them, so a
     // reader waiting for the persisted state would wait for itself.
     let local = registry.health_handle(label, property);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let wait = indexes.build_wait;
+    // A wait too long to add to the clock is no bound at all.
+    let deadline = std::time::Instant::now().checked_add(wait);
     let poll_step = std::time::Duration::from_millis(25);
     loop {
         if let Some(health) = &local {
@@ -8655,13 +8661,22 @@ fn gate_vector_index_read(
                     )));
                 }
                 OnlineDuringBuild::Block => {
-                    if std::time::Instant::now() >= deadline {
+                    let remaining = match deadline {
+                        Some(deadline) => {
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                        }
+                        None => poll_step,
+                    };
+                    if remaining.is_zero() {
                         return Err(ExecutionError::Unsupported(format!(
-                            "vector index '{}' still building after 30s",
+                            "vector index '{}' still building after {wait:?}; wait longer \
+                             with /*+ vector_build_wait('...') */ or the session's \
+                             vector_build_wait",
                             def.name
                         )));
                     }
-                    std::thread::sleep(poll_step);
+                    // Never sleep past the caller's bound.
+                    std::thread::sleep(poll_step.min(remaining));
                     continue;
                 }
                 OnlineDuringBuild::PartialRecall => {
@@ -15478,6 +15493,7 @@ fn execute_create_vector_index(
     let Some(VectorIndexes {
         registry,
         engine: engine_arc,
+        ..
     }) = ctx.vector_indexes
     else {
         return Err(ExecutionError::Unsupported(

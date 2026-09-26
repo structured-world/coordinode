@@ -107,6 +107,10 @@ pub struct ServerConfig {
     /// read again, in seconds (`None` = 60). A read that fails is remembered
     /// for the same time.
     pub planner_stats_ttl_secs: Option<u64>,
+    /// How long a query waits for a vector index still being built, under
+    /// the `block` policy, when it names no bound of its own, in milliseconds
+    /// (`None` = 30000). A query's `vector_build_wait` hint overrides it.
+    pub vector_build_wait_ms: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -236,6 +240,7 @@ impl Default for ServerConfig {
             peers: Vec::new(),
             membership_change_timeout_secs: None,
             planner_stats_ttl_secs: None,
+            vector_build_wait_ms: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

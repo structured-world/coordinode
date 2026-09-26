@@ -66,6 +66,19 @@ fn planner_stats_ttl_parses_from_the_config_file() {
     assert_eq!(c.planner_stats_ttl_secs, Some(5));
 }
 
+/// The default bound on waiting for a building vector index is a config-file
+/// setting: unset it leaves the database default, set it carries the
+/// milliseconds given.
+#[test]
+fn vector_build_wait_parses_from_the_config_file() {
+    assert!(ServerConfig::default().vector_build_wait_ms.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "vector_build_wait_ms: 1500\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.vector_build_wait_ms, Some(1500));
+}
+
 #[test]
 fn cli_overrides_beat_the_config_file() {
     // The CLI carries only bootstrap-critical knobs now; a fine tunable

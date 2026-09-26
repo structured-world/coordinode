@@ -174,6 +174,9 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
             crate::cypher::ast::QueryHint::ReadConsistency(mode) => {
                 read_consistency_hint = Some(*mode);
             }
+            // An execution setting, not part of the plan: the frontend
+            // carries it beside the plan.
+            crate::cypher::ast::QueryHint::VectorBuildWait(_) => {}
         }
     }
 

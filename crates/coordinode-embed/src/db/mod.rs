@@ -164,6 +164,10 @@ const STATS_CACHE_TTL_SECS: u64 = 60;
 /// missing a write its own timestamp covers.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// How long a query waits for a vector index still being built, under the
+/// `block` policy, when neither the query nor the session names a bound.
+pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Number of node IDs to pre-allocate per batch.
 ///
 /// On startup, the database reserves `ID_BATCH_SIZE` IDs by persisting
@@ -361,6 +365,11 @@ pub struct Database {
     /// replaces what a query's `read_consistency` implies, but not a mode the
     /// query names in a hint. `None`: each query decides.
     vector_consistency: Option<VectorConsistencyMode>,
+    /// How long a query waits for a vector index still being built, under
+    /// the `block` policy, unless it names its own bound in a hint. Set by
+    /// `SET vector_build_wait` or [`Database::set_vector_build_wait`]; the
+    /// server sets it from its configuration.
+    vector_build_wait: Duration,
     /// Session-level read concern. Default: Local.
     read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
     /// One-shot snapshot timestamp for the next query (consumed on use).
@@ -494,6 +503,8 @@ struct CachedPlan {
     plan: planner::logical::LogicalPlan,
     /// The query named its own vector consistency in a hint.
     vector_consistency_hinted: bool,
+    /// The bound the query named in a `vector_build_wait` hint, if any.
+    vector_build_wait: Option<Duration>,
 }
 
 /// Bounded query-string → [`CachedPlan`] cache shared across all
@@ -557,6 +568,15 @@ impl PlanCache {
 /// service layer can shrink from "one Database mutex per request"
 /// to "Database held shared, only the actual write-paths take an
 /// exclusive lock".
+/// A session setting a `SET` command changes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SessionSet {
+    /// `SET vector_consistency = 'mode'`.
+    VectorConsistency(VectorConsistencyMode),
+    /// `SET vector_build_wait = '5s'`.
+    VectorBuildWait(Duration),
+}
+
 #[derive(Debug, Clone)]
 struct QuerySession {
     read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
@@ -1091,6 +1111,7 @@ impl Database {
             proposal_id_gen,
             pipeline,
             vector_consistency: None,
+            vector_build_wait: DEFAULT_VECTOR_BUILD_WAIT,
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             cached_stats: Mutex::new(None),
@@ -1552,11 +1573,16 @@ impl Database {
     /// can stay on `&self`; this method needs `&mut self` because it
     /// mutates the session default field.
     fn try_apply_session_set(&mut self, query: &str) -> bool {
-        if let Some(mode) = Self::try_parse_session_set(query) {
-            self.vector_consistency = Some(mode);
-            true
-        } else {
-            false
+        match Self::try_parse_session_set(query) {
+            Some(SessionSet::VectorConsistency(mode)) => {
+                self.vector_consistency = Some(mode);
+                true
+            }
+            Some(SessionSet::VectorBuildWait(wait)) => {
+                self.vector_build_wait = wait;
+                true
+            }
+            None => false,
         }
     }
 
@@ -1658,6 +1684,7 @@ impl Database {
                 fingerprint: parsed.fingerprint,
                 plan: parsed.plan,
                 vector_consistency_hinted: parsed.vector_consistency_hinted,
+                vector_build_wait: parsed.vector_build_wait,
             }),
         );
         let session = self.capture_session();
@@ -2121,6 +2148,22 @@ impl Database {
         self.vector_consistency.unwrap_or_default()
     }
 
+    /// Set how long a query waits for a vector index still being built,
+    /// under the `block` policy, before it fails.
+    ///
+    /// Equivalent to `SET vector_build_wait = '5s'` in Cypher; a query that
+    /// names its own bound in a `vector_build_wait` hint keeps it. Takes
+    /// effect from the next query. Default [`DEFAULT_VECTOR_BUILD_WAIT`].
+    pub fn set_vector_build_wait(&mut self, wait: Duration) {
+        self.vector_build_wait = wait;
+    }
+
+    /// How long a query waits for a vector index still being built, when it
+    /// names no bound of its own.
+    pub fn vector_build_wait(&self) -> Duration {
+        self.vector_build_wait
+    }
+
     /// Set session-level read concern.
     pub fn set_read_concern(
         &mut self,
@@ -2386,12 +2429,14 @@ impl Database {
         // canonical form, fingerprint, and unoptimized logical plan.
         // Optimizer passes below still run on the cloned plan so they
         // observe the current index registry / stats.
-        let (canonical, fp, mut plan, hinted) = match self.plan_cache.get(query) {
+        let (canonical, fp, mut plan, hinted, hinted_build_wait) = match self.plan_cache.get(query)
+        {
             Some(cached) => (
                 cached.canonical.clone(),
                 cached.fingerprint,
                 cached.plan.clone(),
                 cached.vector_consistency_hinted,
+                cached.vector_build_wait,
             ),
             None => {
                 // Parse, validate, lower, and fingerprint through the query
@@ -2405,6 +2450,7 @@ impl Database {
                         fingerprint: parsed.fingerprint,
                         plan: parsed.plan.clone(),
                         vector_consistency_hinted: parsed.vector_consistency_hinted,
+                        vector_build_wait: parsed.vector_build_wait,
                     }),
                 );
                 (
@@ -2412,6 +2458,7 @@ impl Database {
                     parsed.fingerprint,
                     parsed.plan,
                     parsed.vector_consistency_hinted,
+                    parsed.vector_build_wait,
                 )
             }
         };
@@ -2589,6 +2636,8 @@ impl Database {
             vector_indexes: Some(coordinode_query::executor::runner::VectorIndexes {
                 registry: &self.vector_index_registry,
                 engine: &self.engine,
+                // The query's own bound wins over the session's.
+                build_wait: hinted_build_wait.unwrap_or(self.vector_build_wait),
             }),
             btree_index_registry: Some(&self.index_registry),
             // Extension-op handlers for this Database (empty by default). An
@@ -3305,38 +3354,42 @@ impl Database {
 
     /// Try to parse a session SET command.
     ///
-    /// Supports: `SET vector_consistency = 'mode'`
-    /// Returns `Some(mode)` if matched, `None` otherwise.
-    fn try_parse_session_set(query: &str) -> Option<VectorConsistencyMode> {
+    /// Supports `SET vector_consistency = 'mode'` and
+    /// `SET vector_build_wait = '5s'`. `None` for anything else, including a
+    /// value the setting cannot take: the text then goes to the Cypher parser,
+    /// which refuses it.
+    fn try_parse_session_set(query: &str) -> Option<SessionSet> {
         let trimmed = query.trim();
 
-        // Case-insensitive matching for SET vector_consistency = '...'
+        // Case-insensitive matching for SET <name> = '...'
         let lower = trimmed.to_ascii_lowercase();
         if !lower.starts_with("set ") {
             return None;
         }
 
         let rest = trimmed[4..].trim();
-        let lower_rest = rest.to_ascii_lowercase();
-        if !lower_rest.starts_with("vector_consistency") {
-            return None;
-        }
-
-        // Find '=' sign
-        let after_name = rest["vector_consistency".len()..].trim();
-        let after_eq = after_name.strip_prefix('=')?;
+        let (name, after_eq) = rest.split_once('=')?;
         let value = after_eq.trim();
 
         // Strip quotes (single or double)
-        let unquoted = if (value.starts_with('\'') && value.ends_with('\''))
-            || (value.starts_with('"') && value.ends_with('"'))
+        let unquoted = if value.len() >= 2
+            && ((value.starts_with('\'') && value.ends_with('\''))
+                || (value.starts_with('"') && value.ends_with('"')))
         {
             &value[1..value.len() - 1]
         } else {
             value
         };
 
-        VectorConsistencyMode::from_str_opt(unquoted)
+        match name.trim().to_ascii_lowercase().as_str() {
+            "vector_consistency" => {
+                VectorConsistencyMode::from_str_opt(unquoted).map(SessionSet::VectorConsistency)
+            }
+            "vector_build_wait" => {
+                coordinode_query::cypher::parse_wait(unquoted).map(SessionSet::VectorBuildWait)
+            }
+            _ => None,
+        }
     }
 }
 

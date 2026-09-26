@@ -71,9 +71,29 @@ governed by `online_during_build`:
 
 | Value | Behaviour |
 |-------|-----------|
-| `"block"` (default) | Reader waits, up to 30 seconds, until the index on the member serving it is complete, then proceeds. Matches the legacy synchronous semantic for callers that just want "do the right thing". |
+| `"block"` (default) | Reader waits until the index on the member serving it is complete, then proceeds; if the wait runs out first it gets an error. The caller decides how long (see below). Matches the legacy synchronous semantic for callers that just want "do the right thing". |
 | `"partial-recall"` | Reader hits the partial HNSW graph immediately. Recall improves as the backfill writes more vectors; useful when search latency matters more than completeness. |
 | `"offline"` | Reader gets an error so it can pick a fallback path (e.g. brute force, alternative index, or queueing). |
+
+How long a `"block"` reader waits is the caller's choice, most specific
+first:
+
+```cypher
+-- This query only: wait up to 5 seconds, then fail.
+MATCH (p:Product)
+RETURN p.name, vector_distance(p.embedding, $q) AS d
+ORDER BY d LIMIT 10 /*+ vector_build_wait('5s') */
+
+-- Every later query of this embedded session that names no bound.
+SET vector_build_wait = '250ms'
+```
+
+Values are a whole number with a unit: `ms`, `s` or `m`; `'0ms'` refuses a
+building index at once. A malformed value is an error, not a hint quietly
+dropped. Without either, the wait is the server's `vector_build_wait_ms`
+(default 30 seconds; see [Configuration](../guide/configuration.md)). `SET`
+applies to an embedded database; over the network a client names its bound
+in the hint.
 
 A backfill that aborts (panic, write error) lands the index in the `Failed`
 state and every reader sees an error regardless of policy. A subsequent

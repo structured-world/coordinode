@@ -405,6 +405,58 @@ fn set_vector_consistency_invalid_value_falls_through_to_parser() {
     assert!(result.is_err());
 }
 
+/// `SET vector_build_wait` replaces the session's bound on waiting for a
+/// building vector index; it starts at the default and the API setter is the
+/// same knob.
+#[test]
+fn set_vector_build_wait_session() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    assert_eq!(db.vector_build_wait(), DEFAULT_VECTOR_BUILD_WAIT);
+
+    let rows = db
+        .execute_cypher("SET vector_build_wait = '5s'")
+        .expect("set 5s");
+    assert!(rows.is_empty());
+    assert_eq!(db.vector_build_wait(), Duration::from_secs(5));
+
+    db.execute_cypher("set VECTOR_BUILD_WAIT = \"250ms\"")
+        .expect("case and quotes");
+    assert_eq!(db.vector_build_wait(), Duration::from_millis(250));
+
+    db.set_vector_build_wait(Duration::from_secs(2));
+    assert_eq!(db.vector_build_wait(), Duration::from_secs(2));
+}
+
+/// A value the setting cannot take is refused and leaves the bound as it was.
+#[test]
+fn set_vector_build_wait_invalid_value_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for bad in ["'5'", "'soon'", "'1.5s'"] {
+        assert!(
+            db.execute_cypher(&format!("SET vector_build_wait = {bad}"))
+                .is_err(),
+            "accepted {bad}"
+        );
+    }
+    assert_eq!(db.vector_build_wait(), DEFAULT_VECTOR_BUILD_WAIT);
+}
+
+/// The shared entry point serves many callers at once, so a session setting
+/// cannot change through it: the SET is refused rather than ignored.
+#[test]
+fn set_vector_build_wait_is_refused_on_the_shared_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    assert!(
+        db.execute_cypher_shared("SET vector_build_wait = '5s'", None, None, None, None)
+            .is_err()
+    );
+    assert_eq!(db.vector_build_wait(), DEFAULT_VECTOR_BUILD_WAIT);
+}
+
 #[test]
 fn extension_op_dispatches_through_database() {
     use std::sync::atomic::{AtomicBool, Ordering};

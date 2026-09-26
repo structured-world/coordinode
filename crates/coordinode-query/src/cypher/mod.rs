@@ -13,5 +13,5 @@ pub mod semantic;
 
 pub use ast::*;
 pub use errors::ParseError;
-pub use parser::parse;
+pub use parser::{parse, parse_wait};
 pub use semantic::{MapSchemaProvider, SchemaProvider, SemanticError, analyze};

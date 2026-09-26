@@ -60,8 +60,9 @@ impl QueryFrontend for SqlFrontend {
             },
             canonical,
             fingerprint,
-            // SQL has no consistency hints.
+            // SQL has no query hints.
             vector_consistency_hinted: false,
+            vector_build_wait: None,
         })
     }
 

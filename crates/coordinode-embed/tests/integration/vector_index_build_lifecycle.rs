@@ -176,6 +176,53 @@ fn every_write_across_a_build_is_in_the_index() {
     );
 }
 
+/// The bound on waiting for a building index belongs to the caller: the
+/// session's bound applies to a query that names none, and a query's own hint
+/// wins over it. With the session at zero a read of the building index is
+/// refused at once; the same read with a generous hint waits and is served.
+#[test]
+fn a_query_hint_bounds_the_wait_over_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open db");
+    // Enough vectors that the build is still running when the reads arrive.
+    for start in (0..20_000).step_by(2_000) {
+        create_items(&mut db, start..start + 2_000);
+    }
+    db.execute_cypher("SET vector_build_wait = '0ms'")
+        .expect("session bound");
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+         OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 8}",
+    )
+    .expect("create vector index");
+    let search = format!(
+        "MATCH (n:Item) WITH *, vector_distance(n.embedding, [{}]) AS d \
+         ORDER BY d ASC LIMIT 1 RETURN n.ext_id AS ext_id",
+        spread_vector(7)
+    );
+
+    assert!(
+        !db.index_builds().is_empty(),
+        "the build finished before the reads, so they prove nothing"
+    );
+    let refused = db.execute_cypher(&search);
+    assert!(
+        refused.is_err(),
+        "the session's zero bound refuses the building index: {refused:?}"
+    );
+
+    let served = db
+        .execute_cypher(&format!("{search} /*+ vector_build_wait('2m') */"))
+        .expect("the query's own bound waits for the build");
+    assert_eq!(
+        served
+            .first()
+            .and_then(|row| row.get("ext_id"))
+            .and_then(|v| v.as_int()),
+        Some(7)
+    );
+}
+
 /// Writes that land WHILE the index is building must end up in it.
 ///
 /// While a build runs the writer leaves the index alone: batching the vectors

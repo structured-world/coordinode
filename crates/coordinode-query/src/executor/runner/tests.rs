@@ -71,25 +71,30 @@ fn seed_node_record(engine: &StorageEngine, shard_id: u16, node_id: NodeId, reco
     txn.commit(&ctx).expect("commit node");
 }
 
-/// A reader under the `Block` policy is served as soon as the build hands the
-/// index over. The build then keeps its tap open until every transaction
-/// opened before the handover has ended, the reader's own among them, so a
-/// reader waiting for the persisted `Ready` would wait for itself.
-#[test]
-fn a_blocked_reader_is_served_once_the_build_hands_over() {
+/// An oracle-backed engine holding a `Doc.embedding` index (default `block`
+/// policy) persisted as building and registered rebuilding, with no build
+/// running yet.
+fn building_vector_index() -> (
+    tempfile::TempDir,
+    Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    Arc<StorageEngine>,
+    crate::index::VectorIndexRegistry,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine = StorageEngine::open_with_oracle(
-        &StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]),
-        std::sync::Arc::clone(&oracle),
-    )
-    .expect("open engine");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&oracle),
+        )
+        .expect("open engine"),
+    );
     let def = crate::index::IndexDefinition::hnsw(
         "emb",
         "Doc",
@@ -117,6 +122,28 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
     .expect("persist building");
     let registry = crate::index::VectorIndexRegistry::new();
     registry.register_for_build(def, None);
+    (dir, oracle, engine, registry)
+}
+
+fn vector_indexes<'a>(
+    engine: &'a Arc<StorageEngine>,
+    registry: &'a crate::index::VectorIndexRegistry,
+    build_wait: std::time::Duration,
+) -> VectorIndexes<'a> {
+    VectorIndexes {
+        registry,
+        engine,
+        build_wait,
+    }
+}
+
+/// A reader under the `Block` policy is served as soon as the build hands the
+/// index over. The build then keeps its tap open until every transaction
+/// opened before the handover has ended, the reader's own among them, so a
+/// reader waiting for the persisted `Ready` would wait for itself.
+#[test]
+fn a_blocked_reader_is_served_once_the_build_hands_over() {
+    let (_dir, oracle, engine, registry) = building_vector_index();
     let hnsw = registry.get("Doc", "embedding").expect("hnsw");
     let health = registry.health_handle("Doc", "embedding").expect("health");
     let field = FieldInterner::new().intern("embedding");
@@ -144,8 +171,12 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
             .run()
         });
         let started = std::time::Instant::now();
-        gate_vector_index_read(&engine, &registry, "Doc", "embedding")
-            .expect("the reader is served once the index is handed over");
+        gate_vector_index_read(
+            vector_indexes(&engine, &registry, std::time::Duration::from_secs(30)),
+            "Doc",
+            "embedding",
+        )
+        .expect("the reader is served once the index is handed over");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "served at the handover, not after a timeout"
@@ -153,6 +184,57 @@ fn a_blocked_reader_is_served_once_the_build_hands_over() {
         drop(reader);
         build.join().expect("build thread").expect("build");
     });
+}
+
+/// A blocked reader waits as long as its caller allows and no longer: with no
+/// build to finish the index, a 50 ms bound fails the read in about 50 ms,
+/// and the error says how to wait longer.
+#[test]
+fn a_blocked_reader_waits_no_longer_than_its_bound() {
+    let (_dir, _oracle, engine, registry) = building_vector_index();
+    let bound = std::time::Duration::from_millis(50);
+
+    let started = std::time::Instant::now();
+    let err = gate_vector_index_read(
+        vector_indexes(&engine, &registry, bound),
+        "Doc",
+        "embedding",
+    )
+    .expect_err("the index never finishes, so the bound runs out");
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= bound,
+        "gave up after {waited:?}, before its bound"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "waited {waited:?}, far past its 50 ms bound"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("vector_build_wait"),
+        "the error names the setting that bounds the wait: {message}"
+    );
+}
+
+/// A zero bound refuses a building index at once instead of polling.
+#[test]
+fn a_zero_bound_refuses_a_building_index_at_once() {
+    let (_dir, _oracle, engine, registry) = building_vector_index();
+
+    let started = std::time::Instant::now();
+    let result = gate_vector_index_read(
+        vector_indexes(&engine, &registry, std::time::Duration::ZERO),
+        "Doc",
+        "embedding",
+    );
+
+    assert!(result.is_err(), "a building index with no wait is refused");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(20),
+        "no poll step was slept"
+    );
 }
 
 /// Commit a temporal node version in its own MVCC transaction.

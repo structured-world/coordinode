@@ -94,6 +94,11 @@ pub enum QueryHint {
     /// for this query only. Syntax: `/*+ read_consistency('snapshot') */`.
     /// An explicit hint always beats the planner's auto-promotion rule.
     ReadConsistency(coordinode_core::txn::read_consistency::ReadConsistencyMode),
+
+    /// How long this query waits for a vector index still being built,
+    /// under the `block` policy, before it fails. Syntax:
+    /// `/*+ vector_build_wait('5s') */`; wins over the session setting.
+    VectorBuildWait(core::time::Duration),
 }
 
 /// A single clause in a Cypher query.
