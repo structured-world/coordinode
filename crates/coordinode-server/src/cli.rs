@@ -179,8 +179,8 @@ pub fn parse_args_from(args: &[String]) -> Command {
                     .filter(|s| !s.is_empty())
                     .collect()
             });
-            // CLI carries only bootstrap-critical settings (CLAUDE.md
-            // "Configuration Surface"): bind addresses, identity, data dir,
+            // CLI carries only bootstrap-critical settings: bind addresses,
+            // identity, data dir,
             // peers, the TLS identity needed to secure-bind, and the startup fd
             // limit. Every fine tunable lives in the YAML config file only — the
             // argv length is OS-bounded (`ARG_MAX`), so tunables do not get flags.

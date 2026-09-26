@@ -20,8 +20,7 @@ Thumbs.db
 !.env.example
 *.log
 
-# === PRIVATE — must NOT leak to public GitHub repo ===
-# See CLAUDE.md "Repository Boundary" section for full policy.
+# === PRIVATE: must NOT leak to public GitHub repo ===
 
 # Architecture docs (internal planning, competitive analysis, donor references)
 /arch/
@@ -48,7 +47,7 @@ Thumbs.db
 # Local cargo overrides (path deps for development)
 .cargo/config.toml
 
-# Claude Code project config (contains internal workflow, memory, instructions)
+# Local editor and tooling config
 /CLAUDE.md
 .claude/
 

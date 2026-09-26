@@ -5,9 +5,8 @@
 //! LRU TTL), and `std::collections::HashMap` (open-bucket map). The
 //! production [`PersistentMonotonicHlcClock`] also embeds an
 //! `Arc<StorageEngine>` for restart-monotonicity persistence. None
-//! of these are replaceable below `std`; per
-//! `coordinode/CLAUDE.md §"no-std Readiness Policy"` this crate
-//! legitimately occupies the `std-only` tier.
+//! of these are replaceable below `std`, so this crate legitimately
+//! occupies the `std-only` tier.
 //!
 //! This crate implements **BucketCatalog** — the per-shard in-memory
 //! state machine that sits **above** [`coordinode_modality::TimeSeriesStore`]
@@ -52,7 +51,7 @@
 //! These all build on top of the foundation here — the public
 //! catalog surface stays stable across the slices.
 //!
-//! ## Multi-instance positioning (CLAUDE.md checklist)
+//! ## Multi-instance positioning
 //!
 //! The catalog is **per-shard**, not global, so each shard's
 //! `BucketCatalog` instance is the single writer for its shard's

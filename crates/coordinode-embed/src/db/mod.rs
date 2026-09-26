@@ -6,8 +6,8 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-// no-std: spin::RwLock (drop-in, same API). parking_lot::RwLock is the
-// std-only hot-path-fast lock per ~/projects/sw/CLAUDE.md.
+// no-std: spin::RwLock (drop-in, same API). parking_lot::RwLock: smaller than
+// std's and its uncontended path never enters the kernel.
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 

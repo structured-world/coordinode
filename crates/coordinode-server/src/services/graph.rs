@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-// no-std: spin::RwLock (drop-in). parking_lot::RwLock chosen over
-// std::sync per ~/projects/sw/CLAUDE.md hot-path rule.
+// no-std: spin::RwLock (drop-in). parking_lot::RwLock over std::sync: its
+// uncontended path never enters the kernel.
 use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};

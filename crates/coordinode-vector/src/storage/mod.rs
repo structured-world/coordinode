@@ -14,9 +14,8 @@
 //! `StorageEngine`; tests use the in-memory mock below.
 //!
 //! Why a trait, not a direct `StorageEngine` dependency: keeps
-//! `coordinode-vector` from depending on `coordinode-storage`. Per the
-//! crate-isolation rule in CLAUDE.md, cross-crate communication goes
-//! through traits, never concrete types.
+//! `coordinode-vector` from depending on `coordinode-storage`: crates
+//! talk to each other through traits, never concrete types.
 //
 // no-std: `Send + Sync` super-bounds use `core` traits; `Arc<dyn _>` is
 //         `alloc`-clean. The trait itself does not pull `std` types.
