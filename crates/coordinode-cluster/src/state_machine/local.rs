@@ -4,8 +4,8 @@
 //! `(from, to)` edge with an async action; `start` spawns a tokio task that runs
 //! the action, reports progress, and writes every state change through an
 //! injected [`TransitionLog`] (wired to a metadata-Raft proposal in production,
-//! a recorder in tests). Per ADR-038 the event stream is bound to a tokio
-//! broadcast receiver.
+//! a recorder in tests). The event stream is bound to a tokio broadcast
+//! receiver.
 //!
 //! Resting-state model: a registered edge has exactly two resting states,
 //! `from` and `to`. A cancel mid-transition rolls back to `from` (the action
@@ -59,7 +59,7 @@ pub struct TransitionCheckpoint {
 /// Persistence port: every state change is written through here. Production
 /// binds this to a metadata-Raft proposal (so a crash recovers by Raft replay);
 /// tests bind a recorder. Implementations MUST NOT keep authoritative state in a
-/// non-Raft store (ADR-038 recursion constraint).
+/// non-Raft store: that store would itself need a crash-safe transition.
 pub trait TransitionLog: Send + Sync {
     /// Durably record a checkpoint. Called on every state/terminal change and
     /// may be called on progress updates.
@@ -185,7 +185,7 @@ pub struct LocalStateMachine {
 }
 
 /// Builder registering the `(from, to)` transition edges a [`LocalStateMachine`]
-/// can drive. Each R-PROD* state graph registers its edges here.
+/// can drive. Each reconfiguration's state graph registers its edges here.
 pub struct LocalStateMachineBuilder {
     actions: HashMap<(StateLabel, StateLabel), Action>,
 }
@@ -281,8 +281,8 @@ impl LocalStateMachine {
         });
     }
 
-    /// Rebuild the registry from persisted checkpoints after a restart (ADR-038
-    /// crash recovery). The caller replays committed metadata-Raft entries
+    /// Rebuild the registry from persisted checkpoints after a restart (crash
+    /// recovery). The caller replays committed metadata-Raft entries
     /// (decoded to [`TransitionCheckpoint`]) in commit order; this folds them to
     /// each operation's last committed state, re-registers every operation
     /// (terminal ones stay queryable and keep deduping repeat starts), and

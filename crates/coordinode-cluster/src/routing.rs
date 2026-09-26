@@ -1,15 +1,14 @@
 //! [`ShardRouting`] trait + CE [`SingleShardRouting`] impl.
 //!
 //! Layer 5 (query engine) consults the routing trait to decide which
-//! shards a query touches. In CE the answer is always "shard 0";
-//! Phase 2 multi-shard CE and Phase 3 EE will provide richer impls
-//! against the same trait.
+//! shards a query touches. With one shard the answer is always
+//! "shard 0"; multi-shard impls answer against the same trait.
 
 use crate::error::TopologyResult;
 use crate::types::{NodeAddr, ShardId};
 
-/// Layer 6 routing contract. CE single-shard and Phase 3 EE
-/// multi-shard implementations share this trait.
+/// Layer 6 routing contract. Single-shard and multi-shard
+/// implementations share this trait.
 ///
 /// All methods take a `&self` so a routing instance is cheaply
 /// clonable / `Arc`-shareable across query-engine workers — routing

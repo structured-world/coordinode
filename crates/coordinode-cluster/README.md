@@ -3,8 +3,7 @@
 Layer 6 of the CoordiNode storage stack: **cluster topology + shard
 routing** traits with their CE single-node implementations.
 
-This crate sits at the top of the storage stack (see
-`arch/core/storage-stack.md` §Layer 6). It owns the 5-level
+This crate sits at the top of the storage stack. It owns the 5-level
 failure-domain tree (`geo → dc → rack → server → endpoint`) and the
 shard-to-node map. Two traits drive every consumer:
 
@@ -14,8 +13,8 @@ shard-to-node map. Two traits drive every consumer:
 | `ShardRouting` | Layer 5 (query engine) | Routing key → shard id resolution |
 
 The trait surface is **identical CE/EE** — only the impls differ. CE
-ships `SingleNodeTopology` + `SingleShardRouting`; future Phase 2 CE
-multi-node and Phase 3 EE `CrushTopology` plug into the same traits.
+ships `SingleNodeTopology` + `SingleShardRouting`; multi-node CE and
+the EE `CrushTopology` plug into the same traits.
 
 ## Quick start
 
@@ -50,15 +49,15 @@ let candidates = topology
   CRUSH rules is a separate admin path; this crate's trait is
   read-only on the hot path.
 - **EE-only rules in a CE binary surface as `TopologyError::EeOnly`.**
-  Phase 3 EE `CrushTopology` parses the full CRUSH rule grammar
-  (`crush.md`); CE only handles `CrushRule::LocalTier`.
+  The EE `CrushTopology` parses the full CRUSH rule grammar; CE only
+  handles `CrushRule::LocalTier`.
 - **Modality enum is the Layer 4 inventory.** Adding a store
   modality means adding a `Modality` variant and bumping the
   `Modality::all()` count; a regression test pins the count.
 
 ## Failure-domain hierarchy
 
-Per `arch/placement/crush.md` the tree has exactly 5 levels:
+The tree has exactly 5 levels:
 
 ```
 geo → dc → rack → server → endpoint
@@ -66,16 +65,14 @@ geo → dc → rack → server → endpoint
 
 CE single-node deployments collapse the upper four levels to
 `"local"`; the leaf endpoint still carries its real id and tier so
-placement candidate filtering by tier works out of the box. Phase 2
-CE and Phase 3 EE will populate the upper levels from the cluster
-config.
+placement candidate filtering by tier works out of the box. Multi-node
+deployments populate the upper levels from the cluster config.
 
-## Status
+## Implementations
 
-- **CE Phase 1:** ✅ `SingleNodeTopology`, `SingleShardRouting`
-- **CE Phase 2 (multi-node HA):** ❌ — same trait, new impl
-- **EE Phase 3 (CRUSH multi-DC):** ❌ — same trait, `CrushTopology`
-  + `MultiShardRouting`
+- **CE single node:** `SingleNodeTopology`, `SingleShardRouting`
+- **CE multi-node HA:** same traits, a multi-node impl
+- **EE CRUSH multi-DC:** same traits, `CrushTopology` + `MultiShardRouting`
 
 ## License
 

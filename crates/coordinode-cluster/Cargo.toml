@@ -1,6 +1,6 @@
 [package]
 name = "coordinode-cluster"
-description = "Layer 6 cluster topology: ClusterTopology + ShardRouting traits with CE SingleNodeTopology + SingleShardRouting implementations (storage-stack.md Layer 6, crush.md 5-level failure domain hierarchy)"
+description = "Layer 6 cluster topology: ClusterTopology + ShardRouting traits with CE SingleNodeTopology + SingleShardRouting implementations over a 5-level failure-domain hierarchy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

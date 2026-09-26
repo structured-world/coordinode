@@ -1,4 +1,4 @@
-//! Benchmark harness — R700.
+//! Benchmark harness.
 //!
 //! Standardised JSON schema for ALL CoordiNode benchmarks (vector,
 //! graph, time-series, spatial, document, full-text). Per-modality

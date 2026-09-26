@@ -4,8 +4,8 @@
 //! These are intentionally minimal — the 5-level failure-domain tree,
 //! a shard descriptor, a node address, and the modality / placement-rule
 //! enums the upper layers need to reason about placement. Full CRUSH
-//! rule parsing and validation lives in the EE `CrushTopology` impl
-//! (Phase 3) — CE only needs the trivial `srv-only` shape.
+//! rule parsing and validation lives in the EE `CrushTopology` impl;
+//! CE only needs the trivial `srv-only` shape.
 
 use coordinode_storage::engine::config::Tier;
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,7 @@ pub enum Modality {
     Edge,
     /// Vector indexes (HNSW).
     Vector,
-    /// Document partial-update merges (ADR-015) — lives on the Node
+    /// Document partial-update merges: lives on the Node
     /// partition but uses dedicated merge operators.
     Document,
     /// Time-series buckets + overflow segments.
@@ -286,7 +286,7 @@ impl TopologyTree {
     }
 
     /// Endpoints living in a specific data centre. Used by
-    /// `SeqnoConsumerRegistry` (ADR-028) to expand a cascading
+    /// `SeqnoConsumerRegistry` to expand a cascading
     /// retention scope like `dc:eu-west-1` to the concrete
     /// endpoint set.
     ///
@@ -336,8 +336,7 @@ impl TopologyTree {
 /// Placement rule consulted by
 /// [`crate::ClusterTopology::placement_candidates`]. CE only uses the
 /// trivial `local` rule (any matching endpoint on the local server);
-/// EE will parse the full YAML rule grammar from `crush.md` into
-/// richer variants in Phase 3.
+/// EE parses the full CRUSH rule grammar into richer variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CrushRule {

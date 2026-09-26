@@ -1,16 +1,16 @@
-//! Node-state-machine primitive (R-PROD-STATE-MACHINE, ADR-031 / ADR-038).
+//! Node-state-machine primitive.
 //!
 //! Every runtime node reconfiguration in CoordiNode is a long-running
 //! state-machine transition driven by a metadata-Raft proposal, never a process
-//! restart (ADR-031). This module defines the **backend contract** every
+//! restart. This module defines the **backend contract** every
 //! transition runs on: a small trait plus the operation/progress/event types
-//! shared by all R-PROD* transitions (storage role, Raft role, compression,
-//! placement scope). Factoring the five cross-cutting mechanisms — idempotency,
-//! cancellation, progress, observation, Raft-persisted intermediate state — into
-//! one primitive keeps each R-PROD* task a thin state graph plus action
+//! shared by all node reconfigurations (storage role, Raft role, compression,
+//! placement scope). Factoring the five cross-cutting mechanisms (idempotency,
+//! cancellation, progress, observation, Raft-persisted intermediate state) into
+//! one primitive keeps each reconfiguration a thin state graph plus action
 //! callbacks.
 //!
-//! Two backends implement the contract (ADR-038):
+//! Two backends implement the contract:
 //! - CE `LocalStateMachine` — in-process, zero external deps, binds
 //!   [`StateMachineBackend::EventStream`] to a tokio broadcast receiver.
 //! - EE `SflowBackend` (opt-in `sflow` feature) — binds `EventStream` to
@@ -29,7 +29,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OperationId(pub u64);
 
-/// A node-behaviour state in some R-PROD* state graph (e.g. `"compute"`,
+/// A node-behaviour state in some reconfiguration's state graph (e.g. `"compute"`,
 /// `"full-storage"`, `"voter"`, `"learner"`). Opaque to the primitive — each
 /// transition's own state graph gives the labels meaning. Every label in a graph
 /// must be a valid resting state (the cluster can run there indefinitely), so a
@@ -190,7 +190,7 @@ pub enum BackendError {
     Internal(String),
 }
 
-/// The contract every state-machine backend honours (ADR-038). Drives one
+/// The contract every state-machine backend honours. Drives one
 /// long-running node-reconfiguration transition: idempotent `start`, `status`
 /// polling, graceful `cancel`, a `observe` event stream, and `list`.
 ///
@@ -202,7 +202,7 @@ pub enum BackendError {
     message = "`{Self}` is not a state-machine backend",
     label = "needs `impl StateMachineBackend`",
     note = "implement the CE `LocalStateMachine` (in-process, tokio broadcast events) \
-            or the EE `SflowBackend`; see arch/operations/state-machine.md and ADR-038"
+            or the EE `SflowBackend`"
 )]
 pub trait StateMachineBackend: Send + Sync {
     /// Per-operation health/progress event stream. Each backend binds this to its

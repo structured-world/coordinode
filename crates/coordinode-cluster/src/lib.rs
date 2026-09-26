@@ -1,9 +1,8 @@
 //! Layer 6 — cluster topology + shard routing.
 //!
-//! This crate sits at the top of the storage stack (see
-//! `arch/core/storage-stack.md` §Layer 6). It owns the 5-level
-//! failure-domain tree (`geo → dc → rack → server → endpoint`,
-//! `arch/placement/crush.md`) and the shard-to-node map. Two traits:
+//! This crate sits at the top of the storage stack. It owns the 5-level
+//! failure-domain tree (`geo → dc → rack → server → endpoint`) and the
+//! shard-to-node map. Two traits:
 //!
 //! - [`ClusterTopology`] — topology tree + shard descriptors +
 //!   placement candidate sets. Consumed by Layer 2 (placement) and
@@ -19,9 +18,9 @@
 //! - [`SingleShardRouting`] — every key lands at
 //!   [`ShardId::ZERO`].
 //!
-//! Phase 2 multi-node CE will add a `Multi*` impl of the same trait;
-//! Phase 3 EE will add `CrushTopology` / `MultiShardRouting` with
-//! full CRUSH placement rules. The query / storage layers above
+//! Multi-node CE adds a `Multi*` impl of the same trait; EE adds
+//! `CrushTopology` / `MultiShardRouting` with full CRUSH placement
+//! rules. The query / storage layers above
 //! depend on the trait, so neither swap requires call-site changes.
 //!
 //! ## Migration planner
