@@ -1144,12 +1144,39 @@ impl RaftNode {
         }
     }
 
-    /// Check if this node is currently the Raft leader.
+    /// Check if this node is currently the Raft leader, as its group confirms.
+    ///
+    /// Leadership the group does not confirm within two election timeouts is
+    /// not leadership: by then its followers have called an election. The bound
+    /// is ours because openraft's own wait for the read point to apply has none,
+    /// and a leader elected just before its peers left waits forever for the
+    /// first entry of its term to commit.
     pub async fn is_leader(&self) -> bool {
-        self.raft
-            .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead)
-            .await
-            .is_ok()
+        // Saturating on purpose: an election timeout too large to double is
+        // already a wait as long as the group takes, and the bound stays that.
+        let bound = std::time::Duration::from_millis(
+            self.raft.config().election_timeout_max.saturating_mul(2),
+        );
+        matches!(
+            tokio::time::timeout(
+                bound,
+                self.raft
+                    .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// Whether this node believes it leads, from its own state alone.
+    ///
+    /// Asks the group nothing, so it answers at once whatever the group's
+    /// state: what a node needs when deciding its own shutdown, where waiting
+    /// on peers that are gone would keep it from stopping.
+    fn leads_by_its_own_account(&self) -> bool {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        metrics.state.is_leader() && metrics.current_leader == Some(self.node_id)
     }
 
     /// Ensure linearizable read: verify this node is leader with a fresh
@@ -1394,7 +1421,10 @@ impl RaftNode {
 
         // Step 2: Transfer leadership if we're the leader. Each step is logged
         // so a shutdown that does not return shows which one it is stuck in.
-        let leads = self.is_leader().await;
+        // The node's own account decides: asking the group would wait on
+        // peers that may already be gone, and a leader without them could not
+        // hand its leadership over anyway.
+        let leads = self.leads_by_its_own_account();
         tracing::info!(
             node_id = self.node_id,
             leads,

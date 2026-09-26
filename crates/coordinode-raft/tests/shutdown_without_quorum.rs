@@ -101,6 +101,76 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
     assert!(result.is_ok(), "TIMED OUT — shutdown without a quorum");
 }
 
+/// Stopping does not ask the group anything. Whether to hand leadership over
+/// is decided from what the node itself knows. The last member of a group
+/// that was shut down leader first is no leader at all: its leader is gone,
+/// it stands for election and nobody answers. Asking the group whether it
+/// leads is then a question with no one to answer it, so the member stops in
+/// about the time its local checkpoint takes, not after the question gives up.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_member_stops_without_waiting_on_the_group() {
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let p3 = alloc_port();
+        let d1 = tempfile::tempdir().expect("d1");
+        let d2 = tempfile::tempdir().expect("d2");
+        let d3 = tempfile::tempdir().expect("d3");
+
+        let n1 = RaftNode::open_cluster(
+            1,
+            open_engine(d1.path()),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            open_engine(d2.path()),
+            format!("127.0.0.1:{p2}").parse().expect("addr"),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            open_engine(d3.path()),
+            format!("127.0.0.1:{p3}").parse().expect("addr"),
+        )
+        .await
+        .expect("n3");
+
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add 2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add 3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters");
+
+        // Leader first, as a rolling stop does: node 1 hands leadership on,
+        // then node 2 goes too. Node 3 is left with no leader and no quorum,
+        // and once its election timer fires it stands for an election nobody
+        // can answer.
+        n1.shutdown().await.expect("shutdown 1");
+        n2.shutdown().await.expect("shutdown 2");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let started = std::time::Instant::now();
+        n3.shutdown().await.expect("shutdown 3");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "the last member took {took:?} to stop: it waited on the group"
+        );
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT — the last member never stopped");
+}
+
 /// The same holds for the question itself: asking a node whether it leads must
 /// come back, with `false`, when the group cannot confirm it.
 #[tokio::test(flavor = "multi_thread")]
