@@ -695,6 +695,62 @@ async fn a_snapshot_holds_exactly_the_entries_up_to_its_log_id() {
     );
 }
 
+/// An entry past the snapshot that the leader committed before the follower
+/// installed the snapshot must win over the snapshot's older value for the
+/// same key: the follower reads what the leader reads.
+#[tokio::test]
+async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
+    use openraft::entry::RaftEntry;
+    let put = |index: u64, ts: u64, value: &[u8]| {
+        Entry::new_normal(
+            log_id(1, index),
+            Request::single(RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: b"node:1:k".to_vec(),
+                    value: value.to_vec(),
+                }],
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::from_raw(ts - 1),
+                bypass_rate_limiter: false,
+            }),
+        )
+    };
+
+    let leader_rig = coordinode_test_fixtures::PowerRig::new();
+    let (leader, leader_clock) = open_rig_engine(&leader_rig);
+    let mut sm =
+        CoordinodeStateMachine::with_oracle(Arc::clone(&leader), Some(leader_clock.clone()))
+            .expect("open leader");
+    let t1 = leader_clock.current().as_raw() + 1;
+    apply_entries(&mut sm, vec![put(1, t1, b"v1")]).await;
+    let mut builder = sm.get_snapshot_builder().await;
+    let snapshot = builder.build_snapshot().await.expect("build");
+    let t2 = leader_clock.current().as_raw() + 1;
+    apply_entries(&mut sm, vec![put(2, t2, b"v2")]).await;
+
+    // The snapshot reaches the follower after entry 2 was committed.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let follower_rig = coordinode_test_fixtures::PowerRig::new();
+    let (follower, follower_clock) = open_rig_engine(&follower_rig);
+    let mut fsm = CoordinodeStateMachine::with_oracle(Arc::clone(&follower), Some(follower_clock))
+        .expect("open follower");
+    fsm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("install");
+    apply_entries(&mut fsm, vec![put(2, t2, b"v2")]).await;
+
+    assert_eq!(
+        follower
+            .get(Partition::Node, b"node:1:k")
+            .expect("follower get")
+            .as_deref(),
+        Some(b"v2".as_slice()),
+        "the follower must read the entry committed after the snapshot"
+    );
+}
+
 fn open_rig_engine(
     rig: &coordinode_test_fixtures::PowerRig,
 ) -> (

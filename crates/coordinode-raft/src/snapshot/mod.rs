@@ -206,9 +206,11 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
 /// write transaction internally (all-or-nothing commit).
 ///
 /// **Step 2 (idempotent cleanup):** Delete stale keys that exist in
-/// the current engine but are absent in the snapshot. If crash occurs
-/// during step 2, stale keys remain (harmless — cleaned up on next
-/// snapshot install).
+/// the current engine but are absent in the snapshot. A crash during step 2
+/// leaves some of them, but the caller records the snapshot's position only
+/// after this returns: on restart the node still stands at its old position
+/// and catches up either through another install (whose step 2 finishes the
+/// cleanup) or through the log, whose deletes remove the same keys.
 ///
 /// **Important:** Raft keys (`raft:*`) in the Schema partition are
 /// always preserved — they're managed by openraft, not application data.
@@ -361,8 +363,9 @@ fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
 /// a crash before it commits leaves the old data intact.
 ///
 /// **Step 2 (idempotent cleanup):** delete keys the engine holds and the
-/// snapshot does not; a crash midway leaves stale keys that the next install
-/// removes.
+/// snapshot does not. A crash midway leaves stale keys, but the position is
+/// recorded only after this returns, so the node catches up again from its
+/// old position and the reinstall or the log's deletes remove them.
 ///
 /// **Columnar tables** are then made exactly the snapshot's, when it lists
 /// them.
