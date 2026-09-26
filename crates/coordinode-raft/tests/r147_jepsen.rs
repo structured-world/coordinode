@@ -450,6 +450,68 @@ async fn partition_minority_cannot_commit_majority_can() {
     assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
 }
 
+/// A linearizable read on a leader cut off from its quorum must fail within the
+/// fence timeout: serving it would be a stale read once the majority has moved
+/// on, and waiting without a bound would hang the request for as long as the
+/// partition lasts.
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_leader_refuses_a_linearizable_read_within_the_timeout() {
+    use coordinode_raft::read_fence::{ReadConcern, ReadPreference};
+
+    nemesis::heal();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3) = bootstrap_3_node().await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        write(&n1, &id_gen, 100, "node:1:lin-base", "base").expect("baseline commit");
+
+        nemesis::isolate(1, &[2, 3]);
+
+        // Once the majority has elected a new leader and committed past the
+        // old one, node 1's lease has long expired.
+        let survivors = [&n2, &n3];
+        let new_leader = await_new_leader(&survivors, 1).await;
+        let id_gen_maj = ProposalIdGenerator::with_base(new_leader << 48);
+        commit_on_majority(
+            &survivors,
+            1,
+            &id_gen_maj,
+            200,
+            "node:1:lin-maj",
+            "majority",
+        )
+        .await;
+
+        let fence_timeout = Duration::from_secs(1);
+        let mut fence = n1.node.read_fence();
+        let read = tokio::time::timeout(
+            Duration::from_secs(10),
+            fence.apply(
+                ReadPreference::Primary,
+                ReadConcern::Linearizable,
+                fence_timeout,
+            ),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "a linearizable read on an isolated leader hung past its {fence_timeout:?} timeout"
+        );
+        assert!(
+            read.is_ok_and(|r| r.is_err()),
+            "an isolated leader served a linearizable read (stale read)"
+        );
+
+        nemesis::heal();
+        n1.node.shutdown().await.ok();
+        n2.node.shutdown().await.ok();
+        n3.node.shutdown().await.ok();
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
+}
+
 /// True when an entry of `batch` writes `key`.
 fn carries(batch: &[(OplogEntry, ResumeToken)], key: &[u8]) -> bool {
     batch.iter().any(|(entry, _)| {

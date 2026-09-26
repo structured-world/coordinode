@@ -1,8 +1,7 @@
 //! Read fence: consistency controls for follower reads.
 //!
-//! Implements the read-side consistency model described in
-//! `arch/distribution/consistency.md`. Controls which node may serve a read
-//! and what data the node must have applied before returning results.
+//! Implements the read-side consistency model: controls which node may serve
+//! a read and what data the node must have applied before returning results.
 //!
 //! ## Read Preference
 //!
@@ -19,7 +18,7 @@
 //! - `Local`: whatever the node has applied (always safe in Raft — followers
 //!   only apply committed entries)
 //! - `Majority`: same as Local in CE Raft (all applied data is majority-committed);
-//!   distinction matters with `after_index` (R142 causal sessions)
+//!   distinction matters with `after_index` (causal sessions)
 //! - `Linearizable`: leader-only lease read — guarantees reading after all prior
 //!   commits. Adds ~1 heartbeat RTT
 //! - `Snapshot`: MVCC snapshot at current applied index (CE = same as Majority)
@@ -91,7 +90,7 @@ pub enum ReadConcern {
     Local,
     /// Return data acknowledged by majority. In CE Raft, this is equivalent to
     /// `Local` (all applied data is already committed). Distinction matters when
-    /// the client provides an `after_index` for causal consistency (R142).
+    /// the client provides an `after_index` for causal consistency.
     Majority,
     /// Strongest guarantee: node must be leader and confirm lease before reading.
     /// Returns data after all prior commits. Adds ~1 heartbeat RTT.
@@ -120,7 +119,7 @@ impl ReadConcern {
 pub enum ReadFenceError {
     /// Caller requested `Secondary` but this node is the Raft leader.
     ///
-    /// R151 (request router) will redirect to a follower node.
+    /// Returned to the client, which retries on a follower.
     #[error(
         "readPreference=SECONDARY requires a follower node. \
          This node is the Raft leader. Use SECONDARY_PREFERRED for automatic fallback."
@@ -129,7 +128,8 @@ pub enum ReadFenceError {
 
     /// Caller requested `Primary` but this node is not the Raft leader.
     ///
-    /// R151 (request router) will redirect to the leader.
+    /// The server forwards such a read to the leader once instead of
+    /// returning this error.
     #[error(
         "readPreference=PRIMARY requires the Raft leader. \
          This node is a follower. Use PRIMARY_PREFERRED for automatic fallback."
@@ -159,6 +159,11 @@ pub enum ReadFenceError {
          within the deadline"
     )]
     Timeout { target: u64, current: u64 },
+
+    /// The leader could not confirm its lease for a linearizable read within
+    /// the fence timeout.
+    #[error("Read fence timeout: leadership not confirmed within {timeout_ms} ms")]
+    LeaseTimeout { timeout_ms: u64 },
 
     /// Underlying Raft error (e.g., not initialized, fatal state).
     #[error("Raft error during read fence: {0}")]
@@ -245,8 +250,8 @@ impl ReadFence {
         &mut self,
         preference: ReadPreference,
         concern: ReadConcern,
-        // Reserved for R142 causal read timeout (majority wait with after_index).
-        _timeout: Duration,
+        // Bound on the one blocking check here, the linearizable lease read.
+        timeout: Duration,
     ) -> Result<(), ReadFenceError> {
         let is_leader = self.check_is_leader().await;
 
@@ -294,7 +299,7 @@ impl ReadFence {
             }
             ReadConcern::Majority => {
                 // In Raft, all applied entries on any node are already majority-committed.
-                // No blocking fence needed without an explicit `after_index` (R142).
+                // No blocking fence needed without an explicit `after_index`.
                 // CE: equivalent to Local.
             }
             ReadConcern::Snapshot => {
@@ -306,10 +311,16 @@ impl ReadFence {
                 if !is_leader {
                     return Err(ReadFenceError::LinearizableRequiresLeader);
                 }
-                self.raft
-                    .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead)
-                    .await
-                    .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
+                tokio::time::timeout(
+                    timeout,
+                    self.raft
+                        .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead),
+                )
+                .await
+                .map_err(|_| ReadFenceError::LeaseTimeout {
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                })?
+                .map_err(|e| ReadFenceError::Raft(e.to_string()))?;
             }
         }
 
@@ -327,7 +338,7 @@ impl ReadFence {
 
     /// Wait until the applied index reaches at least `target`.
     ///
-    /// Used by R142 causal sessions: the client provides an `after_index`
+    /// Used by causal sessions: the client provides an `after_index`
     /// from a prior write, and the follower waits before returning results.
     pub async fn wait_for_index(
         &mut self,
@@ -363,7 +374,7 @@ impl ReadFence {
     /// Return the current applied log index on this node.
     ///
     /// Include in query responses as `QueryStats.applied_index` so clients
-    /// can use it for causal reads (R142 `after_index`).
+    /// can use it for causal reads (`after_index`).
     pub fn applied_index(&self) -> u64 {
         *self.applied_rx.borrow()
     }

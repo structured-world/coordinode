@@ -535,7 +535,9 @@ fn fence_error_to_status(err: ReadFenceError) -> Status {
         ReadFenceError::NotLeader => Status::failed_precondition(err.to_string()),
         ReadFenceError::LinearizableRequiresLeader => Status::failed_precondition(err.to_string()),
         ReadFenceError::StaleReplica { .. } => Status::unavailable(err.to_string()),
-        ReadFenceError::Timeout { .. } => Status::deadline_exceeded(err.to_string()),
+        ReadFenceError::Timeout { .. } | ReadFenceError::LeaseTimeout { .. } => {
+            Status::deadline_exceeded(err.to_string())
+        }
         ReadFenceError::Raft(e) => Status::internal(format!("Raft error: {e}")),
     }
 }
