@@ -6,6 +6,11 @@ dir = "target/nextest"
 
 [profile.default]
 fail-fast = false
+# A leak is a child process still holding the test's stdout/stderr after the
+# test exits. Under a loaded run nextest itself can see the pipe close more
+# than the default 100ms after exit, which flags pure tests that spawn
+# nothing; a real leaked child (a server left running) outlives one second.
+leak-timeout = "1s"
 
 [profile.default.slow-timeout]
 period = "30s"
@@ -45,6 +50,7 @@ max-threads = 4
 # CI profile: inherits overrides via re-declaration + JUnit output
 [profile.ci]
 fail-fast = false
+leak-timeout = "1s"
 
 [profile.ci.slow-timeout]
 period = "60s"
