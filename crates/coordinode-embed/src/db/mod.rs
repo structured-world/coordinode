@@ -80,7 +80,7 @@ pub struct PagedCypherResult {
 
 /// `StorageStats` adapter that augments graph-level statistics (label
 /// counts, fan-out averages) with per-vector-index statistics drawn from
-/// the live `VectorIndexRegistry`. R-PUSH1's push-down rule needs both
+/// the live `VectorIndexRegistry`. The graph-predicate push-down rule needs both
 /// dimensions in one place — `optimize_push_down` reads everything through
 /// a single `&dyn StorageStats` reference.
 ///
@@ -88,8 +88,7 @@ pub struct PagedCypherResult {
 /// vector half is computed on demand (cheap — registry lookups are
 /// in-memory). Crossover thresholds are derived per-index from HNSW M and
 /// quantization settings (cached at build time on the index definition;
-/// the heuristic here is the temporary formula that R-PUSH4 will replace
-/// with measured constants).
+/// the heuristic here stands until measured constants replace it).
 struct CombinedStats<'a> {
     graph: &'a coordinode_storage::engine::stats::StorageStatsComputer,
     vector: &'a coordinode_query::index::VectorIndexRegistry,
@@ -128,10 +127,9 @@ impl<'a> coordinode_core::graph::stats::StorageStats for CombinedStats<'a> {
     }
 
     fn vector_index_crossover(&self, label: &str, property: &str) -> Option<usize> {
-        // Per arch/core/query-engine.md § Graph Predicate Push-Down: crossover
-        // is "per-index metadata, computed once at build time from M, dim,
-        // quantisation". Until R-PUSH4 lands measured constants, the heuristic
-        // below tracks the documented defaults:
+        // The crossover is per-index metadata derived from M and quantisation.
+        // Until measured constants replace it, the heuristic below tracks the
+        // expected defaults:
         //   - Node-typed HNSW (M=16, f32): ~500
         //   - Edge-typed or quantised: ~200
         // The formula multiplies M by 32 (≈ HNSW frontier expansion at typical
@@ -311,9 +309,8 @@ impl coordinode_vector::VectorLoader for StorageVectorLoader {
     }
 }
 
-/// Embedded database instance.
 /// How `execute_cypher_impl` should treat the statement's transaction
-/// boundary (ADR-042).
+/// boundary.
 enum TxnMode {
     /// Single-statement auto-commit: allocate a fresh `read_ts`, build a new
     /// transaction, and commit (flush) at the end. The default for every
@@ -327,6 +324,7 @@ enum TxnMode {
     Interactive(Box<coordinode_storage::engine::transaction::TransactionState>),
 }
 
+/// Embedded database instance.
 pub struct Database {
     engine: Arc<StorageEngine>,
     // Wrapped in Arc<RwLock<…>> so concurrent gRPC handlers can hold a
@@ -437,9 +435,8 @@ pub struct Database {
     /// inline at the end of each committed write (deterministic, no extra
     /// thread). Mirrors the `spawn_oplog_worker` discriminator.
     cluster_mode: bool,
-    /// Operator-tunable knobs for the AFTER COMMIT trigger dispatcher (R192):
-    /// cascade-depth cap + default retry policy. Defaults match ADR-026; the
-    /// server overrides them from `coordinode.conf` via
+    /// Operator-tunable knobs for the AFTER COMMIT trigger dispatcher:
+    /// cascade-depth cap + default retry policy. The server overrides them from `coordinode.conf` via
     /// [`Database::set_trigger_dispatch_config`].
     trigger_dispatch_config: after_commit::TriggerDispatchConfig,
     /// Per-query-string parse + plan cache. Repeated invocations of
@@ -448,7 +445,7 @@ pub struct Database {
     /// on a clone of the cached plan so they stay sensitive to live
     /// index registry state. See [`PlanCache`].
     plan_cache: Arc<PlanCache>,
-    /// Open interactive multi-statement transactions (ADR-042), keyed by a
+    /// Open interactive multi-statement transactions, keyed by a
     /// server-allocated transaction id. Leader-local and ephemeral: parked
     /// `TransactionState` (uncommitted writes + OCC read-set + pinned
     /// snapshot) plus the last-touched instant for idle-timeout reaping.
@@ -464,7 +461,7 @@ pub struct Database {
     >,
     /// Monotonic source of interactive transaction ids.
     next_txn_id: AtomicU64,
-    /// Idle timeout for interactive transactions (ADR-042): an open
+    /// Idle timeout for interactive transactions: an open
     /// transaction with no activity for this long is auto-rolled-back (it pins
     /// an MVCC snapshot + buffers memory). Set by the server from the
     /// `--interactive-txn-idle-timeout-secs` flag (passed via
@@ -829,7 +826,7 @@ impl Database {
 
     /// Initialize a database from pre-opened engine, oracle, and pipeline.
     ///
-    /// Used by the server binary in cluster mode (G063): the server creates
+    /// Used by the server binary in cluster mode: the server creates
     /// a shared `StorageEngine` + `TimestampOracle` for the `RaftNode`, then
     /// passes the same engine + a `RaftProposalPipeline` here. The DrainBuffer
     /// and TTL reaper submit mutations through Raft for replication.
@@ -902,7 +899,7 @@ impl Database {
         // updates HNSW inline on the write path and applies no Raft entries.
         follow_raft_applies: bool,
     ) -> Result<Self, DatabaseError> {
-        // Auto-repair on open (G111). For an embedded engine with a retained
+        // Auto-repair on open. For an embedded engine with a retained
         // oplog journal, if a checkpoint exists, scrub and rebuild any corrupt
         // partition from that checkpoint + oplog replay BEFORE any state is read
         // below. Cluster engines (no journal) and journal-less in-memory engines
@@ -993,8 +990,8 @@ impl Database {
 
         // Load vector index definitions from schema: partition and rebuild
         // HNSW graphs from stored vectors (eager rebuild). The registry is
-        // tier-backed: every index it registers persists f32 to LSM per
-        // ADR-033. Interning happens inside `load_vector_indexes` under a
+        // tier-backed: every index it registers persists f32 to LSM, which
+        // stays the source of truth for reranking. Interning happens inside `load_vector_indexes` under a
         // brief write guard; the registry itself holds no interner ref
         // (would cause reentrant write deadlocks against execute_cypher).
         let vector_index_registry = Arc::new(Self::load_vector_indexes(
@@ -1663,7 +1660,7 @@ impl Database {
     }
 
     /// Execute a SQL statement (`SELECT` / `INSERT`) against the relational
-    /// TABLE modality (R650a).
+    /// TABLE modality.
     ///
     /// SQL is parsed and lowered natively into the same neutral `LogicalPlan`
     /// as Cypher via the [`SqlFrontend`](coordinode_query::sql::SqlFrontend),
@@ -1778,7 +1775,7 @@ impl Database {
         Timestamp::from_raw(seqno)
     }
 
-    /// Begin an interactive multi-statement transaction (ADR-042).
+    /// Begin an interactive multi-statement transaction.
     ///
     /// Returns a server-allocated transaction id. Pass it to
     /// [`Self::execute_in_transaction`] for each statement, then
@@ -1810,7 +1807,7 @@ impl Database {
         id
     }
 
-    /// Run one statement of an interactive transaction (ADR-042).
+    /// Run one statement of an interactive transaction.
     ///
     /// The statement reads at the transaction's pinned snapshot and its writes
     /// buffer on the transaction without committing. A statement error aborts
@@ -1871,7 +1868,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Commit an interactive transaction (ADR-042): validate the accumulated
+    /// Commit an interactive transaction: validate the accumulated
     /// write set, assign `commit_ts`, and persist every buffered mutation in a
     /// single proposal. The handle is consumed (removed from the registry)
     /// whether commit succeeds or fails; on a write conflict the client
@@ -1966,7 +1963,7 @@ impl Database {
         })
     }
 
-    /// Roll back an interactive transaction (ADR-042): discard all buffered
+    /// Roll back an interactive transaction: discard all buffered
     /// writes and the OCC read-set. No proposal is emitted (nothing was
     /// durable). Errors only if the id is unknown.
     pub fn rollback_transaction(&self, txn_id: u64) -> Result<(), DatabaseError> {
@@ -2034,11 +2031,11 @@ impl Database {
         Ok(())
     }
 
-    /// Drop interactive transactions idle longer than `timeout` (ADR-042
-    /// mandatory idle timeout). An open transaction pins an MVCC snapshot and
-    /// buffers writes in memory, so an abandoned one would leak retention and
-    /// leader memory. Called opportunistically on `begin`; a production
-    /// deployment also runs this periodically.
+    /// Drop interactive transactions idle longer than `timeout`. An open
+    /// transaction pins an MVCC snapshot and buffers writes in memory, so an
+    /// abandoned one would leak retention and leader memory. Called
+    /// opportunistically on `begin`; the server also runs it on a timer, so
+    /// reaping does not wait for the next `begin`.
     pub fn reap_idle_transactions(&self, timeout: Duration) {
         let now = Instant::now();
         self.interactive_txns
@@ -2047,10 +2044,10 @@ impl Database {
             .retain(|_, (_, touched)| now.duration_since(*touched) < timeout);
     }
 
-    /// Default idle timeout for an open interactive transaction (ADR-042).
+    /// Default idle timeout for an open interactive transaction.
     pub const DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Default max buffered bytes per interactive transaction (256 MiB, ADR-042).
+    /// Default max buffered bytes per interactive transaction (256 MiB).
     pub const DEFAULT_MAX_INTERACTIVE_TXN_BYTES: usize = 256 * 1024 * 1024;
 
     /// Vector-index builds running on this node right now, with live progress.
@@ -2483,10 +2480,9 @@ impl Database {
             plan.vector_consistency,
         );
 
-        // Apply graph-predicate push-down (R-PUSH1): for every VectorFilter
-        // preceded by a Traverse, annotate with strategy decision
-        // (graph_first / acorn_filtered / vector_first) per the cost model
-        // in arch/core/query-engine.md § Graph Predicate Push-Down. The
+        // Apply graph-predicate push-down: for every VectorFilter preceded
+        // by a Traverse, annotate with strategy decision (graph_first /
+        // acorn_filtered / vector_first) from the push-down cost model. The
         // invariant — no unfiltered VectorFilter after Traverse — is
         // contract-tested in the planner regression suite.
         let stats = self.compute_stats();
@@ -2524,7 +2520,7 @@ impl Database {
         let read_ts = match &txn_mode {
             // Interactive transaction: every statement reuses the pinned
             // start_ts so all reads resolve against the same snapshot
-            // (repeatable read across the transaction — ADR-042).
+            // (repeatable read across the transaction).
             TxnMode::Interactive(state) => state.read_ts(),
             TxnMode::AutoCommit if session.read_concern == ReadConcernLevel::Snapshot => {
                 // One-shot snapshot read; already captured into the
@@ -3085,7 +3081,8 @@ impl Database {
 
         // 1. Persist the schema to storage. Version-prefixed key carries the
         //    immutable snapshot; the current_revision pointer names the active
-        //    one. Both writes are part of this commit (ADR-023).
+        //    one. Both writes are part of this commit, so a reader never
+        //    sees a pointer to a revision that is not stored.
         let key = encode_label_schema_key(&schema.name, schema.schema_revision);
         let bytes = schema
             .to_msgpack()

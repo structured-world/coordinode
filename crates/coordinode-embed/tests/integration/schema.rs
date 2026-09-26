@@ -120,7 +120,7 @@ fn multiple_edge_type_creation() {
     assert!(r2.is_ok());
 }
 
-// ── R-API1: create_label_schema / create_edge_type_schema ────────────
+// ── create_label_schema / create_edge_type_schema ────────────────────
 
 /// Schema is persisted to storage and survives a re-open.
 #[test]
@@ -299,7 +299,7 @@ fn create_label_schema_idempotent() {
     schema_v2.add_property(PropertyDef::new("count", PropertyType::Int));
     let v2 = db.create_label_schema(schema_v2).expect("second create");
 
-    // Per ADR-023, schema revision (the key suffix) is bumped only by
+    // The schema revision (the key suffix) is bumped only by
     // ALTER LABEL operations affecting placement/shard_keys — not by
     // property-set differences across idempotent calls to
     // `create_label_schema`. Both writes overwrite the same versioned key.
@@ -307,7 +307,7 @@ fn create_label_schema_idempotent() {
 }
 
 /// Current-revision pointer is written together with the schema body on
-/// `create_label_schema` (per ADR-023). Reading via the pointer yields the
+/// `create_label_schema`. Reading via the pointer yields the
 /// same schema as reading the versioned key directly.
 #[test]
 fn current_revision_pointer_written_alongside_label_schema() {

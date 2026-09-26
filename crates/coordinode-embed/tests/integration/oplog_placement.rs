@@ -7,7 +7,7 @@
 //!   Eligibility: `durability ∈ {Durable, Degraded}`.
 //! - **Volatile-only configs** open (the LSM data path may live on cache media)
 //!   but cannot host an oplog — `select_oplog_endpoint` / `LogStore::open` must
-//!   return a clear error, never a panic (INV-D1).
+//!   return a clear error, never a panic: the oplog must survive a restart.
 //!
 //! Embedded durability is the retained oplog journal (`open_embedded`), which
 //! lands at the same oplog-eligible endpoint; its crash-recovery and
@@ -72,8 +72,8 @@ fn oplog_endpoint_round_robin_across_durable() {
 
 /// Volatile-only config: engine opens (data is allowed to live on RAM
 /// or cache endpoints for the lsm-tree), but oplog selection MUST fail.
-/// This pins the INV-D1 invariant at runtime — oplog needs persistence
-/// even though the LSM data path doesn't.
+/// This pins at runtime that the oplog needs persistence even though
+/// the LSM data path doesn't.
 #[test]
 fn oplog_selection_errors_on_volatile_only_config() {
     let cache = TempDir::new().expect("cache tempdir");
@@ -136,20 +136,31 @@ fn logstore_open_errors_on_no_persistence_config() {
     );
 }
 
-/// **INV-D1 (config-time):** `with_endpoints` MUST panic when given
-/// only Volatile endpoints — oplog/Raft cannot survive on cache media.
+/// **Config time:** an all-Volatile endpoint list is refused at
+/// construction, because oplog/Raft cannot survive on cache media.
+/// `try_with_endpoints` reports it as an error, `with_endpoints` panics.
 /// Tests that genuinely want an all-Volatile config use the explicit
 /// `with_endpoints_no_persistence` escape hatch (covered by the previous
-/// test).
+/// tests).
 #[test]
-#[should_panic(expected = "at least one oplog-eligible endpoint")]
-fn with_endpoints_rejects_all_volatile_config_at_construction() {
+fn all_volatile_config_is_refused_at_construction() {
+    use coordinode_storage::engine::config::EndpointConfigError;
+
     let cache = TempDir::new().expect("cache tempdir");
-    let _ = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let endpoints = vec![EndpointConfig::new(
         "ep-cache",
         cache.path(),
         Media::Nvme,
         Durability::Volatile,
         Tier::HotCache,
-    )]);
+    )];
+    assert!(matches!(
+        StorageConfig::try_with_endpoints(endpoints.clone()),
+        Err(EndpointConfigError::NoOplogEndpoint)
+    ));
+    let panicked = std::panic::catch_unwind(|| StorageConfig::with_endpoints(endpoints));
+    assert!(
+        panicked.is_err(),
+        "with_endpoints must panic on an all-Volatile list"
+    );
 }

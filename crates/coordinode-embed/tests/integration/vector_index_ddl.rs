@@ -1,4 +1,4 @@
-//! Integration tests: VectorIndexRegistry + CREATE/DROP VECTOR INDEX DDL (R-API3).
+//! Integration tests: VectorIndexRegistry + CREATE/DROP VECTOR INDEX DDL.
 //!
 //! Tests the full vector index lifecycle through Database:
 //! - CREATE VECTOR INDEX DDL registers an HNSW index and backfills existing nodes
@@ -1094,7 +1094,7 @@ fn building_state_resets_to_ready_on_reopen() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().to_path_buf();
 
-    // Phase 1: open, create index synchronously, close.
+    // Step 1: open, create index synchronously, close.
     {
         let mut db = coordinode_embed::Database::open(&path).expect("first open");
         db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
@@ -1120,7 +1120,7 @@ fn building_state_resets_to_ready_on_reopen() {
         // db drops here, releasing the engine.
     }
 
-    // Phase 2: reopen. The HNSW rebuild path should flip the state back
+    // Step 2: reopen. The HNSW rebuild path should flip the state back
     // to Ready after re-populating the graph from node records.
     {
         let mut db = coordinode_embed::Database::open(&path).expect("reopen");

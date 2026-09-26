@@ -1,5 +1,5 @@
 //! Hard-limit enforcement + per-endpoint capacity tracking
-//! (storage-stack Layer 1, INV-D3).
+//! (`used ≤ hard_limit` at all times).
 //!
 //! Covers:
 //! - per-endpoint usage scan populates `used_bytes` from on-disk SSTs,
@@ -228,7 +228,7 @@ fn capacity_recovery_re_enables_writes() {
 /// `HardLimitStrategy::CascadeEvict` MUST fire a cascade-eviction
 /// when the scanner observes Emergency severity. The endpoint's
 /// SSTs get demoted via major compaction (the per-LSM-level routing
-/// mechanism from R158).
+/// mechanism).
 #[test]
 fn cascade_evict_strategy_fires_at_emergency_threshold() {
     let hot = TempDir::new().expect("hot tempdir");
@@ -719,7 +719,7 @@ fn warm_load_preserves_full_severity_state() {
         ])
     };
 
-    // Phase 1: fill past 100% + persist the snapshot.
+    // Step 1: fill past 100% + persist the snapshot.
     {
         let engine = StorageEngine::open(&make_config()).expect("first open");
         for i in 0..500u32 {
@@ -734,10 +734,10 @@ fn warm_load_preserves_full_severity_state() {
         // snapshot reaches SST before drop.
         engine.persist().expect("final persist");
         let usage = engine.capacity().get("ep").unwrap();
-        assert!(!usage.is_writable(), "endpoint full at end of phase 1");
+        assert!(!usage.is_writable(), "endpoint full at end of step 1");
     }
 
-    // Phase 2: reopen. The very first inspection — BEFORE any scan
+    // Step 2: reopen. The very first inspection — BEFORE any scan
     // tick — must already report is_writable=false because warm-load
     // resolved severity against the persisted used_bytes.
     let engine = StorageEngine::open(&make_config()).expect("reopen");
@@ -964,7 +964,7 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Phase 1: write to Full (UP-crossing increments counter).
+    // Step 1: write to Full (UP-crossing increments counter).
     for i in 0..5000u32 {
         let key = format!("node:0:{i:010}");
         let _ = engine.put(Partition::Node, key.as_bytes(), b"payload-bytes");
@@ -974,7 +974,7 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
     let usage = engine.capacity().get("ep").expect("tracked");
     assert_eq!(usage.severity(), CapacitySeverity::Full);
 
-    // Phase 2: install a fresh recorder, then delete SSTs +
+    // Step 2: install a fresh recorder, then delete SSTs +
     // refresh — the DOWN-crossing back to Normal must NOT increment
     // the alert counter.
     let recorder = DebuggingRecorder::new();
@@ -1027,14 +1027,14 @@ fn down_crossing_severity_does_not_increment_alert_counter() {
 // The initial pre-write gate was wired only to `engine.put`. All three
 // remaining write paths (`engine.delete`, `engine.merge`,
 // `WriteBatch::commit`) were left ungated — writes through them would
-// succeed even on a Full endpoint, silently violating INV-D3. Each
+// succeed even on a Full endpoint, silently exceeding the hard limit. Each
 // test below MUST fail against the pre-fix code and pass after the
 // gate is propagated to every write path.
 
 /// `engine.delete` on a Full endpoint MUST reject with
 /// `CapacityExhausted`. A delete tombstone still consumes memtable
-/// bytes that will eventually flush to an SST — under INV-D3 the
-/// endpoint can't accept it.
+/// bytes that will eventually flush to an SST, so a Full endpoint
+/// can't accept it.
 #[test]
 fn delete_on_full_endpoint_rejects() {
     let dir = TempDir::new().expect("tempdir");
@@ -1363,19 +1363,19 @@ fn writes_resume_after_compaction_frees_space() {
     ]);
     let engine = StorageEngine::open(&config).expect("open");
 
-    // Phase 1: bulk-write the SAME 100 keys 50 times. Each rewrite
-    // creates a new MVCC version of the same key; the engine keeps
-    // all 50 versions in SSTs until compaction folds them. This is
+    // Step 1: bulk-write the SAME 100 keys over 150 rounds. Each
+    // rewrite creates a new MVCC version of the same key; the engine
+    // keeps the versions in SSTs until compaction folds them. This is
     // the easy way to manufacture compaction-reclaimable space
-    // without depending on tombstones.
-    // Wider per-round padding + more rounds so the rewrite barrage
-    // pushes the endpoint past the 200K hard limit even under the
-    // tighter SST encoding the engine ships in v5.
+    // without depending on tombstones. The padding and round count
+    // push the endpoint past the 200K hard limit.
     let padding = "x".repeat(64);
     for round in 0..150u32 {
         for i in 0..100u32 {
             let key = format!("node:0:{i:010}");
             let value = format!("round-{round}-{padding}");
+            // Once the endpoint fills, the gate rejects the rest of the
+            // barrage; that rejection is the state this test starts from.
             let _ = engine.put(Partition::Node, key.as_bytes(), value.as_bytes());
         }
     }
@@ -1395,9 +1395,9 @@ fn writes_resume_after_compaction_frees_space() {
         "writes must be gated while endpoint is Full",
     );
 
-    // Phase 2: fire major compaction. It will fold every key down to
-    // its latest version, reclaiming the ~49× redundancy from
-    // Phase 1. After refresh, used_bytes drops back below the
+    // Step 2: fire major compaction. It will fold every key down to
+    // its latest version, reclaiming the redundancy from step 1.
+    // After refresh, used_bytes drops back below the
     // threshold and is_writable flips on.
     engine
         .major_compact(Partition::Node)
@@ -1427,11 +1427,11 @@ fn writes_resume_after_compaction_frees_space() {
     assert!(
         usage.is_writable(),
         "writes must resume after compaction reclaims space \
-         (used={} <= hard_limit=40000)",
+         (used={} <= hard_limit=200000)",
         usage.used(),
     );
 
-    // Phase 3: confirm the gate now accepts new writes.
+    // Step 3: confirm the gate now accepts new writes.
     engine
         .put(Partition::Node, b"node:0:after-compact", b"v")
         .expect("write must succeed after compaction recovery");

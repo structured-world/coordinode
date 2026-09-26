@@ -250,7 +250,7 @@ fn sq8_calibration_lifecycle() {
         ..HnswConfig::default()
     });
 
-    // Phase 1: before calibration
+    // Step 1: before calibration
     for i in 0..19u64 {
         index.insert(i, vec![i as f32, (i as f32).sin(), 0.0]);
     }
@@ -260,14 +260,14 @@ fn sq8_calibration_lifecycle() {
     );
     assert!(index.sq8_params().is_none());
 
-    // Phase 2: trigger calibration
+    // Step 2: trigger calibration
     index.insert(19, vec![19.0, 19.0_f32.sin(), 0.0]);
     assert!(index.is_quantized(), "should be calibrated at threshold");
 
     let params = index.sq8_params().expect("params should exist");
     assert_eq!(params.dims(), 3);
 
-    // Phase 3: new inserts after calibration are immediately quantized
+    // Step 3: new inserts after calibration are immediately quantized
     index.insert(100, vec![10.0, 0.5, 0.0]);
     assert_eq!(index.len(), 21);
 
@@ -501,7 +501,7 @@ fn snapshot_mode_emits_stats_warning() {
     // Query with snapshot mode
     {
         let read_ts = oracle.next();
-        // Pure vector KNN is single-modality (post-R-SNAP6) — no auto-promotion.
+        // Pure vector KNN is single-modality, so no auto-promotion.
         // Explicit `read_consistency('snapshot')` hint forces snapshot mode so
         // the HNSW post-filter path emits MVCC stats this test asserts.
         let ast = cypher::parse(
@@ -579,7 +579,7 @@ fn current_mode_no_stats() {
 ///   ts=1003: CREATE Movie B (embedding [0.9, 0.1])  ← after snapshot
 ///   search at snapshot ts=1002: should see A, NOT B
 #[test]
-fn r106e_concurrent_insert_invisible_in_snapshot() {
+fn concurrent_insert_invisible_in_snapshot() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
@@ -728,7 +728,7 @@ fn r106e_concurrent_insert_invisible_in_snapshot() {
 ///   read at snapshot_read_ts=1003: A should STILL be visible (deleted after snapshot)
 ///   read at latest ts: A should be gone
 #[test]
-fn r106e_concurrent_delete_still_visible_in_snapshot() {
+fn concurrent_delete_still_visible_in_snapshot() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
@@ -867,7 +867,7 @@ fn r106e_concurrent_delete_still_visible_in_snapshot() {
 /// (Uses mvcc_read_ts directly — AS OF TIMESTAMP Cypher syntax wiring
 /// to mvcc_read_ts is a separate enhancement.)
 #[test]
-fn r106e_time_travel_vector_search_via_mvcc_read_ts() {
+fn time_travel_vector_search_via_mvcc_read_ts() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::NodeIdAllocator;
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
@@ -1005,7 +1005,7 @@ fn r106e_time_travel_vector_search_via_mvcc_read_ts() {
 ///
 /// Verifies that snapshot mode recall stays high (>95%) under churn.
 #[test]
-fn r106e_recall_benchmark_snapshot_vs_current() {
+fn recall_benchmark_snapshot_vs_current() {
     // Build a 10K-vector HNSW index (100K too slow for unit test; benchmark
     // uses criterion for the full 100K measurement)
     let n = 10_000usize;
@@ -1120,7 +1120,7 @@ fn hnsw_search_with_visibility_integration() {
     assert!((stats.overfetch_factor - 1.2).abs() < f64::EPSILON);
 }
 
-// ── HNSW Index Integration with VectorFilter (G009) ──────────────
+// ── HNSW Index Integration with VectorFilter ─────────────────────
 
 /// End-to-end test: create a vector index via the Database API, insert nodes,
 /// and check a threshold query still answers correctly with the index present.
@@ -1290,12 +1290,12 @@ fn hnsw_bulk_insert_and_search() {
     assert_eq!(results[0].id, 50, "nearest should be exact match");
 }
 
-// ── G060: Automatic HNSW maintenance on executor write path ─────────
+// ── Automatic HNSW maintenance on executor write path ───────────────
 
-/// G060 test 1: CREATE node with vector property automatically inserts
+/// CREATE node with vector property automatically inserts
 /// the vector into the HNSW index (no manual on_vector_written needed).
 #[test]
-fn g060_create_node_auto_inserts_into_hnsw() {
+fn create_node_auto_inserts_into_hnsw() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1348,9 +1348,9 @@ fn g060_create_node_auto_inserts_into_hnsw() {
     );
 }
 
-/// G060 test 2: SET vector property on existing node updates the HNSW index.
+/// SET vector property on existing node updates the HNSW index.
 #[test]
-fn g060_set_vector_property_updates_hnsw() {
+fn set_vector_property_updates_hnsw() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1400,9 +1400,9 @@ fn g060_set_vector_property_updates_hnsw() {
     );
 }
 
-/// G060 test 3: CREATE node without vector property does NOT affect HNSW.
+/// CREATE node without vector property does NOT affect HNSW.
 #[test]
-fn g060_create_nonvector_node_does_not_affect_hnsw() {
+fn create_nonvector_node_does_not_affect_hnsw() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1434,10 +1434,10 @@ fn g060_create_nonvector_node_does_not_affect_hnsw() {
     );
 }
 
-/// G060 test 4: HNSW auto-maintenance with multiple nodes — search uses
+/// HNSW auto-maintenance with multiple nodes — search uses
 /// the HNSW index to find nearest vectors correctly.
 #[test]
-fn g060_hnsw_search_after_auto_inserts() {
+fn hnsw_search_after_auto_inserts() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1476,12 +1476,12 @@ fn g060_hnsw_search_after_auto_inserts() {
     );
 }
 
-/// G060 test 5: DELETE node calls on_vector_deleted (wiring correctness).
+/// DELETE node calls on_vector_deleted (wiring correctness).
 /// Since on_vector_deleted is intentionally a no-op (MVCC post-filter),
 /// we verify the deletion doesn't crash and the vector remains in the
 /// HNSW graph (by design — MVCC visibility handles exclusion).
 #[test]
-fn g060_delete_node_calls_on_vector_deleted() {
+fn delete_node_calls_on_vector_deleted() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1527,9 +1527,9 @@ fn g060_delete_node_calls_on_vector_deleted() {
     );
 }
 
-/// G060 test 6: REMOVE vector property calls on_vector_deleted wiring.
+/// REMOVE vector property calls on_vector_deleted wiring.
 #[test]
-fn g060_remove_vector_property_wiring() {
+fn remove_vector_property_wiring() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1566,17 +1566,17 @@ fn g060_remove_vector_property_wiring() {
     );
 }
 
-// ── G061: HNSW index persistence and rebuild on startup ─────────────
+// ── HNSW index persistence and rebuild on startup ───────────────────
 
-/// G061 test 1: HNSW index survives Database close + reopen.
+/// HNSW index survives Database close + reopen.
 /// Create vector index, insert nodes, close DB, reopen, search.
 #[test]
-fn g061_hnsw_persists_across_restart() {
+fn hnsw_persists_across_restart() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // Phase 1: create index, insert vectors, close
+    // Step 1: create index, insert vectors, close
     {
         let mut db = Database::open(dir.path()).expect("open");
         db.create_vector_index(
@@ -1607,7 +1607,7 @@ fn g061_hnsw_persists_across_restart() {
         assert_eq!(results.len(), 3, "should find 3 vectors before close");
     } // db dropped here
 
-    // Phase 2: reopen and verify HNSW was rebuilt
+    // Step 2: reopen and verify HNSW was rebuilt
     {
         let db = Database::open(dir.path()).expect("reopen");
         let reg = db.vector_index_registry();
@@ -1630,9 +1630,9 @@ fn g061_hnsw_persists_across_restart() {
     }
 }
 
-/// G061 test 2: Multiple vector indexes on different labels persist.
+/// Multiple vector indexes on different labels persist.
 #[test]
-fn g061_multiple_indexes_persist() {
+fn multiple_indexes_persist() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1691,9 +1691,9 @@ fn g061_multiple_indexes_persist() {
     }
 }
 
-/// G061 test 3: Empty database reopens without errors.
+/// Empty database reopens without errors.
 #[test]
-fn g061_empty_db_reopen_no_errors() {
+fn empty_db_reopen_no_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Open and close with no vector indexes
@@ -1711,9 +1711,10 @@ fn g061_empty_db_reopen_no_errors() {
     }
 }
 
-/// G061 test 4: Nodes added after reopen are also auto-indexed (G060 + G061 combined).
+/// Nodes added after reopen are also auto-indexed (rebuild + write-path
+/// maintenance combined).
 #[test]
-fn g061_new_vectors_indexed_after_reopen() {
+fn new_vectors_indexed_after_reopen() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1746,7 +1747,7 @@ fn g061_new_vectors_indexed_after_reopen() {
             .expect("search");
         assert_eq!(results.len(), 1, "rebuilt HNSW has 1 vector");
 
-        // Add new node (G060 auto-maintenance should work)
+        // Add new node (write-path auto-maintenance should index it)
         db.execute_cypher("CREATE (b:Item {name: 'B', v: [0.0, 1.0, 0.0]})")
             .expect("create B");
 
@@ -1757,17 +1758,17 @@ fn g061_new_vectors_indexed_after_reopen() {
         assert_eq!(
             results.len(),
             2,
-            "HNSW should have 2 vectors: 1 rebuilt + 1 new from G060"
+            "HNSW should have 2 vectors: 1 rebuilt + 1 new from the write path"
         );
     }
 }
 
-// ── G009: StorageVectorLoader integration test ─────────────────────
+// ── StorageVectorLoader integration test ───────────────────────────
 // Verifies the full chain: Database creates a StorageVectorLoader that
 // successfully reads f32 vectors from the node: partition for HNSW reranking.
 
 #[test]
-fn g009_storage_vector_loader_reads_from_node_partition() {
+fn storage_vector_loader_reads_from_node_partition() {
     use coordinode_embed::db::StorageVectorLoader;
     use coordinode_vector::VectorLoader;
 
@@ -1831,10 +1832,10 @@ fn g009_storage_vector_loader_reads_from_node_partition() {
     );
 }
 
-/// G009 E2E: Create HNSW index with offload_vectors=true, insert vectors
+/// E2E: Create HNSW index with offload_vectors=true, insert vectors
 /// via Cypher, query with vector_distance — full pipeline through executor.
 #[test]
-fn g009_offloaded_hnsw_search_e2e_through_cypher() {
+fn offloaded_hnsw_search_e2e_through_cypher() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1907,10 +1908,10 @@ fn g009_offloaded_hnsw_search_e2e_through_cypher() {
     );
 }
 
-/// G009 E2E: Force offloaded mode via manual SQ8 calibration, then verify
+/// E2E: Force offloaded mode via manual SQ8 calibration, then verify
 /// search_with_loader reranks with exact f32 loaded from node: partition.
 #[test]
-fn g009_forced_offload_search_through_registry() {
+fn forced_offload_search_through_registry() {
     use coordinode_embed::db::StorageVectorLoader;
     use coordinode_query::index::VectorIndexConfig;
 
@@ -2007,7 +2008,7 @@ fn g009_forced_offload_search_through_registry() {
     }
 }
 
-/// G009 E2E: force offload, then query through Cypher and check the answer is
+/// E2E: force offload, then query through Cypher and check the answer is
 /// still right.
 ///
 /// What this covers today: an offloaded index (f32 vectors evicted from RAM)
@@ -2016,7 +2017,7 @@ fn g009_forced_offload_search_through_registry() {
 /// threshold, so the executor scores them directly, and the threshold half of
 /// the predicate is exact by construction (see the `VectorFilter` arm). The
 /// loader itself is covered by `offload_search_with_loader_returns_correct_results`
-/// (unit) and `g009_forced_offload_search_through_registry` (registry level,
+/// (unit) and `forced_offload_search_through_registry` (registry level,
 /// real `StorageVectorLoader`).
 ///
 /// The executor's `ctx.vector_loader` argument has no end-to-end test, and an
@@ -2027,9 +2028,9 @@ fn g009_forced_offload_search_through_registry() {
 /// column is recomputed from the node record, and the only difference is ANN
 /// result quality, which cannot be asserted without pinning approximate
 /// ranking. A sharp test needs an observable counter on the loader, which
-/// belongs with `EXPLAIN ANALYZE` (R945).
+/// belongs with `EXPLAIN ANALYZE`.
 #[test]
-fn g009_forced_offload_cypher_e2e() {
+fn forced_offload_cypher_e2e() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2198,11 +2199,10 @@ fn threshold_query_names(db: &mut Database) -> Vec<String> {
 /// global top-k drops members of that set — a different answer, not a lower
 /// recall.
 ///
-/// The shape under test is the one `arch/core/query-engine.md` § Graph
-/// Predicate Push-Down governs: a traversal produces the candidate set, a
-/// vector predicate filters it. The invariant there reads "It may never
-/// materialise `C` and then run an unfiltered HNSW scan ignoring `C`", which
-/// is what the executor used to do: every target ranks below 200 decoys
+/// The shape under test is the one graph-predicate push-down governs: a
+/// traversal produces the candidate set `C`, a vector predicate filters it.
+/// The executor may never materialise `C` and then run an unfiltered HNSW
+/// scan ignoring `C`, which is what it used to do: every target ranks below 200 decoys
 /// globally, so none survived the intersection although all of them pass the
 /// threshold.
 #[test]

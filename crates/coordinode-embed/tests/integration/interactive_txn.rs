@@ -1,4 +1,4 @@
-//! Integration tests: interactive multi-statement transactions (ADR-042).
+//! Integration tests: interactive multi-statement transactions.
 //!
 //! Exercises the `Database` interactive transaction API end to end through
 //! the full pipeline: `begin_transaction` → N `execute_in_transaction` →

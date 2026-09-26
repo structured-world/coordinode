@@ -1,4 +1,4 @@
-//! Embedded checkpoint + WAL-replay-repair (G111).
+//! Embedded checkpoint + WAL-replay-repair.
 //!
 //! Single-node / embedded deployments have no replica to repair a corrupt
 //! partition from, so the durability story is: detect corruption (scrub) and

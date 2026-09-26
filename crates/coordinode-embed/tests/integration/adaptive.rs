@@ -1,4 +1,4 @@
-//! Integration tests: adaptive parallel traversal (G010).
+//! Integration tests: adaptive parallel traversal.
 //!
 //! Tests that the executor switches to rayon parallel processing when
 //! fan-out exceeds `parallel_threshold`, producing the same results as
@@ -259,9 +259,9 @@ fn parallel_traversal_injects_computed_properties() {
     }
 }
 
-// ── G066 regression: varlen edge properties at depth > 1 ──────────────
+// ── Regression: varlen edge properties at depth > 1 ───────────────────
 
-/// REGRESSION (G066): Edge properties in variable-length traversal at depth > 1
+/// REGRESSION: Edge properties in variable-length traversal at depth > 1
 /// should reflect the actual edge at that depth, not the original source edge.
 ///
 /// Graph: A --[KNOWS {since: 2020}]--> B --[KNOWS {since: 2023}]--> C
@@ -317,15 +317,15 @@ fn varlen_edge_properties_at_depth_2() {
         })
         .expect("Charlie row should exist");
 
-    // G066 BUG: At depth=2, r.since should be 2023 (Bob→Charlie edge),
-    // but the pre-existing bug looks up Alice→Charlie which doesn't exist → Null.
-    // This test documents the expected CORRECT behavior.
+    // At depth=2, r.since must be 2023 (Bob→Charlie edge); looking the
+    // edge up from the original source (Alice→Charlie, which doesn't
+    // exist) would yield Null.
     let since = charlie_row.get("since");
     assert_eq!(
         since,
         Some(&coordinode_core::graph::types::Value::Int(2023)),
         "depth-2 edge property should be 2023 (Bob→Charlie), got {since:?} \
-         — G066: varlen edge source ID bug"
+         — varlen edge looked up from the wrong source"
     );
 }
 

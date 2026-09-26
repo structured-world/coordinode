@@ -1,4 +1,4 @@
-//! Integration tests: ALTER LABEL SET SCHEMA DDL (G029).
+//! Integration tests: ALTER LABEL SET SCHEMA DDL.
 //!
 //! Verifies that schema mode can be changed via Cypher DDL
 //! and that write-time validation respects the new mode.
@@ -110,10 +110,10 @@ fn alter_label_invalid_mode_parse_error() {
     assert!(result.is_err(), "invalid mode should fail");
 }
 
-// ── ADR-023 C-decision regression: revision-bump semantics ──────────
+// ── Regression: revision-bump semantics ─────────────────────────────
 
 /// ALTER LABEL ... SET SCHEMA <mode> must bump `schema_revision` (mode change is
-/// a write-path mutation per ADR-023). Adding a property via `Database::
+/// a write-path mutation). Adding a property via `Database::
 /// create_label_schema` (or implicit declaration on first node insert) must
 /// NOT bump `schema_revision` (properties mutate the current snapshot in
 /// place). Together these enforce the lexicon decision: revisions track DDL
@@ -135,14 +135,14 @@ fn alter_label_mode_bumps_revision_but_property_add_does_not() {
 
     // Adding another property through a fresh create with the same name is
     // idempotent and must NOT advance the revision — property mutations are
-    // snapshot edits, not new revisions (ADR-023).
+    // snapshot edits, not new revisions.
     let mut schema_v2 = LabelSchema::new_node_id("Doc");
     schema_v2.add_property(PropertyDef::new("title", PropertyType::String));
     schema_v2.add_property(PropertyDef::new("body", PropertyType::String));
     let rev_after_property_add = db.create_label_schema(schema_v2).expect("re-create");
     assert_eq!(
         rev_after_property_add, 1,
-        "adding a property must NOT bump schema_revision (per ADR-023)"
+        "adding a property must NOT bump schema_revision"
     );
 
     // ALTER LABEL SET SCHEMA <mode> mutates write-path semantics → MUST bump.

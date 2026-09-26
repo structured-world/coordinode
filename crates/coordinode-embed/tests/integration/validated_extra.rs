@@ -1,4 +1,4 @@
-//! Integration tests: VALIDATED mode _extra overflow storage (G028).
+//! Integration tests: VALIDATED mode _extra overflow storage.
 //!
 //! Verifies that in VALIDATED schema mode, undeclared properties
 //! are stored in the `extra` overflow map (string keys, no interning)

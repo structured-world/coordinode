@@ -1,6 +1,6 @@
 //! Integration tests: Database and BlobService share a single StorageEngine.
 //!
-//! Verifies G023: engine_shared() returns an Arc to the SAME storage instance
+//! Verifies that engine_shared() returns an Arc to the SAME storage instance
 //! used by Database — writes through one handle are visible through the other.
 //! No separate blob_store subdirectory; all partitions in one storage DB.
 

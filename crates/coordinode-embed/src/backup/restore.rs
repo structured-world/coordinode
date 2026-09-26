@@ -51,7 +51,7 @@ pub struct RestoreStats {
 ///
 /// Reads length-prefixed MessagePack entries and writes them
 /// directly to storage partitions. Fastest restore method.
-/// ADR-016: writes use plain engine.put() — oracle auto-stamps seqno.
+/// Writes use plain engine.put(); the oracle stamps each seqno.
 pub fn restore_binary<R: Read>(
     engine: &StorageEngine,
     reader: &mut R,
@@ -197,7 +197,7 @@ fn schema_fingerprint_of_empty() -> u64 {
 /// encoding the adjacency keys.
 ///
 /// Requires an existing FieldInterner (or creates a new one).
-/// ADR-016: writes use plain engine.put() — oracle auto-stamps seqno.
+/// Writes go straight to the engine; the oracle stamps each seqno.
 pub fn restore_json<R: BufRead>(
     engine: &StorageEngine,
     interner: &mut FieldInterner,

@@ -1,4 +1,4 @@
-//! Integration tests: Oplog segment format (R074).
+//! Integration tests: Oplog segment format.
 //!
 //! Tests verify that:
 //!   - OplogManager can append entries and read them back from sealed segments

@@ -17,7 +17,7 @@ fn open_db() -> (Database, tempfile::TempDir) {
 
 /// Seed SSE token postings through one committed MVCC transaction —
 /// the `EncryptedIndex` store buffers its `Partition::Idx` writes on
-/// the transaction (ADR-041).
+/// the transaction.
 fn commit_sse(
     engine: &coordinode_storage::engine::core::StorageEngine,
     body: impl FnOnce(&mut coordinode_storage::engine::transaction::Transaction),

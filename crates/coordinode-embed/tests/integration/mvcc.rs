@@ -1046,7 +1046,7 @@ fn executor_pipeline_read_only_no_proposal() {
     assert_eq!(next_id.as_raw(), 1, "no proposal should have been created");
 }
 
-/// R064: verify that Database::open() wires TimestampOracle into storage engine.
+/// Verify that Database::open() wires TimestampOracle into storage engine.
 /// The oracle must drive LSM seqnos — writes through Database must produce
 /// seqnos from the oracle, not from a default counter.
 #[test]
@@ -1071,8 +1071,10 @@ fn database_oracle_drives_storage_seqnos() {
     );
 }
 
-/// R064: verify snapshot_at works through full Database stack with oracle seqnos.
-/// Write v1, take snapshot seqno, write v2, snapshot_at(old_seqno) sees v1.
+/// Verify snapshot_at works through full Database stack with oracle seqnos:
+/// a later write moves the current snapshot past the captured seqno, and
+/// snapshot_at(old_seqno) resolves to no later than it. What each snapshot
+/// sees is checked by the snapshot-isolation tests below.
 #[test]
 fn database_snapshot_at_through_oracle() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1087,10 +1089,8 @@ fn database_snapshot_at_through_oracle() {
     db.execute_cypher("CREATE (n:User {name: 'bob'})")
         .expect("create v2");
 
-    // snapshot_at old seqno should still see alice but NOT bob
     let old_snap = db.engine().snapshot_at(snap_seqno).expect("snapshot_at");
 
-    // Current snapshot should see both
     let current_snap = db.engine().snapshot();
     assert!(
         current_snap > snap_seqno,
@@ -1099,23 +1099,22 @@ fn database_snapshot_at_through_oracle() {
         snap_seqno
     );
 
-    // Verify old snapshot works (basic sanity — detailed MVCC tests elsewhere)
     assert!(old_snap <= snap_seqno);
 }
 
 // ────────────────────────────────────────────────────────────────────
-// R065: Native seqno MVCC integration tests (ADR-016)
+// Native seqno MVCC integration tests
 //
 // These tests verify that the snapshot_at() read path works correctly
 // through the full Database → execute_cypher → snapshot pipeline.
 // ────────────────────────────────────────────────────────────────────
 
-/// R065: Snapshot isolation through Database.execute_cypher().
+/// Snapshot isolation through Database.execute_cypher().
 ///
 /// Write node A, capture seqno, write node B. Snapshot at old seqno
 /// should see A but not B. Current snapshot sees both.
 #[test]
-fn r065_snapshot_isolation_through_database() {
+fn snapshot_isolation_through_database() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = coordinode_embed::Database::open(dir.path()).expect("open");
 
@@ -1158,13 +1157,13 @@ fn r065_snapshot_isolation_through_database() {
     assert_eq!(old_count, 1, "old snapshot should see only alice, not bob");
 }
 
-/// R065: Write + overwrite via SET, verify snapshot sees old version.
+/// Write + overwrite via SET, verify snapshot sees old version.
 ///
 /// CREATE node → snapshot → SET property → current reads new value,
 /// snapshot reads old value. Verifies that engine.put() with oracle
 /// seqno correctly versions data for snapshot_at reads.
 #[test]
-fn r065_snapshot_sees_old_version_after_set() {
+fn snapshot_sees_old_version_after_set() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = coordinode_embed::Database::open(dir.path()).expect("open");
 
@@ -1216,13 +1215,13 @@ fn r065_snapshot_sees_old_version_after_set() {
     assert!(found_v1, "old snapshot should see val='v1', not 'v2'");
 }
 
-/// R065: Delete a node, verify snapshot before delete still sees it.
+/// Delete a node, verify snapshot before delete still sees it.
 ///
 /// CREATE node → snapshot → DELETE → current returns empty,
 /// old snapshot still has the node. Tests LSM tombstone + snapshot
 /// interaction (engine.delete creates tombstone, snapshot_at ignores it).
 #[test]
-fn r065_snapshot_before_delete_still_visible() {
+fn snapshot_before_delete_still_visible() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = coordinode_embed::Database::open(dir.path()).expect("open");
 
@@ -1264,13 +1263,13 @@ fn r065_snapshot_before_delete_still_visible() {
     );
 }
 
-/// R065: Multiple writes at different seqnos, verify snapshot_at each.
+/// Multiple writes at different seqnos, verify snapshot_at each.
 ///
 /// Write 5 nodes at different timestamps, take snapshot after each.
 /// Verify snapshot_at(ts_N) sees exactly N nodes. This tests that
 /// native seqno MVCC provides correct point-in-time visibility.
 #[test]
-fn r065_multiple_snapshots_at_different_seqnos() {
+fn multiple_snapshots_at_different_seqnos() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = coordinode_embed::Database::open(dir.path()).expect("open");
 
@@ -1312,14 +1311,14 @@ fn r065_multiple_snapshots_at_different_seqnos() {
     }
 }
 
-/// R065: OCC conflict detection through Database API.
+/// OCC conflict detection through Database API.
 ///
 /// Two sequential transactions where the second modifies a key read by
 /// the first. Since Database.execute_cypher runs each statement as its
 /// own transaction, we verify OCC at a lower level: set up a write
 /// between two executor calls sharing a read-set.
 #[test]
-fn r065_occ_detects_concurrent_modification() {
+fn occ_detects_concurrent_modification() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 
@@ -1374,13 +1373,13 @@ fn r065_occ_detects_concurrent_modification() {
         .expect("stale read with disjoint writes must commit");
 }
 
-/// R066: ABA detection — write + revert to same value still triggers conflict.
+/// ABA detection — write + revert to same value still triggers conflict.
 ///
-/// Value comparison (R065) would miss this: write "A" → write "B" → write "A".
-/// Seqno-based detection (R066) catches it because the latest seqno > start_ts,
+/// Value comparison would miss this: write "A" → write "B" → write "A".
+/// Seqno-based detection catches it because the latest seqno > start_ts,
 /// regardless of the value being identical.
 #[test]
-fn r066_occ_detects_aba_write() {
+fn occ_detects_aba_write() {
     use coordinode_core::graph::intern::FieldInterner;
     use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 

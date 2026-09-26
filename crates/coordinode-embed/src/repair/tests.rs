@@ -1,4 +1,4 @@
-//! Tests for embedded checkpoint + WAL-replay-repair (G111).
+//! Tests for embedded checkpoint + WAL-replay-repair.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -263,7 +263,7 @@ fn database_open_auto_repairs_corrupt_partition() {
     use crate::Database;
     let dir = TempDir::new().expect("tempdir");
 
-    // Phase 1: 100 rows checkpointed (the repair base), then a bulk of
+    // Step 1: 100 rows checkpointed (the repair base), then a bulk of
     // post-checkpoint rows flushed to their own SSTs (recorded in the oplog past
     // the checkpoint cursor), then close. Those post-checkpoint tables are what we
     // corrupt: not hard-linked into the checkpoint, so the base stays clean.
@@ -282,7 +282,7 @@ fn database_open_auto_repairs_corrupt_partition() {
             .expect("flush post-checkpoint rows to their own SSTs");
     }
 
-    // Phase 2: corrupt every post-checkpoint Node table (excluding the
+    // Step 2: corrupt every post-checkpoint Node table (excluding the
     // checkpoint-shared base), so the scrub flags Node while the repair base
     // stays a clean source for the rebuild.
     let root = checkpoint_root(dir.path());
@@ -295,7 +295,7 @@ fn database_open_auto_repairs_corrupt_partition() {
         "test must corrupt a post-checkpoint Node table"
     );
 
-    // Phase 3: reopen via Database::open — auto-on-open repair must heal the
+    // Step 3: reopen via Database::open — auto-on-open repair must heal the
     // partition from the checkpoint base (100 rows) plus oplog replay (the
     // post-checkpoint rows) before serving, with no explicit call.
     let mut db = Database::open(dir.path()).expect("reopen auto-repairs");

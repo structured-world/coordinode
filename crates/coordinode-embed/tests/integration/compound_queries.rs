@@ -131,7 +131,7 @@ fn gold_fraud_ring_graph_traversal() {
     );
 
     // NOTE: Cross-MATCH-clause predicates (referencing variables from both sides
-    // of CartesianProduct) require WHERE pushup above CartesianProduct (G024).
+    // of CartesianProduct) require WHERE pushup above CartesianProduct.
     // Currently the planner pushes WHERE into the second MATCH's branch where
     // `suspect` is not yet in scope. The graph traversal works correctly.
 }

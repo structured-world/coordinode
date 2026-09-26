@@ -581,7 +581,7 @@ fn oplog_replay_through_multi_tier_routing() {
         ])
     };
 
-    // Phase 1: open embedded (retained oplog), journal + apply, drop without flush.
+    // Step 1: open embedded (retained oplog), journal + apply, drop without flush.
     {
         let oracle = Arc::new(TimestampOracle::new());
         let engine =
@@ -600,8 +600,8 @@ fn oplog_replay_through_multi_tier_routing() {
         // Drop without persist — memtable NOT flushed, only the oplog on disk.
     }
 
-    // Phase 2: reopen. Oplog replay restores the memtable; the engine is
-    // operational with the routing persisted from Phase 1.
+    // Step 2: reopen. Oplog replay restores the memtable; the engine is
+    // operational with the routing persisted from step 1.
     let oracle = Arc::new(TimestampOracle::new());
     let engine = StorageEngine::open_embedded(&make_config(), oracle).expect("reopen with replay");
     let value = engine

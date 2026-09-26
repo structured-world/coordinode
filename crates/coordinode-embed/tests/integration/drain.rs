@@ -1,4 +1,4 @@
-//! Integration tests for volatile write drain (R077a).
+//! Integration tests for volatile write drain.
 //!
 //! Tests the full flow: Database with j:memory → write data → verify local
 //! visibility → drain → verify data persisted. Also tests the volatile

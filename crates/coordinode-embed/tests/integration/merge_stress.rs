@@ -1,4 +1,4 @@
-//! Integration tests: R010d merge operator stress + time-travel through Database API.
+//! Integration tests: merge operator stress + time-travel through Database API.
 //!
 //! Tests the full pipeline: Cypher → parser → planner → executor → merge operator → storage.
 //! Verifies:
@@ -19,7 +19,7 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
-// ── R010d test 1: concurrent edge creation through Cypher ──────────
+// ── Concurrent edge creation through Cypher ────────────────────────
 
 #[test]
 fn concurrent_edge_creation_via_cypher_zero_conflict() {
@@ -73,7 +73,7 @@ fn concurrent_edge_creation_via_cypher_zero_conflict() {
     assert_eq!(ids, expected, "not all target IDs found via traversal");
 }
 
-// ── R010d test 2: edge time-travel via storage snapshot ──────────────
+// ── Edge time-travel via storage snapshot ────────────────────────────
 
 #[test]
 fn edge_time_travel_via_storage_snapshot() {
@@ -84,7 +84,7 @@ fn edge_time_travel_via_storage_snapshot() {
     // engine's AS OF TIMESTAMP does not yet filter adj: partition reads (gap).
     let (mut db, _dir) = open_db();
 
-    // Phase 1: Create 3 nodes and 2 edges.
+    // Step 1: Create 3 nodes and 2 edges.
     db.execute_cypher("CREATE (a:Node {name: 'A'})")
         .expect("create A");
     db.execute_cypher("CREATE (b:Node {name: 'B'})")
@@ -101,7 +101,7 @@ fn edge_time_travel_via_storage_snapshot() {
     db.engine_shared().persist().expect("persist");
     let snap_after_2_edges = db.engine_shared().snapshot();
 
-    // Phase 2: Add 1 more edge.
+    // Step 2: Add 1 more edge.
     db.execute_cypher("CREATE (d:Node {name: 'D'})")
         .expect("create D");
     db.execute_cypher("MATCH (a:Node {name: 'A'}), (d:Node {name: 'D'}) CREATE (a)-[:LINK]->(d)")
@@ -140,7 +140,7 @@ fn edge_time_travel_via_storage_snapshot() {
     );
 }
 
-// ── R010d test 3: compaction preserves edge snapshot correctness ────
+// ── Compaction preserves edge snapshot correctness ──────────────────
 
 #[test]
 fn edge_compaction_preserves_snapshot_correctness() {

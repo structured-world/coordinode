@@ -1170,7 +1170,7 @@ fn explain_stats_after_interleaved_writes() {
     );
 }
 
-// ── StorageStats TTL cache tests (G034) ────────────────────────────
+// ── StorageStats TTL cache tests ───────────────────────────────────
 
 /// Verify that two consecutive explain_cypher calls return consistent
 /// results (cache hit path — second call should use cached stats).
@@ -1396,7 +1396,7 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
     );
 }
 
-// === G022: MissingIndex false-positive prevention (IndexRegistry cross-check) ===
+// === MissingIndex false-positive prevention (IndexRegistry cross-check) ===
 
 /// When an index exists for (User, email), EXPLAIN SUGGEST should NOT suggest
 /// CREATE INDEX for that property — preventing false positives.
@@ -1435,7 +1435,8 @@ fn explain_suggest_no_false_positive_when_index_exists() {
     let db = Database::open(dir.path()).expect("open db");
 
     // Step 3: EXPLAIN SUGGEST for a query that filters User.email.
-    // Without G022 fix, this would suggest CREATE INDEX even though it exists.
+    // Without the registry cross-check, this would suggest CREATE INDEX
+    // even though the index exists.
     let result = db
         .explain_suggest("MATCH (n:User) WHERE n.email = 'test@example.com' RETURN n")
         .expect("explain_suggest");

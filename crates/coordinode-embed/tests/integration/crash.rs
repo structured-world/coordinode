@@ -86,7 +86,7 @@ fn nodes_persist_across_reopen() {
             .execute_cypher("MATCH (n:User) RETURN n.name ORDER BY n.name")
             .expect("match");
         assert_eq!(rows.len(), 2);
-        // Verify property values survive reopen (G027 fix: interner persistence)
+        // Verify property values survive reopen (the field interner persists)
         let mut names: Vec<String> = rows
             .iter()
             .filter_map(|r| {

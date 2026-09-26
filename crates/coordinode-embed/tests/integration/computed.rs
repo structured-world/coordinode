@@ -1,8 +1,8 @@
-//! Integration tests: COMPUTED property query-time evaluation (R082, R085).
+//! Integration tests: COMPUTED property query-time evaluation.
 //!
 //! Tests that COMPUTED properties (Decay, TTL, VectorDecay) are evaluated
-//! inline during query execution and visible in RETURN and WHERE clauses.
-//! R085 tests verify multi-timestamp decay interpolation and TTL subtree scope.
+//! inline during query execution and visible in RETURN and WHERE clauses,
+//! including multi-timestamp decay interpolation and TTL subtree scope.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -252,7 +252,7 @@ fn computed_on_traversal_target() {
     }
 }
 
-// ── COMPUTED TTL Background Reaper (R083) ────────────────────────────
+// ── COMPUTED TTL Background Reaper ───────────────────────────────────
 
 /// Background reaper deletes expired nodes (scope: Node).
 #[test]
@@ -357,7 +357,7 @@ fn computed_ttl_reaper_cleans_edges_on_node_delete() {
 fn computed_ttl_field_removal_survives_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // Phase 1: create node, run reaper, verify field removed.
+    // Step 1: create node, run reaper, verify field removed.
     {
         let mut db = Database::open(dir.path()).expect("open");
 
@@ -405,7 +405,7 @@ fn computed_ttl_field_removal_survives_reopen() {
     }
     // Database dropped → flush + close.
 
-    // Phase 2: reopen and verify merge operand was compacted correctly.
+    // Step 2: reopen and verify merge operand was compacted correctly.
     {
         let mut db = Database::open(dir.path()).expect("reopen");
         let rows = db
@@ -1091,7 +1091,7 @@ fn vector_decay_in_compound_where() {
     assert_eq!(rows[0].get("title"), Some(&Value::String("fresh".into())));
 }
 
-// ── R085: COMPUTED integration tests ────────────────────────────────
+// ── COMPUTED integration tests ──────────────────────────────────────
 
 // ── (1) Decay returns correct interpolated value at 5 timestamps ────
 
@@ -1344,7 +1344,7 @@ fn computed_ttl_subtree_removes_anchor_preserves_document() {
     );
 }
 
-/// Regression test for G068: Subtree scope with `target_field = Some(...)` must
+/// Regression test: Subtree scope with `target_field = Some(...)` must
 /// delete the specified target property, NOT the anchor TIMESTAMP field.
 ///
 /// Schema: anchor = `cached_at` (TIMESTAMP trigger), target = `payload` (Document).

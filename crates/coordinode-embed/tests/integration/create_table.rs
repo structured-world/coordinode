@@ -1,4 +1,4 @@
-//! CREATE TABLE end-to-end: parse -> plan -> execute over real storage (R901).
+//! CREATE TABLE end-to-end: parse -> plan -> execute over real storage.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

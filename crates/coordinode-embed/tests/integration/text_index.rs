@@ -1,4 +1,4 @@
-//! Integration tests: TextIndexRegistry + CREATE/DROP TEXT INDEX DDL (G013).
+//! Integration tests: TextIndexRegistry + CREATE/DROP TEXT INDEX DDL.
 //!
 //! Tests the full text index lifecycle through Database:
 //! - CREATE TEXT INDEX DDL creates tantivy index and backfills existing nodes
@@ -161,7 +161,7 @@ fn drop_text_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("dropped"), Some(&Value::Bool(true)));
 
-    // R-HYB1b: after DROP, text_match() must hard-fail with a clear message
+    // After DROP, text_match() must hard-fail with a clear message
     // rather than silently passing every row through. The old graceful-
     // degradation behaviour was a semantic bug (the opposite of what the
     // filter asked for).
@@ -341,7 +341,7 @@ fn remove_property_removes_from_text_index() {
 
 // ── Non-matching label not indexed ─────────────────────────────────
 
-// ── Multi-field DDL (G016) ─────────────────────────────────────────
+// ── Multi-field DDL ────────────────────────────────────────────────
 
 /// CREATE TEXT INDEX with multi-field per-analyzer syntax.
 #[test]

@@ -1,4 +1,4 @@
-//! Integration tests for Database::from_engine() (G063).
+//! Integration tests for Database::from_engine().
 //!
 //! Verifies that Database works correctly when initialized with an
 //! externally-provided StorageEngine, TimestampOracle, and ProposalPipeline.

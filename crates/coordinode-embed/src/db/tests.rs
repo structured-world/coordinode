@@ -233,7 +233,7 @@ fn data_persists_across_reopen() {
 }
 
 /// Node IDs are monotonically increasing across database reopens.
-/// This verifies G001: persistent NodeIdAllocator.
+/// This verifies the NodeIdAllocator persists across reopen.
 #[test]
 fn node_ids_persist_across_reopen() {
     use coordinode_core::graph::types::Value;
@@ -544,8 +544,8 @@ fn engine_shared_multiple_arcs() {
     // Both point to the same allocation (Arc strong count = 6:
     // one in Database, one in OwnedLocalProposalPipeline (drain),
     // one in TtlReaperHandle (background thread), one in the
-    // LsmVectorTier backing VectorIndexRegistry (ADR-033 f32
-    // truth tier), two here).
+    // LsmVectorTier backing VectorIndexRegistry (f32 truth tier),
+    // two here).
     assert_eq!(Arc::strong_count(&arc1), 6);
     assert_eq!(Arc::strong_count(&arc2), 6);
 
@@ -1060,7 +1060,7 @@ fn vector_set_updates_hnsw_index() {
     );
 }
 
-// ── R-PUSH1: end-to-end + wiring tests ────────────────────────────
+// ── Graph-predicate push-down: end-to-end + wiring tests ──────────
 
 /// CombinedStats returns real values from VectorIndexRegistry when the
 /// index is registered. Closes the gap where vector_index_size/dim/
@@ -1237,7 +1237,7 @@ fn end_to_end_traverse_then_vector_filter_gets_push_down_decision() {
         )
         .expect("explain");
     // The plan must build cleanly; we don't assert the strategy slug
-    // here (that's R-PUSH2's EXPLAIN JSON contract). What we assert
+    // here (the EXPLAIN JSON tests own that). What we assert
     // end-to-end is that the explain pipeline runs without panic and
     // touches the push_down pass — verified indirectly by checking
     // that planner test invariants still hold on the equivalent plan

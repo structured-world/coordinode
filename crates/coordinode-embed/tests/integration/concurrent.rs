@@ -2,7 +2,6 @@
 //!
 //! Verifies that when multiple threads execute UPSERTs on the same node,
 //! the CAS mechanism prevents lost updates and data corruption.
-//! This test validates G007: UPSERT CAS under concurrent access.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

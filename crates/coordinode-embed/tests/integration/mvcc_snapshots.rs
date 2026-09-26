@@ -1,6 +1,6 @@
-//! R069: MVCC integration tests (ADR-016 native seqno MVCC).
+//! MVCC integration tests (native seqno MVCC).
 //!
-//! Verifies the full rewritten MVCC pipeline end-to-end:
+//! Verifies the MVCC pipeline end-to-end:
 //!   (1) snapshot_at reads at 10 different timestamps return correct version
 //!   (2) OCC conflict: concurrent writes to same key → ErrConflict
 //!   (3) Merge operators: concurrent edge adds → no conflict, correct posting list
@@ -454,7 +454,7 @@ fn gc_with_oracle_snapshot_at_and_compaction_interaction() {
     assert!(found_v4, "post-GC snapshot_at sees v4");
 }
 
-// ── G052: Edge time-travel via ReadConcern::snapshot_at ──────────────
+// ── Edge time-travel via ReadConcern::snapshot_at ────────────────────
 //
 // Regression test: edges written after a snapshot should be invisible
 // when querying with ReadConcern::Snapshot at that timestamp.
@@ -516,9 +516,9 @@ fn edge_time_travel_via_read_concern_snapshot() {
 
 #[test]
 fn edge_time_travel_via_cypher_as_of_timestamp() {
-    // Regression test for G052: Cypher AS OF TIMESTAMP syntax must override
-    // snapshots for BOTH nodes and edges. Currently, snapshot_ts is evaluated
-    // AFTER snapshots are created, so the value is ignored.
+    // Regression test: Cypher AS OF TIMESTAMP syntax must override
+    // snapshots for BOTH nodes and edges; evaluating snapshot_ts after the
+    // snapshots are taken would silently ignore it.
     let (mut db, _dir) = open_db();
 
     // Create nodes and an edge.

@@ -1,4 +1,4 @@
-//! Shared test fixtures for integration tests (G056).
+//! Shared test fixtures for integration tests.
 //!
 //! Reduces ExecutionContext boilerplate from ~20 lines to 1 function call.
 //! Three variants: legacy (no MVCC), MVCC (oracle + snapshot), MVCC + pipeline.

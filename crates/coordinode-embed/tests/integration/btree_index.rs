@@ -118,7 +118,7 @@ fn drop_nonexistent_index_returns_error() {
 
 #[test]
 fn explain_shows_index_scan_after_create_index_via_cypher() {
-    // Regression test (R-API2): after CREATE INDEX, EXPLAIN for a matching
+    // Regression test: after CREATE INDEX, EXPLAIN for a matching
     // WHERE clause must show IndexScan, not NodeScan.
     let (mut db, _dir) = open_db();
 

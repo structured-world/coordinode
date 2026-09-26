@@ -1,4 +1,4 @@
-//! AFTER COMMIT trigger dispatcher (the trigger architecture, ADR-026).
+//! AFTER COMMIT trigger dispatcher.
 //!
 //! AFTER COMMIT triggers are not run inline. When a committed mutation matches
 //! one, the executor enqueues a durable [`PendingTriggerEvent`] under
@@ -43,16 +43,15 @@ use coordinode_storage::engine::partition::Partition;
 
 use super::{Database, DatabaseError, QuerySession, TxnMode};
 
-/// Operator-tunable knobs for the AFTER COMMIT trigger dispatcher (R192). The
+/// Operator-tunable knobs for the AFTER COMMIT trigger dispatcher. The
 /// server wires these from `coordinode.conf` / CLI flags; embedded callers can
-/// set them via [`Database::set_trigger_dispatch_config`]. Defaults match the
-/// trigger architecture (ADR-026 / ADR-026A): cascade depth 10, `RETRY 3 WITH
-/// BACKOFF 1000`.
+/// set them via [`Database::set_trigger_dispatch_config`]. Defaults: cascade
+/// depth 10, `RETRY 3 WITH BACKOFF 1000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TriggerDispatchConfig {
-    /// Cluster cap on async AFTER COMMIT cascade generations (the trigger
-    /// architecture L1). An event whose generation exceeds this is
-    /// dead-lettered (cascade overflow) instead of executed.
+    /// Cluster cap on async AFTER COMMIT cascade generations, so a trigger
+    /// that fires itself cannot run forever. An event whose generation
+    /// exceeds this is dead-lettered (cascade overflow) instead of executed.
     pub max_cascade_depth: u32,
     /// Total execution attempts for an AFTER COMMIT trigger that declares no
     /// `ON ERROR` policy, before the event is dead-lettered.

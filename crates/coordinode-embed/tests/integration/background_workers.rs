@@ -1,4 +1,4 @@
-//! Integration tests: FlushManager (R072) and CompactionScheduler (R073)
+//! Integration tests: FlushManager and CompactionScheduler
 //! exercised through the StorageEngine API.
 //!
 //! Tests verify that:
@@ -49,7 +49,7 @@ fn poll_until(timeout: Duration, f: impl Fn() -> bool) -> bool {
     false
 }
 
-// ── FlushManager integration (R072) ─────────────────────────────────────────
+// ── FlushManager integration ────────────────────────────────────────────────
 
 /// FlushManager flushes the active memtable to SST via StorageEngine.
 ///
@@ -146,7 +146,7 @@ fn flush_manager_data_survives_reopen() {
     }
 }
 
-// ── CompactionScheduler integration (R073) ──────────────────────────────────
+// ── CompactionScheduler integration ─────────────────────────────────────────
 
 /// CompactionScheduler compacts L0 SSTs without corrupting data.
 ///

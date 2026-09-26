@@ -298,9 +298,9 @@ fn temporal_node_survives_binary_roundtrip() {
     let dir1 = tempfile::tempdir().unwrap();
     let mut db1 = Database::open(dir1.path()).unwrap();
 
-    // Declare a temporal node type (R172a contract — valid_from must
-    // be present on CREATE; valid_to optional). `valid_from`/`valid_to`
-    // are typed INT here, matching the working pattern in crud.rs:4687.
+    // Declare a temporal node type (valid_from must be present on
+    // CREATE; valid_to optional). `valid_from`/`valid_to` are typed INT
+    // here, matching the temporal tests in crud.rs.
     // Writing TIMESTAMP literals from raw Cypher needs a `datetime(...)`
     // wrapper that's orthogonal to what we're testing (data integrity
     // of the bitemporal storage path).
@@ -311,7 +311,7 @@ fn temporal_node_survives_binary_roundtrip() {
     .unwrap();
 
     // Two temporal versions of the same logical entity — distinct
-    // valid_from values so per-version storage (R172b) keeps them
+    // valid_from values so per-version storage keeps them
     // separately.
     db1.execute_cypher(
         "CREATE (:Person {name: 'Alice', valid_from: 1577836800000, valid_to: 1640995200000})",

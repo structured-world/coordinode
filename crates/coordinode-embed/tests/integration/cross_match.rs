@@ -1,4 +1,4 @@
-//! Integration tests: cross-MATCH WHERE predicate lifting (G024).
+//! Integration tests: cross-MATCH WHERE predicate lifting.
 //!
 //! Verifies that WHERE predicates referencing variables from multiple
 //! MATCH clauses are correctly placed ABOVE the CartesianProduct,
