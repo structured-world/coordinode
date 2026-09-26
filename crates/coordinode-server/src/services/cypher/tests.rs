@@ -1671,8 +1671,8 @@ async fn causal_read_without_write_concern_accepted() {
     );
 }
 
-// --- Audit gap closures: gRPC wiring of write_concern, WriteStats, and
-//     ALTER LABEL schema_revision visibility (see DEVLOG audit) ---
+// --- gRPC wiring of write_concern, WriteStats, and ALTER LABEL
+//     schema_revision visibility ---
 
 /// Regression: WriteStats must propagate from executor to QueryStats.
 /// Previously hardcoded to zero — clients had no way to see mutation
