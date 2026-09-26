@@ -104,6 +104,55 @@ async fn list_edge_types_returns_existing_types() {
 
 // ── create_label / create_edge_type persist the schema ──
 
+/// A property type or schema mode the protocol does not define is refused,
+/// not stored as STRING or STRICT: a client sending a newer enum value would
+/// otherwise get a schema it never asked for, silently.
+#[tokio::test]
+async fn unknown_enum_values_are_refused_not_defaulted() {
+    let (svc, _dir) = test_service();
+
+    let unknown_type = svc
+        .create_label(Request::new(graph::CreateLabelRequest {
+            name: "Unknown".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "p".to_string(),
+                r#type: 42,
+                required: false,
+                unique: false,
+            }],
+            computed_properties: vec![],
+            schema_mode: graph::SchemaMode::Strict as i32,
+        }))
+        .await
+        .expect_err("an unknown property type must be refused");
+    assert_eq!(unknown_type.code(), tonic::Code::InvalidArgument);
+
+    let unknown_mode = svc
+        .create_label(Request::new(graph::CreateLabelRequest {
+            name: "Unknown".to_string(),
+            properties: vec![],
+            computed_properties: vec![],
+            schema_mode: 42,
+        }))
+        .await
+        .expect_err("an unknown schema mode must be refused");
+    assert_eq!(unknown_mode.code(), tonic::Code::InvalidArgument);
+
+    let unknown_edge_type = svc
+        .create_edge_type(Request::new(graph::CreateEdgeTypeRequest {
+            name: "UNKNOWN".to_string(),
+            properties: vec![graph::PropertyDefinition {
+                name: "p".to_string(),
+                r#type: 42,
+                required: false,
+                unique: false,
+            }],
+        }))
+        .await
+        .expect_err("an unknown edge property type must be refused");
+    assert_eq!(unknown_edge_type.code(), tonic::Code::InvalidArgument);
+}
+
 /// create_label persists schema and returns version > 0.
 #[tokio::test]
 async fn create_label_persists_schema() {

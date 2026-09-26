@@ -17,30 +17,34 @@ use coordinode_storage::engine::partition::Partition;
 use crate::proto::graph;
 use crate::services::db_err_to_status;
 
-/// Map proto `PropertyType` integer value to internal `PropertyType`.
+/// Map a proto `PropertyType` to the internal `PropertyType`.
 ///
-/// Proto integers:
-///   0 = UNSPECIFIED, 1 = INT64, 2 = FLOAT64, 3 = STRING, 4 = BOOL,
-///   5 = BYTES, 6 = TIMESTAMP, 7 = VECTOR, 8 = LIST, 9 = MAP
-fn proto_type_to_property_type(t: i32) -> PropertyType {
-    match t {
-        1 => PropertyType::Int,
-        2 => PropertyType::Float,
-        3 => PropertyType::String,
-        4 => PropertyType::Bool,
-        5 => PropertyType::Binary,
-        6 => PropertyType::Timestamp,
+/// UNSPECIFIED means STRING, the most permissive type. A value the protocol
+/// does not define is refused rather than guessed.
+fn proto_type_to_property_type(t: i32) -> Result<PropertyType, Status> {
+    use graph::PropertyType as P;
+    let Ok(t) = P::try_from(t) else {
+        return Err(Status::invalid_argument(format!(
+            "unknown property type: {t}"
+        )));
+    };
+    Ok(match t {
+        P::Unspecified | P::String => PropertyType::String,
+        P::Int64 => PropertyType::Int,
+        P::Float64 => PropertyType::Float,
+        P::Bool => PropertyType::Bool,
+        P::Bytes => PropertyType::Binary,
+        P::Timestamp => PropertyType::Timestamp,
         // The proto definition carries no dimensions, so the schema records 0
         // ("unset"): writes accept any vector length, and the vector index
         // takes its dimensions from CREATE VECTOR INDEX.
-        7 => PropertyType::Vector {
+        P::Vector => PropertyType::Vector {
             dimensions: 0,
             metric: VectorMetric::Cosine,
         },
-        8 => PropertyType::Array(Box::new(PropertyType::String)),
-        9 => PropertyType::Map,
-        _ => PropertyType::String, // UNSPECIFIED → String (most permissive)
-    }
+        P::List => PropertyType::Array(Box::new(PropertyType::String)),
+        P::Map => PropertyType::Map,
+    })
 }
 
 /// Convert a proto `ComputedPropertyDefinition` to an internal `ComputedSpec`.
@@ -48,21 +52,21 @@ fn proto_type_to_property_type(t: i32) -> PropertyType {
 /// Returns `Err(Status::invalid_argument)` if required fields are missing or
 /// the computed_type is UNSPECIFIED.
 fn proto_to_computed_spec(def: &graph::ComputedPropertyDefinition) -> Result<ComputedSpec, Status> {
-    let computed_type = def.computed_type;
-    let formula_type = def.formula_type;
+    use graph::{ComputedType, DecayFormulaType, TtlScopeType};
 
-    let formula = match formula_type {
-        // 0 = UNSPECIFIED → default to Linear (acceptable for TTL where formula is unused)
-        0 | 1 => DecayFormula::Linear,
-        2 => DecayFormula::Exponential { lambda: def.lambda },
-        3 => DecayFormula::PowerLaw {
+    let formula = match DecayFormulaType::try_from(def.formula_type) {
+        // UNSPECIFIED means Linear: a TTL ignores the formula anyway.
+        Ok(DecayFormulaType::Unspecified | DecayFormulaType::Linear) => DecayFormula::Linear,
+        Ok(DecayFormulaType::Exponential) => DecayFormula::Exponential { lambda: def.lambda },
+        Ok(DecayFormulaType::PowerLaw) => DecayFormula::PowerLaw {
             tau: def.tau,
             alpha: def.alpha,
         },
-        4 => DecayFormula::Step,
-        _ => {
+        Ok(DecayFormulaType::Step) => DecayFormula::Step,
+        Err(_) => {
             return Err(Status::invalid_argument(format!(
-                "unknown decay_formula_type: {formula_type}"
+                "unknown decay_formula_type: {}",
+                def.formula_type
             )));
         }
     };
@@ -79,14 +83,14 @@ fn proto_to_computed_spec(def: &graph::ComputedPropertyDefinition) -> Result<Com
         ));
     }
 
-    match computed_type {
-        1 => {
-            // TTL
-            let scope = match def.scope {
-                0 | 3 => TtlScope::Node, // UNSPECIFIED defaults to Node
-                1 => TtlScope::Field,
-                2 => TtlScope::Subtree,
-                _ => {
+    match ComputedType::try_from(def.computed_type) {
+        Ok(ComputedType::Ttl) => {
+            let scope = match TtlScopeType::try_from(def.scope) {
+                // UNSPECIFIED means the whole node.
+                Ok(TtlScopeType::Unspecified | TtlScopeType::Node) => TtlScope::Node,
+                Ok(TtlScopeType::Field) => TtlScope::Field,
+                Ok(TtlScopeType::Subtree) => TtlScope::Subtree,
+                Err(_) => {
                     return Err(Status::invalid_argument(format!(
                         "unknown ttl_scope: {}",
                         def.scope
@@ -105,29 +109,24 @@ fn proto_to_computed_spec(def: &graph::ComputedPropertyDefinition) -> Result<Com
                 target_field,
             })
         }
-        2 => {
-            // Decay
-            Ok(ComputedSpec::Decay {
-                formula,
-                initial: def.initial,
-                target: def.target,
-                duration_secs: def.duration_secs,
-                anchor_field: anchor,
-            })
-        }
-        3 => {
-            // VectorDecay
-            Ok(ComputedSpec::VectorDecay {
-                formula,
-                duration_secs: def.duration_secs,
-                anchor_field: anchor,
-            })
-        }
-        0 => Err(Status::invalid_argument(
+        Ok(ComputedType::Decay) => Ok(ComputedSpec::Decay {
+            formula,
+            initial: def.initial,
+            target: def.target,
+            duration_secs: def.duration_secs,
+            anchor_field: anchor,
+        }),
+        Ok(ComputedType::VectorDecay) => Ok(ComputedSpec::VectorDecay {
+            formula,
+            duration_secs: def.duration_secs,
+            anchor_field: anchor,
+        }),
+        Ok(ComputedType::Unspecified) => Err(Status::invalid_argument(
             "computed_property: computed_type must not be UNSPECIFIED",
         )),
-        _ => Err(Status::invalid_argument(format!(
-            "unknown computed_type: {computed_type}"
+        Err(_) => Err(Status::invalid_argument(format!(
+            "unknown computed_type: {}",
+            def.computed_type
         ))),
     }
 }
@@ -146,14 +145,14 @@ fn computed_spec_to_proto(name: &str, spec: &ComputedSpec) -> graph::ComputedPro
             scope,
             target_field,
         } => {
-            def.computed_type = 1; // TTL
+            def.computed_type = graph::ComputedType::Ttl as i32;
             def.duration_secs = *duration_secs;
             def.anchor_field = anchor_field.clone();
             def.scope = match scope {
-                TtlScope::Field => 1,
-                TtlScope::Subtree => 2,
-                TtlScope::Node => 3,
-            };
+                TtlScope::Field => graph::TtlScopeType::Field,
+                TtlScope::Subtree => graph::TtlScopeType::Subtree,
+                TtlScope::Node => graph::TtlScopeType::Node,
+            } as i32;
             def.target_field = target_field.clone().unwrap_or_default();
         }
         ComputedSpec::Decay {
@@ -163,7 +162,7 @@ fn computed_spec_to_proto(name: &str, spec: &ComputedSpec) -> graph::ComputedPro
             duration_secs,
             anchor_field,
         } => {
-            def.computed_type = 2; // Decay
+            def.computed_type = graph::ComputedType::Decay as i32;
             def.duration_secs = *duration_secs;
             def.anchor_field = anchor_field.clone();
             def.initial = *initial;
@@ -175,7 +174,7 @@ fn computed_spec_to_proto(name: &str, spec: &ComputedSpec) -> graph::ComputedPro
             duration_secs,
             anchor_field,
         } => {
-            def.computed_type = 3; // VectorDecay
+            def.computed_type = graph::ComputedType::VectorDecay as i32;
             def.duration_secs = *duration_secs;
             def.anchor_field = anchor_field.clone();
             set_formula_fields(&mut def, formula);
@@ -186,62 +185,68 @@ fn computed_spec_to_proto(name: &str, spec: &ComputedSpec) -> graph::ComputedPro
 }
 
 fn set_formula_fields(def: &mut graph::ComputedPropertyDefinition, formula: &DecayFormula) {
-    match formula {
-        DecayFormula::Linear => {
-            def.formula_type = 1;
-        }
+    use graph::DecayFormulaType as F;
+    def.formula_type = match formula {
+        DecayFormula::Linear => F::Linear,
         DecayFormula::Exponential { lambda } => {
-            def.formula_type = 2;
             def.lambda = *lambda;
+            F::Exponential
         }
         DecayFormula::PowerLaw { tau, alpha } => {
-            def.formula_type = 3;
             def.tau = *tau;
             def.alpha = *alpha;
+            F::PowerLaw
         }
-        DecayFormula::Step => {
-            def.formula_type = 4;
-        }
-    }
+        DecayFormula::Step => F::Step,
+    } as i32;
 }
 
-/// Convert a proto `SchemaMode` integer to the internal `SchemaMode`.
+/// Convert a proto `SchemaMode` to the internal `SchemaMode`.
 ///
-/// Proto values:
-///   0 = UNSPECIFIED → defaults to STRICT (most type-safe)
-///   1 = STRICT, 2 = VALIDATED, 3 = FLEXIBLE
-fn proto_to_schema_mode(v: i32) -> SchemaMode {
-    match v {
-        2 => SchemaMode::Validated,
-        3 => SchemaMode::Flexible,
-        _ => SchemaMode::Strict, // UNSPECIFIED (0) and STRICT (1) both → Strict
+/// UNSPECIFIED means STRICT, the most type-safe mode. A value the protocol
+/// does not define is refused rather than guessed.
+fn proto_to_schema_mode(v: i32) -> Result<SchemaMode, Status> {
+    use graph::SchemaMode as M;
+    match M::try_from(v) {
+        Ok(M::Unspecified | M::Strict) => Ok(SchemaMode::Strict),
+        Ok(M::Validated) => Ok(SchemaMode::Validated),
+        Ok(M::Flexible) => Ok(SchemaMode::Flexible),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "unknown schema mode: {v}"
+        ))),
     }
 }
 
-/// Convert an internal `SchemaMode` to a proto integer.
+/// Convert an internal `SchemaMode` to its proto value.
 fn schema_mode_to_proto(mode: SchemaMode) -> i32 {
-    match mode {
-        SchemaMode::Strict => 1,
-        SchemaMode::Validated => 2,
-        SchemaMode::Flexible => 3,
-    }
+    let proto = match mode {
+        SchemaMode::Strict => graph::SchemaMode::Strict,
+        SchemaMode::Validated => graph::SchemaMode::Validated,
+        SchemaMode::Flexible => graph::SchemaMode::Flexible,
+    };
+    proto as i32
 }
 
-/// Map internal `PropertyType` to proto integer for list_labels responses.
+/// Map an internal `PropertyType` to its proto value for list_labels.
 fn property_type_to_proto(pt: &PropertyType) -> i32 {
-    match pt {
-        PropertyType::Int => 1,
-        PropertyType::Float => 2,
-        PropertyType::String => 3,
-        PropertyType::Bool => 4,
-        PropertyType::Binary | PropertyType::Blob => 5,
-        PropertyType::Timestamp => 6,
-        PropertyType::Vector { .. } => 7,
-        PropertyType::Array(_) => 8,
-        PropertyType::Map => 9,
-        // Document, Geo, Computed have no direct proto representation → MAP as closest.
-        _ => 9,
-    }
+    use graph::PropertyType as P;
+    let proto = match pt {
+        PropertyType::Int => P::Int64,
+        PropertyType::Float => P::Float64,
+        PropertyType::String => P::String,
+        PropertyType::Bool => P::Bool,
+        PropertyType::Binary | PropertyType::Blob => P::Bytes,
+        PropertyType::Timestamp => P::Timestamp,
+        PropertyType::Vector { .. } => P::Vector,
+        PropertyType::Array(_) => P::List,
+        // The protocol has no document, geo or computed type; MAP is the
+        // closest shape a client can decode.
+        PropertyType::Map
+        | PropertyType::Document
+        | PropertyType::Geo
+        | PropertyType::Computed(_) => P::Map,
+    };
+    proto as i32
 }
 
 pub struct SchemaServiceImpl {
@@ -265,11 +270,11 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         let mut schema = LabelSchema::new_node_id(&req.name);
 
         // Apply schema mode (defaults to STRICT when unspecified).
-        let mode = proto_to_schema_mode(req.schema_mode);
+        let mode = proto_to_schema_mode(req.schema_mode)?;
         schema.set_mode(mode);
 
         for prop_def in &req.properties {
-            let property_type = proto_type_to_property_type(prop_def.r#type);
+            let property_type = proto_type_to_property_type(prop_def.r#type)?;
             let mut prop = PropertyDef::new(&prop_def.name, property_type);
             if prop_def.required {
                 prop = prop.not_null();
@@ -315,7 +320,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // Build internal EdgeTypeSchema from the proto request.
         let mut schema = EdgeTypeSchema::new(&req.name);
         for prop_def in &req.properties {
-            let property_type = proto_type_to_property_type(prop_def.r#type);
+            let property_type = proto_type_to_property_type(prop_def.r#type)?;
             let mut prop = PropertyDef::new(&prop_def.name, property_type);
             if prop_def.required {
                 prop = prop.not_null();
@@ -427,7 +432,8 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                             properties: vec![],
                             schema_revision: 0,
                             computed_properties: vec![],
-                            schema_mode: 0, // UNSPECIFIED — no declared schema
+                            // No declared schema.
+                            schema_mode: graph::SchemaMode::Unspecified as i32,
                         });
                 }
             }
