@@ -20,12 +20,11 @@
 
 # ─── Hardware ───────────────────────────────────────────────────────────────
 [hardware.ro]
-hostname = "ro.private.systems"  # 192.168.1.200
 cpu = "Intel i9-9900K"            # 8 cores / 16 threads, AVX2 + FMA, NO AVX-512
 cores_physical = 8
 threads_logical = 16
 notes = """
-Bench host. All CI vector benches and donor competitor runs happen here.
+Bench host. All CI vector benches and competitor runs happen here.
 For honest per-core comparisons, restrict competitor server processes to
 one thread (or measure CoordiNode multi-thread search through a wrapper).
 """

@@ -237,7 +237,7 @@ jobs:
           ROUTE_TOP_M: ${{ inputs.route_top_m || '1' }}
           # First N base vectors per dataset (groundtruth recomputed
           # brute-force inside bench-vector-ann). 50k by default to
-          # match the hnswlib competitor donor cells already published
+          # match the hnswlib competitor cells already published
           # on bench-data (glove-100-50k-angular t1/t4), so every push
           # produces apples-to-apples E_core and absolute QPS deltas
           # vs hnswlib without a separate manual cell. Manual runs can

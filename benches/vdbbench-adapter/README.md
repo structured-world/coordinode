@@ -40,8 +40,8 @@ corresponding planner support lands.
 ## Prerequisites
 
 - `coordinode-server` reachable from the runner host (default
-  `localhost:7080`). On the bench host (`ro` / <redacted>) it's
-  typically managed via `systemd` or a tmux session — see
+  `localhost:7080`). On the bench host it's typically managed via
+  `systemd` or a tmux session — see
   `scripts/run-coordinode-ann-benchmarks.sh` for the canonical
   startup invocation, adapted for the server target.
 - Python packages: `vectordb_bench`, `coordinode` (the gRPC client

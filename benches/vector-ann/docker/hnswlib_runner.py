@@ -35,7 +35,6 @@ import argparse
 import json
 import os
 import platform
-import socket
 import struct
 import sys
 import time
@@ -79,11 +78,27 @@ def read_ivecs(path: Path) -> np.ndarray:
     return arr[:, 1:].copy()
 
 
+def cpu_brand() -> str:
+    """CPU model string as the Rust fingerprint reports it; empty if unknown.
+
+    Never the host name: results are published, and the machine's name is
+    not part of the hardware description.
+    """
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor()
+
+
 def hardware_fingerprint() -> dict:
     """Match Rust `coordinode_bench::HardwareFingerprint`."""
     mem_gb = psutil.virtual_memory().total // (1024 ** 3)
     return {
-        "cpu_brand": platform.processor() or socket.gethostname(),
+        "cpu_brand": cpu_brand(),
         "cpu_cores": psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True),
         "cpu_threads": psutil.cpu_count(logical=True),
         "ram_gb": int(mem_gb),

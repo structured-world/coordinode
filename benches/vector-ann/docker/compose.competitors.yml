@@ -1,7 +1,7 @@
 # Manual-run competitor benchmark stack.
 #
 # These benches are NOT triggered by CI — they run ONCE on the
-# bench host (<bench-runner> / <redacted>) per release or
+# bench host (<bench-runner>) per release or
 # when a competitor publishes a notable HNSW change. The resulting
 # JSON is placed into the repo under bench-results/ by the human
 # running them.

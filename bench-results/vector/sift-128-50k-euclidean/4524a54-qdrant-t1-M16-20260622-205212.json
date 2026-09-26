@@ -9,7 +9,7 @@
     "commit_date": "2026-06-22T20:52:12.957716+00:00"
   },
   "hardware": {
-    "cpu_brand": "ro.private.systems",
+    "cpu_brand": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
     "cpu_cores": 8,
     "cpu_threads": 16,
     "ram_gb": 62,

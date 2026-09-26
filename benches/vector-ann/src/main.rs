@@ -58,8 +58,8 @@ use crate::fvecs::{read_fvecs, read_ivecs};
 /// Linux-only via `/proc/self/status` (VmRSS line). Returns `None` on
 /// non-Linux hosts so the report degrades gracefully — the field is
 /// dropped from `metrics` rather than reported as a meaningless zero.
-/// The bench host (ro / <redacted>) is Linux, so the donor sweep
-/// always carries memory numbers; macOS dev runs simply omit them.
+/// The bench host is Linux, so the published sweep always carries memory
+/// numbers; macOS dev runs simply omit them.
 fn read_rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     status

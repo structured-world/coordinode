@@ -10,11 +10,11 @@ Recall@k + QPS sweep against the [Texmex INRIA](http://corpus-texmex.irisa.fr/) 
 
 - **Is:** the CoordiNode side of an ANN benchmark. Runs CN's own HNSW (from `coordinode-vector`), records per-`ef_search` recall@10 + QPS + p50/p95/p99 latency, stamps with git + hardware fingerprint.
 - **Isn't:** a competitor runner. **Competitors run separately** in Docker on the same host (see [Competitor runs](#competitor-runs) below) — their JSON results are placed into `bench-results/` **manually**, once per release / quarterly / when a competitor ships a notable HNSW change.
-- **CI** runs ONLY the CoordiNode side, on `push` to `main`, on the self-hosted bench runner (`<redacted>`). Competitor numbers do NOT re-run on every commit.
+- **CI** runs ONLY the CoordiNode side, on `push` to `main`, on the self-hosted bench runner. Competitor numbers do NOT re-run on every commit.
 
 ---
 
-## Server layout (<redacted> / `<bench-runner>`)
+## Server layout (`<bench-runner>`)
 
 Dataset lives **permanently** on the runner — NEVER committed to the repo:
 
