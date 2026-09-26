@@ -82,7 +82,7 @@ impl NodeId {
         self.0 & NODE_ID_MAX_SEQUENCE
     }
 
-    /// Derive a stable NodeId from a relational table's primary key (R901).
+    /// Derive a stable NodeId from a relational table's primary key.
     ///
     /// A `STORAGE` table bridges its declared primary key to a NodeId so the
     /// same key always maps to the same node (identity + upsert-by-key) and the
@@ -334,7 +334,7 @@ pub fn decode_node_key(key: &[u8]) -> Option<(u16, NodeId)> {
 /// One entry per version. Multiple versions of the same `node_id` coexist
 /// on a temporal label; an "active at valid-time T" query prefix-scans
 /// [`temporal_node_id_prefix`] and stops at the upper bound. Symmetric with
-/// the temporal-edge layout (ADR-021).
+/// the temporal-edge layout.
 ///
 /// 17-byte suffix total: `node:` (5) + shard (2) + `:` (1) + id (8) + `:` (1) + valid_from (8).
 pub fn encode_temporal_node_key(shard_id: u16, node_id: NodeId, valid_from_ms: i64) -> Vec<u8> {
@@ -552,7 +552,7 @@ impl NodeRecord {
     /// Deserialize from MessagePack bytes.
     ///
     /// Handles both raw msgpack (legacy) and prefix-encoded format from the
-    /// DocumentMerge operator (0x00 prefix = full NodeRecord, see ADR-015).
+    /// DocumentMerge operator (0x00 prefix = full NodeRecord).
     pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         if !data.is_empty() && data[0] == crate::graph::doc_delta::PREFIX_NODE_RECORD {
             // Prefix-encoded format (after DocumentMerge): strip 0x00 prefix.

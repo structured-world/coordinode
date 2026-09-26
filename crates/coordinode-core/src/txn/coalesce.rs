@@ -1,4 +1,4 @@
-//! Run-length coalescing of delete mutations into range deletes (G096).
+//! Run-length coalescing of delete mutations into range deletes.
 //!
 //! A bulk delete ("delete all relationships between these nodes", drop an edge
 //! type / index / shard keyspace) produces many [`Mutation::Delete`] of

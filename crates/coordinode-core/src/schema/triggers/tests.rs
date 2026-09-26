@@ -74,7 +74,7 @@ fn trigger_scan_prefix_test_prefix_is_correct_byte_string() {
     assert_eq!(trigger_scan_prefix(), b"schema:trigger:");
 }
 
-// ── AFTER COMMIT event journal (R192) ───────────────────────────────────────
+// ── AFTER COMMIT event journal ──────────────────────────────────────────────
 
 #[test]
 fn pending_key_encodes_name_and_be_seq() {

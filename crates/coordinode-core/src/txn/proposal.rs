@@ -148,7 +148,7 @@ pub enum Mutation {
         operand: Vec<u8>,
     },
     /// Delete every key in the half-open range `[start, end)` with one MVCC
-    /// range tombstone (G096). Produced by run-length coalescing a dense
+    /// range tombstone. Produced by run-length coalescing a dense
     /// contiguous run of deleted keys, or by a whole-prefix DROP. The range
     /// covers only keys that are all being deleted — never across a gap holding a
     /// surviving key.
@@ -223,14 +223,14 @@ pub enum PartitionId {
     Schema,
     Idx,
     Counter,
-    /// `vec:` — f32 vector truth tier. Per ADR-033 (revised), every
-    /// vector property's full-precision bytes live here as the
-    /// per-vector source of truth. Phase 1.5 cross-shard rerank reads
+    /// `vec:` — f32 vector truth tier. Every vector property's
+    /// full-precision bytes live here as the
+    /// per-vector source of truth. Cross-shard rerank reads
     /// f32 directly from here (matches Qdrant / Weaviate / ES BBQ
     /// pattern — no intermediate quantized disk tier).
     VectorF32,
 
-    /// `registry:` — per-shard consumer-retention registry (ADR-028).
+    /// `registry:` — per-shard consumer-retention registry.
     /// Holds `ConsumerRegistration` records replicated through this shard's
     /// Raft group; `min(checkpoint_seqno)` over the keyspace is the shard's
     /// retention floor consumed by LSM compaction, oplog retention, and the
@@ -264,7 +264,7 @@ pub struct RaftProposal {
     ///
     /// Used for latency-sensitive proposals that must not be delayed:
     /// - Membership changes (add/remove node)
-    /// - Delta proposals (commit/abort oracle decisions, R140+)
+    /// - Delta proposals (commit/abort oracle decisions)
     ///
     /// Follows Dgraph pattern: delta proposals bypass the IOU-based
     /// rate limiter entirely (worker/proposal.go:287-290).

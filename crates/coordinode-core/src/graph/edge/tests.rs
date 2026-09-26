@@ -1,7 +1,7 @@
 use super::*;
 use crate::graph::types::Value;
 
-// -- Edge-property codec tests (ADR-040) --
+// -- Edge-property codec tests --
 
 #[test]
 fn edge_props_codec_round_trips() {
@@ -25,7 +25,7 @@ fn edge_props_codec_round_trips() {
 
 #[test]
 fn edge_props_codec_is_deterministic_regardless_of_input_order() {
-    // The whole point of ADR-040: identical logical facet set →
+    // The whole point of the canonical format: identical logical facet set →
     // identical bytes, so page-ECC / dedup / snapshot-diff are stable.
     let a = vec![
         (2u32, Value::Int(2)),
@@ -60,7 +60,7 @@ fn edge_properties_wire_matches_executor_vec_shape() {
     // EdgeProperties (the typed Layer-4 value) and the executor's raw
     // Vec<(field_id, value)> MUST serialise to the same bytes — that is
     // what lets LocalEdgeStore writes round-trip through the executor's
-    // reader and vice versa (the unification that ADR-040 mandates).
+    // reader and vice versa: there is one format.
     let pairs = vec![(5u32, Value::Int(10)), (2u32, Value::String("x".into()))];
     let mut ep = EdgeProperties::new();
     for (fid, v) in &pairs {
@@ -522,7 +522,7 @@ fn edge_properties_all_types() {
     assert_eq!(ep, restored);
 }
 
-// -- Discriminated edge keys (ADR-029) --
+// -- Discriminated edge keys --
 
 #[test]
 fn discriminator_int_key_roundtrips() {
@@ -543,7 +543,7 @@ fn discriminator_int_key_roundtrips() {
 
 #[test]
 fn discriminator_timestamp_is_byte_identical_to_temporal_key() {
-    // ADR-029: TEMPORAL is DISCRIMINATED BY (valid_from) — one storage shape.
+    // TEMPORAL is DISCRIMINATED BY (valid_from): one storage shape.
     let vf = 1_710_000_000_000i64;
     let temporal =
         encode_temporal_edgeprop_key("WORKS_AT", NodeId::from_raw(1), NodeId::from_raw(2), vf);

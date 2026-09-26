@@ -175,7 +175,7 @@ pub fn trigger_scan_prefix() -> &'static [u8] {
     b"schema:trigger:"
 }
 
-// ── AFTER COMMIT event journal (the trigger architecture, ADR-026) ──────────────
+// ── AFTER COMMIT event journal ──────────────────────────────────────────────────
 //
 // AFTER COMMIT triggers do not fire inline. When a mutation matches an
 // AFTER COMMIT trigger, the committing transaction enqueues a durable

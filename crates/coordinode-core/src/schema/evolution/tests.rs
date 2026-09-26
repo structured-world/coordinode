@@ -19,7 +19,7 @@ fn add_property_simple() {
     );
     assert!(result.is_ok());
     assert!(schema.get_property("bio").is_some());
-    // Per ADR-023, property additions do not bump the schema revision —
+    // Property additions do not bump the schema revision:
     // version tracks placement/shard_keys changes via `ALTER LABEL`.
     assert_eq!(schema.schema_revision, v_before);
 }
@@ -104,7 +104,7 @@ fn remove_property() {
     let result = apply_change(&mut schema, SchemaChange::RemoveProperty("age".to_string()));
     assert!(result.is_ok());
     assert!(schema.get_property("age").is_none());
-    // Per ADR-023, property removals do not bump the schema revision.
+    // Property removals do not bump the schema revision.
     assert_eq!(schema.schema_revision, v_before);
 }
 

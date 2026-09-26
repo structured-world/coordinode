@@ -176,8 +176,8 @@ impl std::fmt::Display for SchemaMode {
 /// Placement policy controlling how nodes of a label are distributed across
 /// shard groups in EE. CE single-shard deployments always use `NodeId`.
 ///
-/// Declared explicitly at label creation — there is no default. Per ADR-023,
-/// every label declares its placement strategy at creation time.
+/// Declared explicitly at label creation: there is no default, every label
+/// declares its placement strategy at creation time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlacementPolicy {
     /// Graph-style placement: `hash(NodeId) mod N_shards`. Edges co-locate
@@ -197,7 +197,7 @@ pub enum PlacementPolicy {
 
 /// State of a shard key in a label's lifecycle.
 ///
-/// Multi-key coexistence (ADR-023): during a lazy re-shard, a label has one
+/// Multi-key coexistence: during a lazy re-shard, a label has one
 /// PRIMARY (where new writes route) plus optionally one LEGACY (where
 /// pre-migration data still lives). The A-strict baseline allows at most one
 /// LEGACY at a time.
@@ -256,7 +256,7 @@ impl ShardKeySpec {
     }
 }
 
-/// Physical storage layout for a relational TABLE label (R901). Orthogonal to
+/// Physical storage layout for a relational TABLE label. Orthogonal to
 /// the logical model: a table declares its layout independently of its schema.
 /// Only meaningful for table labels (those with a non-empty primary key); plain
 /// graph labels are always row-stored on the node path.
@@ -269,7 +269,7 @@ pub enum StorageLayout {
     /// Rows stored in the engine's native columnar block type (per-column
     /// chunks, zone maps, vectorized scan). Best for analytical scans over a
     /// few columns of many rows. Each columnar table owns its own columnar
-    /// tree (see the relational TABLE modality in the architecture docs).
+    /// tree.
     Columnar,
 }
 
@@ -290,12 +290,12 @@ pub struct LabelSchema {
     /// `NodeId` (graph default), `Hash(prop)`, or `Range(prop)`.
     pub placement: PlacementPolicy,
 
-    /// Multi-key list for lazy re-sharding (ADR-023). Always contains at least
+    /// Multi-key list for lazy re-sharding. Always contains at least
     /// one PRIMARY entry. During a lazy migration also contains one LEGACY
     /// entry. CE labels carry `[primary_node_id(1)]` permanently.
     pub shard_keys: Vec<ShardKeySpec>,
 
-    /// Schema snapshot revision (ADR-023). Bumped by any `ALTER LABEL`
+    /// Schema snapshot revision. Bumped by any `ALTER LABEL`
     /// operation that changes write-path semantics: `placement`, `shard_keys`,
     /// or `mode`. Property additions or removals do NOT bump this — they are
     /// mutations of the current snapshot. The revision is the key suffix for
@@ -309,25 +309,24 @@ pub struct LabelSchema {
     /// "version" = data.
     pub schema_revision: u64,
 
-    /// Bitemporal flag (ADR-027, R172a). When `true`, every node of this
+    /// Bitemporal flag. When `true`, every node of this
     /// label carries the `(valid_from, valid_to)` valid-time interval and
     /// the engine-assigned `__ingestion_ts__` (HLC commit-ts), and the
     /// storage layer keeps one node record per `(node_id, valid_from)` so
     /// multiple versions of the same logical node coexist. Immutable for
     /// the lifetime of the label — toggling on an existing label is
     /// rejected at DDL time; re-creation via a new label is the migration
-    /// path. Default: `false` (point-in-time only — current MVCC-only
-    /// behaviour for all pre-ADR-027 labels).
+    /// path. Default: `false` (point-in-time only, MVCC history alone).
     pub temporal: bool,
 
-    /// Declared primary-key columns (R901). Non-empty marks this label as a
+    /// Declared primary-key columns. Non-empty marks this label as a
     /// relational TABLE: the primary key is the row identity (bridged to a
     /// NodeId) and the relational/SQL surface plans against it. Empty for a
     /// plain graph label. Ordered as declared (composite keys allowed).
     #[serde(default)]
     pub primary_key: Vec<String>,
 
-    /// Physical storage layout for a table label (R901). `Row` (default) stores
+    /// Physical storage layout for a table label. `Row` (default) stores
     /// each row on the node path; `Columnar` stores rows in the engine's native
     /// columnar block type. Ignored for non-table labels.
     #[serde(default)]
@@ -393,7 +392,7 @@ impl LabelSchema {
         Self::new(name, PlacementPolicy::NodeId)
     }
 
-    /// Set the bitemporal flag (ADR-027, R172a). The flag is immutable for
+    /// Set the bitemporal flag. The flag is immutable for
     /// the lifetime of an installed label — this setter is only for fresh
     /// schemas constructed in-memory by the DDL executor before the first
     /// `save_current_label_schema` call.
@@ -403,7 +402,7 @@ impl LabelSchema {
 
     /// Add a property definition. Mutates the current snapshot; does not
     /// bump `schema_revision` (revision changes only on placement/shard_keys/
-    /// mode mutations per ADR-023).
+    /// mode mutations).
     pub fn add_property(&mut self, prop: PropertyDef) {
         self.properties.insert(prop.name.clone(), prop);
     }
@@ -441,7 +440,7 @@ impl LabelSchema {
     }
 }
 
-/// Placement policy for edges relative to their endpoint nodes (ADR-023).
+/// Placement policy for edges relative to their endpoint nodes.
 ///
 /// Determines which shard's adjacency posting carries the edge's existence
 /// entry when source and target are on different shards. Only meaningful in
@@ -476,7 +475,7 @@ pub struct MigrationStateEntry {
     /// Lifecycle state of this doc within the migration.
     pub state: MigrationDocState,
     /// HLC timestamp at which this entry was enqueued for migration. Used by
-    /// the priority queue (R210f query-driven on-touch) to prefer recently
+    /// the priority queue (query-driven, on touch) to prefer recently
     /// touched docs.
     pub enqueued_at: i64,
 }
@@ -493,7 +492,7 @@ pub enum MigrationDocState {
 }
 
 /// Chunk-assignment table stored under `schema:chunks:<label>` — maps key
-/// ranges to shard ids for a given label (R210e routing pipeline).
+/// ranges to shard ids for a given label.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkAssignmentTable {
     /// Label this table belongs to.
@@ -541,14 +540,14 @@ pub struct EdgeTypeSchema {
     /// Whether this edge type supports temporal semantics.
     pub temporal: bool,
 
-    /// Placement policy for adjacency entries relative to endpoint nodes
-    /// (ADR-023). Default `ColocateWithSource` matches the graph-default
+    /// Placement policy for adjacency entries relative to endpoint nodes.
+    /// Default `ColocateWithSource` matches the graph-default
     /// traversal pattern; alternative values opt into target-co-location or
     /// replicated adjacency for specific workloads.
     pub placement: EdgePlacement,
 
     /// Schema snapshot revision. Bumped by ALTER operations affecting
-    /// placement or temporal flag (mirrors LabelSchema semantics per ADR-023).
+    /// placement or temporal flag (mirrors LabelSchema semantics).
     pub schema_revision: u64,
 }
 
@@ -566,7 +565,7 @@ impl EdgeTypeSchema {
     }
 
     /// Add a property definition. Mutates the current snapshot; does not
-    /// bump `schema_revision` (mirrors LabelSchema semantics per ADR-023).
+    /// bump `schema_revision` (mirrors LabelSchema semantics).
     pub fn add_property(&mut self, prop: PropertyDef) {
         self.properties.insert(prop.name.clone(), prop);
     }
@@ -603,8 +602,8 @@ impl EdgeTypeSchema {
 /// Encode a revisioned schema key for a label:
 /// `schema:label:<name>:<revision>`.
 ///
-/// Per ADR-023, the schema partition is revision-prefixed from day one — each
-/// `ALTER LABEL` (when shard-key mutation lands in R210c) writes a new
+/// The schema partition is revision-prefixed from day one: each shard-key
+/// changing `ALTER LABEL` writes a new
 /// revision while older revisions remain as immutable snapshots. CE
 /// deployments only ever write revision 1 (no `ALTER LABEL SHARD BY` in CE),
 /// but the key format is final-state from the first commit.
@@ -656,7 +655,7 @@ pub fn encode_edge_type_current_revision_key(name: &str) -> Vec<u8> {
 /// Encode the per-doc migration state key:
 /// `schema:migration_state:<label>:<node_id u64 BE>`.
 ///
-/// Per ADR-023, this partition (logical key namespace inside `Partition::Schema`)
+/// This logical key namespace inside `Partition::Schema`
 /// holds in-flight migration state for `ALTER LABEL SHARD BY` operations. The
 /// entry is keyed by `(label, node_id)` and the value is the
 /// `MigrationStateEntry` MessagePack body. Entries are deleted as docs

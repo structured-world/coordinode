@@ -1,11 +1,11 @@
-//! R-SNAP1: unified `read_consistency` knob.
+//! Unified `read_consistency` knob.
 //!
 //! `read_consistency` governs **cross-modality snapshot alignment** — whether
 //! graph, vector, full-text, document, and time-series reads inside a single
 //! query resolve against the same HLC timestamp. Orthogonal to `read_concern`
 //! (durability visibility, see `read_concern.rs`).
 //!
-//! Default selection rule (per arch/core/transactions.md § Read Consistency):
+//! Default selection rule:
 //! - Query touches >1 modality → auto-promoted to `Snapshot`
 //! - Single-modality query → stays `Current` (perf-first default)
 //! - User hint `/*+ read_consistency('snapshot') */` or `/*+ read_consistency('exact') */`

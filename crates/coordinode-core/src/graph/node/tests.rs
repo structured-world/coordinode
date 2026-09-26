@@ -394,7 +394,7 @@ fn record_msgpack_is_compact() {
     );
 }
 
-// -- G028: extra overflow map --
+// -- extra overflow map --
 
 #[test]
 fn extra_set_and_get() {
@@ -460,7 +460,7 @@ fn backward_compat_roundtrip_without_extra() {
     assert_eq!(rec, decoded);
 }
 
-// ─── R172b: temporal node key encoding (ADR-027) ──────────────────────
+// ─── temporal node key encoding ──────────────────────────────────────
 
 #[test]
 fn temporal_node_key_roundtrip() {

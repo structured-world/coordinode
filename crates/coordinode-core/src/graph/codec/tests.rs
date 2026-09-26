@@ -364,7 +364,7 @@ fn streamvbyte_multi_block_roundtrip() {
     assert_eq!(decode_uids(&pack), uids);
 }
 
-// ====== R011a StreamVByte vs LEB128 evaluation (API comparison) ======
+// ====== StreamVByte vs LEB128 evaluation (API comparison) ======
 
 /// Generate test UIDs: sequential with small gaps (typical adjacency list).
 fn gen_sequential_uids(count: usize) -> Vec<u64> {

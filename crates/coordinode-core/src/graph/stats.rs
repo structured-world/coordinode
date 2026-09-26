@@ -53,10 +53,9 @@ pub trait StorageStats {
     /// Number of distinct labels in the database.
     fn label_count(&self) -> u64;
 
-    // ── Vector index statistics (R-PUSH1) ──────────────────────────────
+    // ── Vector index statistics ────────────────────────────────────────
     //
-    // The graph predicate push-down rule (`arch/core/query-engine.md`
-    // § Graph Predicate Push-Down) compares candidate-set size `|C|` against
+    // The graph predicate push-down rule compares candidate-set size `|C|` against
     // the vector index size `|V|` to pick a strategy. These methods expose
     // the index parameters that the rule depends on. All return `None` when
     // the index is not registered or statistics are unavailable; callers

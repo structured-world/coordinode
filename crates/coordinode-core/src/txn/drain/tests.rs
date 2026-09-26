@@ -50,7 +50,7 @@ fn test_entry(n_mutations: usize, ts: u64) -> DrainEntry {
 }
 
 /// A drained batch of consecutive point deletes is coalesced into a range delete
-/// in the submitted proposal (G096) — the producer wiring, end to end.
+/// in the submitted proposal: the producer wiring, end to end.
 #[test]
 fn drain_coalesces_consecutive_deletes_into_range() {
     let buf = DrainBuffer::new(1 << 20);

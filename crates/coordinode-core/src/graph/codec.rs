@@ -15,7 +15,7 @@
 //!
 //! **Migration note:** V4 data used LEB128 encoding in `deltas`. Any V4
 //! data must be re-encoded via a migration tool before reading with this
-//! decoder. See ROADMAP R098 for the V5 migration plan.
+//! decoder.
 //!
 //! Inspired by Dgraph's `codec/codec.go` Encoder/Decoder pattern.
 

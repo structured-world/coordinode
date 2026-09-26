@@ -57,8 +57,8 @@ fn label_schema_add_properties() {
     schema.add_property(PropertyDef::new("age", PropertyType::Int));
 
     assert_eq!(schema.properties.len(), 2);
-    // Per ADR-023, property additions mutate the current snapshot but
-    // do not bump the schema revision — only `ALTER LABEL` operations
+    // Property additions mutate the current snapshot but
+    // do not bump the schema revision: only `ALTER LABEL` operations
     // affecting placement/shard_keys do.
     assert_eq!(schema.schema_revision, 1);
     assert!(schema.get_property("name").is_some());
@@ -339,11 +339,9 @@ fn property_with_default_value() {
 
 #[test]
 fn schema_version_stable_across_property_mutations() {
-    // Per ADR-023, schema revision is bumped only by `ALTER LABEL`
-    // operations affecting placement/shard_keys. Property additions and
-    // removals mutate the current snapshot in place without bumping
-    // version. ALTER LABEL semantics (R210c) bump version explicitly when
-    // they ship.
+    // Schema revision is bumped only by `ALTER LABEL` operations
+    // affecting placement/shard_keys. Property additions and removals
+    // mutate the current snapshot in place without bumping it.
     let mut schema = LabelSchema::new_node_id("Test");
     assert_eq!(schema.schema_revision, 1);
     schema.add_property(PropertyDef::new("a", PropertyType::Int));
@@ -409,7 +407,7 @@ fn schema_mode_msgpack_roundtrip() {
     assert_eq!(restored.name, "Flexible");
 }
 
-// ── COMPUTED properties (R081) ───────────────────────────────
+// ── COMPUTED properties ───────────────────────────────
 
 #[test]
 fn computed_property_def() {

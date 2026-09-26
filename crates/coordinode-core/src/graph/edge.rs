@@ -269,7 +269,7 @@ pub fn valid_from_upper_bound_key(
     encode_temporal_edgeprop_key(edge_type, source_id, target_id, bound)
 }
 
-// -- Discriminated edge property keys (ADR-029) --
+// -- Discriminated edge property keys --
 //
 // A `DISCRIMINATED BY (col)` edge type stores one edgeprop entry per discriminator
 // value, keyed `edgeprop:<TYPE>:<src>:<tgt>:<discriminator>`. The discriminator is
@@ -307,7 +307,7 @@ pub(crate) fn decode_f64_sortable(bytes: [u8; 8]) -> f64 {
     f64::from_bits(bits)
 }
 
-/// Encode a discriminator value as an order-preserving key suffix (ADR-029).
+/// Encode a discriminator value as an order-preserving key suffix.
 ///
 /// Supported discriminator types: `Int` / `Timestamp` (8-byte sign-flipped BE,
 /// byte-identical to temporal `valid_from`), `Float` (8-byte sortable), `Bool`
@@ -364,7 +364,7 @@ pub fn decode_discriminator_value(bytes: &[u8], kind: &PropertyType) -> Option<P
 /// Encode a discriminated edge property key:
 /// `edgeprop:<edge_type>:<src BE>:<tgt BE>:<discriminator>`.
 ///
-/// Returns `None` if `discriminator` is not an ADR-029-supported type.
+/// Returns `None` if `discriminator` is not a supported discriminator type.
 pub fn encode_discriminated_edgeprop_key(
     edge_type: &str,
     source_id: NodeId,
@@ -457,14 +457,14 @@ impl EdgeProperties {
         self.props.is_empty()
     }
 
-    /// Serialize to the canonical edge-property wire format (ADR-040).
+    /// Serialize to the canonical edge-property wire format.
     pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         let pairs: Vec<(u32, PropertyValue)> =
             self.props.iter().map(|(k, v)| (*k, v.clone())).collect();
         encode_edge_props(&pairs)
     }
 
-    /// Deserialize from the canonical edge-property wire format (ADR-040).
+    /// Deserialize from the canonical edge-property wire format.
     pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         let props = decode_edge_props(data)?.into_iter().collect();
         Ok(Self { props })
@@ -478,13 +478,13 @@ impl Default for EdgeProperties {
 }
 
 /// Encode an edge-property facet set to the single canonical on-disk wire
-/// format (ADR-040): a MessagePack array of `(field_id, value)` pairs
+/// format: a MessagePack array of `(field_id, value)` pairs
 /// sorted ascending by `field_id`, duplicate field ids collapsed last-wins.
 ///
 /// This is the ONLY edge-property value encoder in the tree. Every writer
 /// — the query executor, [`EdgeProperties::to_msgpack`], backup restore —
 /// routes through it so the `edgeprop:` partition holds exactly one byte
-/// layout (no dual-format readers, per ADR-021). Sorting makes the bytes
+/// layout (no dual-format readers). Sorting makes the bytes
 /// deterministic: the same logical facet set always yields the same bytes
 /// regardless of insertion order or `HashMap` iteration order, which is a
 /// hard requirement for page-ECC, block dedup, and snapshot diffing.
@@ -499,8 +499,8 @@ pub fn encode_edge_props(
     rmp_serde::to_vec(&pairs)
 }
 
-/// Decode an edge-property facet set from the canonical wire format
-/// (ADR-040). Counterpart to [`encode_edge_props`]. Returns the pairs in
+/// Decode an edge-property facet set from the canonical wire format.
+/// Counterpart to [`encode_edge_props`]. Returns the pairs in
 /// stored (sorted-by-`field_id`) order.
 pub fn decode_edge_props(
     bytes: &[u8],

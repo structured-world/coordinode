@@ -5,7 +5,7 @@
 //! function applies deltas during reads and compaction.
 //!
 //! Wire format: `[0x01, msgpack(DocDelta)]` — prefix byte 0x01 distinguishes
-//! merge operands from full NodeRecords (prefix 0x00). See ADR-015.
+//! merge operands from full NodeRecords (prefix 0x00).
 
 use serde::{Deserialize, Serialize};
 

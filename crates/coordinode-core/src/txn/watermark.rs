@@ -1,4 +1,4 @@
-//! R-SNAP2: Per-shard `maxAssigned` watermark and `WaitForTs(T)` primitive.
+//! Per-shard `maxAssigned` watermark and `WaitForTs(T)` primitive.
 //!
 //! ## Role in the Cross-Modality Snapshot Protocol
 //!
@@ -9,16 +9,14 @@
 //! every applied commit, readers at `T` block on `wait_for(T, timeout)`
 //! until the watermark reaches `T` (or the timeout fires).
 //!
-//! Per arch/core/transactions.md § Cross-Modality Snapshot Protocol:
-//!
-//! > Shard checks its local `maxAssigned` counter (monotonic atomic,
-//! > updated on every applied commit). If `maxAssigned < T`: `WaitForTs(T)`
-//! > — block until applier progresses past T (bounded by ~apply_latency,
-//! > typically <1ms; timeout returns `ErrReadTimeout`).
+//! The shard checks its local `maxAssigned` counter (monotonic atomic,
+//! updated on every applied commit). If `maxAssigned < T`, `WaitForTs(T)`
+//! blocks until the applier progresses past T (bounded by ~apply_latency,
+//! typically <1ms; the timeout returns `ErrReadTimeout`).
 //!
 //! ## Why per-shard and not central
 //!
-//! CoordiNode uses HLC (ADR-007) which gives each shard its own monotonic
+//! CoordiNode uses HLC, which gives each shard its own monotonic
 //! timestamp stream. No central oracle. The watermark is therefore
 //! per-shard state — each shard advances independently. Reads against a
 //! specific shard consult that shard's watermark; cross-shard reads wait
@@ -49,7 +47,7 @@ use std::time::Duration;
 use crate::txn::timestamp::Timestamp;
 
 /// Default timeout for `wait_for` calls when the caller does not specify one.
-/// Matches `read_timeout_ms` default in arch/core/transactions.md.
+/// Matches the default `read_timeout_ms`.
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_millis(2000);
 
 /// Errors returned by `MaxAssignedWatermark::wait_for`.
