@@ -22,7 +22,7 @@
   "dataset": "random-3072-angular",
   "subject": "hnswlib",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 21513.024747133255,
     "dataset_dim": null,

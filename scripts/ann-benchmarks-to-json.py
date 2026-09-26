@@ -23,7 +23,7 @@ Each JSON looks like::
       "dataset": "sift-128-euclidean",
       "subject": "coordinode",          # or hnswlib / faiss-hnsw / qdrant / ...
       "codec": "none",
-      "version": "0.4.3",
+      "version": "0.8.0",               # the subject library's release
       "metrics": {
         "build_secs": 22.3,
         "dataset_dim": 128,
@@ -48,8 +48,6 @@ import os
 import platform
 import re
 import subprocess
-import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -284,8 +282,10 @@ def main() -> None:
     p.add_argument("--out-dir", required=True, type=Path,
                    help="where to write bench-results/vector/<dataset>/*.json")
     p.add_argument("--codec", default="none")
-    p.add_argument("--version", default="0.4.3",
-                   help="subject library version label")
+    # No default: the label names the benchmarked library's own release, and
+    # any fixed default would silently mislabel every subject but one.
+    p.add_argument("--version", required=True,
+                   help="release of the benchmarked library (e.g. 0.8.0 for hnswlib)")
     args = p.parse_args()
 
     subject = args.subject or args.algorithm

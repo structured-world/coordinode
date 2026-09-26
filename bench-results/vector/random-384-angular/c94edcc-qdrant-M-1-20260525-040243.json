@@ -22,7 +22,7 @@
   "dataset": "random-384-angular",
   "subject": "qdrant",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 2236.7258076667786,
     "dataset_dim": null,

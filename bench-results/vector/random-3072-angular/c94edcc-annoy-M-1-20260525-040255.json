@@ -22,7 +22,7 @@
   "dataset": "random-3072-angular",
   "subject": "annoy",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 720.2175078392029,
     "dataset_dim": null,

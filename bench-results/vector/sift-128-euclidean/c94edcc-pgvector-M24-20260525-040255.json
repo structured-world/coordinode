@@ -22,7 +22,7 @@
   "dataset": "sift-128-euclidean",
   "subject": "pgvector",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 1010.127053976059,
     "dataset_dim": 128,

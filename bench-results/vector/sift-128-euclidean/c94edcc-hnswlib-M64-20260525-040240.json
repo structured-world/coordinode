@@ -22,7 +22,7 @@
   "dataset": "sift-128-euclidean",
   "subject": "hnswlib",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 964.4836251735687,
     "dataset_dim": 128,

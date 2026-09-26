@@ -22,7 +22,7 @@
   "dataset": "sift-128-euclidean",
   "subject": "qdrant",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 618.0560734272003,
     "dataset_dim": 128,

@@ -22,7 +22,7 @@
   "dataset": "random-384-angular",
   "subject": "pgvector",
   "codec": "none",
-  "version": "donor",
+  "version": "unknown",
   "metrics": {
     "build_secs": 2362.8857321739197,
     "dataset_dim": null,
