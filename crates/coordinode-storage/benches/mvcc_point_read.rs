@@ -1,7 +1,7 @@
-//! Benchmark: MVCC point read latency (R070).
+//! Benchmark: MVCC point read latency.
 //!
 //! Measures native seqno MVCC read performance on hot keys with many versions.
-//! Target (ADR-016, V2): 1-3µs point read on hot keys with 100+ versions.
+//! Target: 1-3µs point read on hot keys with 100+ versions.
 //!
 //! Scenarios:
 //!   1. point_read/latest — read current value of key with N versions
@@ -53,7 +53,7 @@ fn setup_versioned_key(num_versions: usize) -> (StorageEngine, tempfile::TempDir
 
 /// Benchmark: read latest value of a key with N historical versions.
 ///
-/// This is the primary metric from ADR-016: "point read on hot key".
+/// This is the primary MVCC read metric: "point read on hot key".
 /// With native seqno MVCC, this should be O(1) regardless of version count.
 fn bench_point_read_latest(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage/mvcc_point_read/latest");

@@ -716,7 +716,7 @@ fn to_tree_config_uses_first_endpoint_path() {
     assert!(dir1.path().exists(), "first endpoint dir is the active one");
 }
 
-// ── R089: ColonSeparatedPrefix tests ────────────────────────────
+// ── ColonSeparatedPrefix tests ──────────────────────────────────
 
 #[test]
 fn prefix_extractor_adj_key() {
@@ -774,7 +774,7 @@ fn prefix_extractor_valid_scan_boundary() {
     assert!(!ext.is_valid_scan_boundary(b""));
 }
 
-// ── R089: drop_range integration ────────────────────────────────
+// ── drop_range integration ──────────────────────────────────────
 
 #[test]
 fn drop_range_deletes_keys_in_range() {

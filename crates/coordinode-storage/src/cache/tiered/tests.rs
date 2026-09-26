@@ -378,7 +378,7 @@ fn background_thread_stops_on_drop() {
     // If we get here without hanging, the thread stopped cleanly
 }
 
-// ── Weighted eviction tests (G019) ────────────────────────────
+// ── Weighted eviction tests ───────────────────────────────────
 
 /// Low-weight entries are evicted before high-weight entries.
 #[test]

@@ -3,7 +3,7 @@
 //! Each storage partition (except `Schema`, which always stays single-tier
 //! for bootstrap reasons) is assigned a `PartitionRouting` — a deterministic
 //! mapping from LSM level to the endpoint that hosts SST files for that
-//! level. Defaults follow `arch/placement/tiered-storage.md`:
+//! level. Defaults:
 //!
 //! - **L0-L1** → first endpoint with `tier ∈ {Hot, HotCache, Memory}`
 //! - **L2-L3** → first endpoint with `tier == Warm`
@@ -41,7 +41,7 @@ pub(crate) const MAX_ROUTED_LEVEL: u8 = 6;
 /// Mapping from LSM level (0..=6) to the endpoint id that hosts SST files
 /// at that level for a single partition.
 ///
-/// `BTreeMap` (not `HashMap` per the original ROADMAP wording) so that
+/// `BTreeMap` (not `HashMap`) so that
 /// MessagePack serialisation is deterministic byte-for-byte across opens —
 /// makes diff-based debugging of routing state straightforward.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

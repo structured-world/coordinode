@@ -1,4 +1,4 @@
-//! Integration tests for embedded oplog-journal crash recovery (G111).
+//! Integration tests for embedded oplog-journal crash recovery.
 //!
 //! These validate the full round-trip an embedded engine performs:
 //!   open_embedded → oplog_append + apply → drop (simulated crash) →
@@ -60,7 +60,7 @@ fn embedded_engine_has_journal_on_durable_endpoint() {
 fn put_survives_crash_via_journal_replay() {
     let dir = TempDir::new().expect("temp dir");
 
-    // Phase 1: journal + apply, then "crash" (drop without persist).
+    // Step 1: journal + apply, then "crash" (drop without persist).
     {
         let oracle = Arc::new(TimestampOracle::new());
         let engine =
@@ -77,7 +77,7 @@ fn put_survives_crash_via_journal_replay() {
         // Drop without persist() — memtable lost, only the oplog has the write.
     }
 
-    // Phase 2: reopen — recovery must replay the journalled Put.
+    // Step 2: reopen — recovery must replay the journalled Put.
     {
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle).expect("reopen");
@@ -161,7 +161,7 @@ fn multi_partition_entry_replays_as_one_batch_at_its_ts() {
 fn delete_survives_crash_via_journal_replay() {
     let dir = TempDir::new().expect("temp dir");
 
-    // Phase 1: write a value and make it durable (flushed to SST).
+    // Step 1: write a value and make it durable (flushed to SST).
     {
         let oracle = Arc::new(TimestampOracle::new());
         let engine =
@@ -189,7 +189,7 @@ fn delete_survives_crash_via_journal_replay() {
         // Crash.
     }
 
-    // Phase 2: reopen — the Delete must be replayed over the durable Put.
+    // Step 2: reopen — the Delete must be replayed over the durable Put.
     {
         let oracle = Arc::new(TimestampOracle::new());
         let engine = StorageEngine::open_embedded(&durable_cfg(&dir), oracle).expect("reopen");

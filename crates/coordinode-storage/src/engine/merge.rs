@@ -7,7 +7,7 @@
 //!
 //! - **`DocumentMerge`** (`node:` partition): path-targeted partial document updates
 //!   via `DocDelta` operands (SetPath, DeletePath, ArrayPush, etc.). Eliminates
-//!   read-modify-write for nested DOCUMENT properties. See ADR-015.
+//!   read-modify-write for nested DOCUMENT properties.
 //!
 //! - **`CounterMerge`** (`counter:` partition): atomic i64 increment/decrement.
 //!   Base value is i64 LE, operands are i64 LE deltas. Result = base + sum(deltas).
@@ -357,7 +357,7 @@ fn apply_delta_to_record_batched(
 /// Mirrors the `DocumentMerge` LSM merge path but operates on a pre-loaded
 /// record. Callers use this when they need to materialise the post-delta
 /// state synchronously rather than queue merge operands — the canonical
-/// case is the R172c Phase 3b temporal close+open path, where a nested
+/// case is the temporal close+open path, where a nested
 /// `SET n.doc.a.b = …` on a temporal node must produce the full new-version
 /// NodeRecord (not a merge operand on the non-temporal key).
 ///

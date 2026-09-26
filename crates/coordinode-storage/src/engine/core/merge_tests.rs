@@ -170,7 +170,7 @@ fn merge_many_sequential_adds() {
     }
 }
 
-// -- R010b: edge cases + concurrent tests --
+// -- edge cases + concurrent tests --
 
 #[test]
 fn merge_concurrent_multithreaded_adds() {
@@ -666,7 +666,7 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
 }
 
 // ================================================================
-// R010d: Merge operator stress + time-travel tests
+// Merge operator stress + time-travel tests
 // ================================================================
 
 #[test]
@@ -822,7 +822,7 @@ fn merge_compaction_preserves_time_travel() {
     let engine = StorageEngine::open(&config).expect("open");
     let key = b"adj:KNOWS:out:node7";
 
-    // Phase 1: Write 200 UIDs in 2 batches, snapshot after each.
+    // Step 1: Write 200 UIDs in 2 batches, snapshot after each.
     for uid in 0..100u64 {
         engine
             .merge(Partition::Adj, key, &encode_add(uid))
@@ -839,10 +839,10 @@ fn merge_compaction_preserves_time_travel() {
     engine.persist().expect("persist");
     let snap_after_200 = engine.snapshot();
 
-    // Phase 2: Force compaction.
+    // Step 2: Force compaction.
     engine.force_compaction(Partition::Adj).expect("compaction");
 
-    // Phase 3: Write 50 more UIDs after compaction.
+    // Step 3: Write 50 more UIDs after compaction.
     for uid in 200..250u64 {
         engine
             .merge(Partition::Adj, key, &encode_add(uid))
@@ -996,7 +996,7 @@ fn merge_stress_interleaved_add_remove_concurrent() {
     );
 }
 
-// === G049: UidPack format verification ===
+// === UidPack format verification ===
 
 #[test]
 fn merge_stores_uidpack_format_on_disk() {
@@ -1043,7 +1043,7 @@ fn merge_stores_uidpack_format_on_disk() {
     );
 }
 
-// === R061: snapshot_at integration tests ===
+// === snapshot_at integration tests ===
 
 #[test]
 fn snapshot_at_reads_historical_value() {
@@ -1116,7 +1116,7 @@ fn snapshot_at_isolation_from_concurrent_writes() {
     }
 }
 
-// === R064: TimestampOracle as SequenceNumberGenerator ===
+// === TimestampOracle as SequenceNumberGenerator ===
 
 #[test]
 fn open_with_oracle_writes_use_oracle_seqno() {
@@ -1191,7 +1191,7 @@ fn oracle_snapshot_at_matches_write_timestamp() {
     assert_eq!(current.as_deref(), Some(b"v2".as_ref()));
 }
 
-// === R066: has_write_after — seqno-based OCC conflict detection ===
+// === has_write_after — seqno-based OCC conflict detection ===
 
 #[test]
 fn has_write_after_detects_newer_write() {
@@ -1327,7 +1327,7 @@ fn has_write_after_different_partitions_independent() {
     );
 }
 
-// === R163: Document merge operator integration tests ===
+// === Document merge operator integration tests ===
 
 #[test]
 fn doc_merge_through_storage_engine() {
@@ -1642,7 +1642,7 @@ fn doc_merge_concurrent_increment_same_path() {
 
 #[test]
 fn doc_merge_legacy_node_record_without_prefix() {
-    // Pre-R163 data: NodeRecord stored without 0x00 prefix.
+    // Legacy data: NodeRecord stored without 0x00 prefix.
     // engine.put() writes bare msgpack. After merge with DocDelta,
     // the result should have the 0x00 prefix and contain both
     // original data and delta.
@@ -1686,7 +1686,7 @@ fn doc_merge_legacy_node_record_without_prefix() {
     assert_eq!(merged.get_extra("new_field"), Some(&Value::Int(99)));
 }
 
-/// G064: Concurrent threads SET different paths on the same node via merge operands.
+/// Concurrent threads SET different paths on the same node via merge operands.
 /// All changes must be applied — no data loss, no conflict.
 #[test]
 fn doc_merge_concurrent_different_prop_field_paths() {
@@ -1756,7 +1756,7 @@ fn doc_merge_concurrent_different_prop_field_paths() {
     }
 }
 
-/// R165: 100 concurrent writers each push to the same array via ArrayPush merge operands.
+/// 100 concurrent writers each push to the same array via ArrayPush merge operands.
 /// All pushes must be applied — no data loss. Order is seqno-based.
 #[test]
 fn doc_merge_concurrent_100_writers_array_push() {

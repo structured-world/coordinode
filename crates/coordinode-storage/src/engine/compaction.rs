@@ -1,4 +1,4 @@
-//! CompactionScheduler: priority-based LSM compaction worker pool (R073).
+//! CompactionScheduler: priority-based LSM compaction worker pool.
 //!
 //! Monitor thread polls all partition trees every `poll_interval_ms` and
 //! submits [`CompactionRequest`]s sorted by priority (Urgent → High →

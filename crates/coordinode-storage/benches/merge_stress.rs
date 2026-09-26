@@ -1,6 +1,6 @@
 //! Benchmark: merge operator throughput under concurrent writes.
 //!
-//! R010d: measures merge-based posting list writes at various scales
+//! Measures merge-based posting list writes at various scales
 //! (10K, 100K, 1M UIDs) and compares batch vs single-operand encoding.
 
 #![allow(clippy::expect_used)]

@@ -123,7 +123,7 @@ fn range_scan_inclusive_bounds_yields_both_endpoints() {
 
 #[test]
 fn range_scan_skips_keys_outside_window() {
-    // Pin the "skip dead zones" contract that G101's bbox
+    // Pin the "skip dead zones" contract that the spatial bbox
     // decomposition relies on — keys outside [start, end] must
     // NOT appear in the iterator at all (not "yielded then
     // filtered").
@@ -224,7 +224,7 @@ fn range_seekable_yields_window_without_seek() {
 
 #[test]
 fn range_seekable_seek_to_skips_dead_zone() {
-    // The skip-scan contract G101 relies on: open one iterator over the
+    // The skip-scan contract the spatial index relies on: open one iterator over the
     // broad window, jump past a dead zone with seek_to — the in-between
     // keys are skipped at the iterator (never yielded), not post-filtered.
     let (_dir, engine) = open_engine();
@@ -557,7 +557,7 @@ fn occ_scope_validate_multi_partition_mixed_outcome() {
 #[test]
 fn multimodal_coordinator_dyn_dispatch_works() {
     // Bind to the trait through `&dyn`. This is the contract used
-    // by EE Phase 3 (`MultiShardCoordinator`) — Layer 4 / Layer 5
+    // by the EE `MultiShardCoordinator`: Layer 4 / Layer 5
     // hold a trait object, never a concrete type.
     let (_dir, engine) = open_engine();
     let coord: &dyn MultiModalCoordinator = engine.coordinator();

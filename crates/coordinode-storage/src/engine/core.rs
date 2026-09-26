@@ -161,7 +161,7 @@ pub struct StorageEngine {
     /// persistent endpoint. The retained oplog drives crash recovery and
     /// WAL-replay-repair (rebuild a corrupt partition from a checkpoint then
     /// replay forward). In cluster mode this is `None` — the Raft log is the
-    /// equivalent retained oplog (ADR-017).
+    /// equivalent retained oplog.
     oplog: Option<Arc<Mutex<EmbeddedOplog>>>,
     /// Which journal indices are applied, and the last fold of them into the
     /// partition trees' coverage records. `Some` exactly when `oplog` is.
@@ -1945,7 +1945,7 @@ impl StorageEngine {
         self.coordinator.advance_gc_watermark();
     }
 
-    /// Publish the consumer-registry retention floor (ADR-028 feed a):
+    /// Publish the consumer-registry retention floor (the seqno-space feed):
     /// `min(consumer_checkpoints, MVCC time-travel window)`, supplied by the
     /// `SeqnoConsumerRegistry` in `coordinode-replicate`. The effective GC
     /// watermark becomes `min(live snapshot pin / current seqno, floor)` — a
@@ -2183,7 +2183,7 @@ impl StorageEngine {
     }
 
     /// Delete the half-open range `[start, end)` of a partition with one MVCC
-    /// range tombstone (G096). Snapshot-aware and seqno'd, so it replicates and
+    /// range tombstone. Snapshot-aware and seqno'd, so it replicates and
     /// PITR-replays correctly — unlike [`drop_range`](Self::drop_range), which is
     /// an eager, non-MVCC table-level drop. Invalidates the partition's cache:
     /// the tombstone leaves the shadowed keys physically present, so a stale
@@ -2225,7 +2225,7 @@ impl StorageEngine {
     /// Maps the partition-agnostic [`PartitionId`] the mutation carries to the
     /// physical [`Partition`] and dispatches to [`Self::put`] / [`Self::delete`]
     /// / [`Self::merge`]. Put/Delete write plain keys (the seqno oracle
-    /// auto-stamps under ADR-016); Merge writes the raw operand. This lets
+    /// auto-stamps them); Merge writes the raw operand. This lets
     /// callers above the storage layer (background maintenance, proposal
     /// pipelines) apply mutations without naming a partition or key encoder.
     ///
@@ -2252,7 +2252,7 @@ impl StorageEngine {
     }
 
     /// Apply every mutation of one committed proposal at a single seqno: its
-    /// commit timestamp (ADR-016, `seqno == commit_ts`). This is the one write
+    /// commit timestamp (`seqno == commit_ts`). This is the one write
     /// path for a transaction's commit in every deployment mode: the embedded
     /// pipeline, the Raft state machine applying a replicated entry, and the
     /// direct no-pipeline commit all land here, so a snapshot read at

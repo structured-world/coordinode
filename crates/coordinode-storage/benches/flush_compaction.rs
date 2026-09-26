@@ -1,4 +1,4 @@
-//! Benchmark: flush and compaction throughput (R072, R073).
+//! Benchmark: flush and compaction throughput.
 //!
 //! Measures:
 //!   1. flush/write_then_wait — time to write N keys and wait for FlushManager
@@ -49,7 +49,7 @@ fn wait_for(timeout: Duration, label: &str, f: impl Fn() -> bool) {
     panic!("wait_for timeout: {label}");
 }
 
-// ── Flush benchmarks (R072) ───────────────────────────────────────────────────
+// ── Flush benchmarks ──────────────────────────────────────────────────────────
 
 /// Benchmark: write N keys → wait for FlushManager to drain all sealed memtables.
 ///
@@ -122,7 +122,7 @@ fn bench_flush_put_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Compaction benchmarks (R073) ──────────────────────────────────────────────
+// ── Compaction benchmarks ─────────────────────────────────────────────────────
 
 /// Benchmark: CompactionScheduler L0 convergence time.
 ///

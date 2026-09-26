@@ -827,7 +827,7 @@ fn reads_leave_no_occ_scope() {
 
 #[test]
 fn into_state_resume_preserves_buffer_occ_and_read_ts() {
-    // The interactive-transaction park/resume cycle (ADR-042): a
+    // The interactive-transaction park/resume cycle: a
     // transaction's progress survives being parked as TransactionState
     // and rebuilt with fresh engine/oracle borrows.
     let (engine, oracle, _d) = test_engine();

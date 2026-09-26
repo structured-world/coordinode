@@ -69,8 +69,8 @@ impl OplogManager {
     }
 
     /// Open the oplog manager with an active write directory plus extra
-    /// directories scanned for sealed segments at startup
-    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
+    /// directories scanned for sealed segments at startup (segments written
+    /// under an earlier endpoint routing).
     ///
     /// `active_dir` receives all new segments. `recovery_dirs` are
     /// scanned at startup for `oplog-*.bin` files and merged into the

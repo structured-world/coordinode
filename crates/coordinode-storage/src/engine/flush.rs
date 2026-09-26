@@ -1,4 +1,4 @@
-//! FlushManager: background memtable → SST flush worker pool (R072).
+//! FlushManager: background memtable → SST flush worker pool.
 //!
 //! Monitors all partition trees and flushes sealed memtables to SST when either:
 //!   - active memtable size exceeds `flush_threshold_bytes`
@@ -162,7 +162,7 @@ struct FlushMonitorConfig {
 /// 3. **Memtable age:** any non-empty memtable older than
 ///    `max_memtable_age_secs` (default 30s; `0` disables the trigger).
 ///    Without this, light or bursty workloads can leave mutations in the
-///    memtable for hours; combined with R076a's purge gate that would
+///    memtable for hours; combined with the oplog purge gate that would
 ///    grow the oplog unbounded waiting for size-based flush to fire.
 ///    The clock starts at startup and resets on every rotation; an empty
 ///    active memtable is never rotated (no data to lose).

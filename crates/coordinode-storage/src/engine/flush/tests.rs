@@ -154,10 +154,10 @@ fn flush_manager_multiple_workers_no_panic() {
 
 #[test]
 fn flush_manager_age_trigger_rotates_idle_memtable() {
-    // R076b: a memtable with even one byte of data must roll over to SST
+    // A memtable with even one byte of data must roll over to SST
     // after `max_memtable_age_secs`, independent of the size threshold.
     // Without this, light-load workloads could sit in volatile memory
-    // for hours; combined with the R076a oplog purge gate, oplog
+    // for hours; combined with the oplog purge gate, oplog
     // retention would grow without bound waiting for size-based flush.
     let (trees, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
@@ -205,8 +205,8 @@ fn flush_manager_age_trigger_rotates_idle_memtable() {
 
 #[test]
 fn flush_manager_age_zero_disables_time_based_trigger() {
-    // max_memtable_age_secs == 0 must preserve the pre-R076b behavior:
-    // size and sealed-count gates alone, no implicit time rotation.
+    // max_memtable_age_secs == 0 disables the age trigger: size and
+    // sealed-count gates alone, no implicit time rotation.
     let (trees, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 

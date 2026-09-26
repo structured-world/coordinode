@@ -10,8 +10,7 @@ use crate::cache::config::TieredCacheConfig;
 use crate::engine::merge::{CounterMerge, DocumentMerge, PostingListMerge};
 use crate::engine::partition::Partition;
 
-// ── Storage endpoint types (arch/core/storage-stack.md Layer 1 + ────────
-//                            arch/placement/storage-endpoints.md)        ──
+// ── Storage endpoint types (storage stack Layer 1) ──────────────────────
 
 /// Physical media type backing a storage endpoint.
 ///
@@ -40,11 +39,7 @@ pub enum Media {
 /// Operator-marked at config time. NEVER inferred from media kind — the same
 /// SSD can be `Durable` (in RAID-1), `Degraded` (single drive primary
 /// storage), or `Volatile` (cache file). The placement engine reads this
-/// flag to enforce the invariants below.
-///
-/// See [storage-stack.md](../../arch/core/storage-stack.md) §Cross-cutting
-/// axis: Durability tri-state for the full invariant set (INV-D1..D4) and
-/// the redundancy-mechanism mapping table.
+/// flag to enforce the invariants listed on each variant (INV-D1..D4).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
@@ -95,8 +90,7 @@ pub enum Tier {
 /// Configuration of one storage endpoint — one mount point on the local
 /// server, with its own media, durability profile, capacity, and tier.
 ///
-/// This is the **Layer 1** primitive in the storage stack
-/// ([storage-stack.md](../../arch/core/storage-stack.md)). Multiple
+/// This is the **Layer 1** primitive in the storage stack. Multiple
 /// endpoints per node are the normal case (CoordiNode runs against 40-disk
 /// JBODs routinely); the single-endpoint case is just a one-element
 /// `endpoints` vec passed to [`StorageConfig::with_endpoints`].
@@ -116,7 +110,7 @@ pub struct EndpointConfig {
     /// Server identifier the endpoint physically lives on. `None` in CE
     /// single-node deployments (server identity is implicit — the process
     /// itself). EE multi-server deployments populate this from the cluster
-    /// topology layer (R163) so endpoints in the same `StorageConfig` can
+    /// topology layer so endpoints in the same `StorageConfig` can
     /// be distinguished by physical host when topology-aware placement
     /// rules apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,8 +335,7 @@ impl EndpointConfig {
         self
     }
 
-    /// WAL eligibility predicate ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2):
-    /// endpoint is eligible to host the standalone WAL iff it offers fast
+    /// WAL eligibility predicate: endpoint is eligible to host the standalone WAL iff it offers fast
     /// sequential writes (NVMe/SSD media OR `Hot` tier) AND it is non-volatile.
     /// `HotCache` is **not** eligible — it is a volatile-by-design RAM/NVMe
     /// cache tier and would have failed the non-volatile check anyway; we
@@ -356,9 +349,7 @@ impl EndpointConfig {
         fast && non_volatile
     }
 
-    /// Oplog eligibility predicate ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
-    /// [storage-endpoints.md](../../arch/placement/storage-endpoints.md) INV-D1):
-    /// endpoint is eligible to host oplog segments iff its durability class
+    /// Oplog eligibility predicate (INV-D1): endpoint is eligible to host oplog segments iff its durability class
     /// guarantees survival of a process restart. `Volatile` is rejected
     /// (segments lost on restart = consensus log lost = data loss). Both
     /// `Durable` and `Degraded` are eligible — `Degraded` is acceptable
@@ -609,8 +600,8 @@ pub struct StorageConfig {
     /// oplog purge gate (see `OplogManager::purge_before`) to keep oplog
     /// retention bounded while preserving crash safety.
     ///
-    /// Set to `0` to disable the time-based trigger (size-based only — the
-    /// pre-R076b behavior). Default: 30.
+    /// Set to `0` to disable the time-based trigger (size-based only).
+    /// Default: 30.
     pub max_memtable_age_secs: u64,
 
     /// Number of background compaction worker threads. Default: 2.
@@ -788,7 +779,7 @@ impl StorageConfig {
     pub fn with_endpoints(endpoints: Vec<EndpointConfig>) -> Self {
         Self::validate_common(&endpoints);
         // INV-D1 (config-time): at least one oplog-eligible endpoint.
-        // Oplog = Raft log = WAL = CDC source (ADR-017) MUST survive
+        // Oplog = Raft log = WAL = CDC source, so it MUST survive
         // process restart, so a config with no durable/degraded endpoints
         // cannot host a production storage engine. Tests that genuinely
         // need an all-volatile (MemFs) config must use
@@ -927,7 +918,7 @@ impl StorageConfig {
     }
 
     /// Select the endpoint that hosts the **standalone WAL** for this
-    /// instance ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2).
+    /// instance.
     ///
     /// Picks the first endpoint matching [`EndpointConfig::is_wal_eligible`].
     /// WAL is non-replicated single-file storage; spreading it across
@@ -947,8 +938,7 @@ impl StorageConfig {
     }
 
     /// Select the endpoint that hosts oplog segments for `shard_id`
-    /// ([storage-stack.md](../../arch/core/storage-stack.md) Layer 1↔2,
-    /// [storage-endpoints.md](../../arch/placement/storage-endpoints.md) INV-D1).
+    /// (INV-D1: a non-volatile endpoint).
     ///
     /// Round-robin within the oplog-eligible set, keyed by `shard_id`.
     /// CE single-shard with a single oplog-eligible endpoint always
@@ -1043,7 +1033,7 @@ impl StorageConfig {
     ///   data, raising the read floor to the install and refusing every
     ///   snapshot inside the retention window.
     /// - `PostingListMerge` merge operator on `Adj`.
-    /// - `DocumentMerge` merge operator on `Node` (ADR-015).
+    /// - `DocumentMerge` merge operator on `Node`.
     /// - KV separation (BlobTree) for the `Blob` partition.
     pub(crate) fn to_tree_config(
         &self,
@@ -1121,7 +1111,7 @@ impl StorageConfig {
         // Merge operators, per partition:
         //
         // - Adj: PostingListMerge — conflict-free edge writes via Add/Remove deltas.
-        // - Node: DocumentMerge — path-targeted partial document updates (ADR-015).
+        // - Node: DocumentMerge — path-targeted partial document updates.
         //   Handles both full NodeRecords (0x00 prefix) and DocDelta operands (0x01).
         // - Counter: CounterMerge — atomic i64 increment/decrement.
         if part == Partition::Adj {
@@ -1141,13 +1131,13 @@ impl StorageConfig {
             config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
         }
 
-        // Prefix extractor for bloom-accelerated prefix scans (R089).
+        // Prefix extractor for bloom-accelerated prefix scans.
         // All partitions use colon-separated keys (node:, adj:, edgeprop:, etc.)
         // so one extractor serves all. Biggest impact on adj: partition where
         // prefix_scan("adj:KNOWS:out:") is the hot path for graph traversal.
         config = config.prefix_extractor(Arc::new(ColonSeparatedPrefix));
 
-        // Per-block Reed-Solomon page ECC (R159 Part C). The lsm-tree
+        // Per-block Reed-Solomon page ECC. The lsm-tree
         // flag is per-tree, but the ECC policy is per-endpoint, and a
         // tree's levels can span endpoints of different durability via
         // routing. Take the most-protective decision: enable ECC for the

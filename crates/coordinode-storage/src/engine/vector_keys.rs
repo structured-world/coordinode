@@ -1,11 +1,11 @@
-//! Key encoding for the vector storage tier (ADR-033 revised).
+//! Key encoding for the vector storage tier.
 //!
-//! One partition holds the f32 source of truth per ADR-033:
+//! One partition holds the f32 source of truth:
 //!
 //! - [`Partition::VectorF32`][crate::engine::partition::Partition::VectorF32]
 //!   stores the f32 source-of-truth bytes (`dim × 4` bytes per vector).
 //!   In-RAM codecs (RaBitQ default, optional SQ8 / PolarQuant / PQ)
-//!   regenerate from this on calibration. Phase 1.5 cross-shard rerank
+//!   regenerate from this on calibration. Cross-shard rerank
 //!   reads f32 directly here — no intermediate quantized disk tier
 //!   (matches Qdrant / Weaviate / ES BBQ pattern).
 //!

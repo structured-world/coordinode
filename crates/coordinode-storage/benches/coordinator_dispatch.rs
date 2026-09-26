@@ -1,6 +1,6 @@
 //! Coordinator dispatch overhead — measures the cost of the
 //! partition-handle lookup and the seqno-stamp on the hot read/write
-//! paths. R164 introduced one extra struct boundary on every access;
+//! paths. The coordinator adds one extra struct boundary on every access;
 //! this bench pins the additional cost (should be in the
 //! 10-100 ns/op range — single HashMap lookup + atomic load).
 

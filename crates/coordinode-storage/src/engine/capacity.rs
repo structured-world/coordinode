@@ -234,8 +234,8 @@ impl CapacityTracker {
             // through this mount point, not just partition SSTs:
             //   - `<part>/tables/`     — LSM SST files
             //   - `<part>/manifest/`   — lsm-tree manifest + segment metadata
-            //   - `wal/standalone.wal` — standalone WAL file (R157)
-            //   - `oplog/<shard>/`     — Raft oplog segments (R157)
+            //   - `wal/standalone.wal` — standalone WAL file
+            //   - `oplog/<shard>/`     — Raft oplog segments
             //   - `text_indexes/`      — tantivy FTS index segments
             //   - any future engine-managed subdirectory
             //

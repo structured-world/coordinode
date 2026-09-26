@@ -3,7 +3,7 @@
 //!
 //! A `WriteBatch` groups multiple mutations into a single logical unit. Every
 //! mutation in the batch lands at the SAME seqno, so an MVCC snapshot either
-//! sees the whole batch or none of it (ADR-016: seqno == commit_ts). Each
+//! sees the whole batch or none of it (seqno == commit_ts). Each
 //! partition group's point writes are handed to the tree as one lsm-tree
 //! batch, which holds the version-history guard for the whole insert: a
 //! concurrent memtable rotation cannot seal a memtable holding only a prefix

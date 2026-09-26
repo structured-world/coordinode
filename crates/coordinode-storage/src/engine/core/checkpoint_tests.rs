@@ -13,7 +13,7 @@ fn disk_engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&config).expect("open engine")
 }
 
-/// R159 Part C: a `page_ecc = ForceOn` endpoint makes
+/// A `page_ecc = ForceOn` endpoint makes
 /// `to_tree_config_with_routing` request `Config::page_ecc(true)`.
 /// Verify the engine opens (no `PageEccUnsupported`), and a value
 /// survives a flush-to-SST + reopen — i.e. it round-trips through

@@ -1,4 +1,4 @@
-//! Benchmark: parallel memtable writes within a write batch (R091).
+//! Benchmark: parallel memtable writes within a write batch.
 //!
 //! Measures the throughput of `WriteBatch::commit()` on multi-partition
 //! workloads, comparing the serial path (< PARALLEL_THRESHOLD mutations or

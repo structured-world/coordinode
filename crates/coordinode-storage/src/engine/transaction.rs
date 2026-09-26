@@ -1,4 +1,4 @@
-//! Layer-3 transaction context (ADR-041).
+//! Layer-3 transaction context.
 //!
 //! Owns the per-statement transactional state and is **modality-agnostic** —
 //! its surface is `get` / `put` / `delete` / `prefix_scan` over
@@ -195,7 +195,7 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
     }
 }
 
-/// Per-statement transaction context (ADR-041). See the module docs.
+/// Per-statement transaction context. See the module docs.
 pub struct Transaction<'a> {
     engine: &'a StorageEngine,
     /// `None` selects legacy mode: writes apply directly to the engine with no
@@ -289,7 +289,7 @@ pub struct Transaction<'a> {
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
 /// `engine` / `oracle` borrows. An interactive multi-statement transaction
-/// (ADR-042) parks this in a leader-local registry between statements and
+/// parks this in a leader-local registry between statements and
 /// rebuilds a [`Transaction`] around it (via [`Transaction::resume`]) for each
 /// statement, so the pinned snapshot, write buffer, OCC read-set, and merge
 /// buffers persist across statements while the transaction itself stays a
@@ -495,7 +495,7 @@ impl<'a> Transaction<'a> {
     /// the transaction's progress — the pinned `read_ts` + snapshots, the
     /// read-your-own-writes write buffer, the OCC read-set, and the adjacency
     /// / node merge buffers — is moved out. Pair with [`Self::resume`] to park
-    /// an interactive multi-statement transaction (ADR-042) in a leader-local
+    /// an interactive multi-statement transaction in a leader-local
     /// registry between statements and rebuild it for the next statement, so
     /// the snapshot and accumulated buffers persist while the `Transaction`
     /// itself stays a short-lived borrow.
@@ -1135,7 +1135,7 @@ impl<'a> Transaction<'a> {
     /// detection against the read-set, and apply all buffered point writes +
     /// commutative merge operands under the effective write concern.
     ///
-    /// This is the single Layer-3 commit locus (ADR-041): OCC validation,
+    /// This is the single Layer-3 commit locus: OCC validation,
     /// `commit_ts` assignment, write-concern fan-out, and the Raft proposal
     /// pipeline all live here. Adjacency (`adj:`) keys bypass conflict checking
     /// because posting-list operations are commutative merge operands.
@@ -1306,7 +1306,7 @@ impl<'a> Transaction<'a> {
             }
         }
 
-        // First-committer-wins over the WRITE set (ADR-016 seqno probing, write
+        // First-committer-wins over the WRITE set (seqno probing, write
         // keys only). Every mainstream engine conflicts on concurrent writes
         // and never on stale reads at its default level: PostgreSQL and Oracle
         // row-lock writers, MongoDB conflicts on a concurrently written
@@ -1521,7 +1521,7 @@ impl<'a> Transaction<'a> {
             }
 
             // Coalesce dense runs of point deletes into range deletes before
-            // proposing (G096): a bulk delete ("delete all relationships between
+            // proposing: a bulk delete ("delete all relationships between
             // these nodes", DROP) replicates + PITR-logs as a few range ops
             // instead of N point tombstones. Non-deletes / short runs untouched.
             coordinode_core::txn::coalesce::coalesce_delete_mutations(

@@ -2,7 +2,7 @@
 //! primitive that sits between Layer 4 modality stores and Layer 2
 //! per-partition LSM trees.
 //!
-//! ## Responsibilities (per `arch/core/storage-stack.md` §Layer 3)
+//! ## Responsibilities
 //!
 //! - **Per-partition tree map** — maintains the `Partition →
 //!   AnyTree` mapping, opened once at engine bootstrap.
@@ -161,10 +161,9 @@ impl OccScope {
     }
 
     /// Typed variant of [`Self::contains`] for the
-    /// `(Partition::Node, encode_node_key(shard, id))` pair. Built
-    /// for the R165 OCC audit suite so test assertions don't have
-    /// to reach into the raw `encode_node_key` encoder (R166
-    /// encoder-lockdown follow-up).
+    /// `(Partition::Node, encode_node_key(shard, id))` pair, so OCC
+    /// test assertions don't have to reach into the raw
+    /// `encode_node_key` encoder.
     pub fn contains_node(&self, shard: u16, id: coordinode_core::graph::node::NodeId) -> bool {
         let key = coordinode_core::graph::node::encode_node_key(shard, id);
         self.contains(Partition::Node, &key)
@@ -233,17 +232,16 @@ pub struct OccConflict {
     pub read_ts: lsm_tree::SeqNo,
 }
 
-/// Layer-3 contract: multimodal coordinator across the 8 partitions
-/// (`arch/core/storage-stack.md` §Layer 3, §Per-layer trait surface).
+/// Layer-3 contract: multimodal coordinator across the 8 partitions.
 ///
 /// CE deployments use [`LocalMultiModalCoordinator`] (single-Raft,
-/// single-shard). EE Phase 3 plugs in `MultiShardCoordinator` against
+/// single-shard). EE plugs in `MultiShardCoordinator` against
 /// the same trait — cross-shard 2PC and distributed snapshot
 /// composition happen below this contract; Layer 4 modality stores
 /// and Layer 5 query engine bind to the trait, not the concrete impl.
 ///
 /// The trait surface deliberately omits `AnyTree` / `lsm_tree::Cache`
-/// handles — per Layer-3 arch responsibility ("Knows: all partitions,
+/// handles — per the Layer-3 responsibility ("Knows: all partitions,
 /// merge ops, MVCC snapshots, OCC sets; does NOT know: per-level
 /// endpoint placement, tier policy"), exposing LSM internals through
 /// the trait would leak Layer 2 concerns. Concrete impls may surface
@@ -255,8 +253,8 @@ pub struct OccConflict {
     note = "CE deployments obtain a coordinator via `StorageEngine::coordinator()` which returns the \
             single-shard `LocalMultiModalCoordinator`. EE deployments plug `MultiShardCoordinator` \
             against the same trait. If you're implementing a new coordinator, mirror the surface of \
-            `LocalMultiModalCoordinator` (seqno + read/write/scan/OCC primitives) and review \
-            arch/core/storage-stack.md §Layer 3 before adding methods."
+            `LocalMultiModalCoordinator` (seqno + read/write/scan/OCC primitives) and keep \
+            per-level placement and tier policy out of the trait."
 )]
 pub trait MultiModalCoordinator: Send + Sync {
     /// Allocate the next monotonically-increasing seqno.
@@ -793,7 +791,7 @@ impl LocalMultiModalCoordinator {
         self.gc_controller.tick();
     }
 
-    /// Publish the consumer-registry retention floor (ADR-028 feed a):
+    /// Publish the consumer-registry retention floor (the seqno-space feed):
     /// `min(consumer_checkpoints, time-travel window)`. The effective GC
     /// watermark becomes `min(live-pin / current seqno, this floor)`, so a
     /// lagging CDC / backup consumer or the MVCC retention window holds old
@@ -891,7 +889,7 @@ impl LocalMultiModalCoordinator {
 
     /// Delete the half-open range `[start, end)` with one MVCC range tombstone,
     /// stamped with the next seqno. This is the seqno'd, snapshot-aware,
-    /// replication/PITR-correct range delete (G096) — distinct from the eager,
+    /// replication/PITR-correct range delete, distinct from the eager,
     /// non-MVCC `drop_range` table-drop.
     pub(crate) fn remove_range(
         &self,

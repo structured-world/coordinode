@@ -327,7 +327,7 @@ fn doc_merge_empty_operand_returns_error() {
     assert!(op.merge(b"node:0:1", None, &[empty]).is_err());
 }
 
-// --- PropField (G064) tests ---
+// --- PropField tests ---
 
 #[test]
 fn doc_merge_prop_field_set_path() {
@@ -527,7 +527,7 @@ fn doc_merge_mixed_extra_and_prop_field() {
 
 #[test]
 fn doc_merge_legacy_bare_record_as_base() {
-    // Legacy NodeRecord without 0x00 prefix (pre-R163 data).
+    // Legacy NodeRecord without the 0x00 prefix.
     let op = DocumentMerge;
 
     let rec = NodeRecord::new("Legacy");
@@ -549,7 +549,7 @@ fn doc_merge_legacy_bare_record_as_base() {
     assert_eq!(merged.get_extra("x"), Some(&Value::Int(1)));
 }
 
-// ── RemoveProperty (R083 TTL reaper) ─────────────────────────────
+// ── RemoveProperty (TTL reaper) ──────────────────────────────────
 
 #[test]
 fn doc_merge_remove_property_prop_field() {
@@ -632,7 +632,7 @@ fn doc_merge_remove_property_idempotent() {
     assert_eq!(merged.props.get(&1), Some(&Value::Int(100)));
 }
 
-// ── R099: Extra-delta batching (batch rmpv round-trips) ──────────────────
+// ── Extra-delta batching (batch rmpv round-trips) ────────────────────────
 
 #[test]
 fn doc_merge_multiple_extra_deltas_batched_same_result() {

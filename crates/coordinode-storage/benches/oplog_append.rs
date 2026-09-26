@@ -1,4 +1,4 @@
-//! Benchmark: oplog append throughput and read-range latency (R074).
+//! Benchmark: oplog append throughput and read-range latency.
 //!
 //! Measures:
 //!   1. oplog/append_throughput — entries/sec for sequential append
@@ -35,7 +35,7 @@ fn open_manager(dir: &std::path::Path) -> OplogManager {
     OplogManager::open(dir, 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600).expect("open manager")
 }
 
-// ── Append throughput (R074) ─────────────────────────────────────────────────
+// ── Append throughput ────────────────────────────────────────────────────────
 
 /// Benchmark: sequential append throughput.
 ///
@@ -65,7 +65,7 @@ fn bench_oplog_append_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Read-range latency (R074) ─────────────────────────────────────────────────
+// ── Read-range latency ────────────────────────────────────────────────────────
 
 /// Benchmark: read-range across sealed segments.
 ///

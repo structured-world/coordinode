@@ -41,10 +41,10 @@ parking_lot = { workspace = true }
 # Key sets of the write taps: internal keys, no attacker-chosen hash input.
 rustc-hash = { workspace = true }
 
-# LSM engine — permanent fork (ADR-018), crates.io dependency
+# LSM engine: coordinode-lsm-tree from crates.io
 lsm-tree = { workspace = true }
 
-# Storage internals dependencies (consumed from fjall per ADR-019)
+# Storage internals dependencies (carried over from fjall)
 dashmap = "6.1.0"
 flume = { version = "0.12.0", default-features = false }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
@@ -75,7 +75,7 @@ tempfile = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
-# Storage internal test dependencies (consumed from fjall per ADR-019)
+# Storage internal test dependencies (carried over from fjall)
 nanoid = "0.5"
 test-log = "0.2.18"
 rand = "0.10"

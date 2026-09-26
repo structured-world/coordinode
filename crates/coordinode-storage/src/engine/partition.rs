@@ -44,17 +44,17 @@ pub enum Partition {
     /// Uses `CounterMerge` operator: base i64 + sum of delta operands.
     Counter,
 
-    /// `vec:` — f32 vector truth tier (ADR-033 revised).
+    /// `vec:` — f32 vector truth tier.
     /// Key format: `vec:<label_id>:<property_id>:<node_id>`
     /// Value: dense f32 little-endian bytes (`dim × 4` bytes).
     /// Per-vector source of truth; HNSW in-RAM codecs (RaBitQ default,
     /// optional SQ8 / PolarQuant / PQ) regenerate from here on
-    /// calibration. Phase 1.5 cross-shard rerank fetches f32 directly
+    /// calibration. Cross-shard rerank fetches f32 directly
     /// (matches Qdrant / Weaviate / ES BBQ pattern — no intermediate
     /// quantized disk tier).
     VectorF32,
 
-    /// `registry:` — per-shard consumer-retention registry (ADR-028).
+    /// `registry:` — per-shard consumer-retention registry.
     /// Key format: `registry:<consumer_id>`. Holds `ConsumerRegistration`
     /// records replicated through this shard's Raft group; the minimum
     /// checkpoint over the keyspace is the shard's retention floor.

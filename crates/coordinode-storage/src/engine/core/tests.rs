@@ -63,7 +63,7 @@ fn test_engine() -> (StorageEngine, Option<TempDir>) {
 }
 
 /// `remove_range` deletes exactly the keys in `[start, end)` and leaves keys
-/// outside the range intact — the MVCC range-tombstone path (G096).
+/// outside the range intact — the MVCC range-tombstone path.
 #[test]
 fn remove_range_deletes_only_keys_in_range() {
     let engine = test_engine_memfs();
