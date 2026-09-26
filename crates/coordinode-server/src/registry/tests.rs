@@ -4,7 +4,7 @@ use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
 /// Microseconds per second: the engine window is operator-facing in seconds
-/// and lives in HLC microseconds (ADR-007).
+/// and lives in HLC microseconds.
 const US_PER_SEC: u64 = 1_000_000;
 
 /// Open a fresh single-endpoint engine in a temp directory with the given

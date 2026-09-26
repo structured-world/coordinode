@@ -157,9 +157,9 @@ pub struct ServerConfig {
     pub cdc_poll_interval_ms: Option<NonZeroU64>,
     /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
-    /// Interactive-transaction idle timeout in seconds (ADR-042).
+    /// Interactive-transaction idle timeout in seconds.
     pub interactive_txn_idle_timeout_secs: u64,
-    /// Max buffered (uncommitted) bytes per interactive transaction (ADR-042).
+    /// Max buffered (uncommitted) bytes per interactive transaction.
     pub interactive_txn_max_bytes: u64,
     /// Inter-node gRPC transport zstd compression level (C-zstd numbering:
     /// positive 1..=22 trade speed for ratio). Applied to inter-node wire
@@ -200,11 +200,11 @@ pub struct ServerConfig {
     pub checkpoint_dir: Option<String>,
     /// Number of recent checkpoints to retain; older ones are pruned. Default 3.
     pub checkpoint_keep: usize,
-    // ── AFTER COMMIT trigger dispatch (R192) ─────────────────────────────────
+    // ── AFTER COMMIT trigger dispatch ────────────────────────────────────────
     // Fine tunables: config-file only, no CLI flag. The first three also have a runtime seam
     // (`Database::set_trigger_dispatch_config`) the future `setParameters` admin
     // command drives; `trigger_dispatch_interval_ms` is restart-only.
-    /// AFTER COMMIT trigger cascade-depth cap (the trigger architecture L1). An
+    /// AFTER COMMIT trigger cascade-depth cap (the async side of L1). An
     /// async trigger chain deeper than this is dead-lettered as a cascade
     /// overflow rather than executed. Per-trigger `CASCADE_LIMIT` overrides it.
     /// `None` = 10.
@@ -405,8 +405,8 @@ impl ServerConfig {
         }
     }
 
-    /// Build the runtime-tunable AFTER COMMIT trigger dispatch config (R192)
-    /// from the resolved file settings, applying ADR-026 defaults for unset
+    /// Build the runtime-tunable AFTER COMMIT trigger dispatch config
+    /// from the resolved file settings, applying the built-in defaults for unset
     /// knobs. Applied to the `Database` at startup via
     /// `set_trigger_dispatch_config`; the same setter is the future
     /// `setParameters` seam.

@@ -1256,7 +1256,7 @@ fn proto_to_value_roundtrip() {
     }
 }
 
-// --- Causal consistency (R142) tests ---
+// --- Causal consistency tests ---
 
 /// after_index > 0 with readConcern=LOCAL is rejected with FailedPrecondition.
 ///
@@ -1537,7 +1537,7 @@ async fn causal_after_index_zero_always_valid() {
     }
 }
 
-// ── G088: write-concern validation in causal sessions ─────────────────────
+// ── Write-concern validation in causal sessions ───────────────────────────
 
 /// A causal write that names no write concern is accepted: the default is
 /// majority, which is exactly what a causal session needs. `after_index > 0`

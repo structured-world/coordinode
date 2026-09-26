@@ -176,7 +176,7 @@ fn register_replication_metrics() {
         "Snapshot duration"
     );
 
-    // Proposal pipeline (G036)
+    // Proposal pipeline
     metrics::describe_counter!(
         "coordinode_raft_proposals_total",
         "Proposals by outcome: ok, timeout, not_leader, error"

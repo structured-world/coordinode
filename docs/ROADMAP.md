@@ -57,7 +57,7 @@ These features are implemented, tested, and available today.
 
 **Operations**
 - Built-in query advisor: EXPLAIN SUGGEST with 5 detectors + N+1 pattern detection
-- Prometheus metrics, structured JSON logging, OTLP tracing
+- Prometheus metrics, structured JSON logging
 - Backup/restore (JSON, Cypher, binary formats)
 - Docker image, embedded library mode (`coordinode-embed`)
 

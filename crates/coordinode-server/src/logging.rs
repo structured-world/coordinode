@@ -8,9 +8,8 @@
 //! Log level is controlled via `RUST_LOG` env var (default: `info`).
 //!
 //! # Cluster-ready notes
-//! - Each CE node logs independently.
-//! - W3C traceparent propagation enables distributed tracing across nodes.
-//! - OTLP export configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (Phase 2+).
+//! - Each CE node logs independently; there is no trace export (OTLP) or
+//!   cross-node trace-context propagation.
 
 use tracing_subscriber::{EnvFilter, fmt};
 

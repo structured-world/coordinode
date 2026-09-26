@@ -249,7 +249,7 @@ pub(crate) async fn serve(
     // - Cluster (--peers): multi-node Raft (GrpcNetwork, leader election).
     //   Writes replicated to followers before commit.
     //
-    // `raft_node_shared` provides the read fence (R141), ClusterService
+    // `raft_node_shared` provides the follower-read fence, ClusterService
     // administration, and ensures consistent apply ordering via oracle.
 
     // Common setup: open storage engine + timestamp oracle. The storage
@@ -673,7 +673,7 @@ pub(crate) async fn serve(
         std::time::Duration::from_secs(1),
     );
 
-    // Per-shard consumer-retention registry (ADR-028). Once CDC / backup
+    // Per-shard consumer-retention registry. Once CDC / backup
     // consumers register, it holds older MVCC versions / oplog segments
     // back for them, on top of the engine's own time-travel window (which
     // the engine enforces by itself from `retention_window_secs`). The
@@ -766,11 +766,13 @@ pub(crate) async fn serve(
         });
     }
 
-    // Drive AFTER COMMIT trigger dispatch on the Raft leader (R192,
-    // ADR-026). The event queue (`trigger_pending:`) is Raft-replicated,
-    // so every node sees the same backlog; gating execution on the lease
-    // holder makes each event fire exactly once cluster-wide (the body's
-    // writes have to go through the leader's pipeline anyway). Woken by
+    // Drive AFTER COMMIT trigger dispatch on the Raft leader. The event
+    // queue (`trigger_pending:`) is Raft-replicated, so every node sees the
+    // same backlog; gating execution on the lease holder means only one
+    // node runs the backlog at a time (the body's writes have to go through
+    // the leader's pipeline anyway). A leader change before an event is
+    // acknowledged runs it again on the new leader, so bodies run at least
+    // once. Woken by
     // each applied entry (covers fresh enqueues) and a periodic tick
     // (covers retry backoff timers). The blocking dispatch runs off the
     // async runtime so a long body never stalls consensus.

@@ -32,7 +32,7 @@ pub(crate) struct RegistryTuning {
     pub eviction_interval_ms: Option<u64>,
 }
 
-/// Build the per-shard consumer-retention registry (ADR-028) and start its
+/// Build the per-shard consumer-retention registry and start its
 /// background service, applying any operator overrides from `tuning`.
 ///
 /// Returns the live [`ShardConsumerRegistry`] (cheap to clone — `Arc`-backed —

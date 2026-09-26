@@ -102,7 +102,7 @@ async fn list_edge_types_returns_existing_types() {
     );
 }
 
-// ── R-API1: create_label / create_edge_type now persists schema ──
+// ── create_label / create_edge_type persist the schema ──
 
 /// create_label persists schema and returns version > 0.
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn list_labels_returns_schema_properties() {
     );
 }
 
-// ── R-API4: ComputedPropertyDefinition via gRPC ──────────────────────────
+// ── ComputedPropertyDefinition via gRPC ──────────────────────────────────
 
 /// create_label with TTL ComputedPropertyDefinition → schema persisted with
 /// ComputedSpec::Ttl; TtlReaper deletes an expired node.
@@ -598,7 +598,7 @@ async fn create_label_computed_empty_anchor_field_returns_error() {
     assert!(result.is_err(), "empty anchor_field must be rejected");
 }
 
-// ── R-API5: SchemaMode via gRPC — CREATE/SET enforcement ────────────────
+// ── SchemaMode via gRPC: CREATE/SET enforcement ─────────────────────────
 
 /// create_label with schema_mode=STRICT (1) persists the mode; SET of an
 /// unknown property on a STRICT label is rejected.
@@ -1538,7 +1538,8 @@ async fn on_violation_skip_with_property_path() {
     // (No Document property declared here, so just verify SKIP on all-fail → empty.)
 }
 
-/// Multiple PropertyPath SET-items on the same node in one statement (R-API6 cache).
+/// Multiple PropertyPath SET-items on the same node in one statement (the
+/// per-statement schema-label cache).
 ///
 /// Verifies that N PropertyPath items targeting the same node in a single SET
 /// clause all succeed. This exercises the `schema_label_cache` path: the first
@@ -1597,7 +1598,8 @@ async fn schema_label_cache_multiple_paths_same_node() {
     );
 }
 
-/// Multiple DocFunction SET-items on the same node in one statement (R-API6 cache).
+/// Multiple DocFunction SET-items on the same node in one statement (the
+/// per-statement schema-label cache).
 ///
 /// Verifies that N `doc_push` items targeting the same node's arrays in a single
 /// SET clause all succeed. DocFunction uses the same `schema_label_for_node` cache

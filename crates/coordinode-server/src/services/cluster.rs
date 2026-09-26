@@ -355,7 +355,8 @@ impl ClusterService for ClusterServiceImpl {
 
         // Self-decommission path (this node is the leader and is being decommissioned):
         //   1. Transfer leadership to a peer.
-        //   2. Forward DecommissionNode to the new leader, which executes Phases 0-2.
+        //   2. Forward DecommissionNode to the new leader, which runs the quorum
+        //      gate and the membership remove.
         let is_self = node_id == self.raft_node.node_id();
         let is_leader = self.raft_node.is_leader().await;
 
@@ -365,9 +366,8 @@ impl ClusterService for ClusterServiceImpl {
                 .await;
         }
 
-        // Normal path: Phase 0 (quorum gate) + Phase 2 (membership remove).
-        // Phase 0 is embedded in RaftNode::decommission_node().
-        // The current node must be the Raft leader for change_membership to succeed.
+        // Normal path: quorum gate + membership remove, both inside
+        // RaftNode::decommission_node(). The current node must be the Raft leader for change_membership to succeed.
         let result = self
             .raft_node
             .decommission_node(node_id, pruning, force)
@@ -433,7 +433,7 @@ impl ClusterServiceImpl {
             "DecommissionNode self: transferring leadership before membership remove"
         );
 
-        // Phase 1: Transfer leadership. Returns after 500ms or when transfer is confirmed.
+        // Transfer leadership. Returns after 500ms or when transfer is confirmed.
         self.raft_node
             .transfer_leadership_to(peer_id)
             .await
@@ -446,7 +446,8 @@ impl ClusterServiceImpl {
         );
 
         // Forward DecommissionNode to the new leader (the peer we transferred to).
-        // The peer now executes Phases 0-2 and returns the result.
+        // The peer now runs the quorum gate and the membership remove and
+        // returns the result.
         let endpoint = if peer_addr.starts_with("http://") || peer_addr.starts_with("https://") {
             peer_addr.clone()
         } else {

@@ -437,8 +437,8 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
 /// AFTER COMMIT trigger in a real 2-node Raft cluster: the event the leader
 /// enqueues is replicated, the leader's dispatch executes the body through the
 /// Raft pipeline, and the body's effect (an AuditEntry node) replicates to the
-/// follower. This is the cluster realization of R192 — the queue and the body's
-/// writes both go through consensus, so the trigger fires once cluster-wide.
+/// follower. The queue and the body's writes both go through consensus, so
+/// only the leader runs the body and every node sees its effect.
 #[tokio::test(flavor = "multi_thread")]
 async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
     use coordinode_core::graph::types::Value;

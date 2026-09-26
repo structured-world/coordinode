@@ -104,8 +104,8 @@ async fn create_node_returns_nonzero_id() {
 
 /// create_node populates element_id with a valid Crockford base32 encoding
 /// that roundtrips back to the same node_id. Regression: previously the
-/// field did not exist on proto Node; clients had no canonical identifier
-/// per ADR-022.
+/// field did not exist on proto Node, so clients had no canonical
+/// identifier to pass back.
 #[tokio::test]
 async fn create_node_returns_well_formed_element_id() {
     let (svc, _dir) = test_service();
@@ -551,7 +551,7 @@ async fn traverse_outbound_does_not_traverse_reverse() {
     );
 }
 
-/// Regression G079: traverse must populate labels and properties in returned nodes.
+/// Regression: traverse must populate labels and properties in returned nodes.
 ///
 /// Before fix: `labels: vec![]`, `properties: HashMap::new()` always.
 /// After fix: labels contain the primary label, properties contain the node's properties.
@@ -616,7 +616,7 @@ async fn traverse_returns_labels_and_properties() {
 
     assert_eq!(node.node_id, dst.node_id, "node_id must match");
 
-    // G079 regression: labels must not be empty.
+    // Labels must not be empty.
     assert!(
         !node.labels.is_empty(),
         "traverse must populate labels, got empty vec"
@@ -627,7 +627,7 @@ async fn traverse_returns_labels_and_properties() {
         node.labels
     );
 
-    // G079 regression: properties must not be empty.
+    // Properties must not be empty.
     assert!(
         node.properties.contains_key("color"),
         "traverse must populate properties, got {:?}",

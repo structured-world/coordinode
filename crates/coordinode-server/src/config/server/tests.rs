@@ -357,7 +357,7 @@ fn trigger_dispatch_defaults_when_unset() {
 #[test]
 fn trigger_dispatch_knobs_parse_from_config_file_only() {
     // Config-file keys (no CLI flag) deserialize and resolve into the dispatch
-    // config; unset keys keep ADR-026 defaults.
+    // config; unset keys keep the built-in defaults.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.yaml");
     std::fs::write(

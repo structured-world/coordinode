@@ -690,7 +690,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         let start = std::time::Instant::now();
 
-        // Interactive transaction statement (ADR-042): a non-zero transaction_id
+        // Interactive transaction statement: a non-zero transaction_id
         // runs this statement against the held transaction — reads at its pinned
         // snapshot, writes buffer until CommitTransaction. No per-statement
         // commit and no causal fence (the snapshot was pinned at BEGIN). A zero
@@ -757,8 +757,9 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // Causal session validation: after_index requires readConcern >= MAJORITY.
         //
         // A LOCAL read offers no majority-commit guarantee, so a causal fence on top
-        // of it would be logically unsound. LINEARIZABLE is incompatible per
-        // arch/distribution/consistency.md ("afterClusterTime + linearizable = reject").
+        // of it would be logically unsound. LINEARIZABLE is rejected too: it
+        // already reads the latest committed state, so a causal fence adds
+        // nothing and a request carrying both is a client error.
         if after_idx > 0 {
             match concern {
                 ReadConcern::Local => {
@@ -777,7 +778,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             }
         }
 
-        // Causal session write-concern validation (G088).
+        // Causal session write-concern validation.
         //
         // Writes in a causal session (after_index > 0) MUST use writeConcern >=
         // majority. A sub-majority write (w:1, w:0) may be acknowledged to the

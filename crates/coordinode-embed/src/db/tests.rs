@@ -859,7 +859,6 @@ fn vector_schema_dimension_survives_restart() {
 
 // ─── Bug regression: HNSW not rebuilt for overflow (Flexible-mode) vectors ───
 
-/// After DB restart, HNSW must be rebuilt from vectors stored in `record.extra`
 /// Schema with dimensions=0 (the value gRPC sets via proto_type_to_property_type(7)):
 /// writing a vector must NOT fail on type/dimension mismatch.
 ///
@@ -900,6 +899,7 @@ fn vector_write_with_grpc_schema_zero_dimensions_does_not_error() {
     );
 }
 
+/// After DB restart, HNSW must be rebuilt from vectors stored in `record.extra`
 /// (overflow props in Flexible/Validated schema mode).
 ///
 /// Bug: `load_vector_indexes` only checks `record.props.get(&field_id)`.

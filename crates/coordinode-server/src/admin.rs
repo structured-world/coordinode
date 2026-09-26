@@ -393,7 +393,8 @@ fn decompressing_reader<R: std::io::Read + 'static>(
 }
 
 /// Execute `coordinode admin node decommission` — connect to a running cluster and
-/// gracefully decommission a node via the Phase 0-2 protocol.
+/// gracefully decommission a node (quorum check, leadership transfer,
+/// membership removal).
 ///
 /// Steps:
 /// 1. Connect to any cluster member via gRPC.

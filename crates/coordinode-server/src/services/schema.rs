@@ -30,8 +30,9 @@ fn proto_type_to_property_type(t: i32) -> PropertyType {
         4 => PropertyType::Bool,
         5 => PropertyType::Binary,
         6 => PropertyType::Timestamp,
-        // VECTOR without explicit dimensions — schema stores structural intent;
-        // HNSW index creation (R-API3) will fill dimensions from CREATE VECTOR INDEX.
+        // The proto definition carries no dimensions, so the schema records 0
+        // ("unset"): writes accept any vector length, and the vector index
+        // takes its dimensions from CREATE VECTOR INDEX.
         7 => PropertyType::Vector {
             dimensions: 0,
             metric: VectorMetric::Cosine,
