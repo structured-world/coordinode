@@ -262,3 +262,22 @@ fn extract_http_headers() {
     assert_eq!(ctx.function, "fetchData");
     assert_eq!(ctx.app, "frontend");
 }
+
+/// A client built on Windows reports `src\api\feed.rs`; the same call site
+/// from a Linux build reports `src/api/feed.rs`. Both are one source, so the
+/// separator is normalised and the two count against the same entry.
+#[test]
+fn a_windows_path_is_the_same_source_as_its_unix_form() {
+    let mut map = HashMap::new();
+    map.insert("file".to_string(), r"src\api\feed.rs".to_string());
+    let get = |key: &str| -> Option<String> { map.get(key).cloned() };
+    let windows = extract_from_map(&get, "file", "line", "func", "app", "ver").expect("extract");
+    assert_eq!(windows.file, "src/api/feed.rs");
+
+    let mut tracker = SourceTracker::new();
+    tracker.record(&windows);
+    tracker.record(&ctx("src/api/feed.rs", 0, ""));
+    let snaps = tracker.snapshot();
+    assert_eq!(snaps.len(), 1, "one call site, whichever OS reported it");
+    assert_eq!(snaps[0].call_count, 2);
+}

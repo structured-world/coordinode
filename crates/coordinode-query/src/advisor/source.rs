@@ -56,9 +56,14 @@ pub fn extract_from_map(
     app_key: &str,
     version_key: &str,
 ) -> Option<SourceContext> {
-    let file = get(file_key)?;
+    let mut file = get(file_key)?;
     if file.is_empty() {
         return None;
+    }
+    // One call site reads `src\x.rs` from a Windows build and `src/x.rs`
+    // from any other; a single separator keeps them one source.
+    if file.contains('\\') {
+        file = file.replace('\\', "/");
     }
 
     let line = get(line_key)

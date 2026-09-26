@@ -103,6 +103,18 @@ const ALLOWED: &[(&str, usize)] = &[
     ("src/index/registry.rs", 0),
 ];
 
+/// `path` relative to the crate root, joined with `/` whatever the host
+/// separator: `SCAN_FILES` is written that way, and a Windows path would
+/// otherwise never match it.
+fn crate_relative(path: &Path) -> String {
+    path.strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[test]
 fn encoder_lockdown_no_raw_encoder_growth() {
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -183,11 +195,7 @@ fn encoder_lockdown_no_new_files_with_raw_encoders() {
         {
             continue;
         }
-        let rel = path
-            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let rel = crate_relative(path);
         let content = fs::read_to_string(path).unwrap_or_default();
         let uses_raw = RAW_ENCODER_NEEDLES.iter().any(|n| content.contains(n));
         if uses_raw && !SCAN_FILES.iter().any(|s| rel.ends_with(s)) {
@@ -237,11 +245,7 @@ fn encoder_lockdown_tests_dir_is_clean() {
         if path.file_name().is_some_and(|n| n == "encoder_lockdown.rs") {
             continue;
         }
-        let rel = path
-            .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let rel = crate_relative(path);
         let content = fs::read_to_string(path).unwrap_or_default();
         for needle in TEST_ENCODER_NEEDLES {
             if content.contains(needle) {
