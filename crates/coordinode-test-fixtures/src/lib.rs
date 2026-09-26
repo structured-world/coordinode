@@ -301,46 +301,62 @@ impl Default for PowerRig {
     }
 }
 
-/// Ports this process has already handed out.
+/// Ports handed out are drawn from here: below the Linux ephemeral range
+/// (32768-60999) and the IANA dynamic range macOS and Windows use
+/// (49152-65535), so the kernel never gives one of them to an outgoing
+/// connection.
+const PORT_BASE: u16 = 20_000;
+const PORT_SPAN: u16 = 12_000;
+
+/// How far into [`PORT_SPAN`] this process has walked.
 ///
 /// Deliberately global: the property being enforced is that no port is
 /// returned twice for the lifetime of the process, and a caller that had to
-/// thread state through to get that could simply forget to. Contention is
-/// nil (a handful of allocations per test), so a plain std mutex is enough
-/// and keeps this crate free of another dependency.
-static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+/// thread state through to get that could simply forget to.
+static NEXT_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Reserve a loopback port for a test that needs to know an address before
 /// the code under test binds it.
 ///
-/// Binding to `:0` asks the kernel for a free port, but the probe has to be
-/// closed before the port can be handed over, and a closed probe leaves the
-/// port free for the next one to be given the same answer. A test that
-/// allocates several addresses up front could therefore hand two nodes the
-/// same port, and the second to bind it dies with `EADDRINUSE`. Remembering
-/// what has been handed out and asking again on a repeat removes that.
+/// A port from `:0` is an ephemeral one, and the kernel hands the same range
+/// to every outgoing connection on the machine: under a parallel test run a
+/// neighbouring process's client socket can take the port between this call
+/// and the bind, which then fails with `EADDRINUSE`. The ports here come from
+/// a range the kernel never assigns on its own. Each process starts at an
+/// offset derived from its id and walks forward, so a process never repeats
+/// itself and concurrent processes start far apart; a probe bind skips any
+/// port something already holds.
 ///
-/// What remains is a genuine race with the rest of the machine: the port is
-/// free between this call and the bind, so bind as early as the code under
-/// test allows.
+/// The port is still only free, not held, until the code under test binds
+/// it, so bind as early as that code allows.
 pub fn alloc_port() -> u16 {
+    alloc_port_on(std::net::Ipv4Addr::LOCALHOST.into())
+}
+
+/// [`alloc_port`] for a server that binds `ip` rather than `127.0.0.1`, such
+/// as `[::1]`: the probe has to bind the address the server will.
+pub fn alloc_port_on(ip: std::net::IpAddr) -> u16 {
     // Generous relative to the number of ports a test asks for, and small
-    // enough that a kernel with nothing left to give fails the test rather
+    // enough that a machine with nothing left to give fails the test rather
     // than hanging it.
-    const ATTEMPTS: usize = 64;
+    const ATTEMPTS: u32 = 256;
+    // Coprime with the span, so consecutive process ids land far apart.
+    const PID_STRIDE: u32 = 7_919;
 
+    let start = std::process::id().wrapping_mul(PID_STRIDE);
     for _ in 0..ATTEMPTS {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 for port alloc");
-        let port = probe.local_addr().expect("local_addr").port();
-        drop(probe);
-
-        let mut handed_out = HANDED_OUT.lock().expect("port registry poisoned");
-        if !handed_out.contains(&port) {
-            handed_out.push(port);
+        let step = NEXT_OFFSET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // The remainder is below PORT_SPAN, so the sum stays below 32000.
+        let offset = start.wrapping_add(step) % u32::from(PORT_SPAN);
+        let port = PORT_BASE + u16::try_from(offset).expect("offset below the span");
+        if std::net::TcpListener::bind((ip, port)).is_ok() {
             return port;
         }
     }
-    panic!("no unused loopback port after {ATTEMPTS} attempts");
+    panic!(
+        "no free port on {ip} in {PORT_BASE}..{} after {ATTEMPTS} attempts",
+        PORT_BASE + PORT_SPAN
+    );
 }
 
 /// Reserve `N` distinct loopback ports at once, for tests that read better

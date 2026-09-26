@@ -40,18 +40,12 @@ use coordinode_raft::cluster::{RaftNode, nemesis};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_test_fixtures::alloc_port;
 
 /// Hard per-test timeout — a hung election/replication fails fast, never spins.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Cluster harness (self-contained; mirrors raft_cluster.rs) ───────────────
-
-fn alloc_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
 
 struct TestNode {
     node: RaftNode,

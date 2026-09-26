@@ -854,17 +854,24 @@ fn retained_history_on_a_memory_engine_reads_memfs_folders() {
 /// A tables folder the process cannot list is an error, not a zero: a zero
 /// would read as "no history" on an endpoint whose history is simply
 /// unreadable, and the capacity refresh would publish it as such.
+///
+/// The folder is made unlistable by putting a plain file in its place, not
+/// by removing its permissions: a process running as root lists a mode-000
+/// directory regardless, so a permission-based setup proves nothing there.
 #[cfg(unix)]
 #[test]
 fn retained_history_reports_an_unreadable_tables_folder() {
-    use std::os::unix::fs::PermissionsExt;
-
-    /// Restores the folder's permissions on drop, so a failed assertion
-    /// does not leave an unreadable directory behind in the tempdir.
-    struct Restore(std::path::PathBuf);
+    /// Puts the real folder back on drop, so the engine closes over the
+    /// tree it opened even when an assertion fails. The engine keeps its
+    /// table files open, and on unix an open file survives the rename.
+    struct Restore {
+        tables: std::path::PathBuf,
+        aside: std::path::PathBuf,
+    }
     impl Drop for Restore {
         fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_file(&self.tables);
+            let _ = std::fs::rename(&self.aside, &self.tables);
         }
     }
 
@@ -883,8 +890,13 @@ fn retained_history_reports_an_unreadable_tables_folder() {
     flush(&engine);
 
     let tables = dir.path().join(Partition::Node.name()).join("tables");
-    let _restore = Restore(tables.clone());
-    std::fs::set_permissions(&tables, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let aside = dir.path().join(Partition::Node.name()).join("tables.aside");
+    std::fs::rename(&tables, &aside).expect("move the folder aside");
+    let _restore = Restore {
+        tables: tables.clone(),
+        aside,
+    };
+    std::fs::write(&tables, b"").expect("a file where the folder was");
 
     let err = engine
         .retained_history(Partition::Node)

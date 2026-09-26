@@ -473,8 +473,6 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
         let _ = base;
 
         // The same directory, now the first member of a group.
-        let p1 = alloc_port();
-        let p2 = alloc_port();
         let e1 = Arc::new(
             StorageEngine::open_with_oracle(&config(dir1.path()), Arc::new(TimestampOracle::new()))
                 .expect("reopen the embedded directory under the replicated build"),
@@ -483,6 +481,7 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
             e1.holds_user_data().expect("read"),
             "the embedded run must have left data behind"
         );
+        let p1 = alloc_port();
         let n1 = RaftNode::open_cluster(
             1,
             Arc::clone(&e1),
@@ -497,6 +496,7 @@ async fn an_embedded_directory_opens_as_the_first_member_of_a_group() {
             StorageEngine::open_with_oracle(&config(dir2.path()), Arc::new(TimestampOracle::new()))
                 .expect("open the empty member"),
         );
+        let p2 = alloc_port();
         let n2 = RaftNode::open_joining(
             2,
             Arc::clone(&e2),

@@ -7,7 +7,6 @@
 // Test harness: panic!/expect!/unwrap! are appropriate for infrastructure failures.
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -415,8 +414,12 @@ fn force_reap(child: &mut Child) {
 
 /// Return the path to the `coordinode` binary.
 ///
-/// Uses `COORDINODE_BIN` env var first (CI / explicit override), then falls
-/// back to the Cargo debug build in the workspace target directory.
+/// Uses `COORDINODE_BIN` env var first (CI / explicit override), then the
+/// build next to this test binary, then the release build of the same target
+/// directory.
+///
+/// The test binary lives at `<target>/<profile>/deps/<test>`, so its profile
+/// directory holds the server build whatever `CARGO_TARGET_DIR` points at.
 ///
 /// Exposed `pub` so integration tests can directly `Command::new(binary_path())`
 /// for non-standard startup scenarios (e.g. checking `--mode=compute` is rejected).
@@ -425,21 +428,22 @@ pub fn binary_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    // Walk up from this crate's manifest dir to the workspace root.
-    // tests/integration/ → tests/ → workspace root (2 levels up).
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest
+    let name = format!("coordinode{}", std::env::consts::EXE_SUFFIX);
+    let exe = std::env::current_exe().expect("test binary path");
+    let profile = exe
         .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
+        .and_then(|deps| deps.parent())
+        .expect("test binary sits in <target>/<profile>/deps");
 
-    let bin = workspace.join("target/debug/coordinode");
+    let bin = profile.join(&name);
     if bin.exists() {
         return bin;
     }
-    let release = workspace.join("target/release/coordinode");
-    if release.exists() {
-        return release;
+    if let Some(target) = profile.parent() {
+        let release = target.join("release").join(&name);
+        if release.exists() {
+            return release;
+        }
     }
 
     panic!(
@@ -516,14 +520,10 @@ fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: Pat
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
 }
 
-/// Bind port 0 to get a free ephemeral port from the OS.
+/// A free port on `[::1]`, where the spawned server listens.
 ///
 /// Exposed `pub` so multi-node tests can pre-allocate every member's port
 /// before spawning (each member's `--peers` needs the others' ports up front).
 pub fn free_port() -> u16 {
-    // Bind to [::1] with port 0 — the OS assigns a free port.
-    // We immediately close the listener so coordinode can bind the same port.
-    // Tiny race window, but acceptable for local integration tests.
-    let listener = TcpListener::bind("[::1]:0").expect("bind [::1]:0");
-    listener.local_addr().expect("local addr").port()
+    coordinode_test_fixtures::alloc_port_on(std::net::Ipv6Addr::LOCALHOST.into())
 }

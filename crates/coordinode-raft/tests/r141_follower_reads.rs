@@ -27,16 +27,10 @@ use coordinode_raft::read_fence::{
 };
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_test_fixtures::alloc_port;
 
 /// Hard timeout for multi-node tests that require cluster formation.
 const CLUSTER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn alloc_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0 for port alloc");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
 
 /// Bootstrap a 3-node cluster. Returns (leader_node, follower_node, dirs).
 /// Caller must keep dirs alive for the duration of the test.

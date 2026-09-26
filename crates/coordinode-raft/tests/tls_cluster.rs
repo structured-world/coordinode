@@ -26,18 +26,11 @@ use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_test_fixtures::alloc_port;
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Allocate a free localhost port (bind-to-zero, then release).
-fn alloc_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
 
 /// Generate an in-memory CA and one node certificate (PEM) signed by it. The
 /// node cert carries the `127.0.0.1` IP SAN and both ServerAuth + ClientAuth

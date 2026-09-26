@@ -982,6 +982,7 @@ name = "coordinode-integration"
 version = "0.6.0"
 dependencies = [
  "coordinode-client",
+ "coordinode-test-fixtures",
  "coordinode-workspace-hack",
  "prost",
  "rand 0.10.3",

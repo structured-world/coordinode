@@ -213,3 +213,26 @@ fn grouped_allocation_yields_distinct_ports() {
     assert_ne!(b, c);
     assert_ne!(a, c);
 }
+
+/// A handed-out port lies below every kernel's ephemeral range, so no
+/// outgoing connection from a neighbouring test process can take it
+/// before the server binds. A port from `:0` fails this on every OS.
+#[test]
+fn allocated_ports_lie_outside_the_ephemeral_range() {
+    for port in (0..64).map(|_| alloc_port()) {
+        assert!(
+            (20_000..32_000).contains(&port),
+            "{port} is in a range the kernel assigns to outgoing connections"
+        );
+    }
+}
+
+/// The IPv6 loopback variant probes the address the integration harness's
+/// servers bind, and keeps the same range.
+#[test]
+fn an_ipv6_loopback_port_is_free_on_that_address() {
+    let ip = std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+    let port = crate::alloc_port_on(ip);
+    assert!((20_000..32_000).contains(&port));
+    std::net::TcpListener::bind((ip, port)).expect("the port is free on [::1]");
+}
