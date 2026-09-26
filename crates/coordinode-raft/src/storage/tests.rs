@@ -284,6 +284,29 @@ fn a_store_that_applied_entries_without_coverage_is_refused() {
     );
 }
 
+/// Readers waiting on the applied watermark (causal reads with an
+/// `after_index`, the change stream's bound) must see an installed snapshot
+/// at once: on an idle cluster no later apply would ever move it.
+#[tokio::test]
+async fn installing_a_snapshot_publishes_its_applied_index() {
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(engine).expect("open state machine");
+    let mut applied = sm.subscribe_applied();
+    assert_eq!(*applied.borrow_and_update(), 0);
+
+    let meta = SnapshotMeta {
+        last_log_id: Some(log_id(2, 20)),
+        last_membership: openraft::StoredMembership::default(),
+    };
+    sm.install_snapshot(&meta, std::io::Cursor::new(Vec::new()))
+        .await
+        .unwrap();
+
+    assert!(applied.has_changed().unwrap(), "waiters are woken");
+    assert_eq!(*applied.borrow(), 20);
+    assert_eq!(sm.applied_index(), 20);
+}
+
 #[tokio::test]
 async fn installing_a_snapshot_rebinds_every_tree_to_it() {
     // After the install every tree holds exactly the snapshot, so the

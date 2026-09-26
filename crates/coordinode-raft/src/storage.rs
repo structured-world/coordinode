@@ -1657,6 +1657,18 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             .last_applied
             .lock()
             .map_err(|e| io::Error::other(format!("mutex poisoned: {e}")))? = meta.last_log_id;
+        // The snapshot's entries are applied now; waiters on the watermark
+        // must not have to wait for a later entry that an idle cluster never
+        // sends.
+        if let Some(log_id) = meta.last_log_id {
+            self.applied_tx.send_if_modified(|applied| {
+                let raised = log_id.index > *applied;
+                if raised {
+                    *applied = log_id.index;
+                }
+                raised
+            });
+        }
 
         *self
             .last_membership
