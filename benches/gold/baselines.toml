@@ -163,10 +163,9 @@ source = "Databricks SpatialBench analysis (Jan 2026)"
 # Document (YCSB A/B/C/F — networked client→server)
 # ─────────────────────────────────────────────────────────────
 #
-# Per methodology.md principle #7, every competitor is benched in
-# exactly TWO codec modes: **zstd** (codec-fair) and **none**
-# (CPU-only baseline). Snappy / LZ4 / pglz are deliberately
-# excluded — see methodology.md §"Codec choice" for the reasoning.
+# Every competitor is benched in exactly TWO codec modes: **zstd**
+# (codec-fair) and **none** (CPU-only baseline). Snappy / LZ4 / pglz
+# are deliberately excluded: they would compare codecs, not engines.
 # Snappy baselines from upstream publications are kept as
 # `notes`-only context, NOT as comparable rows.
 
