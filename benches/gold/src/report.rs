@@ -1,5 +1,5 @@
-//! Shared report-rendering helpers — print the structured per-
-//! modality + composite blocks defined in `arch/benchmarks/methodology.md`.
+//! Shared report-rendering helpers: print the structured per-modality
+//! and composite blocks.
 
 /// One row in a per-modality table.
 pub struct Row {

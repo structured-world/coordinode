@@ -1,6 +1,6 @@
 //! YCSB gold-bench binary. Runs workload A + C against a tempdir
-//! `StorageEngine` and renders the per-modality YCSB report from
-//! `arch/benchmarks/methodology.md`. Pass `--standard` to use the
+//! `StorageEngine` and renders the per-modality YCSB report. Pass
+//! `--standard` to use the
 //! published-baseline preset (1 M records / 1 M ops) instead of the
 //! default CI preset.
 
@@ -79,11 +79,9 @@ fn print_report(a: &WorkloadResult, c: &WorkloadResult, baselines: &Baselines) {
          CoordiNode is running embedded in-process here; MongoDB's row is\n\
          a placeholder (the value column reads \"-\" until the harness\n\
          actually runs Mongo via mongoperf / YCSB / networked driver in\n\
-         BOTH zstd and uncompressed modes per methodology §Codec choice).\n\
-         The ratios below are NOT publishable marketing numbers — they\n\
-         measure engine micro-perf, not buyer-comparable workloads.\n\
-         For honest comparisons see the v0.4-alpha milestone gate in\n\
-         arch/benchmarks/methodology.md.\n",
+         BOTH zstd and uncompressed modes).\n\
+         The ratios below are NOT publishable marketing numbers: they\n\
+         measure engine micro-perf, not buyer-comparable workloads.\n",
     );
 
     println!("\nDocument (YCSB Workload A: 50% read / 50% update)");

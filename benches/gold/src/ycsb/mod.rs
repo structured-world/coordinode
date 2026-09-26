@@ -16,7 +16,7 @@
 //! Each workload run returns a [`WorkloadResult`] with throughput
 //! and tail-latency metrics. The `run` binary feeds these to the
 //! shared report layer which renders the structured per-modality
-//! report from `arch/benchmarks/methodology.md`.
+//! report.
 //!
 //! ## Scope of this initial cut
 //!

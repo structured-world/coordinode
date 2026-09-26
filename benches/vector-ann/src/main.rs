@@ -148,7 +148,7 @@ struct Args {
 
     /// RaBitQ bit-width when `--quantization=rabitq`. `1` is the
     /// classic SIGMOD 2024 sign-bit popcount kernel; `2..=4` selects
-    /// Extended-RaBitQ (R862) which trades RAM for recall — 2-bit
+    /// Extended-RaBitQ, which trades RAM for recall: 2-bit
     /// typically reaches the same recall as 1-bit + heavy rerank in
     /// 2× the code size and no rerank.
     ///
@@ -498,32 +498,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!(
                 "--quantization: expected `none`, `sq8`, or `rabitq`, got `{other}`"
             )
-            .into())
+            .into());
         }
     };
-    let config = HnswConfig {
-        m: args.m,
-        m_max0,
-        ef_construction: args.ef_construction,
-        ef_search: sweep[0],
-        metric,
-        max_dimensions: d as u32,
-        quantization,
-        alpha_pruning: args.alpha_pruning,
-        rerank_oversample_factor: args.rerank_oversample,
-        rerank_mode: match args.rerank_mode.as_str() {
-            "inline" => coordinode_vector::hnsw::RerankMode::Inline,
-            "end-of-search" => coordinode_vector::hnsw::RerankMode::EndOfSearch,
-            "none" => coordinode_vector::hnsw::RerankMode::None,
-            other => {
-                return Err(format!(
+    let config =
+        HnswConfig {
+            m: args.m,
+            m_max0,
+            ef_construction: args.ef_construction,
+            ef_search: sweep[0],
+            metric,
+            max_dimensions: d as u32,
+            quantization,
+            alpha_pruning: args.alpha_pruning,
+            rerank_oversample_factor: args.rerank_oversample,
+            rerank_mode: match args.rerank_mode.as_str() {
+                "inline" => coordinode_vector::hnsw::RerankMode::Inline,
+                "end-of-search" => coordinode_vector::hnsw::RerankMode::EndOfSearch,
+                "none" => coordinode_vector::hnsw::RerankMode::None,
+                other => return Err(format!(
                     "--rerank-mode: expected `inline`, `end-of-search`, or `none`, got `{other}`"
                 )
-                .into())
-            }
-        },
-        ..Default::default()
-    };
+                .into()),
+            },
+            ..Default::default()
+        };
     // Build the shard fleet. `n_shards=1` collapses to a single index
     // (today's shape, bit-identical control path). `n_shards>1`
     // partitions the train set by `id % N` so each shard owns roughly
@@ -609,7 +608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
     info!(n_shards, routing = ?args.shard_routing, "building shard fleet");
-    // Chunked `insert_batch` (R858b). The apply-phase backfill bug that
+    // Chunked `insert_batch`. The apply-phase backfill bug that
     // collapsed recall at chunked scale was fixed by folding backfilled
     // candidates into the prune selection; 1k chunks match the API's
     // documented safe-batch upper bound.

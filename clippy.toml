@@ -1,4 +1,4 @@
-# Layer-5 storage-partition guard (ADR-041).
+# Layer-5 storage-partition guard.
 #
 # The query layer (coordinode-query) must reach storage only through the
 # Layer-4 modality stores (NodeStore, EdgeStore, IndexStore, SchemaStore, ...).
@@ -8,5 +8,5 @@
 # `#![deny]`), so the storage / modality crates that legitimately name
 # partitions are unaffected.
 disallowed-types = [
-    { path = "coordinode_storage::engine::partition::Partition", reason = "Layer 5 (coordinode-query) reaches storage only through Layer-4 modality stores (ADR-041); name partitions inside the stores, not the query layer" },
+    { path = "coordinode_storage::engine::partition::Partition", reason = "Layer 5 (coordinode-query) reaches storage only through Layer-4 modality stores; name partitions inside the stores, not the query layer" },
 ]

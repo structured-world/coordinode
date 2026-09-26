@@ -40,8 +40,7 @@ authors = ["Dmitry Prudnikov <mail@polaz.com>"]
 publish = false
 
 [workspace.dependencies]
-# Storage — coordinode-lsm-tree as crates.io dep (ADR-018), fjall consumed (ADR-019)
-# coordinode-lsm-tree remains as external crates.io dependency (ADR-018)
+# Storage: coordinode-lsm-tree from crates.io, the sole LSM engine.
 # The floor is the oldest release the code actually needs (MergeOperator::
 # composes_operands, and manifests with more than 255 runs per level), not the
 # major: a consumer with its own lockfile otherwise keeps an older 5.x that
@@ -54,7 +53,7 @@ openraft = { version = "0.10.0-alpha.25", features = ["serde"] }
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy
 # default feature that pulls the C `zstd` (zstd-sys) crate. FTS index compression
-# uses lz4 instead — keeping the whole stack pure-Rust (ADR-013, no FFI) and
+# uses lz4 instead, keeping the whole stack pure Rust (no FFI) and
 # letting the musl release build run without the `-D_FORTIFY_SOURCE=0` workaround.
 tantivy = { version = "0.26", default-features = false, features = [
     "mmap",
@@ -176,7 +175,8 @@ expect_used = "warn"
 panic = "warn"
 # Off by default workspace-wide; coordinode-query opts in via a crate-level
 # `#![deny(clippy::disallowed_types)]` to forbid naming the storage partition
-# enum in the query layer (ADR-041). The clippy.toml that lists the type is
+# enum in the query layer, which reaches storage only through the modality
+# stores. The clippy.toml that lists the type is
 # global, so this keeps the lint inert in the storage / modality / embed
 # crates that legitimately name partitions.
 disallowed_types = "allow"

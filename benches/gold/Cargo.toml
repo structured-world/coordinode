@@ -4,7 +4,7 @@
 
 [package]
 name = "coordinode-gold-bench"
-description = "Gold benchmark suite (L2 from arch/benchmarks/methodology.md): YCSB, LDBC SNB, ann-benchmarks, TSBS, SpatialBench against published competitor baselines. Outputs the structured per-modality + composite score report."
+description = "Gold benchmark suite: YCSB, LDBC SNB, ann-benchmarks, TSBS, SpatialBench against published competitor baselines. Outputs the structured per-modality + composite score report."
 version = "0.4.3"
 edition = "2021"
 rust-version = "1.90"
@@ -40,7 +40,7 @@ tempfile = "3"
 # A standalone workspace does not inherit the production workspace's lint
 # table, so the one entry that matters here is repeated: the repo-wide
 # clippy.toml lists the storage partition enum as a disallowed type for the
-# query layer (ADR-041), and this harness drives the storage engine's KV path
+# query layer, and this harness drives the storage engine's KV path
 # directly, where naming a partition is the point.
 [lints.clippy]
 disallowed_types = "allow"

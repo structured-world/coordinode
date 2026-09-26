@@ -1,5 +1,5 @@
-//! Gold benchmark suite — Level 2 from
-//! `arch/benchmarks/methodology.md`. Hosts the YCSB, LDBC, ann-
+//! Gold benchmark suite: standard workloads against published competitor
+//! baselines. Hosts the YCSB, LDBC, ann-
 //! benchmarks etc. harness code; the binaries in
 //! `src/{ycsb,report}/main.rs` are thin drivers over the modules
 //! here.

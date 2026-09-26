@@ -169,7 +169,7 @@ mod tests {
                 allowed,
                 "non-multi-model competitor `{name}` (root `{engine_root}`) in \
                  YCSB workload_c — only mongodb_8 / surrealdb_3_0 / arangodb_3_12 \
-                 (per any codec) belong here per arch/benchmarks/methodology.md",
+                 (per any codec) belong here: YCSB compares multi-model engines only",
             );
         }
     }

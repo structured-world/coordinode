@@ -421,7 +421,7 @@ jobs:
               done
             fi
 
-            # Gap #2 (E+C) RerankMode + oversample sweep on glove RaBitQ.
+            # RerankMode + oversample sweep on glove RaBitQ.
             # Manual-only: this matrix is for marketing recall/QPS curves,
             # not regression detection, so it's gated behind FULL_SWEEP.
             if [ "$FULL_SWEEP" != "true" ]; then

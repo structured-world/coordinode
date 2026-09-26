@@ -7,11 +7,11 @@ ignore = [
     "RUSTSEC-2026-0173",
     # rsa "Marvin Attack" timing sidechannel. Reached via jsonwebtoken's pure-Rust
     # rust_crypto backend (RSA JWT verify). No fixed rsa release exists; we keep
-    # rust_crypto over the aws_lc_rs C-FFI backend (ADR-013); JWT verify is a
+    # rust_crypto over the aws_lc_rs C-FFI backend (no FFI anywhere); JWT verify is a
     # public-key op, so the private-key timing leak is not exploitable here.
     "RUSTSEC-2023-0071",
     # rustls-webpki 0.102.x CRL / name-constraint advisories. Pulled transitively
-    # by rustls-rustcrypto 0.0.2-alpha (pure-Rust crypto provider, ADR-013 no-FFI),
+    # by rustls-rustcrypto 0.0.2-alpha (pure-Rust crypto provider, no FFI),
     # which pins ^0.102 and has no newer published release, so an update cannot
     # resolve them. Inter-node mTLS uses a private CA with directly-issued node
     # certs — we parse no CRLs and rely on no name constraints, so these paths are

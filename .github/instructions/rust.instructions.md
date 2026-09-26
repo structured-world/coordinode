@@ -27,7 +27,7 @@ Focus review effort on real bugs, not cosmetics. Stop after finding issues in hi
 - Partial write exposure: readers seeing data that is still being written
 - fsync ordering: metadata (WAL, Raft log) must be durable before the operation it describes is considered committed
 - Hardcoded secrets, credentials, or private URLs
-- Information leaks: internal architecture, planning artifacts, or roadmap IDs in error messages
+- Information leaks: internal task or decision numbers, stage labels, paths to internal architecture documents, or local tool instruction files anywhere in code, comments, test names, error messages or docs
 - Panic paths: any `unwrap()` on storage/network I/O (`#[deny(clippy::unwrap_used)]`)
 
 ### Tier 3 — API Design and Robustness (flag if clear improvement)
@@ -70,7 +70,7 @@ These are not actionable review findings. Do not raise them:
 - No `unwrap()` / `expect()` on I/O paths — use `?` propagation
 - `expect()` is acceptable for programmer invariants (e.g., lock poisoning, `const` construction) with reason
 - Code must pass `cargo clippy --all-features -- -D warnings`
-- Architecture reference comments (e.g., "see arch/core/storage-engine.md") are documentation, not noise — preserve them
+- A comment states the rule or the reason itself; a comment that points at an internal document or names an internal task number instead is a leak (Tier 2)
 
 ## Testing Standards
 
@@ -83,7 +83,7 @@ These are not actionable review findings. Do not raise them:
 
 ## CoordiNode-Specific Rules
 
-- No C/C++ FFI in CE application code (ADR-013). Note: zstd compression dependency uses C FFI via zstd-sys until structured-zstd migration
+- No C/C++ FFI in CE application code
 - No `Box<dyn Any>` — use proper typing (enums or generics)
 - Storage internals (LSM handles, column families) must not leak above `coordinode-storage`
 - No crate may depend on `coordinode-server`

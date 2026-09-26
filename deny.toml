@@ -37,12 +37,12 @@ ignore = [
     # verification in the REST proxy). No fixed `rsa` release exists (latest is
     # 0.10.0-rc; the advisory lists patched: []). We deliberately keep the
     # `rust_crypto` backend over jsonwebtoken's `aws_lc_rs` backend, which would
-    # reintroduce a C/asm dependency (ADR-013: pure-Rust, no FFI). JWT verify is a
+    # reintroduce a C/asm dependency (the stack is pure Rust, no FFI). JWT verify is a
     # public-key operation, so the private-key timing leak is not exploitable here.
     # Revisit once RustCrypto ships a constant-time `rsa` stable.
     "RUSTSEC-2023-0071",
     # rustls-webpki 0.102.x CRL / name-constraint advisories. Pulled transitively
-    # by rustls-rustcrypto 0.0.2-alpha (pure-Rust crypto provider, ADR-013 no-FFI),
+    # by rustls-rustcrypto 0.0.2-alpha (pure-Rust crypto provider, no FFI),
     # which pins ^0.102 and has no newer published release, so an update cannot
     # resolve them. Inter-node mTLS uses a private CA with directly-issued node
     # certs — we parse no CRLs and rely on no name constraints, so these code

@@ -56,7 +56,7 @@ sweep = [
 ]
 
 [[coordinode.glove_100_angular]]
-sha = "45b87bf"  # R863 default α=1.0 = no-op (== 8ef4ea2 == 14ec191 modulo run noise)
+sha = "45b87bf"  # alpha pruning default α=1.0 = no-op (== 8ef4ea2 == 14ec191 modulo run noise)
 codec = "rabitq-1bit"
 dataset = "glove-100-angular"
 dataset_n_train = 1_183_514
@@ -65,7 +65,7 @@ k = 10
 m = 16
 m_max0 = 32
 ef_construction = 200
-alpha_pruning = 1.0       # R863 RobustPrune disabled (default)
+alpha_pruning = 1.0       # RobustPrune disabled (default)
 build_threads = 4
 search_threads = 1
 build_secs = 305
@@ -91,7 +91,7 @@ m_max0 = 32
 ef_construction = 200
 alpha_pruning = 1.0
 rerank_mode = "end-of-search"
-rerank_oversample_factor = 2.0   # ← GAP #2 BREAKTHROUGH — qdrant parity row
+rerank_oversample_factor = 2.0   # ← qdrant parity row
 build_threads = 4
 search_threads = 1
 build_secs = 505
@@ -105,7 +105,7 @@ sweep = [
   { ef = 800, recall_at_10 = 0.9451, qps =  240.79 },   # ← CROSSES recall 0.95, matches qdrant 246
 ]
 notes = """
-GAP #2 BREAKTHROUGH ROW. End-of-search + oversample=2.0 at ef=800
+QDRANT PARITY ROW. End-of-search + oversample=2.0 at ef=800
 hits recall 0.9451 with 240.79 QPS — within 2% of qdrant's 246 QPS
 at ef=400 / recall 0.9577. The matched-recall, matched-thread
 comparison is essentially a tie:
@@ -117,19 +117,18 @@ comparison is essentially a tie:
   pgvector   f32                 ef= 800:  104 QPS @ recall 0.9535
 
 CoordiNode jumps from 4th place (139 QPS, behind qdrant and ahead of
-pgvector) to tied-2nd with qdrant — Gap #2 effectively closed against
-qdrant. Cumulative arc from the early-June baseline cf35132 (137 QPS):
+pgvector) to tied-2nd with qdrant: the throughput gap to qdrant is
+effectively closed. Cumulative arc from the early-June baseline cf35132 (137 QPS):
 
   cf35132 (peek_mut)                                       137 QPS
-  → 14ec191 (Phase 2 InlineLayer0 + skip f32 prefetch)     162 QPS  (+18%)
+  → 14ec191 (InlineLayer0 + skip f32 prefetch)             162 QPS  (+18%)
   → d365611 (SmallVec inline RaBitQ code)                  162 QPS  (~)
   → 5fb4953 (SIMD FHT-Kac AVX2/NEON)                       162 QPS  (~)
   → c953a05 (unchecked visited.check_and_mark)             ?        (not isolated; CI cancelled)
   → 06421a5 (EndOfSearch + oversample=2.0)                 241 QPS  (+49% over 5fb4953, +76% cumulative)
 
 Residual gap to hnswlib f32 = 575 / 241 ≈ 2.4× (was 4.1×). Closing it
-needs the orthogonal Gap #1 (HNSW engine contiguous layout / task #182)
-work — the cheap-distance graph traversal still has structural
+needs the orthogonal contiguous HNSW layout work: the cheap-distance graph traversal still has structural
 overhead vs hnswlib's data_level0_memory_ single-allocation pattern.
 
 EndOfSearch + oversample=2.0 is now the recommended production
@@ -187,7 +186,7 @@ m = 16
 m_max0 = 32
 ef_construction = 200
 alpha_pruning = 1.0
-rerank_mode = "end-of-search"   # Gap #2 (E+C) fix — qdrant / chroma / DiskANN pattern
+rerank_mode = "end-of-search"   # qdrant / chroma / DiskANN rerank pattern
 build_threads = 4
 search_threads = 1
 build_secs = 315
@@ -218,7 +217,7 @@ RaBitQ popcount distance instead of the exact f32. To hit recall ≥
 ~1600 for parity, QPS roughly halved to ~227 — still ~+63% over the
 inline α=1.2 row that crosses recall 0.95 at ef=800).
 
-Next Gap #2 step: add an `oversample_factor` knob so the search
+Next step: add an `oversample_factor` knob so the search
 traverses with frontier_ef = oversample × user_ef, then end-of-search
 rerank picks user_ef from the larger candidate set. This is the
 qdrant `oversampling` parameter.
@@ -235,7 +234,7 @@ m = 16
 m_max0 = 32
 ef_construction = 200
 alpha_pruning = 1.0
-rerank_mode = "none"   # Gap #2 diagnostic — no f32 rerank at all
+rerank_mode = "none"   # diagnostic: no f32 rerank at all
 build_threads = 4
 search_threads = 1
 build_secs = 293
@@ -271,7 +270,7 @@ k = 10
 m = 16
 m_max0 = 32
 ef_construction = 200
-alpha_pruning = 1.2       # R863 RobustPrune active (Vamana paper production default)
+alpha_pruning = 1.2       # RobustPrune active (Vamana paper production default)
 build_threads = 4
 search_threads = 1
 build_secs = 3726          # 12× slower build than α=1.0 (Vamana paper claimed 20-50% overhead; our pruning loop costs more due to per-insert O(R · |V|) distance evaluations)
@@ -517,7 +516,7 @@ Recall ≥ 0.95 single-thread glove M=16 leaderboard:
 So CoordiNode is in the middle of the pack, ahead of pgvector and
 annoy and behind qdrant and hnswlib. Closing the residual 1.77× to
 qdrant is what d67fc2d's oversample sweep is bench-pending; closing
-the 4.1× to hnswlib needs the Gap #1 layout work.
+the 4.1× to hnswlib needs the contiguous HNSW layout work.
 """
 
 [[qdrant.glove_100_angular]]
@@ -556,9 +555,9 @@ the CoordiNode rows above. A fresh hnswlib run with a wider ef sweep
 (ef ∈ {1200, 1600}) is needed for a clean head-to-head at recall ≥
 0.95.
 
-Closing the residual Gap #2 (~1.77× behind qdrant on cosine RaBitQ
-at matched recall) is what the d67fc2d oversampling knob and Gap #1
-(HNSW engine layout) are queued to attack next.
+Closing the residual ~1.77× behind qdrant on cosine RaBitQ at matched
+recall is what the d67fc2d oversampling knob and the contiguous HNSW
+layout are queued to attack next.
 """
 
 # ─── Verified hnswlib runs ──────────────────────────────────────────────────
@@ -606,8 +605,8 @@ difference on the same hardware under shared load. Several runs with
 median taken would tighten the comparison; not redone here because the
 trajectory and ordering are clear without it.
 
-Closing the 4.1x gap to hnswlib needs the orthogonal Gap #1 work
-(HNSW engine layout) that's queued as task #182 — independent of the
+Closing the 4.1x gap to hnswlib needs the orthogonal contiguous HNSW
+layout work, independent of the
 RerankMode / oversample work that's closing the second factor against
 qdrant.
 """

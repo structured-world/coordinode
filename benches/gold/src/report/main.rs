@@ -1,7 +1,6 @@
 //! `gold-report` binary placeholder. Once LDBC / ann / TSBS / etc.
 //! land their per-modality runners, this binary will orchestrate all
-//! of them and render the full Composite block from
-//! `arch/benchmarks/methodology.md`. For now it prints the
+//! of them and render the full Composite block. For now it prints the
 //! "what's currently implemented" status so it has a meaningful exit
 //! code in CI.
 
