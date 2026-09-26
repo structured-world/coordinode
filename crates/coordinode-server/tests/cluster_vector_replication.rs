@@ -88,6 +88,28 @@ fn vec_for(i: usize, dim: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Deterministic vector for row `i` whose coordinates are independent uniform
+/// draws (splitmix64). `vec_for` derives every coordinate from one hash of
+/// `i`, which puts the rows near a curve; an approximate index then misses
+/// some of its own points, so it is no base for asserting that every vector
+/// is found.
+fn uniform_vec(i: usize, dim: usize) -> Vec<f64> {
+    (0..dim as u64)
+        .map(|d| {
+            let mut z = (i as u64)
+                .wrapping_mul(dim as u64)
+                .wrapping_add(d)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            // Rounded as the query text will carry it, so a stored vector
+            // and its query are the same point.
+            ((z >> 11) as f64 / (1u64 << 53) as f64 * 1e6).round() / 1e6
+        })
+        .collect()
+}
+
 fn top_ids(db: &mut Database, qv: &[f64]) -> Vec<i64> {
     let qv_str = qv
         .iter()
@@ -287,6 +309,129 @@ async fn follower_vector_search_matches_leader() {
         }
     }
     panic!("follower vector search never converged to leader recall: {last_state}");
+}
+
+/// A follower builds an index another member defined in the background, while
+/// the leader keeps writing. Every vector replicated during that build must be
+/// in the follower's index once it finishes: those entries apply on the
+/// follower beside its scan, some below the snapshot the scan read.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_replicated_during_a_follower_build_reach_its_index() {
+    const N: usize = 6000;
+    const DIM: usize = 8;
+
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+    let mut n1 = open_node(1, p1, true).await;
+    let mut n2 = open_node(2, p2, false).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1._node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    n1._node.change_membership(vec![1, 2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let create_rows = |db: &mut Database, range: std::ops::Range<usize>| {
+        let rows = range
+            .map(|i| {
+                let emb = uniform_vec(i, DIM)
+                    .iter()
+                    .map(|x| format!("{x:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ext_id: {i}, embedding: [{emb}]}}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        db.execute_cypher(&format!(
+            "UNWIND [{rows}] AS row \
+             CREATE (n:Item {{ext_id: row.ext_id, embedding: row.embedding}})"
+        ))
+        .unwrap();
+    };
+    for start in (0..N).step_by(500) {
+        create_rows(&mut n1.db, start..start + 500);
+    }
+    n1.db
+        .execute_cypher(
+            "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+             OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 8}",
+        )
+        .unwrap();
+
+    // Bring the index up on the follower once the definition has reached it,
+    // as the server does on every applied entry.
+    let mut started = false;
+    for _ in 0..40 {
+        n2.db.refresh_field_interner().unwrap();
+        if n2.db.refresh_vector_indexes().unwrap() > 0 {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(started, "the index definition never reached the follower");
+
+    // Keep writing through the leader for as long as the follower builds.
+    let mut late = N;
+    let mut during = 0;
+    while !n2.db.index_builds().is_empty() {
+        create_rows(&mut n1.db, late..late + 20);
+        late += 20;
+        during += 1;
+    }
+    assert!(
+        during > 0,
+        "the follower's build finished before any write landed beside it"
+    );
+
+    // Then keep writing with no build running, which the follower's index
+    // takes from its maintenance of applied entries.
+    let steady = late..late + 1000;
+    for start in steady.clone().step_by(20) {
+        create_rows(&mut n1.db, start..start + 20);
+    }
+
+    // Every vector is its own nearest neighbour on both members, found by
+    // the index. The follower applies behind the leader, so it gets a while.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut missing_follower: Vec<usize> = (N..steady.end).collect();
+    while !missing_follower.is_empty() && std::time::Instant::now() < deadline {
+        missing_follower
+            .retain(|&i| top_ids(&mut n2.db, &uniform_vec(i, DIM)).first() != Some(&(i as i64)));
+        if !missing_follower.is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let missing_leader: Vec<(usize, Option<usize>)> = (N..steady.end)
+        .filter_map(|i| {
+            let ids = top_ids(&mut n1.db, &uniform_vec(i, DIM));
+            (ids.first() != Some(&(i as i64)))
+                .then(|| (i, ids.iter().position(|&id| id == i as i64)))
+        })
+        .collect();
+    assert!(
+        missing_leader.is_empty() && missing_follower.is_empty(),
+        "of {} vectors ({} written during the follower's build) the index misses \
+         {} on the leader {missing_leader:?} and {} on the follower {missing_follower:?}",
+        steady.end - N,
+        late - N,
+        missing_leader.len(),
+        missing_follower.len(),
+    );
+    let plan = n2
+        .db
+        .explain_cypher(
+            "MATCH (n:Item) WITH *, vector_distance(n.embedding, [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]) AS d \
+             ORDER BY d ASC LIMIT 10 RETURN n.ext_id",
+        )
+        .unwrap();
+    assert!(
+        plan.contains("HnswScan"),
+        "the follower answered without its index:\n{plan}"
+    );
 }
 
 /// AFTER COMMIT trigger in a real 2-node Raft cluster: the event the leader

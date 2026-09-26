@@ -15557,110 +15557,125 @@ fn execute_create_vector_index(
     // backfill into a background thread and return immediately; with
     // None (test paths that build ExecutionContext with only a borrowed
     // engine) we keep the legacy synchronous loop.
-    let (final_state, nodes_indexed): (IndexState, i64) =
-        match (&ctx.engine_arc, hnsw_handle, field_id) {
-            (Some(engine_arc), Some(hnsw), Some(fid)) => {
-                // Publish the Building state so concurrent readers and the
-                // crash-recovery path see "backfill in progress" before the
-                // thread starts touching SSTs.
-                let initial_state = IndexState::Building {
-                    written: 0,
-                    estimated_total: 0,
-                };
-                let _ =
-                    crate::index::ops::save_index_state(ctx.engine, name, initial_state.clone());
+    let (final_state, nodes_indexed): (IndexState, i64) = match (
+        &ctx.engine_arc,
+        hnsw_handle,
+        field_id,
+    ) {
+        (Some(engine_arc), Some(hnsw), Some(fid)) => {
+            // Publish the Building state so concurrent readers and the
+            // crash-recovery path see "backfill in progress" before the
+            // thread starts touching SSTs.
+            let initial_state = IndexState::Building {
+                written: 0,
+                estimated_total: 0,
+            };
+            if let Err(e) =
+                crate::index::ops::save_index_state(ctx.engine, name, initial_state.clone())
+            {
+                // Only the crash-recovery marker is lost: a reopen then
+                // finds the index Ready and rebuilds it all the same.
+                tracing::warn!(index = %name, error = %e, "could not persist the building state");
+            }
 
-                let engine = Arc::clone(engine_arc);
-                let label_owned = label.to_string();
-                let name_owned = name.to_string();
-                let token = registry.new_build_token();
-                let build_token = token.clone();
-                // The build publishes through the index's health signal, not
-                // the registry: the signal is atomic and `Arc`-shared, so the
-                // thread needs neither a borrow of the registry nor a lock on
-                // the search path to report where it is.
-                let health = registry.health_handle(label, property).ok_or_else(|| {
-                    ExecutionError::Unsupported(format!(
-                        "vector index '{name}' has no health signal to publish build progress on"
-                    ))
-                })?;
+            let engine = Arc::clone(engine_arc);
+            let label_owned = label.to_string();
+            let name_owned = name.to_string();
+            let token = registry.new_build_token();
+            let build_token = token.clone();
+            // The build publishes through the index's health signal, not
+            // the registry: the signal is atomic and `Arc`-shared, so the
+            // thread needs neither a borrow of the registry nor a lock on
+            // the search path to report where it is.
+            let health = registry.health_handle(label, property).ok_or_else(|| {
+                ExecutionError::Unsupported(format!(
+                    "vector index '{name}' has no health signal to publish build progress on"
+                ))
+            })?;
+            let unbuilt = Arc::clone(&health);
 
-                let thread = std::thread::Builder::new()
-                    .name(format!("vec-backfill-{name}"))
-                    .spawn(move || {
-                        let outcome =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                crate::index::VectorBuild {
-                                    engine: engine.as_ref(),
-                                    token: &build_token,
-                                    shard_id,
-                                    targets: &[crate::index::BuildTarget {
-                                        hnsw: hnsw.as_ref(),
-                                        health: health.as_ref(),
-                                        label: &label_owned,
-                                        field_id: fid,
-                                    }],
-                                }
-                                .run()
-                            }));
-                        let terminal = match outcome {
-                            Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
-                                tracing::info!(
-                                    index = %name_owned,
-                                    scanned,
-                                    "vector index backfill complete"
-                                );
-                                IndexState::Ready
-                            }
-                            // Cancelled: the index is being dropped or replaced
-                            // by whoever cancelled us. Writing anything now —
-                            // state or progress — would land under their
-                            // statement and conflict with a write they never
-                            // saw. They own the index from here.
-                            Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
-                            Ok(Err(e)) => IndexState::Failed { reason: e },
-                            Err(panic) => {
-                                let reason = panic
-                                    .downcast_ref::<&'static str>()
-                                    .map(|s| (*s).to_string())
-                                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "panic in backfill thread".to_string());
-                                IndexState::Failed { reason }
-                            }
-                        };
-                        match &terminal {
-                            IndexState::Failed { reason } => health.mark_offline(reason.clone()),
-                            _ => health.mark_ready(),
+            let thread = std::thread::Builder::new()
+                .name(format!("vec-backfill-{name}"))
+                .spawn(move || {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::index::VectorBuild {
+                            engine: engine.as_ref(),
+                            token: &build_token,
+                            shard_id,
+                            targets: &[crate::index::BuildTarget {
+                                hnsw: hnsw.as_ref(),
+                                health: health.as_ref(),
+                                label: &label_owned,
+                                field_id: fid,
+                            }],
                         }
-                        let _ = crate::index::ops::save_index_state(
-                            engine.as_ref(),
-                            &name_owned,
-                            terminal,
-                        );
-                    })
-                    .map_err(|e| {
-                        ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
-                    })?;
-                registry.register_build(name, label, property, &token, thread);
-
-                (initial_state, 0)
-            }
-            _ => {
-                // Synchronous fallback (legacy path / tests): the statement
-                // inserts through the writer path, which a rebuilding index
-                // leaves to a build, so the index is handed over first.
-                if let Some(health) = registry.health_handle(label, property) {
-                    health.mark_ready();
-                }
-                let written = match field_id {
-                    Some(fid) => {
-                        run_backfill_sync(ctx.engine, registry, label, property, fid, shard_id)
+                        .run()
+                    }));
+                    let terminal = match outcome {
+                        Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
+                            tracing::info!(
+                                index = %name_owned,
+                                scanned,
+                                "vector index backfill complete"
+                            );
+                            IndexState::Ready
+                        }
+                        // Cancelled: the index is being dropped or replaced
+                        // by whoever cancelled us. Writing anything now —
+                        // state or progress — would land under their
+                        // statement and conflict with a write they never
+                        // saw. They own the index from here.
+                        Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
+                        Ok(Err(e)) => IndexState::Failed { reason: e },
+                        Err(panic) => {
+                            let reason = panic
+                                .downcast_ref::<&'static str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "panic in backfill thread".to_string());
+                            IndexState::Failed { reason }
+                        }
+                    };
+                    match &terminal {
+                        IndexState::Failed { reason } => health.mark_offline(reason.clone()),
+                        _ => health.mark_ready(),
                     }
-                    None => 0,
-                };
-                (IndexState::Ready, written as i64)
+                    if let Err(e) =
+                        crate::index::ops::save_index_state(engine.as_ref(), &name_owned, terminal)
+                    {
+                        tracing::warn!(
+                            index = %name_owned,
+                            error = %e,
+                            "could not persist the build's terminal state"
+                        );
+                    }
+                })
+                .map_err(|e| {
+                    // Registered rebuilding with no build behind it, the
+                    // index would hold a blocked reader until its timeout.
+                    unbuilt.mark_offline(format!("could not start the build: {e}"));
+                    ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
+                })?;
+            registry.register_build(name, label, property, &token, thread);
+
+            (initial_state, 0)
+        }
+        _ => {
+            // Synchronous fallback (legacy path / tests): the statement
+            // inserts through the writer path, which a rebuilding index
+            // leaves to a build, so the index is handed over first.
+            if let Some(health) = registry.health_handle(label, property) {
+                health.mark_ready();
             }
-        };
+            let written = match field_id {
+                Some(fid) => {
+                    run_backfill_sync(ctx.engine, registry, label, property, fid, shard_id)
+                }
+                None => 0,
+            };
+            (IndexState::Ready, written as i64)
+        }
+    };
 
     let state_label = match &final_state {
         IndexState::Building { .. } => "building",

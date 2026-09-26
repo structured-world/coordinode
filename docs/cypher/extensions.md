@@ -62,12 +62,16 @@ DROP VECTOR INDEX product_embedding
 #### Online-during-build policy
 
 `CREATE VECTOR INDEX` returns immediately after persisting the definition;
-the HNSW graph is populated by a background backfill thread. Queries that
-arrive before the backfill finishes are governed by `online_during_build`:
+the HNSW graph is populated by a background backfill thread. Writes are never
+paused while it runs, and every vector written during the backfill ends up in
+the index, including writes replicated from another member. Each member of a
+cluster builds its own copy of the graph in the background once the
+definition reaches it. Queries that arrive before the backfill finishes are
+governed by `online_during_build`:
 
 | Value | Behaviour |
 |-------|-----------|
-| `"block"` (default) | Reader polls the persisted state up to 30 seconds, then proceeds when the index reaches `Ready`. Matches the legacy synchronous semantic for callers that just want "do the right thing". |
+| `"block"` (default) | Reader waits, up to 30 seconds, until the index on the member serving it is complete, then proceeds. Matches the legacy synchronous semantic for callers that just want "do the right thing". |
 | `"partial-recall"` | Reader hits the partial HNSW graph immediately. Recall improves as the backfill writes more vectors; useful when search latency matters more than completeness. |
 | `"offline"` | Reader gets an error so it can pick a fallback path (e.g. brute force, alternative index, or queueing). |
 

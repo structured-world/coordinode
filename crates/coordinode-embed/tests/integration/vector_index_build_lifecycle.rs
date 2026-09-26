@@ -82,14 +82,108 @@ fn drop_cancels_a_running_build_and_it_stays_dropped() {
         .expect("re-create after the cancelled build");
 }
 
+/// Deterministic 8-dimensional vector for row `i`, each coordinate an
+/// independent uniform draw (splitmix64). Coordinates derived from one hash
+/// of `i` put the rows on a low-dimensional curve, where an approximate
+/// index misses its own points for reasons that have nothing to do with
+/// what is tested here.
+fn spread_vector(i: usize) -> String {
+    (0..8u64)
+        .map(|d| {
+            let mut z = (i as u64)
+                .wrapping_mul(8)
+                .wrapping_add(d)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            format!("{:.6}", (z >> 11) as f64 / (1u64 << 53) as f64)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_items(db: &mut Database, range: std::ops::Range<usize>) {
+    let rows = range
+        .map(|i| format!("{{ext_id: {i}, embedding: [{}]}}", spread_vector(i)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    db.execute_cypher(&format!(
+        "UNWIND [{rows}] AS row CREATE (:Item {{ext_id: row.ext_id, embedding: row.embedding}})"
+    ))
+    .expect("create items");
+}
+
+fn nearest(db: &mut Database, i: usize) -> Option<i64> {
+    db.execute_cypher(&format!(
+        "MATCH (n:Item) WITH *, vector_distance(n.embedding, [{}]) AS d \
+         ORDER BY d ASC LIMIT 1 RETURN n.ext_id AS ext_id",
+        spread_vector(i)
+    ))
+    .expect("vector search")
+    .first()
+    .and_then(|row| row.get("ext_id"))
+    .and_then(|v| v.as_int())
+}
+
+/// Statements that keep committing for the whole length of a build, each in
+/// its own transaction, some before the handover and some after: every
+/// vector they wrote is in the index when the build is done, found by the
+/// index itself.
+#[test]
+fn every_write_across_a_build_is_in_the_index() {
+    const N: usize = 6000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open db");
+    for start in (0..N).step_by(500) {
+        create_items(&mut db, start..start + 500);
+    }
+    db.execute_cypher(
+        "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+         OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 8, \
+         online_during_build: \"partial-recall\"}",
+    )
+    .expect("create vector index");
+
+    let mut late = N;
+    let mut during = 0;
+    while !db.index_builds().is_empty() {
+        create_items(&mut db, late..late + 20);
+        late += 20;
+        during += 1;
+    }
+    assert!(during > 1, "the build finished before the writes started");
+
+    let missing: Vec<usize> = (N..late)
+        .filter(|&i| nearest(&mut db, i) != Some(i as i64))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {} vectors written across the build are not found by the index: {missing:?}",
+        missing.len(),
+        late - N
+    );
+    let plan = db
+        .explain_cypher(&format!(
+            "MATCH (n:Item) WITH *, vector_distance(n.embedding, [{}]) AS d \
+             ORDER BY d ASC LIMIT 1 RETURN n.ext_id",
+            spread_vector(0)
+        ))
+        .expect("explain");
+    assert!(
+        plan.contains("HnswScan"),
+        "searched without the index:\n{plan}"
+    );
+}
+
 /// Writes that land WHILE the index is building must end up in it.
 ///
 /// While a build runs the writer leaves the index alone: batching the vectors
 /// through the build is much cheaper per vector than encoding and linking one
-/// at a time. What makes that safe is the drain, which folds in everything
-/// written since the scan started and repeats until there is nothing left, and
-/// only then hands maintenance back to the writers. Without it those writes
-/// would simply be missing from the graph.
+/// at a time. What makes that safe is the build's tap of applied writes, which
+/// delivers everything that lands after the scan's snapshot and is folded in
+/// until nothing is left, and only then hands maintenance back to the
+/// writers. Without it those writes would simply be missing from the graph.
 #[test]
 fn writes_during_a_build_are_drained_into_the_index() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -105,7 +199,7 @@ fn writes_during_a_build_are_drained_into_the_index() {
     )
     .expect("create vector index");
 
-    // Written while the build is in flight, so only the drain can place them.
+    // Written while the build is in flight, so only the tap can place them.
     db.execute_cypher(
         "UNWIND range(1, 200) AS i \
          CREATE (:Doc {tag: 'late', embedding: [0.0, toFloat(i), 0.0]})",
@@ -119,9 +213,9 @@ fn writes_during_a_build_are_drained_into_the_index() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    // Every late vector must be its own nearest neighbour. A vector the drain
+    // Every late vector must be its own nearest neighbour. A vector the build
     // missed answers with something else entirely.
-    for i in [1.0_f32, 97.0, 200.0] {
+    for i in (1..=200).map(|i| i as f32) {
         let rows = db
             .execute_cypher(&format!(
                 "MATCH (n:Doc) WITH n, vector_similarity(n.embedding, [0.0, {i:.1}, 0.0]) AS s \
@@ -139,7 +233,7 @@ fn writes_during_a_build_are_drained_into_the_index() {
         assert_eq!(
             tag.as_deref(),
             Some("late"),
-            "a vector written during the build was not drained into the index"
+            "a vector written during the build was not folded into the index"
         );
     }
 }

@@ -1368,6 +1368,9 @@ impl Database {
         let engine = Arc::clone(engine);
         let name = def.name.clone();
         let label = def.label.clone();
+        // The index was registered rebuilding; without a build it would stay
+        // so, and a blocked reader would wait on it until its timeout.
+        let unbuilt = Arc::clone(&health);
         let spawned = std::thread::Builder::new()
             .name(format!("vec-replica-{name}"))
             .spawn(move || {
@@ -1405,6 +1408,7 @@ impl Database {
             }
             Err(e) => {
                 tracing::warn!(index = %def.name, error = %e, "could not spawn the replica build");
+                unbuilt.mark_offline(format!("could not start the build: {e}"));
             }
         }
     }

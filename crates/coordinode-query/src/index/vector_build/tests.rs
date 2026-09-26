@@ -75,17 +75,28 @@ impl Fixture {
     /// Apply a `Doc` node with `vector` at `commit_ts`, as a Raft apply or a
     /// commit that reserved its timestamp early would.
     fn apply_doc_at(&self, id: u64, vector: [f32; 3], commit_ts: u64) {
-        let mut record = NodeRecord::new("Doc");
-        record.set(self.field, Value::Vector(vector.to_vec()));
+        self.apply_at(put(0, id, &record("Doc", self.field, vector)), commit_ts);
+    }
+
+    /// Apply `record` as node `id` of `shard`, at a fresh commit timestamp.
+    fn apply_record(&self, shard: u16, id: u64, record: &NodeRecord) {
+        self.apply_at(put(shard, id, record), self.oracle.next().as_raw());
+    }
+
+    /// Delete node `id` of shard 0.
+    fn delete_node(&self, id: u64) {
+        self.apply_at(
+            Mutation::Delete {
+                partition: PartitionId::Node,
+                key: coordinode_core::graph::node::encode_node_key(0, NodeId::from_raw(id)),
+            },
+            self.oracle.next().as_raw(),
+        );
+    }
+
+    fn apply_at(&self, mutation: Mutation, commit_ts: u64) {
         self.engine
-            .apply_proposal_at(
-                &[Mutation::Put {
-                    partition: PartitionId::Node,
-                    key: coordinode_core::graph::node::encode_node_key(0, NodeId::from_raw(id)),
-                    value: record.to_msgpack().expect("encode"),
-                }],
-                commit_ts,
-            )
+            .apply_proposal_at(&[mutation], commit_ts)
             .expect("apply");
     }
 
@@ -143,6 +154,21 @@ impl Fixture {
         let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
         let graph = hnsw.read().expect("hnsw");
         graph.len()
+    }
+}
+
+/// A node of `label` carrying `vector` in `field`.
+fn record(label: &str, field: u32, vector: [f32; 3]) -> NodeRecord {
+    let mut record = NodeRecord::new(label);
+    record.set(field, Value::Vector(vector.to_vec()));
+    record
+}
+
+fn put(shard: u16, id: u64, record: &NodeRecord) -> Mutation {
+    Mutation::Put {
+        partition: PartitionId::Node,
+        key: coordinode_core::graph::node::encode_node_key(shard, NodeId::from_raw(id)),
+        value: record.to_msgpack().expect("encode"),
     }
 }
 
@@ -243,4 +269,196 @@ fn a_build_with_nothing_to_wait_for_ends_ready_and_fresh() {
         fx.health().indexed_hlc() >= before,
         "the watermark covers every write made before the build"
     );
+}
+
+/// Thousands of writes landing after the handover are folded in more than one
+/// chunk: every one of them is a member when the build ends, beside every
+/// scanned node.
+#[test]
+fn every_node_written_after_the_handover_is_a_member() {
+    let fx = fixture();
+    let v = |id: u64| [1.0, id as f32, (id % 7) as f32];
+    for id in 1..=3000u64 {
+        fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
+    }
+    let older = fx.open_transaction();
+
+    let outcome = fx.build_while(|health| {
+        await_handover(health);
+        for id in 3001..=5000u64 {
+            fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
+        }
+        drop(older);
+    });
+
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 3000 }));
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    let graph = hnsw.read().expect("graph");
+    let absent: Vec<u64> = (1..=5000).filter(|&id| !graph.contains(id)).collect();
+    assert!(absent.is_empty(), "not in the graph: {absent:?}");
+    assert_eq!(graph.len(), 5000);
+}
+
+/// A node that stops being a member while the build runs (deleted,
+/// relabelled, or stripped of its vector) is counted as a stale entry for the
+/// read path to re-validate, never re-inserted from what the tap delivered.
+#[test]
+fn a_node_leaving_the_index_during_the_build_is_counted_stale() {
+    let fx = fixture();
+    for id in 1..=3 {
+        fx.apply_doc_at(id, [0.0, 1.0, id as f32], fx.oracle.next().as_raw());
+    }
+    let older = fx.open_transaction();
+
+    let outcome = fx.build_while(|health| {
+        await_handover(health);
+        fx.delete_node(1);
+        fx.apply_record(0, 2, &record("Other", fx.field, [0.0, 1.0, 2.0]));
+        fx.apply_record(0, 3, &NodeRecord::new("Doc"));
+        drop(older);
+    });
+
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 3 }));
+    assert_eq!(
+        fx.health().tombstones(),
+        3,
+        "the deleted, the relabelled and the stripped node"
+    );
+}
+
+/// A vector rewritten while the build runs ends up in the index at its new
+/// value: the fold reads the record as it stands, not as it was scanned.
+#[test]
+fn a_vector_rewritten_during_the_build_is_indexed_at_its_new_value() {
+    let fx = fixture();
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
+    fx.apply_doc_at(2, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
+    let older = fx.open_transaction();
+
+    let outcome = fx.build_while(|health| {
+        await_handover(health);
+        fx.apply_record(0, 1, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
+        drop(older);
+    });
+
+    assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
+    assert!(fx.indexed([1.0, 0.0, 0.0], 1), "found at its new value");
+    assert_eq!(fx.health().tombstones(), 0, "still a member");
+}
+
+/// The build indexes one shard: a node another shard owns, landing while it
+/// runs, is delivered by the tap and left out.
+#[test]
+fn a_write_to_another_shard_is_not_folded() {
+    let fx = fixture();
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
+    let older = fx.open_transaction();
+
+    let outcome = fx.build_while(|health| {
+        await_handover(health);
+        fx.apply_record(1, 5, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
+        drop(older);
+    });
+
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
+    assert_eq!(fx.graph_len(), 1, "only this shard's node");
+}
+
+/// A build cancelled before it reaches the tap stops inside the scan, at the
+/// first progress check, instead of reading the whole shard.
+#[test]
+fn a_cancelled_build_stops_during_the_scan() {
+    let fx = fixture();
+    for id in 1..=3000u64 {
+        fx.apply_doc_at(id, [1.0, id as f32, 0.0], fx.oracle.next().as_raw());
+    }
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    let health = fx.health();
+    let token = fx.registry.new_build_token();
+    token.cancel();
+
+    assert_eq!(
+        fx.build(&hnsw, &health, &token),
+        Ok(BuildOutcome::Cancelled)
+    );
+    assert!(
+        fx.graph_len() < 3000,
+        "the scan went on after the cancellation: {} inserted",
+        fx.graph_len()
+    );
+}
+
+/// Several indexes over one shard share a build: one scan fills each with its
+/// own label's vectors, and a write landing during the build reaches the
+/// index it belongs to and no other.
+#[test]
+fn one_build_fills_every_index_of_the_shard() {
+    let fx = fixture();
+    let mut interner = FieldInterner::new();
+    assert_eq!(interner.intern("embedding"), fx.field);
+    let pixels = interner.intern("pixels");
+    fx.registry.register_for_build(
+        IndexDefinition::hnsw(
+            "img",
+            "Img",
+            "pixels",
+            VectorIndexConfig {
+                dimensions: 3,
+                metric: coordinode_core::graph::types::VectorMetric::Cosine,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
+            },
+        ),
+        None,
+    );
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
+    fx.apply_record(0, 2, &record("Img", pixels, [0.0, 0.0, 1.0]));
+
+    let docs = fx.registry.get("Doc", "embedding").expect("docs");
+    let imgs = fx.registry.get("Img", "pixels").expect("imgs");
+    let doc_health = fx.health();
+    let img_health = fx.registry.health_handle("Img", "pixels").expect("health");
+    let token = fx.registry.new_build_token();
+    let older = fx.open_transaction();
+
+    let outcome = std::thread::scope(|scope| {
+        let build = scope.spawn(|| {
+            VectorBuild {
+                engine: &fx.engine,
+                token: &token,
+                shard_id: 0,
+                targets: &[
+                    BuildTarget {
+                        hnsw: &docs,
+                        health: &doc_health,
+                        label: "Doc",
+                        field_id: fx.field,
+                    },
+                    BuildTarget {
+                        hnsw: &imgs,
+                        health: &img_health,
+                        label: "Img",
+                        field_id: pixels,
+                    },
+                ],
+            }
+            .run()
+        });
+        await_handover(&doc_health);
+        fx.apply_record(0, 3, &record("Img", pixels, [1.0, 0.0, 0.0]));
+        drop(older);
+        build.join().expect("build thread")
+    });
+
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 2 }));
+    let docs = docs.read().expect("docs");
+    let imgs = imgs.read().expect("imgs");
+    assert_eq!(docs.len(), 1, "only the Doc node");
+    assert_eq!(imgs.len(), 2, "the scanned Img node and the late one");
+    assert!(imgs.search(&[1.0, 0.0, 0.0], 1).iter().any(|r| r.id == 3));
+    assert!(img_health.snapshot().is_ready());
 }
