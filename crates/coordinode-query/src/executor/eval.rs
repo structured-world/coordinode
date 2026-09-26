@@ -519,7 +519,7 @@ pub(crate) fn dispatch_scalar_function(
         }
         "id" => {
             // id(n) → raw NodeId u64 (deprecated; prefer elementId).
-            // Kept for Neo4j v4 driver compatibility per arch/compatibility/neo4j.md.
+            // Kept for Neo4j v4 driver compatibility.
             if let Some(var) = first_arg_var {
                 match row.get(var) {
                     Some(Value::Int(raw)) => Value::Int(*raw),
@@ -733,7 +733,7 @@ pub(crate) fn dispatch_scalar_function(
         // currently unused (node and query are for semantics / future introspection);
         // the third optional arg is a map of weights:
         //   {vector: f32, text: f32}  — defaults 0.65 / 0.35
-        // Semantics match arch/search/document-scoring.md § Document-Level Scoring Formula:
+        // Document-level scoring formula:
         //   hybrid_score(c, q) = w_vec × vec_similarity(c, q) + w_bm25 × text_score(c, q)
         // Vector normalization:
         //   "vector_similarity" (cosine, already [0,1] or [-1,1]) → use raw value

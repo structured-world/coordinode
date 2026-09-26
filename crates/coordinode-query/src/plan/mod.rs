@@ -180,7 +180,7 @@ pub struct AlterTriggerDef {
     pub action: AlterTriggerAction,
 }
 
-/// A column of a relational TABLE, in the neutral IR (R901). The type is a
+/// A column of a relational TABLE, in the neutral IR. The type is a
 /// lexical name resolved to a `PropertyType` by the executor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableColumn {

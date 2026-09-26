@@ -199,7 +199,7 @@ text_index_language_override = { kw_language ~ kw_override ~ string_literal }
 // DROP TEXT INDEX idx_name
 drop_text_index_clause = { kw_drop ~ kw_text ~ kw_index ~ identifier }
 
-// --- CREATE/DROP ENCRYPTED INDEX (SSE, G017) ---
+// --- CREATE/DROP ENCRYPTED INDEX (SSE) ---
 
 // CREATE ENCRYPTED INDEX idx_name ON :Label(property)
 create_encrypted_index_clause = {
@@ -255,7 +255,7 @@ create_edge_type_clause = {
     ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
 }
 
-// --- CREATE NODE TYPE (R172a per ADR-027) ---
+// --- CREATE NODE TYPE ---
 //
 // CREATE NODE TYPE <name> [TEMPORAL] [WITH ( <property_decl_list> )]
 //
@@ -282,7 +282,7 @@ property_type_name = @{
 
 property_decl_modifier = { kw_not ~ kw_null }
 
-// --- CREATE TABLE (R901) — relational TABLE modality ---
+// --- CREATE TABLE — relational TABLE modality ---
 //
 //   CREATE TABLE <name> ( <col> <TYPE> [PRIMARY KEY | NOT NULL | UNIQUE]* , ... )
 //     [STORAGE (ROW | COLUMNAR)]
@@ -303,11 +303,11 @@ table_column_type      = { identifier }
 table_column_modifier  = { (kw_primary ~ kw_key) | (kw_not ~ kw_null) | kw_unique }
 table_storage_layout   = { kw_row | kw_columnar }
 
-// DROP TABLE <name> (R901). For a columnar table this also drops the per-table
+// DROP TABLE <name>. For a columnar table this also drops the per-table
 // columnar tree; the label schema pointer is tombstoned either way.
 drop_table_clause = { kw_drop ~ kw_table ~ identifier }
 
-// --- TRIGGER DDL (R190 — per ADR-026) ---
+// --- TRIGGER DDL ---
 //
 //   CREATE TRIGGER name
 //     ON :Label CREATE | UPDATE | DELETE              (or [:EdgeType])
@@ -448,7 +448,7 @@ on_create_action = { kw_on ~ kw_create ~ kw_set ~ set_items }
 
 merge_all_clause = { kw_merge ~ kw_all ~ pattern ~ merge_action* }
 
-// --- MERGE NODES (R180: native node merge, replaces APOC apoc.refactor.mergeNodes) ---
+// --- MERGE NODES (native node merge, replaces APOC apoc.refactor.mergeNodes) ---
 //
 //   MERGE NODES (a, b) INTO a
 //     [ON CONFLICT KEEP FIRST | KEEP LAST | COALESCE | SET <set_items>]
@@ -924,10 +924,10 @@ kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
-// CREATE NODE TYPE — bitemporal node-label DDL (R172a per ADR-027).
+// CREATE NODE TYPE — bitemporal node-label DDL.
 // Context keyword: `node` remains a valid identifier elsewhere.
 kw_node       = @{ ^"node" ~ !(ASCII_ALPHANUMERIC | "_") }
-// CREATE TABLE — relational TABLE modality DDL (R901). Context keywords so they
+// CREATE TABLE — relational TABLE modality DDL. Context keywords so they
 // remain valid identifiers elsewhere.
 kw_table      = @{ ^"table" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_storage    = @{ ^"storage" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -935,7 +935,7 @@ kw_row        = @{ ^"row" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_columnar   = @{ ^"columnar" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_primary    = @{ ^"primary" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_key        = @{ ^"key" ~ !(ASCII_ALPHANUMERIC | "_") }
-// MERGE NODES (R180) — context keywords (NOT in reserved_word, so they remain
+// MERGE NODES — context keywords (NOT in reserved_word, so they remain
 // valid identifiers and function names like coalesce()).
 kw_nodes      = @{ ^"nodes" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_from       = @{ ^"from" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -947,7 +947,7 @@ kw_both       = @{ ^"both" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_target     = @{ ^"target" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_properties = @{ ^"properties" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_duplicate  = @{ ^"duplicate" ~ !(ASCII_ALPHANUMERIC | "_") }
-// TRIGGER DDL (R190) — context keywords (NOT in reserved_word, so they
+// TRIGGER DDL — context keywords (NOT in reserved_word, so they
 // remain valid identifiers in user data).
 kw_trigger     = @{ ^"trigger" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_triggers    = @{ ^"triggers" ~ !(ASCII_ALPHANUMERIC | "_") }

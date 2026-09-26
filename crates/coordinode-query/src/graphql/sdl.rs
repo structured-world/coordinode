@@ -300,7 +300,8 @@ fn generate_mutation_type(labels: &[&LabelSchema], edge_types: &[&EdgeTypeSchema
 /// # Cluster-ready notes
 /// - Subscriptions are per-node (client connects to one node).
 /// - In CE 3-node HA: local WAL events trigger local subscriptions.
-/// - Cross-node subscription propagation via CDC/NATS in Phase 2+.
+/// - Events from other nodes do not reach a node's subscriptions; that
+///   needs propagation through CDC.
 fn generate_subscription_type(labels: &[&LabelSchema], edge_types: &[&EdgeTypeSchema]) -> String {
     let mut fields = Vec::new();
 

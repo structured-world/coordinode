@@ -1,4 +1,4 @@
-//! Integration tests for `DETACH DOCUMENT` (R167).
+//! Integration tests for `DETACH DOCUMENT`.
 //!
 //! Verifies the full pipeline (parse → plan → execute → merge flush) against
 //! real CoordiNode storage:

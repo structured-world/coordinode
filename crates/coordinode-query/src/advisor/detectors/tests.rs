@@ -123,7 +123,7 @@ fn no_missing_index_different_variable() {
     assert!(suggestions.is_empty());
 }
 
-// --- G022: IndexRegistry cross-check tests ---
+// --- IndexRegistry cross-check tests ---
 
 /// Index exists for (label, property) → no MissingIndex suggestion.
 #[test]

@@ -20,7 +20,7 @@ pub struct LogicalPlan {
     /// Set from session state or per-query hint. Shown in EXPLAIN output
     /// when the plan contains VectorFilter operators.
     pub vector_consistency: VectorConsistencyMode,
-    /// R-SNAP1: cross-modality read-consistency mode for this plan.
+    /// Cross-modality read-consistency mode for this plan.
     ///
     /// Set from an explicit `/*+ read_consistency('mode') */` hint or
     /// auto-promoted by the planner when the query touches >1 modality.
@@ -350,7 +350,7 @@ pub enum LogicalOp {
         transfer: Option<crate::plan::TransferEdgesSpec>,
     },
 
-    /// `MERGE NODES (a, b) INTO <target>` — native node-merge operation (R180).
+    /// `MERGE NODES (a, b) INTO <target>` — native node-merge operation.
     ///
     /// `input` produces rows binding `source_a` and `source_b` to node columns
     /// (built by the planner from a preceding MATCH). For each input row, the
@@ -370,7 +370,7 @@ pub enum LogicalOp {
     /// CLONE NODE: deep-copy a bound node into a fresh node, optionally cloning
     /// its incident edges. `input` binds `source`; the clone is bound to
     /// `target`. Single MVCC transaction; goes through the create path (fresh
-    /// id, index registration). See arch/compatibility/native-procedures.md.
+    /// id, index registration).
     CloneNode {
         input: Box<LogicalOp>,
         source: String,
@@ -386,8 +386,7 @@ pub enum LogicalOp {
 
     /// REDIRECT EDGES: re-point a bound node's edges onto another bound node.
     /// `input` binds both `source` and `target`. Single MVCC transaction;
-    /// adjacency moves via posting-list merge operators. See
-    /// arch/compatibility/native-procedures.md.
+    /// adjacency moves via posting-list merge operators.
     RedirectEdges {
         input: Box<LogicalOp>,
         source: String,
@@ -508,7 +507,7 @@ pub enum LogicalOp {
         properties: Vec<crate::plan::PropertyDecl>,
     },
 
-    /// CREATE NODE TYPE: declare a node-label schema entry (R172a per ADR-027).
+    /// CREATE NODE TYPE: declare a node-label schema entry.
     ///
     /// When `temporal = true`, every node of this label carries the bitemporal
     /// `(valid_from, valid_to)` interval and the engine-assigned
@@ -522,7 +521,7 @@ pub enum LogicalOp {
     },
 
     /// CREATE TABLE: declare a relational TABLE label with a declared primary
-    /// key and a physical storage layout (R901). A columnar table is backed by
+    /// key and a physical storage layout. A columnar table is backed by
     /// its own columnar-mode tree; a row table stays on the node path.
     CreateTable {
         name: String,
@@ -533,17 +532,17 @@ pub enum LogicalOp {
         columnar: bool,
     },
 
-    /// CREATE TRIGGER — the trigger architecture. Registers a trigger definition in the
-    /// schema partition, updates the `(target, event)` index, and (in EE)
-    /// notifies trigger workers of the new subscription.
+    /// CREATE TRIGGER. Registers a trigger definition in the schema
+    /// partition, updates the `(target, event)` index, and (in EE) notifies
+    /// trigger workers of the new subscription.
     CreateTrigger { clause: crate::plan::TriggerDef },
-    /// DROP TRIGGER — the trigger architecture.
+    /// DROP TRIGGER.
     DropTrigger { name: String },
 
-    /// DROP TABLE: drop a relational TABLE label (R901). Tombstones the schema
+    /// DROP TABLE: drop a relational TABLE label. Tombstones the schema
     /// pointer and, for a columnar table, drops its per-table columnar tree.
     DropTable { name: String },
-    /// SHOW TRIGGERS — the trigger architecture. Reads schema partition and returns one row per
+    /// SHOW TRIGGERS. Reads the schema partition and returns one row per
     /// registered trigger.
     ShowTriggers,
     /// SHOW SESSIONS: operational introspection. Reads the live session
@@ -552,7 +551,7 @@ pub enum LogicalOp {
     /// SHOW TRANSACTIONS: operational introspection. Reads the live session
     /// registry and returns one row per open interactive transaction.
     ShowTransactions,
-    /// ALTER TRIGGER — the trigger architecture.
+    /// ALTER TRIGGER.
     AlterTrigger {
         clause: crate::plan::AlterTriggerDef,
     },
@@ -588,7 +587,7 @@ pub enum LogicalOp {
         /// When present, the effective score is `vector_score * decay_value`.
         /// Detected from `vector_similarity(...) * decay_field > threshold` pattern.
         decay_field: Option<crate::plan::expr::Expr>,
-        /// Graph predicate push-down decision (R-PUSH1). Populated by the
+        /// Graph predicate push-down decision. Populated by the
         /// `optimize_push_down` planner pass when the upstream input contains
         /// a `Traverse`. `None` means either the input does not contain a
         /// traversal (no push-down applicable) or the optimizer pass was not
@@ -607,7 +606,7 @@ pub enum LogicalOp {
     /// (HNSW search → extract src/tgt → verify pattern) instead of graph-first
     /// (traverse → brute-force vector distance).
     ///
-    /// Decision thresholds (from arch/search/vector.md):
+    /// Decision thresholds:
     /// - < 200 edges: Graph-first (brute-force cheaper than HNSW overhead)
     /// - 200-10K + selectivity > 1%: Graph-first
     /// - 200-10K + selectivity < 1%: Vector-first
@@ -750,7 +749,7 @@ pub enum LogicalOp {
     /// a per-row scalar.
     ///
     /// `shard_overfetch_cap` is `None` for single-node CE. For the distributed
-    /// plan (R-HYB5) the shard-local stage sets this to `Some(K * 3)` so
+    /// plan the shard-local stage sets this to `Some(K * 3)` so
     /// each shard emits its top-K×3 rows with per-method ranks, and the
     /// coordinator stage re-ranks the union without a cap.
     RankFuse {
@@ -767,8 +766,7 @@ pub enum LogicalOp {
         /// one method resolves to text.
         query_text: Option<crate::plan::expr::Expr>,
         /// Per-shard overfetch cap (distributed RankFuse). `None` in CE /
-        /// single-node — always processes the full input. Shape ready for
-        /// R-HYB5 without call-site changes.
+        /// single-node — always processes the full input.
         shard_overfetch_cap: Option<usize>,
         /// Fusion kernel — RRF (default, rank-based) or score-aware variants.
         /// Defaults to `Rrf { k: 60 }` so existing callers see no behavioural
@@ -776,7 +774,7 @@ pub enum LogicalOp {
         fusion: FusionStrategy,
     },
 
-    /// Document-level aggregate score (R-HYB2c).
+    /// Document-level aggregate score.
     ///
     /// For each input row that binds `doc_variable` to a Document node,
     /// traverse outward `HAS_CHUNK` edges, score each chunk against the
@@ -1259,7 +1257,7 @@ impl std::fmt::Display for EdgeVectorStrategy {
 
 /// Select edge vector strategy based on estimated fan-out and threshold.
 ///
-/// Decision table from arch/search/vector.md:
+/// Decision table:
 /// - < 200 edges: Graph-first (brute-force cheaper than HNSW overhead)
 /// - 200-10K + threshold > 0.01 (selectivity > 1%): Graph-first
 /// - 200-10K + threshold <= 0.01 (selectivity < 1%): Vector-first
@@ -1861,8 +1859,8 @@ impl LogicalPlan {
 
     /// The stable EXPLAIN `push_down` JSON block for this plan's graph→vector
     /// push-down decision, or `None` when no `VectorFilter` carries one (no
-    /// `TRAVERSE`→`VECTOR_FILTER` shape, or the pass did not run). Schema is the
-    /// public contract in `arch/core/query-engine.md` (R-PUSH2). The block is
+    /// `TRAVERSE`→`VECTOR_FILTER` shape, or the pass did not run). The schema
+    /// is a public contract (see [`crate::planner::push_down`]). The block is
     /// the SW Query Advisor's machine-readable view of the strategy choice.
     #[must_use]
     pub fn explain_push_down_json(&self) -> Option<String> {
@@ -2268,7 +2266,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 ""
             };
             // Surface the push-down strategy on the operator line when the
-            // planner attached a decision (graph→vector push-down, R-PUSH1/2).
+            // planner attached a decision (graph→vector push-down).
             let strategy_info = push_down
                 .as_ref()
                 .map(|d| format!(", strategy={}", d.strategy.as_wire_str()))

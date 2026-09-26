@@ -180,7 +180,7 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         }
     }
 
-    // R-SNAP1: auto-promote `read_consistency` to `snapshot` when the query
+    // Auto-promote `read_consistency` to `snapshot` when the query
     // touches >1 modality. An explicit hint always wins — even a hint that
     // sets `current` on a cross-modality query is honoured (user knows
     // something the planner doesn't).
@@ -192,7 +192,7 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
         }
     });
 
-    // R-SNAP1 vector-consistency narrower override: if the user explicitly
+    // Vector-consistency narrower override: if the user explicitly
     // set `vector_consistency`, it wins for the vector modality. Otherwise
     // `vector_consistency` follows `read_consistency` (Current → Current,
     // Snapshot → Snapshot, Exact → Exact) — the three variants map 1:1.
@@ -213,10 +213,9 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
     })
 }
 
-/// R-SNAP1: count the number of distinct modalities a logical plan touches.
+/// Count the number of distinct modalities a logical plan touches.
 ///
-/// The auto-promotion rule (arch/core/transactions.md § Read Consistency)
-/// says:
+/// The read-consistency auto-promotion rule:
 /// > IF query touches >1 modality (graph + vector, vector + text, etc.):
 /// >     read_consistency = 'snapshot'
 /// > ELSE IF query is single-modality:
@@ -233,10 +232,9 @@ pub fn build_logical_plan(query: &Query) -> Result<LogicalPlan, PlanError> {
 ///   as its own modality for the cross-modality promotion rule, since it
 ///   mixes graph traversal + vector scoring with a distinct cache column.
 fn modality_count(root: &LogicalOp) -> usize {
-    // Per `arch/core/transactions.md § Read Consistency`: the auto-promotion
-    // rule fires when a query touches MORE THAN ONE modality from the set
-    // {graph, vector, text, doc}. Arch doc explicitly names "pure vector KNN"
-    // and "pure graph traversal" as single-modality examples.
+    // The auto-promotion rule fires when a query touches MORE THAN ONE
+    // modality from the set {graph, vector, text, doc}. "Pure vector KNN"
+    // and "pure graph traversal" are both single-modality.
     //
     // The subtlety: every query begins with a NodeScan / IndexScan — that's
     // the row source, not a distinct "graph modality". A VectorTopK riding on
@@ -417,7 +415,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                     })
                 }
                 Some(existing) if mc.where_clause.is_some() => {
-                    // G024: When building on top of a prior clause, the WHERE
+                    // When building on top of a prior clause, the WHERE
                     // may reference variables from both the prior plan (existing)
                     // and this MATCH's patterns. Predicates referencing prior
                     // variables must be lifted ABOVE the CartesianProduct.
@@ -972,7 +970,7 @@ fn parse_vector_metric(s: Option<&str>) -> coordinode_core::graph::types::Vector
 /// - `sq8` → `Sq8`
 /// - `rabitq` / `rabitq-1bit` → `RaBitQ { bits: 1 }`
 /// - `rabitq-2bit` / `rabitq-3bit` / `rabitq-4bit` → Extended-RaBitQ
-///   at the indicated bit width (R862)
+///   at the indicated bit width
 ///
 /// Unrecognized values fall back to `None` rather than erroring so a
 /// typo in a DDL string doesn't fail an entire migration; the planner
@@ -2347,8 +2345,8 @@ fn extract_vector_label_prop<'a>(
 
 /// Compute the push-down decision for a `VectorFilter` whose upstream input
 /// contains a `Traverse`. Pulls per-index statistics via [`StorageStats`]
-/// when available; falls back to documented defaults from
-/// `arch/core/query-engine.md` § Graph Predicate Push-Down otherwise.
+/// when available; falls back to the default crossover and selectivity
+/// constants otherwise.
 ///
 /// `enclosing_limit` is the LIMIT value of the enclosing ancestor (the
 /// optimizer pass walks top-down and remembers Limit values it has seen
@@ -2356,11 +2354,10 @@ fn extract_vector_label_prop<'a>(
 /// top_k = 100.
 ///
 /// Estimation is approximate by design — the planner compares costs
-/// ordinally, and refinement (better selectivity estimation, histograms,
-/// per-shard fan-out) is the scope of future tasks (R-PUSH2/R-PUSH4 and
-/// later CBO work). What R-PUSH1 guarantees is that the rule fires and
-/// produces a deterministic decision; the EXPLAIN-visible cost numbers
-/// will tighten over releases without breaking the strategy contract.
+/// ordinally, without histograms or per-shard fan-out. What is guaranteed
+/// is that the rule fires and produces a deterministic decision; the
+/// EXPLAIN-visible cost numbers may tighten over releases without breaking
+/// the strategy contract.
 fn compute_push_down_decision(
     vector_expr: &crate::plan::expr::Expr,
     input: &LogicalOp,
@@ -2424,8 +2421,7 @@ fn compute_push_down_decision(
     // For `vector_similarity(...) > 0.9`, low threshold means very few
     // matches; for `vector_distance(...) < 0.1`, similarly selective. The
     // current heuristic is intentionally simple — neutral 0.5 unless the
-    // threshold is extreme. R-PUSH2 will refine this from real index
-    // distribution stats.
+    // threshold is extreme; it does not read the index's distribution.
     let vector_selectivity = if less_than {
         // distance < threshold: lower threshold = fewer matches = lower selectivity
         (threshold * 0.5).clamp(0.001, 1.0)
@@ -3978,7 +3974,7 @@ fn apply_compound_where(predicate: &Expr, input: LogicalOp) -> Result<LogicalOp,
 
 /// Collect variables introduced by a list of MATCH patterns.
 ///
-/// Used by G024 predicate lifting to determine which variables
+/// Used by cross-MATCH predicate lifting to determine which variables
 /// a MATCH branch introduces vs which come from prior clauses.
 fn collect_pattern_variables(patterns: &[Pattern]) -> Vec<String> {
     let mut vars = Vec::new();
@@ -4305,7 +4301,7 @@ fn find_last_variable(op: &LogicalOp) -> String {
 }
 
 // =============================================================================
-// R-HYB2b: rrf_score planner post-pass
+// rrf_score planner post-pass
 // =============================================================================
 
 /// Signature captured from the first `rrf_score(...)` / `cc_score(...)` /
@@ -5013,7 +5009,7 @@ fn ensure_rrf_passthrough(op: LogicalOp) -> LogicalOp {
 }
 
 // =============================================================================
-// R-HYB2c: doc_score planner post-pass
+// doc_score planner post-pass
 // =============================================================================
 
 /// Canonical signature captured from a `doc_score(...)` call-site. Multiple

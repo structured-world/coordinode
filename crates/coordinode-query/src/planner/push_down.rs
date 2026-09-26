@@ -1,7 +1,6 @@
-//! Graph predicate push-down into vector scan (R-PUSH1).
+//! Graph predicate push-down into vector scan.
 //!
-//! Implements the planner-level rule from `arch/core/query-engine.md`
-//! § Graph Predicate Push-Down into Vector Scan: when a plan contains a
+//! The planner-level rule: when a plan contains a
 //! `TRAVERSE` stage producing a candidate set `C` followed by a
 //! `VECTOR_FILTER` over property `p`, the planner picks one of three
 //! strategies and annotates the `VectorFilter` operator with the decision.
@@ -18,7 +17,7 @@ use std::collections::HashMap;
 
 /// The three push-down strategies the planner may pick.
 ///
-/// Stable wire identity (part of EXPLAIN JSON contract, R-PUSH2/R-PUSH4):
+/// Stable wire identity (part of the EXPLAIN JSON contract):
 /// new variants may be added in future versions, but existing variants are
 /// never renamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,7 +53,7 @@ impl std::fmt::Display for PushDownStrategy {
 
 /// Stable reason slugs explaining why a strategy was picked.
 ///
-/// Part of the EXPLAIN JSON contract (R-PUSH2/R-PUSH4): callers may rely on
+/// Part of the EXPLAIN JSON contract: callers may rely on
 /// these exact slug strings; new slugs may be added but existing slugs are
 /// never renamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,10 +123,9 @@ pub struct PushDownDecision {
 }
 
 impl PushDownDecision {
-    /// Render the stable EXPLAIN `push_down` JSON block defined in
-    /// `arch/core/query-engine.md` § Graph Predicate Push-Down (EXPLAIN output
-    /// contract). Field names and the `strategy` / `reason` slug strings are
-    /// frozen across minor versions (R-PUSH2 / R-PUSH4); new slugs may be added
+    /// Render the stable EXPLAIN `push_down` JSON block. Field names and the
+    /// `strategy` / `reason` slug strings are frozen across minor versions;
+    /// new slugs may be added
     /// but existing ones are never renamed. `cost_units_alternatives` lists
     /// every strategy considered, sorted by slug for deterministic output.
     #[must_use]
@@ -163,7 +161,7 @@ impl PushDownDecision {
 ///
 /// These are properties of the HNSW index itself, cached on the
 /// `SegmentDescriptor` / `IndexDefinition` after build, not recomputed per
-/// query. R-PUSH1 cost model treats them as constants for the lifetime of
+/// query. The cost model treats them as constants for the lifetime of
 /// the index.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VectorIndexParams {
@@ -244,7 +242,7 @@ pub fn cost_vector_first(n_total: usize, vector_dim: u32, k: usize) -> f64 {
 
 /// α(selectivity) for ACORN cost model.
 ///
-/// Per `arch/search/vector.md` § HNSW Filtering: α ≈ 1 at 30% selectivity,
+/// Filtered HNSW (ACORN) costs α ≈ 1 at 30% selectivity,
 /// ≈ 4 at 5% selectivity. Linear interpolation in the [5%, 30%] band.
 ///
 /// Outside the band: clamped to the endpoint values (1.0 above 30%, 4.0
@@ -273,8 +271,7 @@ const ACORN_BAND_HIGH: f64 = 0.30;
 /// selective" — HNSW top-K + graph verify wins over any graph-first variant.
 const VECTOR_HIGHLY_SELECTIVE_THRESHOLD: f64 = 0.01;
 
-/// Implement the strategy-selection rule from
-/// `arch/core/query-engine.md` § Graph Predicate Push-Down:
+/// Implement the graph-predicate push-down strategy-selection rule:
 ///
 /// ```text
 /// if |C| < crossover(p):                        -> Graph-first

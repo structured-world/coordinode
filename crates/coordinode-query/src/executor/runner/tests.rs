@@ -28,10 +28,9 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
 }
 
 /// Insert a test node into storage via the typed Layer-4
-/// [`coordinode_modality::LocalNodeStore`]. The helper used to
-/// hand-build the node key via `encode_node_key`; routing
-/// through `NodeStore::put` keeps the fixture aligned with the
-/// engine's idiomatic write path (R165 / R166 encoder lockdown).
+/// [`coordinode_modality::LocalNodeStore`]. Routing through
+/// `NodeStore::put` instead of hand-building the key keeps the fixture
+/// aligned with the engine's write path (see the encoder lockdown test).
 fn insert_node(
     engine: &StorageEngine,
     shard_id: u16,
@@ -405,9 +404,8 @@ fn make_ctx<'a>(
         drain_buffer: None,
         nvme_write_buffer: None,
         mvcc_snapshot: None,
-        // L1/L2 cascade tracking (the trigger architecture) — counters start at zero per
-        // originating user mutation; defaults match cluster setting
-        // defaults documented in the trigger architecture.
+        // L1/L2 cascade tracking — counters start at zero per originating
+        // user mutation; limits match the cluster setting defaults.
         cascade_depth: 0,
         cascade_depth_limit: 10,
         cascade_fire_counts: std::collections::HashMap::new(),
@@ -3175,7 +3173,7 @@ fn aggregate_pipeline_with_then_group_by() {
     assert_eq!(result[0].get("total"), Some(&Value::Int(3))); // 3 User nodes
 }
 
-// -- DETACH DELETE reverse posting list cleanup (G050) --
+// -- DETACH DELETE reverse posting list cleanup --
 
 #[test]
 fn detach_delete_cleans_reverse_posting_lists() {
@@ -3530,7 +3528,7 @@ fn detach_delete_multi_edge_type_targeted_lookup() {
     }
 }
 
-// ── Correlated OPTIONAL MATCH detection (G004) ─────────────────────
+// ── Correlated OPTIONAL MATCH detection ────────────────────────────
 
 #[test]
 fn needs_correlated_non_correlated() {
@@ -3662,10 +3660,10 @@ fn collect_expr_vars_covers_string_match() {
     assert!(vars.contains(&"b".to_string()));
 }
 
-// -- G067: Parallel path OCC read-set tracking --
+// -- Parallel path OCC read-set tracking --
 
 #[test]
-fn g067_parallel_traversal_leaves_no_occ_scope() {
+fn parallel_traversal_leaves_no_occ_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = std::sync::Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(100)));
     let engine = StorageEngine::open_with_oracle(
@@ -3766,7 +3764,7 @@ fn g067_parallel_traversal_leaves_no_occ_scope() {
 }
 
 #[test]
-fn g104_ensure_occ_scope_idempotent_in_mvcc_mode() {
+fn ensure_occ_scope_idempotent_in_mvcc_mode() {
     // ensure_occ_scope must create scope exactly once per
     // transaction and return the same handle on subsequent
     // calls — otherwise tracked keys collected before the
@@ -3988,7 +3986,7 @@ fn mvcc_get_edge_props_leaves_no_occ_scope() {
     .expect("open");
     let src = NodeId::from_raw(1);
     let tgt = NodeId::from_raw(2);
-    // Seed via the Layer-4 store. Post-ADR-040 `EdgeProperties` and the
+    // Seed via the Layer-4 store. `EdgeProperties` and the
     // executor's `Vec<(field_id, Value)>` shape serialise to identical
     // bytes through the one canonical codec, so the executor reads this
     // fixture back verbatim.
@@ -4056,7 +4054,7 @@ fn mvcc_get_edge_props_temporal_tracks_25byte_key_not_short() {
     let src = NodeId::from_raw(11);
     let tgt = NodeId::from_raw(22);
     // Seed a temporal edge version through the Layer-4 store (canonical
-    // edgeprop codec — wire-identical to the executor, ADR-040).
+    // edgeprop codec — wire-identical to the executor).
     {
         use coordinode_core::graph::edge::EdgeProperties;
         use coordinode_core::txn::write_concern::WriteConcern;
@@ -4334,9 +4332,8 @@ fn mvcc_get_edge_props_missing_returns_none() {
 
 #[test]
 fn upsert_on_match_concurrent_write_is_caught_by_layer3_occ() {
-    // R165 S6 removed the manual byte-CAS pre-flight from
-    // execute_merge. Layer-3 OCC must now catch the same
-    // "concurrent writer modified a matched node between MATCH
+    // execute_merge has no byte-CAS pre-flight, so Layer-3 OCC must
+    // catch the "concurrent writer modified a matched node between MATCH
     // and SET" scenario at commit time via has_write_after.
     //
     // Scenario: txn MATCH-reads node `k`, a sibling txn writes `k`, then the
@@ -5236,7 +5233,7 @@ fn legacy_mode_prefix_scan_does_not_materialise_scope() {
 }
 
 #[test]
-fn g104_ensure_occ_scope_returns_none_in_legacy_mode() {
+fn ensure_occ_scope_returns_none_in_legacy_mode() {
     // Legacy mode (no MVCC oracle) → no OCC scope, no conflict
     // detection. Calling ensure_occ_scope must be safe and
     // return None.
@@ -5262,7 +5259,7 @@ fn g104_ensure_occ_scope_returns_none_in_legacy_mode() {
 }
 
 #[test]
-fn g067_parallel_occ_detects_conflict_on_target_node() {
+fn parallel_occ_detects_conflict_on_target_node() {
     // End-to-end: parallel traversal reads target nodes, concurrent write
     // modifies one target, OCC conflict detection catches it.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -5505,7 +5502,7 @@ fn detach_delete_adj_purge_is_buffered_not_immediate() {
     );
 }
 
-// --- CREATE INDEX / DROP INDEX DDL integration tests (R-API2) ---
+// --- CREATE INDEX / DROP INDEX DDL integration tests ---
 
 /// Helper: build an ExecutionContext with the btree_index_registry wired in.
 fn make_ctx_with_btree<'a>(
@@ -5718,7 +5715,7 @@ fn create_index_duplicate_name_returns_error() {
     );
 }
 
-/// Regression test (R-API2): after CREATE INDEX, EXPLAIN must show IndexScan
+/// Regression test: after CREATE INDEX, EXPLAIN must show IndexScan
 /// instead of NodeScan for a matching WHERE clause.
 ///
 /// Without `optimize_index_selection`, MATCH (n:User) WHERE n.name = "Alice"
@@ -6062,7 +6059,7 @@ fn index_scan_resolves_correlated_key() {
     );
 }
 
-// -- R171: edgeprop_write_key routing --
+// -- edgeprop_write_key routing --
 
 #[test]
 fn edgeprop_write_key_non_temporal_uses_legacy_shape() {
@@ -6102,7 +6099,7 @@ fn edgeprop_write_key_temporal_keys_sort_by_valid_from() {
     assert!(early < late, "earlier valid_from must sort first");
 }
 
-// ── the trigger architecture: L1+L2 cascade tracking ────────────────────────────
+// ── L1+L2 cascade tracking ──────────────────────────────────────────────────────
 
 /// L1 trip: nesting deeper than the depth limit returns `CascadeOverflow`
 /// with the full chain attached for diagnostics.

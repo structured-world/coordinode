@@ -20,7 +20,7 @@ use coordinode_core::schema::validation::validate_one;
 use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_storage::engine::core::StorageEngine;
-// ADR-041 storage-partition guard: the only legitimate Partition users in this
+// Storage-partition guard: the only legitimate Partition users in this
 // crate are the partition-parameterised transaction primitives below (which
 // take it by argument) and test fixtures. Production execution goes through the
 // typed Layer-4 stores. See the crate-level `#![deny(clippy::disallowed_types)]`.
@@ -192,7 +192,7 @@ pub enum ExecutionError {
     #[error("schema violation: {0}")]
     SchemaViolation(String),
 
-    /// L1 cycle protection trip (the trigger architecture): cumulative trigger cascade depth
+    /// L1 cycle protection trip: cumulative trigger cascade depth
     /// for the current originating mutation exceeded its limit. `chain` lists
     /// the trigger names that fired, in firing order, to help diagnose the
     /// runaway cascade.
@@ -203,7 +203,7 @@ pub enum ExecutionError {
         chain: Vec<String>,
     },
 
-    /// L2 cycle protection trip (the trigger architecture): a single trigger fired more times
+    /// L2 cycle protection trip: a single trigger fired more times
     /// than its `CASCADE_FANOUT` allows within one cascade root. Wide-but-
     /// shallow runaways (one trigger re-firing per row of a batch) trip this
     /// well before L1.
@@ -313,7 +313,7 @@ impl FeedbackCache {
 
 impl Default for FeedbackCache {
     fn default() -> Self {
-        Self::new(100_000) // matches arch doc: feedback_cache_size: 100000
+        Self::new(100_000) // default feedback_cache_size
     }
 }
 
@@ -516,36 +516,35 @@ pub struct ExecutionContext<'a> {
     /// Reached only by the [`LogicalOp::Extension`] dispatch arm; `None` /
     /// empty in pure-CE contexts means no extension ops are dispatchable.
     pub extensions: Option<&'a ExtensionRegistry>,
-    /// Optional VectorLoader for disk-backed f32 reranking (G009).
+    /// Optional VectorLoader for disk-backed f32 reranking.
     /// When HNSW indexes have `offload_vectors` enabled, this loader provides
     /// f32 vectors from storage for exact reranking of SQ8 candidates.
     pub vector_loader: Option<&'a dyn coordinode_vector::VectorLoader>,
     /// MVCC timestamp oracle. When set, enables MVCC-versioned reads/writes.
     pub mvcc_oracle: Option<&'a TimestampOracle>,
-    /// R-SNAP2: per-shard `maxAssigned` watermark handle.
+    /// Per-shard `maxAssigned` watermark handle.
     ///
     /// Readers under `read_consistency = 'snapshot'` call
     /// `applied_watermark.wait_for(snapshot_ts, read_timeout)` before
     /// dispatching the read, so every modality on this shard observes the
     /// fully-applied state at `snapshot_ts`. `None` in legacy /
     /// single-writer test contexts — the executor then skips the wait and
-    /// reads "current" state. Wired in by `R-SNAP1` at the planner
-    /// auto-promotion site.
+    /// reads "current" state.
     pub applied_watermark:
         Option<std::sync::Arc<coordinode_core::txn::watermark::MaxAssignedWatermark>>,
-    /// R-SNAP1: cross-modality read consistency mode for this statement.
+    /// Cross-modality read consistency mode for this statement.
     /// Set by the planner from `LogicalPlan::read_consistency` (hint or
     /// auto-promotion). Default `Current` preserves the single-modality
     /// fast path.
     pub read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode,
-    /// R-SNAP1: timeout for `applied_watermark.wait_for(snapshot_ts, …)`
-    /// under `Snapshot` / `Exact` consistency. Default 2s matches
-    /// `arch/core/transactions.md § Cross-Modality Snapshot Protocol`.
+    /// Timeout for `applied_watermark.wait_for(snapshot_ts, …)` under
+    /// `Snapshot` / `Exact` consistency. Default 2s, the documented
+    /// `read_timeout`.
     pub read_timeout: std::time::Duration,
     /// MVCC read timestamp (start_ts). Allocated from oracle at statement start.
     /// All reads see a consistent snapshot at this timestamp.
     pub mvcc_read_ts: Timestamp,
-    /// Layer-3 transaction context (ADR-041): owns the MVCC read snapshot,
+    /// Layer-3 transaction context: owns the MVCC read snapshot,
     /// the read-your-own-writes write buffer, and the OCC read-set. The
     /// executor routes primitive `(partition, key)` reads/writes through it
     /// (`mvcc_get` / `mvcc_put` / `mvcc_delete` / `mvcc_prefix_scan` delegate
@@ -605,9 +604,7 @@ pub struct ExecutionContext<'a> {
     /// checkpoint protocol (`begin_drain` / `complete_drain`) ensures entries
     /// are cleaned up after successful Raft commit.
     pub nvme_write_buffer: Option<&'a coordinode_storage::cache::write_buffer::NvmeWriteBuffer>,
-    /// Pending merge-add UIDs per adj key (raw key, no MVCC timestamp).
-    ///
-    /// MVCC snapshot for point-in-time reads (ADR-016: native seqno MVCC).
+    /// MVCC snapshot for point-in-time reads (native seqno MVCC).
     ///
     /// When MVCC is enabled, this snapshot is created at `mvcc_read_ts` via
     /// `engine.snapshot_at(seqno)`. All reads (mvcc_get, mvcc_prefix_scan)
@@ -616,24 +613,20 @@ pub struct ExecutionContext<'a> {
     ///
     /// When None (legacy mode), reads go directly through engine.get().
     pub mvcc_snapshot: Option<StorageSnapshot>,
-    /// L1 cascade depth counter (the trigger architecture). Shared across all triggers in
-    /// one originating user mutation. Incremented before each trigger body
-    /// is executed, decremented (RAII-style) when the body returns. When
-    /// `cascade_depth > cascade_depth_limit` the firing is rejected with
-    /// `ExecutionError::CascadeOverflow`.
-    ///
-    /// Wired by the trigger architecture probe; enforced by future trigger executors executors.
+    /// L1 cascade depth counter. Shared across all triggers in one
+    /// originating user mutation. Incremented before each trigger body is
+    /// executed ([`Self::cascade_enter`]), decremented when the body returns
+    /// ([`Self::cascade_exit`]). When `cascade_depth > cascade_depth_limit`
+    /// the firing is rejected with `ExecutionError::CascadeOverflow`.
     pub cascade_depth: u32,
     /// Cluster-default cap on `cascade_depth`. Per-trigger `CASCADE_LIMIT n`
     /// in the trigger definition tightens this further when present.
     /// Source: cluster setting `triggers.max_cascade_depth` (default 10).
     pub cascade_depth_limit: u32,
-    /// L2 unique-trigger fanout map (the trigger architecture). Keyed by trigger name; value
-    /// is the number of times that trigger has fired within the current
-    /// cascade root. When `cascade_fire_counts[name] > cascade_fanout_limit`
-    /// the firing is rejected with `ExecutionError::CascadeFanoutOverflow`.
-    ///
-    /// Wired by the trigger architecture probe; enforced by future trigger executors executors.
+    /// L2 unique-trigger fanout map. Keyed by trigger name; value is the
+    /// number of times that trigger has fired within the current cascade
+    /// root. When `cascade_fire_counts[name] > cascade_fanout_limit` the
+    /// firing is rejected with `ExecutionError::CascadeFanoutOverflow`.
     pub cascade_fire_counts: HashMap<String, u32>,
     /// Cluster-default cap on per-trigger fanout. Per-trigger `CASCADE_FANOUT n`
     /// tightens this further when present. Source: cluster setting
@@ -644,7 +637,7 @@ pub struct ExecutionContext<'a> {
     /// dead-letter records when L1/L2 trip.
     pub cascade_chain: Vec<String>,
     /// Async AFTER COMMIT cascade generation of the statement being executed
-    /// (the trigger architecture L1, ADR-026). `0` for a user statement; set to
+    /// (the async counterpart of L1). `0` for a user statement; set to
     /// the queued event's `generation` when the dispatcher runs a trigger body,
     /// so any AFTER COMMIT events that body enqueues are stamped `generation + 1`
     /// and the dispatcher can bound the async cascade depth.
@@ -740,7 +733,7 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// L1+L2 cascade entry (the trigger architecture). Call before executing a trigger body.
+    /// L1+L2 cascade entry. Call before executing a trigger body.
     /// Increments depth + per-trigger fire count, appends to chain, and trips
     /// `CascadeOverflow` / `CascadeFanoutOverflow` when limits are exceeded.
     ///
@@ -823,11 +816,10 @@ impl<'a> ExecutionContext<'a> {
         self.cascade_chain.clear();
     }
 
-    /// load all enabled triggers that match a single
+    /// Load all enabled triggers that match a single
     /// `(target_segment, event)` mutation. The lookup is O(matching_triggers)
     /// — it reads exactly one index key + N definition keys, never scans the
-    /// trigger table. future trigger executors call this at trigger firing time; the trigger architecture
-    /// itself only ships the helper + tests.
+    /// trigger table. Called at trigger firing time.
     ///
     /// `target_segment` must come from
     /// `TriggerTargetSchema::index_key_segment` (`n:Label` or `e:EdgeType`).
@@ -944,8 +936,8 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// Sync the Layer-3 transaction's read snapshot + read timestamp from the
-    /// executor's current values. Transitional (ADR-041): the executor still
-    /// owns `mvcc_snapshot` / `mvcc_read_ts` (assigned post-construction and
+    /// executor's current values. The executor owns `mvcc_snapshot` /
+    /// `mvcc_read_ts` (assigned post-construction and
     /// read pervasively), so we refresh the transaction's copies at the point
     /// of each read. Called at the entry of every read primitive; the
     /// transaction's OCC scope is created lazily at the first tracked read,
@@ -981,12 +973,12 @@ impl<'a> ExecutionContext<'a> {
     /// MVCC-aware read: write buffer → snapshot O(1) → legacy fallback.
     ///
     /// 1. Check write buffer (read-your-own-writes within this statement)
-    /// 2. If MVCC snapshot set: snapshot.get() — O(1) native seqno MVCC (ADR-016)
+    /// 2. If MVCC snapshot set: snapshot.get() — O(1) native seqno MVCC
     /// 3. If no snapshot: direct engine.get() — legacy mode
     ///
     /// Generic test-access primitive used by this crate's and downstream
     /// crates' tests. Production execution reads through the typed Layer-4
-    /// stores (no `Partition` in production query paths, ADR-041).
+    /// stores (no `Partition` in production query paths).
     #[allow(clippy::disallowed_types)] // partition-parameterised primitive
     pub fn mvcc_get(
         &mut self,
@@ -997,7 +989,7 @@ impl<'a> ExecutionContext<'a> {
         // RYOW for pending node merge deltas: materialize into the write
         // buffer so the transaction read below sees the correct state. This
         // node-modality concern stays above the modality-agnostic Layer-3
-        // transaction (ADR-041).
+        // transaction.
         if part == Partition::Node && self.txn.node_deltas().iter().any(|(k, _)| k == key) {
             self.materialize_node_deltas(key)?;
         }
@@ -1028,10 +1020,9 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Resolves the indirection through `schema:current_revision:label:<name>`
     /// to find the active schema revision, then loads
-    /// `schema:label:<name>:<revision>`. Per ADR-023 the schema partition is
-    /// revision-prefixed from day one; CE deployments only ever see revision 1
-    /// (no `ALTER LABEL SHARD BY` in CE), but the read path traverses the
-    /// pointer regardless so the same code handles future multi-revision EE.
+    /// `schema:label:<name>:<revision>`. The schema partition is
+    /// revision-prefixed: DDL such as `ALTER LABEL ... SET SCHEMA` writes a
+    /// new revision and moves the pointer, so readers always go through it.
     pub fn load_current_label_schema(
         &mut self,
         name: &str,
@@ -1159,7 +1150,7 @@ impl<'a> ExecutionContext<'a> {
         node_id: NodeId,
     ) -> Result<Option<NodeRecord>, ExecutionError> {
         // Layer-4 LocalNodeStore owns key encoding + node-delta RYOW and does
-        // the OCC-tracked read (ADR-041); the query layer keeps the decode +
+        // the OCC-tracked read; the query layer keeps the decode +
         // its diagnostic error contract (node id in the message).
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
@@ -1215,13 +1206,13 @@ impl<'a> ExecutionContext<'a> {
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
         // Delegate to Layer-4 LocalNodeStore (owns key encoding + msgpack);
-        // the put buffers on the transaction for atomic flush (ADR-041).
+        // the put buffers on the transaction for atomic flush.
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
         Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
     }
 
-    /// Write a node record into a `STORAGE COLUMNAR` table's own tree (R901).
+    /// Write a node record into a `STORAGE COLUMNAR` table's own tree.
     ///
     /// Columnar tables live outside the Partition-based transaction, so the
     /// write goes straight to the table's columnar tree at a fresh oracle
@@ -1700,7 +1691,7 @@ impl<'a> ExecutionContext<'a> {
     pub fn mvcc_flush(&mut self) -> Result<Option<Timestamp>, ExecutionError> {
         // Push the executor's per-statement context (oracle, snapshot, read_ts)
         // into the Layer-3 transaction, then delegate to the single commit
-        // locus (ADR-041): OCC validation, commit_ts assignment, write-concern
+        // locus: OCC validation, commit_ts assignment, write-concern
         // fan-out, and the Raft proposal pipeline all live in `Transaction`.
         self.sync_txn_state();
         // Asked before the commit drains the buffers, which is the only
@@ -1740,11 +1731,11 @@ impl<'a> ExecutionContext<'a> {
     /// Materialize pending node merge deltas for a key into the write buffer.
     ///
     /// Called lazily from the generic `mvcc_get()` primitive. Production node
-    /// reads materialise deltas inside `LocalNodeStore` (ADR-041).
+    /// reads materialise deltas inside `LocalNodeStore`.
     fn materialize_node_deltas(&mut self, node_key: &[u8]) -> Result<(), ExecutionError> {
         // Node-delta read-your-own-writes lives in Layer-4 LocalNodeStore
         // (node-modality concern); the modality-agnostic transaction does not
-        // own it (ADR-041).
+        // own it.
         Ok(
             coordinode_modality::LocalNodeStore::materialize_pending_deltas(
                 &mut self.txn,
@@ -1790,7 +1781,7 @@ impl<'a> ExecutionContext<'a> {
     // ── Adj partition: raw posting read (test-only) ──
     // Production adjacency access goes through the typed EdgeStore methods
     // (posting_fwd/rev, posting_for_key, merge_add_fwd/rev, …) — no raw adj
-    // key or `Partition::Adj` in the query layer (ADR-041).
+    // key or `Partition::Adj` in the query layer.
 
     /// Read an adjacency posting list (raw key, no MVCC timestamp).
     ///
@@ -1853,8 +1844,8 @@ impl<'a> ExecutionContext<'a> {
     // `(edge_type, node)` instead of a pre-encoded key. All delegate to
     // the raw merge-path methods above, so the commutative merge +
     // read-your-own-writes + AS-OF snapshot semantics are unchanged.
-    // Adjacency stays off the OCC path by construction (edge add/remove
-    // is commutative — see storage-engine.md merge-operator contract).
+    // Adjacency stays off the OCC path by construction: edge add/remove
+    // goes through the posting-list merge operator, which is commutative.
 
     /// Forward-adjacency read (`src`'s out-neighbours for `edge_type`).
     pub fn adj_get_fwd(
@@ -2139,7 +2130,7 @@ pub(crate) fn plan_allows_varlen_target_dedup(root: &LogicalOp) -> bool {
 /// via [`execute_no_commit`] and then flushes the transaction
 /// ([`ExecutionContext::mvcc_flush`] — assign `commit_ts`, OCC validate,
 /// persist via the Raft proposal pipeline). Interactive multi-statement
-/// transactions (ADR-042) call [`execute_no_commit`] directly and commit the
+/// transactions call [`execute_no_commit`] directly and commit the
 /// shared transaction once, after the final statement.
 pub fn execute(
     plan: &LogicalPlan,
@@ -2157,13 +2148,13 @@ pub fn execute(
 /// Runs the full plan (snapshot setup, watermark wait, operator tree) and
 /// leaves every mutation buffered on `ctx.txn` — the caller is responsible
 /// for committing (or rolling back). [`execute`] wraps this with an
-/// auto-commit; interactive transactions (ADR-042) run N statements through
+/// auto-commit; interactive transactions run N statements through
 /// this entry against one shared `ctx.txn` and commit once at the end.
 pub fn execute_no_commit(
     plan: &LogicalPlan,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // ADR-016: Take MVCC snapshot at mvcc_read_ts for native seqno reads.
+    // Take MVCC snapshot at mvcc_read_ts for native seqno reads.
     // All reads (node, schema, edgeprop) go through this snapshot for O(1) lookups.
     // When oracle is set, snapshot_at(seqno) pins the LSM tree at read_ts.
     // For legacy mode (no oracle), mvcc_snapshot stays None → direct engine reads.
@@ -2198,7 +2189,7 @@ pub fn execute_no_commit(
     ctx.sync_txn_state();
 
     // Handle AS OF TIMESTAMP: evaluate the timestamp expression, override snapshots.
-    // Since commit_ts = seqno (ADR-016, OracleSeqnoGenerator), the timestamp value
+    // Since commit_ts = seqno (OracleSeqnoGenerator), the timestamp value
     // is directly usable as a snapshot seqno for both node and adj partitions.
     if let Some(ref ts_expr) = plan.snapshot_ts {
         let ts_val = eval_neutral(ts_expr, &Row::new())?;
@@ -2285,14 +2276,14 @@ pub fn execute_no_commit(
         &plan_owned
     };
 
-    // R-SNAP1: propagate the plan's cross-modality consistency decision into
+    // Propagate the plan's cross-modality consistency decision into
     // the execution context so downstream operators (VectorFilter, etc.)
     // observe it without a separate parameter. The planner has already
     // applied auto-promotion and the narrower `vector_consistency` override.
     ctx.read_consistency = plan.read_consistency;
     ctx.vector_consistency = plan.vector_consistency;
 
-    // R-SNAP1: cross-modality snapshot wait. When `read_consistency` is
+    // Cross-modality snapshot wait. When `read_consistency` is
     // `Snapshot` or `Exact`, every modality on this shard must observe the
     // fully-applied state at a single HLC timestamp T. Block on the
     // `MaxAssignedWatermark` until the applier has persisted every write
@@ -2403,7 +2394,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         } => {
             let input_rows = execute_op(input, ctx)?;
 
-            // G069: wildcard relationship pattern `MATCH (n)-[r]->(m)` — no type filter.
+            // Wildcard relationship pattern `MATCH (n)-[r]->(m)` — no type filter.
             // When edge_types is empty, expand over all schema-registered edge types.
             // This scans `schema:edge_type:<name>` keys (written on every CREATE edge)
             // plus any uncommitted registrations in the current transaction's write buffer.
@@ -2488,11 +2479,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         } => {
             let rows = execute_op(input, ctx)?;
 
-            // R-HYB1 guard: `text_score()` relies on `__text_score__` populated
-            // by an upstream `TextFilter`. If a projection references `text_score`
-            // but TextFilter never ran (missing FT index, or no paired
-            // `text_match(...)` in WHERE), we must fail with a clear error rather
-            // than silently returning 0.0. See ADR-020 and regression test
+            // text_score guard: `text_score()` relies on `__text_score__`
+            // populated by an upstream `TextFilter`. If a projection references
+            // `text_score` but TextFilter never ran (missing FT index, or no
+            // paired `text_match(...)` in WHERE), we must fail with a clear
+            // error rather than silently returning 0.0. See regression test
             // `text_score_without_text_match_errors`.
             let score_reqs: crate::executor::eval::ScoreRequirements = items
                 .iter()
@@ -2630,7 +2621,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::Sort { input, items } => {
             let rows = execute_op(input, ctx)?;
 
-            // Same R-HYB1 guard as Project: an `ORDER BY text_score(...)` (bare
+            // Same text_score guard as Project: an `ORDER BY text_score(...)` (bare
             // or inside arithmetic) without an upstream TextFilter would sort
             // by silent zeros. Error instead.
             let score_reqs: crate::executor::eval::ScoreRequirements = items
@@ -2735,7 +2726,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::CartesianProduct { left, right } => {
             let left_rows = execute_op(left, ctx)?;
 
-            // G072: MERGE (src)-[r:TYPE]->(tgt) in a CartesianProduct context requires
+            // MERGE (src)-[r:TYPE]->(tgt) in a CartesianProduct context requires
             // correlated execution so the Merge can access the bound src/tgt variables.
             // Without this, execute_merge gets no source/target IDs and fails when it
             // tries to create the edge from a non-NodeScan pattern.
@@ -2820,9 +2811,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // materialised candidate set. An ANN index cannot serve it: HNSW
             // answers top-k, and any k-bounded pre-filter drops candidates
             // that pass τ but rank below k globally — a different answer, not
-            // a lower recall. That is also what `query-engine.md` § Graph
-            // Predicate Push-Down forbids ("never materialise `C` and then run
-            // an unfiltered HNSW scan ignoring `C`").
+            // a lower recall. Graph-predicate push-down forbids the same
+            // thing: never materialise `C` and then run an unfiltered HNSW
+            // scan ignoring `C`.
             //
             // Nothing is lost by evaluating exactly: each surviving row's
             // score is recomputed from the row's own vector anyway, so the
@@ -3537,7 +3528,7 @@ fn execute_node_scan(
             Value::String(primary_label.clone()),
         );
 
-        // Inject COMPUTED property values from schema (R082).
+        // Inject COMPUTED property values from schema.
         inject_computed_properties(&mut row, variable, &primary_label, ctx);
 
         // Apply inline property filters from pattern. When this scan runs
@@ -3851,15 +3842,13 @@ fn execute_traverse(
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // R172d (initial slice): traversal into a temporal target label
-    // materialises EVERY version of the target node (prefix-scan over
-    // `node:<shard>:<target_uid>:*`). The version's `valid_from` is
-    // surfaced as `<target>.valid_from`, and each version emits its own
-    // row so downstream RETURN / WHERE can filter by interval. Without
-    // an `AS OF VALID_TIME` clause (G096) the read is "all versions" —
-    // the same default as label-scoped MATCH on temporal labels. Once
-    // R172d gains the AS OF clause + planner push-down, this scan will
-    // be narrowed to the requested time slice.
+    // Traversal into a temporal target label materialises EVERY version
+    // of the target node (prefix-scan over `node:<shard>:<target_uid>:*`).
+    // The version's `valid_from` is surfaced as `<target>.valid_from`, and
+    // each version emits its own row so downstream RETURN / WHERE can
+    // filter by interval. There is no `AS OF VALID_TIME` narrowing here:
+    // the read is "all versions", the same default as label-scoped MATCH
+    // on temporal labels.
     //
     // Behaviour is detected per target label at row-build time; the
     // dispatch happens in `build_target_rows`.
@@ -3966,7 +3955,7 @@ fn build_target_rows(
 
     let target_id = NodeId::from_raw(target_uid);
 
-    // R172d: detect whether ANY of the target labels is temporal. If
+    // Detect whether ANY of the target labels is temporal. If
     // so, every version of the target is materialised (prefix scan);
     // otherwise the legacy 16-byte point read is used. Detection runs
     // at row-build time — label schemas don't change within a single
@@ -4045,14 +4034,14 @@ fn build_target_rows(
             Value::String(target_label.clone()),
         );
 
-        // R172d: re-surface valid_from from the key suffix so callers
+        // Re-surface valid_from from the key suffix so callers
         // always see a non-null binding even if the stored property map
         // happens to omit it (defensive — write path requires it).
         if let Some(vf) = valid_from_opt {
             out_row.insert(format!("{target_variable}.valid_from"), Value::Int(vf));
         }
 
-        // Inject COMPUTED property values from schema (R082).
+        // Inject COMPUTED property values from schema.
         inject_computed_properties(&mut out_row, target_variable, &target_label, ctx);
 
         materialised_rows.push(out_row);
@@ -4278,7 +4267,8 @@ fn process_targets_parallel(
                 }
 
                 let mut out_row = input_row.clone();
-                // Update source in row for correct edge property lookup (G066 fix)
+                // Update source in row so a deeper hop looks its edge
+                // properties up from the actual source, not the start node.
                 out_row.insert(source.to_string(), Value::Int(*src_uid as i64));
                 out_row.insert(target_variable.to_string(), Value::Int(*tgt_uid as i64));
 
@@ -4302,7 +4292,7 @@ fn process_targets_parallel(
                     Value::String(target_label.clone()),
                 );
 
-                // Inject COMPUTED property values (R082) in parallel path
+                // Inject COMPUTED property values in parallel path
                 inject_computed_from_engine(
                     &mut out_row,
                     target_variable,
@@ -4315,7 +4305,7 @@ fn process_targets_parallel(
                 if let Some(ev) = edge_variable {
                     if let Some(et) = edge_type {
                         out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
-                        // G070: store relationship variable itself for count(r) support
+                        // Store the relationship variable itself for count(r) support
                         out_row.insert(ev.to_string(), Value::String(et.to_string()));
 
                         {
@@ -4430,7 +4420,7 @@ fn execute_single_hop_traverse(
         // traversal forces the sequential path. Non-temporal queries keep the
         // parallel optimization.
         let has_temporal = params.edge_temporal.iter().any(|t| *t);
-        // R172d: temporal target labels need per-version prefix scans
+        // Temporal target labels need per-version prefix scans
         // which the parallel target-materialisation path doesn't speak
         // yet. Force sequential when any target label is temporal —
         // mirrors the same gate as temporal edges above.
@@ -5638,7 +5628,7 @@ fn execute_rank_fuse(
         }
     }
 
-    // Apply shard overfetch cap (R-HYB5 future path; None in CE).
+    // Apply shard overfetch cap (set by a distributed plan; None in CE).
     if let Some(cap) = shard_overfetch_cap {
         if out_rows.len() > cap {
             // Sort by __rrf_score__ DESC and truncate to keep best candidates.
@@ -5717,7 +5707,7 @@ fn score_vector_method(
 }
 
 /// Score rows by a text (BM25) method via `TextIndexRegistry`. Missing FT-index
-/// for the (label, property) is a hard error (matches R-HYB1 guard spirit).
+/// for the (label, property) is a hard error, like the `text_score()` guard.
 fn score_text_method(
     rows: &[Row],
     method_expr: &crate::plan::expr::Expr,
@@ -6300,17 +6290,12 @@ fn coerce_value_to_vec(val: &Value) -> Option<Vec<f32>> {
     }
 }
 
-/// TextFilter: search TextIndex for matching documents, filter rows.
+/// Build the hard-fail error message for a missing full-text index.
 ///
-/// For each row, evaluates `text_expr` to get the text content of a node field,
-/// then searches the TextIndex for matches. Keeps rows whose node_id appears
-/// in the search results.
-/// Build the R-HYB1b hard-fail error message for a missing full-text index.
-///
-/// Consistent with R-HYB1 `text_score()` guard and R-HYB2b RankFuse text-method
-/// guard — `text_match()` no longer silently passes every row when the index
-/// is missing (that was the old graceful-degradation bug that turned
-/// `WHERE text_match(...)` into a no-op filter). Tells the user how to fix it.
+/// Consistent with the `text_score()` guard and the RankFuse text-method
+/// guard: `text_match()` must not silently pass every row when the index is
+/// missing, which would turn `WHERE text_match(...)` into a no-op filter.
+/// Tells the user how to fix it.
 fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -> ExecutionError {
     let msg = match (label, property) {
         (Some(l), Some(p)) => format!(
@@ -6328,6 +6313,11 @@ fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -
     ExecutionError::Unsupported(msg)
 }
 
+/// TextFilter: search TextIndex for matching documents, filter rows.
+///
+/// For each row, evaluates `text_expr` to get the text content of a node field,
+/// then searches the TextIndex for matches. Keeps rows whose node_id appears
+/// in the search results.
 fn execute_text_filter(
     rows: &[Row],
     text_expr: &crate::plan::expr::Expr,
@@ -6386,7 +6376,7 @@ fn execute_text_filter(
                     })?
                 }
             } else {
-                // R-HYB1b: registry is wired but has no index for (label, property) —
+                // Registry is wired but has no index for (label, property) —
                 // hard-fail, don't silently pass every row through.
                 return Err(text_match_missing_index_error(Some(l), Some(p)));
             }
@@ -6404,7 +6394,7 @@ fn execute_text_filter(
                     .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
             }
         } else {
-            // R-HYB1b: neither registry lookup worked nor legacy index present.
+            // Neither registry lookup worked nor legacy index present.
             return Err(text_match_missing_index_error(label, property));
         }
     } else if let Some(text_index) = ctx.text_index {
@@ -6419,7 +6409,7 @@ fn execute_text_filter(
                 .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
         }
     } else {
-        // R-HYB1b: no registry and no legacy index — hard-fail.
+        // No registry and no legacy index — hard-fail.
         return Err(text_match_missing_index_error(label, property));
     };
 
@@ -7370,7 +7360,7 @@ fn execute_merge(
     multi: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // G072: MERGE (src)-[r:TYPE]->(tgt) — relationship pattern with correlated bindings.
+    // MERGE (src)-[r:TYPE]->(tgt) — relationship pattern with correlated bindings.
     // When the pattern is a Traverse and ctx.correlated_row has src/tgt bound, use the
     // targeted match+create path instead of the generic execute_op + execute_create_from_pattern.
     // The generic path scans all nodes and fails to create edges from Traverse patterns.
@@ -7393,7 +7383,7 @@ fn execute_merge(
         return execute_update(&created, on_create, &ViolationMode::Fail, ctx);
     }
 
-    // G077: Standalone MERGE ALL — Cartesian product across all matching src × tgt nodes.
+    // Standalone MERGE ALL — Cartesian product across all matching src × tgt nodes.
     // Pattern: MERGE ALL (a:L {k:v})-[r:T]->(b:L {k:v})
     // Algorithm:
     //   1. Find or create source nodes (all of them).
@@ -7405,7 +7395,7 @@ fn execute_merge(
         }
     }
 
-    // G074: Standalone relationship MERGE — no correlated_row (no preceding MATCH).
+    // Standalone relationship MERGE — no correlated_row (no preceding MATCH).
     // Pattern: MERGE (a:L {k:v})-[r:T]->(b:L {k:v})
     // Algorithm:
     //   1. Try to find the complete existing path via execute_op (full graph scan).
@@ -7723,7 +7713,7 @@ fn execute_merge_relationship_check(
         }
 
         // Edge (src → tgt) exists in adjacency list.
-        // G075: if edge_filters are specified, also verify that the stored edge properties
+        // If edge_filters are specified, also verify that the stored edge properties
         // match. Two MERGEs with different property values for the same (src, tgt, type) are
         // treated as distinct — no match if properties differ (since the data model stores
         // one EdgeProp record per (type, src, tgt), a mismatch means the edge's current
@@ -8037,7 +8027,7 @@ fn correlated_subplan_rows(
 /// nodes bound in `correlated`. Called from `execute_merge` when no existing edge
 /// was found by `execute_merge_relationship_check`.
 ///
-/// G075: edge properties from `edge_filters` are now stored in the EdgeProp partition
+/// Edge properties from `edge_filters` are stored in the EdgeProp partition
 /// so that subsequent MATCH or MERGE can retrieve and compare them.
 fn execute_merge_relationship_create(
     traverse: &LogicalOp,
@@ -8125,7 +8115,7 @@ fn execute_merge_relationship_create(
         row.insert(format!("{ev}.__tgt__"), Value::Int(to_id.as_raw() as i64));
     }
 
-    // G075: store edge properties (from pattern `[r:TYPE {prop: val}]`) in EdgeProp partition.
+    // Store edge properties (from pattern `[r:TYPE {prop: val}]`) in EdgeProp partition.
     // Key: edgeprop:<TYPE>:<from_id BE>:<to_id BE>  (same format as CREATE clause).
     // Value: MessagePack Vec<(field_id, Value)>.
     // Note: if this edge already existed with different properties, the new values
@@ -8161,7 +8151,7 @@ fn execute_merge_relationship_create(
     Ok(vec![row])
 }
 
-/// G074: Create a complete relationship pattern for standalone MERGE (no preceding MATCH).
+/// Create a complete relationship pattern for standalone MERGE (no preceding MATCH).
 ///
 /// Called from `execute_merge` when the pattern is a Traverse but `correlated_row` is `None`
 /// and no existing complete path was found by `execute_op`.
@@ -8173,7 +8163,7 @@ fn execute_merge_relationship_create(
 ///   4. Merge the two node rows into a synthetic correlated row.
 ///   5. Delegate edge creation to `execute_merge_relationship_create`.
 ///
-/// "Find or create" semantics per GAPS.md G074:
+/// "Find or create" semantics:
 ///   - If a node matching the label+property pattern already exists, reuse the first match.
 ///   - If no matching node exists, create a new one with the given labels and properties.
 fn execute_merge_relationship_standalone_create(
@@ -8712,7 +8702,7 @@ fn execute_create_node(
         .map(|s| s.mode)
         .unwrap_or(SchemaMode::Flexible);
 
-    // R172a reserved-name guard at CREATE time: `__ingestion_ts__` is
+    // Reserved-name guard at CREATE time: `__ingestion_ts__` is
     // engine-owned on temporal labels — populated automatically with the HLC
     // commit timestamp, user-immutable. Rejecting user-supplied values up
     // front prevents accidental shadowing and matches the symmetric DDL-time
@@ -8728,20 +8718,16 @@ fn execute_create_node(
         }
     }
 
-    // R172a write-time guard: temporal node types require `valid_from` on every
+    // Write-time guard: temporal node types require `valid_from` on every
     // CREATE (mirror of the edge-side enforcement at `execute_create_edge`).
-    // Mechanical bitemporal storage (per-version node key with the i64 BE
-    // valid_from suffix) lands in R172b; this guard is here so the contract is
-    // honoured from R172a onward — a CREATE on a TEMPORAL label without
-    // `valid_from` is rejected at write time rather than silently writing a
-    // record that the future per-version key encoder cannot place.
+    // The per-version node key carries the i64 BE valid_from suffix, so a
+    // CREATE on a TEMPORAL label without `valid_from` is rejected at write
+    // time rather than writing a record the key encoder cannot place.
     //
     // Multi-label case: scan EVERY label, not just `labels.first()`. A node
     // declared `CREATE (n:Foo:Bar)` where any of Foo / Bar carries the
-    // TEMPORAL flag must satisfy the bitemporal contract. This is conservative
-    // — if a temporal mix is invalid (R172b will need to decide which key
-    // layout wins on conflict), the write must still reject without
-    // `valid_from`. Reports the first temporal label name to the user.
+    // TEMPORAL flag must satisfy the bitemporal contract. Reports the first
+    // temporal label name to the user.
     let mut temporal_label: Option<String> = None;
     for lbl in labels {
         if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
@@ -8761,7 +8747,7 @@ fn execute_create_node(
         }
     }
 
-    // R901: a relational table bridges its declared primary key to a NodeId, so
+    // A relational table bridges its declared primary key to a NodeId, so
     // the same key maps to the same node (identity + upsert-by-key). A ROW table
     // writes that node on the node path; a COLUMNAR table writes it to its own
     // columnar tree (`table_columnar`).
@@ -8874,7 +8860,7 @@ fn execute_create_node(
             }
         }
 
-        // R172b temporal storage path: when the (primary or any) label is
+        // Temporal storage path: when the (primary or any) label is
         // TEMPORAL, extract `valid_from` from the supplied properties and
         // emit the per-version key. Auto-populate `__ingestion_ts__` from
         // the current HLC commit timestamp so the bitemporal system-axis is
@@ -9280,14 +9266,14 @@ fn execute_update(
 
     let mut results = Vec::new();
 
-    // R172c temporal-node SET routing. For each SET item targeting a node
+    // Temporal-node SET routing. For each SET item targeting a node
     // on a temporal label, classify by property:
     //
     //   * `valid_from` → reject (immutable storage-key suffix).
     //   * `valid_to`   → mutate in place at the matched per-version key
-    //     (close-version path, Phase 1).
+    //     (the close-version path).
     //   * Other property / label mutations → write a NEW version row at
-    //     `valid_from = NOW` (close current + open new — Phase 2).
+    //     `valid_from = NOW` (the close+open path: close current, open new).
     //
     // Mixed `valid_to` + other items on the SAME variable in the SAME
     // clause is rejected as ambiguous: should `valid_to` close the
@@ -9362,8 +9348,8 @@ fn execute_update(
     'row_loop: for (row_idx, row) in input_rows.iter().enumerate() {
         let mut out_row = row.clone();
 
-        // R172c Phase 2: close-current + open-new processing for temporal
-        // nodes mutated by non-`valid_to` SET items. This block fires
+        // Close+open processing for temporal nodes mutated by non-`valid_to`
+        // SET items. This block fires
         // BEFORE the normal SET loop. For each (var) on this row that the
         // pre-scan classified as "needs new version", we:
         //   1. Read the current matched version's record (via the bound
@@ -9478,8 +9464,8 @@ fn execute_update(
                             }
                         }
                         crate::plan::SetItem::PropertyPath { path, expr, .. } => {
-                            // R172c Phase 3b: nested PropertyPath SET on
-                            // temporal. Build the same DocDelta the
+                            // Nested PropertyPath SET on temporal. Build
+                            // the same DocDelta the
                             // non-temporal path queues as a merge operand,
                             // but apply it in-memory to `new_record` so the
                             // close+open writes carry the post-delta state.
@@ -9513,8 +9499,8 @@ fn execute_update(
                             value_expr,
                             ..
                         } => {
-                            // R172c Phase 3b: doc_push / doc_pull /
-                            // doc_add_to_set / doc_inc on temporal nodes.
+                            // doc_push / doc_pull / doc_add_to_set /
+                            // doc_inc on temporal nodes.
                             // Same construction as the non-temporal path,
                             // but applied in-memory to `new_record`.
                             let val = eval_neutral(value_expr, &out_row)?;
@@ -9644,7 +9630,7 @@ fn execute_update(
         let mut edge_update_snapshots: std::collections::HashMap<String, EdgeUpdateSnapshot> =
             std::collections::HashMap::new();
         for (snap_item_idx, item) in items.iter().enumerate() {
-            // R172c Phase 2: skip items already processed in the close+open
+            // Skip items already processed in the close+open
             // pass above. Their snapshot is implicitly the pre-mutation
             // record (which still exists at the matched per-version key
             // until we rewrote its valid_to). For UPDATE-trigger purposes
@@ -9741,7 +9727,7 @@ fn execute_update(
         }
 
         for (item_idx, item) in items.iter().enumerate() {
-            // R172c Phase 2: skip items already handled by the close+open
+            // Skip items already handled by the close+open
             // path at the top of this row's processing. Their property
             // values are already in the new version's record and the
             // output row was updated to reflect that state.
@@ -9754,7 +9740,7 @@ fn execute_update(
                     property,
                     expr,
                 } => {
-                    // R172a reserved-name guard at SET time: `__ingestion_ts__`
+                    // Reserved-name guard at SET time: `__ingestion_ts__`
                     // is engine-owned on temporal labels (auto-populated with
                     // HLC commit-ts, user-immutable). Reject before any storage
                     // mutation so the bitemporal contract cannot be subverted
@@ -9796,7 +9782,7 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    // R172c temporal node close-version path: when the label
+                    // Temporal node close-version path: when the label
                     // is TEMPORAL and the property being set is `valid_to`,
                     // mutate the record at the per-version (25-byte) key
                     // bound by the row's `valid_from`. The valid_from key
@@ -10579,8 +10565,8 @@ fn execute_remove(
     items: &[crate::plan::RemoveItem],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // R172c Phase 3: REMOVE on a temporal node is a *new version* — same
-    // close-current + open-new dance as Phase 2 SET. Removing a property
+    // REMOVE on a temporal node is a *new version* — the same close+open
+    // path as a temporal SET. Removing a property
     // / label is a state change that must be visible as a new version in
     // the bitemporal record, not a silent in-place mutation of the
     // matched historical row.
@@ -10595,9 +10581,10 @@ fn execute_remove(
     //     property absent in the new record.
     //   * REMOVE `n:Label` → close current + open new with the label
     //     dropped.
-    //   * REMOVE `n.<path.to.nested>` (PropertyPath) → REJECT (Phase 3b,
-    //     same reason as SET nested path — merge_node_deltas is keyed on
-    //     the non-temporal key and needs a temporal-aware rewrite).
+    //   * REMOVE `n.<path.to.nested>` (PropertyPath) → close current + open
+    //     new, with the path removed by a DocDelta applied in memory to
+    //     the new record (the merge-operand path is keyed on the
+    //     non-temporal key).
     let mut temporal_remove_vars: std::collections::HashSet<(usize, String)> =
         std::collections::HashSet::new();
     for (row_idx, row) in input_rows.iter().enumerate() {
@@ -10639,7 +10626,7 @@ fn execute_remove(
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
                 crate::plan::RemoveItem::PropertyPath { .. } => {
-                    // R172c Phase 3b: classify; the delta is built and
+                    // Classify; the delta is built and
                     // applied to `new_record` in the close+open block.
                     temporal_remove_vars.insert((row_idx, var.clone()));
                 }
@@ -10655,9 +10642,9 @@ fn execute_remove(
     for (row_idx, row) in input_rows.iter().enumerate() {
         let mut out_row = row.clone();
 
-        // R172c Phase 3: close-current + open-new processing for temporal
-        // nodes whose REMOVE pre-scan classified as new-version. Mirrors
-        // the SET Phase 2 block — same shape, same invariants. Items
+        // Close+open processing for temporal nodes whose REMOVE pre-scan
+        // classified as new-version. Mirrors the temporal SET block — same
+        // shape, same invariants. Items
         // applied here are recorded in `processed_temporal_items` so the
         // standard REMOVE loop below skips them on this row.
         let mut processed_temporal_items: std::collections::HashSet<usize> =
@@ -10721,7 +10708,7 @@ fn execute_remove(
                             ctx.write_stats.labels_removed += 1;
                         }
                         crate::plan::RemoveItem::PropertyPath { path, .. } => {
-                            // R172c Phase 3b: nested REMOVE on temporal —
+                            // Nested REMOVE on temporal —
                             // build DeletePath DocDelta, apply in-memory.
                             if path.is_empty() {
                                 return Err(ExecutionError::Unsupported(format!(
@@ -10781,7 +10768,7 @@ fn execute_remove(
 
                 // Surface the new version's valid_from on out_row so any
                 // downstream RETURN sees the latest version, symmetric with
-                // SET Phase 2 behaviour.
+                // the temporal SET path.
                 out_row.insert(format!("{var}.valid_from"), Value::Int(new_valid_from));
                 if new_record.primary_label() != closing_record.primary_label() {
                     out_row.insert(
@@ -10978,8 +10965,8 @@ fn execute_delete(
     let mut deleted_edges: std::collections::HashSet<(String, u64, u64)> =
         std::collections::HashSet::new();
 
-    // R172c Phase 3: DELETE on temporal nodes is a *positive bitemporal
-    // fact* (XTDB-donor pattern, ADR-027). Instead of hard-deleting the
+    // DELETE on temporal nodes is a *positive bitemporal fact* (the XTDB
+    // pattern). Instead of hard-deleting the
     // stored per-version records, we append a tombstone row at
     // `valid_from = NOW, valid_to = NULL` carrying `__deleted__: true`
     // — an explicit assertion that the node ceased to exist at NOW.
@@ -11096,13 +11083,12 @@ fn execute_delete(
 
     for (row_idx, row) in input_rows.iter().enumerate() {
         for var in variables {
-            // R172c Phase 3: if this (row, var) was tombstoned above as a
-            // temporal-node positive bitemporal fact, skip the legacy
-            // hard-delete path entirely — the tombstone IS the delete.
-            // Edges connected to a temporal node are intentionally left
-            // intact: at past valid times the node still existed, so its
-            // edges are still part of history. Edge cascade for temporal
-            // nodes is a separate concern tracked under R172c Phase 4.
+            // If this (row, var) was tombstoned above as a temporal-node
+            // positive bitemporal fact, skip the hard-delete path entirely
+            // — the tombstone IS the delete. Edges connected to a temporal
+            // node are intentionally left intact: at past valid times the
+            // node still existed, so its edges are still part of history.
+            // DETACH DELETE on a temporal node does not cascade to them.
             if tombstoned_temporal_rows.contains(&(row_idx, var.clone())) {
                 continue;
             }
@@ -11395,14 +11381,14 @@ fn execute_delete(
 }
 
 // =====================================================================
-// MERGE NODES (R180)
+// MERGE NODES
 // =====================================================================
 
 /// Execute a `MERGE NODES (a, b) INTO target` clause for each input row.
 ///
 /// Collapses the non-surviving source into the surviving target within a
-/// single MVCC transaction. See arch/compatibility/native-procedures.md for
-/// the full semantic contract.
+/// single MVCC transaction. The semantic contract is documented with
+/// `MERGE NODES` in `docs/cypher/extensions.md`.
 #[allow(clippy::too_many_arguments)]
 fn execute_merge_nodes(
     input_rows: &[Row],
@@ -12706,7 +12692,7 @@ fn detach_delete_node(
 }
 
 // =====================================================================
-// DETACH DOCUMENT (R167)
+// DETACH DOCUMENT
 // =====================================================================
 
 /// Execute a DETACH DOCUMENT clause for each input row.
@@ -13062,7 +13048,8 @@ fn value_to_rmpv(v: &Value) -> rmpv::Value {
 
 /// Decompose a document (top level must be a map) into (String, Value) pairs
 /// suitable for property assignment on the new target node. Nested maps become
-/// `Value::Document`, preserving the arch doc's shallow-promotion semantics.
+/// `Value::Document`: promotion is shallow, only the top level becomes
+/// properties.
 fn document_top_level_to_props(doc: &rmpv::Value) -> Result<Vec<(String, Value)>, ExecutionError> {
     let rmpv::Value::Map(entries) = doc else {
         return Err(ExecutionError::Unsupported(
@@ -13319,7 +13306,7 @@ fn transfer_edges_on_node(
 }
 
 // =====================================================================
-// ATTACH DOCUMENT (R168)
+// ATTACH DOCUMENT
 // =====================================================================
 
 /// Execute an ATTACH DOCUMENT clause for each input row.
@@ -13331,7 +13318,7 @@ fn transfer_edges_on_node(
 ///     via a `DocDelta::SetPath` merge operand (O(1) write, no read).
 ///  4. Delete the connecting edge (a → u): adj forward + reverse + edgeprop.
 ///  5. Optional `TRANSFER EDGES ON source TO target WHERE ...` — re-points
-///     matching edges via posting-list merges (reuses R167 helper).
+///     matching edges via posting-list merges (the DETACH DOCUMENT helper).
 ///  6. Cascade-delete remaining edges on the source node, unless
 ///     `on_remaining_fail` is true and any untransferred edges remain — in
 ///     which case abort with an error. Delete the source node record.
@@ -14380,27 +14367,20 @@ fn execute_alter_label(
     Ok(vec![row])
 }
 
-/// Execute CREATE EDGE TYPE: register an edge-type schema in the Schema partition.
-///
-/// Persists an `EdgeTypeSchema` keyed by `schema:edge_type:<name>` via the MVCC
-/// write buffer. Subsequent edge writes that name this type can be validated
-/// against the declared properties; if `temporal == true`, the write path
-/// requires `valid_from` and stores per-version edgeprop entries.
-///
-/// Returns one row: `{ name, temporal, version, properties }`.
-/// Execute `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` (R172a per
-/// ADR-027). Mirror of `execute_create_edge_type` for node labels.
+/// Execute `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]`. Mirror of
+/// `execute_create_edge_type` for node labels.
 ///
 /// Persists a new `LabelSchema` with the bitemporal flag set as declared and
 /// the user-supplied property declarations. Rejects:
 ///   - Duplicate label (label already has a current-revision pointer)
 ///   - Reserved engine-internal property names (`__ingestion_ts__`,
-///     `valid_from`, `valid_to`, `__src__`, `__tgt__`, `__type__`) — these
-///     are populated/owned by the engine; user declarations would shadow them
+///     `__src__`, `__tgt__`, `__type__`) — these are populated/owned by the
+///     engine; user declarations would shadow them. `valid_from` and
+///     `valid_to` are user-supplied and may be declared.
 ///   - Unsupported property type spellings
 ///
 /// The TEMPORAL flag is immutable from this point forward: changing it
-/// requires creating a new label type and copying data (per ADR-027).
+/// requires creating a new label type and copying data.
 fn execute_create_node_type(
     name: &str,
     temporal: bool,
@@ -14427,7 +14407,7 @@ fn execute_create_node_type(
     // rejecting them keeps the reserved-name surface symmetric and prevents
     // accidental confusion. `valid_from` / `valid_to` are NOT in this list
     // by design: they are user-supplied bitemporal interval fields on
-    // temporal labels (see arch/core/temporal-edges.md) — engine validates
+    // temporal labels — engine validates
     // their type and invariants at write time but does not own the values.
     for decl in properties {
         if matches!(
@@ -14512,7 +14492,7 @@ fn resolve_table_column_type(
     })
 }
 
-/// CREATE TABLE: declare a relational TABLE label (R901). Persists a
+/// CREATE TABLE: declare a relational TABLE label. Persists a
 /// `LabelSchema` carrying the declared primary key and storage layout, and for
 /// a columnar table opens the per-table columnar tree.
 fn execute_create_table(
@@ -14586,7 +14566,7 @@ fn execute_create_table(
     Ok(vec![row])
 }
 
-/// DROP TABLE: drop a relational TABLE label (R901). Tombstones the schema
+/// DROP TABLE: drop a relational TABLE label. Tombstones the schema
 /// pointer and, for a columnar table, drops its per-table columnar tree.
 fn execute_drop_table(
     name: &str,
@@ -14615,6 +14595,14 @@ fn execute_drop_table(
     Ok(vec![row])
 }
 
+/// Execute CREATE EDGE TYPE: register an edge-type schema in the Schema partition.
+///
+/// Persists an `EdgeTypeSchema` keyed by `schema:edge_type:<name>` via the MVCC
+/// write buffer. Subsequent edge writes that name this type can be validated
+/// against the declared properties; if `temporal == true`, the write path
+/// requires `valid_from` and stores per-version edgeprop entries.
+///
+/// Returns one row: `{ name, temporal, version, properties }`.
 fn execute_create_edge_type(
     name: &str,
     temporal: bool,
@@ -14679,7 +14667,7 @@ fn execute_create_edge_type(
 }
 
 // ======================================================================
-// the trigger architecture: Trigger DDL executors
+// Trigger DDL executors
 // ======================================================================
 
 fn current_hlc_us() -> u64 {
@@ -15020,18 +15008,17 @@ fn execute_alter_trigger(
 ///
 /// `ON ERROR PROPAGATE` (the BEFORE COMMIT default) bubbles errors up to
 /// abort the originating transaction. `RETRY` and `DEAD_LETTER` on
-/// BEFORE COMMIT are simplified to PROPAGATE for now — synchronous retry
-/// inside the same transaction would deadlock against write locks, and
-/// dead-lettering inside an aborting transaction is paradoxical (the
-/// dead-letter write would itself be rolled back). The doc comment in
-/// the trigger architecture document spells out this constraint.
+/// BEFORE COMMIT behave as PROPAGATE — synchronous retry inside the same
+/// transaction would deadlock against write locks, and dead-lettering
+/// inside an aborting transaction is paradoxical (the dead-letter write
+/// would itself be rolled back).
 ///
 /// AFTER COMMIT triggers in the matched list are enqueued — not run inline.
 /// Each one writes a durable [`PendingTriggerEvent`](coordinode_core::schema::triggers::PendingTriggerEvent)
 /// into the SAME transaction as the originating mutation (atomic enqueue), and
 /// the out-of-band dispatcher (`Database::dispatch_after_commit_triggers`)
-/// executes the body afterwards with the parameters captured here (ADR-026,
-/// event-journal mechanism). The enqueued `generation` bounds async cascade
+/// executes the body afterwards with the parameters captured here. The
+/// enqueued `generation` bounds async cascade
 /// depth.
 pub(crate) fn fire_before_commit_triggers(
     matched: &[coordinode_core::schema::triggers::TriggerSchema],

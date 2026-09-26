@@ -1,4 +1,4 @@
-//! Integration tests for `ATTACH DOCUMENT` (R168).
+//! Integration tests for `ATTACH DOCUMENT`.
 //!
 //! Verifies the full pipeline (parse → plan → execute → merge flush) against
 //! real CoordiNode storage:

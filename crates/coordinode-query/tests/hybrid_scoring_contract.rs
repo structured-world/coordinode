@@ -1,18 +1,17 @@
-//! R-HYB4: Hybrid scoring API stability contract tests.
+//! Hybrid scoring API stability contract tests.
 //!
-//! These tests freeze the public Cypher surface described in
-//! `arch/search/document-scoring.md § Scoring Functions in OpenCypher` and
-//! `§ API Stability Contract`:
+//! These tests freeze the public Cypher scoring surface documented in
+//! `docs/cypher/functions.md`:
 //!
-//! > These signatures are stable across minor versions once shipped:
-//! > - Return types, argument positions, default weights — frozen.
-//! > - New optional args (maps) may be added behind a `weights: {...}` parameter.
-//! > - BM25 parameters (`k1`, `b`) are not runtime-configurable — tantivy
-//! >   defaults `k1 = 1.2`, `b = 0.75` (ADR-020).
-//! > - `rrf_score` `k` constant (60) is the IR standard and is not a tunable.
-//! >
-//! > Breaking changes require a major version bump and an alias function
-//! > (e.g., `hybrid_score_v2`) during a full release cycle before removal.
+//! - These signatures are stable across minor versions once shipped:
+//!   return types, argument positions and default weights are frozen.
+//! - New optional args (maps) may be added behind a `weights: {...}` parameter.
+//! - BM25 parameters (`k1`, `b`) are not runtime-configurable — tantivy
+//!   defaults `k1 = 1.2`, `b = 0.75`.
+//! - `rrf_score` `k` constant (60) is the IR standard and is not a tunable.
+//!
+//! Breaking changes require a major version bump and an alias function
+//! (e.g., `hybrid_score_v2`) during a full release cycle before removal.
 //!
 //! Four test groups, one per contract bullet:
 //! (1) Documented arities — every function callable with every arity listed in
@@ -168,7 +167,7 @@ fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_i
 // ─────────────────────────────────────────────────────────────────────────
 // Contract test group 1: every documented arity must plan-build cleanly.
 //
-// The scoring-functions table in `arch/search/document-scoring.md` lists the
+// The scoring-functions table in `docs/cypher/functions.md` lists the
 // canonical arities. If any of these parse-and-plan invocations breaks, the
 // public API has drifted — bump the major version or add an alias function.
 // ─────────────────────────────────────────────────────────────────────────
@@ -200,7 +199,7 @@ fn contract_vector_similarity_arities() {
 #[test]
 fn contract_text_match_arities() {
     // Table row: `text_match(field, query [,opts])` → 2 args + 3 args (with
-    // explicit language per G015).
+    // explicit language).
     plan_ok("MATCH (a:Article) WHERE text_match(a.body, \"rust\") RETURN a");
     plan_ok("MATCH (a:Article) WHERE text_match(a.body, \"rust\", \"english\") RETURN a");
 }
@@ -295,8 +294,8 @@ fn contract_doc_score_documented_weight_keys_parse() {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Contract test group 3: `rrf_score` k=60 is not a runtime tunable.
-// Per arch doc § API Stability Contract: "`rrf_score` `k` constant (60) is
-// the IR standard (Cormack et al., 2009) and is not a tunable." Any attempt
+// The `rrf_score` `k` constant (60) is the IR standard (Cormack et al.,
+// 2009) and is not a tunable. Any attempt
 // to override k via a third argument must be rejected at plan time, not
 // silently accepted.
 // ─────────────────────────────────────────────────────────────────────────
@@ -344,12 +343,12 @@ fn contract_rrf_score_rejects_scalar_third_argument() {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Contract test group 4: `text_score` returns BM25 with tantivy defaults.
-// Per ADR-020: k1 = 1.2, b = 0.75, not runtime-configurable. A golden test
-// locks the absolute BM25 score for a deterministic 2-doc corpus. If a
-// future tantivy bump changes BM25 math (different k1/b defaults, different
-// IDF smoothing, different length normalisation), this test fires and the
-// next bump becomes a conscious decision — either document the drift in
-// ADR-020 and re-lock, or pin tantivy.
+// k1 = 1.2, b = 0.75, not runtime-configurable. A golden test locks the
+// absolute BM25 score for a deterministic corpus. If a future tantivy bump
+// changes BM25 math (different k1/b defaults, different IDF smoothing,
+// different length normalisation), this test fires and the next bump
+// becomes a conscious decision — either document the drift in the public
+// scoring docs and re-lock, or pin tantivy.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Execute a Cypher query with a legacy text index directly wired (avoids
@@ -379,7 +378,7 @@ fn contract_bm25_defaults_text_score_magnitudes() {
     // outside the tolerance for a k1/b change (k1 = 0.5 → scores drop by
     // ~40%; b = 0.25 → scores shift by ~15%). If a tantivy bump moves the
     // score outside the bracket, the test fires and forces a decision:
-    // update ADR-020 and re-lock, or pin tantivy to a compatible version.
+    // document the change and re-lock, or pin tantivy to a compatible version.
     //
     // We assert ORDER exactly (deterministic) and MAGNITUDE ranges (loose
     // enough to survive implementation-detail drift in tantivy within the
@@ -444,7 +443,7 @@ fn contract_bm25_defaults_text_score_magnitudes() {
 
     // --- Magnitude bracket. These ranges are informed by tantivy's current
     //     defaults; any tantivy change large enough to move scores outside
-    //     them should trigger a conscious review (ADR-020 update or pin).
+    //     them should trigger a conscious review (document it or pin).
     //     Bracket is deliberately wide on purpose: it catches *defaults*
     //     changes (k1 ≠ 1.2, b ≠ 0.75) without being so tight that minor
     //     internal refactors trip it.
@@ -457,27 +456,27 @@ fn contract_bm25_defaults_text_score_magnitudes() {
     //     If a future tantivy bump produces scores outside [0.1, 5.0] for
     //     any row on this corpus, the bump has either changed BM25 defaults
     //     or introduced a pre-processing pipeline change (tokeniser,
-    //     stopwords) — both require ADR-020 update.
+    //     stopwords) — both require updating the public scoring docs.
     for (i, &s) in scores.iter().enumerate() {
         assert!(
             (0.1..=5.0).contains(&s),
             "BM25 score out of expected envelope at position {i}: got {s}, \
              expected within [0.1, 5.0]. Either tantivy defaults (k1, b) \
-             changed, or the tokeniser pipeline drifted — update ADR-020 \
-             and re-lock this test, or pin tantivy."
+             changed, or the tokeniser pipeline drifted — document the \
+             change and re-lock this test, or pin tantivy."
         );
     }
 }
 
 #[test]
 fn contract_bm25_is_not_runtime_configurable() {
-    // Per ADR-020, k1/b are not exposed at query time. Any attempt to pass
+    // k1/b are not exposed at query time. Any attempt to pass
     // them through `text_score` opts (or as a 3rd arg) must be rejected at
     // parse or plan time.
     //
     // Current surface exposes 2-arg text_score only. A 3-arg call is not
-    // part of the documented contract — it may parse (opts is allowed in
-    // the arch-doc signature) but passing k1/b through it is not a supported
+    // part of the documented contract — it may parse (the signature allows
+    // an opts map) but passing k1/b through it is not a supported
     // extension. This test documents the expectation for any future opts map.
     let ast = parse(
         "MATCH (a:Article) WHERE text_match(a.body, \"x\") \
@@ -535,7 +534,7 @@ fn contract_bm25_is_not_runtime_configurable() {
             assert!(
                 (b - w).abs() < 1e-9,
                 "contract violation — k1 override must not change text_score: baseline={b}, with_k1={w}. \
-                 ADR-020 forbids runtime k1/b."
+                 k1/b are not runtime-configurable."
             );
         }
     }

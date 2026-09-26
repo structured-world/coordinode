@@ -73,7 +73,7 @@ pub struct VectorIndexRegistry {
     /// write lock. Advanced by the oplog-tailing maintenance worker as it
     /// applies writes, and transitioned around rebuilds.
     health: RwLock<HashMap<VectorIndexKey, Arc<HealthSignal>>>,
-    /// Optional persistent f32 truth tier backend (ADR-033). When set,
+    /// Optional persistent f32 truth tier backend. When set,
     /// callers obtain a `VectorTierHandle` via [`Self::tier_handle`]
     /// using pre-resolved `(label_id, property_id)` and pass it to
     /// [`Self::register_with_tier`]. The registry intentionally does
@@ -183,7 +183,7 @@ impl VectorIndexRegistry {
     /// caller-provided tier handle. When `tier` is `Some`, every
     /// insert into the resulting HNSW also writes the f32 original
     /// to the LSM truth tier under
-    /// `vec:<label_id><property_id><node_id>` (ADR-033).
+    /// `vec:<label_id><property_id><node_id>`.
     ///
     /// The caller is responsible for populating the index with
     /// existing vectors (see `bulk_insert`).
@@ -219,7 +219,7 @@ impl VectorIndexRegistry {
         let mut hnsw = HnswIndex::new(Self::hnsw_config_from(config, def.property()));
         // Bind the caller-resolved tier handle BEFORE the index is
         // moved into the registry so subsequent inserts persist f32
-        // to disk per ADR-033. `None` keeps the index pure in-RAM
+        // to disk. `None` keeps the index pure in-RAM
         // (test path, ad-hoc analytics).
         hnsw.set_vector_tier(tier);
 

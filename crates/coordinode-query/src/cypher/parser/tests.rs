@@ -870,7 +870,7 @@ fn delete_multiple() {
     }
 }
 
-// -- MERGE NODES (R180) --
+// -- MERGE NODES --
 
 #[test]
 fn merge_nodes_default_keep_first() {
@@ -1038,7 +1038,7 @@ fn merge_nodes_rejects_duplicate_without_transfer() {
     );
 }
 
-// -- CLONE NODE (R182) --
+// -- CLONE NODE --
 
 #[test]
 fn clone_node_minimal_defaults_copy_properties() {
@@ -1097,7 +1097,7 @@ fn clone_node_same_source_and_target_rejected() {
     );
 }
 
-// -- REDIRECT EDGES (R183) --
+// -- REDIRECT EDGES --
 
 #[test]
 fn redirect_edges_minimal_defaults_both_all_types() {
@@ -1215,7 +1215,7 @@ fn create_trigger_all_event_kinds() {
 
 #[test]
 fn create_trigger_with_maxdepth_and_on_error_propagate() {
-    // `MAXDEPTH n` is the deprecated alias for `CASCADE_LIMIT n` (the trigger architecture).
+    // `MAXDEPTH n` is the deprecated alias for `CASCADE_LIMIT n`.
     let q = parse_ok(
         "CREATE TRIGGER t4 ON :User CREATE BEFORE COMMIT \
              EXECUTE CREATE (a:L) \
@@ -1334,7 +1334,7 @@ fn create_trigger_on_error_dead_letter() {
 
 #[test]
 fn create_trigger_default_on_error_per_timing() {
-    // the trigger architecture defaults: BEFORE → Propagate, AFTER → Retry 3 / 1000ms
+    // Defaults: BEFORE → Propagate, AFTER → Retry 3 / 1000ms
     assert_eq!(
         OnErrorPolicy::default_for(TriggerTiming::BeforeCommit),
         OnErrorPolicy::Propagate
@@ -1558,7 +1558,7 @@ fn set_multiple_with_path() {
     }
 }
 
-// -- doc_* functions (R165) --
+// -- doc_* functions --
 
 #[test]
 fn set_doc_push() {
@@ -1874,7 +1874,7 @@ fn map_projection_nested() {
     }
 }
 
-// ── Per-query hint extraction (G026) ───────────────────────────────
+// ── Per-query hint extraction ──────────────────────────────────────
 
 #[test]
 fn hint_vector_consistency_snapshot() {
@@ -1983,7 +1983,7 @@ fn parse_wait_refuses_overflow() {
     );
 }
 
-// --- CREATE TEXT INDEX DDL (G016) ---
+// --- CREATE TEXT INDEX DDL ---
 
 #[test]
 fn create_text_index_simple_syntax() {
@@ -2159,7 +2159,7 @@ fn parse_parenthesized_expr_not_pattern_predicate() {
     );
 }
 
-// --- CREATE INDEX / DROP INDEX DDL (R-API2) ---
+// --- CREATE INDEX / DROP INDEX DDL ---
 
 #[test]
 fn create_index_simple() {
@@ -2316,7 +2316,7 @@ fn chained_subscript_access() {
     }
 }
 
-// ====== DETACH DOCUMENT (R167) ======
+// ====== DETACH DOCUMENT ======
 
 #[test]
 fn detach_document_basic() {
@@ -2396,7 +2396,7 @@ fn detach_document_reverse_relationship() {
     assert_eq!(dd.edge_direction, EdgeFromSource::Incoming);
 }
 
-// ====== ATTACH DOCUMENT (R168) ======
+// ====== ATTACH DOCUMENT ======
 
 #[test]
 fn attach_document_basic() {
@@ -2532,7 +2532,7 @@ fn create_edge_type_rejects_unknown_type() {
     let _ = parse_err("CREATE EDGE TYPE WORKS_AT WITH (foo: QUATERNION)");
 }
 
-// ===== CREATE NODE TYPE (R172a per ADR-027) =====
+// ===== CREATE NODE TYPE =====
 
 #[test]
 fn create_node_type_minimal() {

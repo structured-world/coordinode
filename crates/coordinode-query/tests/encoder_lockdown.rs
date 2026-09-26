@@ -1,4 +1,4 @@
-//! R165 encoder lockdown — regression gate.
+//! Encoder lockdown — regression gate.
 //!
 //! Asserts that production source files in `coordinode-query` do not
 //! grow new raw `encode_node_key` / `encode_temporal_node_key` /
@@ -16,8 +16,8 @@
 //! - `executor/runner.rs` helper-module region — the typed helpers
 //!   themselves call the encoders. Bounded by a sentinel-comment
 //!   range so the gate stays mechanical.
-//! - `#[cfg(test)]` modules — test fixtures use raw encoders to
-//!   construct probe keys. Test-only code migrates in R166.
+//! - `#[cfg(test)]` modules — a few test fixtures must build raw
+//!   probe keys (for example to plant undecodable bytes).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -65,13 +65,13 @@ const SCAN_FILES: &[&str] = &[
 /// CURRENT post-migration count; the gate fails if a future PR
 /// raises it. Update with the migration audit comment when lowering.
 const ALLOWED: &[(&str, usize)] = &[
-    // runner.rs baseline. After R166 the cfg(test) seed fixtures route
-    // through the real Layer-4 stores (`LocalNodeStore::put[_temporal]`,
-    // `LocalEdgeStore::put_edge[_temporal]`) — unblocked by ADR-040, which
-    // made `EdgeProperties` and the executor's `Vec<(field_id, Value)>`
-    // shape wire-identical — and the OCC-scope asserts use typed
+    // runner.rs baseline. The cfg(test) seed fixtures route through the
+    // real Layer-4 stores (`LocalNodeStore::put[_temporal]`,
+    // `LocalEdgeStore::put_edge[_temporal]`), which works because
+    // `EdgeProperties` and the executor's `Vec<(field_id, Value)>` shape
+    // are wire-identical, and the OCC-scope asserts use typed
     // `OccScope::contains_node` / `contains_edge_props`. Remaining 34 =
-    // ~30 production typed-helper internals + R165 intentional production
+    // ~30 production typed-helper internals + intentional production
     // residuals (raw-byte edgeprop transfer, prefix-scan harvest) + 4
     // legit-raw cfg(test) sites that MUST build raw keys: three
     // decode-error tests planting non-MessagePack garbage at node /
@@ -81,19 +81,19 @@ const ALLOWED: &[(&str, usize)] = &[
     // vector_predicate.rs: one raw encode_node_key on the ACORN-filtered
     // hot path (predicate evaluator point-get, production) + one
     // cfg(test) corrupt-record test that plants invalid bytes at a raw
-    // node key. The valid-fixture seed migrated to LocalNodeStore (R166).
+    // node key. The valid-fixture seed goes through LocalNodeStore.
     // Total = 2.
     ("src/executor/vector_predicate.rs", 2),
-    // ops.rs — fully routed through LocalIndexStore after slice 12.
+    // ops.rs — fully routed through LocalIndexStore.
     ("src/index/ops.rs", 0),
-    // build.rs (R166): cfg(test) `insert_node` helper now routes
-    // through LocalNodeStore. 0 raw encoder usages.
+    // build.rs: cfg(test) `insert_node` helper routes through
+    // LocalNodeStore. 0 raw encoder usages.
     ("src/index/build.rs", 0),
-    // ttl.rs (R166): cfg(test) `insert_node_with_timestamp` helper
-    // + verify-deleted assertions now route through LocalNodeStore.
+    // ttl.rs: cfg(test) `insert_node_with_timestamp` helper
+    // + verify-deleted assertions route through LocalNodeStore.
     // 0 raw encoder usages.
     ("src/index/ttl.rs", 0),
-    // ttl_reaper.rs: fully migrated. cfg(test) fixtures route through
+    // ttl_reaper.rs: cfg(test) fixtures route through
     // LocalNodeStore; the production `prepare_subtree_mutations` builds
     // its EdgeProp delete via the typed `Mutation::delete_edge_props`
     // constructor in `coordinode-core` (which holds the encoder call
@@ -187,7 +187,7 @@ fn encoder_lockdown_no_new_files_with_raw_encoders() {
         // moved out of the inline `#[cfg(test)] mod ...`. They are test code,
         // exempt from the production encoder lockdown exactly as the inline
         // `cfg(test)` modules they replaced were — fixtures may build raw probe
-        // keys (migrating in R166). No production source file is named `*tests.rs`,
+        // keys. No production source file is named `*tests.rs`,
         // so this gates production only.
         if path
             .file_name()

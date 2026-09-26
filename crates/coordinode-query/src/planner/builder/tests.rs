@@ -522,7 +522,7 @@ fn plain_property_filter_no_regression() {
     );
 }
 
-// -- G024: cross-MATCH predicate lifting --
+// -- cross-MATCH predicate lifting --
 
 /// MATCH (a) MATCH (b) WHERE a.x = b.y
 /// The Filter should be ABOVE CartesianProduct, not inside the right branch.
@@ -616,7 +616,7 @@ fn collect_pattern_variables_basic() {
     assert_eq!(vars, vec!["a", "r", "b"]);
 }
 
-// -- G029: ALTER LABEL SET SCHEMA --
+// -- ALTER LABEL SET SCHEMA --
 
 #[test]
 fn alter_label_parses() {
@@ -826,7 +826,7 @@ fn vector_top_k_multi_item_order_not_optimized() {
 /// Pattern A with RETURN that drops the vector variable → NOT optimized.
 /// `RETURN n.name` removes `n.embedding` from intermediate rows, so the
 /// optimizer must fall back to plain Sort+Limit. This guards against the
-/// regression found by g009_forced_offload_cypher_e2e integration test.
+/// regression found by the forced_offload_cypher_e2e integration test.
 #[test]
 fn vector_top_k_pattern_a_dropped_variable_not_optimized() {
     let root = plan_root(
@@ -1094,7 +1094,7 @@ fn vector_top_k_with_parameter_query_vector() {
     }
 }
 
-// -- R171: lift_temporal_filter --
+// -- lift_temporal_filter --
 
 /// Finds the `temporal_filter` field on the innermost Traverse, if any.
 fn first_temporal_filter(op: &LogicalOp) -> Option<&TemporalFilter> {
@@ -1204,7 +1204,7 @@ fn vector_top_k_explain_output() {
     );
 }
 
-// ── R-PUSH1: Graph-Predicate Push-Down Invariant ──────────────────────
+// ── Graph-Predicate Push-Down Invariant ───────────────────────────────
 
 /// Walk a plan tree asserting the push-down invariant:
 /// every `VectorFilter` whose input contains a `Traverse` carries
@@ -1269,7 +1269,7 @@ fn push_down_invariant_simple_traverse_then_vector() {
 fn push_down_explain_json_emitted_for_real_plan() {
     // A real TRAVERSE→VECTOR_FILTER query, run through the same pass order as
     // execute_cypher_impl, carries a push_down decision that renders the stable
-    // EXPLAIN block (R-PUSH2).
+    // EXPLAIN block.
     let root = optimized_plan(
         "MATCH (a:User)-[:LIKES]->(b:Movie) \
              WHERE vector_distance(b.embedding, [1.0, 0.0, 0.0]) < 0.5 \
@@ -1427,7 +1427,7 @@ fn push_down_invariant_passes_when_decision_attached() {
     assert_push_down_invariant(&valid).expect("plan with decision attached must pass");
 }
 
-/// Contract sweep (R-PUSH4): NO plan produced by the planner for any
+/// Contract sweep: NO plan produced by the planner for any
 /// representative graph+vector query shape may place a `TRAVERSE` before an
 /// unfiltered `VECTOR_FILTER`. This generalises the single-shape invariant
 /// tests above into a corpus, so the "zero plans in the suite violate the

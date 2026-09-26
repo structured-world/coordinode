@@ -146,7 +146,7 @@ fn register_schema_edge_type(engine: &StorageEngine, edge_type: &str) {
 
 fn insert_edge(engine: &StorageEngine, edge_type: &str, source_id: u64, target_id: u64) {
     // Seed an edge through the Layer-4 store (hides adj-key encoding; writes
-    // the same commutative merge operands the executor reads — ADR-040/R166).
+    // the same commutative merge operands the executor reads).
     use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
     use coordinode_core::txn::write_concern::WriteConcern;
     use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
@@ -1567,7 +1567,7 @@ fn create_edge_between_existing_nodes() {
     assert_eq!(results.len(), 1, "should find Bob→Eve LIKES edge");
 }
 
-/// R010c: Multiple edges to same source within one statement use merge buffer.
+/// Multiple edges to same source within one statement use merge buffer.
 /// Verifies read-your-own-writes: second CREATE sees first's edge.
 #[test]
 fn create_multiple_edges_from_same_source() {
@@ -1596,7 +1596,7 @@ fn create_multiple_edges_from_same_source() {
     assert_eq!(results.len(), 3, "should find all 3 LIKES edges from Alice");
 }
 
-/// R010c: Edge creation via merge + edge traversal in same query.
+/// Edge creation via merge + edge traversal in same query.
 /// Tests that merge buffer provides read-your-own-writes within execution.
 #[test]
 fn create_then_traverse_same_execution() {
@@ -1621,7 +1621,7 @@ fn create_then_traverse_same_execution() {
     assert_eq!(results.len(), 1, "should find TRUSTS edge");
 }
 
-/// R010c: DETACH DELETE removes node and its edges.
+/// DETACH DELETE removes node and its edges.
 #[test]
 fn detach_delete_removes_edges() {
     let (_fx, mut interner) = setup_social_graph();
@@ -2117,7 +2117,7 @@ fn aggregate_count_distinct_end_to_end() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// DISTINCT with non-consecutive duplicates (G033 regression test)
+// DISTINCT with non-consecutive duplicates (regression test)
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -3662,7 +3662,7 @@ fn vector_top_k_brute_force_without_index() {
     assert_eq!(top_id, 1, "closest to [1,0,0] is node id 1");
 }
 
-// ── type() and labels() scalar functions (R523/R524 partial) ──────────
+// ── type() and labels() scalar functions ──────────────────────────────
 
 /// `type(r)` returns the relationship type as a string.
 #[test]
@@ -4094,12 +4094,11 @@ fn text_score_returns_bm25() {
     }
 }
 
-// R-HYB1b regression: `text_match()` against a property with NO full-text
-// index must error at execute time, not silently pass every row through
-// (the old graceful-degradation returned all rows — a semantic bug that made
-// `MATCH (n:Chunk) WHERE text_match(n.body, "foo") RETURN n` return every
-// Chunk when no index existed, the opposite of what the caller asked for).
-// Consistent with R-HYB1 `text_score()` guard and R-HYB2b RankFuse guard.
+// Regression: `text_match()` against a property with NO full-text index
+// must error at execute time, not silently pass every row through (which
+// would make `MATCH (n:Chunk) WHERE text_match(n.body, "foo") RETURN n`
+// return every Chunk when no index exists, the opposite of what the caller
+// asked for). Consistent with the `text_score()` and RankFuse guards.
 #[test]
 fn text_match_no_index_errors() {
     let (_fx, mut interner) = setup_social_graph();
@@ -4117,7 +4116,7 @@ fn text_match_no_index_errors() {
     );
 }
 
-// R-HYB1b regression: if the input row set is empty (e.g. MATCH matched no
+// Regression: if the input row set is empty (e.g. MATCH matched no
 // nodes after DETACH DELETE), `text_match()` must return an empty result
 // rather than erroring on a missing index. There is nothing to filter, and
 // failing here would turn a legitimately empty upstream into a spurious
@@ -4144,7 +4143,7 @@ fn text_match_empty_input_short_circuits_without_index_lookup() {
     );
 }
 
-// R-HYB1b regression: when a `TextIndexRegistry` is wired but has no entry
+// Regression: when a `TextIndexRegistry` is wired but has no entry
 // for the specific (label, property), the error must name BOTH the label
 // and the property so the user can create the right index.
 #[test]
@@ -4186,10 +4185,10 @@ fn text_match_registry_missing_entry_errors_with_label_and_property() {
     );
 }
 
-// R-HYB1 regression #3: using text_score() without a paired text_match() in
-// WHERE (no FT index configured) must return an explicit executor error, not
-// silently yield 0.0 scores. Prior behavior returned 0 which misleads the
-// caller into thinking the document has zero BM25 relevance.
+// Regression: using text_score() without a paired text_match() in WHERE (no
+// FT index configured) must return an explicit executor error, not silently
+// yield 0.0 scores, which would mislead the caller into thinking the document
+// has zero BM25 relevance.
 #[test]
 fn text_score_without_text_match_errors() {
     let (_fx, mut interner) = setup_social_graph();
@@ -4210,7 +4209,7 @@ fn text_score_without_text_match_errors() {
     );
 }
 
-// R-HYB1: text_score() usable in ORDER BY — verifies the BM25 score streamed
+// text_score() usable in ORDER BY — verifies the BM25 score streamed
 // from TextFilter drives result ordering. Doc with more term occurrences must
 // rank higher (BM25 = monotonic in term frequency when docs are similar length).
 #[test]
@@ -4293,10 +4292,9 @@ fn text_score_orders_results_by_bm25() {
     );
 }
 
-// R-HYB1: text_score() composes arithmetically with vector_distance() inside
-// ORDER BY / RETURN. This is the canonical arch doc example
-// (arch/search/document-scoring.md §Arithmetic Composition):
-// a weighted blend of vector similarity and BM25 drives ordering.
+// text_score() composes arithmetically with vector_distance() inside
+// ORDER BY / RETURN: a weighted blend of vector similarity and BM25 drives
+// ordering.
 #[test]
 fn text_score_composes_with_vector_distance_in_order_by() {
     let fx = test_engine();
@@ -4378,7 +4376,7 @@ fn text_score_composes_with_vector_distance_in_order_by() {
     );
 }
 
-// R-HYB2 hybrid_score regression #1:
+// hybrid_score regression:
 // hybrid_score(c, $q) with default weights (0.65 vector / 0.35 text) must match
 // the manual arithmetic blend `(1.0 - vector_distance) * 0.65 + text_score * 0.35`
 // for every row when both filter operators run in the same plan.
@@ -4472,7 +4470,7 @@ fn hybrid_score_matches_manual_arithmetic() {
     }
 }
 
-// R-HYB2 hybrid_score: the weights map `{vector: 1.0, text: 0.0}` must yield
+// hybrid_score: the weights map `{vector: 1.0, text: 0.0}` must yield
 // the pure vector component (equivalent to `1.0 - vector_distance` under the
 // L2 normalization). Verifies weight overriding end to end.
 #[test]
@@ -4520,7 +4518,7 @@ fn hybrid_score_custom_weights_override_defaults() {
     );
 }
 
-// R-HYB2 hybrid_score: without any text_match / vector_distance in WHERE, the
+// hybrid_score: without any text_match / vector_distance in WHERE, the
 // row has neither cache column populated → fail with a clear error naming the
 // required predicates, not silently return 0.0 / Null.
 #[test]
@@ -5035,7 +5033,7 @@ mod multi_lang_text_index {
     }
 }
 
-// ── DETACH DELETE reverse posting list cleanup (G050) ──
+// ── DETACH DELETE reverse posting list cleanup ──
 
 /// E2E: DETACH DELETE removes the node AND cleans up the counterpart
 /// posting lists so traversal from surviving nodes sees no stale edges.
@@ -6477,16 +6475,14 @@ fn detach_delete_e2e_diamond_graph_documents() {
     );
 }
 
-// ── Correlated OPTIONAL MATCH (G004) ──────────────────────────────────
+// ── Correlated OPTIONAL MATCH ─────────────────────────────────────────
 
 #[test]
 fn optional_match_correlated_where_cross_variable() {
-    // Regression test for G004: OPTIONAL MATCH with WHERE predicate
-    // referencing a variable from the outer MATCH scope.
-    //
-    // Current bug: right side executes once, `a.age` evaluates to Null
-    // because "a" is not in right-side rows. All rows filtered out →
-    // incorrect NULL result instead of matching rows.
+    // Regression test: OPTIONAL MATCH with WHERE predicate referencing a
+    // variable from the outer MATCH scope. Executing the right side once,
+    // without the outer row, would evaluate `a.age` to Null and filter out
+    // every row, returning NULL instead of the matching rows.
     let (_fx, mut interner) = setup_social_graph();
     let engine = &_fx.engine;
 
@@ -6664,7 +6660,7 @@ fn optional_match_non_correlated_still_works() {
     );
 }
 
-// ── Per-query hint syntax (G026) ──────────────────────────────────────
+// ── Per-query hint syntax ─────────────────────────────────────────────
 
 #[test]
 fn hint_vector_consistency_flows_to_plan() {
@@ -6691,11 +6687,11 @@ fn hint_absent_uses_default() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// G015: 3-arg text_match(field, query, language) — multi-language search
+// 3-arg text_match(field, query, language) — multi-language search
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn g015_text_match_3arg_with_language() {
+fn text_match_3arg_with_language() {
     // Verify text_match(field, query, language) works through the full
     // planner → executor pipeline with explicit language tokenization.
     let fx = test_engine();
@@ -6794,7 +6790,7 @@ fn g015_text_match_3arg_with_language() {
 }
 
 #[test]
-fn g015_text_match_3arg_planner_extracts_language() {
+fn text_match_3arg_planner_extracts_language() {
     // Verify the planner correctly extracts the language from 3-arg text_match
     // into LogicalOp::TextFilter.language.
     use coordinode_query::planner::logical::LogicalOp;
@@ -6834,7 +6830,7 @@ fn g015_text_match_3arg_planner_extracts_language() {
 }
 
 #[test]
-fn g015_text_match_2arg_has_no_language() {
+fn text_match_2arg_has_no_language() {
     // Verify 2-arg text_match produces TextFilter with language=None.
     use coordinode_query::planner::logical::LogicalOp;
 
@@ -6865,7 +6861,7 @@ fn g015_text_match_2arg_has_no_language() {
 }
 
 #[test]
-fn g015_explain_shows_language_in_text_filter() {
+fn explain_shows_language_in_text_filter() {
     // 3-arg: EXPLAIN should show language
     let ast =
         parse("MATCH (n:Doc) WHERE text_match(n.body, \"hello\", \"russian\") RETURN n").unwrap();
@@ -6886,12 +6882,12 @@ fn g015_explain_shows_language_in_text_filter() {
     );
 }
 
-// ── Document Path-Targeted Updates (R164) ────────────────────────────
+// ── Document Path-Targeted Updates ───────────────────────────────────
 
 /// SET n.config.network.ssid = "home" on a node with a DOCUMENT property.
 /// Verifies the merge operand is applied and readable via dot-notation.
 #[test]
-fn r164_set_deep_path_on_document_property() {
+fn set_deep_path_on_document_property() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -6949,7 +6945,7 @@ fn r164_set_deep_path_on_document_property() {
 
 /// SET creates intermediate objects when path doesn't fully exist.
 #[test]
-fn r164_set_path_creates_intermediates() {
+fn set_path_creates_intermediates() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -6987,7 +6983,7 @@ fn r164_set_path_creates_intermediates() {
 
 /// REMOVE n.config.network.ssid deletes a nested path.
 #[test]
-fn r164_remove_deep_path() {
+fn remove_deep_path() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7037,7 +7033,7 @@ fn r164_remove_deep_path() {
 
 /// REMOVE on non-existent deep path is a no-op (idempotent).
 #[test]
-fn r164_remove_nonexistent_path_is_noop() {
+fn remove_nonexistent_path_is_noop() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7077,7 +7073,7 @@ fn r164_remove_nonexistent_path_is_noop() {
 
 /// Mixed SET: single-level property + deep path in same statement.
 #[test]
-fn r164_mixed_set_property_and_path() {
+fn mixed_set_property_and_path() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7120,7 +7116,7 @@ fn r164_mixed_set_property_and_path() {
 
 /// SET deep path with non-string values: integer, nested map, boolean.
 #[test]
-fn r164_set_deep_path_non_string_values() {
+fn set_deep_path_non_string_values() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7169,7 +7165,7 @@ fn r164_set_deep_path_non_string_values() {
 /// SET two different deep paths on the same node in separate statements.
 /// Both changes should persist (no lost update).
 #[test]
-fn r164_set_two_different_paths_sequential() {
+fn set_two_different_paths_sequential() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7229,7 +7225,7 @@ fn r164_set_two_different_paths_sequential() {
 
 /// SET overwrites existing value at deep path (last-writer-wins).
 #[test]
-fn r164_set_overwrites_existing_deep_value() {
+fn set_overwrites_existing_deep_value() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7262,12 +7258,12 @@ fn r164_set_overwrites_existing_deep_value() {
     assert_eq!(rows[0].get("n.config.level"), Some(&Value::Int(42)));
 }
 
-// ── G064: Merge-based document path updates ─────────────────────────
+// ── Merge-based document path updates ───────────────────────────────
 
 /// RYOW: SET deep path then RETURN in same query must see the update.
 /// This exercises the RYOW materialization path in mvcc_get().
 #[test]
-fn g064_ryow_set_then_return_same_query() {
+fn ryow_set_then_return_same_query() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7301,7 +7297,7 @@ fn g064_ryow_set_then_return_same_query() {
 /// SET deep path on a node that has NO DOCUMENT property at that name yet.
 /// The merge operator should create the property as a Document with intermediate maps.
 #[test]
-fn g064_set_path_creates_property_from_nothing() {
+fn set_path_creates_property_from_nothing() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7341,7 +7337,7 @@ fn g064_set_path_creates_property_from_nothing() {
 /// Multiple SET deep paths on the same node in a single statement.
 /// All should be applied (via separate merge operands).
 #[test]
-fn g064_multiple_set_paths_same_statement() {
+fn multiple_set_paths_same_statement() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7375,7 +7371,7 @@ fn g064_multiple_set_paths_same_statement() {
 
 /// REMOVE + SET on different paths of the same DOCUMENT in one statement.
 #[test]
-fn g064_remove_and_set_same_document_one_statement() {
+fn remove_and_set_same_document_one_statement() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7426,7 +7422,7 @@ fn g064_remove_and_set_same_document_one_statement() {
 /// RYOW via prefix_scan: SET deep path then re-scan nodes in same statement.
 /// The NodeScan must see the updated value through materialization.
 #[test]
-fn g064_ryow_prefix_scan_sees_merge_deltas() {
+fn ryow_prefix_scan_sees_merge_deltas() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7467,7 +7463,7 @@ fn g064_ryow_prefix_scan_sees_merge_deltas() {
 
 /// SET deep path with a map literal value (nested object, not just scalar).
 #[test]
-fn g064_set_deep_path_map_literal_value() {
+fn set_deep_path_map_literal_value() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7507,7 +7503,7 @@ fn g064_set_deep_path_map_literal_value() {
 
 /// UPSERT (MERGE) with deep path SET in ON MATCH clause.
 #[test]
-fn g064_upsert_on_match_with_property_path() {
+fn upsert_on_match_with_property_path() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7549,11 +7545,11 @@ fn g064_upsert_on_match_with_property_path() {
     assert_eq!(rows[0].get("u.stats.login_count"), Some(&Value::Int(5)));
 }
 
-// ── R165: Array operators as merge operands ──────────────────────────
+// ── Array operators as merge operands ────────────────────────────────
 
 /// doc_push appends a value to an array property.
 #[test]
-fn r165_doc_push_to_array() {
+fn doc_push_to_array() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7594,7 +7590,7 @@ fn r165_doc_push_to_array() {
 
 /// doc_pull removes the first occurrence of a value from an array.
 #[test]
-fn r165_doc_pull_from_array() {
+fn doc_pull_from_array() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7640,7 +7636,7 @@ fn r165_doc_pull_from_array() {
 
 /// doc_add_to_set adds only if not already present.
 #[test]
-fn r165_doc_add_to_set_dedup() {
+fn doc_add_to_set_dedup() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7687,7 +7683,7 @@ fn r165_doc_add_to_set_dedup() {
 
 /// doc_inc atomically increments a numeric field.
 #[test]
-fn r165_doc_inc_integer() {
+fn doc_inc_integer() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7718,7 +7714,7 @@ fn r165_doc_inc_integer() {
 
 /// doc_inc with negative value decrements.
 #[test]
-fn r165_doc_inc_negative() {
+fn doc_inc_negative() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7753,7 +7749,7 @@ fn r165_doc_inc_negative() {
 
 /// doc_push creates array from nothing when property doesn't exist.
 #[test]
-fn r165_doc_push_creates_array() {
+fn doc_push_creates_array() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7790,7 +7786,7 @@ fn r165_doc_push_creates_array() {
 
 /// Multiple doc functions in one SET statement.
 #[test]
-fn r165_multiple_doc_ops_one_statement() {
+fn multiple_doc_ops_one_statement() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7841,7 +7837,7 @@ fn r165_multiple_doc_ops_one_statement() {
 
 /// doc_inc on non-existent field creates it with the increment value as initial.
 #[test]
-fn r165_doc_inc_creates_from_nothing() {
+fn doc_inc_creates_from_nothing() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7870,7 +7866,7 @@ fn r165_doc_inc_creates_from_nothing() {
 
 /// doc_pull on missing value is a no-op (idempotent).
 #[test]
-fn r165_doc_pull_missing_value_noop() {
+fn doc_pull_missing_value_noop() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -7909,10 +7905,10 @@ fn r165_doc_pull_missing_value_noop() {
     }
 }
 
-// ── G069: wildcard relationship pattern ──────────────────────────────────────
+// ── Wildcard relationship pattern ────────────────────────────────────────────
 
-/// Regression test for G069: `MATCH (n)-[r]->(m)` (no type filter) returned 0
-/// rows because `expand_one_hop` with empty `edge_types` iterated an empty slice.
+/// Regression test: `MATCH (n)-[r]->(m)` (no type filter) must not return 0
+/// rows by having `expand_one_hop` iterate an empty `edge_types` slice.
 ///
 /// Verifies:
 /// - Wildcard `[r]` returns all edges regardless of type (KNOWS + LIKES)
@@ -7953,7 +7949,7 @@ fn test_wildcard_relationship_returns_results() {
     insert_edge(engine, "KNOWS", 1, 2);
     insert_edge(engine, "LIKES", 1, 5);
 
-    // Register edge types in schema so wildcard scan can enumerate them (G069).
+    // Register edge types in schema so wildcard scan can enumerate them.
     // In production, the executor registers these automatically on CREATE.
     register_schema_edge_type(engine, "KNOWS");
     register_schema_edge_type(engine, "LIKES");
@@ -8002,7 +7998,7 @@ fn test_wildcard_relationship_returns_results() {
     );
 }
 
-/// G069 edge case: wildcard on a graph with no schema-registered edge types returns 0 rows.
+/// Edge case: wildcard on a graph with no schema-registered edge types returns 0 rows.
 #[test]
 fn test_wildcard_relationship_empty_schema_returns_zero() {
     let fx = test_engine();
@@ -8031,11 +8027,11 @@ fn test_wildcard_relationship_empty_schema_returns_zero() {
     );
 }
 
-// ── G070: count(r) for relationship variable ─────────────────────────────────
+// ── count(r) for relationship variable ───────────────────────────────────────
 
-/// Regression test for G070: `count(r)` returned 0 for relationship variables
-/// because `r` was not stored as a row column — only `r.__type__` was stored.
-/// `eval_aggregate_values` filtered out the resulting `Value::Null`, giving 0.
+/// Regression test: `count(r)` must count relationship variables. With only
+/// `r.__type__` stored as a row column, `r` itself would evaluate to
+/// `Value::Null`, which `eval_aggregate_values` filters out, giving 0.
 ///
 /// Verifies:
 /// - `count(r)` returns the correct number of edges (not 0)
@@ -8116,10 +8112,10 @@ fn test_count_relationship_variable() {
     );
 }
 
-// ── G072: MERGE relationship pattern ─────────────────────────────────────────
+// ── MERGE relationship pattern ───────────────────────────────────────────────
 
-/// Regression test for G072: `MERGE (src)-[r:TYPE]->(dst)` between already-bound
-/// nodes failed with "MERGE create from non-NodeScan pattern".
+/// Regression test: `MERGE (src)-[r:TYPE]->(dst)` between already-bound
+/// nodes must not fail with "MERGE create from non-NodeScan pattern".
 ///
 /// What this tests:
 /// - MERGE (a)-[:KNOWS]->(b) creates the edge when it doesn't exist
@@ -8144,7 +8140,6 @@ fn test_merge_relationship_creates_edge() {
     );
 
     // MERGE relationship — should CREATE because edge doesn't exist yet
-    // G072: previously failed with "MERGE create from non-NodeScan pattern"
     let merge_q = "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) \
                    MERGE (a)-[r:KNOWS]->(b) RETURN r.__type__ AS rel_type";
     let merge_rows = run_cypher_with_alloc(merge_q, engine, &mut interner, &allocator);
@@ -8216,7 +8211,7 @@ fn test_merge_relationship_creates_edge() {
     );
 }
 
-/// G072 — multiple MATCH pairs: each pair gets its own correlated MERGE.
+/// Multiple MATCH pairs: each pair gets its own correlated MERGE.
 ///
 /// What this tests:
 /// - CartesianProduct correlated execution runs once per left row
@@ -8303,7 +8298,7 @@ fn test_merge_relationship_multiple_pairs() {
     );
 }
 
-/// G072 — MERGE relationship with ON CREATE SET applies properties only on creation.
+/// MERGE relationship with ON CREATE SET applies properties only on creation.
 ///
 /// What this tests:
 /// - ON CREATE SET sets a property on the edge row when the edge is created
@@ -8355,7 +8350,7 @@ fn test_merge_relationship_on_create_set() {
     );
 }
 
-/// G074 — standalone MERGE relationship creates both nodes and edge from scratch.
+/// Standalone MERGE relationship creates both nodes and edge from scratch.
 ///
 /// What this tests:
 /// - `MERGE (a:Person {name:'X'})-[r:KNOWS]->(b:Person {name:'Y'})` succeeds with no
@@ -8405,7 +8400,7 @@ fn test_merge_relationship_standalone_creates_from_scratch() {
     );
 }
 
-/// G074 — standalone MERGE is idempotent: second run finds the existing path.
+/// Standalone MERGE is idempotent: second run finds the existing path.
 ///
 /// What this tests:
 /// - Running the same standalone MERGE twice does not create duplicate nodes or edges
@@ -8474,7 +8469,7 @@ fn test_merge_relationship_standalone_idempotent() {
     );
 }
 
-/// G074 — standalone MERGE reuses existing nodes when the edge is missing.
+/// Standalone MERGE reuses existing nodes when the edge is missing.
 ///
 /// What this tests:
 /// - Pre-existing nodes are reused (not duplicated) when the edge doesn't exist yet
@@ -8524,7 +8519,7 @@ fn test_merge_relationship_standalone_reuses_existing_nodes() {
     );
 }
 
-/// G074 — standalone MERGE errors when the source pattern is ambiguous (multiple matches).
+/// Standalone MERGE errors when the source pattern is ambiguous (multiple matches).
 ///
 /// What this tests:
 /// - If multiple nodes match the source pattern, MERGE returns an error (not silent take-first)
@@ -8565,7 +8560,7 @@ fn test_merge_relationship_standalone_ambiguous_source_errors() {
     );
 }
 
-/// G074 — standalone MERGE errors when the target pattern is ambiguous.
+/// Standalone MERGE errors when the target pattern is ambiguous.
 #[test]
 fn test_merge_relationship_standalone_ambiguous_target_errors() {
     let fx = test_engine();
@@ -8598,7 +8593,7 @@ fn test_merge_relationship_standalone_ambiguous_target_errors() {
     );
 }
 
-/// G074 — standalone MERGE RETURN exposes node variables directly (not just r.__type__).
+/// Standalone MERGE RETURN exposes node variables directly (not just r.__type__).
 ///
 /// What this tests:
 /// - `MERGE (a:L {k:v})-[r:T]->(b:L {k:v}) RETURN a.name, b.name, r.__type__` returns all three
@@ -8662,7 +8657,7 @@ fn test_merge_relationship_standalone_return_node_variables() {
     );
 }
 
-/// G072 — MERGE relationship with ON MATCH SET applies properties only when edge already exists.
+/// MERGE relationship with ON MATCH SET applies properties only when edge already exists.
 ///
 /// What this tests:
 /// - When the edge already exists, ON MATCH SET fires (updates node/property)
@@ -8712,7 +8707,7 @@ fn test_merge_relationship_on_match_set() {
     );
 }
 
-/// G072 — MERGE incoming relationship `MERGE (a)<-[r:T]-(b)`.
+/// MERGE incoming relationship `MERGE (a)<-[r:T]-(b)`.
 ///
 /// What this tests:
 /// - Direction::Incoming is handled correctly in execute_merge_relationship_check
@@ -8782,7 +8777,7 @@ fn test_merge_relationship_incoming_direction() {
     );
 }
 
-/// G075 — MERGE stores edge properties and uses them for match discrimination.
+/// MERGE stores edge properties and uses them for match discrimination.
 ///
 /// What this tests:
 /// - `MERGE (a)-[r:T {prop: val}]->(b)` stores the property in EdgeProp partition
@@ -8901,7 +8896,7 @@ fn test_merge_relationship_edge_properties_stored_and_checked() {
     );
 }
 
-/// G075 — ON CREATE SET fires and can reference edge variable with stored properties.
+/// ON CREATE SET fires and can reference edge variable with stored properties.
 ///
 /// What this tests:
 /// - `MERGE (a)-[r:T {weight: 5}]->(b) ON CREATE SET r.created = 1` stores both
@@ -8956,7 +8951,7 @@ fn test_merge_relationship_edge_properties_on_create_set() {
     );
 }
 
-/// G072 — two MERGE relationship clauses in a single query.
+/// Two MERGE relationship clauses in a single query.
 ///
 /// Plan structure: CartesianProduct{CartesianProduct{MATCH, Merge1}, Merge2}.
 /// Verifies that the nested correlated execution works correctly for both levels.
@@ -9050,7 +9045,7 @@ fn test_merge_two_relationship_clauses() {
     );
 }
 
-/// G072 — self-loop MERGE: source and target variable are the same node.
+/// Self-loop MERGE: source and target variable are the same node.
 ///
 /// What this tests:
 /// - MERGE (a)-[r:SELF_REF]->(a) where source and target are the same node ID
@@ -9117,19 +9112,19 @@ fn test_merge_relationship_self_loop() {
     );
 }
 
-/// G069 + G072 integration — wildcard MATCH after Cypher MERGE.
+/// Wildcard MATCH after Cypher MERGE.
 ///
-/// The G069 fix (list_edge_types reads schema partition) must see edge types
-/// registered by execute_merge_relationship_create (which writes schema key).
+/// The wildcard scan (list_edge_types reads the schema partition) must see edge
+/// types registered by execute_merge_relationship_create (which writes schema key).
 /// This test verifies end-to-end: Cypher MERGE → schema key written → wildcard
 /// MATCH finds the edge.
 ///
 /// What this tests:
 /// - No manual insert_edge — edges created purely via Cypher MERGE
 /// - Wildcard [r] returns the MERGE-created edge with correct __type__
-/// - count(r) on the MERGE-created edge returns 1 (G070 + G072 integration)
+/// - count(r) on the MERGE-created edge returns 1
 #[test]
-fn test_g069_wildcard_after_cypher_merge() {
+fn test_wildcard_after_cypher_merge() {
     let fx = test_engine();
     let engine = &fx.engine;
     let mut interner = FieldInterner::new();
@@ -9151,7 +9146,7 @@ fn test_g069_wildcard_after_cypher_merge() {
         &allocator,
     );
 
-    // Wildcard [r] must find the MERGE-created KNOWS edge (G069 fix)
+    // Wildcard [r] must find the MERGE-created KNOWS edge
     let wild_rows = run_cypher_with_alloc(
         "MATCH (a)-[r]->(b) RETURN r.__type__ AS t",
         engine,
@@ -9165,7 +9160,7 @@ fn test_g069_wildcard_after_cypher_merge() {
         "wildcard should return KNOWS type"
     );
 
-    // count(r) on the MERGE-created edge must return 1 (G070 fix)
+    // count(r) on the MERGE-created edge must return 1
     let cnt_rows = run_cypher_with_alloc(
         "MATCH (a)-[r:KNOWS]->(b) RETURN count(r) AS cnt",
         engine,
@@ -9179,10 +9174,10 @@ fn test_g069_wildcard_after_cypher_merge() {
     );
 }
 
-// ── Pattern predicate in WHERE (G071) ────────────────────────────────────
+// ── Pattern predicate in WHERE ───────────────────────────────────────────
 
 #[test]
-fn g071_where_pattern_predicate_positive() {
+fn where_pattern_predicate_positive() {
     // WHERE (a)-[:KNOWS]->(b) should return rows where the edge exists
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9432,7 +9427,7 @@ fn shortest_path_end_to_end_unreachable_binds_null() {
 }
 
 #[test]
-fn g071_where_not_pattern_predicate() {
+fn where_not_pattern_predicate() {
     // WHERE NOT (a)-[:KNOWS]->(b) should return rows where the edge does NOT exist
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9469,7 +9464,7 @@ fn g071_where_not_pattern_predicate() {
 }
 
 #[test]
-fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
+fn where_not_pattern_predicate_blocks_when_edge_exists() {
     // WHERE NOT (a)-[:KNOWS]->(b) should filter out rows where the edge DOES exist
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9509,7 +9504,7 @@ fn g071_where_not_pattern_predicate_blocks_when_edge_exists() {
 }
 
 #[test]
-fn g071_pattern_predicate_with_and() {
+fn pattern_predicate_with_and() {
     // WHERE (a)-[:KNOWS]->(b) AND b.age > 20
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9549,7 +9544,7 @@ fn g071_pattern_predicate_with_and() {
 }
 
 #[test]
-fn g071_pattern_predicate_wildcard_type() {
+fn pattern_predicate_wildcard_type() {
     // WHERE (a)-[]->(b) — wildcard edge type
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9585,7 +9580,7 @@ fn g071_pattern_predicate_wildcard_type() {
 }
 
 #[test]
-fn g071_pattern_predicate_wrong_direction() {
+fn pattern_predicate_wrong_direction() {
     // WHERE (a)-[:KNOWS]->(b) but edge is b→a, not a→b
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9621,8 +9616,8 @@ fn g071_pattern_predicate_wrong_direction() {
 }
 
 #[test]
-fn g071_standalone_where_not_pattern() {
-    // Standalone WHERE (two separate MATCH clauses + WHERE) — the exact syntax from G071 description:
+fn standalone_where_not_pattern() {
+    // Standalone WHERE (two separate MATCH clauses + WHERE):
     // MATCH (src) MATCH (dst) WHERE NOT (src)-[:TYPE]->(dst) CREATE ...
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9669,7 +9664,7 @@ fn g071_standalone_where_not_pattern() {
 }
 
 #[test]
-fn g071_pattern_predicate_incoming_direction() {
+fn pattern_predicate_incoming_direction() {
     // WHERE (a)<-[:KNOWS]-(b) — incoming direction
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9706,7 +9701,7 @@ fn g071_pattern_predicate_incoming_direction() {
 }
 
 #[test]
-fn g071_pattern_predicate_in_or() {
+fn pattern_predicate_in_or() {
     // WHERE (a)-[:KNOWS]->(b) OR a.name = 'Charlie'
     let fx = test_engine();
     let engine = &fx.engine;
@@ -9752,9 +9747,9 @@ fn g071_pattern_predicate_in_or() {
     assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
 }
 
-// ─── G077: MERGE ALL ─────────────────────────────────────────────────────────
+// ─── MERGE ALL ───────────────────────────────────────────────────────────────
 
-/// G077 — MERGE ALL creates one edge per (src × tgt) pair when no edges exist.
+/// MERGE ALL creates one edge per (src × tgt) pair when no edges exist.
 ///
 /// What this tests:
 /// - Two source nodes × two target nodes → 4 edges created (Cartesian product).
@@ -9793,7 +9788,7 @@ fn test_merge_all_creates_cartesian_product() {
     }
 }
 
-/// G077 — MERGE ALL is idempotent: running twice on existing edges returns same count.
+/// MERGE ALL is idempotent: running twice on existing edges returns same count.
 ///
 /// What this tests:
 /// - First MERGE ALL creates 4 edges.
@@ -9832,7 +9827,7 @@ fn test_merge_all_idempotent() {
     assert_eq!(rows2.len(), 4, "second run finds same 4 edges (idempotent)");
 }
 
-/// G077 — MERGE ALL creates src and tgt nodes from scratch when none exist.
+/// MERGE ALL creates src and tgt nodes from scratch when none exist.
 ///
 /// What this tests:
 /// - No nodes of either label exist before MERGE ALL.
@@ -9860,7 +9855,7 @@ fn test_merge_all_creates_from_scratch() {
     );
 }
 
-/// G077 — MERGE ALL does NOT error on ambiguous source (unlike MERGE).
+/// MERGE ALL does NOT error on ambiguous source (unlike MERGE).
 ///
 /// What this tests:
 /// - MERGE errors when >1 source node matches.
@@ -9892,7 +9887,7 @@ fn test_merge_all_does_not_error_on_ambiguous_source() {
     assert_eq!(rows.len(), 2, "2 workers × 1 queue = 2 edges, no error");
 }
 
-/// G077 — MERGE ALL ON CREATE SET applies to newly created edges.
+/// MERGE ALL ON CREATE SET applies to newly created edges.
 ///
 /// What this tests:
 /// - Two edges are created on first run.
@@ -9931,7 +9926,7 @@ fn test_merge_all_on_create_set() {
     assert_eq!(rows2.len(), 2, "second run: idempotent, 2 edges found");
 }
 
-/// G077 — MERGE ALL does NOT error on ambiguous target (unlike MERGE).
+/// MERGE ALL does NOT error on ambiguous target (unlike MERGE).
 ///
 /// What this tests:
 /// - MERGE errors when >1 target node matches (symmetric to ambiguous source).
@@ -9963,7 +9958,7 @@ fn test_merge_all_does_not_error_on_ambiguous_target() {
     assert_eq!(rows.len(), 2, "1 router × 2 devices = 2 edges, no error");
 }
 
-/// G077 — MERGE ALL ON MATCH SET fires on existing edges.
+/// MERGE ALL ON MATCH SET fires on existing edges.
 ///
 /// What this tests:
 /// - Pre-create 2 edges manually.
@@ -10007,7 +10002,7 @@ fn test_merge_all_on_match_set() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// R-HYB2b: rrf_score([methods…], {vector:…, text:…}) — RankFuse operator
+// rrf_score([methods…], {vector:…, text:…}) — RankFuse operator
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Run a Cypher query with both a vector index registry and a text index
@@ -10092,7 +10087,7 @@ fn setup_rrf_indices(
     (vec_reg, text_reg)
 }
 
-/// R-HYB2b regression #2: parser/planner rejects any 3rd argument to
+/// Regression: parser/planner rejects any 3rd argument to
 /// `rrf_score(...)`. `k=60` is the IR standard (Cormack 2009) and not tunable.
 #[test]
 fn rrf_score_rejects_k_override() {
@@ -10109,7 +10104,7 @@ fn rrf_score_rejects_k_override() {
     );
 }
 
-/// R-HYB2b: empty method list is rejected at plan time.
+/// rrf_score: empty method list is rejected at plan time.
 #[test]
 fn rrf_score_rejects_empty_methods() {
     let ast = parse(
@@ -10125,7 +10120,7 @@ fn rrf_score_rejects_empty_methods() {
     );
 }
 
-/// R-HYB2b: query map with an unknown key is rejected.
+/// rrf_score: query map with an unknown key is rejected.
 #[test]
 fn rrf_score_rejects_unknown_query_key() {
     let ast = parse(
@@ -10141,7 +10136,7 @@ fn rrf_score_rejects_unknown_query_key() {
     );
 }
 
-/// R-HYB2b: rrf_score in WHERE is rejected (materialised rank assignment
+/// rrf_score in WHERE is rejected (materialised rank assignment
 /// is impossible at filter-time).
 #[test]
 fn rrf_score_rejects_where_placement() {
@@ -10159,7 +10154,7 @@ fn rrf_score_rejects_where_placement() {
     );
 }
 
-/// R-HYB2b: plan shape — a valid rrf_score produces a RankFuse operator below
+/// rrf_score plan shape — a valid rrf_score produces a RankFuse operator below
 /// the topmost Project. Verified via EXPLAIN text.
 #[test]
 fn rrf_score_plan_contains_rank_fuse() {
@@ -10181,7 +10176,7 @@ fn rrf_score_plan_contains_rank_fuse() {
     );
 }
 
-/// R-HYB2b regression #1: RRF ranking handles methods with divergent score
+/// Regression: RRF ranking handles methods with divergent score
 /// distributions. One doc is top-1 on BOTH methods (balanced) and must win
 /// regardless of raw-score scale. A naïve weighted-sum with equal weights
 /// would be dominated by whichever method has larger raw scores (here BM25,
@@ -10305,7 +10300,7 @@ fn rrf_score_handles_divergent_distributions() {
     );
 }
 
-/// R-HYB2b: penalty-rank semantics. A row missing one method entirely still
+/// rrf_score penalty-rank semantics. A row missing one method entirely still
 /// receives a score from the other methods — proof that RRF is additive,
 /// not short-circuit.
 #[test]
@@ -10370,7 +10365,7 @@ fn rrf_score_missing_method_uses_penalty_rank() {
     );
 }
 
-/// R-HYB2b: unscorable method (no HNSW index, no FT index, and no vector
+/// rrf_score: unscorable method (no HNSW index, no FT index, and no vector
 /// values) errors with a clear message.
 #[test]
 fn rrf_score_unscorable_method_errors() {
@@ -10417,7 +10412,7 @@ fn rrf_score_unscorable_method_errors() {
     );
 }
 
-/// R-HYB2b: competition ranking — rows with identical vector scores receive
+/// rrf_score competition ranking — rows with identical vector scores receive
 /// the SAME rank, so their RRF contribution for that method is equal. We
 /// seed two rows with identical vectors + identical text to force a tie,
 /// then verify their scores are identical.
@@ -10482,7 +10477,7 @@ fn rrf_score_competition_rank_ties() {
     );
 }
 
-/// R-HYB2b: full pipeline — `MATCH → RETURN rrf_score AS s → ORDER BY s DESC
+/// rrf_score full pipeline — `MATCH → RETURN rrf_score AS s → ORDER BY s DESC
 /// → LIMIT K`. Verifies that LIMIT applies AFTER RankFuse ranks the full set
 /// (if LIMIT clipped before RankFuse, ranks would be wrong).
 #[test]
@@ -10544,10 +10539,10 @@ fn rrf_score_pipeline_with_order_by_and_limit() {
     );
 }
 
-/// R-HYB2b: brute-force vector scoring path — when a vector property has NO
+/// rrf_score brute-force vector scoring path — when a vector property has NO
 /// HNSW index registered, RankFuse falls back to in-memory cosine similarity
 /// (same code path used for edge vector properties in `VectorBruteForce`).
-/// Proves the full edge-vector scope of R-HYB2b — the resolver correctly
+/// Proves the edge-vector scope of rrf_score — the resolver correctly
 /// classifies an indexless vector property as brute-force and scores all
 /// rows, rather than erroring out.
 #[test]
@@ -10629,7 +10624,7 @@ fn rrf_score_brute_force_vector_without_hnsw() {
     assert_eq!(bottom_id, 3, "node 3 (orthogonal + no text) must rank last");
 }
 
-/// R-HYB2b: method expression that isn't a `var.property` access is rejected
+/// rrf_score: method expression that isn't a `var.property` access is rejected
 /// at execute time with a message naming the problem.
 #[test]
 fn rrf_score_non_property_method_errors() {
@@ -10666,7 +10661,7 @@ fn rrf_score_non_property_method_errors() {
     );
 }
 
-/// R-HYB2b: two `rrf_score(...)` calls with differing method lists in the
+/// Two `rrf_score(...)` calls with differing method lists in the
 /// same query are rejected at plan time. Same signature is fine (redundant
 /// reads of `__rrf_score__`).
 #[test]
@@ -10685,7 +10680,7 @@ fn rrf_score_multiple_differing_calls_rejected() {
     );
 }
 
-/// R-HYB2b: if all methods are vector but the query map omits the `vector`
+/// rrf_score: if all methods are vector but the query map omits the `vector`
 /// key, execution errors with a clear message.
 #[test]
 fn rrf_score_missing_vector_key_when_needed_errors() {
@@ -10726,7 +10721,7 @@ fn rrf_score_missing_vector_key_when_needed_errors() {
     );
 }
 
-/// R-HYB2b: `ORDER BY rrf_score(...) DESC` as a direct call (not via alias)
+/// `ORDER BY rrf_score(...) DESC` as a direct call (not via alias)
 /// must work. Exercises the `ensure_rrf_passthrough` code path that injects
 /// a synthetic `__rrf_score__` Project item so Sort (above Project) still
 /// sees the score column.
@@ -10783,7 +10778,7 @@ fn rrf_score_order_by_direct_call() {
     );
 }
 
-/// R-HYB2b: vector-only RRF on two orthogonal vector methods (no text).
+/// Vector-only RRF on two orthogonal vector methods (no text).
 /// Exercises the degenerate query map `{vector: ...}` (no `text` key).
 #[test]
 fn rrf_score_vector_only_multiple_methods() {
@@ -10836,7 +10831,7 @@ fn rrf_score_vector_only_multiple_methods() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// R-HYB2c: doc_score(doc, query [, α, β, γ]) — document-level aggregate
+// doc_score(doc, query [, α, β, γ]) — document-level aggregate
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Seed `n_chunks` Chunk nodes connected to a Document via HAS_CHUNK.
@@ -10861,7 +10856,7 @@ fn seed_doc_with_chunks(
     }
 }
 
-/// R-HYB2c regression #1: `doc_score(d, q)` with default weights (0.5/0.3/0.2)
+/// Regression: `doc_score(d, q)` with default weights (0.5/0.3/0.2)
 /// must equal `0.5·max + 0.3·avg + 0.2·coverage` computed independently by
 /// hand over the HAS_CHUNK children.
 #[test]
@@ -10909,7 +10904,7 @@ fn doc_score_matches_manual_aggregate() {
     );
 }
 
-/// R-HYB2c regression #2a: positional overrides α/β/γ.
+/// doc_score: positional overrides α/β/γ.
 #[test]
 fn doc_score_custom_weights_positional() {
     let fx = test_engine();
@@ -10940,7 +10935,7 @@ fn doc_score_custom_weights_positional() {
     );
 }
 
-/// R-HYB2c regression #2b: weights map overrides α/β/γ.
+/// doc_score: weights map overrides α/β/γ.
 #[test]
 fn doc_score_custom_weights_map() {
     let fx = test_engine();
@@ -10971,7 +10966,7 @@ fn doc_score_custom_weights_map() {
     );
 }
 
-/// R-HYB2c regression #3: document with zero HAS_CHUNK children returns 0
+/// doc_score: document with zero HAS_CHUNK children returns 0
 /// (not an error, not null). Required by the task spec.
 #[test]
 fn doc_score_zero_chunks_returns_zero() {
@@ -10999,7 +10994,7 @@ fn doc_score_zero_chunks_returns_zero() {
     );
 }
 
-/// R-HYB2c: chunks without embedding reduce coverage (they count toward total
+/// doc_score: chunks without embedding reduce coverage (they count toward total
 /// but not toward matching). Formula: max/avg only over valid embeddings,
 /// coverage = matching / total where total includes all HAS_CHUNK children.
 #[test]
@@ -11039,7 +11034,7 @@ fn doc_score_missing_embeddings_reduce_coverage() {
     );
 }
 
-/// R-HYB2c: chunks with orthogonal / negatively-correlated embeddings must
+/// doc_score: chunks with orthogonal / negatively-correlated embeddings must
 /// count toward `total` but NOT toward `matching`. Max and avg use the
 /// actual chunk similarities (which may be zero/negative); coverage drops.
 #[test]
@@ -11093,7 +11088,7 @@ fn doc_score_negative_similarity_chunks_excluded_from_matching() {
     );
 }
 
-/// R-HYB2c: doc_score composes with ORDER BY and LIMIT to pick top docs.
+/// doc_score composes with ORDER BY and LIMIT to pick top docs.
 #[test]
 fn doc_score_orders_documents_by_relevance() {
     let fx = test_engine();
@@ -11157,7 +11152,7 @@ fn doc_score_orders_documents_by_relevance() {
     }
 }
 
-/// R-HYB2c: plan-time guards — arity outside 2/3/5 rejected.
+/// doc_score plan-time guards — arity outside 2/3/5 rejected.
 #[test]
 fn doc_score_rejects_wrong_arity() {
     let cases = [
@@ -11180,7 +11175,7 @@ fn doc_score_rejects_wrong_arity() {
     }
 }
 
-/// R-HYB2c: first arg must be a bound variable, not a literal or expression.
+/// doc_score: first arg must be a bound variable, not a literal or expression.
 #[test]
 fn doc_score_rejects_non_variable_doc() {
     let ast = parse(
@@ -11196,7 +11191,7 @@ fn doc_score_rejects_non_variable_doc() {
     );
 }
 
-/// R-HYB2c: weights map with unknown key rejected.
+/// doc_score: weights map with unknown key rejected.
 #[test]
 fn doc_score_rejects_unknown_weight_key() {
     let ast = parse(
@@ -11212,7 +11207,7 @@ fn doc_score_rejects_unknown_weight_key() {
     );
 }
 
-/// R-HYB2c: doc_score in WHERE is rejected (correlated aggregate, not filter).
+/// doc_score in WHERE is rejected (correlated aggregate, not filter).
 #[test]
 fn doc_score_rejects_where_placement() {
     let ast = parse(
@@ -11229,7 +11224,7 @@ fn doc_score_rejects_where_placement() {
     );
 }
 
-/// R-HYB2c: EXPLAIN surfaces the DocScore operator under the innermost Project.
+/// EXPLAIN surfaces the DocScore operator under the innermost Project.
 #[test]
 fn doc_score_plan_contains_doc_score_operator() {
     let ast = parse(
@@ -11246,7 +11241,7 @@ fn doc_score_plan_contains_doc_score_operator() {
     );
 }
 
-/// R-HYB2c: two `doc_score(...)` calls with differing args in one plan are
+/// Two `doc_score(...)` calls with differing args in one plan are
 /// rejected at plan time. Same-signature repetition is allowed (both resolve
 /// to `__doc_score__`) but different signatures would require two operators.
 #[test]
@@ -11265,7 +11260,7 @@ fn doc_score_multiple_differing_calls_rejected() {
     );
 }
 
-/// R-HYB2c: `ORDER BY doc_score(...) DESC` used as a bare function call (not
+/// `ORDER BY doc_score(...) DESC` used as a bare function call (not
 /// via alias) exercises the `ensure_doc_passthrough` code path that injects
 /// `__doc_score__` as a synthetic Project item so Sort (above Project) can
 /// read it.
@@ -11305,7 +11300,7 @@ fn doc_score_order_by_direct_call() {
     );
 }
 
-/// R-HYB2c: query can be supplied as a Cypher parameter `$q` and is resolved
+/// doc_score: query can be supplied as a Cypher parameter `$q` and is resolved
 /// to a vector before execution.
 #[test]
 fn doc_score_query_as_parameter() {
@@ -11342,13 +11337,13 @@ fn doc_score_query_as_parameter() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// R-SNAP1: read_consistency knob + planner auto-promotion
+// read_consistency knob + planner auto-promotion
 // ═══════════════════════════════════════════════════════════════════════
 
 use coordinode_core::txn::read_consistency::ReadConsistencyMode;
 use coordinode_core::txn::watermark::MaxAssignedWatermark;
 
-/// R-SNAP1 regression #1: cross-modality query with NO hint is auto-promoted
+/// Regression: cross-modality query with NO hint is auto-promoted
 /// to `snapshot` by the planner. Here the query touches graph + vector +
 /// text — three modalities, so promotion must fire.
 #[test]
@@ -11374,11 +11369,11 @@ fn read_consistency_auto_promote_cross_modality_to_snapshot() {
     );
 }
 
-/// R-SNAP1 regression #2: single-modality query stays on `current` — no
+/// Regression: single-modality query stays on `current` — no
 /// auto-promotion.
 ///
-/// Modality counting (see `planner::builder::modality_count` and
-/// `arch/core/transactions.md § Read Consistency`): a bare `NodeScan` or
+/// Modality counting (see `planner::builder::modality_count`): a bare
+/// `NodeScan` or
 /// `IndexScan` is a carrier, not a distinct modality. Genuine graph work
 /// requires `Traverse` or `ShortestPath`. Pure vector KNN, pure text
 /// search, and pure graph traversal are each single-modality and stay on
@@ -11401,7 +11396,7 @@ fn read_consistency_single_modality_stays_current() {
     );
 }
 
-/// R-SNAP1 regression #3: explicit `vector_consistency('exact')` overrides
+/// Regression: explicit `vector_consistency('exact')` overrides
 /// the promotion for the vector modality ONLY. `read_consistency` stays at
 /// `snapshot` (auto-promoted because the query crosses modalities), so FTS
 /// and graph reads still align at a single HLC T; the vector path goes
@@ -11428,7 +11423,7 @@ fn read_consistency_vector_consistency_narrower_override() {
     );
 }
 
-/// R-SNAP1: an explicit `read_consistency('snapshot')` hint promotes even a
+/// An explicit `read_consistency('snapshot')` hint promotes even a
 /// single-modality query. User knows something the planner doesn't.
 #[test]
 fn read_consistency_explicit_hint_overrides_single_modality_default() {
@@ -11445,7 +11440,7 @@ fn read_consistency_explicit_hint_overrides_single_modality_default() {
     );
 }
 
-/// R-SNAP1: an explicit `read_consistency('current')` hint overrides
+/// An explicit `read_consistency('current')` hint overrides
 /// auto-promotion (rare but valid — caller accepts potential
 /// cross-modality skew for latency).
 #[test]
@@ -11465,7 +11460,7 @@ fn read_consistency_explicit_current_hint_defeats_auto_promotion() {
     );
 }
 
-/// R-SNAP1: `read_consistency = 'current'` skips the watermark wait entirely —
+/// `read_consistency = 'current'` skips the watermark wait entirely —
 /// even when `applied_watermark` is wired, `Current` mode does not invoke
 /// `wait_for`. Verify by wiring a watermark that is permanently behind the
 /// `mvcc_read_ts`; in `Current` mode the query succeeds immediately.
@@ -11500,7 +11495,7 @@ fn read_consistency_current_does_not_block_on_watermark() {
     );
 }
 
-/// R-SNAP1: `read_consistency = 'snapshot'` with an explicit hint on a
+/// `read_consistency = 'snapshot'` with an explicit hint on a
 /// single-modality query blocks on the watermark and returns an error
 /// when the applier never catches up. Direct test of the timeout path.
 #[test]
@@ -11534,7 +11529,7 @@ fn read_consistency_snapshot_times_out_on_stale_watermark() {
     );
 }
 
-/// R-SNAP1: `read_consistency = 'snapshot'` unblocks when the applier
+/// `read_consistency = 'snapshot'` unblocks when the applier
 /// catches up before the timeout. Full integration: reader blocks, we
 /// advance the watermark from a spawned thread, reader unblocks and
 /// returns rows.
@@ -11576,7 +11571,7 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
     );
 }
 
-/// R-SNAP1: `read_consistency = 'snapshot'` with NO watermark wired (legacy
+/// `read_consistency = 'snapshot'` with NO watermark wired (legacy
 /// context) executes without blocking — mode applies only when a watermark
 /// is available.
 #[test]
@@ -11598,7 +11593,7 @@ fn read_consistency_snapshot_without_watermark_is_noop() {
     assert_eq!(rows.len(), 1);
 }
 
-/// R-SNAP1: EXPLAIN output shows the effective `vector_consistency` when
+/// EXPLAIN output shows the effective `vector_consistency` when
 /// VectorFilter operators are present. The `read_consistency` → plan
 /// propagation drives this display.
 #[test]
@@ -11620,7 +11615,7 @@ fn read_consistency_drives_explain_vector_consistency_label() {
     );
 }
 
-/// R-SNAP1: `read_consistency='exact'` hint triggers the watermark wait
+/// `read_consistency='exact'` hint triggers the watermark wait
 /// just like `snapshot` (both return true from `requires_snapshot_wait`).
 /// The difference between them is the downstream vector scoring path
 /// (HNSW post-filter vs brute-force); at the wait-for boundary they
@@ -11659,7 +11654,7 @@ fn read_consistency_exact_also_blocks_on_watermark() {
     );
 }
 
-/// R-SNAP1: when `AS OF TIMESTAMP` is set, the watermark wait targets
+/// When `AS OF TIMESTAMP` is set, the watermark wait targets
 /// `ctx.snapshot_ts` (the explicit historical point), NOT `mvcc_read_ts`.
 /// This covers the target-resolution branch in `execute()`.
 #[test]

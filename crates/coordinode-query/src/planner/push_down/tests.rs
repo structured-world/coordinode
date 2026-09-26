@@ -167,7 +167,7 @@ fn strategy_wire_strings_are_stable() {
     assert_eq!(PushDownStrategy::VectorFirst.as_wire_str(), "vector_first");
 }
 
-// ── EXPLAIN push_down JSON block emission (R-PUSH2) ────────────────
+// ── EXPLAIN push_down JSON block emission ──────────────────────────
 
 /// The block carries every contract field with the stable slug strings.
 #[test]
@@ -255,7 +255,7 @@ fn reason_wire_strings_are_stable() {
     );
 }
 
-// ── EXPLAIN push_down JSON contract: parse + version boundary (R-PUSH4) ──
+// ── EXPLAIN push_down JSON contract: parse + version boundary ──
 
 /// The hand-rendered EXPLAIN block must be well-formed JSON whose every
 /// frozen field is present with the contract-mandated JSON type and the

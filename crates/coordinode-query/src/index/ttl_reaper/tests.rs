@@ -251,8 +251,8 @@ fn reap_removes_field_on_expiry() {
 /// When `target_field` is specified, Subtree scope must delete the target
 /// DOCUMENT field, NOT the anchor TIMESTAMP field that triggered expiry.
 ///
-/// Regression test for G068: previously Subtree behaved identically to Field
-/// (always deleted anchor_field regardless of target_field).
+/// Regression test: Subtree must not behave like Field (deleting
+/// anchor_field regardless of target_field).
 #[test]
 fn reap_subtree_with_target_field_deletes_target_not_anchor() {
     let dir = tempfile::tempdir().expect("tempdir");

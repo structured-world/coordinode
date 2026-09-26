@@ -76,7 +76,7 @@ pub fn build_index(
         ..Default::default()
     };
 
-    // Phase 1: Setup — validate
+    // Step 1: Setup — validate
     if index.properties.is_empty() {
         result
             .errors
@@ -85,7 +85,7 @@ pub fn build_index(
         return result;
     }
 
-    // Phase 2: InProgress — scan nodes
+    // Step 2: InProgress — scan nodes
     result.state = Some(IndexBuildState::InProgress);
 
     let nodes = LocalNodeStore;
@@ -191,7 +191,7 @@ pub fn build_index(
         }
     }
 
-    // Phase 3: Commit or Abort
+    // Step 3: Commit or Abort
     if !result.violations.is_empty() {
         // Unique constraint violations — abort
         // Clean up: drop all created index entries

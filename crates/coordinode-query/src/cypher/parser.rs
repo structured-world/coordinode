@@ -1039,7 +1039,7 @@ fn build_drop_text_index_clause(pair: Pair<'_, Rule>) -> Result<DropTextIndexCla
     Ok(DropTextIndexClause { name })
 }
 
-// --- Encrypted Index DDL (SSE, G017) ---
+// --- Encrypted Index DDL (SSE) ---
 
 fn build_create_encrypted_index_clause(
     pair: Pair<'_, Rule>,
@@ -1178,8 +1178,8 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
     })
 }
 
-/// Build a `CREATE NODE TYPE … [TEMPORAL] [WITH (...)]` clause (R172a per
-/// ADR-027). Mirror of `build_create_edge_type_clause` — the grammar shape
+/// Build a `CREATE NODE TYPE … [TEMPORAL] [WITH (...)]` clause. Mirror of
+/// `build_create_edge_type_clause` — the grammar shape
 /// is identical apart from `kw_edge` → `kw_node`, so the inner walker is
 /// structurally the same.
 fn build_create_node_type_clause(
@@ -1242,7 +1242,7 @@ fn build_create_node_type_clause(
     })
 }
 
-/// Build a `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` clause (R901).
+/// Build a `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` clause.
 fn build_create_table_clause(
     pair: Pair<'_, Rule>,
 ) -> Result<crate::cypher::ast::CreateTableClause, ParseError> {
@@ -1354,7 +1354,7 @@ fn build_create_trigger_clause(pair: Pair<'_, Rule>) -> Result<CreateTriggerClau
                     .ok_or_else(|| ParseError::Invalid("trigger_option: missing inner".into()))?;
                 match opt.as_rule() {
                     Rule::trigger_cascade_limit | Rule::trigger_maxdepth => {
-                        // MAXDEPTH is a deprecated alias for CASCADE_LIMIT (the trigger architecture).
+                        // MAXDEPTH is a deprecated alias for CASCADE_LIMIT.
                         if let Some(v) = parse_trigger_integer_option(opt)? {
                             cascade_limit = Some(v);
                         }
@@ -1853,8 +1853,7 @@ fn build_merge_nodes_clause(pair: Pair<'_, Rule>) -> Result<MergeNodesClause, Pa
     let mut conflict = MergeNodesConflictStrategy::default();
     let mut transfer_edges: Option<TransferEdgesEndpoints> = None;
     let mut duplicate: Option<MergeNodesDuplicateStrategy> = None;
-    // Default per arch/compatibility/native-procedures.md: edge properties are
-    // always transferred. The `TRANSFER EDGE PROPERTIES` clause is a redundant
+    // Edge properties are always transferred by default. The `TRANSFER EDGE PROPERTIES` clause is a redundant
     // readability ack; its absence does NOT mean "drop properties".
     let mut transfer_edge_properties = true;
 
@@ -2009,7 +2008,7 @@ fn build_clone_node_clause(pair: Pair<'_, Rule>) -> Result<CloneNodeClause, Pars
 
     let mut with_edges = false;
     // Properties are copied by default; `WITH PROPERTIES` is an explicit,
-    // equivalent affirmation (see arch/compatibility/native-procedures.md).
+    // equivalent affirmation.
     let mut with_properties = true;
     let mut set_items = Vec::new();
     let mut as_of = None;

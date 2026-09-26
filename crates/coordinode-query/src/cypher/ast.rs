@@ -131,14 +131,14 @@ pub enum Clause {
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
     /// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable
-    /// label DDL (R172a per ADR-027). Mirror of `CreateEdgeType` for nodes.
+    /// label DDL. Mirror of `CreateEdgeType` for nodes.
     CreateNodeType(CreateNodeTypeClause),
 
     /// `CREATE TABLE <name> ( <cols> ) [STORAGE ROW|COLUMNAR]` — relational
-    /// TABLE modality DDL (R901).
+    /// TABLE modality DDL.
     CreateTable(CreateTableClause),
 
-    /// `DROP TABLE <name>` — relational TABLE modality DDL (R901).
+    /// `DROP TABLE <name>` — relational TABLE modality DDL.
     DropTable(DropTableClause),
 
     /// `CREATE TRIGGER … ON :Label CREATE|UPDATE|DELETE BEFORE|AFTER COMMIT EXECUTE … [ON ERROR …]`.
@@ -380,7 +380,7 @@ pub struct CreateVectorIndexClause {
     /// - `"sq8"`
     /// - `"rabitq"` (1-bit; default `bits=1`)
     /// - `"rabitq-1bit"` / `"rabitq-2bit"` / `"rabitq-3bit"` /
-    ///   `"rabitq-4bit"` (Extended-RaBitQ R862 — higher bits trade
+    ///   `"rabitq-4bit"` (Extended-RaBitQ — higher bits trade
     ///   RAM for recall)
     ///
     /// Case-insensitive. Unrecognized values fall back to `"none"`.
@@ -422,7 +422,7 @@ pub struct CreateEdgeTypeClause {
 }
 
 /// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable
-/// label DDL (R172a per ADR-027). Mirror of `CreateEdgeTypeClause` for nodes.
+/// label DDL. Mirror of `CreateEdgeTypeClause` for nodes.
 ///
 /// When `temporal == true`, every node record of this label carries the
 /// `(valid_from, valid_to)` valid-time interval plus the engine-assigned
@@ -454,7 +454,7 @@ pub struct EdgePropertyDecl {
     pub not_null: bool,
 }
 
-/// Physical storage layout selected by `CREATE TABLE`'s `STORAGE` clause (R901).
+/// Physical storage layout selected by `CREATE TABLE`'s `STORAGE` clause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableStorageLayout {
     /// `STORAGE ROW` (default): one record per row on the node path.
@@ -464,7 +464,7 @@ pub enum TableStorageLayout {
     Columnar,
 }
 
-/// A single `CREATE TABLE` column declaration: `name TYPE [modifiers]` (R901).
+/// A single `CREATE TABLE` column declaration: `name TYPE [modifiers]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableColumnDecl {
     /// Column name.
@@ -481,7 +481,7 @@ pub struct TableColumnDecl {
 }
 
 /// `CREATE TABLE <name> ( <columns> ) [STORAGE ROW|COLUMNAR]` — relational
-/// TABLE modality DDL (R901).
+/// TABLE modality DDL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTableClause {
     /// Table (label) name.
@@ -492,7 +492,7 @@ pub struct CreateTableClause {
     pub layout: TableStorageLayout,
 }
 
-/// `DROP TABLE <name>` — relational TABLE modality DDL (R901).
+/// `DROP TABLE <name>` — relational TABLE modality DDL.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableClause {
     /// Table (label) name to drop.
@@ -524,12 +524,12 @@ pub struct CreateTriggerClause {
     /// re-parsed and executed when the trigger fires. The grammar guarantees
     /// the source is at least one syntactically valid clause sequence.
     pub body_source: String,
-    /// L1 cascade-depth limit per-trigger override (the trigger architecture).
+    /// L1 cascade-depth limit per-trigger override.
     /// Counter is shared across all triggers in one originating mutation;
     /// this field overrides the cluster default (`triggers.max_cascade_depth`,
     /// 10). Parsed from `CASCADE_LIMIT n` or its deprecated alias `MAXDEPTH n`.
     pub cascade_limit: Option<u32>,
-    /// L2 unique-trigger fanout limit per-trigger override (the trigger architecture).
+    /// L2 unique-trigger fanout limit per-trigger override.
     /// Counter is per-trigger within one cascade; this field overrides the
     /// cluster default (`triggers.max_cascade_fanout`, 100). Parsed from
     /// `CASCADE_FANOUT n`.
@@ -601,7 +601,7 @@ pub enum TriggerTiming {
     AfterCommit,
 }
 
-/// Per-trigger error handling policy (the trigger architecture).
+/// Per-trigger error handling policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnErrorPolicy {
     /// `BEFORE COMMIT`: aborts the originating transaction.
@@ -620,7 +620,7 @@ pub enum OnErrorPolicy {
 
 impl OnErrorPolicy {
     /// Default policy when a `CREATE TRIGGER` statement omits `ON ERROR`.
-    /// Spec'd in the trigger architecture: BEFORE → Propagate; AFTER → Retry 3 with 1s backoff.
+    /// BEFORE → Propagate; AFTER → Retry 3 with 1s backoff.
     pub fn default_for(timing: TriggerTiming) -> Self {
         match timing {
             TriggerTiming::BeforeCommit => Self::Propagate,
@@ -1193,7 +1193,8 @@ pub struct DeleteClause {
     pub exprs: Vec<Expr>,
 }
 
-/// `MERGE NODES (a, b) INTO <target>` clause — see R180 / `arch/compatibility/native-procedures.md`.
+/// `MERGE NODES (a, b) INTO <target>` clause — the native replacement for
+/// `apoc.refactor.mergeNodes`.
 ///
 /// Collapses two bound node variables into one within a single MVCC transaction.
 /// The non-surviving node is DETACH DELETEd after property merge and edge transfer.
@@ -1218,9 +1219,9 @@ pub struct MergeNodesClause {
     pub duplicate: MergeNodesDuplicateStrategy,
     /// `TRANSFER EDGE PROPERTIES` — copy edge facets from non-surviving to surviving.
     ///
-    /// Per arch/compatibility/native-procedures.md: "Edge properties are
-    /// transferred by default." The clause is therefore a redundant
-    /// readability marker — its absence does NOT mean "drop edge properties".
+    /// Edge properties are transferred by default, so the clause is a
+    /// redundant readability marker — its absence does NOT mean "drop edge
+    /// properties".
     /// The flag is preserved on the AST so future extensions can carry
     /// alternative policies without re-encoding the grammar.
     pub transfer_edge_properties: bool,
@@ -1239,8 +1240,7 @@ pub struct TransferEdgesEndpoints {
 ///
 /// A first-class, distribution-safe Cypher operation (single MVCC transaction):
 /// the source `a` must be bound by a preceding MATCH, and the clone `b` is a
-/// freshly-allocated node returned to the row. See
-/// arch/compatibility/native-procedures.md § CLONE NODES. The clone goes through
+/// freshly-allocated node returned to the row. The clone goes through
 /// the same create path as `CREATE` (fresh node id, index registration, BlobStore
 /// dedup), and `WITH EDGES` clones incident edges via posting-list merge
 /// operators. For a temporal-labelled source the current version is cloned (the
@@ -1286,8 +1286,7 @@ pub enum RedirectDirection {
 /// `REDIRECT EDGES FROM a TO b [WHERE type(r) IN [...]] [DIRECTION ...]` moves
 /// edges off the bound node `a` onto the bound node `b` in a single MVCC
 /// transaction, via posting-list merge operators (no read-modify-write). A
-/// building block for graph refactoring. See
-/// arch/compatibility/native-procedures.md § REDIRECT EDGES.
+/// building block for graph refactoring.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RedirectEdgesClause {
     /// Source node variable (`a`) — edges are moved off this node. Must be bound.
@@ -1365,7 +1364,7 @@ pub struct DetachDocumentClause {
     pub edge_type: Option<String>,
     /// Edge direction from the perspective of `source_variable`. `Outgoing`
     /// means `(source)-[:TYPE]->(target)`; `Incoming` means `(source)<-[:TYPE]-(target)`;
-    /// the canonical form in the arch doc is `(a:Address)-[:HAS_ADDRESS]->(n)`
+    /// the canonical form is `(a:Address)-[:HAS_ADDRESS]->(n)`
     /// which stores as `Incoming` from `n`'s perspective.
     pub edge_direction: EdgeFromSource,
     /// Optional variable name bound to the new edge (not yet used by executor).

@@ -1050,7 +1050,7 @@ fn eval_map_projection_missing_prop_is_null() {
     }
 }
 
-// ---- R520 string functions ----
+// ---- string functions ----
 
 /// Invoke a scalar function by name with literal arguments against an empty row.
 fn call_fn(name: &str, args: Vec<Value>) -> Value {
@@ -1260,7 +1260,7 @@ fn every_implemented_function_is_still_reachable() {
     }
 }
 
-// ---- R521 math functions ----
+// ---- math functions ----
 
 #[test]
 fn math_fn_abs_preserves_type() {
@@ -1389,7 +1389,7 @@ fn math_fn_null_propagation() {
     assert_eq!(call_fn("sign", vec![Value::Null]), Value::Null);
 }
 
-// ---- R522 trigonometric functions ----
+// ---- trigonometric functions ----
 
 fn approx(v: Value, want: f64) {
     match v {
@@ -1457,7 +1457,7 @@ fn trig_fn_null_propagation() {
     assert_eq!(call_fn("degrees", vec![s("x")]), Value::Null);
 }
 
-// ---- R523 scalar functions ----
+// ---- scalar functions ----
 
 #[test]
 fn scalar_fn_nullif() {
@@ -1553,7 +1553,7 @@ fn scalar_fn_start_end_node_and_properties() {
     }
 }
 
-// ---- R524 list functions ----
+// ---- list functions ----
 
 #[test]
 fn list_fn_head_last_tail() {

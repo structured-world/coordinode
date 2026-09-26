@@ -1,12 +1,12 @@
-//! R-SNAP6 — Snapshot API stability contract tests.
+//! Snapshot API stability contract tests.
 //!
 //! These tests FREEZE the public surface of the `read_consistency` knob.
 //!
 //! **Breaking any of these tests is a breaking-change signal.** Before
 //! editing the test to match new behaviour, the change MUST:
 //!
-//! 1. Update `arch/core/transactions.md § Read Consistency` with the new
-//!    rule or value.
+//! 1. Update the `read_consistency` section of `docs/cypher/reference.md`
+//!    with the new rule or value.
 //! 2. Add an alias for the old name (if renaming) — never remove a string
 //!    form that was ever shipped in a public release.
 //! 3. Run a full deprecation cycle (one minor release with the old form
@@ -67,7 +67,7 @@ fn contract_mode_variants_are_exactly_three() {
     assert_eq!(
         all.len(),
         3,
-        "read_consistency has exactly 3 public modes — changing this count requires arch/core/transactions.md update"
+        "read_consistency has exactly 3 public modes — changing this count requires updating the public docs"
     );
 }
 
