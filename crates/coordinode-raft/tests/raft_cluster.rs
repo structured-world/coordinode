@@ -555,7 +555,7 @@ async fn cluster_multiple_proposals_replicate() {
     assert!(result.is_ok(), "TIMED OUT — multi-proposal replicate");
 }
 
-/// Runtime voter↔learner transitions (R-PROD2): demote a voter to a learner
+/// Runtime voter↔learner transitions: demote a voter to a learner
 /// (cluster keeps working at 2-voter quorum, the demoted node still receives
 /// replication), then promote it back to a voter — all live, no restart.
 #[tokio::test(flavor = "multi_thread")]
@@ -854,7 +854,7 @@ async fn cluster_crash_recovery() {
         let path2 = dir2.path().to_path_buf();
         let path3 = dir3.path().to_path_buf();
 
-        // Phase 1: Bootstrap + write data
+        // Step 1: Bootstrap + write data
         {
             let e1 = Arc::new(
                 StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -951,7 +951,7 @@ async fn cluster_crash_recovery() {
         }
         // All dropped, files flushed
 
-        // Phase 2: Reopen all nodes from same storage, verify data
+        // Step 2: Reopen all nodes from same storage, verify data
         {
             let e1 = Arc::new(
                 StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1793,7 +1793,7 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
     );
 }
 
-/// G046: Multi-chunk gRPC snapshot transfer.
+/// Multi-chunk gRPC snapshot transfer.
 /// Same pattern as cluster_snapshot_grpc_transfer_to_new_node but with
 /// large payload (>4MB) to verify chunked transfer protocol works
 /// end-to-end through real gRPC.
@@ -1961,7 +1961,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
     );
 }
 
-/// G042: Follower restart reconnection.
+/// Follower restart reconnection.
 /// Leader has cached gRPC connection to follower → follower shuts down →
 /// follower restarts on same port → leader reconnects automatically →
 /// new data replicates to restarted follower.
@@ -2187,7 +2187,7 @@ async fn cluster_follower_restart_reconnection() {
         assert_eq!(
             val_after.as_deref(),
             Some(b"post".as_slice()),
-            "G042: data written AFTER follower restart should replicate — \
+            "data written AFTER follower restart should replicate — \
              proves gRPC reconnection via connect_lazy()"
         );
 
@@ -2203,7 +2203,7 @@ async fn cluster_follower_restart_reconnection() {
     );
 }
 
-/// R136: Graceful leader transfer — leader transfers to specific peer,
+/// Graceful leader transfer — leader transfers to specific peer,
 /// new leader serves writes, old leader becomes follower.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_graceful_leader_transfer() {
@@ -2378,7 +2378,7 @@ async fn cluster_graceful_leader_transfer() {
     );
 }
 
-/// R136: Graceful shutdown transfers leadership automatically.
+/// Graceful shutdown transfers leadership automatically.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_graceful_shutdown_transfers_leadership() {
     let _ = tracing_subscriber::fmt()
@@ -2496,7 +2496,7 @@ async fn cluster_graceful_shutdown_transfers_leadership() {
     );
 }
 
-/// R137: Snapshot-based replica bootstrap — new node joins a cluster with
+/// Snapshot-based replica bootstrap — new node joins a cluster with
 /// purged logs, receives snapshot, then catches up via log replay for
 /// writes that happened AFTER the snapshot. Verifies both snapshot data
 /// and post-snapshot log replay are present on the bootstrapped node.
@@ -2541,7 +2541,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         let pipeline = n1.pipeline();
         let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
 
-        // ── Phase 1: Write pre-snapshot data ──
+        // ── Step 1: Write pre-snapshot data ──
         for i in 1..=5u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
@@ -2562,13 +2562,14 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         n1.raft().trigger().snapshot().await.expect("snapshot");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
+        // Purge the log the snapshot covers, so the joining node can only
+        // receive the pre-snapshot writes through the snapshot.
         let applied = n1.applied_index();
-        if applied > 1 {
-            n1.raft().trigger().purge_log(applied).await.expect("purge");
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        assert!(applied > 5, "the five writes are applied ({applied})");
+        n1.raft().trigger().purge_log(applied).await.expect("purge");
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // ── Phase 2: Write post-snapshot data (still in leader's log) ──
+        // ── Step 2: Write post-snapshot data (still in leader's log) ──
         for i in 1..=5u64 {
             let p = RaftProposal {
                 id: id_gen.next(),
@@ -2613,39 +2614,33 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         n1.add_node(2, format!("http://127.0.0.1:{p2}"))
             .await
             .expect("add n2");
-        tokio::time::sleep(Duration::from_secs(8)).await;
-
-        // ── Verify: new node has BOTH pre-snapshot AND post-snapshot data ──
-
-        // Pre-snapshot data (came via StreamSnapshot)
-        let mut pre_found = 0;
-        for i in 1..=5u64 {
-            if let Ok(Some(_)) = e2.get(Partition::Node, format!("node:0:pre-{i}").as_bytes()) {
-                pre_found += 1;
-            }
-        }
-        assert!(
-            pre_found >= 3,
-            "new node should have pre-snapshot data via StreamSnapshot ({pre_found}/5)"
-        );
-
-        // Post-snapshot data (came via log replay / AppendEntries)
-        let mut post_found = 0;
-        for i in 1..=5u64 {
-            if let Ok(Some(_)) = e2.get(Partition::Node, format!("node:0:post-{i}").as_bytes()) {
-                post_found += 1;
-            }
-        }
-        assert!(
-            post_found >= 3,
-            "new node should have post-snapshot data via log replay ({post_found}/5)"
-        );
-
-        tracing::info!(
-            pre_found,
-            post_found,
-            "R137: snapshot bootstrap + log replay verified"
-        );
+        // ── Verify: new node has ALL pre-snapshot AND post-snapshot data ──
+        // Every write was committed, so a catch-up that holds fewer than all
+        // of them has lost data.
+        let found = |prefix: &str| {
+            (1..=5u64)
+                .filter(|i| {
+                    matches!(
+                        e2.get(Partition::Node, format!("node:0:{prefix}-{i}").as_bytes()),
+                        Ok(Some(_))
+                    )
+                })
+                .count()
+        };
+        // Pre-snapshot data comes via StreamSnapshot.
+        await_condition(
+            Duration::from_secs(30),
+            "new node should hold every pre-snapshot write via StreamSnapshot",
+            || found("pre") == 5,
+        )
+        .await;
+        // Post-snapshot data comes via log replay / AppendEntries.
+        await_condition(
+            Duration::from_secs(30),
+            "new node should hold every post-snapshot write via log replay",
+            || found("post") == 5,
+        )
+        .await;
 
         n1.shutdown().await.expect("s1");
         n2.shutdown().await.expect("s2");
@@ -2658,7 +2653,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
     );
 }
 
-/// R140: Replication status and staleness tracking — leader reports
+/// Replication status and staleness tracking — leader reports
 /// per-node matched index, lag, and heartbeat state.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_replication_status_tracking() {
@@ -2826,7 +2821,7 @@ async fn cluster_replication_status_tracking() {
         // Don't assert exact value, just verify the method works
         let _ = n2.is_within_staleness(leader_last, 0);
 
-        tracing::info!("R140: replication status tracking verified");
+        tracing::info!("replication status tracking verified");
 
         n1.shutdown().await.expect("s1");
         n2.shutdown().await.expect("s2");
@@ -2840,7 +2835,7 @@ async fn cluster_replication_status_tracking() {
     );
 }
 
-/// R123: Read concern levels — linearizable requires leader confirmation,
+/// Read concern levels — linearizable requires leader confirmation,
 /// majority uses commit_index, local reads immediately.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_read_concern_levels() {
@@ -2987,7 +2982,7 @@ async fn cluster_read_concern_levels() {
             applied,
             commit,
             follower_applied,
-            "R123: read concern levels verified"
+            "read concern levels verified"
         );
 
         n1.shutdown().await.expect("s1");
@@ -3345,9 +3340,9 @@ async fn cluster_write_concern_acks_counts_members() {
     );
 }
 
-// ── R091b: monitor_and_promote join lifecycle ──────────────────────────────────
+// ── monitor_and_promote join lifecycle ─────────────────────────────────────────
 
-/// Regression test for the join protocol (R091b).
+/// Regression test for the join protocol.
 ///
 /// Verifies that `monitor_and_promote` drives a Learner node to Voter status
 /// and emits the expected phase progression: Learner → ReadyCheck → Promoting → Complete.
@@ -3437,7 +3432,7 @@ async fn cluster_join_monitor_and_promote() {
             node2.role
         );
 
-        tracing::info!("R091b: monitor_and_promote join lifecycle verified");
+        tracing::info!("monitor_and_promote join lifecycle verified");
 
         promote_handle.0.shutdown().await.expect("leader shutdown");
         n2.node.shutdown().await.expect("n2 shutdown");
@@ -3485,12 +3480,12 @@ async fn the_last_voter_shuts_down_after_its_peer_is_gone() {
     );
 }
 
-// ── R091c: Node Decommission Protocol ─────────────────────────────────────────
+// ── Node Decommission Protocol ────────────────────────────────────────────────
 
 /// Quorum gate: decommissioning a node in a 2-node cluster must fail.
 ///
 /// With 2 voters, removing one leaves 1 voter which cannot form a majority.
-/// Phase 0b must reject this with a clear error.
+/// The quorum gate must reject this with a clear error.
 #[tokio::test(flavor = "multi_thread")]
 async fn decommission_quorum_gate_blocks_2_node_cluster() {
     let _ = tracing_subscriber::fmt()
@@ -3531,7 +3526,7 @@ async fn decommission_quorum_gate_blocks_2_node_cluster() {
             "error must mention voter/quorum, got: {msg}"
         );
 
-        tracing::info!("R091c: quorum gate blocks 2-node decommission — verified");
+        tracing::info!("quorum gate blocks 2-node decommission — verified");
 
         n1.node.shutdown().await.expect("n1 shutdown");
         n2.node.shutdown().await.expect("n2 shutdown");
@@ -3546,8 +3541,8 @@ async fn decommission_quorum_gate_blocks_2_node_cluster() {
 
 /// Decommissioning a follower from a 3-node cluster must succeed.
 ///
-/// Phase 0: quorum gate passes (3 - 1 = 2 voters remaining).
-/// Phase 2: change_membership removes node 3 from voter set.
+/// The quorum gate passes (3 - 1 = 2 voters remaining), then
+/// change_membership removes node 3 from voter set.
 /// After decommission, the cluster continues with nodes 1 + 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn decommission_follower_succeeds_in_3_node_cluster() {
@@ -3602,7 +3597,7 @@ async fn decommission_follower_succeeds_in_3_node_cluster() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(n1.node.is_leader().await, "n1 must still be leader");
 
-        tracing::info!("R091c: follower decommission in 3-node cluster — verified");
+        tracing::info!("follower decommission in 3-node cluster — verified");
 
         n1.node.shutdown().await.expect("n1 shutdown");
         n2.node.shutdown().await.expect("n2 shutdown");
@@ -3834,7 +3829,7 @@ async fn a_change_behind_one_that_cannot_commit_is_refused_after_its_wait() {
 
 /// Decommissioning a non-voter node must fail with a clear error.
 ///
-/// Phase 0a: the node must be in the current voter set.
+/// The node must be in the current voter set.
 /// Node 99 was never added — must fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn decommission_non_voter_fails() {
@@ -3878,7 +3873,7 @@ async fn decommission_non_voter_fails() {
             "error must mention voter set, got: {msg}"
         );
 
-        tracing::info!("R091c: non-voter decommission rejected — verified");
+        tracing::info!("non-voter decommission rejected — verified");
 
         n1.node.shutdown().await.expect("n1 shutdown");
         n2.node.shutdown().await.expect("n2 shutdown");
@@ -3936,7 +3931,7 @@ async fn decommission_force_skips_quorum_gate() {
             result.message
         );
 
-        tracing::info!("R091c: force decommission skips quorum gate — verified");
+        tracing::info!("force decommission skips quorum gate — verified");
 
         n1.node.shutdown().await.expect("n1 shutdown");
         let _ = n2.node.shutdown().await; // may fail — decommissioned
@@ -3956,7 +3951,7 @@ async fn decommission_force_skips_quorum_gate() {
 /// the DecommissionResult carries `operator_cleanup_required = true` so that
 /// the CLI and any orchestration layer can surface the advisory to the operator.
 ///
-/// ORDERING: This test MUST remain LAST in the R091c decommission section.
+/// ORDERING: This test MUST remain LAST in the decommission section.
 /// It bootstraps a full 3-node cluster — the most expensive setup in this suite.
 /// All edge-case tests above use cheaper 2-node clusters or single-node fast paths
 /// and must finish before the GC pressure of this test is introduced.
@@ -4001,14 +3996,17 @@ async fn decommission_pruning_flag_sets_operator_cleanup_required() {
             .await
             .expect("decommission node 3 with pruning");
 
-        assert_eq!(result.node_id, 3, "result must reference decommissioned node");
+        assert_eq!(
+            result.node_id, 3,
+            "result must reference decommissioned node"
+        );
         assert!(
             result.operator_cleanup_required,
             "pruning=true must set operator_cleanup_required"
         );
 
         tracing::info!(
-            "R091c: pruning flag sets operator_cleanup_required — verified (node_id={}, cleanup={})",
+            "pruning flag sets operator_cleanup_required — verified (node_id={}, cleanup={})",
             result.node_id,
             result.operator_cleanup_required
         );

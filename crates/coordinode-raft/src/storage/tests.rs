@@ -1021,7 +1021,7 @@ async fn log_store_purge_survives_reopen() {
         )])
     };
 
-    // Phase 1: write + purge
+    // Step 1: write + purge
     {
         let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
         let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
@@ -1036,7 +1036,7 @@ async fn log_store_purge_survives_reopen() {
         store.purge(log_id(1, 2)).await.unwrap();
     }
 
-    // Phase 2: reopen, verify purge state persisted
+    // Step 2: reopen, verify purge state persisted
     {
         let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));
         let mut store = LogStore::open(engine).unwrap();
@@ -1104,7 +1104,7 @@ async fn snapshot_survives_reopen() {
         )])
     };
 
-    // Phase 1: build snapshot
+    // Step 1: build snapshot
     {
         let engine = Arc::new(StorageEngine::open(&config()).expect("open"));
         engine
@@ -1118,7 +1118,7 @@ async fn snapshot_survives_reopen() {
         let _snap = builder.build_snapshot().await.unwrap();
     }
 
-    // Phase 2: reopen, verify snapshot is still there
+    // Step 2: reopen, verify snapshot is still there
     {
         let engine = Arc::new(StorageEngine::open(&config()).expect("reopen"));
         let mut sm = CoordinodeStateMachine::new(engine).expect("reopen state machine");

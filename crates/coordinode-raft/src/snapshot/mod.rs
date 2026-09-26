@@ -198,16 +198,16 @@ pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
 
 /// Install a full snapshot: deserialize and write all KV pairs to CoordiNode storage.
 ///
-/// Uses a **two-phase crash-safe** approach:
+/// Uses a **two-step crash-safe** approach:
 ///
-/// **Phase 1 (atomic via WriteBatch):** Write ALL snapshot entries in a
-/// single atomic batch. If crash occurs during Phase 1, no writes are
+/// **Step 1 (atomic via WriteBatch):** Write ALL snapshot entries in a
+/// single atomic batch. If crash occurs during step 1, no writes are
 /// visible — old data remains intact. WriteBatch uses the storage
 /// write transaction internally (all-or-nothing commit).
 ///
-/// **Phase 2 (idempotent cleanup):** Delete stale keys that exist in
+/// **Step 2 (idempotent cleanup):** Delete stale keys that exist in
 /// the current engine but are absent in the snapshot. If crash occurs
-/// during Phase 2, stale keys remain (harmless — cleaned up on next
+/// during step 2, stale keys remain (harmless — cleaned up on next
 /// snapshot install).
 ///
 /// **Important:** Raft keys (`raft:*`) in the Schema partition are
@@ -357,10 +357,10 @@ fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
 
 /// Replace the receiver's state with a full snapshot.
 ///
-/// **Phase 1 (atomic via WriteBatch):** every snapshot entry in one batch;
+/// **Step 1 (atomic via WriteBatch):** every snapshot entry in one batch;
 /// a crash before it commits leaves the old data intact.
 ///
-/// **Phase 2 (idempotent cleanup):** delete keys the engine holds and the
+/// **Step 2 (idempotent cleanup):** delete keys the engine holds and the
 /// snapshot does not; a crash midway leaves stale keys that the next install
 /// removes.
 ///

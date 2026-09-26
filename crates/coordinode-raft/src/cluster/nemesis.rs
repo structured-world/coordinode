@@ -1,6 +1,7 @@
 //! Test-only network nemesis: a process-global directed-partition matrix the
 //! Raft network layer consults before each outbound RPC, so integration tests
-//! (R147 Jepsen suite) can inject network partitions into an in-process cluster.
+//! (the Jepsen-style suite) can inject network partitions into an in-process
+//! cluster.
 //!
 //! **Production-safe by construction.** An `AtomicBool` gate (`ENABLED`) is the
 //! only thing the hot path touches when no test has armed the nemesis: a single
@@ -9,7 +10,7 @@
 //! [`block`] / [`isolate`]. Production code never arms it, so it stays a no-op.
 //!
 //! Not behind `#[cfg(test)]` because integration tests live in a separate crate
-//! (`tests/r147_jepsen.rs`) and cannot see the library's test-cfg items; the
+//! (`tests/jepsen.rs`) and cannot see the library's test-cfg items; the
 //! atomic gate makes the always-compiled form free in production.
 
 use std::collections::HashSet;

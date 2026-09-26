@@ -132,8 +132,8 @@ impl GrpcNetwork {
     /// openraft's `NetBackoff` (200ms infinite retry), this provides
     /// transparent recovery from network partitions and node restarts.
     ///
-    /// Previous issue (G042): `connect().await` created a one-shot
-    /// connection. If it dropped, all subsequent RPCs failed permanently.
+    /// `connect().await` is not used: it creates a one-shot connection,
+    /// and once that drops every subsequent RPC fails permanently.
     async fn get_client(
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {

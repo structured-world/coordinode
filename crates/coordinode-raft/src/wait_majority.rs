@@ -179,7 +179,7 @@ async fn drain_loop(
     config: BatchConfig,
 ) {
     loop {
-        // Phase 1: Wait for the first proposal (blocks until work arrives).
+        // Step 1: Wait for the first proposal (blocks until work arrives).
         let first = match rx.recv().await {
             Some(entry) => entry,
             None => {
@@ -189,7 +189,7 @@ async fn drain_loop(
             }
         };
 
-        // Phase 2: Collect additional proposals within the linger window.
+        // Step 2: Collect additional proposals within the linger window.
         // Non-blocking drain first, then linger for stragglers.
         let mut batch = Vec::with_capacity(config.max_batch_size);
         batch.push(first);
@@ -213,7 +213,7 @@ async fn drain_loop(
             }
         }
 
-        // Phase 3: Split bypass and normal proposals.
+        // Step 3: Split bypass and normal proposals.
         //
         // bypass_rate_limiter proposals (delta/membership) are latency-sensitive
         // and must not be delayed by rate limiter backpressure. They get their

@@ -594,7 +594,7 @@ async fn e2e_crash_recovery_data_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
 
-    // Phase 1: Write data
+    // Step 1: Write data
     {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -644,7 +644,7 @@ async fn e2e_crash_recovery_data_survives_restart() {
     }
     // All Arc<StorageEngine> dropped, files flushed
 
-    // Phase 2: Reopen from same storage directory and verify
+    // Step 2: Reopen from same storage directory and verify
     {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -682,7 +682,7 @@ async fn e2e_crash_recovery_data_survives_restart() {
             );
         }
 
-        // Phase 3: Verify the node can accept NEW proposals after restart
+        // Step 3: Verify the node can accept NEW proposals after restart
         let pipeline = node.pipeline();
         let id_gen = ProposalIdGenerator::with_base(1000); // different base to avoid dedup
 
@@ -725,7 +725,7 @@ async fn e2e_watermark_survives_restart() {
 
     let watermark_before;
 
-    // Phase 1: Write and record watermark
+    // Step 1: Write and record watermark
     {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -760,7 +760,7 @@ async fn e2e_watermark_survives_restart() {
         node.shutdown().await.expect("shutdown");
     }
 
-    // Phase 2: Reopen and verify watermark
+    // Step 2: Reopen and verify watermark
     {
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",

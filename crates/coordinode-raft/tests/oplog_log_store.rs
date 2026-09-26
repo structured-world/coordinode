@@ -1,7 +1,7 @@
-//! Integration tests: Oplog as Raft log storage (R075).
+//! Integration tests: Oplog as Raft log storage.
 //!
 //! Tests verify that:
-//!   - `LogStore::open()` creates `<oplog_endpoint>/oplog/<shard>/` (R157)
+//!   - `LogStore::open()` creates `<oplog_endpoint>/oplog/<shard>/`
 //!   - `append()` writes to oplog; `get_log_state()` returns O(1) `last_log_id`
 //!   - `last_log_id` and `last_purged` survive close + reopen (Partition::Raft)
 //!   - `purge()` updates `last_purged` and filters entries in `try_get_log_entries`
@@ -56,7 +56,7 @@ fn make_log_id(index: u64, term: u64) -> LogId {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// `LogStore::open()` creates `<oplog_endpoint>/oplog/<shard_id>/` on first
-/// open (R157 multi-endpoint placement). For a single-endpoint config the
+/// open (multi-endpoint placement). For a single-endpoint config the
 /// endpoint path equals `engine.data_dir()`.
 #[test]
 fn logstore_creates_oplog_directory() {

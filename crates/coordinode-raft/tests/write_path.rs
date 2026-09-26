@@ -179,7 +179,7 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
 
-    // ── Phase 1: Write 5 proposals and flush to SST ───────────────────────────
+    // ── Step 1: Write 5 proposals and flush to SST ────────────────────────────
     {
         let engine = open_engine(&data_dir);
         let engine_read = Arc::clone(&engine);
@@ -252,7 +252,7 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         node.shutdown().await.expect("shutdown");
     }
 
-    // ── Phase 2: Reopen and verify crash recovery ────────────────────────────
+    // ── Step 2: Reopen and verify crash recovery ─────────────────────────────
     {
         let engine = open_engine(&data_dir);
         let engine_read = Arc::clone(&engine);

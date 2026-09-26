@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Integration tests for R141: follower reads (read fence).
+//! Integration tests for follower reads (read fence).
 //!
 //! Verifies:
 //! - `ReadFence::apply()` passes for all valid preference/concern combos

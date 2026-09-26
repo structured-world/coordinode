@@ -1,28 +1,30 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! R147 — Jepsen-style distributed-correctness suite (Rust-native, in-process).
+//! Jepsen-style distributed-correctness suite (Rust-native, in-process).
 //!
 //! The targeted-invariant approach (vs a general linearizability checker or an
 //! external Clojure Jepsen): we drive a real 3-node Raft cluster, inject faults
-//! (nemeses), and assert the specific guarantees `consensus.md` promises and the
-//! R147 "must pass" list names. The external Clojure+Elle harness is a separate
-//! end-of-project deliverable (R926).
+//! (nemeses), and assert the specific guarantees the consensus layer promises.
 //!
-//! Increment 1 (this file): **crash-fault invariants** —
+//! **Crash-fault invariants** —
 //! - `no_data_loss_on_leader_crash`: majority-acked writes survive a leader crash.
 //! - `read_your_writes_after_failover`: a client's acked write is readable from
 //!   the new leader, and the cluster stays writable after failover.
 //!
-//! Increment 2 (this file): **network-partition nemesis** —
+//! **Network-partition nemesis** —
 //! - `partition_minority_cannot_commit_majority_can`: isolate the leader into a
 //!   minority; the majority elects a new leader and commits, the minority leader
 //!   cannot commit, and on heal the minority converges with no split-brain.
+//! - `isolated_leader_refuses_a_linearizable_read_within_the_timeout`: the
+//!   isolated old leader serves no stale linearizable read.
+//! - `change_stream_never_delivers_what_an_isolated_leader_cannot_commit`: the
+//!   change stream carries only committed entries.
 //!
-//! Increment 3a (this file): **single-register linearizability checker** —
+//! **Single-register linearizability checker** —
 //! a Wing-Gong-Lowe checker (validated by its own unit tests) run over a
 //! concurrent client workload against the real cluster
 //! (`register_history_is_linearizable_under_concurrency`).
 //!
-//! Increment 3b (this file): **clock-skew nemesis** —
+//! **Clock-skew nemesis** —
 //! - `linearizable_despite_clock_skew`: one follower's HLC is seeded ~2s ahead
 //!   of wall clock; the register history stays linearizable and the skewed node
 //!   converges, since HLC gossip (advance-to-max on apply) keeps apply-seqnos

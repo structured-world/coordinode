@@ -90,7 +90,7 @@ async fn single_node_propose_and_read() {
     // Propose through Raft pipeline
     pipeline.propose_and_wait(&proposal).expect("propose");
 
-    // Verify data was applied to storage (ADR-016: plain keys, no versioned encoding)
+    // Verify data was applied to storage (plain keys, no versioned encoding)
     let result = engine_clone
         .get(Partition::Node, b"node:1:42")
         .expect("read");
@@ -171,7 +171,7 @@ async fn multiple_proposals_sequential() {
         pipeline.propose_and_wait(&proposal).expect("propose");
     }
 
-    // Verify all 5 writes (ADR-016: plain keys, direct engine reads)
+    // Verify all 5 writes (plain keys, direct engine reads)
     for i in 1..=5u64 {
         let result = engine_clone
             .get(Partition::Node, format!("node:1:{i}").as_bytes())

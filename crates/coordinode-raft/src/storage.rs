@@ -347,9 +347,9 @@ impl LogStore {
     }
 
     /// Open the LogStore, routing oplog segments to the oplog-eligible
-    /// endpoint chosen for shard 0
-    /// ([arch/core/storage-stack.md](../../../arch/core/storage-stack.md)
-    /// Layer 1↔2, INV-D1). Path layout: `<endpoint.path>/oplog/<shard_id>/`.
+    /// endpoint chosen for shard 0, so the log lands on media fit to carry
+    /// it rather than wherever the data partitions live. Path layout:
+    /// `<endpoint.path>/oplog/<shard_id>/`.
     /// Recovery scans every oplog-eligible endpoint's directory for sealed
     /// segments left over from a previous config-driven routing.
     ///
@@ -921,7 +921,7 @@ struct DedupEntry {
 /// and snapshot trigger decisions.
 pub struct CoordinodeStateMachine {
     engine: Arc<StorageEngine>,
-    /// Timestamp oracle advanced during Raft apply (R068, ADR-016).
+    /// Timestamp oracle advanced during Raft apply.
     ///
     /// Every entry is applied at its `commit_ts` as one batch (the engine
     /// stamps the seqno; see `StorageEngine::apply_proposal_at`), and the
@@ -947,7 +947,7 @@ pub struct CoordinodeStateMachine {
     applied_tx: tokio::sync::watch::Sender<u64>,
     /// Receiver side kept to prevent channel closure.
     applied_rx: tokio::sync::watch::Receiver<u64>,
-    /// R-SNAP2: per-shard `maxAssigned` watermark over HLC commit_ts.
+    /// Per-shard `maxAssigned` watermark over HLC commit_ts.
     /// Distinct from `applied_tx` (Raft log index). Advanced after every
     /// successful proposal apply so snapshot readers can `WaitForTs(T)`
     /// until every write with `commit_ts ≤ T` has been applied to every
@@ -1093,7 +1093,7 @@ impl CoordinodeStateMachine {
         Self::with_oracle(engine, None)
     }
 
-    /// Create with a timestamp oracle for seqno advancement (ADR-016).
+    /// Create with a timestamp oracle for seqno advancement.
     ///
     /// When oracle is set, `apply_proposal()` calls `oracle.advance_to(commit_ts)`
     /// after applying the entry at `commit_ts`, so later allocations are newer.
@@ -1104,7 +1104,7 @@ impl CoordinodeStateMachine {
         Self::with_oracle_and_watermark(engine, oracle, None)
     }
 
-    /// R-SNAP2: create with a timestamp oracle AND a `MaxAssignedWatermark`.
+    /// Create with a timestamp oracle AND a `MaxAssignedWatermark`.
     ///
     /// When the watermark is set, `apply_proposal()` advances it to the
     /// proposal's `commit_ts` AFTER every mutation in that proposal has
@@ -1231,8 +1231,8 @@ impl CoordinodeStateMachine {
     /// to wait for updates, or `borrow()` to read the current value.
     ///
     /// Used by:
-    /// - Follower reads: wait until `Applied >= query.readTs` (R141)
-    /// - Snapshot decisions: check entries since last snapshot (R134)
+    /// - Follower reads: wait until `Applied >= query.readTs`
+    /// - Snapshot decisions: check entries since last snapshot
     /// - Health monitoring: detect how far behind this node is
     pub fn subscribe_applied(&self) -> tokio::sync::watch::Receiver<u64> {
         self.applied_rx.clone()
@@ -1280,10 +1280,10 @@ impl CoordinodeStateMachine {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
-    /// Apply a single proposal's mutations to storage (ADR-016: native seqno MVCC).
+    /// Apply a single proposal's mutations to storage (native seqno MVCC).
     ///
-    /// Put/Delete use plain engine.put()/delete() — OracleSeqnoGenerator
-    /// auto-stamps seqno. No versioned key encoding.
+    /// The whole proposal is applied as one batch at its `commit_ts` seqno.
+    /// No versioned key encoding.
     ///
     /// Includes dedup check: if this proposal ID was already applied with
     /// the same size estimate, skip re-application (idempotent Raft replay).
@@ -1324,7 +1324,7 @@ impl CoordinodeStateMachine {
             }
         }
 
-        // Apply the whole entry at ONE seqno, its commit_ts (ADR-016): a
+        // Apply the whole entry at ONE seqno, its commit_ts: a
         // snapshot at commit_ts sees every mutation of the entry, a snapshot
         // one tick earlier sees none, on the leader and on every follower
         // alike. The engine advances its own generator past commit_ts; the
@@ -1375,7 +1375,7 @@ impl CoordinodeStateMachine {
         // Periodic dedup GC (every DEDUP_GC_INTERVAL_SECS)
         self.maybe_gc_dedup();
 
-        // R-SNAP2: advance the per-shard `maxAssigned` watermark AFTER every
+        // Advance the per-shard `maxAssigned` watermark AFTER every
         // mutation in this proposal has been persisted. Snapshot readers at
         // T ≤ commit_ts now see a fully-applied state on this shard.
         // Monotonic — a proposal whose commit_ts is below the current

@@ -1,4 +1,4 @@
-//! Integration tests: Oplog CDC consumer API (R077).
+//! Integration tests: Oplog CDC consumer API.
 //!
 //! Tests verify that:
 //!   - `OplogTailer` streams entries from sealed segments
@@ -394,11 +394,11 @@ async fn cdc_tailer_resume_after_partial_read() {
     }
 }
 
-// ── G058: CDC edge_type filter works through Raft path ──────────────
+// ── CDC edge_type filter works through Raft path ────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cdc_filter_edge_type_through_raft() {
-    // Regression test for G058: Raft proposals produce decoded
+    // Regression test: Raft proposals produce decoded
     // OplogOp::Insert/Delete/Merge alongside RaftEntry, enabling
     // server-side CDC filtering by edge_type.
     let dir = tempfile::tempdir().expect("tempdir");

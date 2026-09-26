@@ -11,9 +11,11 @@
 //!
 //! ## 3-node CE cluster
 //!
-//! For HA deployments (R133), nodes join an existing cluster via
-//! `RaftNode::join()` (not yet implemented). The network layer handles
-//! AppendEntries, Vote, and Snapshot RPCs between nodes.
+//! For HA deployments, a node joins an existing cluster via
+//! [`RaftNode::open_joining`] as a learner, and
+//! [`RaftNode::monitor_and_promote`] promotes it to a voter once it has
+//! caught up. The network layer handles AppendEntries, Vote, and Snapshot
+//! RPCs between nodes.
 
 pub mod grpc_server;
 pub mod nemesis;
@@ -40,29 +42,14 @@ use crate::proto::replication::raft_service_server::RaftServiceServer;
 /// commit, which is an error to report rather than a delay to extend.
 pub const DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS: u64 = 30_000;
 
-/// Raft node orchestrator.
-///
-/// Manages the lifecycle of an openraft instance, providing:
-/// - Proposal pipeline for submitting writes
-/// - Applied watermark for tracking state machine progress
-/// - Leader status queries
-///
-/// ## Ownership
-///
-/// `RaftNode` owns the `Raft<TypeConfig>` instance. The state machine
-/// and log store are consumed by openraft and managed internally.
-///
-/// **Must call [`shutdown()`](Self::shutdown) before dropping** to ensure
-/// graceful leader transfer and WAL flush. Dropping without shutdown
-/// may leave the node in an unclean state.
 /// Type alias for the openraft Raft instance with our config + state machine.
 type RaftInstance = openraft::Raft<TypeConfig, CoordinodeStateMachine>;
 
 /// Configuration for the background snapshot trigger task.
 ///
 /// openraft only supports entry-count-based triggers (`LogsSinceLast`).
-/// This config adds WAL-size and periodic timer triggers as described
-/// in the architecture (arch/distribution/consensus.md:82-85).
+/// This config adds WAL-size and periodic timer triggers, so a log that
+/// grows through a few large entries is still compacted.
 pub struct SnapshotTriggerConfig {
     /// Check interval for periodic trigger (default: 60s).
     pub check_interval: std::time::Duration,
@@ -85,6 +72,21 @@ impl Default for SnapshotTriggerConfig {
 /// leave the directory locked for the caller that reopens it.
 const SNAPSHOT_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Raft node orchestrator.
+///
+/// Manages the lifecycle of an openraft instance, providing:
+/// - Proposal pipeline for submitting writes
+/// - Applied watermark for tracking state machine progress
+/// - Leader status queries
+///
+/// ## Ownership
+///
+/// `RaftNode` owns the `Raft<TypeConfig>` instance. The state machine
+/// and log store are consumed by openraft and managed internally.
+///
+/// **Must call [`shutdown()`](Self::shutdown) before dropping** to ensure
+/// graceful leader transfer and WAL flush. Dropping without shutdown
+/// may leave the node in an unclean state.
 pub struct RaftNode {
     /// The openraft instance.
     raft: Arc<RaftInstance>,
@@ -155,7 +157,7 @@ impl RaftNode {
         Self::open_with_oracle(node_id, engine, None).await
     }
 
-    /// Open a Raft node with timestamp oracle for seqno advancement (R068).
+    /// Open a Raft node with timestamp oracle for seqno advancement.
     ///
     /// When oracle is provided, the state machine calls `oracle.advance_to(commit_ts)`
     /// before applying each entry's mutations. This ensures Raft replay produces
@@ -919,8 +921,7 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Promote an existing learner to a voter at runtime (ADR-031 Raft-role
-    /// transition; leader-only).
+    /// Promote an existing learner to a voter at runtime (leader-only).
     ///
     /// The node must already be a learner (added via [`add_node`](Self::add_node)
     /// and caught up on replication). Adds it to the voter set via openraft
@@ -966,8 +967,8 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Demote a voter back to a learner at runtime (ADR-031 Raft-role
-    /// transition; leader-only). The node keeps receiving log replication but
+    /// Demote a voter back to a learner at runtime (leader-only). The node
+    /// keeps receiving log replication but
     /// stops voting — distinct from [`decommission_node`](Self::decommission_node)
     /// / [`remove_node`](Self::remove_node), which drop the node from the cluster
     /// entirely.
@@ -1539,7 +1540,7 @@ impl RaftNode {
             );
         }
 
-        // Flush active memtables to SST so Phase 2 (reopen) sees all writes.
+        // Flush active memtables to SST so a later reopen sees all writes.
         //
         // openraft's internal tasks hold Arc<LogStore> and Arc<StateMachine>,
         // both of which hold Arc<StorageEngine>. After raft.shutdown() the tasks
@@ -1553,7 +1554,7 @@ impl RaftNode {
         result
     }
 
-    // ── Replication status & staleness tracking (R140) ──
+    // ── Replication status & staleness tracking ──
 
     /// Get the current replication status for all cluster nodes.
     ///
@@ -1673,9 +1674,9 @@ pub enum NodeRole {
 
 // ── Decommission Protocol ─────────────────────────────────────────────────────
 
-/// Result of a successful node decommission (Phases 0-2).
+/// Result of a successful node decommission.
 ///
-/// Phase 3 (local data deletion) is the operator's responsibility in CE — the
+/// Deleting the local data is the operator's responsibility in CE: the
 /// server cannot remotely wipe data on the decommissioned node.
 #[derive(Debug, Clone)]
 pub struct DecommissionResult {
@@ -1689,26 +1690,26 @@ pub struct DecommissionResult {
 }
 
 impl RaftNode {
-    /// Graceful node decommission: Phases 0-2 for CE.
+    /// Graceful node decommission.
     ///
-    /// ## Phase 0 — Quorum gate (unless `force`)
+    /// ## Step 1: quorum gate (unless `force`)
     /// Verifies that removing `node_id` leaves ≥ 2 voters in the cluster.
     /// CE 3-node minimum: after removal, 2 voters remain (quorum = 2).
     /// Returns `RaftNodeError::Membership` if quorum would be lost or if
     /// `node_id` is not in the current voter set.
     ///
-    /// ## Phase 1 — Leadership transfer (unless `force`)
+    /// ## Step 2: leadership transfer (unless `force`)
     /// If `node_id` is the current Raft leader, the caller must handle leadership
     /// transfer before calling this method (service layer responsibility). This
     /// method returns `RaftNodeError::Membership` if called as non-leader when
     /// `node_id` is the current leader — the service layer must transfer first.
     ///
-    /// ## Phase 2 — Membership remove
+    /// ## Step 3: membership remove
     /// Calls `change_membership(remove: node_id)` via openraft. Only succeeds
     /// when this node is the current leader (openraft invariant).
     ///
     /// ## Force path
-    /// When `force=true`, skips Phase 0 and Phase 1. Useful for permanently
+    /// When `force=true`, skips steps 1 and 2. Useful for permanently
     /// unavailable nodes. May cause data loss if the node held single-copy shards.
     ///
     /// # Errors
@@ -1740,17 +1741,18 @@ impl RaftNode {
         };
 
         if !force {
-            // Phase 0a: node must be a current voter.
+            // Step 1a: node must be a current voter.
             if !current_voters.contains(&node_id) {
                 return Err(RaftNodeError::Membership(format!(
                     "node {node_id} is not in the current voter set — cannot decommission"
                 )));
             }
 
-            // Phase 0b: quorum gate — CE requires ≥ 2 voters after removal.
+            // Step 1b: quorum gate — CE requires ≥ 2 voters after removal.
             // Quorum = majority of voters; for 2 voters: majority = 2 (no fault tolerance).
             // For 1 voter: cluster cannot reach consensus.
-            let remaining = current_voters.len().saturating_sub(1);
+            // Step 1a proved `node_id` is in the set, so it holds at least one.
+            let remaining = current_voters.len() - 1;
             if remaining < 2 {
                 return Err(RaftNodeError::Membership(format!(
                     "cannot decommission node {node_id}: would leave {remaining} voter(s), \
@@ -1759,7 +1761,7 @@ impl RaftNode {
                 )));
             }
 
-            // Phase 1: Leadership check.
+            // Step 2: leadership check.
             // If the target node is the current leader and it is NOT us (this node),
             // we cannot call change_membership (only the leader can). Return an error
             // so the service layer can handle forwarding.
@@ -1779,7 +1781,7 @@ impl RaftNode {
             // This is enforced in ClusterServiceImpl::decommission_node().
         }
 
-        // Phase 2: Membership remove.
+        // Step 3: membership remove.
         // Compute new voter set (current minus node_id).
         let new_members: std::collections::BTreeSet<u64> = current_voters
             .into_iter()
@@ -1815,7 +1817,10 @@ impl RaftNode {
                  Verify data integrity — some shards may have lost replicas."
             )
         } else {
-            format!("Node {node_id} gracefully decommissioned (Phases 0-2 complete).")
+            format!(
+                "Node {node_id} gracefully decommissioned (quorum checked, leadership \
+                 moved off, membership removed)."
+            )
         };
 
         Ok(DecommissionResult {
@@ -1914,7 +1919,8 @@ impl RaftNode {
         progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
     ) -> Result<(), RaftNodeError> {
         // Number of entries a Learner may be behind before it is considered
-        // ready for Voter promotion (arch/distribution/consensus.md:242).
+        // ready for Voter promotion: close enough that the remaining gap
+        // replicates within a few heartbeats once it starts voting.
         const READINESS_LAG_THRESHOLD: u64 = 1_000;
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60); // 30 min
@@ -1922,7 +1928,7 @@ impl RaftNode {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let mut initial_lag: Option<u64> = None;
 
-        // Phase 1: poll until lag ≤ READINESS_LAG_THRESHOLD.
+        // Step 1: poll until lag ≤ READINESS_LAG_THRESHOLD.
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let _ = progress_tx.send(JoinProgressEvent {
@@ -1982,7 +1988,7 @@ impl RaftNode {
             });
         }
 
-        // Phase 2: promote to Voter.
+        // Step 2: promote to Voter.
         let _ = progress_tx.send(JoinProgressEvent {
             node_id,
             phase: JoinPhase::Promoting,
