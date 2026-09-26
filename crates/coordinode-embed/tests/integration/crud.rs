@@ -266,7 +266,7 @@ fn detach_delete_node() {
 }
 
 /// DETACH DELETE removes all edges across multiple edge types.
-/// Verifies that the targeted adj lookup (G051 fix) works for multi-edge-type graphs.
+/// Verifies that the targeted adj lookup works for multi-edge-type graphs.
 #[test]
 fn detach_delete_cleans_multi_edge_type_graph() {
     let mut db = open_db();
@@ -353,7 +353,7 @@ fn merge_no_duplicate() {
     assert_eq!(rows.len(), 1);
 }
 
-/// G074 — standalone relationship MERGE through the embed API.
+/// Standalone relationship MERGE through the embed API.
 ///
 /// What this tests:
 /// - `MERGE (a:L {k:v})-[r:T]->(b:L {k:v})` succeeds end-to-end via Database API
@@ -477,7 +477,7 @@ fn map_projection_with_computed_field() {
     }
 }
 
-/// R123: Snapshot read concern — reads data at a specific MVCC timestamp,
+/// Snapshot read concern — reads data at a specific MVCC timestamp,
 /// ignoring writes that happened after that timestamp.
 #[test]
 fn read_concern_snapshot_pins_to_timestamp() {
@@ -555,7 +555,7 @@ fn read_concern_snapshot_pins_to_timestamp() {
     assert!(err.is_err(), "invalid read concern should fail validation");
 }
 
-/// R123: Read concern session API — set_read_concern persists across queries.
+/// Read concern session API — set_read_concern persists across queries.
 #[test]
 fn read_concern_session_level() {
     use coordinode_core::txn::read_concern::ReadConcernLevel;
@@ -936,7 +936,7 @@ fn merge_match_does_not_silently_overwrite_existing_properties() {
     );
 }
 
-// ── MERGE NODES (R180) ────────────────────────────────────────────────
+// ── MERGE NODES ───────────────────────────────────────────────────────
 
 /// Two `User` nodes are collapsed into one; default `KEEP FIRST` keeps the
 /// surviving node's properties and the non-survivor is gone.
@@ -2484,7 +2484,7 @@ fn merge_nodes_self_loop_and_other_peers_mixed_transfer() {
     assert_eq!(emails, vec!["a@x.com", "c@x.com", "d@x.com"]);
 }
 
-// ── CLONE NODE (R182) ─────────────────────────────────────────────────
+// ── CLONE NODE ────────────────────────────────────────────────────────
 
 /// CLONE NODE deep-copies labels and properties into a fresh node; the original
 /// survives and the clone carries the same property values under a new id.
@@ -2739,7 +2739,7 @@ fn clone_node_temporal_as_of_before_existence_errors() {
     );
 }
 
-// ── REDIRECT EDGES (R183) ─────────────────────────────────────────────
+// ── REDIRECT EDGES ────────────────────────────────────────────────────
 
 /// REDIRECT EDGES moves an outgoing edge off the source onto the destination:
 /// after the redirect, the item is owned by `b`, not `a`.
@@ -3578,7 +3578,7 @@ fn trigger_create_rejects_empty_body() {
     );
 }
 
-// ── BEFORE COMMIT trigger firing (R191) ────────────────────────────────
+// ── BEFORE COMMIT trigger firing ───────────────────────────────────────
 
 /// Audit log via BEFORE COMMIT trigger: creating a `:User` fires the
 /// trigger, which writes an `:AuditEntry` referencing the new node. Both
@@ -4036,7 +4036,7 @@ fn trigger_node_label_does_not_fire_on_same_named_edge_type() {
 }
 
 // =====================================================================
-// R191 expansion — SET on edge, MERGE node/edge, DETACH DELETE cascade,
+// BEFORE COMMIT triggers — SET on edge, MERGE node/edge, DETACH DELETE cascade,
 // explicit DELETE edge trigger firings.
 // =====================================================================
 
@@ -5086,7 +5086,7 @@ fn trigger_edge_update_propagate_aborts_set() {
 }
 
 // =====================================================================
-// AFTER COMMIT triggers — durable event-journal dispatch (ADR-026).
+// AFTER COMMIT triggers — durable event-journal dispatch.
 // Embedded drains the queue inline after each committed write, so a
 // firing is observable in the same test without a background worker.
 // =====================================================================
@@ -5351,9 +5351,9 @@ fn trigger_after_commit_cascade_depth_bound_is_runtime_tunable() {
 }
 
 // =====================================================================
-// R172a — CREATE NODE TYPE DDL (per ADR-027, bitemporal nodes scaffold).
-// Only the DDL surface is verified here; per-version storage layout +
-// write/read executor support land in R172b-e.
+// CREATE NODE TYPE DDL (bitemporal nodes). This section verifies the DDL
+// surface and write-time guards; per-version storage and the read/write
+// executor are covered by the sections that follow.
 // =====================================================================
 
 /// `CREATE NODE TYPE Foo` persists a `LabelSchema` with `temporal=false`
@@ -5402,7 +5402,7 @@ fn create_node_type_with_properties() {
 
 /// Creating the same label twice is rejected — TEMPORAL flag is
 /// immutable, so re-CREATE is the only path to flip it, which would
-/// silently violate ADR-027's immutability invariant.
+/// silently break that immutability.
 #[test]
 fn create_node_type_rejects_duplicate() {
     let mut db = open_db();
@@ -5419,7 +5419,7 @@ fn create_node_type_rejects_duplicate() {
     );
 }
 
-/// `__ingestion_ts__` is reserved for engine use (ADR-027). Declaring
+/// `__ingestion_ts__` is reserved for engine use (the system-time axis). Declaring
 /// it as a user property must be rejected at DDL time.
 #[test]
 fn create_node_type_rejects_reserved_ingestion_ts() {
@@ -5435,7 +5435,7 @@ fn create_node_type_rejects_reserved_ingestion_ts() {
 }
 
 /// `valid_from` / `valid_to` are user-supplied bitemporal interval fields
-/// on TEMPORAL labels (per arch/core/temporal-edges.md). They are NOT
+/// on TEMPORAL labels. They are NOT
 /// reserved — users declare them in `WITH (...)` to lock the type contract,
 /// mirror of `CREATE EDGE TYPE … TEMPORAL WITH (valid_from: TIMESTAMP NOT NULL)`.
 /// This test verifies the declaration is accepted on a temporal node label.
@@ -5467,9 +5467,7 @@ fn create_node_type_rejects_other_reserved_names() {
 
 /// CREATE on a TEMPORAL label must require `valid_from` — symmetric with
 /// `execute_create_edge`'s rejection for temporal edge types without
-/// `valid_from`. The mechanical per-version storage layout lands in R172b;
-/// this guard locks the write contract in from R172a so future writes can
-/// rely on the invariant.
+/// `valid_from`, the key every per-version record is stored under.
 #[test]
 fn create_node_on_temporal_label_without_valid_from_rejected() {
     let mut db = open_db();
@@ -5492,12 +5490,10 @@ fn create_node_on_temporal_label_without_valid_from_rejected() {
     );
 }
 
-/// CREATE on a TEMPORAL label WITH `valid_from` is accepted (mechanical
-/// per-version key writing still lands in R172b, but the write-time
-/// contract is satisfied here). `valid_from` declared as INT to sidestep
-/// TIMESTAMP↔INT coercion (which is the temporal write executor's job in
-/// R172c — see the analogous edge path in `execute_create_edge` for the
-/// final coercion semantics).
+/// CREATE on a TEMPORAL label WITH `valid_from` is accepted. `valid_from`
+/// is declared as INT to sidestep TIMESTAMP↔INT coercion, which this test
+/// does not exercise (the edge path in `execute_create_edge` shows the
+/// coercion semantics).
 #[test]
 fn create_node_on_temporal_label_with_valid_from_accepted() {
     let mut db = open_db();
@@ -5677,15 +5673,15 @@ fn create_node_type_temporal_flag_persists_across_restart() {
 }
 
 // =====================================================================
-// R172b — Per-version temporal node storage (per ADR-027). Phase B: end-
-// to-end CREATE + MATCH on temporal labels (Phase A scaffold validation).
+// Per-version temporal node storage: end-to-end CREATE + MATCH on
+// temporal labels.
 // =====================================================================
 
 /// Three CREATEs on a temporal label produce three separate node_ids
-/// today (each `CREATE` allocates a fresh id via `id_allocator.next()`).
-/// R172c will introduce identity-preserving multi-version writes
-/// (`SET n.valid_to = ...` close-version + new CREATE re-using the same
-/// `node_id`). R172b's encoder unit tests cover the same-node-id case
+/// (each `CREATE` allocates a fresh id via `id_allocator.next()`);
+/// versions of one node come from SET, which closes the current version
+/// and opens a new one under the same `node_id`. The encoder unit tests
+/// cover the same-node-id case
 /// (`temporal_node_key_versions_sort_chronologically`); this integration
 /// test verifies the end-to-end CREATE + MATCH path with three distinct
 /// temporal nodes each carrying their own `valid_from`, validating that
@@ -5723,7 +5719,7 @@ fn create_temporal_nodes_each_with_own_valid_from_match_returns_all() {
 
 /// `__ingestion_ts__` is auto-populated on temporal CREATE and queryable
 /// as a regular property. Non-temporal nodes do not carry it. Validates
-/// the engine-managed system-time axis (ADR-027 consequence (0)).
+/// the engine-managed system-time axis.
 #[test]
 fn temporal_create_populates_ingestion_ts() {
     use coordinode_core::graph::types::Value;
@@ -5832,7 +5828,7 @@ fn temporal_and_non_temporal_coexist_in_same_db() {
     );
 }
 
-/// R172c Phase 3: DELETE on a temporal node is a *positive bitemporal
+/// DELETE on a temporal node is a *positive bitemporal
 /// fact* — the original version is closed at `valid_to = NOW` and a new
 /// tombstone version is appended at `valid_from = NOW` carrying
 /// `__deleted__: true`. History before NOW remains queryable; the node
@@ -5847,7 +5843,7 @@ fn delete_on_temporal_node_writes_tombstone_and_closes_open_version() {
         .expect("CREATE temporal");
 
     db.execute_cypher("MATCH (p:Person) DELETE p")
-        .expect("R172c Phase 3: DELETE on temporal must succeed");
+        .expect("DELETE on temporal must succeed");
 
     let rows = db
         .execute_cypher(
@@ -5933,7 +5929,7 @@ fn delete_on_already_closed_temporal_node_is_safe() {
     );
 }
 
-/// R172c Phase 3: REMOVE n.<prop> on a temporal node writes a NEW version
+/// REMOVE n.<prop> on a temporal node writes a NEW version
 /// with the property absent, while preserving the historical (closed)
 /// version intact.
 #[test]
@@ -5948,7 +5944,7 @@ fn remove_property_on_temporal_node_writes_new_version_without_prop() {
         .expect("CREATE temporal");
 
     db.execute_cypher("MATCH (p:Person) REMOVE p.nickname")
-        .expect("REMOVE on temporal must succeed (Phase 3 close+open)");
+        .expect("REMOVE on temporal must succeed (close+open)");
 
     let rows = db
         .execute_cypher(
@@ -5956,7 +5952,7 @@ fn remove_property_on_temporal_node_writes_new_version_without_prop() {
              p.valid_to AS vt, p.nickname AS nick",
         )
         .expect("MATCH after REMOVE");
-    assert!(rows.len() >= 2, "must have old + new version: {rows:?}");
+    assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
 
     // Original (vf=100) closed, still has nickname.
     let original = rows
@@ -6025,7 +6021,7 @@ fn remove_property_on_non_temporal_node_remains_in_place() {
     assert!(matches!(rows[0].get("nick"), None | Some(Value::Null)));
 }
 
-/// R172c Phase 3b: SET on a nested property path of a temporal node writes
+/// SET on a nested property path of a temporal node writes
 /// a NEW version with the nested change applied, while preserving the
 /// historical (closed) version intact.
 #[test]
@@ -6040,7 +6036,7 @@ fn set_nested_property_path_on_temporal_node_writes_new_version() {
         .expect("CREATE temporal with nested doc");
 
     db.execute_cypher("MATCH (p:Person) SET p.config.host = 'new'")
-        .expect("nested SET on temporal must succeed (Phase 3b)");
+        .expect("nested SET on temporal must succeed");
 
     let rows = db
         .execute_cypher(
@@ -6087,7 +6083,7 @@ fn set_nested_property_path_on_temporal_node_writes_new_version() {
     }
 }
 
-/// R172c Phase 3b: REMOVE on a nested property path of a temporal node
+/// REMOVE on a nested property path of a temporal node
 /// writes a new version with the nested key removed, while the historical
 /// version retains it.
 #[test]
@@ -6105,7 +6101,7 @@ fn remove_nested_property_path_on_temporal_node_writes_new_version() {
     .expect("CREATE with nested doc");
 
     db.execute_cypher("MATCH (p:Person) REMOVE p.config.port")
-        .expect("nested REMOVE on temporal must succeed (Phase 3b)");
+        .expect("nested REMOVE on temporal must succeed");
 
     let rows = db
         .execute_cypher(
@@ -6153,7 +6149,7 @@ fn remove_nested_property_path_on_temporal_node_writes_new_version() {
     }
 }
 
-/// R172c Phase 3b: doc_push on a temporal node array property writes a new
+/// doc_push on a temporal node array property writes a new
 /// version with the appended element; historical version unchanged.
 #[test]
 fn doc_push_on_temporal_node_writes_new_version_with_append() {
@@ -6167,7 +6163,7 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
         .expect("CREATE with array");
 
     db.execute_cypher("MATCH (b:Bag) SET doc_push(b.data.items, 'b')")
-        .expect("doc_push on temporal must succeed (Phase 3b)");
+        .expect("doc_push on temporal must succeed");
 
     let rows = db
         .execute_cypher("MATCH (b:Bag) RETURN b.valid_from AS vf, b.valid_to AS vt, b.data AS data")
@@ -6202,7 +6198,7 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
     assert_eq!(new_items[1], rmpv::Value::String("b".into()));
 }
 
-/// R172c Phase 3b: doc_inc on a temporal node numeric property writes a
+/// doc_inc on a temporal node numeric property writes a
 /// new version with the incremented value.
 #[test]
 fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
@@ -6249,7 +6245,7 @@ fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
     assert_eq!(extract_views(new_version), Some(15.0));
 }
 
-/// R172c Phase 3b edge case: multiple nested SET items on the same
+/// Edge case: multiple nested SET items on the same
 /// temporal node in one clause must produce ONE new version with all
 /// changes applied — not N versions.
 #[test]
@@ -6367,10 +6363,10 @@ fn temporal_create_accepts_negative_valid_from() {
     assert!(by_vf[0].0 < 0 && by_vf[1].0 > 0);
 }
 
-/// `MATCH (a)-[:E]->(b:TempLabel) RETURN b` would silently emit zero rows
-/// R172d initial slice: traversal into a temporal target label now
-/// materialises every version of the target (prefix scan over
-/// `node:<shard>:<target_uid>:*`). Each version emits its own row.
+/// `MATCH (a)-[:E]->(b:TempLabel) RETURN b`: traversal into a temporal
+/// target label materialises every version of the target (prefix scan
+/// over `node:<shard>:<target_uid>:*`) instead of silently emitting zero
+/// rows. Each version emits its own row.
 #[test]
 fn traverse_into_temporal_label_materialises_all_versions() {
     use coordinode_core::graph::types::Value;
@@ -6447,7 +6443,7 @@ fn traverse_into_non_temporal_label_still_single_row() {
     assert_eq!(rows[0].get("name"), Some(&Value::String("Acme".into())));
 }
 
-/// R172d edge case: variable-length traversal `(a)-[:E*1..2]->(b:TempLabel)`
+/// Edge case: variable-length traversal `(a)-[:E*1..2]->(b:TempLabel)`
 /// must also fan out across target versions (varlen path also routes
 /// through `build_target_rows`).
 #[test]
@@ -6482,7 +6478,7 @@ fn varlen_traverse_into_temporal_label_fans_out_versions() {
     );
 }
 
-/// R172d edge case: target node with multiple labels including a
+/// Edge case: target node with multiple labels including a
 /// temporal one — fan-out triggers based on ANY temporal label among
 /// the requested target_labels.
 #[test]
@@ -6515,7 +6511,7 @@ fn traverse_into_multi_label_temporal_target_fans_out_versions() {
     );
 }
 
-/// R172c Phase 3b: doc_pull on a temporal node array property writes a
+/// doc_pull on a temporal node array property writes a
 /// new version with the value removed.
 #[test]
 fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
@@ -6562,7 +6558,7 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
     );
 }
 
-/// R172c Phase 3b: doc_add_to_set on a temporal node array property
+/// doc_add_to_set on a temporal node array property
 /// writes a new version with the value added only if not already present.
 #[test]
 fn doc_add_to_set_on_temporal_node_writes_new_version_with_dedup() {
@@ -6597,7 +6593,7 @@ fn doc_add_to_set_on_temporal_node_writes_new_version_with_dedup() {
     }
 }
 
-/// R172c Phase 2: `SET n += {…}` (MergeProperties) on a temporal node
+/// `SET n += {…}` (MergeProperties) on a temporal node
 /// writes a new version with the merged props applied — same close+open
 /// shape as plain SET.
 #[test]
@@ -6637,7 +6633,7 @@ fn merge_properties_on_temporal_node_writes_new_version() {
     );
 }
 
-/// R172c Phase 2: `SET n = {…}` (ReplaceProperties) on a temporal node
+/// `SET n = {…}` (ReplaceProperties) on a temporal node
 /// writes a new version with ALL user props replaced by the literal.
 /// Engine-managed axes (valid_from / valid_to / __ingestion_ts__) are
 /// re-applied by the close+open machinery.
@@ -6675,10 +6671,10 @@ fn replace_properties_on_temporal_node_writes_new_version_with_full_replace() {
     assert!(matches!(new_version.get("vf"), Some(Value::Int(_))));
 }
 
-/// R172c Phase 3 / Phase 3c: empty path REMOVE on temporal node is
-/// rejected — the close+open machinery requires a non-empty path.
-/// Catches mis-formed AST or future code that constructs RemoveItem
-/// with an empty path vector.
+/// Empty path REMOVE on temporal node is rejected — the close+open
+/// machinery requires a non-empty path. From Cypher the parser refuses
+/// `REMOVE p.` before the executor runs; the test pins that the
+/// statement fails rather than silently succeeding.
 #[test]
 fn remove_empty_property_path_on_temporal_node_is_rejected() {
     let mut db = open_db();
@@ -6700,7 +6696,7 @@ fn remove_empty_property_path_on_temporal_node_is_rejected() {
     assert!(!msg.is_empty(), "must produce an error message: {msg}");
 }
 
-/// R172c Phase 3c: ATTACH DOCUMENT with multi-segment target property
+/// ATTACH DOCUMENT with multi-segment target property
 /// path INTO temporal target — exercises sub-path navigation inside an
 /// existing DOCUMENT on the new version.
 #[test]
@@ -6747,7 +6743,7 @@ fn attach_document_with_multi_segment_path_into_temporal_target() {
 
 /// EMPIRICAL: DETACH DOCUMENT promoting a sub-doc into a TEMPORAL node.
 /// DETACH DOCUMENT delegates to `execute_create_node` for the new node,
-/// which is temporal-aware via R172a+R172b. The question: does the
+/// which is temporal-aware. The question: does the
 /// existing DETACH path correctly pass `valid_from` through, or does the
 /// new node land at a non-temporal key silently?
 #[test]
@@ -6841,9 +6837,9 @@ fn empirical_attach_document_from_temporal_source() {
     assert_eq!(pre.len(), 1, "pre-attach Address must exist");
 }
 
-/// R172c Phase 3c + R172d initial slice: ATTACH DOCUMENT INTO a TEMPORAL
-/// target now works end-to-end. The pattern traverses into the temporal
-/// target (R172d per-version target fan-out), and ATTACH applies the
+/// ATTACH DOCUMENT INTO a TEMPORAL target works end-to-end. The pattern
+/// traverses into the temporal target (per-version target fan-out), and
+/// ATTACH applies the
 /// DocDelta::SetPath via the close+open dance against the matched
 /// per-version target record.
 #[test]
@@ -6864,7 +6860,7 @@ fn attach_document_into_temporal_target_writes_new_version_with_property() {
         .expect("seed edge");
 
     db.execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(p:Person) INTO p.address")
-        .expect("ATTACH into temporal target must succeed (R172d + Phase 3c)");
+        .expect("ATTACH into temporal target must succeed");
 
     // Person now has two versions: original (vf=100, no address) closed,
     // and new version (vf=NOW) carrying the attached address doc.
@@ -6873,7 +6869,7 @@ fn attach_document_into_temporal_target_writes_new_version_with_property() {
             "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.address AS addr",
         )
         .expect("MATCH Person after ATTACH");
-    assert!(rows.len() >= 2, "old + new version: {rows:?}");
+    assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
     let new_version = rows
         .iter()
         .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
@@ -6884,7 +6880,7 @@ fn attach_document_into_temporal_target_writes_new_version_with_property() {
     );
 }
 
-/// R172c Phase 3c: DETACH DOCUMENT FROM a TEMPORAL source now works via
+/// DETACH DOCUMENT FROM a TEMPORAL source works via
 /// the close+open dance — the matched per-version record is closed at
 /// `valid_to = NOW`, a new version is opened with the property removed.
 /// History before NOW is preserved.
@@ -6905,7 +6901,7 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
     db.execute_cypher(
         "MATCH (p:Person) DETACH DOCUMENT p.address AS (a:Address)-[:HAS_ADDRESS]->(p)",
     )
-    .expect("DETACH on temporal source must succeed (R172c Phase 3c)");
+    .expect("DETACH on temporal source must succeed");
 
     // Person now has two versions: original (vf=100, has address) closed,
     // and the new version (vf=NOW, no address) open.
@@ -6915,7 +6911,7 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
              p.address AS address",
         )
         .expect("MATCH Person after detach");
-    assert!(rows.len() >= 2, "must have old + new version: {rows:?}");
+    assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
 
     let original = rows
         .iter()
@@ -6947,16 +6943,80 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
     assert_eq!(addr[0].get("city"), Some(&Value::String("NYC".into())));
 }
 
-// Note: DETACH DOCUMENT WITH TRANSFER EDGES on a temporal source is
-// rejected in `execute_detach_document` (the `Phase 4` guard inside the
-// function), but a direct integration test using `execute_cypher` is
-// blocked by a pre-existing semantic analyzer issue — the `r` variable
-// in `TRANSFER EDGES … WHERE type(r) IN […]` is not auto-bound in the
-// predicate scope, so the call fails at the semantic phase before the
-// executor runs. The lower-level `coordinode-query::tests::detach_document`
-// suite bypasses semantic and exercises TRANSFER EDGES directly. Lifting
-// the guard requires the Phase 4 (node_id, valid_from) edge ownership
-// decision; the assertion remains in the executor as a defence-in-depth.
+/// DETACH DOCUMENT ... TRANSFER EDGES ... WHERE type(r) IN [...] through
+/// the full Cypher pipeline: the edge variable `r` exists only inside the
+/// TRANSFER EDGES predicate, and the statement must pass semantic analysis
+/// and move exactly the matching edges.
+#[test]
+fn detach_document_transfer_edges_runs_through_cypher() {
+    use coordinode_core::graph::types::Value;
+    let mut db = open_db();
+    db.execute_cypher("CREATE (n:User {name: 'Alice', address: {city: 'Prague'}})")
+        .expect("seed user");
+    db.execute_cypher("CREATE (s:Shop {name: 'S'}), (f:Friend {name: 'F'})")
+        .expect("seed peers");
+    db.execute_cypher(
+        "MATCH (n:User), (s:Shop), (f:Friend) \
+         CREATE (n)-[:SHIPS_TO]->(s), (n)-[:KNOWS]->(f)",
+    )
+    .expect("seed edges");
+
+    db.execute_cypher(
+        "MATCH (n:User {name: 'Alice'}) \
+         DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
+         TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO']",
+    )
+    .expect("DETACH DOCUMENT with TRANSFER EDGES must run from Cypher");
+
+    let shipped = db
+        .execute_cypher("MATCH (a:Address)-[:SHIPS_TO]->(s:Shop) RETURN a.city AS city")
+        .expect("match transferred edge");
+    assert_eq!(
+        shipped.len(),
+        1,
+        "SHIPS_TO moved to the Address: {shipped:?}"
+    );
+    assert_eq!(
+        shipped[0].get("city"),
+        Some(&Value::String("Prague".into()))
+    );
+    let kept = db
+        .execute_cypher("MATCH (n:User)-[:KNOWS]->(f:Friend) RETURN n.name AS name")
+        .expect("match kept edge");
+    assert_eq!(kept.len(), 1, "KNOWS stays on the User: {kept:?}");
+}
+
+/// ATTACH ... TRANSFER EDGES ... WHERE type(r) = '...' through the full
+/// Cypher pipeline: the matching edge moves from the attached source to
+/// the target before the source is deleted.
+#[test]
+fn attach_document_transfer_edges_runs_through_cypher() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (u:User {name: 'Alice'}), (a:Address {city: 'Prague'})")
+        .expect("seed nodes");
+    db.execute_cypher("CREATE (s:Shop {name: 'S'})")
+        .expect("seed shop");
+    db.execute_cypher(
+        "MATCH (u:User), (a:Address), (s:Shop) \
+         CREATE (a)-[:HAS_ADDRESS]->(u), (a)-[:SHIPS_TO]->(s)",
+    )
+    .expect("seed edges");
+
+    db.execute_cypher(
+        "ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address \
+         TRANSFER EDGES ON a TO u WHERE type(r) = 'SHIPS_TO'",
+    )
+    .expect("ATTACH with TRANSFER EDGES must run from Cypher");
+
+    let moved = db
+        .execute_cypher("MATCH (u:User)-[:SHIPS_TO]->(s:Shop) RETURN u.name AS name")
+        .expect("match transferred edge");
+    assert_eq!(moved.len(), 1, "SHIPS_TO moved to the User: {moved:?}");
+    let gone = db
+        .execute_cypher("MATCH (a:Address) RETURN a")
+        .expect("match source");
+    assert!(gone.is_empty(), "the attached Address is deleted: {gone:?}");
+}
 
 /// EMPIRICAL: UPSERT ON CREATE into a TEMPORAL label — execute_upsert
 /// has its own CREATE branch that calls `encode_node_key` directly
@@ -6993,11 +7053,11 @@ fn empirical_upsert_on_create_into_temporal_label() {
         .expect("non-temporal UPSERT ON CREATE accepted");
 }
 
-/// R172d initial slice: pattern predicate `WHERE (a)-[:E]->(:Temp)` now
-/// works on a temporal target. The destination label-filter prefix-scans
-/// every version of the candidate node and returns true if ANY version
-/// carries all the requested labels (matches "every version is a fact"
-/// default semantics until G096's AS OF clause lands).
+/// Pattern predicate `WHERE (a)-[:E]->(:Temp)` works on a temporal
+/// target. The destination label-filter prefix-scans every version of the
+/// candidate node and returns true if ANY version carries all the
+/// requested labels ("every version is a fact", the default without an
+/// AS OF clause).
 #[test]
 fn pattern_predicate_into_temporal_label_matches_any_version() {
     use coordinode_core::graph::types::Value;
@@ -7033,7 +7093,7 @@ fn pattern_predicate_into_temporal_label_matches_any_version() {
         .expect("pattern predicate into non-temporal accepted");
 }
 
-/// R172d edge case: negated pattern predicate `WHERE NOT (a)-[:E]->(:Temp)`
+/// Edge case: negated pattern predicate `WHERE NOT (a)-[:E]->(:Temp)`
 /// inverts the "any version matches" semantics — returns true only when
 /// no neighbour version carries the requested labels.
 #[test]
@@ -7066,8 +7126,7 @@ fn negated_pattern_predicate_into_temporal_label_returns_when_no_match() {
 }
 
 // =====================================================================
-// R172c Phase 1 — close-version SET valid_to on temporal nodes +
-// valid_from immutability.
+// Close-version SET valid_to on temporal nodes + valid_from immutability.
 // =====================================================================
 
 /// SET on a temporal node's `valid_to` closes the matched version in
@@ -7155,7 +7214,7 @@ fn temporal_set_valid_from_rejected_immutable() {
     );
 }
 
-/// R172c Phase 2: SET on a non-`valid_to` property of a temporal node
+/// SET on a non-`valid_to` property of a temporal node
 /// closes the current version and opens a new one. Same `node_id`
 /// (identity preserved), new `valid_from = NOW`, new `valid_to = NULL`,
 /// new `__ingestion_ts__`. The previous version is closed by setting
@@ -7183,7 +7242,7 @@ fn temporal_set_property_close_and_open_new_version() {
 
     // SET the name — must produce a new version.
     db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob'")
-        .expect("temporal SET non-valid_to must succeed (Phase 2)");
+        .expect("temporal SET non-valid_to must succeed");
 
     // Post-state: TWO versions of the same logical node — old closed +
     // new open. Both have the same `node_id` (verified via id() in a
@@ -7297,12 +7356,6 @@ fn temporal_set_mixed_valid_to_and_other_rejected() {
     );
 }
 
-// (Former `temporal_set_property_path_phase2b_pointer` reject test
-// removed in R172c Phase 3b: nested SET on temporal is now supported
-// — covered by `set_nested_property_path_on_temporal_node_writes_new_version`,
-// `doc_push_on_temporal_node_writes_new_version_with_append`,
-// `doc_inc_on_temporal_node_writes_new_version_with_increment`, etc.)
-
 /// SET valid_to with a value <= valid_from is rejected — same interval
 /// invariant as CREATE.
 #[test]
@@ -7329,10 +7382,10 @@ fn temporal_set_valid_to_rejects_inverted_interval() {
     assert!(format!("{err}").contains("valid_to"));
 }
 
-/// SET on a non-temporal node is unaffected by R172c routing — should
+/// SET on a non-temporal node is unaffected by temporal routing — should
 /// still mutate-in-place via the standard non-temporal path.
 #[test]
-fn r172c_set_non_temporal_unaffected() {
+fn set_on_non_temporal_node_is_unaffected_by_temporal_routing() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Plain WITH (name: STRING)")

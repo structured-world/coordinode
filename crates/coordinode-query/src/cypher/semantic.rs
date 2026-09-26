@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema};
 
 use super::ast::*;
+use crate::plan::TRANSFER_EDGE_VARIABLE;
 
 /// Semantic analysis error.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -254,7 +255,7 @@ impl<'a> Analyzer<'a> {
                 self.scope
                     .insert(dd.target_variable.clone(), dd.target_labels.clone());
                 if let Some(ref t) = dd.transfer {
-                    self.check_expr(&t.predicate);
+                    self.check_transfer_predicate(&t.predicate);
                 }
             }
             Clause::AttachDocument(ad) => {
@@ -266,7 +267,7 @@ impl<'a> Analyzer<'a> {
                 self.scope
                     .insert(ad.target_variable.clone(), ad.target_labels.clone());
                 if let Some(ref t) = ad.transfer {
-                    self.check_expr(&t.predicate);
+                    self.check_transfer_predicate(&t.predicate);
                 }
             }
             Clause::MergeNodes(mn) => {
@@ -537,6 +538,25 @@ impl<'a> Analyzer<'a> {
                         self.check_expr(expr);
                     }
                 }
+            }
+        }
+    }
+
+    /// Check a `TRANSFER EDGES ... WHERE` predicate. It ranges over the
+    /// source's candidate edges, which it names `r`, so `r` is bound for
+    /// the predicate alone and whatever `r` meant outside is restored.
+    fn check_transfer_predicate(&mut self, predicate: &Expr) {
+        let outer = self
+            .scope
+            .insert(TRANSFER_EDGE_VARIABLE.to_string(), Vec::new());
+        self.check_expr(predicate);
+        match outer {
+            Some(labels) => {
+                self.scope
+                    .insert(TRANSFER_EDGE_VARIABLE.to_string(), labels);
+            }
+            None => {
+                self.scope.remove(TRANSFER_EDGE_VARIABLE);
             }
         }
     }

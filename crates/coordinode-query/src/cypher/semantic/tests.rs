@@ -205,6 +205,33 @@ fn delete_undefined_variable() {
     )));
 }
 
+/// The TRANSFER EDGES predicate names the candidate edge `r`: it is bound
+/// inside the predicate and nowhere after it.
+#[test]
+fn transfer_edges_binds_r_for_its_predicate_only() {
+    let errors = parse_and_analyze(
+        "MATCH (n:User) \
+         DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
+         TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO'] \
+         RETURN a",
+    );
+    assert!(errors.is_empty(), "r is bound in the predicate: {errors:?}");
+
+    let errors = parse_and_analyze(
+        "MATCH (n:User) \
+         DETACH DOCUMENT n.address AS (a:Address)-[:HAS_ADDRESS]->(n) \
+         TRANSFER EDGES ON n TO a WHERE type(r) IN ['SHIPS_TO'] \
+         RETURN r",
+    );
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            SemanticError::UndefinedVariable { ref name } if name == "r"
+        )),
+        "r must not leak past the predicate: {errors:?}"
+    );
+}
+
 #[test]
 fn merge_introduces_variable() {
     let errors = parse_and_analyze("MERGE (n:User {email: 'alice@test.com'}) RETURN n");

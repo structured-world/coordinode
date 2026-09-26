@@ -13197,7 +13197,7 @@ fn emit_property_removal(
 
 /// Attempt to extract the edge-type list from a `TRANSFER EDGES WHERE` predicate.
 ///
-/// Supported shapes (enough for the spec in arch/core/document-operations.md):
+/// Supported shapes, where `r` is [`crate::plan::TRANSFER_EDGE_VARIABLE`]:
 ///   - `type(r) IN ['T1', 'T2', ...]`
 ///   - `type(r) = 'T1'`
 ///
@@ -13214,7 +13214,10 @@ fn extract_transfer_edge_types(
             NExpr::Call { name, args, .. }
                 if name.eq_ignore_ascii_case("type")
                     && args.len() == 1
-                    && matches!(&args[0], NExpr::Variable(v) if v == "r")
+                    && matches!(
+                        &args[0],
+                        NExpr::Variable(v) if v == crate::plan::TRANSFER_EDGE_VARIABLE
+                    )
         )
     }
 

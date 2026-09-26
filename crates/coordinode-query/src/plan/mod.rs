@@ -269,6 +269,10 @@ pub struct TransferEdgesEndpoints {
     pub dst: String,
 }
 
+/// Name a `TRANSFER EDGES ... WHERE` predicate uses for the candidate edge,
+/// as in `type(r) IN ['SHIPS_TO']`. Bound for the predicate only.
+pub const TRANSFER_EDGE_VARIABLE: &str = "r";
+
 /// `TRANSFER EDGES ON <node> TO <target> WHERE <predicate>` clause, in the
 /// neutral IR.
 #[derive(Debug, Clone, PartialEq)]
@@ -277,7 +281,8 @@ pub struct TransferEdgesSpec {
     pub node_variable: String,
     /// The node that receives the re-pointed edges.
     pub target_variable: String,
-    /// Predicate selecting which edges to transfer. The edge variable is `r`.
+    /// Predicate selecting which edges to transfer; it names the candidate
+    /// edge [`TRANSFER_EDGE_VARIABLE`].
     pub predicate: Expr,
 }
 
