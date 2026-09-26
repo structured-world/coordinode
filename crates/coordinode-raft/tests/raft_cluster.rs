@@ -1389,7 +1389,7 @@ async fn cluster_background_snapshot_trigger() {
 async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
     use coordinode_raft::cluster::SnapshotTriggerConfig;
 
-    let result = tokio::time::timeout(Duration::from_secs(25), async {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
         let p1 = alloc_port();
         let dir = tempfile::tempdir().expect("tempdir");
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -1432,13 +1432,10 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         };
         pipeline.propose_and_wait(&proposal).expect("propose");
 
-        // Let the trigger fire and build the first snapshot.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let builds_after_first = n1.snapshot_builds();
-        assert!(
-            builds_after_first >= 1,
-            "trigger should have built an initial snapshot"
-        );
+        // Let the trigger fire and build the first snapshot. Polled rather
+        // than slept on: under a loaded machine a build takes longer than
+        // any fixed pause.
+        let builds_after_first = await_builds_above(&n1, 0).await;
 
         // NO new entries: several more check intervals must not rebuild.
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1463,11 +1460,7 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
             bypass_rate_limiter: false,
         };
         pipeline.propose_and_wait(&proposal).expect("propose 2");
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(
-            n1.snapshot_builds() > builds_after_idle,
-            "trigger should rebuild once new entries were applied"
-        );
+        await_builds_above(&n1, builds_after_idle).await;
 
         n1.shutdown().await.expect("shutdown");
     })
@@ -1476,6 +1469,18 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         result.is_ok(),
         "TIMED OUT — cluster_snapshot_trigger_skips_when_no_new_entries"
     );
+}
+
+/// Wait until the node has built more than `builds` snapshots, returning the
+/// new count; panics (through the caller's timeout) if it never does.
+async fn await_builds_above(node: &RaftNode, builds: u64) -> u64 {
+    loop {
+        let now = node.snapshot_builds();
+        if now > builds {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// gRPC snapshot transfer e2e: leader takes snapshot, purges logs, then
