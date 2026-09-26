@@ -433,11 +433,17 @@ impl ClusterServiceImpl {
             "DecommissionNode self: transferring leadership before membership remove"
         );
 
-        // Transfer leadership. Returns after 500ms or when transfer is confirmed.
+        // Transfer leadership; returns once the peer leads. A peer that does
+        // not take over in time is a condition the caller can retry.
         self.raft_node
             .transfer_leadership_to(peer_id)
             .await
-            .map_err(|e| Status::internal(format!("leadership transfer failed: {e}")))?;
+            .map_err(|e| match e {
+                coordinode_raft::cluster::RaftNodeError::TransferTimeout { .. } => {
+                    Status::unavailable(format!("leadership transfer failed: {e}"))
+                }
+                e => Status::internal(format!("leadership transfer failed: {e}")),
+            })?;
 
         tracing::info!(
             node_id,

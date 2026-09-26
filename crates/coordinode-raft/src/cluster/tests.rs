@@ -48,6 +48,54 @@ async fn a_directory_reopens_right_after_a_shutdown_during_a_snapshot() {
     StorageEngine::open(&config).expect("the directory is free after shutdown");
 }
 
+/// `checkpoint` returns only once a snapshot covers what was applied when it
+/// was called, however long the build takes: a pre-shutdown checkpoint that
+/// returned early would let the shutdown proceed without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_returns_once_the_snapshot_covers_the_applied_log() {
+    use openraft::async_runtime::watch::WatchReceiver;
+
+    let (_dir, engine) = test_engine();
+    let node = RaftNode::single_node(engine).await.expect("bootstrap");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let proposal = RaftProposal {
+        id: ProposalIdGenerator::new().next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:1:checkpoint".to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(100),
+        start_ts: Timestamp::from_raw(99),
+        bypass_rate_limiter: false,
+    };
+    node.pipeline()
+        .propose_and_wait(&proposal)
+        .expect("propose");
+    let applied = node
+        .raft()
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .map(|id| id.index);
+
+    // A build slower than any fixed pause the checkpoint could take.
+    crate::storage::CAPTURE_DELAY_MS.store(1500, core::sync::atomic::Ordering::Relaxed);
+    node.checkpoint().await.expect("checkpoint");
+
+    let snapshot = node
+        .raft()
+        .metrics()
+        .borrow_watched()
+        .snapshot
+        .map(|id| id.index);
+    assert!(
+        snapshot >= applied,
+        "checkpoint returned with snapshot {snapshot:?} behind the applied {applied:?}"
+    );
+    node.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn single_node_bootstrap_becomes_leader() {
     let (_dir, engine) = test_engine();

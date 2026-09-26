@@ -72,6 +72,12 @@ impl Default for SnapshotTriggerConfig {
 /// leave the directory locked for the caller that reopens it.
 const SNAPSHOT_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a leadership transfer waits for the target to lead, in ms. An
+/// election the target was told to start takes one round to the voters; a
+/// transfer still pending after this is failing (target down, partitioned,
+/// or beaten), not slow.
+pub const LEADERSHIP_TRANSFER_TIMEOUT_MS: u64 = 5_000;
+
 /// Raft node orchestrator.
 ///
 /// Manages the lifecycle of an openraft instance, providing:
@@ -1347,11 +1353,10 @@ impl RaftNode {
     ///
     /// Sends a `TimeoutNow` message to the target, triggering an immediate
     /// election without waiting for `election_timeout` (300-600ms).
-    /// The target wins the election in <1ms.
     ///
-    /// Returns `Ok(())` when the transfer is initiated. The caller should
-    /// verify leadership change via [`is_leader()`](Self::is_leader) or
-    /// the metrics watch.
+    /// Returns `Ok(())` once `target_id` leads and has committed in its term
+    /// (so it serves reads and writes), and [`RaftNodeError::TransferTimeout`]
+    /// when that has not happened within [`LEADERSHIP_TRANSFER_TIMEOUT_MS`].
     ///
     /// No-op if this node is not the leader.
     pub async fn transfer_leadership_to(&self, target_id: u64) -> Result<(), RaftNodeError> {
@@ -1375,42 +1380,75 @@ impl RaftNode {
             .await
             .map_err(|e| RaftNodeError::Shutdown(format!("transfer_leader: {e}")))?;
 
-        // Allow time for the transfer to complete. The TimeoutNow election
-        // itself takes under a millisecond, but the full election round-trip
-        // and log catch-up take longer.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        if self.is_leader().await {
-            tracing::warn!(
-                node_id = self.node_id,
-                target_id,
-                "still leader after transfer attempt"
-            );
-        } else {
-            tracing::info!(
-                node_id = self.node_id,
-                target_id,
-                "leadership transfer successful"
-            );
+        // Done when the target leads AND this node has applied an entry of
+        // the target's term: that entry is applied only once committed, so
+        // the new leader has committed in its term and serves reads and
+        // writes, rather than merely having won the vote.
+        match self
+            .raft
+            .wait(Some(std::time::Duration::from_millis(
+                LEADERSHIP_TRANSFER_TIMEOUT_MS,
+            )))
+            .metrics(
+                |m| {
+                    m.current_leader == Some(target_id)
+                        && m.last_applied
+                            .as_ref()
+                            .map(|l| l.committed_leader_id().term)
+                            == Some(m.current_term)
+                },
+                "leadership transfer",
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    node_id = self.node_id,
+                    target_id,
+                    "leadership transfer successful"
+                );
+                Ok(())
+            }
+            Err(openraft::metrics::WaitError::Timeout(..)) => Err(RaftNodeError::TransferTimeout {
+                target: target_id,
+                timeout_ms: LEADERSHIP_TRANSFER_TIMEOUT_MS,
+            }),
+            Err(e) => Err(RaftNodeError::Shutdown(format!("transfer_leader: {e}"))),
         }
-
-        Ok(())
     }
 
-    /// Force a snapshot at the current applied index.
+    /// Force a snapshot at the current applied index and wait until it is
+    /// built. Used for pre-shutdown checkpointing and manual log compaction.
     ///
-    /// Triggers openraft's snapshot mechanism and waits briefly for it
-    /// to complete. Used for pre-shutdown checkpointing and manual
-    /// log compaction.
+    /// Returns once the snapshot covers every entry applied when the call
+    /// began, or an error when it is not built within the snapshot drain
+    /// window.
     pub async fn checkpoint(&self) -> Result<(), RaftNodeError> {
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let want = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .map(|id| id.index);
         self.raft
             .trigger()
             .snapshot()
             .await
             .map_err(|e| RaftNodeError::Shutdown(format!("checkpoint snapshot: {e}")))?;
 
-        // Wait for snapshot to build (typically <100ms for small datasets)
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Nothing applied means nothing to snapshot.
+        if want.is_some() {
+            self.raft
+                .wait(Some(SNAPSHOT_WORK_DRAIN))
+                .metrics(
+                    |m| m.snapshot.map(|id| id.index) >= want,
+                    "checkpoint snapshot",
+                )
+                .await
+                .map_err(|e| RaftNodeError::Shutdown(format!("checkpoint snapshot: {e}")))?;
+        }
 
         tracing::info!(
             node_id = self.node_id,
@@ -2137,6 +2175,11 @@ pub enum RaftNodeError {
 
     #[error("read concern check failed: {0}")]
     ReadConcern(String),
+
+    /// Leadership was handed to `target`, but `target` did not become the
+    /// leader in time (it is down, partitioned, or lost the election).
+    #[error("leadership did not move to node {target} within {timeout_ms} ms")]
+    TransferTimeout { target: u64, timeout_ms: u64 },
 
     /// A node was asked to join a group while holding data of its own.
     ///

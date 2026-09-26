@@ -15,7 +15,7 @@ use coordinode_core::txn::proposal::{
     Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::{RaftNode, RaftNodeError};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -2321,20 +2321,13 @@ async fn cluster_graceful_leader_transfer() {
             "n1 should NOT be leader after transfer"
         );
 
-        // n2 should become leader (or n3 may win if election race)
-        let new_leader = if n2.is_leader().await {
-            &n2
-        } else if n3.is_leader().await {
-            &n3
-        } else {
-            // Wait a bit more for election
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if n2.is_leader().await { &n2 } else { &n3 }
-        };
+        // The transfer returns only once the target leads and has committed
+        // in its term, so it serves linearizable reads at once.
         assert!(
-            new_leader.is_leader().await,
-            "a new leader should be elected after transfer"
+            n2.is_leader().await,
+            "n2 must lead as soon as the transfer returns"
         );
+        let new_leader = &n2;
 
         // ── Write through new leader ──
         let new_pipeline = new_leader.pipeline();
@@ -2375,6 +2368,88 @@ async fn cluster_graceful_leader_transfer() {
     assert!(
         result.is_ok(),
         "TIMED OUT — cluster_graceful_leader_transfer"
+    );
+}
+
+/// A transfer to a member that is down cannot complete, and says so: the
+/// caller gets `TransferTimeout` instead of a success that leaves it
+/// forwarding work to a node that never took over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let [p1, p2, p3] = coordinode_test_fixtures::alloc_ports();
+        let dirs = [
+            tempfile::tempdir().expect("d1"),
+            tempfile::tempdir().expect("d2"),
+            tempfile::tempdir().expect("d3"),
+        ];
+        let engines: Vec<Arc<StorageEngine>> = dirs
+            .iter()
+            .map(|d| {
+                Arc::new(
+                    StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                        "default",
+                        d.path(),
+                        Media::Hdd,
+                        Durability::Durable,
+                        Tier::Warm,
+                    )]))
+                    .expect("open engine"),
+                )
+            })
+            .collect();
+
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&engines[0]),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+        )
+        .await
+        .expect("n1");
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&engines[1]),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+        )
+        .await
+        .expect("n2");
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&engines[2]),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+        )
+        .await
+        .expect("n3");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add n2");
+        n1.add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add n3");
+        n1.change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+
+        n3.shutdown().await.expect("stop n3");
+        let outcome = n1.transfer_leadership_to(3).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(RaftNodeError::TransferTimeout { target: 3, .. })
+            ),
+            "a transfer to a stopped member must time out, got {outcome:?}"
+        );
+
+        n1.shutdown().await.expect("s1");
+        n2.shutdown().await.expect("s2");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — a_transfer_to_a_stopped_member_reports_the_timeout"
     );
 }
 
