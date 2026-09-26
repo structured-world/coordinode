@@ -683,6 +683,55 @@ fn rebuild_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
     stopped
 }
 
+/// The database open finishes a rebuild a crash cut short, before it serves
+/// anything: the intent alone says the tree is incomplete.
+#[test]
+fn database_open_finishes_an_interrupted_rebuild() {
+    use coordinode_storage::engine::oplog_journal::OplogJournalConfig;
+    use coordinode_test_fixtures::PowerRig;
+
+    let rig = PowerRig::new();
+    let engine = Arc::new(
+        StorageEngine::open_embedded_with_journal(
+            &rig.config(),
+            Arc::new(TimestampOracle::new()),
+            OplogJournalConfig::default(),
+        )
+        .expect("open"),
+    );
+    let data_dir = engine.data_dir().to_path_buf();
+    let root = checkpoint_root(&data_dir);
+    put(&engine, 1, PartitionId::Node, b"node:0:0001", b"base");
+    engine.persist().expect("persist");
+    let ckpt = create_checkpoint(&engine, &root).expect("checkpoint");
+    put(&engine, 2, PartitionId::Node, b"node:0:0002", b"tail");
+    engine.persist().expect("persist");
+    let since = engine.oplog_read_since(0).expect("read").expect("journal");
+
+    // The first write of the rebuild fails: the tree is cleared, nothing
+    // rebuilt reaches the disk.
+    rig.fail_from(lsm_tree::fs::FaultOp::Write, 0);
+    engine
+        .repair_partition_from_checkpoint(&ckpt, &since, Partition::Node)
+        .expect_err("the cut stops the rebuild");
+    rig.cut(engine);
+
+    let db = crate::Database::open(&data_dir).expect("open repairs");
+    for (key, value) in [
+        (&b"node:0:0001"[..], &b"base"[..]),
+        (b"node:0:0002", b"tail"),
+    ] {
+        assert_eq!(
+            db.engine()
+                .get(Partition::Node, key)
+                .expect("get")
+                .as_deref(),
+            Some(value)
+        );
+    }
+    assert!(db.engine().pending_rebuilds().expect("intents").is_empty());
+}
+
 /// A full rebuild clears the tree on disk before the rebuilt data reaches
 /// it. A power cut in between must not leave a tree the next open fills
 /// from the journal alone: the base lives only in the checkpoint, and the

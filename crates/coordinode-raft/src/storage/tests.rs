@@ -147,6 +147,41 @@ async fn log_store_purge_stops_at_what_every_tree_holds() {
 }
 
 #[tokio::test]
+async fn log_store_purge_keeps_what_the_latest_checkpoint_lacks() {
+    // A partition rebuild from the latest checkpoint replays the log from the
+    // oldest entry the checkpoint's trees lack; purging past it would leave
+    // the rebuild nothing to replay, even though every live tree holds it.
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
+    let entries = vec![
+        make_entry(1, 1, "a"),
+        make_entry(2, 1, "b"),
+        make_entry(3, 1, "c"),
+    ];
+    store.append(entries, IOFlushed::noop()).await.unwrap();
+    engine.reset_raft_coverage(4, &[]).unwrap();
+    engine.set_raft_log_keep_from(2);
+
+    store.purge(log_id(1, 3)).await.unwrap();
+
+    let remaining = store.try_get_log_entries(0..=10).await.unwrap();
+    assert_eq!(
+        remaining.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_raft_floor_is_the_lowest_base_of_its_trees() {
+    let (_dir, engine) = test_engine();
+    engine.reset_raft_coverage(7, &[]).unwrap();
+    let ckpt_root = tempfile::tempdir().unwrap();
+    let ckpt = ckpt_root.path().join("c");
+    engine.create_checkpoint(&ckpt).unwrap();
+    assert_eq!(StorageEngine::checkpoint_raft_floor(&ckpt).unwrap(), 7);
+}
+
+#[tokio::test]
 async fn log_store_purge_with_nothing_durable_keeps_everything() {
     // A fresh record covers nothing, so no entry may go.
     let (_dir, engine) = test_engine();
@@ -408,6 +443,139 @@ fn two_tree_merge_entry(index: u64, commit_ts: u64) -> Entry {
 async fn apply_entries(sm: &mut CoordinodeStateMachine, entries: Vec<Entry>) {
     let stream = futures_util::stream::iter(entries.into_iter().map(|e| Ok((e, None))));
     sm.apply(stream).await.expect("apply");
+}
+
+/// Install a peer's Counter copy (six increments, standing at entry 7) with
+/// the disk refusing `op` after `skip` of them, cut the power, reopen, and
+/// install the copy again. Returns whether the fault stopped the install.
+async fn install_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
+    use coordinode_storage::engine::core::{PartitionCopy, RaftPosition};
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let key = b"counter:degree:1".to_vec();
+    let copy = Arc::new(PartitionCopy {
+        rows: vec![(key.clone(), 6i64.to_le_bytes().to_vec())],
+        position: Some(RaftPosition {
+            next: 7,
+            payload: rmp_serde::to_vec(&log_id(1, 6)).expect("payload"),
+        }),
+    });
+    let install = |engine: &Arc<StorageEngine>| {
+        let (engine, copy) = (Arc::clone(engine), Arc::clone(&copy));
+        tokio::task::spawn_blocking(move || {
+            engine.install_partition(Partition::Counter, &copy, true)
+        })
+    };
+
+    let (engine, oracle) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle))
+        .expect("open state machine");
+    apply_entries(&mut sm, vec![two_tree_merge_entry(1, 1000)]).await;
+    engine.persist().expect("persist");
+    rig.fail_from(op, skip);
+    let stopped = install(&engine).await.expect("install task").is_err();
+    drop(sm);
+    rig.cut(engine);
+
+    let (engine, oracle) = open_rig_engine(&rig);
+    let sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle))
+        .expect("a store with an interrupted install opens");
+    if stopped {
+        assert!(
+            engine
+                .pending_rebuilds()
+                .expect("intents")
+                .contains(&Partition::Counter),
+            "{op:?} {skip}: the interrupted install is known"
+        );
+    }
+    install(&engine)
+        .await
+        .expect("install task")
+        .expect("the copy installs again");
+    assert_eq!(
+        engine
+            .get(Partition::Counter, &key)
+            .expect("get")
+            .as_deref(),
+        Some(6i64.to_le_bytes().as_slice()),
+        "{op:?} {skip}: exactly the copy"
+    );
+    assert!(engine.pending_rebuilds().expect("intents").is_empty());
+    assert!(
+        engine
+            .raft_coverage()
+            .expect("coverage")
+            .holds(Partition::Counter, 6, 0)
+    );
+    drop(sm);
+    stopped
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_power_cut_inside_a_partition_install_is_repaired_by_installing_again() {
+    use lsm_tree::fs::FaultOp;
+    for op in [FaultOp::Write, FaultOp::SyncAll, FaultOp::SyncData] {
+        let mut skip = 0;
+        while install_cut_at(op, skip).await {
+            skip += 1;
+        }
+    }
+}
+
+#[test]
+fn captures_a_crash_left_behind_are_cleared_on_open() {
+    // A capture lives only as long as the copy or snapshot build that made
+    // it; one a crash interrupted would otherwise hold its hard links, and
+    // the disk space of every table they pin, for good.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let partition_capture = dir.path().join("partition-capture").join("node-1");
+    let snapshot_capture = dir.path().join("snapshot-capture").join("1");
+    std::fs::create_dir_all(&partition_capture).expect("mkdir");
+    std::fs::create_dir_all(&snapshot_capture).expect("mkdir");
+
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    assert!(!partition_capture.exists());
+    let _sm = CoordinodeStateMachine::new(engine).expect("open state machine");
+    assert!(!snapshot_capture.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_the_log_cannot_complete_changes_nothing() {
+    // The checkpoint's Counter tree lacks entries 1..=3, and the log no
+    // longer holds them. Rebuilding would lose them: the rebuild refuses
+    // before it clears anything.
+    let (_dir, engine) = test_engine();
+    let store = LogStore::open(Arc::clone(&engine)).unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    let ckpt_root = tempfile::tempdir().unwrap();
+    let ckpt = ckpt_root.path().join("c");
+    engine.create_checkpoint(&ckpt).unwrap();
+    apply_entries(
+        &mut sm,
+        (1..=3).map(|i| two_tree_merge_entry(i, 1000 * i)).collect(),
+    )
+    .await;
+    let key = b"counter:degree:1";
+    let before = engine.get(Partition::Counter, key).unwrap();
+
+    let log = Arc::clone(&store.oplog);
+    let rebuilder = Arc::clone(&engine);
+    let err = tokio::task::spawn_blocking(move || {
+        rebuild_partition_from_checkpoint(&rebuilder, &log, &ckpt, Partition::Counter)
+    })
+    .await
+    .expect("rebuild task")
+    .expect_err("the log lacks what the checkpoint needs");
+    assert!(err.to_string().contains("no longer holds"), "{err}");
+    assert_eq!(engine.get(Partition::Counter, key).unwrap(), before);
+    assert!(engine.pending_rebuilds().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
