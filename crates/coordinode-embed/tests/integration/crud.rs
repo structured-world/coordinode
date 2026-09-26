@@ -1453,8 +1453,8 @@ fn merge_nodes_keep_last_updates_btree_index() {
 }
 
 /// Cross-label merge: a is :Person, b is :Account. Target's labels remain
-/// (only Person), source's labels do NOT bleed in. Matches arch-doc
-/// "INTO a" semantics — labels of the surviving node win.
+/// (only Person), source's labels do NOT bleed in: under "INTO a" the
+/// labels of the surviving node win.
 #[test]
 fn merge_nodes_preserves_target_labels_only() {
     let mut db = open_db();
@@ -2032,7 +2032,7 @@ fn merge_nodes_chained_two_merges_into_single_target() {
 
 /// Regression guard for executor WITH-passthrough: `MATCH (a) WITH a RETURN
 /// a.prop` must propagate `a`'s property columns past the WITH projection
-/// barrier (fix landed alongside the the trigger architecture trigger DDL commit).
+/// barrier.
 #[test]
 fn baseline_with_a_return_a_prop() {
     let mut db = open_db();

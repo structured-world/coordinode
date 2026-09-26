@@ -1,4 +1,4 @@
-//! Trigger schema partition layout (the trigger architecture).
+//! Trigger schema partition layout.
 //!
 //! Triggers are stored under two key families in the schema partition:
 //!
@@ -12,7 +12,7 @@
 //!   trigger subscribes to. `DROP TRIGGER` removes them. The probe in the
 //!   executor reads this index by `(label_or_edge_type, event)` so the
 //!   per-mutation cost is `O(matching_triggers)`, never
-//!   `O(total_trigger_count)`. the trigger architecture §3.
+//!   `O(total_trigger_count)`.
 //!
 //! `target` in the index key is prefixed with `n:` for node labels and
 //! `e:` for edge types so the two namespaces never collide on the same
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::types::Value;
 
-/// Persisted form of a trigger registered via `CREATE TRIGGER` (the trigger architecture).
+/// Persisted form of a trigger registered via `CREATE TRIGGER`.
 ///
 /// The body is stored as a raw Cypher source string captured by the parser;
 /// the executor re-parses on each firing (cheap relative to body execution,
@@ -41,14 +41,15 @@ pub struct TriggerSchema {
     pub timing: TriggerTimingSchema,
     /// Raw Cypher source of the trigger body — re-parsed on firing.
     pub body_source: String,
-    /// `MAXDEPTH n` / `CASCADE_LIMIT n` per-trigger override (the trigger architecture L1).
+    /// `MAXDEPTH n` / `CASCADE_LIMIT n` per-trigger override of the L1
+    /// cascade-depth limit.
     /// `None` = use cluster default `triggers.max_cascade_depth`.
     pub cascade_limit: Option<u32>,
-    /// `CASCADE_FANOUT n` per-trigger override (the trigger architecture L2).
+    /// `CASCADE_FANOUT n` per-trigger override of the L2 fanout limit.
     /// `None` = use cluster default `triggers.max_cascade_fanout`.
     pub cascade_fanout: Option<u32>,
     /// Error-handling policy. `None` = use the default for `timing`
-    /// (`BEFORE` → Propagate, `AFTER` → Retry 3 / 1000ms) per the trigger architecture.
+    /// (`BEFORE` → Propagate, `AFTER` → Retry 3 / 1000ms).
     pub on_error: Option<OnErrorPolicySchema>,
     /// Whether the trigger is currently firing. Flipped by
     /// `ALTER TRIGGER … DISABLE / ENABLE`.
@@ -139,7 +140,7 @@ pub enum TriggerTimingSchema {
     AfterCommit,
 }
 
-/// Per-trigger error policy (persisted form, the trigger architecture).
+/// Per-trigger error policy (persisted form).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OnErrorPolicySchema {
@@ -209,7 +210,7 @@ pub struct PendingTriggerEvent {
     pub attempt: u32,
     /// Async cascade generation: `0` for events enqueued by a user mutation,
     /// `n+1` for events enqueued by a generation-`n` trigger body. Bounds the
-    /// async cascade depth (L1, the trigger architecture) — a generation past
+    /// async cascade depth (the async side of L1) — a generation past
     /// the cluster `max_cascade_depth` is dead-lettered instead of executed.
     pub generation: u32,
     /// HLC microseconds when the event was first enqueued.
@@ -221,7 +222,7 @@ pub struct PendingTriggerEvent {
 
 /// A dead-lettered AFTER COMMIT trigger firing — retries exhausted, or a
 /// `DEAD_LETTER` / `PROPAGATE` policy on a committed transaction, or a cascade
-/// overflow. Inspectable via `SHOW TRIGGER FAILURES` (the trigger architecture).
+/// overflow. Inspectable via `SHOW TRIGGER FAILURES`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailedTriggerEvent {
     /// Trigger this event belongs to.
