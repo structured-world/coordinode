@@ -1626,6 +1626,173 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
     );
 }
 
+/// Poll `cond` every 100ms for up to `within`; panic naming `what` if it never holds.
+async fn await_condition(within: Duration, what: &str, cond: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !cond() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A follower that catches up by installing a snapshot reports the snapshot's
+/// entries as applied at once. On an idle cluster no later entry moves its
+/// applied watermark, so a causal read on it for an index the snapshot covers
+/// would otherwise wait for a write that never comes and time out.
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
+    use openraft::async_runtime::watch::WatchReceiver;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=info,openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let dir3 = tempfile::tempdir().expect("d3");
+        let open3 = || {
+            Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    dir3.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open3"),
+            )
+        };
+        let e3 = open3();
+        let n3 = RaftNode::open_joining(
+            3,
+            Arc::clone(&e3),
+            format!("127.0.0.1:{p3}").parse().expect("a"),
+        )
+        .await
+        .expect("n3");
+
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("membership");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Node 3 goes down while the other two keep committing.
+        n3.shutdown().await.expect("shutdown n3");
+        drop(n3);
+        drop(e3);
+
+        let pipeline = n1.node.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let mut last = 0;
+        for i in 1..=5u64 {
+            last = pipeline
+                .propose_and_wait(&RaftProposal {
+                    id: id_gen.next(),
+                    mutations: vec![Mutation::Put {
+                        partition: PartitionId::Node,
+                        key: format!("node:1:idle-{i}").into_bytes(),
+                        value: b"v".to_vec(),
+                    }],
+                    commit_ts: Timestamp::from_raw(100 + i),
+                    start_ts: Timestamp::from_raw(99 + i),
+                    bypass_rate_limiter: false,
+                })
+                .expect("propose")
+                .applied_index
+                .expect("a replicated write has an index");
+        }
+
+        // Snapshot and purge on the leader, so node 3 can catch up only from
+        // the snapshot.
+        n1.node
+            .raft()
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger snapshot");
+        await_condition(Duration::from_secs(10), "leader snapshot", || {
+            n1.node
+                .raft()
+                .metrics()
+                .borrow_watched()
+                .snapshot
+                .is_some_and(|id| id.index >= last)
+        })
+        .await;
+        n1.node
+            .raft()
+            .trigger()
+            .purge_log(last)
+            .await
+            .expect("trigger purge");
+
+        // Restart node 3. The port was free during the downtime, so another
+        // test may hold it for a moment; retry the bind.
+        let e3 = open3();
+        let mut reopened = None;
+        for _ in 0..20 {
+            match RaftNode::open_cluster(
+                3,
+                Arc::clone(&e3),
+                format!("127.0.0.1:{p3}").parse().expect("a"),
+                format!("http://127.0.0.1:{p3}"),
+            )
+            .await
+            {
+                Ok(n) => {
+                    reopened = Some(n);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        let n3 = reopened.expect("reopen n3");
+
+        await_condition(
+            Duration::from_secs(20),
+            "node 3 installs the snapshot",
+            || {
+                n3.raft()
+                    .metrics()
+                    .borrow_watched()
+                    .snapshot
+                    .is_some_and(|id| id.index >= last)
+            },
+        )
+        .await;
+
+        let mut fence = n3.read_fence();
+        fence
+            .wait_for_index(last, Duration::from_secs(3))
+            .await
+            .expect("the snapshot already holds the index");
+        assert!(n3.applied_through() > last);
+
+        n1.node.shutdown().await.expect("s1");
+        n2.node.shutdown().await.expect("s2");
+        n3.shutdown().await.expect("s3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — follower_caught_up_by_snapshot_serves_causal_reads_while_idle"
+    );
+}
+
 /// G046: Multi-chunk gRPC snapshot transfer.
 /// Same pattern as cluster_snapshot_grpc_transfer_to_new_node but with
 /// large payload (>4MB) to verify chunked transfer protocol works

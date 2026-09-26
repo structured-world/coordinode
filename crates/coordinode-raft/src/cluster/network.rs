@@ -220,17 +220,24 @@ impl NetStreamAppend<C> for GrpcNetwork {
             + 'static,
     {
         let partition = self.partitioned();
+        let (local, target) = (self.local_node_id, self.target_node_id);
         Box::pin(async move {
             if let Some(e) = partition {
                 return Err(e);
             }
             let client = self.get_client().await?;
 
-            // Map openraft AppendEntriesRequest stream → msgpack bytes → RaftPayload stream
-            let request_stream = input.map(|req| {
-                let data = rmp_serde::to_vec(&req).unwrap_or_default();
-                RaftPayload { data }
-            });
+            // Map openraft AppendEntriesRequest stream → msgpack bytes → RaftPayload stream.
+            // A partition cuts a stream that is already open too: the request
+            // side ends at the first entry sent across a blocked link.
+            let request_stream = input
+                .take_while(move |_| {
+                    futures_util::future::ready(!super::nemesis::is_blocked(local, target))
+                })
+                .map(|req| {
+                    let data = rmp_serde::to_vec(&req).unwrap_or_default();
+                    RaftPayload { data }
+                });
 
             // Call bidi streaming RPC
             let response = client
@@ -238,8 +245,17 @@ impl NetStreamAppend<C> for GrpcNetwork {
                 .await
                 .map_err(tonic_to_rpc_error)?;
 
-            // Map response stream: RaftPayload → deserialize → StreamAppendResult
-            let output = response.into_inner().map(|result| {
+            // Map response stream: RaftPayload → deserialize → StreamAppendResult.
+            // A reply across a blocked link is lost, as it would be on the wire.
+            let output = response.into_inner().map(move |result| {
+                if super::nemesis::is_blocked(target, local) {
+                    return Err(RPCError::Unreachable(Unreachable::new(
+                        &std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            format!("nemesis: partitioned {target} -> {local}"),
+                        ),
+                    )));
+                }
                 let payload = result.map_err(tonic_to_rpc_error)?;
                 let stream_result: StreamAppendResult<C> = deserialize(&payload.data)?;
                 Ok(stream_result)

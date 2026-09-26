@@ -37,9 +37,12 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::{HybridLogicalClock, Timestamp};
 use coordinode_raft::cluster::{RaftNode, nemesis};
+use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
+use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 use coordinode_test_fixtures::alloc_port;
 
 /// Hard per-test timeout — a hung election/replication fails fast, never spins.
@@ -436,6 +439,121 @@ async fn partition_minority_cannot_commit_majority_can() {
             leaked.is_none(),
             "minority's uncommitted write leaked to the majority (split-brain!)"
         );
+
+        nemesis::heal();
+        n1.node.shutdown().await.ok();
+        n2.node.shutdown().await.ok();
+        n3.node.shutdown().await.ok();
+    })
+    .await;
+    nemesis::heal();
+    assert!(result.is_ok(), "TIMED OUT after {TEST_TIMEOUT:?}");
+}
+
+/// True when an entry of `batch` writes `key`.
+fn carries(batch: &[(OplogEntry, ResumeToken)], key: &[u8]) -> bool {
+    batch.iter().any(|(entry, _)| {
+        entry
+            .ops
+            .iter()
+            .any(|op| matches!(op, OplogOp::Insert { key: k, .. } if k == key))
+    })
+}
+
+/// A change stream on a Raft log reads only the entries its node applied. An
+/// isolated leader still appends the write it cannot commit; the stream never
+/// delivers it. After the heal the old leader's log is truncated and rewritten,
+/// and both the live stream and a token taken before the partition carry on
+/// over the committed history.
+#[tokio::test(flavor = "multi_thread")]
+async fn change_stream_never_delivers_what_an_isolated_leader_cannot_commit() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off,coordinode_raft=info")
+        .with_test_writer()
+        .try_init();
+    nemesis::heal();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3) = bootstrap_3_node().await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        write(&n1, &id_gen, 100, "node:1:c-base", "base").expect("baseline commit");
+
+        let dirs = raft_oplog_dirs(&n1.engine, 0).expect("oplog dirs").all;
+        let all = CdcFilters::default();
+        let mut live = OplogTailer::new(&dirs, ResumeToken::from_start(0)).expect("tailer");
+        let before = live
+            .read_next(10_000, &all, n1.node.applied_through())
+            .expect("read");
+        assert!(carries(&before, b"node:1:c-base"));
+        let token = before
+            .last()
+            .expect("entries before the partition")
+            .1
+            .clone();
+
+        // Right after the cut the old leader still believes it leads and
+        // appends a write it cannot commit.
+        nemesis::isolate(1, &[2, 3]);
+        let mino_pipeline = n1.node.pipeline();
+        let mino_proposal = RaftProposal {
+            id: ProposalIdGenerator::with_base(9u64 << 48).next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:c-mino".to_vec(),
+                value: b"minority".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(300),
+            start_ts: Timestamp::from_raw(299),
+            bypass_rate_limiter: false,
+        };
+        let mino =
+            tokio::task::spawn_blocking(move || mino_pipeline.propose_and_wait(&mino_proposal));
+
+        // The entry sits in the isolated leader's log; wait until it is there,
+        // then read the stream while it stays uncommitted.
+        let mut probe = OplogTailer::new(&dirs, ResumeToken::from_start(0)).expect("tailer");
+        let mut appended = false;
+        for _ in 0..50 {
+            if carries(
+                &probe.read_next(10_000, &all, u64::MAX).expect("read"),
+                b"node:1:c-mino",
+            ) {
+                appended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(appended, "the isolated leader never appended its write");
+        let during = live
+            .read_next(10_000, &all, n1.node.applied_through())
+            .expect("read");
+        assert!(
+            !carries(&during, b"node:1:c-mino"),
+            "an uncommitted entry reached the change stream"
+        );
+
+        let survivors = [&n2, &n3];
+        let new_leader = await_new_leader(&survivors, 1).await;
+        let id_gen_maj = ProposalIdGenerator::with_base(new_leader << 48);
+        commit_on_majority(&survivors, 1, &id_gen_maj, 200, "node:1:c-maj", "majority").await;
+        let mino = tokio::time::timeout(Duration::from_secs(10), mino).await;
+        assert!(!matches!(mino, Ok(Ok(Ok(_)))), "the minority committed");
+
+        nemesis::heal();
+        let v = await_value_eq(&n1.engine, "node:1:c-maj", b"majority").await;
+        assert_eq!(v.as_deref(), Some(b"majority".as_slice()));
+
+        let mut resumed = OplogTailer::new(&dirs, token).expect("tailer");
+        for stream in [&mut live, &mut resumed] {
+            let after = stream
+                .read_next(10_000, &all, n1.node.applied_through())
+                .expect("read");
+            assert!(
+                carries(&after, b"node:1:c-maj"),
+                "the committed write after the rewrite"
+            );
+            assert!(!carries(&after, b"node:1:c-mino"));
+        }
 
         nemesis::heal();
         n1.node.shutdown().await.ok();
