@@ -1,103 +1,242 @@
 use super::*;
-use coordinode_core::graph::node::{NodeId, encode_node_key};
+use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+use coordinode_core::graph::types::Value;
+use coordinode_core::txn::proposal::{Mutation, PartitionId};
 use coordinode_query::index::{IndexDefinition, VectorIndexConfig};
-use coordinode_storage::oplog::entry::OplogEntry;
-use coordinode_storage::oplog::manager::OplogManager;
+use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_storage::engine::partition::Partition;
 
-fn node_insert_op(node_id: u64, vec: Vec<f32>, interner: &RwLock<FieldInterner>) -> OplogOp {
-    use coordinode_core::graph::types::Value;
-    let field_id = interner.write().intern("embedding");
-    let mut record = NodeRecord::new("Item");
-    record.props.insert(field_id, Value::Vector(vec));
-    OplogOp::Insert {
-        partition: NODE_PARTITION_U8,
-        key: encode_node_key(1, NodeId::from_raw(node_id)),
-        value: record.to_msgpack().unwrap(),
-    }
+const SHARD: u16 = 1;
+
+struct Fixture {
+    engine: Arc<StorageEngine>,
+    registry: Arc<VectorIndexRegistry>,
+    interner: Arc<RwLock<FieldInterner>>,
+    field: u32,
+    _dir: tempfile::TempDir,
 }
 
-fn entry(index: u64, ops: Vec<OplogOp>) -> OplogEntry {
-    OplogEntry {
-        ts: index,
-        term: 1,
-        index,
-        shard: 0,
-        ops,
-        is_migration: false,
-        pre_images: None,
-    }
-}
-
-/// Node writes appended to the oplog AFTER the worker started must
-/// land in the registered HNSW index without any rebuild.
-#[test]
-fn worker_applies_live_oplog_inserts() {
+fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let oplog_dir = dir.path().join("oplog").join("0");
-    std::fs::create_dir_all(&oplog_dir).unwrap();
-
+    let engine = Arc::new(
+        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]))
+        .unwrap(),
+    );
     let registry = Arc::new(VectorIndexRegistry::new());
-    let config = VectorIndexConfig {
-        dimensions: 4,
-        metric: coordinode_core::graph::types::VectorMetric::L2,
-        m: 8,
-        ef_construction: 32,
-        quantization: coordinode_vector::hnsw::QuantizationCodec::None,
-        offload_vectors: false,
-        ef_search: None,
-        rerank_candidates: None,
-    };
     registry.register(IndexDefinition::hnsw(
         "item_emb",
         "Item",
         "embedding",
-        config,
+        VectorIndexConfig {
+            dimensions: 4,
+            metric: coordinode_core::graph::types::VectorMetric::L2,
+            m: 8,
+            ef_construction: 32,
+            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+            offload_vectors: false,
+            ef_search: None,
+            rerank_candidates: None,
+        },
     ));
-
     let interner = Arc::new(RwLock::new(FieldInterner::new()));
-    // Pre-intern so the worker resolves the property id the records use.
-    interner.write().intern("embedding");
-
-    let worker = VectorIndexWorker::spawn(
-        oplog_dir.clone(),
-        ResumeToken::from_start(0),
-        Arc::clone(&registry),
-        Arc::clone(&interner),
-    );
-
-    let mut mgr =
-        OplogManager::open(&oplog_dir, 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600).unwrap();
-    for i in 0..20u64 {
-        let op = node_insert_op(i + 1, vec![i as f32, 0.0, 0.0, 0.0], &interner);
-        mgr.append(&entry(i, vec![op])).unwrap();
+    let field = interner.write().intern("embedding");
+    Fixture {
+        engine,
+        registry,
+        interner,
+        field,
+        _dir: dir,
     }
-    mgr.flush().unwrap();
+}
 
-    // Poll until the worker has drained the tail.
-    let handle = registry.get("Item", "embedding").unwrap();
-    let mut indexed = 0;
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(50));
-        indexed = handle.read().map(|h| h.len()).unwrap_or(0);
-        if indexed == 20 {
-            break;
+impl Fixture {
+    fn put_item(&self, id: u64, x: f32) -> Mutation {
+        let mut record = NodeRecord::new("Item");
+        record
+            .props
+            .insert(self.field, Value::Vector(vec![x, 0.0, 0.0, 0.0]));
+        Mutation::Put {
+            partition: PartitionId::Node,
+            key: encode_node_key(SHARD, NodeId::from_raw(id)),
+            value: record.to_msgpack().unwrap(),
         }
     }
-    worker.shutdown();
-    assert_eq!(indexed, 20, "all live oplog inserts must reach the index");
 
-    // Freshness watermark must advance to the last applied entry's HLC
-    // (entries carry ts = index, 0..=19). This is the read-your-writes
-    // fence: a reader that wrote at HLC <= 19 sees a current index.
+    /// Apply `mutations` as Raft entry `index` at commit timestamp `index`.
+    fn apply(&self, index: u64, mutations: &[Mutation]) {
+        self.engine
+            .apply_raft_proposal(mutations, index, index, 0, |_| false)
+            .unwrap();
+    }
+
+    fn spawn(&self, capacity: usize) -> VectorIndexWorker {
+        VectorIndexWorker::spawn(
+            Arc::clone(&self.engine),
+            self.engine.subscribe_applied(Partition::Node, capacity),
+            Arc::clone(&self.registry),
+            Arc::clone(&self.interner),
+            SHARD,
+        )
+    }
+
+    fn indexed(&self) -> usize {
+        let handle = self.registry.get("Item", "embedding").unwrap();
+        handle.read().map(|h| h.len()).unwrap_or(0)
+    }
+
+    /// Wait until the index holds `n` nodes, up to five seconds.
+    fn await_indexed(&self, n: usize) -> usize {
+        self.await_indexed_for(n, 100)
+    }
+
+    /// Wait until the index holds `n` nodes, up to `polls` × 50 ms.
+    fn await_indexed_for(&self, n: usize, polls: usize) -> usize {
+        for _ in 0..polls {
+            if self.indexed() == n {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.indexed()
+    }
+}
+
+/// Entries applied after the worker started reach the index, and the
+/// freshness watermark reaches the last one's commit timestamp.
+#[test]
+fn applied_entries_reach_the_index() {
+    let fx = fixture();
+    let worker = fx.spawn(1024);
+
+    for id in 1..=20u64 {
+        fx.apply(id, &[fx.put_item(id, id as f32)]);
+    }
+
+    let indexed = fx.await_indexed(20);
+    worker.shutdown();
+    assert_eq!(indexed, 20, "every applied node reaches the index");
     assert_eq!(
-        registry
+        fx.registry
             .health_snapshot("Item", "embedding")
             .and_then(|h| h.indexed_hlc()),
-        Some(19),
-        "worker must advance the index freshness watermark to the last applied entry ts"
+        Some(20),
+        "the watermark covers the last applied entry"
     );
+    let handle = fx.registry.get("Item", "embedding").unwrap();
+    let nearest = handle.read().unwrap().search(&[5.0, 0.0, 0.0, 0.0], 1);
+    assert_eq!(nearest.first().map(|r| r.id), Some(5));
+}
 
-    // And the index must actually answer with them.
-    let results = handle.read().unwrap().search(&[5.0, 0.0, 0.0, 0.0], 1);
-    assert_eq!(results.len(), 1);
+/// A store replaced by a snapshot is read afresh: the nodes it holds reach
+/// the index though no entry carried them.
+#[test]
+fn a_snapshot_installed_is_rebuilt_from_the_store() {
+    let fx = fixture();
+    let worker = fx.spawn(1024);
+
+    // Written into the store outside the applies, as an installed snapshot
+    // writes it; then the install is recorded.
+    for id in 1..=5u64 {
+        fx.engine
+            .apply_proposal_at(&[fx.put_item(id, id as f32)], id)
+            .unwrap();
+    }
+    fx.engine.reset_raft_coverage(6, &[]).unwrap();
+
+    let indexed = fx.await_indexed(5);
+    worker.shutdown();
+    assert_eq!(indexed, 5, "the snapshot's nodes are indexed");
+    assert!(
+        fx.registry
+            .health_snapshot("Item", "embedding")
+            .is_some_and(|h| h.is_ready()),
+        "the rebuilt index is ready again"
+    );
+}
+
+/// Entries keep applying for the whole length of an index build and after
+/// it: each one is in the index at the end, whether the build folded it
+/// (applied while the build watched) or the worker inserted it (applied after
+/// the build handed the index over). An entry applied as the build stops
+/// watching used to fall between the two.
+#[test]
+fn every_entry_applied_across_a_build_reaches_the_index() {
+    let fx = fixture();
+    // Enough nodes that the build is still scanning when the applies start.
+    for id in 1..=3000u64 {
+        fx.engine
+            .apply_proposal_at(&[fx.put_item(id, id as f32)], id)
+            .unwrap();
+    }
+    let worker = fx.spawn(1024);
+    let hnsw = fx.registry.get("Item", "embedding").unwrap();
+    let health = fx.registry.health_handle("Item", "embedding").unwrap();
+    health.report_rebuild_progress(0.0, 0);
+    let token = fx.registry.new_build_token();
+
+    let mut next = 100_000u64;
+    std::thread::scope(|scope| {
+        let build = scope.spawn(|| {
+            VectorBuild {
+                engine: &fx.engine,
+                token: &token,
+                shard_id: SHARD,
+                targets: &[BuildTarget {
+                    hnsw: hnsw.as_ref(),
+                    health: health.as_ref(),
+                    label: "Item",
+                    field_id: fx.field,
+                }],
+            }
+            .run()
+        });
+        // Bounded so the worker can catch up in the test's time.
+        while !build.is_finished() && next < 120_000 {
+            fx.apply(next, &[fx.put_item(next, next as f32)]);
+            next += 1;
+        }
+        build.join().unwrap().unwrap();
+    });
+    // And a stretch after it, maintained by the worker alone.
+    for _ in 0..200 {
+        fx.apply(next, &[fx.put_item(next, next as f32)]);
+        next += 1;
+    }
+
+    let expected = 3000 + usize::try_from(next - 100_000).unwrap();
+    let indexed = fx.await_indexed_for(expected, 1200);
+    worker.shutdown();
+    let graph = hnsw.read().unwrap();
+    let missing: Vec<u64> = (100_000..next).filter(|&id| !graph.contains(id)).collect();
+    assert!(missing.is_empty(), "applied but not indexed: {missing:?}");
+    assert_eq!(indexed, expected);
+}
+
+/// A worker that falls behind its queue loses no node: the applies drop the
+/// events it could not take and it rebuilds from the store, which holds them.
+#[test]
+fn a_worker_behind_its_queue_rebuilds_and_loses_nothing() {
+    let fx = fixture();
+    // Hold the index's write lock so the worker stalls on its first fold
+    // while the applies overflow its one-slot queue.
+    let handle = fx.registry.get("Item", "embedding").unwrap();
+    let held = handle.write().unwrap();
+    let worker = fx.spawn(1);
+    for id in 1..=50u64 {
+        fx.apply(id, &[fx.put_item(id, id as f32)]);
+    }
+    drop(held);
+
+    let indexed = fx.await_indexed(50);
+    worker.shutdown();
+    assert_eq!(
+        indexed, 50,
+        "every node is indexed despite the dropped events"
+    );
 }

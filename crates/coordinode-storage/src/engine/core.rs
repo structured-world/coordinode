@@ -205,6 +205,9 @@ pub struct StorageEngine {
     /// Consumers watching the writes a partition receives (see
     /// [`Self::tap_writes`]).
     write_taps: Arc<crate::engine::tap::WriteTaps>,
+    /// Consumers following the Raft entries as they apply (see
+    /// [`Self::subscribe_applied`]).
+    applied_feed: Arc<crate::engine::applied::AppliedFeed>,
     /// The transactions open here (see [`Self::await_transactions_through`]).
     open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
 }
@@ -962,6 +965,7 @@ impl StorageEngine {
             raft_log_keep_from: AtomicU64::new(u64::MAX),
             partition_captures: AtomicU64::new(0),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
+            applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
         })
     }
@@ -2947,6 +2951,20 @@ impl StorageEngine {
         Ok((tap, at))
     }
 
+    /// Follow the Raft entries applied to `partition` from now on, queueing
+    /// at most `capacity` events; see [`crate::engine::applied`].
+    ///
+    /// Only entries the Raft state machine applies through
+    /// [`Self::apply_raft_proposal`] are reported, after they are in the
+    /// store; an engine without Raft reports nothing.
+    pub fn subscribe_applied(
+        &self,
+        partition: Partition,
+        capacity: usize,
+    ) -> crate::engine::applied::AppliedSubscription {
+        self.applied_feed.subscribe(partition, capacity)
+    }
+
     /// Start `tap` over after it reported
     /// [`Tapped::Replaced`](crate::engine::tap::Tapped::Replaced): discard
     /// what it holds and return a fresh snapshot with the guarantee of
@@ -3014,6 +3032,12 @@ impl StorageEngine {
     /// The taps open on this engine, for the write paths outside this file.
     pub(crate) fn write_taps(&self) -> &crate::engine::tap::WriteTaps {
         &self.write_taps
+    }
+
+    /// How many subscriptions to the applies are open.
+    #[cfg(test)]
+    pub(crate) fn applied_subscriptions(&self) -> usize {
+        self.applied_feed.open()
     }
 
     /// How long a snapshot waits for the commits still landing.

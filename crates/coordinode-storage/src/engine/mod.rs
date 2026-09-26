@@ -1,5 +1,6 @@
 //! CoordiNode LSM storage engine — primary KV layer (coordinode-storage).
 
+pub mod applied;
 pub mod batch;
 pub mod capacity;
 pub mod claims;

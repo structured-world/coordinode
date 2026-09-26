@@ -118,10 +118,10 @@ impl BuildToken {
         self.0.load(Ordering::Relaxed)
     }
 
-    /// Ask the build to stop, for a test driving a build without the thread
-    /// the registry would own.
-    #[cfg(test)]
-    pub(crate) fn cancel(&self) {
+    /// Ask the build to stop. The registry does this for the builds it owns;
+    /// whoever runs a build of its own (a worker rebuilding its indexes)
+    /// stops it with this.
+    pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
 }

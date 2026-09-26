@@ -31,6 +31,9 @@ rmpv = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+# Node keys the vector index worker collects: internal keys, no
+# attacker-chosen hash input.
+rustc-hash = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]

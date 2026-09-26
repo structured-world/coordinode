@@ -1,164 +1,254 @@
-//! Incremental HNSW maintenance from the unified oplog.
+//! Incremental HNSW maintenance from the applied Raft entries.
 //!
-//! [`VectorIndexWorker`] tails the oplog and feeds every replicated
-//! node write whose `(label, property)` carries a registered vector
-//! index into the local HNSW graph. This is how a Raft follower's
-//! index stays current AFTER its bootstrap rebuild: the one-shot
-//! backfill covers history, the worker covers the live tail. The
-//! graph itself is never replicated; each replica derives its own.
+//! [`VectorIndexWorker`] follows the entries this node's Raft state machine
+//! applies and keeps every registered vector index current with the node
+//! records they wrote. It works from what has applied, never from the log:
+//! an entry appended to the log may never commit, and one committed is not in
+//! the store until it applies, so reading the log ahead of the applies would
+//! insert vectors that never become data and pass over writes that land after
+//! an index build has stopped watching. The graph itself is never
+//! replicated; each member derives its own.
+//!
+//! The worker reads each record as it stands rather than the value the entry
+//! carried, so a merge, a later write or a delete all reconcile the same way.
+//! A partition replaced wholesale (a snapshot installed, a partition installed
+//! from a peer) or a queue the worker fell behind on is answered with a
+//! rebuild of every index from the store.
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::NodeRecord;
-use coordinode_query::index::VectorIndexRegistry;
-use coordinode_storage::oplog::entry::OplogOp;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
+use coordinode_core::graph::node::NodeId;
+use coordinode_core::txn::timestamp::Timestamp;
+use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_query::index::{BuildTarget, BuildToken, VectorBuild, VectorIndexRegistry};
+use coordinode_storage::engine::applied::{AppliedEvent, AppliedSubscription};
+use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::transaction::Transaction;
 use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
 
-/// Wire discriminant of the Node partition in oplog ops (matches the
-/// raft layer's partition encoding).
-const NODE_PARTITION_U8: u8 = 0;
-
-/// How long the worker sleeps when the oplog has no new entries.
+/// How long the worker waits for an entry before checking whether it should
+/// stop.
 const IDLE_POLL: Duration = Duration::from_millis(50);
 
-/// Max entries pulled from the oplog per batch.
+/// Most applied entries folded together, bounding how long one fold keeps
+/// the indexes' write locks busy.
 const BATCH: usize = 256;
 
-/// Background thread that tails the oplog and applies vector inserts
-/// to the in-memory HNSW indexes of this process.
+/// Background thread that keeps this process's vector indexes current with
+/// the Raft entries applied on this node.
 pub struct VectorIndexWorker {
-    stop: Arc<AtomicBool>,
+    stop: BuildToken,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl VectorIndexWorker {
-    /// Spawn the worker tailing `oplog_dir` from `start` onwards.
-    ///
-    /// `start` should be the position recorded AFTER the bootstrap
-    /// scan/backfill finished, so history is covered by the rebuild
-    /// and the live tail by this worker. HNSW insert is an upsert per
-    /// node id, so overlap between the two is harmless.
+    /// Spawn the worker on `applied`, a subscription to the Node partition
+    /// opened before the indexes were last built from the store, so no
+    /// applied entry falls between the two. `shard_id` is the shard whose
+    /// node rows the indexes hold.
     pub fn spawn(
-        oplog_dir: PathBuf,
-        start: ResumeToken,
+        engine: Arc<StorageEngine>,
+        applied: AppliedSubscription,
         registry: Arc<VectorIndexRegistry>,
         interner: Arc<RwLock<FieldInterner>>,
+        shard_id: u16,
     ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
+        let stop = registry.new_build_token();
+        let worker = Worker {
+            engine,
+            applied,
+            registry,
+            interner,
+            shard_id,
+            stop: stop.clone(),
+        };
         let handle = std::thread::Builder::new()
-            .name("vec-oplog-worker".to_string())
-            .spawn(move || run(oplog_dir, start, registry, interner, stop_flag))
+            .name("vec-applied-worker".to_string())
+            .spawn(move || worker.run())
+            .map_err(|e| tracing::error!(error = %e, "could not start the vector index worker"))
             .ok();
         Self { stop, handle }
     }
 
-    /// Signal the worker to stop and wait for it to exit.
+    /// Signal the worker to stop and wait for it to exit. A rebuild in
+    /// progress stops at its next check.
     pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.cancel();
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::error!("the vector index worker panicked");
+            }
         }
     }
 }
 
 impl Drop for VectorIndexWorker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        self.stop_and_join();
     }
 }
 
-fn run(
-    oplog_dir: PathBuf,
-    start: ResumeToken,
+struct Worker {
+    engine: Arc<StorageEngine>,
+    applied: AppliedSubscription,
     registry: Arc<VectorIndexRegistry>,
     interner: Arc<RwLock<FieldInterner>>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut tailer = OplogTailer::new(&oplog_dir, start);
-    let filters = CdcFilters::default();
-    tracing::info!(dir = %oplog_dir.display(), "vector oplog worker started");
-
-    while !stop.load(Ordering::Relaxed) {
-        let batch = match tailer.read_next(BATCH, &filters) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(%e, "vector oplog worker read error; retrying");
-                std::thread::sleep(IDLE_POLL);
-                continue;
-            }
-        };
-        if batch.is_empty() {
-            std::thread::sleep(IDLE_POLL);
-            continue;
-        }
-        // Track the highest commit HLC consumed in this batch. After the
-        // worker has applied every entry up to `max_ts`, every index it
-        // maintains for this shard has seen all writes up to `max_ts` — the
-        // ones with no vector-write at `max_ts` are still current as of it.
-        // This is the per-shard read-your-writes freshness watermark.
-        let mut max_ts = 0u64;
-        for (entry, _token) in batch {
-            for op in &entry.ops {
-                let OplogOp::Insert {
-                    partition,
-                    key,
-                    value,
-                } = op
-                else {
-                    continue;
-                };
-                if *partition != NODE_PARTITION_U8 {
-                    continue;
-                }
-                apply_node_write(key, value, &registry, &interner);
-            }
-            max_ts = max_ts.max(entry.ts);
-        }
-        if max_ts > 0 {
-            registry.advance_indexed_hlc_all(max_ts);
-        }
-    }
-    tracing::info!("vector oplog worker stopped");
+    shard_id: u16,
+    /// Cancelled when the worker is asked to stop; also stops its rebuilds.
+    stop: BuildToken,
 }
 
-/// Feed one replicated node record into every registered vector index
-/// that covers one of its properties.
-fn apply_node_write(
-    key: &[u8],
-    value: &[u8],
-    registry: &VectorIndexRegistry,
-    interner: &RwLock<FieldInterner>,
-) {
-    let Some((_shard, node_id)) = coordinode_core::graph::node::decode_node_key(key) else {
-        return;
-    };
-    let Ok(record) = NodeRecord::from_msgpack(value) else {
-        return;
-    };
-    let label = record.primary_label();
-    let props = registry.indexed_properties(label);
-    if props.is_empty() {
-        return;
+impl Worker {
+    fn run(self) {
+        tracing::info!("vector index worker started");
+        while !self.stop.is_cancelled() {
+            let Some(first) = self.applied.next(IDLE_POLL) else {
+                continue;
+            };
+            let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
+            let mut replaced = false;
+            let mut max_ts = 0u64;
+            let mut taken = 0usize;
+            let mut event = Some(first);
+            while let Some(current) = event {
+                match current {
+                    AppliedEvent::Keys {
+                        commit_ts,
+                        keys: written,
+                        ..
+                    } => {
+                        max_ts = max_ts.max(commit_ts);
+                        keys.extend(written);
+                    }
+                    AppliedEvent::Replaced => replaced = true,
+                }
+                taken += 1;
+                event = if taken < BATCH {
+                    self.applied.try_next()
+                } else {
+                    None
+                };
+            }
+
+            if replaced {
+                self.rebuild();
+            } else {
+                self.fold(keys);
+            }
+            // Every entry up to `max_ts` is now in the indexes, and so is
+            // every write at or below it that these entries did not touch.
+            if max_ts > 0 {
+                self.registry.advance_indexed_hlc_all(max_ts);
+            }
+        }
+        tracing::info!("vector index worker stopped");
     }
-    let guard = interner.read();
-    for prop in props {
-        let Some(field_id) = guard.lookup(&prop) else {
-            continue;
+
+    /// Bring the nodes behind `keys` into every index that covers them.
+    fn fold(&self, keys: FxHashSet<Vec<u8>>) {
+        let ids: Vec<NodeId> = keys
+            .iter()
+            .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+            .filter(|(shard, _)| *shard == self.shard_id)
+            .map(|(_, id)| id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
+        let records = match LocalNodeStore.get_many(&read, self.shard_id, &ids) {
+            Ok(records) => records,
+            Err(e) => {
+                // The entries are applied and stay in the store; reading them
+                // all again is the one way not to drop these.
+                tracing::warn!(error = %e, nodes = ids.len(), "vector index worker could not read applied nodes; rebuilding");
+                drop(read);
+                self.rebuild();
+                return;
+            }
         };
-        let Some(val) = record.props.get(&field_id) else {
-            continue;
-        };
-        if let Some(vec) = crate::db::try_extract_vector(val) {
-            registry.on_vector_written(label, node_id, &prop, &vec);
+        let interner = self.interner.read();
+        for (node_id, record) in ids.into_iter().zip(records) {
+            // A deleted node stays in the graph as a stale entry the read path
+            // re-validates, the same as a write-path delete leaves it.
+            let Some(record) = record else {
+                continue;
+            };
+            let label = record.primary_label();
+            for property in self.registry.indexed_properties(label) {
+                let Some(field_id) = interner.lookup(&property) else {
+                    continue;
+                };
+                let Some(value) = record.props.get(&field_id) else {
+                    continue;
+                };
+                let Some(vector) = crate::db::try_extract_vector(value) else {
+                    continue;
+                };
+                self.registry
+                    .on_vector_written(label, node_id, &property, &vector);
+            }
+        }
+    }
+
+    /// Rebuild every index from the store: what changed is not known.
+    fn rebuild(&self) {
+        let definitions = self.registry.all_definitions();
+        let interner = self.interner.read();
+        let mut members = Vec::with_capacity(definitions.len());
+        for def in &definitions {
+            let (Some(hnsw), Some(health), Some(field_id)) = (
+                self.registry.get(&def.label, def.property()),
+                self.registry.health_handle(&def.label, def.property()),
+                interner.lookup(def.property()),
+            ) else {
+                continue;
+            };
+            members.push((def, hnsw, health, field_id));
+        }
+        drop(interner);
+        if members.is_empty() {
+            return;
+        }
+        for (_, _, health, _) in &members {
+            // Incomplete until the build hands it over again.
+            health.report_rebuild_progress(0.0, 0);
+        }
+        let targets: Vec<BuildTarget<'_>> = members
+            .iter()
+            .map(|(def, hnsw, health, field_id)| BuildTarget {
+                hnsw: hnsw.as_ref(),
+                health: health.as_ref(),
+                label: &def.label,
+                field_id: *field_id,
+            })
+            .collect();
+        tracing::info!(
+            indexes = targets.len(),
+            "vector index worker rebuilding from the store"
+        );
+        let outcome = VectorBuild {
+            engine: &self.engine,
+            token: &self.stop,
+            shard_id: self.shard_id,
+            targets: &targets,
+        }
+        .run();
+        match outcome {
+            Ok(outcome) => tracing::info!(?outcome, "vector index worker rebuild done"),
+            Err(reason) => {
+                tracing::warn!(%reason, "vector index worker rebuild failed");
+                for (_, _, health, _) in &members {
+                    health.mark_offline(reason.clone());
+                }
+            }
         }
     }
 }

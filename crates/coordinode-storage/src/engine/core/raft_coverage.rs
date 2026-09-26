@@ -274,9 +274,11 @@ impl StorageEngine {
                 .cloned()
                 .collect();
             self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
+            self.applied_feed.applied(index, commit_ts, &kept);
             Ok(kept.len())
         } else {
             self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
+            self.applied_feed.applied(index, commit_ts, mutations);
             Ok(mutations.len())
         }
     }
@@ -417,7 +419,11 @@ impl StorageEngine {
         // Written after the rebuilt data, so a persisted record implies the
         // data it covers is persisted.
         coverage::write_fold(tree, Domain::Raft, 0, next, payload, self.next_seqno());
-        self.finish_rebuild(partition)
+        self.finish_rebuild(partition)?;
+        // The partition was replaced wholesale, from a peer's copy or a
+        // checkpoint: followers of the applies read it afresh.
+        self.applied_feed.replaced(Some(partition));
+        Ok(())
     }
 
     /// Copy `partition` for another node: its replicated rows and, when a
@@ -567,6 +573,9 @@ impl StorageEngine {
         for tree in self.coordinator.trees().values() {
             tree.flush_active_memtable(0)?;
         }
+        // A snapshot now stands in the store in place of whatever the
+        // applies had built: followers of the applies read it afresh.
+        self.applied_feed.replaced(None);
         Ok(())
     }
 

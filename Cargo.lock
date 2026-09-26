@@ -970,6 +970,7 @@ dependencies = [
  "parking_lot",
  "rmp-serde",
  "rmpv",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

@@ -168,6 +168,11 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000)
 /// `block` policy, when neither the query nor the session names a bound.
 pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Applied Raft entries queued for the vector index worker before it is
+/// behind: past this the applies do not wait, the queue drops, and the
+/// worker rebuilds its indexes from the store.
+const APPLIED_QUEUE_CAPACITY: usize = 16_384;
+
 /// Number of node IDs to pre-allocate per batch.
 ///
 /// On startup, the database reserves `ID_BATCH_SIZE` IDs by persisting
@@ -892,13 +897,10 @@ impl Database {
         oracle: Arc<TimestampOracle>,
         engine: Arc<StorageEngine>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
-        // Whether to run the oplog-tailing vector index worker. Only cluster
-        // mode (writes applied by the Raft state machine) needs it; embedded
-        // mode updates HNSW inline on the write path, so spawning the worker
-        // there would double-insert and race the inline path — degrading
-        // recall. (Embedded gained a retained oplog dir with G111, so the mere
-        // presence of `oplog/` is no longer the cluster discriminator.)
-        spawn_oplog_worker: bool,
+        // Whether a Raft state machine applies the writes, so the vector
+        // indexes follow the applied entries through a worker. Embedded mode
+        // updates HNSW inline on the write path and applies no Raft entries.
+        follow_raft_applies: bool,
     ) -> Result<Self, DatabaseError> {
         // Auto-repair on open (G111). For an embedded engine with a retained
         // oplog journal, if a checkpoint exists, scrub and rebuild any corrupt
@@ -982,6 +984,13 @@ impl Database {
             tracing::warn!("failed to load index registry: {e}, starting fresh");
         }
 
+        // Follow the applied Raft entries from before the rebuild below, so
+        // no entry falls between what the rebuild reads and what the worker
+        // receives. Entries arriving during the rebuild are the rebuild's to
+        // fold; the worker's copy of them is a harmless upsert.
+        let applied = follow_raft_applies
+            .then(|| engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY));
+
         // Load vector index definitions from schema: partition and rebuild
         // HNSW graphs from stored vectors (eager rebuild). The registry is
         // tier-backed: every index it registers persists f32 to LSM per
@@ -994,30 +1003,17 @@ impl Database {
             1, /* shard_id */
         ));
 
-        // Tail the oplog for replicated vector writes. The bootstrap
-        // rebuild above covered history; the worker covers the live
-        // tail from here on (HNSW insert is an upsert, so any overlap
-        // between the two is harmless). Embedded deployments update indexes
-        // inline on the write path and run without the worker — `spawn_oplog_worker`
-        // is the cluster discriminator (embedded now also has an `oplog/` dir).
-        let oplog_dir = engine.data_dir().join("oplog").join("0");
-        let vector_worker = if spawn_oplog_worker && oplog_dir.is_dir() {
-            let mut tailer = coordinode_storage::oplog::tailer::OplogTailer::new(
-                &oplog_dir,
-                coordinode_storage::oplog::tailer::ResumeToken::from_start(0),
-            );
-            let start = tailer
-                .seek_to_end()
-                .unwrap_or_else(|_| coordinode_storage::oplog::tailer::ResumeToken::from_start(0));
-            Some(crate::vector_worker::VectorIndexWorker::spawn(
-                oplog_dir,
-                start,
+        // The rebuild above covered what the store held; the worker keeps the
+        // indexes current with every entry applied from here on.
+        let vector_worker = applied.map(|applied| {
+            crate::vector_worker::VectorIndexWorker::spawn(
+                Arc::clone(&engine),
+                applied,
                 Arc::clone(&vector_index_registry),
                 Arc::clone(&shared_interner),
-            ))
-        } else {
-            None
-        };
+                1, /* shard_id */
+            )
+        });
 
         // Load text index definitions and rebuild tantivy indexes from stored nodes.
         let text_index_base = path.join("text_indexes");
@@ -1128,7 +1124,7 @@ impl Database {
             nvme_write_buffer,
             _drain_handle: drain_handle,
             _ttl_reaper_handle: ttl_reaper_handle,
-            cluster_mode: spawn_oplog_worker,
+            cluster_mode: follow_raft_applies,
             trigger_dispatch_config: after_commit::TriggerDispatchConfig::default(),
             // 1024 entries is plenty for the workloads we benchmark
             // against — they repeat a small number of templates. The
