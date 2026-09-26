@@ -47,6 +47,15 @@ fn set_nofile_limit(_target: Option<u64>) -> Option<(u64, u64)> {
     None
 }
 
+/// Delay before a periodic task's first run: `node_id mod 16` sixteenths of
+/// its interval, so a fleet does not run it in lockstep. The product is at
+/// most the interval itself, so it cannot overflow.
+fn startup_jitter(interval: std::time::Duration, node_id: u64) -> std::time::Duration {
+    // Below 16, so the conversion is lossless.
+    let slot = (node_id % 16) as u32;
+    interval / 16 * slot
+}
+
 /// Run the server until SIGTERM or Ctrl+C.
 ///
 /// `config_path` selects the YAML config file (absent = built-in defaults);
@@ -107,6 +116,13 @@ pub(crate) async fn serve(
         }
     };
     let page_ecc_requested = cfg.page_ecc_requested();
+    let sizes = match cfg.byte_sizes() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Bind the resolved settings into the local names the rest of the
     // handler uses. `peers` becomes `None` when empty (= standalone),
@@ -133,11 +149,12 @@ pub(crate) async fn serve(
         storage: _,
         nofile,
         max_connections,
-        max_request_size_mb,
         request_timeout_secs,
         http2_keepalive_secs,
-        cache_size_mb,
-        write_buffer_mb,
+        // Converted to bytes above (`sizes`).
+        max_request_size_mb: _,
+        cache_size_mb: _,
+        write_buffer_mb: _,
         // Applied to the engine through resolve_storage_config above.
         retention_window_secs: _,
         max_invariant_claims: _,
@@ -264,11 +281,11 @@ pub(crate) async fn serve(
     // topology was resolved from config above (a multi-endpoint list or
     // the single-endpoint `data_dir` desugar); apply the cache / write-
     // buffer size overrides on top.
-    if let Some(mb) = cache_size_mb {
-        storage_config.block_cache_bytes = mb.saturating_mul(1024 * 1024);
+    if let Some(bytes) = sizes.cache_bytes {
+        storage_config.block_cache_bytes = bytes;
     }
-    if let Some(mb) = write_buffer_mb {
-        storage_config.max_write_buffer_bytes = mb.saturating_mul(1024 * 1024);
+    if let Some(bytes) = sizes.write_buffer_bytes {
+        storage_config.max_write_buffer_bytes = bytes;
     }
     // Surface the page-ECC build/config mismatch: an operator who asked
     // for per-block ECC on a binary built without the feature gets a
@@ -332,10 +349,7 @@ pub(crate) async fn serve(
             ));
             // Stagger the first run by node id so a fleet does not scrub
             // in lockstep and saturate I/O cluster-wide at once.
-            let jitter = interval
-                .checked_div(16)
-                .map(|slice| slice.saturating_mul(u32::try_from(node_id % 16).unwrap_or(0)))
-                .unwrap_or_default();
+            let jitter = startup_jitter(interval, node_id);
             tokio::spawn(async move {
                 tokio::time::sleep(jitter).await;
                 let mut ticker = tokio::time::interval(interval);
@@ -500,10 +514,7 @@ pub(crate) async fn serve(
         if checkpoint_enabled {
             let ckpt_engine = Arc::clone(&engine);
             let interval = std::time::Duration::from_secs(checkpoint_interval_secs.max(1));
-            let jitter = interval
-                .checked_div(16)
-                .map(|slice| slice.saturating_mul(u32::try_from(node_id % 16).unwrap_or(0)))
-                .unwrap_or_default();
+            let jitter = startup_jitter(interval, node_id);
             tokio::spawn(async move {
                 tokio::time::sleep(jitter).await;
                 let mut ticker = tokio::time::interval(interval);
@@ -725,6 +736,8 @@ pub(crate) async fn serve(
                         "property" => property.clone(),
                     )
                     .set(code);
+                    // Clamped at zero on purpose: the index may pass
+                    // `committed` after it was sampled, which is no lag.
                     let lag = state
                         .indexed_hlc()
                         .map(|h| committed.saturating_sub(h))
@@ -1068,7 +1081,7 @@ pub(crate) async fn serve(
 
     // Cap the decoded size of any single request to guard against
     // unbounded-allocation messages. Applied to every service.
-    let max_req_bytes = max_request_size_mb.saturating_mul(1024 * 1024);
+    let max_req_bytes = sizes.max_request_bytes;
 
     // Publish the running server to everything registered on the builder.
     // Placement defaults to the single-shard, single-node strategy; a

@@ -398,14 +398,14 @@ fn db_error_to_status(err: DatabaseError) -> Status {
         | DatabaseError::Execution(ExecutionError::Storage(
             StorageError::SnapshotOutsideRetention { watermark, .. },
         )) => {
+            // Refused only for a snapshot below the watermark, so the
+            // watermark is at least 1.
+            debug_assert!(*watermark > 0, "a retention refusal at watermark 0");
             return status_with_reason(
                 Code::OutOfRange,
                 rendered,
                 Reason::OutsideRetention,
-                [(
-                    "oldest_readable_ts",
-                    watermark.saturating_sub(1).to_string(),
-                )],
+                [("oldest_readable_ts", (*watermark - 1).to_string())],
             );
         }
         _ => {}

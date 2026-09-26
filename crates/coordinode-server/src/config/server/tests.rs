@@ -12,6 +12,51 @@ fn defaults_match_documented_values() {
     assert!(c.peers.is_empty());
 }
 
+/// MiB settings convert to bytes exactly, and a value whose byte count does
+/// not fit is an error naming the key, not a silent `u64::MAX` cache.
+#[test]
+fn mib_settings_convert_to_bytes_or_name_the_key_that_overflows() {
+    let c = ServerConfig {
+        cache_size_mb: Some(64),
+        write_buffer_mb: Some(8),
+        max_request_size_mb: 16,
+        ..ServerConfig::default()
+    };
+    let sizes = c.byte_sizes().expect("in-range sizes");
+    assert_eq!(sizes.cache_bytes, Some(64 * 1024 * 1024));
+    assert_eq!(sizes.write_buffer_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(sizes.max_request_bytes, 16 * 1024 * 1024);
+
+    for (key, c) in [
+        (
+            "cache_size_mb",
+            ServerConfig {
+                cache_size_mb: Some(u64::MAX),
+                ..ServerConfig::default()
+            },
+        ),
+        (
+            "write_buffer_mb",
+            ServerConfig {
+                write_buffer_mb: Some(u64::MAX),
+                ..ServerConfig::default()
+            },
+        ),
+        (
+            "max_request_size_mb",
+            ServerConfig {
+                max_request_size_mb: usize::MAX,
+                ..ServerConfig::default()
+            },
+        ),
+    ] {
+        let err = c
+            .byte_sizes()
+            .expect_err("an overflowing size must be refused");
+        assert!(err.to_string().contains(key), "{key}: {err}");
+    }
+}
+
 #[test]
 fn load_none_returns_defaults() {
     let c = ServerConfig::load(None).unwrap();

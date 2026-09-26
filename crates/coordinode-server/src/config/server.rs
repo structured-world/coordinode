@@ -68,6 +68,27 @@ pub enum ConfigError {
     /// The config file contents are not valid YAML / have unknown keys.
     #[error("failed to parse config file '{0}': {1}")]
     Parse(String, String),
+    /// A size in MiB whose byte count does not fit the machine's integers.
+    #[error("{key} = {mib} MiB is too large to express in bytes")]
+    SizeTooLarge { key: &'static str, mib: u64 },
+}
+
+/// The MiB-denominated settings, converted to bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSizes {
+    /// `cache_size_mb` in bytes (`None` = engine default).
+    pub cache_bytes: Option<u64>,
+    /// `write_buffer_mb` in bytes (`None` = engine default).
+    pub write_buffer_bytes: Option<u64>,
+    /// `max_request_size_mb` in bytes.
+    pub max_request_bytes: usize,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+fn mib_to_bytes(key: &'static str, mib: u64) -> Result<u64, ConfigError> {
+    mib.checked_mul(MIB)
+        .ok_or(ConfigError::SizeTooLarge { key, mib })
 }
 
 /// Resolved server configuration — the single gate every subsystem reads from.
@@ -325,6 +346,34 @@ impl ServerConfig {
                     .map_err(|e| ConfigError::Parse(p.to_string(), e.to_string()))
             }
         }
+    }
+
+    /// Convert the MiB settings to bytes, refusing a value whose byte count
+    /// does not fit rather than clamping it to the integer maximum.
+    pub fn byte_sizes(&self) -> Result<ByteSizes, ConfigError> {
+        let max_request_mib =
+            u64::try_from(self.max_request_size_mb).map_err(|_| ConfigError::SizeTooLarge {
+                key: "max_request_size_mb",
+                mib: u64::MAX,
+            })?;
+        let max_request_bytes =
+            usize::try_from(mib_to_bytes("max_request_size_mb", max_request_mib)?).map_err(
+                |_| ConfigError::SizeTooLarge {
+                    key: "max_request_size_mb",
+                    mib: max_request_mib,
+                },
+            )?;
+        Ok(ByteSizes {
+            cache_bytes: self
+                .cache_size_mb
+                .map(|mib| mib_to_bytes("cache_size_mb", mib))
+                .transpose()?,
+            write_buffer_bytes: self
+                .write_buffer_mb
+                .map(|mib| mib_to_bytes("write_buffer_mb", mib))
+                .transpose()?,
+            max_request_bytes,
+        })
     }
 
     /// Fold command-line overrides in last: any field the CLI set (`Some`)
