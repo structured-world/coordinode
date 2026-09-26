@@ -811,7 +811,16 @@ version (keyed on `valid_from`).
 | Timing | Where it runs | Failure default | Failure mode |
 |--------|---------------|-----------------|--------------|
 | `BEFORE COMMIT` | Raft leader, synchronous within the mutation's proposal | `PROPAGATE` | Aborts the originating transaction (caller sees the error) |
-| `AFTER COMMIT` | Oplog consumer pool, any cluster node | `RETRY 3 WITH BACKOFF 1000` | Durable retry queue → dead-letter partition on exhaustion |
+| `AFTER COMMIT` | Raft leader, dispatched from a durable queue after the commit | `RETRY 3 WITH BACKOFF 1000` | Durable retry queue → dead-letter partition on exhaustion |
+
+On a `BEFORE COMMIT` trigger, `RETRY` and `DEAD_LETTER` behave as
+`PROPAGATE`: retrying inside the originating transaction would deadlock
+against its own writes, and a dead-letter record written by a transaction
+that is aborting would be rolled back with it.
+
+An `AFTER COMMIT` body runs at least once: a crash between running the body
+and removing its queue entry runs it again on recovery, so bodies should be
+idempotent.
 
 **Cycle protection (4 layers):**
 

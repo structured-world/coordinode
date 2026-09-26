@@ -396,7 +396,7 @@ DROP TRIGGER audit
 | `ON [:EdgeType]` | Fire on edge mutations of the given type |
 | `CREATE \| UPDATE \| DELETE` | Event filter — any subset, joined by `\|` |
 | `BEFORE COMMIT` | Synchronous on Raft leader; failure can abort the transaction |
-| `AFTER COMMIT` | Asynchronous via oplog consumers; runs on any cluster node |
+| `AFTER COMMIT` | Asynchronous; dispatched on the Raft leader from a durable queue after the commit |
 | `EXECUTE <clauses>` | Cypher body (single or multi-clause); re-parsed on firing |
 | `CASCADE_LIMIT n` | Per-trigger override of L1 cascade depth (default 10) |
 | `CASCADE_FANOUT n` | Per-trigger override of L2 unique-trigger fanout (default 100) |
