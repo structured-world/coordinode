@@ -3589,16 +3589,16 @@ fn execute_btree_index_scan(
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // R172b safe-reject: B-tree index lookup returns node ids, then reads
-    // node records via 16-byte `encode_node_key` to project. Temporal
-    // records live at the 25-byte per-version key — would silently return
-    // None and the row is dropped. Version-aware index entries
-    // (`(node_id, valid_from)` point identity) land in R172d.
+    // Safe-reject: B-tree index lookup returns node ids, then reads node
+    // records via 16-byte `encode_node_key` to project. Temporal records
+    // live at the 25-byte per-version key — would silently return None and
+    // the row is dropped. Serving this needs version-aware index entries
+    // (`(node_id, valid_from)` point identity).
     if let Ok(Some(s)) = ctx.load_current_label_schema(label) {
         if s.temporal {
             return Err(ExecutionError::Unsupported(format!(
                 "B-tree index scan on temporal label '{label}' is not yet \
-                 supported (lands in R172d — version-aware index entries)."
+                 supported: index entries do not carry the version key."
             )));
         }
     }
@@ -8268,11 +8268,11 @@ fn execute_upsert(
     on_create_patterns: &[Pattern],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Phase 1: MATCH — find existing nodes
+    // Step 1: MATCH — find existing nodes
     let matches = execute_op(pattern, ctx)?;
 
     if !matches.is_empty() {
-        // Phase 2: ON MATCH — CAS check + apply SET items
+        // Step 2: ON MATCH — apply SET items
         if on_match.is_empty() {
             return Ok(matches);
         }
@@ -8283,19 +8283,17 @@ fn execute_upsert(
         // `mvcc_flush` calls `coordinator.validate_occ` which probes
         // `has_write_after` on each tracked key and surfaces
         // `ExecutionError::Conflict` if any concurrent writer landed
-        // since `mvcc_read_ts`. The byte-level CAS that used to live
-        // here was pre-G104 manual machinery and is now redundant —
-        // also strictly less safe (it tolerated ABA writes, OCC does
-        // not).
+        // since `mvcc_read_ts`. No byte-level CAS here: it would be
+        // redundant and strictly less safe (it tolerates ABA writes,
+        // OCC does not).
         execute_update(&matches, on_match, &ViolationMode::Fail, ctx)
     } else {
-        // Phase 3: ON CREATE — create nodes and edges from patterns (two-pass)
-        // R172b safe-reject for temporal labels: UPSERT ON CREATE uses
+        // Step 3: ON CREATE — create nodes and edges from patterns (two-pass)
+        // Safe-reject for temporal labels: UPSERT ON CREATE uses
         // `encode_node_key` (16-byte form) directly and would silently
         // bypass the per-version 25-byte key on a temporal label, also
         // skipping `__ingestion_ts__` auto-population and the
-        // `valid_from`-required guard. Per-version semantics for UPSERT
-        // ON CREATE land in R172c alongside MERGE.
+        // `valid_from`-required guard.
         for create_pattern in on_create_patterns {
             for element in &create_pattern.elements {
                 if let PatternElement::Node(np) = element {
@@ -8304,9 +8302,8 @@ fn execute_upsert(
                             if s.temporal {
                                 return Err(ExecutionError::Unsupported(format!(
                                     "UPSERT ON CREATE into temporal label '{lbl}' is not \
-                                     yet supported (lands in R172c — per-version write \
-                                     executor). Use an explicit CREATE clause for \
-                                     temporal labels in the R172b scope."
+                                     yet supported. Use an explicit CREATE clause for \
+                                     temporal labels."
                                 )));
                             }
                         }
@@ -8483,19 +8480,18 @@ fn execute_create_from_pattern(
             labels,
             property_filters,
         } => {
-            // R172b safe-reject for temporal labels: this code path (used by
+            // Safe-reject for temporal labels: this code path (used by
             // MERGE's create branch and by `MERGE (a)-[:E]->(b)` endpoint
             // synthesis) writes via the 16-byte non-temporal key
             // unconditionally. A temporal target would silently land in
-            // non-temporal storage. Per-version semantics for MERGE/UPSERT
-            // on temporal labels land in R172c.
+            // non-temporal storage, so MERGE/UPSERT on temporal labels is
+            // refused until it writes per-version keys.
             for lbl in labels {
                 if let Ok(Some(s)) = ctx.load_current_label_schema(lbl) {
                     if s.temporal {
                         return Err(ExecutionError::Unsupported(format!(
                             "MERGE / UPSERT into temporal label '{lbl}' is not yet \
-                             supported (lands in R172c — per-version write executor). \
-                             Use explicit CREATE for temporal labels in the R172b scope."
+                             supported. Use explicit CREATE for temporal labels."
                         )));
                     }
                 }
@@ -11446,13 +11442,12 @@ fn execute_merge_nodes(
         }
     }
 
-    // R172b safe-reject for temporal labels: MERGE NODES reads source
-    // nodes via 16-byte `encode_node_key`, mutates the target record, and
-    // deletes the non-survivor via `detach_delete_node` — none of these
-    // paths are temporal-aware. Merging two temporal nodes (whether the
-    // intent is "fold version histories" or "treat all versions as one
-    // logical node") is genuinely a per-version write-executor concern
-    // and lands in R172c.
+    // Safe-reject for temporal labels: MERGE NODES reads source nodes via
+    // 16-byte `encode_node_key`, mutates the target record, and deletes
+    // the non-survivor via `detach_delete_node` — none of these paths are
+    // temporal-aware. Merging two temporal nodes (whether the intent is
+    // "fold version histories" or "treat all versions as one logical
+    // node") needs a per-version write path.
     for row in input_rows {
         for var in [source_a, source_b] {
             if !matches!(row.get(var), Some(Value::Int(_))) {
@@ -11464,8 +11459,8 @@ fn execute_merge_nodes(
             if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
                 if s.temporal {
                     return Err(ExecutionError::Unsupported(format!(
-                        "MERGE NODES on temporal label '{primary}' is not yet supported \
-                         (lands in R172c — per-version write executor)."
+                        "MERGE NODES on temporal label '{primary}' is not yet supported: \
+                         merging needs to fold per-version histories."
                     )));
                 }
             }
@@ -12756,19 +12751,17 @@ fn execute_detach_document(
         None => None,
     };
 
-    // R172c Phase 3c: DETACH DOCUMENT on a temporal source no longer
-    // safe-rejects. The source-mutation side ("remove property from
-    // source") routes through the close+open dance — read source's
-    // current per-version record, build a new version with the property
-    // removed via DocDelta (applied in-memory by
-    // `apply_doc_deltas_to_record`), close current at valid_to = NOW.
+    // DETACH DOCUMENT on a temporal source: the source-mutation side
+    // ("remove property from source") routes through the close+open
+    // dance — read source's current per-version record, build a new
+    // version with the property removed via DocDelta (applied in-memory
+    // by `apply_doc_deltas_to_record`), close current at valid_to = NOW.
     //
-    // TRANSFER EDGES on a temporal source remains rejected: edge
-    // transfer semantics on bitemporal nodes are Phase 4 territory
-    // (the new version of the source has a different temporal identity
-    // than the closed version — which version owns the transferred
-    // edges?). Without that decision we'd silently re-point edges to
-    // an ambiguous (node_id, valid_from) pair.
+    // TRANSFER EDGES on a temporal source is rejected: the new version
+    // of the source has a different temporal identity than the closed
+    // version, and nothing yet decides which version owns the
+    // transferred edges. Without that decision we'd silently re-point
+    // edges to an ambiguous (node_id, valid_from) pair.
 
     let mut results: Vec<Row> = Vec::new();
 
@@ -12796,9 +12789,9 @@ fn execute_detach_document(
         if source_is_temporal && transfer_types.is_some() {
             return Err(ExecutionError::Unsupported(format!(
                 "DETACH DOCUMENT with TRANSFER EDGES on a temporal source \
-                 (var `{source_variable}`) is not yet supported: edge \
-                 ownership across version boundaries requires the Phase 4 \
-                 (node_id, valid_from) routing. Use plain DETACH DOCUMENT \
+                 (var `{source_variable}`) is not yet supported: edges \
+                 would need an owner per (node_id, valid_from) version. \
+                 Use plain DETACH DOCUMENT \
                  (no TRANSFER EDGES) and add the desired edges to the new \
                  target explicitly."
             )));
@@ -13365,14 +13358,13 @@ fn execute_attach_document(
         None => None,
     };
 
-    // R172c Phase 3c: ATTACH DOCUMENT supports a temporal *target* —
-    // the target's matched per-version record is read via its
-    // `<target>.valid_from` binding and the property added via the
-    // close+open dance (DocDelta::SetPath applied in-memory to the
-    // new-version clone). Temporal *source* remains rejected: ATTACH
-    // cascade-deletes the source, which on a temporal label needs the
-    // positive-bitemporal-fact tombstone composition + cross-version
-    // edge cleanup (Phase 4).
+    // ATTACH DOCUMENT supports a temporal *target* — the target's
+    // matched per-version record is read via its `<target>.valid_from`
+    // binding and the property added via the close+open dance
+    // (DocDelta::SetPath applied in-memory to the new-version clone).
+    // Temporal *source* is rejected: ATTACH cascade-deletes the source,
+    // which on a temporal label needs the positive-bitemporal-fact
+    // tombstone composition + cross-version edge cleanup.
     for row in input_rows {
         if let Some(Value::String(primary)) = row.get(&format!("{source_variable}.__label__")) {
             if let Ok(Some(s)) = ctx.load_current_label_schema(primary) {
@@ -13382,8 +13374,8 @@ fn execute_attach_document(
                          `{source_variable}`, label '{primary}') is not yet \
                          supported: ATTACH cascade-deletes the source, which on \
                          a temporal label requires the positive-bitemporal-fact \
-                         tombstone composition + cross-version edge cleanup \
-                         (Phase 4). ATTACH onto a temporal *target* is supported."
+                         tombstone composition + cross-version edge cleanup. \
+                         ATTACH onto a temporal *target* is supported."
                     )));
                 }
             }

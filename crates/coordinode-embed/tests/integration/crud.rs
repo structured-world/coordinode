@@ -6817,17 +6817,18 @@ fn empirical_attach_document_from_temporal_source() {
         .expect("pre-attach scan");
     eprintln!("pre-attach Address count: {}", pre.len());
 
-    // R172c Phase 3c: ATTACH still rejects when the *source* is
-    // temporal (cascade-delete of a temporal source is Phase 4). The
-    // pre-guard's confusing "source node not found" message is replaced
-    // with an explicit Phase 4 pointer.
+    // ATTACH rejects when the *source* is temporal (cascade-deleting a
+    // temporal source is not supported). The error says why, instead of
+    // a confusing "source node not found".
     let err = db
         .execute_cypher("ATTACH (a:Address)-[:HAS_ADDRESS]->(u:User) INTO u.address")
         .expect_err("ATTACH from temporal source must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("temporal") && msg.contains("Phase 4") && msg.contains("Address"),
-        "error must mention temporal + Phase 4 + label: {msg}"
+        msg.contains("temporal *source*")
+            && msg.contains("cascade-deletes the source")
+            && msg.contains("Address"),
+        "error must name the temporal source, the reason and the label: {msg}"
     );
     // Pre-guard behaviour was "source node node:1 not found".
     assert!(
@@ -6970,17 +6971,19 @@ fn empirical_upsert_on_create_into_temporal_label() {
 
     // UPSERT MATCH (p:Person {name:'X'}) ON CREATE CREATE (p:Person ...)
     // — Person is temporal, the ON CREATE pattern would write via
-    // non-temporal key. R172b safe-reject must intercept.
+    // non-temporal key. The safe-reject must intercept.
     let err = db
         .execute_cypher(
             "UPSERT MATCH (p:Person {name: 'X'}) \
              ON CREATE CREATE (p:Person {name: 'X', valid_from: 100})",
         )
-        .expect_err("UPSERT ON CREATE into temporal label must reject with R172c pointer");
+        .expect_err("UPSERT ON CREATE into temporal label must reject");
     let msg = format!("{err}");
     assert!(
-        msg.contains("temporal") && msg.contains("R172c") && msg.contains("Person"),
-        "error must mention temporal + R172c + label: {msg}"
+        msg.contains("UPSERT ON CREATE into temporal label")
+            && msg.contains("Person")
+            && msg.contains("explicit CREATE"),
+        "error must name the operation, the label and the alternative: {msg}"
     );
 
     // UPSERT MATCH with ON CREATE into non-temporal label is unaffected.
