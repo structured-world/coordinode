@@ -19,7 +19,6 @@ tracing = { workspace = true }
 rmp-serde = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-tempfile = { workspace = true }
 # tls-webpki-roots enables tonic's TLS API without forcing a crypto provider
 # feature (tls-ring / tls-aws-lc would link C); the process-default provider
 # (pure-Rust rustls-rustcrypto, installed at startup) is used instead.

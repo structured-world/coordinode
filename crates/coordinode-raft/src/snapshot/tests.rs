@@ -14,6 +14,13 @@ fn open_engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&config).expect("open engine")
 }
 
+/// `engine`'s full snapshot, in memory.
+fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
+    let mut buf = io::Cursor::new(Vec::new());
+    write_full_snapshot(engine, &mut buf)?;
+    Ok(buf.into_inner())
+}
+
 #[test]
 fn test_snapshot_roundtrip_empty_db() {
     let dir = tempdir().unwrap();
@@ -232,64 +239,58 @@ fn test_snapshot_replaces_existing_data() {
 }
 
 #[test]
-fn test_snapshot_transfer_serde_roundtrip() {
-    use crate::storage::Vote;
+fn a_snapshot_written_past_a_prefix_installs() {
+    // A backup frames the snapshot after its own header; the counts patched
+    // in place and the checksum read back must be the snapshot's own.
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
+    engine
+        .put(Partition::Adj, b"adj:KNOWS:out:1", b"\x02")
+        .unwrap();
 
-    let transfer = SnapshotTransfer {
-        vote: Vote::new(1, 1),
-        meta: openraft::storage::SnapshotMeta {
-            last_log_id: None,
-            last_membership: openraft::StoredMembership::default(),
-        },
-        data: vec![1, 2, 3],
-    };
-    let bytes = rmp_serde::to_vec(&transfer).expect("serialize");
-    let decoded: SnapshotTransfer = rmp_serde::from_slice(&bytes).expect("deserialize");
-    assert_eq!(decoded.data, vec![1, 2, 3]);
+    let mut buf = io::Cursor::new(b"frame".to_vec());
+    buf.seek(SeekFrom::End(0)).unwrap();
+    let written = write_full_snapshot(&engine, &mut buf).unwrap();
+    let buf = buf.into_inner();
+    assert_eq!(buf.len() as u64, 5 + written);
+    assert_eq!(&buf[..5], b"frame", "the prefix is left as it was");
+    assert_eq!(buf[5..], build_full_snapshot(&engine).unwrap()[..]);
+
+    let dir2 = tempdir().unwrap();
+    let engine2 = open_engine(dir2.path());
+    install_full_snapshot(&engine2, &buf[5..]).unwrap();
+    assert_eq!(
+        engine2
+            .get(Partition::Node, b"node:0:1")
+            .unwrap()
+            .as_deref(),
+        Some(b"alice".as_slice())
+    );
+    assert_eq!(
+        engine2
+            .get(Partition::Adj, b"adj:KNOWS:out:1")
+            .unwrap()
+            .as_deref(),
+        Some(b"\x02".as_slice())
+    );
+}
+
+#[test]
+fn a_streamed_snapshot_with_bytes_past_its_checksum_is_refused() {
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    let mut data = build_full_snapshot(&engine).unwrap();
+    data.extend_from_slice(b"x");
+
+    let err = install_full_snapshot_from_reader(&engine, &mut io::Cursor::new(&data)).unwrap_err();
+    assert!(
+        err.to_string().contains("bytes past its checksum"),
+        "got: {err}"
+    );
 }
 
 // ── Chunked Transfer Protocol Tests ────────────────────────────
-
-#[test]
-fn test_chunk_snapshot_data_single_chunk() {
-    // Data smaller than SNAPSHOT_CHUNK_SIZE → single chunk
-    let data = vec![0u8; 100];
-    let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].len(), 100);
-}
-
-#[test]
-fn test_chunk_snapshot_data_multiple_chunks() {
-    // Data larger than SNAPSHOT_CHUNK_SIZE → multiple chunks
-    let size = SNAPSHOT_CHUNK_SIZE * 2 + 1000;
-    let data = vec![0xABu8; size];
-    let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
-    assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].len(), SNAPSHOT_CHUNK_SIZE);
-    assert_eq!(chunks[1].len(), SNAPSHOT_CHUNK_SIZE);
-    assert_eq!(chunks[2].len(), 1000);
-
-    // Reassembled data matches original
-    let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
-    assert_eq!(reassembled, data);
-}
-
-#[test]
-fn test_chunk_snapshot_data_exact_boundary() {
-    // Data exactly SNAPSHOT_CHUNK_SIZE → single chunk, no remainder
-    let data = vec![0u8; SNAPSHOT_CHUNK_SIZE];
-    let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].len(), SNAPSHOT_CHUNK_SIZE);
-}
-
-#[test]
-fn test_chunk_snapshot_data_empty() {
-    let data: Vec<u8> = Vec::new();
-    let chunks: Vec<&[u8]> = chunk_snapshot_data(&data).collect();
-    assert_eq!(chunks.len(), 0);
-}
 
 #[test]
 fn test_snapshot_chunk_message_serde_roundtrip() {

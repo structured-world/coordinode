@@ -15,10 +15,11 @@
 //! - `raft:oplog:last_log_id` — oplog-based last log id
 //!
 //! **`Partition::Schema`** — shared with user schema data (`schema:*` keys):
-//! - `raft:sm:applied` — last applied log id (state machine)
-//! - `raft:sm:membership` — last applied membership config
-//! - `raft:snapshot:meta` — snapshot metadata
-//! - `raft:snapshot:data` — snapshot data (serialized)
+//! - `raft:sm:applied`: last applied log id (state machine)
+//! - `raft:sm:membership`: last applied membership config
+//! - `raft:snapshot:meta`: snapshot metadata
+//! - `raft:snapshot:file`: the snapshot's file name; the bytes live in the
+//!   engine's `raft-snapshot` directory, outside the store
 //!
 //! User schema uses `schema:label:*`, `schema:edge_type:*`, `schema:meta:*`
 //! keys in the same `Partition::Schema`. No collision occurs because prefixes
@@ -46,6 +47,11 @@ use coordinode_storage::engine::core::{
 };
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
+
+use crate::snapshot::SnapshotFile;
+#[cfg(test)]
+use crate::snapshot::store::KEY_SNAPSHOT_META;
+use crate::snapshot::store::SnapshotStore;
 
 /// Maximum age for dedup entries before GC (10 minutes): far longer than
 /// any proposal retry window, so an entry this old can no longer meet a
@@ -127,12 +133,8 @@ pub type Entry = openraft::impls::Entry<
 >;
 pub type SnapshotMeta =
     openraft::storage::SnapshotMeta<CommittedLeaderId, u64, openraft::impls::BasicNode>;
-pub type Snapshot = openraft::storage::Snapshot<
-    CommittedLeaderId,
-    u64,
-    openraft::impls::BasicNode,
-    std::io::Cursor<Vec<u8>>,
->;
+pub type Snapshot =
+    openraft::storage::Snapshot<CommittedLeaderId, u64, openraft::impls::BasicNode, SnapshotFile>;
 pub type StoredMembership =
     openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>;
 
@@ -142,8 +144,6 @@ const KEY_VOTE: &[u8] = b"raft:vote";
 const KEY_COMMITTED: &[u8] = b"raft:committed";
 const KEY_SM_APPLIED: &[u8] = b"raft:sm:applied";
 const KEY_SM_MEMBERSHIP: &[u8] = b"raft:sm:membership";
-const KEY_SNAPSHOT_META: &[u8] = b"raft:snapshot:meta";
-const KEY_SNAPSHOT_DATA: &[u8] = b"raft:snapshot:data";
 const KEY_PURGED: &[u8] = b"raft:purged";
 /// Persisted last_log_id for O(1) recovery after restart.
 const KEY_LAST_LOG_ID: &[u8] = b"raft:oplog:last_log_id";
@@ -976,6 +976,8 @@ pub struct CoordinodeStateMachine {
     /// Snapshot work holding the engine off the async runtime, which a
     /// shutdown waits out.
     engine_work: EngineWork,
+    /// The current snapshot's file and record.
+    snapshots: Arc<SnapshotStore>,
 }
 
 /// Work the state machine runs outside openraft's tasks that holds the
@@ -1163,6 +1165,10 @@ impl CoordinodeStateMachine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(io::Error::other(format!("clear snapshot captures: {e}"))),
         }
+        let snapshots = Arc::new(
+            SnapshotStore::open(Arc::clone(&engine))
+                .map_err(|e| io::Error::other(format!("open the snapshot store: {e}")))?,
+        );
         // The trees may still hold markers below their bases; the first fold
         // removes markers from index 0.
         let folded = 0;
@@ -1198,6 +1204,7 @@ impl CoordinodeStateMachine {
             captures: 0,
             gate,
             engine_work: EngineWork::default(),
+            snapshots,
         })
     }
 
@@ -1437,10 +1444,9 @@ impl CoordinodeStateMachine {
 }
 
 impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
-    // Snapshot payloads are whole in-memory blobs, so an owned cursor is the
-    // read/write handle. openraft 0.10 moved this out of the type config onto
-    // the state machine.
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    // A snapshot is a file in the engine's snapshot directory, never a
+    // buffer: it is as large as the store.
+    type SnapshotData = SnapshotFile;
 
     type SnapshotBuilder = CoordinodeSnapshotBuilder;
 
@@ -1598,12 +1604,12 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         };
 
         CoordinodeSnapshotBuilder {
-            engine: Arc::clone(&self.engine),
             last_applied,
             last_membership,
             snapshot_builds: Arc::clone(&self.snapshot_builds),
             capture,
             engine_work: self.engine_work.clone(),
+            snapshots: Arc::clone(&self.snapshots),
             _work: builder_work,
         }
     }
@@ -1611,12 +1617,12 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
     async fn install_snapshot(
         &mut self,
         meta: &openraft::type_config::alias::SnapshotMetaOf<TypeConfig>,
-        snapshot: std::io::Cursor<Vec<u8>>,
+        mut snapshot: SnapshotFile,
     ) -> Result<(), io::Error> {
-        let data = snapshot.into_inner();
+        let data_bytes = snapshot.size()?;
 
         tracing::info!(
-            data_bytes = data.len(),
+            data_bytes,
             last_log_index = meta.last_log_id.map(|id| id.index),
             "installing snapshot"
         );
@@ -1626,11 +1632,22 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let gate = Arc::clone(&self.gate);
         let mut gate = gate.state.lock().await;
 
-        // Apply snapshot data to storage partitions (if non-empty).
-        // Empty snapshots are valid (metadata-only, e.g., from tests).
-        if !data.is_empty() {
-            crate::snapshot::install_full_snapshot(&self.engine, &data)?;
-        }
+        // An empty snapshot carries metadata only and leaves the data as it
+        // is. The parse reads the file as it goes, off the async runtime.
+        let engine = Arc::clone(&self.engine);
+        let work = self.engine_work.start();
+        let mut snapshot = tokio::task::spawn_blocking(move || {
+            let _work = work;
+            if data_bytes > 0 {
+                use std::io::Seek;
+                snapshot.rewind()?;
+                let mut reader = io::BufReader::with_capacity(1 << 20, &mut snapshot);
+                crate::snapshot::install_full_snapshot_from_reader(&engine, &mut reader)?;
+            }
+            Ok::<_, io::Error>(snapshot)
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("snapshot install task: {e}")))??;
 
         // Every tree now holds exactly the snapshot: the entries up to its
         // last log id, nothing above. Recorded durably before openraft is told
@@ -1675,45 +1692,33 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             meta.last_membership.clone();
         self.save_membership(&meta.last_membership)?;
 
-        // Save snapshot data for get_current_snapshot()
-        self.engine
-            .put(Partition::Schema, KEY_SNAPSHOT_DATA, &data)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        // Save snapshot metadata
-        let meta_bytes = rmp_serde::to_vec(meta).map_err(|e| io::Error::other(e.to_string()))?;
-        self.engine
-            .put(Partition::Schema, KEY_SNAPSHOT_META, &meta_bytes)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        // The installed file becomes the current snapshot, moved in place;
+        // get_current_snapshot() serves it from now on.
+        let snapshots = Arc::clone(&self.snapshots);
+        let published_meta = meta.clone();
+        let published =
+            tokio::task::spawn_blocking(move || snapshots.publish(&published_meta, &mut snapshot))
+                .await
+                .map_err(|e| io::Error::other(format!("snapshot publish task: {e}")))??;
+        if !published {
+            // openraft installs only snapshots past what this node applied,
+            // and it builds none past that either.
+            tracing::warn!(
+                last_log_index = meta.last_log_id.map(|id| id.index),
+                "an installed snapshot is older than the one already kept"
+            );
+        }
 
         tracing::info!("snapshot install complete");
         Ok(())
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
-        let meta_bytes = match self
-            .engine
-            .get(Partition::Schema, KEY_SNAPSHOT_META)
-            .map_err(|e| io::Error::other(e.to_string()))?
-        {
-            Some(b) => b.to_vec(),
-            None => return Ok(None),
-        };
-
-        let meta: SnapshotMeta =
-            rmp_serde::from_slice(&meta_bytes).map_err(|e| io::Error::other(e.to_string()))?;
-
-        let data = self
-            .engine
-            .get(Partition::Schema, KEY_SNAPSHOT_DATA)
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .map(|b| b.to_vec())
-            .unwrap_or_default();
-
-        Ok(Some(Snapshot {
-            meta,
-            snapshot: std::io::Cursor::new(data),
-        }))
+        let snapshots = Arc::clone(&self.snapshots);
+        let current = tokio::task::spawn_blocking(move || snapshots.current())
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot open task: {e}")))??;
+        Ok(current.map(|(meta, snapshot)| Snapshot { meta, snapshot }))
     }
 }
 
@@ -1721,15 +1726,13 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 
 /// Builds a full snapshot of all storage partitions for Raft log compaction.
 ///
-/// The snapshot captures every KV pair of the replicated partitions (see
-/// `snapshot::snapshot_partitions`) in a binary format with xxh3 checksum.
-/// This data is then sent to followers via the Snapshot gRPC RPC.
+/// The snapshot holds every KV pair of the replicated partitions (see
+/// `snapshot::snapshot_partitions`) in a checksummed binary format, written
+/// to a file that followers receive through the Snapshot gRPC RPC.
 ///
 /// openraft manages the snapshot metadata (index, term, membership); the
 /// data itself travels in this binary format, never through the Raft log.
 pub struct CoordinodeSnapshotBuilder {
-    /// Engine reference for iterating all storage partitions.
-    engine: Arc<StorageEngine>,
     last_applied: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     last_membership: openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
     /// Shared build counter from the owning state machine.
@@ -1738,8 +1741,10 @@ pub struct CoordinodeSnapshotBuilder {
     capture: Result<std::path::PathBuf, String>,
     /// Where the build's blocking work is counted.
     engine_work: EngineWork,
+    /// Where the built snapshot is published; holds the engine.
+    snapshots: Arc<SnapshotStore>,
     /// Counts this builder as work holding the engine. Declared last, so it
-    /// is dropped after `engine`.
+    /// is dropped after `snapshots`.
     _work: EngineWorkGuard,
 }
 
@@ -1756,7 +1761,7 @@ impl Drop for CoordinodeSnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotFile;
 
     async fn build_snapshot(&mut self) -> Result<Snapshot, io::Error> {
         let last_log_id = self.last_applied;
@@ -1773,41 +1778,34 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         // Serialize the captured store: every entry up to `last_log_id`, none
         // after it.
         let dir = self.capture.clone().map_err(io::Error::other)?;
-        // The capture's tables are hard links into the store's; the build
-        // counts as work on the store until it has closed them.
-        let work = self.engine_work.start();
-        let data = tokio::task::spawn_blocking(move || {
-            let _work = work;
-            let captured = StorageEngine::open_checkpoint(&dir)
-                .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
-            crate::snapshot::build_full_snapshot(&captured)
-        })
-        .await
-        .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
-
         let meta = SnapshotMeta {
             last_log_id,
             last_membership: self.last_membership.clone(),
         };
-
-        tracing::info!(snapshot_bytes = data.len(), "snapshot build complete");
-
-        // Persist snapshot to storage so get_current_snapshot() can return it.
-        // openraft's build_snapshot flow doesn't call install_snapshot()
-        // on the leader — the built snapshot is kept in-memory for sending
-        // to followers. We persist it here for durability and restart recovery.
-        let meta_bytes = rmp_serde::to_vec(&meta).map_err(|e| io::Error::other(e.to_string()))?;
-        self.engine
-            .put(Partition::Schema, KEY_SNAPSHOT_META, &meta_bytes)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        self.engine
-            .put(Partition::Schema, KEY_SNAPSHOT_DATA, &data)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(Snapshot {
-            meta,
-            snapshot: std::io::Cursor::new(data),
+        // The capture's tables are hard links into the store's; the build
+        // counts as work on the store until it has closed them.
+        let work = self.engine_work.start();
+        let snapshots = Arc::clone(&self.snapshots);
+        let published_meta = meta.clone();
+        let (snapshot, bytes) = tokio::task::spawn_blocking(move || {
+            let _work = work;
+            let captured = StorageEngine::open_checkpoint(&dir)
+                .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
+            let mut file = snapshots.stage()?;
+            let bytes = crate::snapshot::write_full_snapshot(&captured, &mut file)?;
+            // openraft keeps only the metadata of what it built and asks
+            // get_current_snapshot() for the bytes, so the build is
+            // published before it is returned.
+            snapshots.publish(&published_meta, &mut file)?;
+            use std::io::Seek;
+            file.rewind()?;
+            Ok::<_, io::Error>((file, bytes))
         })
+        .await
+        .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
+
+        tracing::info!(snapshot_bytes = bytes, "snapshot build complete");
+        Ok(Snapshot { meta, snapshot })
     }
 }
 

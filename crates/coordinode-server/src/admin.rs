@@ -80,7 +80,13 @@ pub(crate) fn run_backup(
     let snapshot = db.engine().snapshot();
     let shard_id = 1u16;
 
-    let file = std::fs::File::create(&output)
+    // Readable too: the raft-snapshot format reads its body back to checksum it.
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&output)
         .map_err(|e| format!("failed to create output file '{output}': {e}"))?;
     let mut writer = std::io::BufWriter::new(file);
 
@@ -132,21 +138,23 @@ pub(crate) fn run_backup(
             // frame so dumps taken with 0.6 still restore.
             use std::io::Write;
             let interner_bytes = db.interner().to_bytes();
-            let snapshot = coordinode_raft::snapshot::build_full_snapshot(db.engine())
-                .map_err(|e| format!("backup failed: {e}"))?;
             let interner_len = u32::try_from(interner_bytes.len())
                 .map_err(|_| "field interner too large to frame".to_string())?;
-            writer
-                .write_all(&[SNAPSHOT_MODE_FULL])
-                .and_then(|()| writer.write_all(&interner_len.to_be_bytes()))
-                .and_then(|()| writer.write_all(&interner_bytes))
-                .and_then(|()| writer.write_all(&snapshot))
-                .and_then(|()| writer.flush())
+            // The snapshot streams into the file, which it seeks and reads
+            // back, so it takes the file itself rather than the buffer.
+            let mut file = writer
+                .into_inner()
+                .map_err(|e| format!("backup write failed: {}", e.error()))?;
+            file.write_all(&[SNAPSHOT_MODE_FULL])
+                .and_then(|()| file.write_all(&interner_len.to_be_bytes()))
+                .and_then(|()| file.write_all(&interner_bytes))
                 .map_err(|e| format!("backup write failed: {e}"))?;
+            let snapshot_bytes =
+                coordinode_raft::snapshot::write_full_snapshot(db.engine(), &mut file)
+                    .map_err(|e| format!("backup failed: {e}"))?;
             info!(
                 interner_bytes = interner_bytes.len(),
-                snapshot_bytes = snapshot.len(),
-                "backup complete (raft-snapshot)"
+                snapshot_bytes, "backup complete (raft-snapshot)"
             );
             return Ok(());
         }
@@ -308,17 +316,14 @@ pub(crate) fn run_restore(
         }
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
             use std::io::Read;
-            let mut data = Vec::new();
-            reader
-                .read_to_end(&mut data)
-                .map_err(|e| format!("restore read failed: {e}"))?;
             // Frame: [mode u8][u32 interner_len][interner][snapshot].
             // Restore the framed interner first (the snapshot omits it),
-            // then install the whole database.
-            if data.len() < 5 {
-                return Err("raft-snapshot file truncated (no frame header)".into());
-            }
-            match data[0] {
+            // then install the whole database, read as it is parsed.
+            let mut frame = [0u8; 5];
+            reader
+                .read_exact(&mut frame)
+                .map_err(|e| format!("raft-snapshot file truncated (no frame header): {e}"))?;
+            match frame[0] {
                 SNAPSHOT_MODE_FULL => {}
                 // 0.6 also wrote seqno-bounded deltas; a delta holds only
                 // what changed after a seqno and cannot stand alone.
@@ -331,19 +336,23 @@ pub(crate) fn run_restore(
                 }
                 other => return Err(format!("unknown snapshot mode byte: {other}").into()),
             }
-            let interner_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-            let body = &data[5..];
-            if body.len() < interner_len {
+            let interner_len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+            // Grown from the bytes actually read: a corrupt length ends in
+            // the truncation error, not in a huge allocation.
+            let mut interner_bytes = Vec::new();
+            (&mut reader)
+                .take(u64::from(interner_len))
+                .read_to_end(&mut interner_bytes)
+                .map_err(|e| format!("restore read failed: {e}"))?;
+            if interner_bytes.len() as u64 != u64::from(interner_len) {
                 return Err("raft-snapshot file truncated (interner body)".into());
             }
-            let (interner_bytes, snapshot) = body.split_at(interner_len);
-            db.persist_field_interner_bytes(interner_bytes)
+            db.persist_field_interner_bytes(&interner_bytes)
                 .map_err(|e| format!("restore interner failed: {e}"))?;
-            coordinode_raft::snapshot::install_full_snapshot(db.engine(), snapshot)
+            coordinode_raft::snapshot::install_full_snapshot_from_reader(db.engine(), &mut reader)
                 .map_err(|e| format!("restore failed: {e}"))?;
             info!(
                 interner_bytes = interner_len,
-                snapshot_bytes = snapshot.len(),
                 "restore complete (raft-snapshot)"
             );
         }

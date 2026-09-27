@@ -267,7 +267,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
 }
 
 impl NetSnapshot<C> for GrpcNetwork {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = crate::snapshot::SnapshotFile;
 
     async fn full_snapshot(
         &mut self,
@@ -293,11 +293,17 @@ impl NetSnapshot<C> for GrpcNetwork {
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
         })?;
 
-        // Build chunked snapshot transfer: header message + data chunks.
-        // This avoids sending the entire snapshot as a single gRPC message
-        // which would cause OOM on large snapshots (>1GB).
-        let snapshot_data = snapshot.snapshot.into_inner();
-        let data_size = snapshot_data.len() as u64;
+        // A header message, then the snapshot file in chunks read as the
+        // stream is consumed: the snapshot is never in memory whole.
+        let io_unreachable =
+            |e: std::io::Error| openraft::error::StreamingError::Unreachable(Unreachable::new(&e));
+        let mut file = snapshot.snapshot;
+        let data_size = file.size().map_err(io_unreachable)?;
+        {
+            use std::io::Seek;
+            file.rewind().map_err(io_unreachable)?;
+        }
+        let reader = tokio::fs::File::from_std(file.try_clone_file().map_err(io_unreachable)?);
 
         let header = crate::snapshot::SnapshotTransferHeader {
             vote,
@@ -313,30 +319,40 @@ impl NetSnapshot<C> for GrpcNetwork {
             )))
         })?;
 
-        // Build the stream: header message + data chunk messages
-        let mut payloads = vec![RaftPayload { data: header_bytes }];
-
-        for chunk in crate::snapshot::chunk_snapshot_data(&snapshot_data) {
-            let chunk_msg = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk.to_vec());
-            let chunk_bytes = rmp_serde::to_vec(&chunk_msg).map_err(|e| {
-                openraft::error::StreamingError::Unreachable(Unreachable::new(
-                    &std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("serialize snapshot chunk: {e}"),
-                    ),
-                ))
-            })?;
-            payloads.push(RaftPayload { data: chunk_bytes });
-        }
-
         tracing::info!(
             data_bytes = data_size,
-            chunks = payloads.len() - 1,
+            chunks = data_size.div_ceil(crate::snapshot::SNAPSHOT_CHUNK_SIZE as u64),
             target = %target_addr,
             "sending chunked snapshot to follower"
         );
 
-        let request_stream = futures_util::stream::iter(payloads);
+        // A read or encode failure ends the stream early; the receiver then
+        // refuses the transfer for its short size and the RPC fails.
+        let chunks =
+            futures_util::stream::unfold((reader, data_size), |(mut reader, left)| async move {
+                use tokio::io::AsyncReadExt;
+                if left == 0 {
+                    return None;
+                }
+                // At most SNAPSHOT_CHUNK_SIZE, a usize.
+                let len = left.min(crate::snapshot::SNAPSHOT_CHUNK_SIZE as u64) as usize;
+                let mut chunk = vec![0u8; len];
+                if let Err(e) = reader.read_exact(&mut chunk).await {
+                    tracing::warn!(%e, "reading the snapshot file to send it");
+                    return None;
+                }
+                let message = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk);
+                match rmp_serde::to_vec(&message) {
+                    Ok(data) => Some((RaftPayload { data }, (reader, left - len as u64))),
+                    Err(e) => {
+                        tracing::warn!(%e, "encoding a snapshot chunk");
+                        None
+                    }
+                }
+            });
+        let request_stream =
+            futures_util::stream::once(async move { RaftPayload { data: header_bytes } })
+                .chain(chunks);
 
         // Race the gRPC call against openraft's cancel signal.
         // If replication is cancelled (leader steps down, follower removed),
@@ -451,7 +467,7 @@ impl NetStreamAppend<C> for StubNetwork {
 }
 
 impl NetSnapshot<C> for StubNetwork {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = crate::snapshot::SnapshotFile;
 
     async fn full_snapshot(
         &mut self,

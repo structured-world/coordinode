@@ -3,6 +3,7 @@
 //! Implements `RaftService` tonic trait. Dispatches incoming RPCs to the
 //! local openraft instance. Uses msgpack for type serialization.
 
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -18,11 +19,16 @@ type RaftInstance = openraft::Raft<TypeConfig, CoordinodeStateMachine>;
 /// gRPC server handler for Raft consensus RPCs.
 pub struct RaftGrpcHandler {
     raft: Arc<RaftInstance>,
+    /// The node's snapshot directory, where a received snapshot is staged so
+    /// the install publishes it in place.
+    snapshot_dir: PathBuf,
 }
 
 impl RaftGrpcHandler {
-    pub fn new(raft: Arc<RaftInstance>) -> Self {
-        Self { raft }
+    /// A handler for `raft`, staging received snapshots in `snapshot_dir`
+    /// (see [`crate::snapshot::snapshot_dir`]).
+    pub fn new(raft: Arc<RaftInstance>, snapshot_dir: PathBuf) -> Self {
+        Self { raft, snapshot_dir }
     }
 }
 
@@ -117,8 +123,8 @@ impl RaftService for RaftGrpcHandler {
         // Message 1: SnapshotChunkMessage::Header (metadata)
         // Messages 2..N: SnapshotChunkMessage::DataChunk (CNSN bytes)
         //
-        // Data chunks are written to a temp file to avoid OOM on large
-        // snapshots. The file is then read by the installer.
+        // Data chunks go into a staged file in the snapshot directory,
+        // which the install reads and then publishes in place.
 
         // Read first message — must be Header
         let first = stream
@@ -129,8 +135,6 @@ impl RaftService for RaftGrpcHandler {
 
         let first_msg: crate::snapshot::SnapshotChunkMessage = rmp_serde::from_slice(&first.data)
             .map_err(|e| {
-            // Backward compatibility: try deserializing as legacy SnapshotTransfer
-            tracing::debug!("chunked header parse failed, trying legacy format: {e}");
             Status::invalid_argument(format!("snapshot header deserialize: {e}"))
         })?;
 
@@ -143,7 +147,7 @@ impl RaftService for RaftGrpcHandler {
             }
         };
 
-        let expected_data_size = header.data_size as usize;
+        let expected_data_size = header.data_size;
 
         tracing::info!(
             data_size = expected_data_size,
@@ -151,10 +155,15 @@ impl RaftService for RaftGrpcHandler {
             "receiving chunked snapshot from leader"
         );
 
-        // Write data chunks to temp file
-        let mut temp_file =
-            tempfile::tempfile().map_err(|e| Status::internal(format!("create temp file: {e}")))?;
-        let mut received_bytes = 0usize;
+        // A staged file is removed if the transfer or the install fails.
+        let staged = crate::snapshot::SnapshotFile::stage(&self.snapshot_dir)
+            .map_err(|e| Status::internal(format!("stage the snapshot file: {e}")))?;
+        let mut writer = tokio::fs::File::from_std(
+            staged
+                .try_clone_file()
+                .map_err(|e| Status::internal(format!("open the snapshot file: {e}")))?,
+        );
+        let mut received_bytes = 0u64;
         let mut chunk_count = 0usize;
 
         while let Some(result) = stream.next().await {
@@ -168,11 +177,12 @@ impl RaftService for RaftGrpcHandler {
 
             match chunk_msg {
                 crate::snapshot::SnapshotChunkMessage::DataChunk(data) => {
-                    use std::io::Write;
-                    temp_file
+                    use tokio::io::AsyncWriteExt;
+                    writer
                         .write_all(&data)
+                        .await
                         .map_err(|e| Status::internal(format!("write snapshot chunk: {e}")))?;
-                    received_bytes += data.len();
+                    received_bytes += data.len() as u64;
                     chunk_count += 1;
                 }
                 crate::snapshot::SnapshotChunkMessage::Header(_) => {
@@ -189,31 +199,27 @@ impl RaftService for RaftGrpcHandler {
             )));
         }
 
+        {
+            use tokio::io::AsyncWriteExt;
+            // The writes complete on tokio's blocking pool; the install reads
+            // the file through another handle.
+            writer
+                .flush()
+                .await
+                .map_err(|e| Status::internal(format!("write snapshot chunk: {e}")))?;
+        }
+        drop(writer);
+
         tracing::info!(
             received_bytes,
             chunk_count,
             "snapshot chunks received, installing"
         );
 
-        // Seek to start of temp file for reading
-        use std::io::Seek;
-        temp_file
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| Status::internal(format!("seek temp file: {e}")))?;
-
-        // openraft passes the data to the state machine's install_snapshot.
-        let mut raft_data = Vec::with_capacity(expected_data_size);
-        {
-            use std::io::Read;
-            std::io::BufReader::new(temp_file)
-                .read_to_end(&mut raft_data)
-                .map_err(|e| Status::internal(format!("read snapshot from temp file: {e}")))?;
-        }
-
-        let snapshot_cursor = std::io::Cursor::new(raft_data);
+        // openraft passes the file to the state machine's install_snapshot.
         let snapshot = openraft::storage::Snapshot {
             meta: header.meta.clone(),
-            snapshot: snapshot_cursor,
+            snapshot: staged,
         };
 
         // install_full_snapshot returns SnapshotResponse with the

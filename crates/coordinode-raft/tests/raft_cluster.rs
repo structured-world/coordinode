@@ -1128,7 +1128,9 @@ async fn cluster_snapshot_build_and_purge() {
         );
 
         // Verify snapshot data is non-empty (contains actual storage KV data)
-        let snap_data = snap.snapshot.into_inner();
+        let mut snapshot = snap.snapshot;
+        let mut snap_data = Vec::new();
+        std::io::Read::read_to_end(&mut snapshot, &mut snap_data).expect("read snapshot");
         assert!(
             snap_data.len() > 100,
             "snapshot data should contain actual KV data, got {} bytes",
@@ -1227,8 +1229,10 @@ async fn cluster_snapshot_install_restores_data() {
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // Build a snapshot from leader state
-        let snap_data = coordinode_raft::snapshot::build_full_snapshot(&n1.engine)
+        let mut snap_data = std::io::Cursor::new(Vec::new());
+        coordinode_raft::snapshot::write_full_snapshot(&n1.engine, &mut snap_data)
             .expect("build snapshot from leader");
+        let snap_data = snap_data.into_inner();
 
         // Install snapshot into a completely fresh engine (simulating new node)
         let fresh_dir = tempfile::tempdir().expect("fresh dir");
@@ -1366,8 +1370,9 @@ async fn cluster_background_snapshot_trigger() {
             snap.is_some(),
             "background trigger should have built a snapshot within 4 seconds"
         );
-        let snap = snap.unwrap();
-        let data = snap.snapshot.into_inner();
+        let mut snapshot = snap.unwrap().snapshot;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut snapshot, &mut data).expect("read snapshot");
         assert!(data.len() > 10, "snapshot data should be non-empty");
         assert_eq!(&data[..4], b"CNSN", "snapshot should have CNSN magic");
 
@@ -1868,22 +1873,20 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify snapshot is large enough to produce multiple chunks
-        let snap_data =
-            coordinode_raft::snapshot::build_full_snapshot(&e1).expect("build snapshot");
-        let chunk_count = coordinode_raft::snapshot::chunk_snapshot_data(&snap_data).count();
+        let data_bytes = coordinode_raft::snapshot::write_full_snapshot(
+            &e1,
+            &mut tempfile::tempfile().expect("scratch file"),
+        )
+        .expect("build snapshot");
+        let chunk_count =
+            data_bytes.div_ceil(coordinode_raft::snapshot::SNAPSHOT_CHUNK_SIZE as u64);
         assert!(
             chunk_count > 1,
             "snapshot should produce multiple chunks, got {chunk_count} \
-             (data size: {} bytes, chunk size: {})",
-            snap_data.len(),
+             (data size: {data_bytes} bytes, chunk size: {})",
             coordinode_raft::snapshot::SNAPSHOT_CHUNK_SIZE,
         );
-        tracing::info!(
-            data_bytes = snap_data.len(),
-            chunk_count,
-            "verified snapshot is multi-chunk"
-        );
-        drop(snap_data); // free memory
+        tracing::info!(data_bytes, chunk_count, "verified snapshot is multi-chunk");
 
         // Trigger snapshot and purge logs to force gRPC snapshot transfer
         n1.raft()

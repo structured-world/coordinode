@@ -37,7 +37,7 @@
 //! [value: value_len bytes]
 //! ```
 
-use std::io::{self, Read as IoRead};
+use std::io::{self, BufRead, Read as IoRead, Seek, SeekFrom, Write};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,19 +48,9 @@ use coordinode_storage::engine::partition::Partition;
 
 use crate::storage::{SnapshotMeta, Vote};
 
-/// Transfer message for sending a snapshot from leader to follower over gRPC.
-///
-/// Contains the leader's vote (for validation), snapshot metadata, and the
-/// whole-store binary snapshot data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotTransfer {
-    /// Leader's current vote (follower validates leadership).
-    pub vote: Vote,
-    /// Snapshot metadata: last_log_id and membership.
-    pub meta: SnapshotMeta,
-    /// Snapshot data in the binary format above.
-    pub data: Vec<u8>,
-}
+pub mod store;
+
+pub use store::{SnapshotFile, snapshot_dir};
 
 /// A list of KV entries for a single partition.
 type PartitionEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -125,75 +115,107 @@ fn snapshot_partitions() -> impl Iterator<Item = Partition> {
         .filter(|&p| p != Partition::Raft)
 }
 
-/// Build a full snapshot of all user-data storage partitions.
+/// Write a full snapshot of every user-data partition (all but
+/// `Partition::Raft`, which openraft manages) and every `STORAGE COLUMNAR`
+/// table to `out`, from its current position, and return the bytes written.
 ///
-/// Iterates all 7 user-data partitions (excludes `Partition::Raft` which is
-/// managed by openraft) and every `STORAGE COLUMNAR` table, serializes every
-/// KV pair, and returns the complete snapshot as bytes, checksummed.
+/// Entries stream to `out` as they are scanned, so memory does not grow with
+/// the store: each partition's entry count is written as a placeholder and
+/// patched once the partition is done, and the checksum is computed by
+/// reading the written bytes back.
 ///
-/// This is called by `CoordinodeSnapshotBuilder::build_snapshot()`.
-pub fn build_full_snapshot(engine: &StorageEngine) -> io::Result<Vec<u8>> {
+/// # Errors
+///
+/// A storage scan or an I/O operation on `out` fails, or a field exceeds the
+/// format's u32 lengths.
+pub fn write_full_snapshot<F>(engine: &StorageEngine, out: &mut F) -> io::Result<u64>
+where
+    F: IoRead + Write + Seek,
+{
+    let start = out.stream_position()?;
     let partitions: Vec<Partition> = snapshot_partitions().collect();
-    let mut buf = Vec::with_capacity(64 * 1024); // Start with 64KB
+    let partition_count = u8::try_from(partitions.len())
+        .map_err(|_| io::Error::other("more partitions than the format's u8 count"))?;
+    let mut counts: Vec<(u64, usize)> = Vec::with_capacity(partitions.len());
 
-    // Header
-    buf.extend_from_slice(MAGIC);
-    buf.push(FORMAT_VERSION);
-    buf.push(partitions.len() as u8);
-
+    let mut w = io::BufWriter::new(&mut *out);
+    w.write_all(MAGIC)?;
+    w.write_all(&[FORMAT_VERSION, partition_count])?;
     for &part in &partitions {
-        let tag = partition_tag(part);
-
-        // Collect all KV entries for this partition.
-        // Use an empty prefix to scan ALL keys in the partition.
+        w.write_all(&[partition_tag(part)])?;
+        let count_at = w.stream_position()?;
+        w.write_all(&[0; 4])?;
         let iter = engine
             .prefix_scan(part, &[])
             .map_err(|e| io::Error::other(format!("snapshot scan {}: {e}", part.name())))?;
-
-        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut entries = 0usize;
         for guard in iter {
             let (key, value) = guard
                 .into_inner()
                 .map_err(|e| io::Error::other(format!("snapshot iter {}: {e}", part.name())))?;
-            // Skip Schema `meta:*` keys — engine-internal per-node
-            // configuration (the LSM-level routing computed against this
-            // node's endpoint set, never replicated). `raft:*` keys are
-            // included here intentionally: existing apply paths filter
-            // them on the receiver side, and including them at build time
-            // preserves the build↔apply hash-checksum invariant.
+            // Schema `meta:*` keys are this node's own configuration (routing
+            // computed against its endpoint set) and never replicate. `raft:*`
+            // keys travel and receivers drop them, so the checksum covers
+            // exactly what was built.
             if part == Partition::Schema && key.starts_with(b"meta:") {
                 continue;
             }
-            entries.push((key.to_vec(), value.to_vec()));
+            put_bytes(&mut w, &key)?;
+            put_bytes(&mut w, &value)?;
+            entries += 1;
         }
-
-        // Partition block header
-        buf.push(tag);
-        put_entries(&mut buf, &entries)?;
-
         tracing::debug!(
             partition = part.name(),
-            entries = entries.len(),
+            entries,
             "snapshot: serialized partition"
         );
+        counts.push((count_at, entries));
     }
 
     let tables = engine
         .columnar_tables_at(engine.snapshot())
         .map_err(|e| io::Error::other(format!("snapshot columnar tables: {e}")))?;
-    put_tables(&mut buf, &tables)?;
+    put_tables(&mut w, &tables)?;
+    w.flush()?;
+    drop(w);
+    let end = out.stream_position()?;
 
-    let hash = fnv1a_64(&buf);
-    buf.extend_from_slice(&hash.to_le_bytes());
+    for (at, entries) in counts {
+        out.seek(SeekFrom::Start(at))?;
+        put_u32(out, entries)?;
+    }
 
+    out.seek(SeekFrom::Start(start))?;
+    let body_len = end - start;
+    let mut reader = io::BufReader::with_capacity(64 * 1024, (&mut *out).take(body_len));
+    let mut hash = FNV_OFFSET;
+    let mut hashed = 0u64;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        hash = fnv1a_fold(hash, chunk);
+        let n = chunk.len();
+        hashed += n as u64;
+        reader.consume(n);
+    }
+    drop(reader);
+    if hashed != body_len {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    }
+    out.seek(SeekFrom::Start(end))?;
+    out.write_all(&hash.to_le_bytes())?;
+    out.flush()?;
+
+    let total = body_len + 8;
     tracing::info!(
-        total_bytes = buf.len(),
+        total_bytes = total,
         partitions = partitions.len(),
         columnar_tables = tables.len(),
         "snapshot: build complete"
     );
-
-    Ok(buf)
+    Ok(total)
 }
 
 /// Install a full snapshot: deserialize and write all KV pairs to CoordiNode storage.
@@ -372,20 +394,23 @@ fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
 fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
     let mut batch = WriteBatch::new(engine);
     let mut total_written = 0usize;
-    for (partition, entries) in &parsed.partitions {
+    // Values move into the batch; only the keys are kept, for the cleanup.
+    let mut snapshot_keys = Vec::with_capacity(parsed.partitions.len());
+    for (partition, entries) in parsed.partitions {
+        let mut keys = std::collections::HashSet::with_capacity(entries.len());
         for (key, value) in entries {
-            batch.put(*partition, key.clone(), value.clone());
+            keys.insert(key.clone());
+            batch.put(partition, key, value);
             total_written += 1;
         }
+        snapshot_keys.push((partition, keys));
     }
     batch
         .commit()
         .map_err(|e| io::Error::other(format!("snapshot phase 1 (atomic write) failed: {e}")))?;
 
     let mut stale_deleted = 0usize;
-    for (partition, snap_entries) in &parsed.partitions {
-        let snap_keys: std::collections::HashSet<&[u8]> =
-            snap_entries.iter().map(|(k, _)| k.as_slice()).collect();
+    for (partition, snap_keys) in &snapshot_keys {
         let iter = engine
             .prefix_scan(*partition, &[])
             .map_err(|e| io::Error::other(format!("cleanup scan {}: {e}", partition.name())))?;
@@ -429,52 +454,46 @@ fn install_tables(engine: &StorageEngine, tables: Option<Vec<ColumnarTable>>) ->
     Ok(count)
 }
 
-/// Append `entries` as `[count: u32][kv_entry]*`.
-fn put_entries(buf: &mut Vec<u8>, entries: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
-    put_u32(buf, entries.len())?;
+/// Write `entries` as `[count: u32][kv_entry]*`.
+fn put_entries(w: &mut impl Write, entries: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    put_u32(w, entries.len())?;
     for (key, value) in entries {
-        put_bytes(buf, key)?;
-        put_bytes(buf, value)?;
+        put_bytes(w, key)?;
+        put_bytes(w, value)?;
     }
     Ok(())
 }
 
-/// Append the columnar table section.
-fn put_tables(buf: &mut Vec<u8>, tables: &[ColumnarTable]) -> io::Result<()> {
-    put_u32(buf, tables.len())?;
+/// Write the columnar table section.
+fn put_tables(w: &mut impl Write, tables: &[ColumnarTable]) -> io::Result<()> {
+    put_u32(w, tables.len())?;
     for (name, rows) in tables {
-        put_bytes(buf, name.as_bytes())?;
-        put_entries(buf, rows)?;
+        put_bytes(w, name.as_bytes())?;
+        put_entries(w, rows)?;
     }
     Ok(())
 }
 
-fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
-    put_u32(buf, bytes.len())?;
-    buf.extend_from_slice(bytes);
-    Ok(())
+fn put_bytes(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    put_u32(w, bytes.len())?;
+    w.write_all(bytes)
 }
 
 /// A length or count as the format's u32; anything larger is refused rather
 /// than written truncated.
-fn put_u32(buf: &mut Vec<u8>, n: usize) -> io::Result<()> {
+fn put_u32(w: &mut impl Write, n: usize) -> io::Result<()> {
     let n = u32::try_from(n)
         .map_err(|_| io::Error::other(format!("snapshot field of {n} exceeds the u32 format")))?;
-    buf.extend_from_slice(&n.to_be_bytes());
-    Ok(())
+    w.write_all(&n.to_be_bytes())
 }
 
 // ── Chunked Snapshot Transfer Protocol ──────────────────────────────
 //
-// For large snapshots (>1GB), sending the entire CNSN blob in a single
-// gRPC message causes OOM on both sender and receiver. The chunked
-// protocol splits the transfer into:
-//
-//   Message 1: SnapshotTransferHeader (vote, meta, data_size)
-//   Messages 2..N: Raw CNSN data chunks (up to SNAPSHOT_CHUNK_SIZE each)
-//
-// The receiver writes chunks to a temp file, then installs from the file
-// via reader-based installers. Memory usage: O(SNAPSHOT_CHUNK_SIZE).
+// A snapshot travels as a header message (vote, meta, data size) followed
+// by raw CNSN chunks of up to SNAPSHOT_CHUNK_SIZE. The sender reads the
+// chunks from its snapshot file as the stream is consumed, and the receiver
+// writes them into a staged file in its own snapshot directory, which the
+// install then publishes in place: neither side holds the snapshot in memory.
 
 /// Maximum size of a single snapshot data chunk in bytes (2 MB).
 ///
@@ -509,23 +528,20 @@ pub enum SnapshotChunkMessage {
     DataChunk(Vec<u8>),
 }
 
-/// Split snapshot CNSN data into chunks for streaming transfer.
-///
-/// Returns an iterator of byte vectors, each up to `SNAPSHOT_CHUNK_SIZE`.
-pub fn chunk_snapshot_data(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    data.chunks(SNAPSHOT_CHUNK_SIZE)
-}
-
 /// Install a full snapshot from a reader (file or buffer).
 ///
-/// Identical to `install_full_snapshot` but reads from `impl Read` instead
-/// of `&[u8]`, avoiding the need to hold the serialized snapshot in memory.
-/// The checksum is verified after the parse and before any write.
+/// Like `install_full_snapshot`, but the serialized snapshot is read as it
+/// is parsed instead of being held whole. The checksum is verified after the
+/// parse and before any write, and the reader must end right after it.
 pub fn install_full_snapshot_from_reader(
     engine: &StorageEngine,
     reader: &mut impl IoRead,
 ) -> io::Result<()> {
-    apply_full(engine, parse_verified_stream(reader)?)
+    let parsed = parse_verified_stream(reader)?;
+    if reader.read(&mut [0u8; 1])? != 0 {
+        return Err(io::Error::other("snapshot has bytes past its checksum"));
+    }
+    apply_full(engine, parsed)
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;

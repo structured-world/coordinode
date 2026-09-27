@@ -2,37 +2,60 @@
 //!
 //! A full Raft snapshot deliberately excludes the `meta:` Schema keys, which
 //! include the field interner. A standalone backup therefore frames the
-//! interner alongside the snapshot blob and restores it separately. This test
-//! exercises that exact sequence at the API level (the CLI arms in `main.rs`
-//! do the same framing) and verifies that property names resolve in a freshly
-//! restored database, i.e. the interner survived the round trip.
+//! interner alongside the snapshot and restores it separately. These tests run
+//! the `coordinode` binary, and check that property names resolve in a
+//! freshly restored database, i.e. the interner survived the round trip.
 #![allow(clippy::expect_used)]
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
+/// Run `coordinode <args>` and require it to succeed.
+fn coordinode(args: &[&std::ffi::OsStr]) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coordinode"))
+        .args(args)
+        .output()
+        .expect("run coordinode");
+    assert!(
+        output.status.success(),
+        "coordinode {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn raft_snapshot_round_trips_data_and_interner() {
-    let src_dir = tempfile::tempdir().expect("src tmpdir");
-    let mut src = Database::open(src_dir.path()).expect("open src");
-    src.execute_cypher("CREATE (a:User {name: 'Alice', age: 30})")
-        .expect("create alice");
-    src.execute_cypher("CREATE (b:User {name: 'Bob', age: 25})")
-        .expect("create bob");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let (src_dir, dst_dir) = (dir.path().join("src"), dir.path().join("dst"));
+    let backup = dir.path().join("db.snap");
+    {
+        let mut src = Database::open(&src_dir).expect("open src");
+        src.execute_cypher("CREATE (a:User {name: 'Alice', age: 30})")
+            .expect("create alice");
+        src.execute_cypher("CREATE (b:User {name: 'Bob', age: 25})")
+            .expect("create bob");
+    }
 
-    // What the backup writes: framed interner + full snapshot blob.
-    let interner_bytes = src.interner().to_bytes();
-    let snapshot =
-        coordinode_raft::snapshot::build_full_snapshot(src.engine()).expect("build snapshot");
-
-    // What the restore does into a fresh database: interner first (the snapshot
-    // omits it), then install the snapshot data.
-    let dst_dir = tempfile::tempdir().expect("dst tmpdir");
-    let mut dst = Database::open(dst_dir.path()).expect("open dst");
-    dst.persist_field_interner_bytes(&interner_bytes)
-        .expect("restore interner");
-    coordinode_raft::snapshot::install_full_snapshot(dst.engine(), &snapshot)
-        .expect("install snapshot");
+    let format = std::ffi::OsStr::new("raft-snapshot");
+    coordinode(&[
+        "backup".as_ref(),
+        "--data".as_ref(),
+        src_dir.as_os_str(),
+        "--output".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    coordinode(&[
+        "restore".as_ref(),
+        "--data".as_ref(),
+        dst_dir.as_os_str(),
+        "--input".as_ref(),
+        backup.as_os_str(),
+        "--format".as_ref(),
+        format,
+    ]);
+    let mut dst = Database::open(&dst_dir).expect("open dst");
 
     // Property names must resolve: an inline `{name: 'Alice'}` filter only
     // matches if the interner mapped "name" -> field id (proves the interner

@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+
 use super::*;
 use coordinode_core::txn::proposal::PartitionId;
 use coordinode_core::txn::timestamp::Timestamp;
@@ -18,6 +20,11 @@ fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
 
 fn log_id(term: u64, index: u64) -> openraft::type_config::alias::LogIdOf<TypeConfig> {
     openraft::LogId::new(CommittedLeaderId { term, node_id: 0 }, index)
+}
+
+/// A snapshot carrying metadata only, staged where a received one would be.
+fn empty_snapshot(engine: &StorageEngine) -> SnapshotFile {
+    SnapshotFile::stage(&crate::snapshot::snapshot_dir(engine)).unwrap()
 }
 
 // -- LogStore --
@@ -290,7 +297,7 @@ fn a_store_that_applied_entries_without_coverage_is_refused() {
 #[tokio::test]
 async fn installing_a_snapshot_publishes_its_applied_index() {
     let (_dir, engine) = test_engine();
-    let mut sm = CoordinodeStateMachine::new(engine).expect("open state machine");
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
     let mut applied = sm.subscribe_applied();
     assert_eq!(*applied.borrow_and_update(), 0);
 
@@ -298,7 +305,7 @@ async fn installing_a_snapshot_publishes_its_applied_index() {
         last_log_id: Some(log_id(2, 20)),
         last_membership: openraft::StoredMembership::default(),
     };
-    sm.install_snapshot(&meta, std::io::Cursor::new(Vec::new()))
+    sm.install_snapshot(&meta, empty_snapshot(&engine))
         .await
         .unwrap();
 
@@ -321,7 +328,7 @@ async fn installing_a_snapshot_rebinds_every_tree_to_it() {
         last_log_id: Some(snapshot_id),
         last_membership: openraft::StoredMembership::default(),
     };
-    sm.install_snapshot(&meta, std::io::Cursor::new(Vec::new()))
+    sm.install_snapshot(&meta, empty_snapshot(&engine))
         .await
         .unwrap();
 
@@ -1135,15 +1142,180 @@ async fn snapshot_build_persists_to_storage() {
     assert!(snap.meta.last_log_id.is_some());
     assert_eq!(snap.meta.last_log_id.unwrap().index, 5);
 
-    // Verify snapshot was persisted to CoordiNode storage (build_snapshot writes it)
+    // The metadata is recorded in the store, the bytes in one file beside it.
     let snap_meta = engine.get(Partition::Schema, KEY_SNAPSHOT_META).unwrap();
     assert!(snap_meta.is_some(), "snapshot meta should be persisted");
-
-    let snap_data = engine.get(Partition::Schema, KEY_SNAPSHOT_DATA).unwrap();
-    assert!(snap_data.is_some(), "snapshot data should be persisted");
-    let data = snap_data.unwrap();
+    let files = snapshot_files(&engine);
+    assert_eq!(files.len(), 1, "one published snapshot file: {files:?}");
+    let data = std::fs::read(&files[0]).unwrap();
     assert!(data.len() > 10, "snapshot data should be non-empty");
     assert_eq!(&data[..4], b"CNSN", "snapshot data should have CNSN magic");
+
+    let (current_meta, mut current) = sm.snapshots.current().unwrap().expect("a current snapshot");
+    assert_eq!(current_meta.last_log_id, snap.meta.last_log_id);
+    let mut read = Vec::new();
+    current.read_to_end(&mut read).unwrap();
+    assert_eq!(read, data, "the current snapshot is the built file");
+}
+
+/// Every file in `engine`'s snapshot directory.
+fn snapshot_files(engine: &StorageEngine) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(crate::snapshot::snapshot_dir(engine))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// A new build replaces the file of the one before it, so the directory
+/// holds one snapshot however many were built.
+#[tokio::test]
+async fn a_new_snapshot_removes_the_file_it_replaces() {
+    let (_dir, engine) = test_engine();
+    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
+
+    let mut published = Vec::new();
+    for index in [5, 6] {
+        *sm.last_applied.lock().unwrap() = Some(log_id(1, index));
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        let files = snapshot_files(&engine);
+        assert_eq!(files.len(), 1, "after the build at {index}: {files:?}");
+        published.push(files[0].clone());
+    }
+    assert_ne!(published[0], published[1], "the second build is a new file");
+}
+
+/// A snapshot older than the current one never replaces it: a build that
+/// finishes after a newer install leaves the newer snapshot current.
+#[tokio::test]
+async fn an_older_snapshot_does_not_replace_a_newer_one() {
+    let (_dir, engine) = test_engine();
+    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
+    let meta_at = |index| SnapshotMeta {
+        last_log_id: Some(log_id(1, index)),
+        last_membership: openraft::StoredMembership::default(),
+    };
+
+    let mut newer = store.stage().unwrap();
+    newer.write_all(b"newer").unwrap();
+    assert!(store.publish(&meta_at(9), &mut newer).unwrap());
+    let mut older = store.stage().unwrap();
+    older.write_all(b"older").unwrap();
+    assert!(!store.publish(&meta_at(4), &mut older).unwrap());
+    drop(older);
+
+    let (meta, mut current) = store.current().unwrap().expect("a current snapshot");
+    assert_eq!(meta.last_log_id, Some(log_id(1, 9)));
+    let mut data = Vec::new();
+    current.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"newer");
+    assert_eq!(snapshot_files(&engine).len(), 1, "the refused file is gone");
+}
+
+/// A received snapshot that never installs, and anything a crash left in
+/// the directory, is gone once the store reopens; the current one stays.
+#[tokio::test]
+async fn reopening_keeps_only_the_current_snapshot() {
+    let (_dir, engine) = test_engine();
+    let dir = crate::snapshot::snapshot_dir(&engine);
+    {
+        let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
+        let mut current = store.stage().unwrap();
+        current.write_all(b"current").unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id(1, 3)),
+            last_membership: openraft::StoredMembership::default(),
+        };
+        assert!(store.publish(&meta, &mut current).unwrap());
+
+        let received = SnapshotFile::stage(&dir).unwrap();
+        drop(received);
+        assert_eq!(
+            snapshot_files(&engine).len(),
+            1,
+            "a dropped staged file goes"
+        );
+    }
+    std::fs::write(dir.join("left-by-a-crash.part"), b"half").unwrap();
+
+    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
+    assert_eq!(
+        snapshot_files(&engine).len(),
+        1,
+        "{:?}",
+        snapshot_files(&engine)
+    );
+    let (_, mut current) = store.current().unwrap().expect("a current snapshot");
+    let mut data = Vec::new();
+    current.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"current");
+}
+
+/// A store an earlier build wrote kept the snapshot bytes as a Schema value;
+/// opening it moves them to a file and drops the value, which every later
+/// snapshot would otherwise carry.
+#[tokio::test]
+async fn a_snapshot_kept_in_the_store_moves_to_a_file() {
+    let (_dir, engine) = test_engine();
+    let meta = SnapshotMeta {
+        last_log_id: Some(log_id(2, 7)),
+        last_membership: openraft::StoredMembership::default(),
+    };
+    engine
+        .put(
+            Partition::Schema,
+            KEY_SNAPSHOT_META,
+            &rmp_serde::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    engine
+        .put(Partition::Schema, b"raft:snapshot:data", b"CNSN-legacy")
+        .unwrap();
+
+    let store = SnapshotStore::open(Arc::clone(&engine)).unwrap();
+    assert!(
+        engine
+            .get(Partition::Schema, b"raft:snapshot:data")
+            .unwrap()
+            .is_none()
+    );
+    let (current_meta, mut current) = store.current().unwrap().expect("a current snapshot");
+    assert_eq!(current_meta.last_log_id, meta.last_log_id);
+    let mut data = Vec::new();
+    current.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"CNSN-legacy");
+}
+
+/// A build serializes the store, and the store must not hold the previous
+/// snapshot: otherwise every snapshot carries all the ones before it and
+/// grows with each build over unchanged data.
+#[tokio::test]
+async fn a_snapshot_does_not_carry_the_previous_one() {
+    let (_dir, engine) = test_engine();
+    engine
+        .put(Partition::Node, b"node:0:1", &vec![7u8; 64 * 1024])
+        .expect("put");
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
+
+    let mut sizes = Vec::new();
+    for index in [5, 6] {
+        *sm.last_applied.lock().unwrap() = Some(log_id(1, index));
+        let mut builder = sm.get_snapshot_builder().await;
+        let mut snap = builder.build_snapshot().await.unwrap();
+        let mut data = Vec::new();
+        snap.snapshot.read_to_end(&mut data).unwrap();
+        sizes.push(data.len());
+    }
+
+    assert!(
+        sizes[1] < sizes[0] + 4096,
+        "the second snapshot of unchanged data grew from {} to {} bytes",
+        sizes[0],
+        sizes[1]
+    );
 }
 
 #[tokio::test]
@@ -1194,7 +1366,9 @@ async fn snapshot_survives_reopen() {
             "snapshot last_log_id term should be 1"
         );
 
-        let data = snap.snapshot.into_inner();
+        let mut snapshot = snap.snapshot;
+        let mut data = Vec::new();
+        snapshot.read_to_end(&mut data).unwrap();
         assert!(
             data.len() > 10,
             "snapshot data should be non-empty after reopen"
