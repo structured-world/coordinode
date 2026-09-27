@@ -17,14 +17,14 @@ services:
     ports:
       - "7080:7080"   # gRPC
       - "7081:7081"   # REST/JSON (embedded proxy, same binary)
-      - "7084:7084"   # Prometheus /metrics, /health
+      - "7084:7084"   # Prometheus /metrics, /health, /ready
     volumes:
       - coordinode-data:/data
     environment:
       - COORDINODE_LOG_FORMAT=json
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/coordinode", "version"]
+      test: ["CMD", "/coordinode", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3

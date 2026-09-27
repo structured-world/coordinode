@@ -232,6 +232,90 @@ fn busy_grpc_port_fails_the_start_before_storage_opens() {
     );
 }
 
+/// Start `serve` with every listener on a free port except `flag`, which gets
+/// a port held here, and return the exit status, stderr, the held address and
+/// whether the data directory was created. A server still running after 30 s
+/// has not refused the start: it is killed and the test fails on that.
+fn serve_with_one_port_taken(flag: &str) -> (std::process::ExitStatus, String, String, bool) {
+    use std::io::Read;
+    let taken = std::net::TcpListener::bind("[::1]:0").expect("hold a port");
+    let held = taken.local_addr().expect("held address").to_string();
+    let root = tempfile::tempdir().expect("tempdir");
+    let data_dir = root.path().join("data");
+
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.arg("serve");
+    for listener in ["--addr", "--ops-addr", "--rest-addr"] {
+        cmd.arg(listener);
+        if listener == flag {
+            cmd.arg(&held);
+        } else {
+            cmd.arg("[::1]:0");
+        }
+    }
+    let mut child = cmd
+        .arg("--data")
+        .arg(&data_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn coordinode binary");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the server") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server kept running with {flag} {held} taken instead of refusing to start");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    (status, stderr, held, data_dir.exists())
+}
+
+/// A taken ops port fails the start like a taken gRPC port. A node running
+/// without its ops listener has no /ready of its own, and a health check
+/// against that port would get its answer from whatever holds it.
+#[test]
+fn busy_ops_port_fails_the_start_before_storage_opens() {
+    let (status, stderr, held, opened) = serve_with_one_port_taken("--ops-addr");
+    assert!(!status.success(), "a taken ops port must fail the start");
+    assert!(
+        stderr.contains(&held),
+        "the error must name the taken address {held}. Got stderr: {stderr}"
+    );
+    assert!(
+        !opened,
+        "storage must not be opened when the ops port is taken"
+    );
+}
+
+/// A taken REST port fails the start: a node that silently serves without its
+/// REST API looks healthy to every probe while clients of that API get
+/// nothing, or reach whatever else holds the port.
+#[test]
+fn busy_rest_port_fails_the_start_before_storage_opens() {
+    let (status, stderr, held, opened) = serve_with_one_port_taken("--rest-addr");
+    assert!(!status.success(), "a taken REST port must fail the start");
+    assert!(
+        stderr.contains(&held),
+        "the error must name the taken address {held}. Got stderr: {stderr}"
+    );
+    assert!(
+        !opened,
+        "storage must not be opened when the REST port is taken"
+    );
+}
+
 /// `--mode=full` must start normally (default mode, CE-supported).
 ///
 /// Regression guard: ensures we don't accidentally reject the default mode.

@@ -377,6 +377,42 @@ fn version_command() {
     assert!(matches!(cmd, Command::Version));
 }
 
+/// A bare `healthcheck` names no address and no config: the address is
+/// resolved later from the server's built-in default.
+#[test]
+fn healthcheck_bare_leaves_the_address_to_the_defaults() {
+    match parse_args_from(&args("coordinode healthcheck")) {
+        Command::Healthcheck {
+            config_path,
+            ops_addr,
+            timeout_ms,
+        } => {
+            assert_eq!(config_path, None);
+            assert_eq!(ops_addr, None);
+            assert_eq!(timeout_ms, 2_000);
+        }
+        _ => panic!("expected Healthcheck"),
+    }
+}
+
+#[test]
+fn healthcheck_takes_a_config_an_ops_address_and_a_timeout() {
+    match parse_args_from(&args(
+        "coordinode healthcheck --config /etc/coordinode.conf --ops-addr 127.0.0.1:9184 --timeout-ms 500",
+    )) {
+        Command::Healthcheck {
+            config_path,
+            ops_addr,
+            timeout_ms,
+        } => {
+            assert_eq!(config_path.as_deref(), Some("/etc/coordinode.conf"));
+            assert_eq!(ops_addr.as_deref(), Some("127.0.0.1:9184"));
+            assert_eq!(timeout_ms, 500);
+        }
+        _ => panic!("expected Healthcheck"),
+    }
+}
+
 #[test]
 fn compact_uses_explicit_data_dir() {
     let cmd = parse_args_from(&args("coordinode compact --data /var/lib/coordinode"));

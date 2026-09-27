@@ -61,10 +61,10 @@ apply when neither the config file nor a flag sets the value.
 | `--config` | (none) | Path to a YAML config file. Absent = built-in defaults. A present-but-unreadable or malformed file is a startup error. Has no config-file key (it names the file). |
 | `--mode` | `full` | Operational mode. The CE binary supports only `full`. `compute` and `storage` require the Enterprise binary and are rejected with a clear message. |
 | `--node-id` | `1` | Numeric node ID, unique within a cluster. Single-node deployments always use `1`. Any value above `1` requires `--peers`. |
-| `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. |
+| `--addr` | `[::]:7080` | gRPC listen address. Carries the native API and inter-node Raft RPCs. A port already in use fails the start before storage is opened; so does a busy `--rest-addr` or `--ops-addr`. |
 | `--advertise-addr` | same as `--addr` | Address other nodes use to reach this node. Set it when `--addr` binds `0.0.0.0` or `[::]` so peers learn the real host/IP. |
-| `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. |
-| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health`, `/ready`. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
+| `--rest-addr` | `[::]:7081` | REST/JSON listen address. Present only when built with the `rest-proxy` feature. A port already in use fails the start. Pass port `0` for an ephemeral port. |
+| `--ops-addr` | `[::]:7084` | Operational HTTP address for `/metrics`, `/health` (200 while the process runs) and `/ready` (200 while the gRPC server serves; 503 while starting and from the shutdown signal on). A port already in use fails the start, so a health check on this port can never be answered by another process. Pass port `0` to let the OS assign an ephemeral port (handy in tests). |
 | `--pg-addr` | (disabled) | PostgreSQL wire-protocol listen address (for example `127.0.0.1:7085`). Unset = the Postgres frontend is off. Serves SQL over the Postgres Simple Query protocol with trust authentication (no password), so bind it to a trusted interface only. |
 | `--data` | `./data` | Data directory. Holds the storage engine state. |
 | `--peers` | (none) | Comma-separated peer addresses, for example `node2:7080,node3:7080`. Presence enables Raft consensus. |
@@ -540,7 +540,7 @@ at a directory given by `--data` (default `./data`); every command that opens
 the storage engine (`backup`, `restore`, `verify`, `checkpoint`, `compact`) also
 accepts `--config FILE` to open a multi-endpoint node at its configured paths
 (see [Storage topology](#storage-topology)). With `--config`, `--data` is
-ignored.
+ignored. `healthcheck` opens nothing: it asks a running server.
 
 | Command | Required flags | Notable options |
 |---------|----------------|-----------------|
@@ -550,6 +550,7 @@ ignored.
 | `coordinode compact` | (none) | `--config FILE` (multi-endpoint); offline major-compaction folding merge operands |
 | `coordinode verify` | (none) | `--config FILE` (multi-endpoint); `--deep` for full-page checksum verification |
 | `coordinode version` | (none) | Print version and exit |
+| `coordinode healthcheck` | (none) | Exit 0 when a running server answers `/ready` with 200, 1 otherwise. Probes the server's `ops_addr`: the built-in default (`[::]:7084`), else the one in `--config FILE`, else `--ops-addr HOST:PORT`, which overrides both. A wildcard address (`[::]`, `0.0.0.0`) is probed on this host's loopback, IPv6 and IPv4. `--timeout-ms N` (default 2000) bounds the connect and the answer. Opens no storage; meant for container health checks |
 | `coordinode admin node join` | `--node ADDR --id ID --addr ADDR` | `--pre-seeded`, `--follow` |
 | `coordinode admin node decommission` | `--node ADDR --id ID` | `--pruning`, `--force`, `--skip-confirmation` |
 

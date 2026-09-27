@@ -346,6 +346,8 @@ pub async fn start_cluster_member_expecting_refusal(
         .arg(peers.join(","))
         .arg("--ops-addr")
         .arg("[::1]:0")
+        .arg("--rest-addr")
+        .arg("[::1]:0")
         .arg("--data")
         .arg(data_dir)
         .env(
@@ -466,11 +468,12 @@ pub fn binary_path() -> PathBuf {
     );
 }
 
-/// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:0 --data DATA_DIR`.
+/// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:0
+/// --rest-addr [::1]:0 --data DATA_DIR`.
 ///
-/// `--ops-addr [::1]:0` lets the OS assign an ephemeral port for the ops HTTP
-/// server, avoiding "Address already in use" conflicts when multiple test
-/// processes run concurrently (each would otherwise fight over the default :7084).
+/// Port 0 lets the OS assign an ephemeral port for the ops and REST HTTP
+/// servers: concurrent test servers would otherwise fight over the defaults
+/// (:7084, :7081), and a taken port fails the start.
 fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
@@ -478,6 +481,8 @@ fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
         .arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--ops-addr")
+        .arg("[::1]:0")
+        .arg("--rest-addr")
         .arg("[::1]:0")
         .arg("--data")
         .arg(&data_dir)
@@ -518,6 +523,8 @@ fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: Pat
         .arg("--peers")
         .arg(peers.join(","))
         .arg("--ops-addr")
+        .arg("[::1]:0")
+        .arg("--rest-addr")
         .arg("[::1]:0")
         .arg("--data")
         .arg(&data_dir)

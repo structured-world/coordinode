@@ -1,11 +1,12 @@
 //! CLI argument parsing for coordinode subcommands.
 //!
 //! Subcommands:
-//! - `serve` (default) — start gRPC + ops servers
-//! - `version` — print version
-//! - `verify --deep` — verify storage integrity
-//! - `backup` — export database to file
-//! - `restore` — import database from file
+//! - `serve` (default): start gRPC + ops servers
+//! - `version`: print version
+//! - `healthcheck`: exit 0 when a running server answers `/ready`
+//! - `verify --deep`: verify storage integrity
+//! - `backup`: export database to file
+//! - `restore`: import database from file
 
 use coordinode_embed::backup::BackupFormat;
 
@@ -27,6 +28,16 @@ pub enum Command {
     },
     /// Print version and exit.
     Version,
+    /// Ask a running server's ops port whether it is ready; exit 0 when it
+    /// is, 1 otherwise. For container health checks in images with no shell.
+    Healthcheck {
+        /// Config file the server runs with; its `ops_addr` is probed.
+        config_path: Option<String>,
+        /// `--ops-addr host:port`, overriding the config file's `ops_addr`.
+        ops_addr: Option<String>,
+        /// How long to wait for the connection, and then for the answer.
+        timeout_ms: u64,
+    },
     /// Verify storage integrity.
     Verify {
         /// Single-endpoint data directory (used when `config_path` is `None`).
@@ -209,6 +220,12 @@ pub fn parse_args_from(args: &[String]) -> Command {
             }
         }
         "version" | "--version" | "-v" => Command::Version,
+        "healthcheck" => Command::Healthcheck {
+            config_path: find_flag(args, "--config"),
+            ops_addr: find_flag(args, "--ops-addr"),
+            timeout_ms: find_flag_num(args, "--timeout-ms")
+                .unwrap_or(crate::healthcheck::DEFAULT_TIMEOUT_MS),
+        },
         "verify" => {
             let data_dir = find_flag(args, "--data").unwrap_or_else(|| "./data".to_string());
             let config_path = find_flag(args, "--config");
@@ -310,6 +327,7 @@ pub fn parse_args_from(args: &[String]) -> Command {
                  coordinode checkpoint --output DIR [--data DIR | --config FILE]\n  \
                  coordinode compact [--data DIR | --config FILE]\n  \
                  coordinode verify [--data DIR | --config FILE] [--deep]\n  \
+                 coordinode healthcheck [--config FILE] [--ops-addr HOST:PORT] [--timeout-ms N]\n  \
                  coordinode version\n  \
                  coordinode admin node join --node CLUSTER_ADDR --id NODE_ID --addr NODE_ADDR [--pre-seeded] [--follow]\n  \
                  coordinode admin node decommission --node CLUSTER_ADDR --id NODE_ID [--pruning] [--force] [--skip-confirmation]\n",

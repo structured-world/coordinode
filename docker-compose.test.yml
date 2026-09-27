@@ -1,17 +1,13 @@
-# CoordiNode — integration test infrastructure.
-#
-# Uses tmpfs for fast, isolated test runs (no disk I/O, auto-cleanup).
+# CoordiNode: a throwaway server for manual testing, on offset ports so it runs
+# beside a development one, with its data on tmpfs (gone when it stops).
 #
 # Usage:
 #   docker compose -f docker-compose.test.yml up -d
-#   cargo test --test integration -- --nocapture
 #   docker compose -f docker-compose.test.yml down
 
 services:
   coordinode-test:
-    build:
-      context: ..
-      dockerfile: coordinode/Dockerfile
+    build: .
     image: coordinode:test
     container_name: coordinode-test
     ports:
@@ -22,7 +18,7 @@ services:
     environment:
       - COORDINODE_LOG_FORMAT=json
     healthcheck:
-      test: ["CMD", "/coordinode", "version"]
+      test: ["CMD", "/coordinode", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 5

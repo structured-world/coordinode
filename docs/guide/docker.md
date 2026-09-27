@@ -60,12 +60,45 @@ Expected response:
 {"status":"ok"}
 ```
 
+## Health Check
+
+The image declares a Docker `HEALTHCHECK` that runs the binary's own probe,
+`/coordinode healthcheck`: it asks `/ready` on the ops port and exits 0 on
+`200`. `/ready` answers `503` until the server accepts requests and again from
+the moment it starts shutting down, so an orchestrator routes nothing to a node
+that is starting or draining. The probe needs no shell or HTTP client in the
+image. `docker compose ps` shows the container as `healthy` once it is ready.
+
+The check probes the ops address the server uses: the built-in default, or the
+one set in a config file passed with `--config`, or `--ops-addr`, which wins
+over both. A server that runs from a config file is checked with the same file:
+
+```yaml
+    command: ["serve", "--config", "/etc/coordinode/coordinode.conf"]
+    healthcheck:
+      test: ["CMD", "/coordinode", "healthcheck", "--config", "/etc/coordinode/coordinode.conf"]
+```
+
+A server started with a different `--ops-addr` on the command line needs the
+same address in the check:
+
+```yaml
+    healthcheck:
+      test: ["CMD", "/coordinode", "healthcheck", "--ops-addr", "127.0.0.1:9184"]
+```
+
+A port the server cannot bind (gRPC, REST or ops) stops it at startup, so the
+check never gets its answer from another process holding the port.
+
+`/health` is the liveness endpoint: it answers `200` for as long as the process
+runs, ready or not.
+
 ## Ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | `7080` | gRPC | Native API — high-throughput clients |
-| `7081` | HTTP/REST | JSON API via `structured-proxy` (REST transcoding, separate container) |
+| `7081` | HTTP/REST | JSON API, transcoded to gRPC inside the same process |
 | `7084` | HTTP | `/health`, `/ready`, Prometheus `/metrics` |
 
 ## Data Persistence

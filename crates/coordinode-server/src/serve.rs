@@ -251,6 +251,18 @@ pub(crate) async fn serve(
     let grpc_incoming = tonic::transport::server::TcpIncoming::bind(addr)
         .map_err(|e| format!("cannot bind the gRPC address {addr}: {e}"))?
         .with_nodelay(Some(true));
+    // The ops and REST ports are claimed here too. A node running without its
+    // ops listener has no /ready of its own, so a health check against that
+    // port would get its answer from whatever holds it; one running without
+    // REST looks healthy while that API reaches nothing.
+    let ops_sock: SocketAddr = ops_addr.parse()?;
+    let ops_listener = tokio::net::TcpListener::bind(ops_sock)
+        .await
+        .map_err(|e| format!("cannot bind the ops address {ops_sock}: {e}"))?;
+    #[cfg(feature = "rest-proxy")]
+    let rest_listener = tokio::net::TcpListener::bind(rest_addr.as_str())
+        .await
+        .map_err(|e| format!("cannot bind the REST address {rest_addr}: {e}"))?;
     // Advertise address is what peers use to connect to this node.
     // Falls back to grpc_addr when not explicitly set.
     let effective_advertise = advertise_addr.unwrap_or_else(|| grpc_addr.clone());
@@ -886,9 +898,10 @@ pub(crate) async fn serve(
     let blob_service = services::blob::BlobServiceImpl::new(blob_engine);
 
     // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
-    let ops_sock: SocketAddr = ops_addr.parse()?;
+    let readiness = ops::Readiness::default();
+    let ops_readiness = readiness.clone();
     tokio::spawn(async move {
-        if let Err(e) = ops::start_ops_server(ops_sock).await {
+        if let Err(e) = ops::start_ops_server(ops_listener, ops_readiness).await {
             tracing::error!("ops server error: {e}");
         }
     });
@@ -958,14 +971,11 @@ pub(crate) async fn serve(
         let proxy = structured_proxy::ProxyServer::from_config(config);
         tokio::spawn(async move {
             match proxy.router() {
-                Ok(router) => match tokio::net::TcpListener::bind(rest_addr.as_str()).await {
-                    Ok(listener) => {
-                        if let Err(e) = axum::serve(listener, router).await {
-                            tracing::error!("REST proxy serve error: {e}");
-                        }
+                Ok(router) => {
+                    if let Err(e) = axum::serve(rest_listener, router).await {
+                        tracing::error!("REST proxy serve error: {e}");
                     }
-                    Err(e) => tracing::error!("REST proxy bind error: {e}"),
-                },
+                }
                 Err(e) => tracing::error!("REST proxy router build error: {e}"),
             }
         });
@@ -1004,6 +1014,7 @@ pub(crate) async fn serve(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("failed to install SIGTERM handler: {e}"))?;
 
+    let shutdown_readiness = readiness.clone();
     let shutdown = async move {
         #[cfg(unix)]
         tokio::select! {
@@ -1019,6 +1030,8 @@ pub(crate) async fn serve(
             let _ = tokio::signal::ctrl_c().await;
             info!("Ctrl+C received — initiating graceful shutdown");
         }
+        // First, so /ready turns a balancer away while in-flight RPCs drain.
+        shutdown_readiness.set(false);
     };
 
     // Network limits: per-request timeout, per-connection in-flight cap,
@@ -1224,6 +1237,9 @@ pub(crate) async fn serve(
     let mut server = server.layer(grpc::NodeInfoLayer::new(node_id));
     let router = server.add_routes(routes.routes());
 
+    // The listener is bound and every service registered: connections that
+    // arrive now are accepted as soon as the server below starts polling.
+    readiness.set(true);
     router
         .serve_with_incoming_shutdown(grpc_incoming, shutdown)
         .await?;

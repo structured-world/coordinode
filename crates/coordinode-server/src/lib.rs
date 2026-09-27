@@ -54,6 +54,7 @@ mod checkpoint;
 pub mod cli;
 pub mod config;
 mod grpc;
+mod healthcheck;
 mod logging;
 mod metrics_catalog;
 mod ops;
@@ -102,6 +103,15 @@ pub(crate) async fn run_with(
     match command {
         cli::Command::Version => {
             println!("coordinode v{}", env!("CARGO_PKG_VERSION"));
+        }
+
+        cli::Command::Healthcheck {
+            config_path,
+            ops_addr,
+            timeout_ms,
+        } => {
+            let ops_addr = healthcheck::ops_addr(ops_addr, config_path.as_deref())?;
+            healthcheck::probe_ready(&ops_addr, std::time::Duration::from_millis(timeout_ms))?;
         }
 
         cli::Command::Verify {

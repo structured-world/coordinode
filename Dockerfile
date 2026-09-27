@@ -79,5 +79,13 @@ VOLUME ["/data"]
 #   7084 - HTTP (Prometheus /metrics, /health, /ready)
 EXPOSE 7080 7081 7082 7083 7084
 
+# Healthy once the server answers /ready on its ops port: 503 while starting
+# and while draining. The image has no shell or client, so the binary probes
+# itself. A server run with --config is checked with the same file
+# (`healthcheck --config FILE`); one run with another --ops-addr, with that
+# address (`healthcheck --ops-addr 127.0.0.1:PORT`).
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["/coordinode", "healthcheck"]
+
 ENTRYPOINT ["/coordinode"]
 CMD ["serve", "--addr", "[::]:7080", "--data", "/data"]
