@@ -35,8 +35,6 @@ arc-swap = { version = "1", default-features = false }
 array-init = { version = "2", default-features = false }
 arrayvec = { version = "0.7", default-features = false, features = ["std"] }
 atomic-waker = { version = "1", default-features = false }
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-lc-sys = { version = "0.45", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8", features = ["macros"] }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 backoff-series = { version = "0.1", default-features = false }
@@ -45,7 +43,6 @@ base2histogram = { version = "0.2", default-features = false }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
-bcder = { version = "0.7", default-features = false }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
@@ -241,13 +238,12 @@ parking_lot = { version = "0.12" }
 parking_lot_core = { version = "0.9", default-features = false }
 parse-size = { version = "1", default-features = false }
 peel-off = { version = "0.1", default-features = false }
-pem-164d15cefe24d7eb = { package = "pem", version = "4" }
-pem-7b89eefb6aaa9bf3 = { package = "pem", version = "3" }
+pem = { version = "3" }
 pem-rfc7468 = { version = "0.7", default-features = false, features = ["alloc"] }
 percent-encoding = { version = "2" }
 pest = { version = "2" }
 pg_interval = { version = "0.6" }
-pgwire = { version = "0.41" }
+pgwire = { version = "0.41", default-features = false, features = ["pg-ext-types", "server-api"] }
 phf-594e8ee84c453af0 = { package = "phf", version = "0.13" }
 phf-a6292c17cd707f01 = { package = "phf", version = "0.11", default-features = false }
 phf_shared-594e8ee84c453af0 = { package = "phf_shared", version = "0.13", default-features = false, features = ["std"] }
@@ -294,7 +290,6 @@ rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
 rayon-core = { version = "1", default-features = false }
-rcgen = { version = "0.14" }
 recursive = { version = "0.1", default-features = false }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
@@ -311,11 +306,11 @@ rust-stemmers-7bc1df87d11e1479 = { package = "rust-stemmers", git = "https://git
 rust-stemmers-dff4ba8e3ae991db = { package = "rust-stemmers", version = "1", default-features = false }
 rust_decimal = { version = "1", features = ["db-postgres"] }
 rustc-hash = { version = "2" }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-rustcrypto = { version = "0.0.2-alpha" }
 rustls-webpki-105c8dd04f4f02b3 = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["std"] }
-rustls-webpki-d21c5af2c68af983 = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls-webpki-d21c5af2c68af983 = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 ryu = { version = "1", default-features = false }
 s2 = { version = "0.2" }
@@ -378,7 +373,7 @@ tinytemplate = { version = "1", default-features = false }
 tinyvec = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-postgres = { version = "0.7" }
-tokio-rustls = { version = "0.26", features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-test = { version = "0.4", default-features = false }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -408,8 +403,7 @@ unicode-properties = { version = "0.1" }
 universal-hash-3b31131e45eafb45 = { package = "universal-hash", version = "0.6", default-features = false }
 universal-hash-d8f496e17d97b5cb = { package = "universal-hash", version = "0.5", default-features = false }
 unsafe-libyaml = { version = "0.2", default-features = false }
-untrusted-274715c4dabd11b0 = { package = "untrusted", version = "0.9", default-features = false }
-untrusted-ca01ad9e24f5d932 = { package = "untrusted", version = "0.7", default-features = false }
+untrusted = { version = "0.9", default-features = false }
 url = { version = "2" }
 utf8-ranges = { version = "1", default-features = false }
 utf8_iter = { version = "1", default-features = false }
@@ -424,9 +418,7 @@ whatlang = { version = "0.18", default-features = false }
 whoami = { version = "2" }
 writeable = { version = "0.6", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
-x509-certificate = { version = "0.25", default-features = false }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
-yasna = { version = "0.6", features = ["std", "time"] }
 yoke = { version = "0.8", default-features = false, features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["derive"] }
@@ -459,8 +451,6 @@ arrayvec = { version = "0.7", default-features = false, features = ["std"] }
 async-trait = { version = "0.1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
 autocfg = { version = "1", default-features = false }
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-lc-sys = { version = "0.45", default-features = false, features = ["prebuilt-nasm"] }
 axum = { version = "0.8", features = ["macros"] }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 axum-macros = { version = "0.5" }
@@ -470,7 +460,6 @@ base2histogram = { version = "0.2", default-features = false }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
 base64-3c51e837cfc5589a = { package = "base64", version = "0.22" }
 base64ct = { version = "1", default-features = false, features = ["alloc"] }
-bcder = { version = "0.7", default-features = false }
 bigdecimal = { version = "0.4", default-features = false, features = ["serde"] }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
@@ -487,7 +476,7 @@ bytes = { version = "1" }
 byteview = { version = "0.10" }
 bzip2-rs = { version = "0.1" }
 cast = { version = "0.3", default-features = false }
-cc = { version = "1", default-features = false, features = ["parallel"] }
+cc = { version = "1", default-features = false }
 census = { version = "0.4", default-features = false }
 cfg-if = { version = "1", default-features = false }
 chacha20-274715c4dabd11b0 = { package = "chacha20", version = "0.9", default-features = false, features = ["zeroize"] }
@@ -505,7 +494,6 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 clap_derive = { version = "4" }
 clap_lex = { version = "1", default-features = false }
-cmake = { version = "0.1", default-features = false }
 cmov = { version = "0.5", default-features = false }
 colorchoice = { version = "1", default-features = false }
 const-oid-274715c4dabd11b0 = { package = "const-oid", version = "0.9", default-features = false }
@@ -543,7 +531,6 @@ digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["a
 display-more = { version = "0.2", default-features = false }
 displaydoc = { version = "0.2", default-features = false }
 downcast-rs = { version = "2" }
-dunce = { version = "1", default-features = false }
 ecdsa = { version = "0.16", default-features = false, features = ["pem", "signing", "std", "verifying"] }
 ed25519 = { version = "2", default-features = false, features = ["alloc", "pkcs8", "std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
@@ -569,7 +556,6 @@ foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2", default-fea
 foldhash-c65f7effa3be6d31 = { package = "foldhash", version = "0.1", default-features = false }
 form_urlencoded = { version = "1" }
 fs4 = { version = "0.13" }
-fs_extra = { version = "1", default-features = false }
 futures = { version = "0.3" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -629,7 +615,6 @@ itertools-3575ec1268b04181 = { package = "itertools", version = "0.15" }
 itertools-582f2526e08bb6a0 = { package = "itertools", version = "0.14" }
 itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 itoa = { version = "1", default-features = false }
-jobserver = { version = "0.1", default-features = false }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 lazy-regex = { version = "3", default-features = false, features = ["lite"] }
 lazy-regex-proc_macros = { version = "3", default-features = false }
@@ -692,8 +677,7 @@ parse-size = { version = "1", default-features = false }
 parse-zoneinfo = { version = "0.3", default-features = false }
 paste = { version = "1", default-features = false }
 peel-off = { version = "0.1", default-features = false }
-pem-164d15cefe24d7eb = { package = "pem", version = "4" }
-pem-7b89eefb6aaa9bf3 = { package = "pem", version = "3" }
+pem = { version = "3" }
 pem-rfc7468 = { version = "0.7", default-features = false, features = ["alloc"] }
 percent-encoding = { version = "2" }
 pest = { version = "2" }
@@ -702,7 +686,7 @@ pest_generator = { version = "2", default-features = false, features = ["std"] }
 pest_meta = { version = "2" }
 petgraph = { version = "0.8", default-features = false, features = ["std"] }
 pg_interval = { version = "0.6" }
-pgwire = { version = "0.41" }
+pgwire = { version = "0.41", default-features = false, features = ["pg-ext-types", "server-api"] }
 phf-594e8ee84c453af0 = { package = "phf", version = "0.13" }
 phf-a6292c17cd707f01 = { package = "phf", version = "0.11", default-features = false }
 phf_codegen = { version = "0.11", default-features = false }
@@ -760,7 +744,6 @@ rand_xoshiro = { version = "0.7", default-features = false }
 rapidhash = { version = "4", default-features = false }
 rayon = { version = "1", default-features = false }
 rayon-core = { version = "1", default-features = false }
-rcgen = { version = "0.14" }
 recursive = { version = "0.1", default-features = false }
 recursive-proc-macro-impl = { version = "0.1", default-features = false }
 regex = { version = "1" }
@@ -779,11 +762,11 @@ rust-stemmers-dff4ba8e3ae991db = { package = "rust-stemmers", version = "1", def
 rust_decimal = { version = "1", features = ["db-postgres"] }
 rustc-hash = { version = "2" }
 rustc_version = { version = "0.4", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "aws_lc_rs", "logging", "ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-rustcrypto = { version = "0.0.2-alpha" }
 rustls-webpki-105c8dd04f4f02b3 = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["std"] }
-rustls-webpki-d21c5af2c68af983 = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
+rustls-webpki-d21c5af2c68af983 = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 rustversion = { version = "1", default-features = false }
 rusty-fork = { version = "0.3", default-features = false, features = ["timeout"] }
 ryu = { version = "1", default-features = false }
@@ -859,7 +842,7 @@ tinyvec = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-macros = { version = "2", default-features = false }
 tokio-postgres = { version = "0.7" }
-tokio-rustls = { version = "0.26", features = ["aws-lc-rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tokio-test = { version = "0.4", default-features = false }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -897,8 +880,7 @@ unicode-xid = { version = "0.2" }
 universal-hash-3b31131e45eafb45 = { package = "universal-hash", version = "0.6", default-features = false }
 universal-hash-d8f496e17d97b5cb = { package = "universal-hash", version = "0.5", default-features = false }
 unsafe-libyaml = { version = "0.2", default-features = false }
-untrusted-274715c4dabd11b0 = { package = "untrusted", version = "0.9", default-features = false }
-untrusted-ca01ad9e24f5d932 = { package = "untrusted", version = "0.7", default-features = false }
+untrusted = { version = "0.9", default-features = false }
 url = { version = "2" }
 utf8-ranges = { version = "1", default-features = false }
 utf8_iter = { version = "1", default-features = false }
@@ -914,9 +896,7 @@ whatlang = { version = "0.18", default-features = false }
 whoami = { version = "2" }
 writeable = { version = "0.6", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
-x509-certificate = { version = "0.25", default-features = false }
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
-yasna = { version = "0.6", features = ["std", "time"] }
 yoke = { version = "0.8", default-features = false, features = ["derive"] }
 yoke-derive = { version = "0.8", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
@@ -962,7 +942,6 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 iana-time-zone = { version = "0.1", default-features = false, features = ["fallback"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 openssl-probe = { version = "0.2", default-features = false }
-pkg-config = { version = "0.3", default-features = false }
 raw-cpuid = { version = "11", default-features = false }
 rlimit = { version = "0.11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
@@ -1002,7 +981,6 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 iana-time-zone = { version = "0.1", default-features = false, features = ["fallback"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 openssl-probe = { version = "0.2", default-features = false }
-pkg-config = { version = "0.3", default-features = false }
 rlimit = { version = "0.11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
 rustls-native-certs = { version = "0.8", default-features = false }
@@ -1043,7 +1021,6 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 iana-time-zone = { version = "0.1", default-features = false, features = ["fallback"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 openssl-probe = { version = "0.2", default-features = false }
-pkg-config = { version = "0.3", default-features = false }
 raw-cpuid = { version = "11", default-features = false }
 rlimit = { version = "0.11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
@@ -1083,7 +1060,6 @@ hyper-util = { version = "0.1", default-features = false, features = ["client-pr
 iana-time-zone = { version = "0.1", default-features = false, features = ["fallback"] }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std"] }
 openssl-probe = { version = "0.2", default-features = false }
-pkg-config = { version = "0.3", default-features = false }
 rlimit = { version = "0.11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
 rustls-native-certs = { version = "0.8", default-features = false }
@@ -1137,7 +1113,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSS
 objc2-io-kit = { version = "0.3", default-features = false, features = ["hidsystem", "libc", "std"] }
 objc2-open-directory = { version = "0.3", default-features = false, features = ["CFODNode", "CFODQuery", "CFODRecord", "CFODSession", "CFOpenDirectory", "CFOpenDirectoryConstants", "objc2-core-foundation", "std"] }
 objc2-system-configuration = { version = "0.3", default-features = false, features = ["SCDynamicStore", "SCDynamicStoreCopySpecific"] }
-pkg-config = { version = "0.3", default-features = false }
 rlimit = { version = "0.11", default-features = false }
 rustix = { version = "1", features = ["fs"] }
 rustls-platform-verifier = { version = "0.7", default-features = false }
@@ -1170,8 +1145,9 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }
@@ -1202,8 +1178,9 @@ windows-link = { version = "0.2", default-features = false }
 windows-numerics = { version = "0.3", default-features = false, features = ["std"] }
 windows-result = { version = "0.4", default-features = false, features = ["std"] }
 windows-strings = { version = "0.5", default-features = false, features = ["std"] }
-windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
-windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 windows-targets = { version = "0.52", default-features = false }
 windows-threading = { version = "0.2", default-features = false }
 windows_x86_64_msvc = { version = "0.52", default-features = false }

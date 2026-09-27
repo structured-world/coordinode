@@ -69,7 +69,9 @@ sha2 = { workspace = true }
 hex = "0.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { workspace = true }
-pgwire = "0.41"
+# The default features add TLS and SCRAM through aws-lc-rs, which links C;
+# the pg listener serves plaintext with trust auth and needs neither.
+pgwire = { version = "0.41", default-features = false, features = ["server-api", "pg-ext-types"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }

@@ -64,4 +64,7 @@ third-party = [
     { name = "coordinode-lsm-tree" },
     { name = "lindera" },
     { name = "jieba-rs" },
+    # Test certificates only. Its crypto backends (ring, aws-lc-rs) are C, and
+    # unified here they would reach every build, the server binary included.
+    { name = "rcgen" },
 ]
