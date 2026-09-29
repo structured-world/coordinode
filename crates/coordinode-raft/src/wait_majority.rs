@@ -137,6 +137,9 @@ impl WaitForMajorityService {
     /// - [`ProposalError::Raft`] on consensus failure
     /// - [`ProposalError::Storage`] on state machine apply failure
     pub async fn submit(&self, proposal: RaftProposal) -> Result<(), ProposalError> {
+        // Refused here, alone: in a batch it would fail the log write of
+        // every proposal it shares an entry with.
+        coordinode_core::txn::frame::check_proposal(&proposal)?;
         let (response_tx, response_rx) = oneshot::channel();
 
         self.tx

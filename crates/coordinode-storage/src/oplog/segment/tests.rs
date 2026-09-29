@@ -55,7 +55,7 @@ fn segment_write_read_roundtrip() {
     let entries: Vec<_> = (0..5u64).map(|i| make_entry(i, 1000 + i)).collect();
 
     // Write
-    let mut writer = SegmentWriter::create(&path, 42, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 42, 0, SyncMethod::Full).expect("create");
     for e in &entries {
         writer.append(e).expect("append");
     }
@@ -78,7 +78,7 @@ fn empty_segment_roundtrip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("empty.bin");
 
-    let writer = SegmentWriter::create(&path, 1, 100).expect("create");
+    let writer = SegmentWriter::create(&path, 1, 100, SyncMethod::Full).expect("create");
     writer.seal().expect("seal");
 
     let reader = SegmentReader::open(&path).expect("open");
@@ -92,7 +92,7 @@ fn entry_checksum_mismatch_detected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("corrupt.bin");
 
-    let mut writer = SegmentWriter::create(&path, 0, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 0, 0, SyncMethod::Full).expect("create");
     writer.append(&make_entry(0, 100)).expect("append");
     writer.seal().expect("seal");
 
@@ -116,7 +116,7 @@ fn footer_checksum_mismatch_detected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bad-footer.bin");
 
-    let mut writer = SegmentWriter::create(&path, 0, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 0, 0, SyncMethod::Full).expect("create");
     writer.append(&make_entry(0, 100)).expect("append");
     writer.seal().expect("seal");
 
@@ -176,7 +176,7 @@ fn large_entry_roundtrip() {
         pre_images: None,
     };
 
-    let mut writer = SegmentWriter::create(&path, 0, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 0, 0, SyncMethod::Full).expect("create");
     writer.append(&entry).expect("append");
     writer.seal().expect("seal");
 
@@ -194,7 +194,7 @@ fn large_entry_roundtrip() {
 fn flush_and_sync_empty_writer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("empty-sync.bin");
-    let mut writer = SegmentWriter::create(&path, 0, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 0, 0, SyncMethod::Full).expect("create");
     // No entries written — flush_and_sync must still succeed.
     writer
         .flush_and_sync()
@@ -211,7 +211,7 @@ fn flush_and_sync_then_seal_readable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sync-then-seal.bin");
 
-    let mut writer = SegmentWriter::create(&path, 7, 0).expect("create");
+    let mut writer = SegmentWriter::create(&path, 7, 0, SyncMethod::Full).expect("create");
     for i in 0..4u64 {
         writer.append(&make_entry(i, 2000 + i)).expect("append");
     }
@@ -227,4 +227,57 @@ fn flush_and_sync_then_seal_readable() {
     );
     assert_eq!(reader.entries()[0].index, 0);
     assert_eq!(reader.entries()[3].index, 3);
+}
+
+/// Every sync method writes a segment that reads back whole: the method
+/// changes how the bytes reach the medium, never which bytes.
+#[test]
+fn every_sync_method_round_trips_a_segment() {
+    for sync in [
+        SyncMethod::Full,
+        SyncMethod::Fsync,
+        SyncMethod::OpenDatasync,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("seg.bin");
+        let mut writer = SegmentWriter::create(&path, 3, 10, sync).expect("create");
+        for i in 10..15u64 {
+            writer.append(&make_entry(i, 100 + i)).expect("append");
+            writer.flush_and_sync().expect("sync");
+        }
+        writer.seal().expect("seal");
+        let reader = SegmentReader::open(&path).expect("open");
+        let indexes: Vec<u64> = reader.entries().iter().map(|e| e.index).collect();
+        assert_eq!(indexes, (10..15).collect::<Vec<_>>(), "{sync:?}");
+    }
+}
+
+/// `open_datasync` opens the segment with O_DSYNC, so each write is durable
+/// without a flush call; the other methods leave the flag off and flush.
+#[cfg(unix)]
+#[test]
+fn open_datasync_opens_the_segment_with_o_dsync() {
+    use rustix::fs::OFlags;
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (sync, expected) in [
+        (SyncMethod::OpenDatasync, true),
+        (SyncMethod::Full, false),
+        (SyncMethod::Fsync, false),
+    ] {
+        let path = dir.path().join(format!("{sync:?}.bin"));
+        let writer = SegmentWriter::create(&path, 0, 0, sync).expect("create");
+        let flags = rustix::fs::fcntl_getfl(writer.file.get_ref()).expect("getfl");
+        assert_eq!(flags.contains(OFlags::DSYNC), expected, "{sync:?}");
+    }
+}
+
+/// An existing segment is still refused under `open_datasync`: the flag
+/// path keeps the create-new semantics the others have.
+#[test]
+fn open_datasync_does_not_overwrite_an_existing_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("taken.bin");
+    std::fs::write(&path, b"x").expect("occupy");
+    assert!(SegmentWriter::create(&path, 0, 0, SyncMethod::OpenDatasync).is_err());
+    assert_eq!(std::fs::read(&path).expect("read"), b"x");
 }

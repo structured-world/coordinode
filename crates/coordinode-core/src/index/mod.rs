@@ -6,4 +6,5 @@
 //! Layer 5 (`coordinode-query`) can produce/consume the same key
 //! format without a circular dependency.
 
+pub mod derive;
 pub mod encoding;

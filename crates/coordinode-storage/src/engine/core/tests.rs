@@ -1416,3 +1416,47 @@ fn a_fresh_store_holds_no_user_data() {
         .expect("put");
     assert!(engine2.holds_user_data().expect("read the written store"));
 }
+
+/// A table flushed before its oplog entries are purged must be as durable as
+/// those entries: the partition trees sync every file at the mode the oplog's
+/// sync method calls for. They synced at the engine default (plain fsync)
+/// under a full-flush oplog, so on macOS a power cut after a purge could lose
+/// acknowledged writes.
+#[test]
+fn partition_trees_sync_as_durably_as_the_oplog() {
+    use crate::engine::config::SyncMethod;
+    use lsm_tree::fs::SyncMode;
+
+    for (method, expected) in [
+        (SyncMethod::Full, SyncMode::Full),
+        (SyncMethod::OpenDatasync, SyncMode::Full),
+        (SyncMethod::Fsync, SyncMode::Normal),
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let injector = Arc::new(lsm_tree::fs::FaultInjector::new());
+        let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        config.fs = Some(Arc::new(lsm_tree::fs::FaultFs::with_injector(
+            lsm_tree::fs::StdFs,
+            Arc::clone(&injector),
+        )));
+        config.oplog_sync_method = method;
+        let engine = StorageEngine::open(&config).expect("open");
+        engine
+            .put(Partition::Node, b"node:00:00000001", b"row")
+            .expect("put");
+        engine.persist().expect("flush");
+
+        let modes = injector.sync_modes_for("node");
+        assert!(!modes.is_empty(), "{method:?}: the flush synced nothing");
+        assert!(
+            modes.iter().all(|m| *m == expected),
+            "{method:?}: tree files synced at {modes:?}, expected {expected:?}"
+        );
+    }
+}

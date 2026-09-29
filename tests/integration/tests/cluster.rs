@@ -17,6 +17,7 @@
 //! | `a_standalone_server_with_data_grows_into_a_cluster` | JoinNode | A machine that already holds data restarts with `--peers`, a second machine is added, and the pre-cluster data is on it |
 //! | `a_server_that_still_holds_data_is_refused_as_a_joiner` | serve | The same machine started as a joiner refuses at startup and names the empty directory as the fix |
 //! | `a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor` | JoinNode, DecommissionNode | A machine with data grows to three and back to two with its data on both members; the step to one is refused naming the rule |
+//! | `a_new_leader_never_reissues_a_node_id` | ExecuteCypher | After the leader goes away the member that takes over creates a node beside the old ones, never over one |
 //!
 //! ## Running
 //!
@@ -157,7 +158,7 @@ async fn self_decommission_transfers_leadership_off_the_leader() {
     leader
         .join_node(JoinNodeRequest {
             node_id: 2,
-            address: n2.endpoint(),
+            address: n2.member_addr(),
             pre_seeded: false,
         })
         .await
@@ -167,7 +168,7 @@ async fn self_decommission_transfers_leadership_off_the_leader() {
     leader
         .join_node(JoinNodeRequest {
             node_id: 3,
-            address: n3.endpoint(),
+            address: n3.member_addr(),
             pre_seeded: false,
         })
         .await
@@ -248,7 +249,7 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
     leader
         .join_node(JoinNodeRequest {
             node_id: 2,
-            address: n2.endpoint(),
+            address: n2.member_addr(),
             pre_seeded: false,
         })
         .await
@@ -328,11 +329,11 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
     // One membership change at a time: a JoinNode is two of them, so adding
     // both at once collides with the change already in flight.
     let mut leader = n1.cluster_client().await;
-    for (id, endpoint) in [(2u64, n2.endpoint()), (3u64, n3.endpoint())] {
+    for (id, address) in [(2u64, n2.member_addr()), (3u64, n3.member_addr())] {
         leader
             .join_node(JoinNodeRequest {
                 node_id: id,
-                address: endpoint,
+                address,
                 pre_seeded: false,
             })
             .await
@@ -449,6 +450,224 @@ async fn a_server_that_still_holds_data_is_refused_as_a_joiner() {
     assert!(
         printed.contains("empty data directory"),
         "the refusal must name the fix, got: {printed}"
+    );
+}
+
+/// The refusal holds after a crash as well: a machine killed right after an
+/// acknowledged write still holds that write, and still may not join.
+///
+/// A graceful stop flushes storage before exiting, so the clean-stop test
+/// above cannot tell a store that holds the write in its files from one that
+/// holds it only in the log it replays on open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_killed_after_a_write_is_refused_as_a_joiner() {
+    let n1 = CoordinodeProcess::start().await;
+    n1.wait_for_leader(Duration::from_secs(15)).await;
+    {
+        let mut cypher = n1.cypher_client().await;
+        cypher
+            .execute_cypher(ExecuteCypherRequest {
+                query: "CREATE (n:StillMine {id: 1}) RETURN n.id".to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 0,
+                read_concern: None,
+                write_concern: None,
+                transaction_id: 0,
+            })
+            .await
+            .expect("the standalone server accepts the write");
+    }
+    let data_dir = n1.kill_keeping_data();
+
+    let (status, printed) =
+        start_cluster_member_expecting_refusal(2, free_port(), &[free_port()], data_dir.path())
+            .await;
+
+    assert!(
+        !status.success(),
+        "a machine that holds an acknowledged write must not come up as a joiner"
+    );
+    assert!(
+        printed.contains("cannot join an existing group"),
+        "the refusal must say what happened, got: {printed}"
+    );
+}
+
+/// Run `query` on `node` as a primary read or write.
+async fn cypher_on(
+    node: &CoordinodeProcess,
+    query: &str,
+) -> Result<Vec<coordinode_integration::proto::query::Row>, tonic::Status> {
+    node.cypher_client()
+        .await
+        .execute_cypher(ExecuteCypherRequest {
+            query: query.to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: None,
+            write_concern: None,
+            transaction_id: 0,
+        })
+        .await
+        .map(|r| r.into_inner().rows)
+}
+
+/// A new leader never hands out a NodeId the old one already used. The
+/// identifiers a leader issues come from ranges the log granted it; a member
+/// that takes over has seen those grants and draws above them, so the node it
+/// creates is added beside the old ones instead of overwriting one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_leader_never_reissues_a_node_id() {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+
+    let mut leader = n1.cluster_client().await;
+    for (id, member) in [(2, &n2), (3, &n3)] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: member.member_addr(),
+                pre_seeded: false,
+            })
+            .await
+            .expect("JoinNode must be accepted");
+        wait_for_voters(
+            &mut leader,
+            usize::try_from(id).expect("small"),
+            Duration::from_secs(40),
+        )
+        .await;
+    }
+    for i in 0..5 {
+        cypher_on(&n1, &format!("CREATE (:Handover {{v: 'before-{i}'}})"))
+            .await
+            .expect("the first leader accepts the write");
+    }
+
+    // The first leader goes away; one of the others takes over.
+    drop(n1);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let new_leader = loop {
+        let mut led = None;
+        for member in [&n2, &n3] {
+            if cypher_on(member, "CREATE (:Handover {v: 'after'})")
+                .await
+                .is_ok()
+            {
+                led = Some(member);
+                break;
+            }
+        }
+        if let Some(member) = led {
+            break member;
+        }
+        assert!(Instant::now() < deadline, "no member took over");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let rows = cypher_on(new_leader, "MATCH (n:Handover) RETURN id(n), n.v")
+        .await
+        .expect("read back");
+    let mut ids = Vec::new();
+    let mut values = Vec::new();
+    for row in rows {
+        use coordinode_integration::proto::common::property_value::Value as Pv;
+        match (&row.values[0].value, &row.values[1].value) {
+            (Some(Pv::IntValue(id)), Some(Pv::StringValue(v))) => {
+                ids.push(*id);
+                values.push(v.clone());
+            }
+            other => panic!("unexpected row {other:?}"),
+        }
+    }
+    values.sort();
+    assert_eq!(
+        values,
+        [
+            "after", "before-0", "before-1", "before-2", "before-3", "before-4"
+        ],
+        "every node the first leader wrote survives and the new one is added"
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 6, "six distinct ids");
+}
+
+/// A unique index outlives the leader that created it: its definition and
+/// its entries travel in the log, so the member that takes over refuses a
+/// duplicate of a value the first leader indexed and finds that value
+/// through the index.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unique_index_holds_across_a_leader_change() {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+
+    let mut leader = n1.cluster_client().await;
+    for (id, member) in [(2, &n2), (3, &n3)] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: member.member_addr(),
+                pre_seeded: false,
+            })
+            .await
+            .expect("JoinNode must be accepted");
+        wait_for_voters(
+            &mut leader,
+            usize::try_from(id).expect("small"),
+            Duration::from_secs(40),
+        )
+        .await;
+    }
+    cypher_on(&n1, "CREATE UNIQUE INDEX account_email ON :Account(email)")
+        .await
+        .expect("the first leader creates the index");
+    cypher_on(&n1, "CREATE (:Account {email: 'a@x'})")
+        .await
+        .expect("the first leader accepts the write");
+
+    drop(n1);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let new_leader = loop {
+        let mut led = None;
+        for member in [&n2, &n3] {
+            if cypher_on(member, "CREATE (:Account {email: 'b@x'})")
+                .await
+                .is_ok()
+            {
+                led = Some(member);
+                break;
+            }
+        }
+        if let Some(member) = led {
+            break member;
+        }
+        assert!(Instant::now() < deadline, "no member took over");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let refused = cypher_on(new_leader, "CREATE (:Account {email: 'a@x'})")
+        .await
+        .expect_err("a duplicate of a value the first leader indexed");
+    assert!(
+        refused.message().contains("unique constraint"),
+        "got: {}",
+        refused.message()
+    );
+    let rows = cypher_on(
+        new_leader,
+        "MATCH (a:Account) WHERE a.email = 'a@x' RETURN count(a)",
+    )
+    .await
+    .expect("read back");
+    use coordinode_integration::proto::common::property_value::Value as Pv;
+    assert!(
+        matches!(rows[0].values[0].value, Some(Pv::IntValue(1))),
+        "the indexed row is found once: {rows:?}"
     );
 }
 

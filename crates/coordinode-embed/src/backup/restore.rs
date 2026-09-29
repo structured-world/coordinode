@@ -6,7 +6,7 @@
 use std::io::{BufRead, Read};
 
 use coordinode_core::graph::edge::EdgeProperties;
-use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::intern::{FieldInterner, FieldRegistrar};
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::Timestamp;
@@ -52,13 +52,19 @@ pub struct RestoreStats {
 /// Reads length-prefixed MessagePack entries and writes them
 /// directly to storage partitions. Fastest restore method.
 /// Writes use plain engine.put(); the oracle stamps each seqno.
+///
+/// The dump's records are encoded with its field dictionary, which it
+/// carries ahead of them: those exact bindings are published through
+/// `fields` before any record is written, and a dump whose bindings
+/// contradict the target's is refused.
 pub fn restore_binary<R: Read>(
     engine: &StorageEngine,
+    fields: &dyn FieldRegistrar,
     reader: &mut R,
     force: bool,
-) -> Result<(RestoreStats, Option<FieldInterner>), RestoreError> {
+) -> Result<RestoreStats, RestoreError> {
     let mut stats = RestoreStats::default();
-    let mut interner = None;
+    let mut adopted = false;
     let mut len_buf = [0u8; 4];
     let mut manifest_seen = false;
 
@@ -81,7 +87,7 @@ pub fn restore_binary<R: Read>(
         let first_entry = stats.nodes == 0
             && stats.edges == 0
             && stats.schema_entries == 0
-            && interner.is_none()
+            && !adopted
             && !manifest_seen;
         if first_entry && !matches!(entry, BackupEntry::Manifest { .. }) && !force {
             return Err(RestoreError::IncompatibleVersion(
@@ -101,7 +107,19 @@ pub fn restore_binary<R: Read>(
                 manifest_seen = true;
             }
             BackupEntry::Interner(data) => {
-                interner = FieldInterner::from_bytes(&data);
+                let bindings = FieldInterner::from_bytes(&data)
+                    .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
+                fields
+                    .adopt(&bindings)
+                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
+                adopted = true;
+            }
+            BackupEntry::Node { .. } | BackupEntry::EdgeProp { .. } if !adopted => {
+                return Err(RestoreError::InvalidFormat(
+                    "the dump holds property records before the field dictionary \
+                     that encodes them"
+                        .into(),
+                ));
             }
             BackupEntry::Node { key, value } => {
                 engine
@@ -138,7 +156,7 @@ pub fn restore_binary<R: Read>(
     coordinode_storage::engine::stats::rebuild_node_counters(engine)
         .map_err(|e| RestoreError::Storage(e.to_string()))?;
 
-    Ok((stats, interner))
+    Ok(stats)
 }
 
 /// Validate a binary dump manifest against the target engine.
@@ -196,11 +214,11 @@ fn schema_fingerprint_of_empty() -> u64 {
 /// Nodes are created via direct storage writes; edges are created by
 /// encoding the adjacency keys.
 ///
-/// Requires an existing FieldInterner (or creates a new one).
-/// Writes go straight to the engine; the oracle stamps each seqno.
+/// Property names are registered through `fields` before each record that
+/// uses them. Writes go straight to the engine; the oracle stamps each seqno.
 pub fn restore_json<R: BufRead>(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     reader: &mut R,
     only_labels: Option<&std::collections::HashSet<String>>,
@@ -241,7 +259,7 @@ pub fn restore_json<R: BufRead>(
                 }
                 write_node_record(
                     engine,
-                    interner,
+                    fields,
                     shard_id,
                     id,
                     labels,
@@ -269,7 +287,7 @@ pub fn restore_json<R: BufRead>(
                 }
                 write_edge_record(
                     engine,
-                    interner,
+                    fields,
                     source,
                     target,
                     edge_type,
@@ -305,7 +323,7 @@ pub fn restore_json<R: BufRead>(
 /// are skipped.
 pub fn restore_apoc_json<R: BufRead>(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     reader: &mut R,
     only_labels: Option<&std::collections::HashSet<String>>,
@@ -336,7 +354,7 @@ pub fn restore_apoc_json<R: BufRead>(
                 }
                 write_node_record(
                     engine,
-                    interner,
+                    fields,
                     shard_id,
                     id,
                     labels,
@@ -358,7 +376,7 @@ pub fn restore_apoc_json<R: BufRead>(
                 }
                 write_edge_record(
                     engine,
-                    interner,
+                    fields,
                     source,
                     target,
                     edge_type,
@@ -401,12 +419,21 @@ fn apoc_id(v: Option<&serde_json::Value>, what: &str) -> Result<u64, RestoreErro
         .ok_or_else(|| RestoreError::InvalidFormat(format!("{what} id is not a numeric string")))
 }
 
-/// Write one node (labels + properties) to storage, interning property names.
-/// Each record commits in its own MVCC transaction (bulk restore is a stream
-/// of independent writes; per-record commit bounds buffer growth).
+/// The ids of `names`, registering the missing ones in one batch, durable
+/// before the record that uses them is written.
+fn field_ids(fields: &dyn FieldRegistrar, names: &[&str]) -> Result<Vec<u32>, RestoreError> {
+    fields
+        .register(names)
+        .map_err(|e| RestoreError::Storage(e.to_string()))
+}
+
+/// Write one node (labels + properties) to storage, registering its
+/// property names first. Each record commits in its own MVCC transaction
+/// (bulk restore is a stream of independent writes; per-record commit
+/// bounds buffer growth).
 fn write_node_record(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     id: u64,
     labels: Vec<String>,
@@ -416,8 +443,8 @@ fn write_node_record(
 
     let mut record = NodeRecord::with_labels(labels);
     if let Some(props) = props {
-        for (name, json_val) in props {
-            let field_id = interner.intern(name);
+        let names: Vec<&str> = props.keys().map(String::as_str).collect();
+        for (json_val, field_id) in props.values().zip(field_ids(fields, &names)?) {
             record.set(field_id, json_to_value(json_val));
         }
     }
@@ -445,7 +472,7 @@ fn put_node_committed(
 /// optional edge properties in executor-native shape.
 fn write_edge_record(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     source: u64,
     target: u64,
     edge_type: &str,
@@ -479,8 +506,9 @@ fn write_edge_record(
             // restored bytes match a put_edge write exactly and stay readable by
             // queries (which expect the executor-native (field_id, Value) shape).
             let mut edge_props = EdgeProperties::new();
-            for (name, json_val) in props.iter() {
-                edge_props.set(interner.intern(name), json_to_value(json_val));
+            let names: Vec<&str> = props.keys().map(String::as_str).collect();
+            for (json_val, field_id) in props.values().zip(field_ids(fields, &names)?) {
+                edge_props.set(field_id, json_to_value(json_val));
             }
             LocalEdgeStore
                 .put_props_direct(
@@ -515,7 +543,7 @@ fn write_edge_record(
 /// must go through the query engine.
 pub fn restore_cypher<R: BufRead>(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
@@ -562,8 +590,10 @@ pub fn restore_cypher<R: BufRead>(
                 // restored bytes identical to a put_edge write and readable by
                 // queries (the executor-native (field_id, Value) shape).
                 let mut edge_props = EdgeProperties::new();
-                for (name, val) in props {
-                    edge_props.set(interner.intern(&name), val);
+                let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
+                let ids = field_ids(fields, &names)?;
+                for ((_, val), field_id) in props.into_iter().zip(ids) {
+                    edge_props.set(field_id, val);
                 }
                 LocalEdgeStore
                     .put_props_direct(
@@ -579,8 +609,10 @@ pub fn restore_cypher<R: BufRead>(
         } else {
             let (id, labels, props) = parse_cypher_node(body)?;
             let mut record = NodeRecord::with_labels(labels);
-            for (name, val) in props {
-                record.set(interner.intern(&name), val);
+            let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
+            let ids = field_ids(fields, &names)?;
+            for ((_, val), field_id) in props.into_iter().zip(ids) {
+                record.set(field_id, val);
             }
             put_node_committed(engine, shard_id, NodeId::from_raw(id), &record)?;
             stats.nodes += 1;
@@ -802,7 +834,7 @@ fn find_top_level(s: &str, delim: char) -> Option<usize> {
 /// (we import data, not evaluate Cypher).
 pub fn restore_apoc_cypher<R: BufRead>(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     reader: &mut R,
 ) -> Result<RestoreStats, RestoreError> {
@@ -829,7 +861,7 @@ pub fn restore_apoc_cypher<R: BufRead>(
         if stmt.is_empty() {
             continue;
         }
-        apply_apoc_cypher_stmt(stmt, engine, interner, shard_id, &mut stats)?;
+        apply_apoc_cypher_stmt(stmt, engine, fields, shard_id, &mut stats)?;
     }
 
     // The rows went in through the typed store, not the executor that
@@ -844,7 +876,7 @@ pub fn restore_apoc_cypher<R: BufRead>(
 fn apply_apoc_cypher_stmt(
     stmt: &str,
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
@@ -871,11 +903,11 @@ fn apply_apoc_cypher_stmt(
     }
 
     if upper.starts_with("UNWIND") {
-        apply_apoc_unwind(stmt, engine, interner, shard_id, stats)
+        apply_apoc_unwind(stmt, engine, fields, shard_id, stats)
     } else if upper.starts_with("CREATE (") || upper.starts_with("CREATE(") {
-        apply_apoc_plain_node(stmt, engine, interner, shard_id, stats)
+        apply_apoc_plain_node(stmt, engine, fields, shard_id, stats)
     } else if upper.starts_with("MATCH") && stmt.contains("]->") {
-        apply_apoc_plain_rel(stmt, engine, interner, stats)
+        apply_apoc_plain_rel(stmt, engine, fields, stats)
     } else {
         // Unknown maintenance statement (e.g. a vendor-specific clause):
         // skip rather than fail; only CREATE/UNWIND carry graph data.
@@ -887,7 +919,7 @@ fn apply_apoc_cypher_stmt(
 fn apply_apoc_unwind(
     stmt: &str,
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
@@ -907,7 +939,7 @@ fn apply_apoc_unwind(
             let source = nested_id(row, "start")?;
             let target = nested_id(row, "end")?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            write_edge_record(engine, interner, source, target, &edge_type, props)?;
+            write_edge_record(engine, fields, source, target, &edge_type, props)?;
             stats.edges += 1;
         }
     } else {
@@ -918,7 +950,7 @@ fn apply_apoc_unwind(
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| RestoreError::InvalidFormat("UNWIND node row missing _id".into()))?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            write_node_record(engine, interner, shard_id, id, labels.clone(), props)?;
+            write_node_record(engine, fields, shard_id, id, labels.clone(), props)?;
             stats.nodes += 1;
         }
     }
@@ -937,7 +969,7 @@ fn nested_id(row: &serde_json::Value, side: &str) -> Result<u64, RestoreError> {
 fn apply_apoc_plain_node(
     stmt: &str,
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
@@ -964,7 +996,7 @@ fn apply_apoc_plain_node(
                     .into(),
             )
         })?;
-    write_node_record(engine, interner, shard_id, id, labels, Some(&obj))?;
+    write_node_record(engine, fields, shard_id, id, labels, Some(&obj))?;
     stats.nodes += 1;
     Ok(())
 }
@@ -973,7 +1005,7 @@ fn apply_apoc_plain_node(
 fn apply_apoc_plain_rel(
     stmt: &str,
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
     let cpos = find_top_keyword(stmt, "CREATE")
@@ -988,7 +1020,7 @@ fn apply_apoc_plain_rel(
     }
     let edge_type = extract_reltype(create_part)?;
     let props = extract_rel_props(create_part)?;
-    write_edge_record(engine, interner, ids[0], ids[1], &edge_type, props.as_ref())?;
+    write_edge_record(engine, fields, ids[0], ids[1], &edge_type, props.as_ref())?;
     stats.edges += 1;
     Ok(())
 }
@@ -1538,7 +1570,7 @@ fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
 /// JSON with no Neo4j round trip.
 pub fn restore_hetio_json<R: BufRead>(
     engine: &StorageEngine,
-    interner: &mut FieldInterner,
+    fields: &dyn FieldRegistrar,
     shard_id: u16,
     reader: &mut R,
     only_labels: Option<&std::collections::HashSet<String>>,
@@ -1592,7 +1624,7 @@ pub fn restore_hetio_json<R: BufRead>(
         props.insert("identifier".to_string(), n.identifier.clone());
         write_node_record(
             engine,
-            interner,
+            fields,
             shard_id,
             id,
             vec![n.kind.clone()],
@@ -1613,7 +1645,7 @@ pub fn restore_hetio_json<R: BufRead>(
         } else {
             Some(&e.data)
         };
-        write_edge_record(engine, interner, src, tgt, &e.kind, props)?;
+        write_edge_record(engine, fields, src, tgt, &e.kind, props)?;
         stats.edges += 1;
     }
 

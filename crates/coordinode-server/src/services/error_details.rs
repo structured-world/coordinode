@@ -105,6 +105,15 @@ pub enum Reason {
     /// level asked of more than one member. Terminal for that request; the
     /// message names the offending combination.
     InvalidWriteConcern,
+    /// A write gave a unique key a second holder: a table's key, or a value of
+    /// a unique index. Nothing was written. Metadata carries `key` and
+    /// `element_id` (the node that holds it), plus `table` for a table key or
+    /// `index` and `property` for a unique index. Terminal: the same write
+    /// will be refused again.
+    DuplicateKey,
+    /// A statement tried to change a key column of an existing row. Metadata
+    /// carries `table` and `column`. Terminal.
+    KeyImmutable,
 }
 
 impl Reason {
@@ -128,6 +137,8 @@ impl Reason {
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
             Reason::IndexNotHistorical => "INDEX_NOT_HISTORICAL",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
+            Reason::DuplicateKey => "DUPLICATE_KEY",
+            Reason::KeyImmutable => "KEY_IMMUTABLE",
         }
     }
 

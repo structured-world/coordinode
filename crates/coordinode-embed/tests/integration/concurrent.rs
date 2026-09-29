@@ -141,7 +141,7 @@ fn concurrent_upsert_data_consistency() {
     let success_count = Arc::new(AtomicU64::new(0));
 
     // Serialize the interner so each thread can reconstruct the same field mappings.
-    let interner_bytes = Arc::new(setup_interner.to_bytes());
+    let interner_bytes = Arc::new(setup_interner.to_bytes().expect("serialize interner"));
 
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
@@ -208,15 +208,21 @@ fn concurrent_upsert_data_consistency() {
 }
 
 /// Auto-commit read-modify-write from several threads on one node, through the
-/// public API: every increment reported as committed is in the final value.
+/// public API: every increment that committed a change is in the final value.
 ///
 /// A statement reads at the timestamp it is given, and that timestamp can
 /// already cover a commit that has taken its number but not applied. Read
 /// there, the statement misses that commit; if the commit lands before this
 /// one registers its own write, nothing is in flight to collide with, and a
 /// validation that looks only at writes after the snapshot finds nothing
-/// either. Both report success and one increment is gone. Refusals are
-/// retried, so the count of successes is exactly what the value must reach.
+/// either. Both report success and one increment is gone.
+///
+/// Only a response that set the property counts as an increment: a
+/// statement that matched no node succeeds with nothing written, and counting
+/// it would report a lost update that never happened. Such statements are
+/// counted apart and retried, like refusals, so the counted increments are
+/// exactly what the value must reach, and a statement that failed to find a
+/// node that exists is reported as what it is.
 #[test]
 fn concurrent_auto_commit_increments_lose_nothing() {
     use coordinode_embed::{Database, DatabaseError};
@@ -230,9 +236,11 @@ fn concurrent_auto_commit_increments_lose_nothing() {
 
     let committed = AtomicU64::new(0);
     let refused = AtomicU64::new(0);
+    let matched_nothing = AtomicU64::new(0);
     thread::scope(|s| {
         for _ in 0..THREADS {
-            let (db, committed, refused) = (&db, &committed, &refused);
+            let (db, committed, refused, matched_nothing) =
+                (&db, &committed, &refused, &matched_nothing);
             s.spawn(move || {
                 let mut done = 0;
                 while done < PER_THREAD {
@@ -243,9 +251,16 @@ fn concurrent_auto_commit_increments_lose_nothing() {
                         None,
                         None,
                     ) {
-                        Ok(_) => {
+                        Ok(result) if result.write_stats.properties_set == 1 => {
                             done += 1;
                             committed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(result) => {
+                            assert_eq!(
+                                result.write_stats.properties_set, 0,
+                                "one node, so at most one property is set"
+                            );
+                            matched_nothing.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
                             refused.fetch_add(1, Ordering::Relaxed);
@@ -261,13 +276,85 @@ fn concurrent_auto_commit_increments_lose_nothing() {
         .execute_cypher("MATCH (n:Tally {id: 0}) RETURN n.v AS v")
         .expect("read tally");
     let committed = committed.into_inner();
+    let matched_nothing = matched_nothing.into_inner();
     assert_eq!(committed, THREADS * PER_THREAD);
     assert_eq!(
         rows[0].get("v"),
         Some(&Value::Int(i64::try_from(committed).expect("fits"))),
-        "{committed} increments committed ({} refused and retried), the value must hold all of them",
+        "{committed} increments committed ({} refused and retried, {matched_nothing} \
+         matched no node), the value must hold all of them",
         refused.into_inner()
     );
+    assert_eq!(
+        matched_nothing, 0,
+        "the node exists throughout, yet {matched_nothing} statements did not find it"
+    );
+}
+
+/// Two writers, one known key, driven directly through the transaction
+/// layer: both read the same version, both stage an increment, and at most
+/// one of them may commit. The second must be refused, whatever order the
+/// commits run in, because its write was computed from a base the first one
+/// replaced.
+#[test]
+fn two_writers_on_one_key_cannot_both_commit_from_the_same_base() {
+    use coordinode_core::txn::proposal::ProposalIdGenerator;
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_raft::proposal::OwnedLocalProposalPipeline;
+    use coordinode_storage::engine::partition::Partition;
+    use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine =
+        Arc::new(StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open"));
+    let pipeline = OwnedLocalProposalPipeline::new(&engine);
+    let ids = ProposalIdGenerator::new();
+    let concern = WriteConcern::majority();
+    let ctx = CommitContext {
+        pipeline: Some(&pipeline),
+        id_gen: Some(&ids),
+        write_concern: &concern,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    let key = b"node:\0\x01:counter".to_vec();
+
+    // Seed the base both writers read.
+    let mut seed = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    seed.put(Partition::Node, &key, b"0").expect("stage seed");
+    seed.commit(&ctx).expect("seed commits");
+
+    for first_commits_first in [true, false] {
+        let mut a = Transaction::begin(&engine, Some(&oracle), oracle.next());
+        let mut b = Transaction::begin(&engine, Some(&oracle), oracle.next());
+        let base_a = a.get(Partition::Node, &key).expect("a reads");
+        let base_b = b.get(Partition::Node, &key).expect("b reads");
+        assert_eq!(base_a, base_b, "both writers start from the same version");
+        a.put(Partition::Node, &key, b"a").expect("a stages");
+        b.put(Partition::Node, &key, b"b").expect("b stages");
+
+        let (first, second) = if first_commits_first {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        first.commit(&ctx).expect("the first writer commits");
+        match second.commit(&ctx) {
+            Err(CommitError::Conflict(_)) => {}
+            other => {
+                panic!("the second writer committed over the first from the same base: {other:?}")
+            }
+        }
+    }
 }
 
 /// Two threads doing UPSERTs with different ON MATCH SET values.
@@ -295,7 +382,7 @@ fn concurrent_upsert_last_writer_wins() {
 
     // Thread A: sets age=100, Thread B: sets age=200
     // Both run 100 iterations. After all complete, age must be 100 or 200.
-    let interner_bytes = Arc::new(setup_interner.to_bytes());
+    let interner_bytes = Arc::new(setup_interner.to_bytes().expect("serialize interner"));
 
     let handles: Vec<_> = [100i64, 200i64]
         .iter()

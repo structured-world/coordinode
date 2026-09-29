@@ -98,3 +98,72 @@ fn write_concern_timeout_distinct_from_retry_timeout() {
     assert!(retry_msg.contains("retries"), "retry: {retry_msg}");
     assert_ne!(wc_msg, retry_msg);
 }
+
+fn sample_proposal() -> RaftProposal {
+    RaftProposal {
+        id: ProposalId::from_raw(7),
+        mutations: vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:7".to_vec(),
+                value: b"v".to_vec(),
+            },
+            Mutation::Delete {
+                partition: PartitionId::Idx,
+                key: b"idx:x".to_vec(),
+            },
+        ],
+        commit_ts: Timestamp::from_raw(100),
+        start_ts: Timestamp::from_raw(90),
+        bypass_rate_limiter: false,
+    }
+}
+
+/// A proposal serializes as one frame (a msgpack binary), inside any
+/// enclosing structure, and comes back unchanged.
+#[test]
+fn a_proposal_serializes_as_its_frame() {
+    let proposal = sample_proposal();
+    let bytes = rmp_serde::to_vec(&vec![proposal.clone()]).expect("serialize");
+    // An array of one element, whose element is a bin holding the frame.
+    let frame = crate::txn::frame::encode_proposal(&proposal).expect("encode");
+    assert_eq!(bytes[0], 0x91, "an array of one");
+    assert!(
+        matches!(bytes[1], 0xC4..=0xC6),
+        "the proposal is a msgpack binary"
+    );
+    assert!(bytes.ends_with(&frame));
+    let back: Vec<RaftProposal> = rmp_serde::from_slice(&bytes).expect("deserialize");
+    assert_eq!(back, vec![proposal]);
+}
+
+/// The shape proposals had before frames, positional or keyed.
+#[derive(Serialize)]
+struct FieldWiseShape<'a> {
+    id: ProposalId,
+    mutations: &'a [Mutation],
+    commit_ts: Timestamp,
+    start_ts: Timestamp,
+    bypass_rate_limiter: bool,
+}
+
+/// A log tail written before frames still replays: the field-wise form, as
+/// an array or as a map, deserializes to the same proposal.
+#[test]
+fn a_field_wise_proposal_from_before_frames_still_reads() {
+    let proposal = sample_proposal();
+    let shape = FieldWiseShape {
+        id: proposal.id,
+        mutations: &proposal.mutations,
+        commit_ts: proposal.commit_ts,
+        start_ts: proposal.start_ts,
+        bypass_rate_limiter: proposal.bypass_rate_limiter,
+    };
+    let positional = rmp_serde::to_vec(&shape).expect("positional");
+    let keyed = rmp_serde::to_vec_named(&shape).expect("keyed");
+    let from_positional: RaftProposal =
+        rmp_serde::from_slice(&positional).expect("read positional");
+    let from_keyed: RaftProposal = rmp_serde::from_slice(&keyed).expect("read keyed");
+    assert_eq!(from_positional, proposal);
+    assert_eq!(from_keyed, proposal);
+}

@@ -8,10 +8,51 @@ use coordinode_storage::engine::partition::Partition;
 
 const SHARD: u16 = 1;
 
+/// A dictionary fixed for the test: the worker only reads bindings.
+struct FixedFields(coordinode_core::graph::intern::FieldInterner);
+
+impl FieldRegistrar for FixedFields {
+    fn register(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<u32>, coordinode_core::graph::intern::DictionaryError> {
+        names
+            .iter()
+            .map(|n| {
+                self.0.lookup(n).ok_or_else(|| {
+                    coordinode_core::graph::intern::DictionaryError::Registration(
+                        "fixed dictionary".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn adopt(
+        &self,
+        _: &coordinode_core::graph::intern::FieldInterner,
+    ) -> Result<(), coordinode_core::graph::intern::DictionaryError> {
+        Err(
+            coordinode_core::graph::intern::DictionaryError::Registration(
+                "fixed dictionary".into(),
+            ),
+        )
+    }
+
+    fn view(
+        &self,
+    ) -> Result<
+        coordinode_core::graph::intern::FieldInterner,
+        coordinode_core::graph::intern::DictionaryError,
+    > {
+        Ok(self.0.clone())
+    }
+}
+
 struct Fixture {
     engine: Arc<StorageEngine>,
     registry: Arc<VectorIndexRegistry>,
-    interner: Arc<RwLock<FieldInterner>>,
+    fields: Arc<FixedFields>,
     field: u32,
     _dir: tempfile::TempDir,
 }
@@ -44,12 +85,12 @@ fn fixture() -> Fixture {
             rerank_candidates: None,
         },
     ));
-    let interner = Arc::new(RwLock::new(FieldInterner::new()));
-    let field = interner.write().intern("embedding");
+    let mut interner = coordinode_core::graph::intern::FieldInterner::new();
+    let field = interner.intern("embedding");
     Fixture {
         engine,
         registry,
-        interner,
+        fields: Arc::new(FixedFields(interner)),
         field,
         _dir: dir,
     }
@@ -80,7 +121,7 @@ impl Fixture {
             Arc::clone(&self.engine),
             self.engine.subscribe_applied(Partition::Node, capacity),
             Arc::clone(&self.registry),
-            Arc::clone(&self.interner),
+            Arc::clone(&self.fields) as Arc<dyn FieldRegistrar>,
             SHARD,
         )
     }

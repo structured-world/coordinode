@@ -465,12 +465,13 @@ fn passes_filter_migration() {
     let normal = make_entry(0, 1000, false);
     let migration = make_entry(1, 1001, true);
 
-    assert!(passes_filter(&normal, &no_filter));
-    assert!(passes_filter(&migration, &no_filter));
-    assert!(passes_filter(&normal, &only_normal));
-    assert!(!passes_filter(&migration, &only_normal));
-    assert!(!passes_filter(&normal, &only_migration));
-    assert!(passes_filter(&migration, &only_migration));
+    let passes = |entry: &OplogEntry, filters| passes_filter(entry, &entry.ops, filters);
+    assert!(passes(&normal, &no_filter));
+    assert!(passes(&migration, &no_filter));
+    assert!(passes(&normal, &only_normal));
+    assert!(!passes(&migration, &only_normal));
+    assert!(!passes(&normal, &only_migration));
+    assert!(passes(&migration, &only_migration));
 }
 
 #[test]
@@ -488,11 +489,71 @@ fn passes_filter_edge_type() {
         ..Default::default()
     };
 
-    assert!(passes_filter(&follows, &filter_follows));
-    assert!(!passes_filter(&likes, &filter_follows));
-    assert!(!passes_filter(&node, &filter_follows));
+    let passes = |entry: &OplogEntry, filters| passes_filter(entry, &entry.ops, filters);
+    assert!(passes(&follows, &filter_follows));
+    assert!(!passes(&likes, &filter_follows));
+    assert!(!passes(&node, &filter_follows));
 
-    assert!(passes_filter(&follows, &filter_both));
-    assert!(passes_filter(&likes, &filter_both));
-    assert!(!passes_filter(&node, &filter_both));
+    assert!(passes(&follows, &filter_both));
+    assert!(passes(&likes, &filter_both));
+    assert!(!passes(&node, &filter_both));
+}
+
+/// A reader sees the operations a unit frame encodes, and filters by them:
+/// an entry recorded as one frame streams and filters like one recorded op
+/// by op.
+#[test]
+fn a_unit_frame_streams_as_its_operations() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(dir.path());
+    let mutations = vec![
+        Mutation::Put {
+            partition: PartitionId::Adj,
+            key: b"adj:FOLLOWS:out:1".to_vec(),
+            value: b"v".to_vec(),
+        },
+        Mutation::Delete {
+            partition: PartitionId::Counter,
+            key: b"c".to_vec(),
+        },
+    ];
+    let frame = coordinode_core::txn::frame::encode_unit(
+        &mutations,
+        coordinode_core::txn::timestamp::Timestamp::from_raw(1000),
+    )
+    .expect("frame");
+    mgr.append(&OplogEntry {
+        ts: 1000,
+        term: 0,
+        index: 0,
+        shard: 0,
+        ops: vec![OplogOp::Unit { frame }],
+        is_migration: false,
+        pre_images: None,
+    })
+    .expect("append");
+    seal_manager(&mut mgr);
+
+    let follows = CdcFilters {
+        edge_types: vec!["FOLLOWS".to_string()],
+        ..Default::default()
+    };
+    let batch = tailer(dir.path(), ResumeToken::from_start(0))
+        .read_next(100, &follows, u64::MAX)
+        .expect("read");
+    assert_eq!(batch.len(), 1, "the frame's adjacency op passes the filter");
+    assert_eq!(
+        batch[0].0.ops,
+        crate::oplog::convert::mutations_to_ops(&mutations).expect("ops")
+    );
+
+    let likes = CdcFilters {
+        edge_types: vec!["LIKES".to_string()],
+        ..Default::default()
+    };
+    let batch = tailer(dir.path(), ResumeToken::from_start(0))
+        .read_next(100, &likes, u64::MAX)
+        .expect("read");
+    assert!(batch.is_empty());
 }

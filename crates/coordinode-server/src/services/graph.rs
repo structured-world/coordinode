@@ -79,11 +79,12 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
 
         let cypher = format!("CREATE (n{label_part}{props_part}) RETURN n");
 
-        let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| db_err_to_status("create_node", e))?
-        };
+        let rows = super::blocking(|| {
+            self.database
+                .write()
+                .execute_cypher_with_params(&cypher, params)
+        })
+        .map_err(|e| db_err_to_status("create_node", e))?;
 
         let node_id = match rows.first().and_then(|r| r.get("n")) {
             Some(Value::Int(id)) => *id as u64,
@@ -101,7 +102,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             element_id: NodeId::from_raw(node_id).to_element_id(),
             // The version the node was created at, so a caller that means to
             // write it again conditionally already has what to state.
-            version: node_version(&self.database.read(), node_id),
+            version: super::blocking(|| node_version(&self.database.read(), node_id)),
         }))
     }
 
@@ -157,11 +158,12 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         let mut params: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         params.insert("rows".to_string(), Value::Array(rows));
 
-        let result_rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| db_err_to_status("create_nodes_batch", e))?
-        };
+        let result_rows = super::blocking(|| {
+            self.database
+                .write()
+                .execute_cypher_with_params(&cypher, params)
+        })
+        .map_err(|e| db_err_to_status("create_nodes_batch", e))?;
 
         if result_rows.len() != req.nodes.len() {
             return Err(Status::internal(format!(
@@ -171,27 +173,30 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             )));
         }
 
-        let nodes: Result<Vec<graph::Node>, Status> = result_rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let node_id = match row.get("m") {
-                    Some(Value::Int(id)) => *id as u64,
-                    _ => {
-                        return Err(Status::internal(format!(
-                            "create_nodes_batch: row[{i}] missing node id"
-                        )));
-                    }
-                };
-                Ok(graph::Node {
-                    node_id,
-                    labels: labels.clone(),
-                    properties: req.nodes[i].properties.clone(),
-                    element_id: NodeId::from_raw(node_id).to_element_id(),
-                    version: node_version(&self.database.read(), node_id),
+        let nodes: Result<Vec<graph::Node>, Status> = super::blocking(|| {
+            let db = self.database.read();
+            result_rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let node_id = match row.get("m") {
+                        Some(Value::Int(id)) => *id as u64,
+                        _ => {
+                            return Err(Status::internal(format!(
+                                "create_nodes_batch: row[{i}] missing node id"
+                            )));
+                        }
+                    };
+                    Ok(graph::Node {
+                        node_id,
+                        labels: labels.clone(),
+                        properties: req.nodes[i].properties.clone(),
+                        element_id: NodeId::from_raw(node_id).to_element_id(),
+                        version: node_version(&db, node_id),
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        });
 
         Ok(Response::new(graph::CreateNodesBatchResponse {
             nodes: nodes?,
@@ -213,18 +218,17 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         // An explicit `RETURN n, n.__label__` would strip `n.*` properties in the Project step.
         // get_node is read-only — shared lock lets parallel reads
         // proceed without blocking on each other.
-        let rows = {
-            let db = self.database.read();
-            db.execute_cypher_shared(
+        let rows = super::blocking(|| {
+            self.database.read().execute_cypher_shared(
                 "MATCH (n) WHERE n = $id RETURN *",
                 Some(params),
                 None,
                 None,
                 None,
             )
-            .map_err(|e| db_err_to_status("get_node", e))?
-            .rows
-        };
+        })
+        .map_err(|e| db_err_to_status("get_node", e))?
+        .rows;
 
         let row = rows
             .first()
@@ -265,7 +269,7 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             element_id: NodeId::from_raw(node_id).to_element_id(),
             // What a reader needs to write this node back conditionally: the
             // version it is at, read in the same call as its contents.
-            version: node_version(&self.database.read(), node_id),
+            version: super::blocking(|| node_version(&self.database.read(), node_id)),
         }))
     }
 
@@ -304,11 +308,12 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
              RETURN src, dst"
         );
 
-        let rows = {
-            let mut db = self.database.write();
-            db.execute_cypher_with_params(&cypher, params)
-                .map_err(|e| db_err_to_status("create_edge", e))?
-        };
+        let rows = super::blocking(|| {
+            self.database
+                .write()
+                .execute_cypher_with_params(&cypher, params)
+        })
+        .map_err(|e| db_err_to_status("create_edge", e))?;
 
         let row = rows
             .first()
@@ -397,58 +402,18 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
         };
 
         // Traversal is read-only — shared lock for parallel reads.
-        let rows = {
-            let db = self.database.read();
-            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
-                .map_err(|e| db_err_to_status("traverse", e))?
-                .rows
-        };
+        let rows = super::blocking(|| {
+            self.database
+                .read()
+                .execute_cypher_shared(&cypher, Some(params), None, None, None)
+        })
+        .map_err(|e| db_err_to_status("traverse", e))?
+        .rows;
 
         // Held across the mapping so every node in one traversal reports its
         // version against one view, rather than each taking its own lock and
         // its own moment.
-        let db = self.database.read();
-        let nodes: Vec<graph::Node> = rows
-            .iter()
-            .filter_map(|row| {
-                // `RETURN *` copies all columns from the Traverse operator row:
-                // `n` = node_id, `n.__label__` = primary label, `n.<prop>` = properties.
-                let node_id = match row.get("n")? {
-                    Value::Int(id) => *id as u64,
-                    _ => return None,
-                };
-
-                // Primary label stored by the Traverse operator as `n.__label__`.
-                let label = match row.get("n.__label__") {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => String::new(),
-                };
-                let labels = if label.is_empty() {
-                    vec![]
-                } else {
-                    vec![label]
-                };
-
-                // All node properties are in the row as `n.<prop>` (excluding internal `__*`).
-                let mut properties: std::collections::HashMap<String, common::PropertyValue> =
-                    std::collections::HashMap::new();
-                for (k, v) in row {
-                    if let Some(prop_name) = k.strip_prefix("n.") {
-                        if !prop_name.starts_with("__") {
-                            properties.insert(prop_name.to_string(), value_to_proto_pub(v));
-                        }
-                    }
-                }
-
-                Some(graph::Node {
-                    node_id,
-                    labels,
-                    properties,
-                    element_id: NodeId::from_raw(node_id).to_element_id(),
-                    version: node_version(&db, node_id),
-                })
-            })
-            .collect();
+        let nodes = super::blocking(|| traversed_nodes(&self.database.read(), &rows));
 
         Ok(Response::new(graph::TraverseResponse {
             nodes,
@@ -456,6 +421,50 @@ impl graph::graph_service_server::GraphService for GraphServiceImpl {
             pagination: None,
         }))
     }
+}
+
+/// The nodes a traversal returned, each with the version `db` holds.
+fn traversed_nodes(db: &Database, rows: &[coordinode_query::executor::Row]) -> Vec<graph::Node> {
+    rows.iter()
+        .filter_map(|row| {
+            // `RETURN *` copies all columns from the Traverse operator row:
+            // `n` = node_id, `n.__label__` = primary label, `n.<prop>` = properties.
+            let node_id = match row.get("n")? {
+                Value::Int(id) => *id as u64,
+                _ => return None,
+            };
+
+            // Primary label stored by the Traverse operator as `n.__label__`.
+            let label = match row.get("n.__label__") {
+                Some(Value::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let labels = if label.is_empty() {
+                vec![]
+            } else {
+                vec![label]
+            };
+
+            // All node properties are in the row as `n.<prop>` (excluding internal `__*`).
+            let mut properties: std::collections::HashMap<String, common::PropertyValue> =
+                std::collections::HashMap::new();
+            for (k, v) in row {
+                if let Some(prop_name) = k.strip_prefix("n.") {
+                    if !prop_name.starts_with("__") {
+                        properties.insert(prop_name.to_string(), value_to_proto_pub(v));
+                    }
+                }
+            }
+
+            Some(graph::Node {
+                node_id,
+                labels,
+                properties,
+                element_id: NodeId::from_raw(node_id).to_element_id(),
+                version: node_version(db, node_id),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

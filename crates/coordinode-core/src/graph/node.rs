@@ -9,8 +9,9 @@
 //!
 //! Both maps are written with keys ascending, so equal records have equal bytes.
 
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,28 @@ pub const NODE_ID_MAX_SEQUENCE: u64 = (1u64 << NODE_ID_SEQUENCE_BITS) - 1;
 
 /// Inclusive maximum value for the `shard_hint` field.
 pub const NODE_ID_MAX_HINT: u32 = (1u32 << NODE_ID_HINT_BITS) - 1;
+
+/// Length of the token that identifies one NodeId lease grant.
+pub const NODE_LEASE_TOKEN_LEN: usize = 16;
+
+/// Schema key prefix of the granted NodeId leases. One write-once record per
+/// grant, keyed by its ceiling (big-endian, so the last record holds the
+/// ceiling every new grant starts from) and holding the grant's token.
+pub const NODE_LEASE_KEY_PREFIX: &[u8] = b"ids:node_lease:";
+
+/// Schema key of the lease record whose ceiling is `ceiling`.
+pub fn node_lease_key(ceiling: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NODE_LEASE_KEY_PREFIX.len() + 8);
+    key.extend_from_slice(NODE_LEASE_KEY_PREFIX);
+    key.extend_from_slice(&ceiling.to_be_bytes());
+    key
+}
+
+/// The ceiling a lease record key names, or `None` for any other key.
+pub fn decode_node_lease_key(key: &[u8]) -> Option<u64> {
+    let raw: [u8; 8] = key.strip_prefix(NODE_LEASE_KEY_PREFIX)?.try_into().ok()?;
+    Some(u64::from_be_bytes(raw))
+}
 
 /// A unique 64-bit node identifier with embedded origin-shard hint.
 ///
@@ -80,36 +103,6 @@ impl NodeId {
     /// Extract the per-shard sequence (bottom 44 bits).
     pub fn sequence(self) -> u64 {
         self.0 & NODE_ID_MAX_SEQUENCE
-    }
-
-    /// Derive a stable NodeId from a relational table's primary key.
-    ///
-    /// A `STORAGE` table bridges its declared primary key to a NodeId so the
-    /// same key always maps to the same node (identity + upsert-by-key) and the
-    /// row is a first-class graph node. The mapping is a deterministic FNV-1a
-    /// hash of the label name and the encoded key, folded into the 44-bit
-    /// sequence with a zero shard hint (matching CE's `origin_shard_hint == 0`
-    /// invariant; EE placement still routes by the key, not the hint). `label`
-    /// namespaces the key so the same key bytes under different tables never
-    /// collide. `key_encoded` is the caller's stable encoding of the primary-key
-    /// value(s).
-    pub fn from_primary_key(label: &str, key_encoded: &[u8]) -> Self {
-        // FNV-1a (64-bit) — deterministic and seed-free, so every node derives
-        // the identical NodeId for a given (label, key). Not a hasher from the
-        // standard library (those are seeded / unspecified across builds).
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut hash = FNV_OFFSET;
-        let mut mix = |bytes: &[u8]| {
-            for &b in bytes {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-        };
-        mix(label.as_bytes());
-        mix(&[0xff]); // separator so (label, key) framing is unambiguous
-        mix(key_encoded);
-        Self::compose(0, hash & NODE_ID_MAX_SEQUENCE)
     }
 }
 
@@ -199,86 +192,196 @@ fn decode_crockford_char(c: u8) -> Option<u8> {
     }
 }
 
-/// Monotonic per-shard node ID allocator.
+/// A range of sequences `(base, ceiling]` granted to one allocator by the
+/// replicated log: no other allocator is ever granted any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdLease {
+    /// The last sequence below the range.
+    pub base: u64,
+    /// The last sequence in the range.
+    pub ceiling: u64,
+}
+
+/// Why an allocator could not hand out an identifier.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdLeaseError {
+    /// The shard's sequence space is used up.
+    #[error("the NodeId sequence space of shard {shard_hint} is exhausted")]
+    Exhausted {
+        /// The shard whose space ran out.
+        shard_hint: u32,
+    },
+    /// The log did not grant a lease, e.g. because this member does not lead.
+    #[error("no NodeId lease was granted: {0}")]
+    NotGranted(String),
+    /// The reserver answered with a range the allocator cannot use.
+    #[error("the NodeId lease ({base}, {ceiling}] is not a valid range")]
+    InvalidLease {
+        /// The lease's base.
+        base: u64,
+        /// The lease's ceiling.
+        ceiling: u64,
+    },
+}
+
+/// Takes NodeId leases from the replicated log for a [`NodeIdAllocator`].
 ///
-/// Thread-safe, lock-free. Each call to `next()` increments the local
-/// sequence counter and composes it with the configured `shard_hint` into a
-/// NodeId. CE constructs with `shard_hint = 0`; EE shard leaders construct
-/// with their coordinator-assigned hint.
+/// Each successful call returns a range no other call, on any member, ever
+/// returns, and above every range granted before it; it is durable before
+/// it returns, so no crash lets it be granted again.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot grant NodeId leases",
+    label = "not an `IdLeaseReserver`",
+    note = "the embedded database grants leases through its proposal pipeline"
+)]
+pub trait IdLeaseReserver: Send + Sync {
+    /// Take a new lease.
+    ///
+    /// # Errors
+    ///
+    /// The log refused or could not complete the grant.
+    fn reserve(&self) -> Result<IdLease, IdLeaseError>;
+}
+
+/// Bits of the counter and ceiling words that carry the lease epoch, above
+/// the sequence.
+const LEASE_EPOCH_SHIFT: u32 = NODE_ID_SEQUENCE_BITS;
+
+/// Lease epochs wrap within 20 bits. Leases take even epochs only (each new
+/// one is two past the last), so a draw that carries past the top of the
+/// sequence space lands on an odd epoch no lease is ever read against.
+const LEASE_EPOCH_MASK: u64 = (1 << (64 - LEASE_EPOCH_SHIFT)) - 1;
+
+/// Per-shard NodeId allocator that hands out sequences only from a lease.
 ///
-/// Sequence is constrained to `[1, NODE_ID_MAX_SEQUENCE]` — wrap is a hard
-/// panic. At 1M writes/sec on a single shard the 44-bit space exhausts in
-/// ~540 days; at 10K writes/sec (typical enterprise) in ~55 years — so
-/// exhaustion is not a steady-state concern, but the check is mandatory
-/// because wrap would corrupt routing (sequence bits leaking into hint bits
-/// would map nodes to phantom shards).
+/// Lock-free. `counter` and `ceiling` each carry `[lease epoch: 20][44 bits]`:
+/// the last sequence drawn and the lease's last sequence. A draw is one
+/// `fetch_add` and one load, and counts only when its epoch is the ceiling's
+/// and it does not pass the ceiling. A new lease publishes its ceiling, with
+/// the next epoch, before its counter, so a sequence drawn under an old lease
+/// is never read against a new one: a range granted to someone else is never
+/// taken for ours. Sequences skipped on a lease change are gaps, never
+/// duplicates.
+///
+/// Sequence is constrained to `[1, NODE_ID_MAX_SEQUENCE]`: a wrap would leak
+/// sequence bits into the hint and map nodes to phantom shards.
 pub struct NodeIdAllocator {
     shard_hint: u32,
     counter: AtomicU64,
+    ceiling: AtomicU64,
+    reserver: Option<Arc<dyn IdLeaseReserver>>,
 }
 
 impl NodeIdAllocator {
-    /// Create a new allocator for a given shard hint, starting from sequence 0.
+    /// An allocator that owns the whole sequence space of `shard_hint`,
+    /// starting at 1: for a store no other member writes to (tests, tools).
     ///
-    /// The `shard_hint` must fit in `NODE_ID_HINT_BITS` (≤ 2^20 - 1). CE
-    /// callers pass `0`; EE shard leaders pass their coordinator-assigned
-    /// hint. The hint is fixed for the allocator's lifetime — changing it
-    /// requires creating a new allocator (which never happens in practice —
-    /// shards do not change their hint after the coordinator assigns it).
+    /// # Panics
+    ///
+    /// `shard_hint` exceeds `NODE_ID_MAX_HINT`.
     pub fn new(shard_hint: u32) -> Self {
+        Self::unleased(NodeId::compose(Self::checked_hint(shard_hint), 0))
+    }
+
+    /// An allocator that owns the sequence space above `last_id`, with its
+    /// shard hint, and hands out `last_id + 1` first.
+    pub fn resume_from(last_id: NodeId) -> Self {
+        Self::unleased(last_id)
+    }
+
+    /// An allocator that takes its sequences from leases `reserver` grants.
+    /// It holds none until the first draw asks for one.
+    ///
+    /// # Panics
+    ///
+    /// `shard_hint` exceeds `NODE_ID_MAX_HINT`.
+    pub fn leased(shard_hint: u32, reserver: Arc<dyn IdLeaseReserver>) -> Self {
+        Self {
+            shard_hint: Self::checked_hint(shard_hint),
+            counter: AtomicU64::new(0),
+            ceiling: AtomicU64::new(0),
+            reserver: Some(reserver),
+        }
+    }
+
+    fn unleased(last_id: NodeId) -> Self {
+        Self {
+            shard_hint: last_id.origin_shard_hint(),
+            counter: AtomicU64::new(last_id.sequence()),
+            ceiling: AtomicU64::new(NODE_ID_MAX_SEQUENCE),
+            reserver: None,
+        }
+    }
+
+    fn checked_hint(shard_hint: u32) -> u32 {
         assert!(
             shard_hint <= NODE_ID_MAX_HINT,
             "shard_hint {shard_hint} exceeds 20-bit ceiling {NODE_ID_MAX_HINT}"
         );
-        Self {
-            shard_hint,
-            counter: AtomicU64::new(0),
+        shard_hint
+    }
+
+    /// Allocate the next node ID for this shard, taking a new lease when the
+    /// current one is used up.
+    ///
+    /// # Errors
+    ///
+    /// The sequence space is exhausted, or a lease was needed and not
+    /// granted.
+    pub fn next(&self) -> Result<NodeId, IdLeaseError> {
+        loop {
+            let drawn = self.counter.fetch_add(1, Ordering::AcqRel) + 1;
+            let ceiling = self.ceiling.load(Ordering::Acquire);
+            let (drawn_epoch, lease_epoch) =
+                (drawn >> LEASE_EPOCH_SHIFT, ceiling >> LEASE_EPOCH_SHIFT);
+            if drawn_epoch == lease_epoch {
+                if drawn & NODE_ID_MAX_SEQUENCE <= ceiling & NODE_ID_MAX_SEQUENCE {
+                    return Ok(NodeId::compose(
+                        self.shard_hint,
+                        drawn & NODE_ID_MAX_SEQUENCE,
+                    ));
+                }
+                self.renew(ceiling)?;
+            } else if drawn_epoch == (lease_epoch + 1) & LEASE_EPOCH_MASK {
+                // The draw carried past the top of the sequence space into
+                // the odd epoch no lease ever uses.
+                self.renew(ceiling)?;
+            }
+            // Otherwise the lease changed after the draw: draw again.
         }
     }
 
-    /// Create an allocator resuming from the last allocated ID.
-    ///
-    /// The shard hint is inferred from `last_id` so persisted high-water
-    /// marks round-trip across restarts without separate bookkeeping.
-    pub fn resume_from(last_id: NodeId) -> Self {
-        Self {
-            shard_hint: last_id.origin_shard_hint(),
-            counter: AtomicU64::new(last_id.sequence()),
+    /// Replace the lease whose ceiling word is `exhausted`. Several threads
+    /// may exhaust it at once; the first to install a new lease wins and the
+    /// leases the others took are left unused.
+    fn renew(&self, exhausted: u64) -> Result<(), IdLeaseError> {
+        let Some(reserver) = &self.reserver else {
+            return Err(IdLeaseError::Exhausted {
+                shard_hint: self.shard_hint,
+            });
+        };
+        let lease = reserver.reserve()?;
+        if lease.base >= lease.ceiling || lease.ceiling > NODE_ID_MAX_SEQUENCE {
+            return Err(IdLeaseError::InvalidLease {
+                base: lease.base,
+                ceiling: lease.ceiling,
+            });
         }
-    }
-
-    /// Allocate the next node ID for this shard.
-    ///
-    /// Increments the per-shard sequence counter and composes it with the
-    /// fixed hint. Panics on wrap into the hint range — see struct docs.
-    pub fn next(&self) -> NodeId {
-        let sequence = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        assert!(
-            sequence <= NODE_ID_MAX_SEQUENCE,
-            "NodeIdAllocator sequence wrap for shard_hint {}: {sequence} > {NODE_ID_MAX_SEQUENCE}",
-            self.shard_hint
-        );
-        NodeId::compose(self.shard_hint, sequence)
-    }
-
-    /// Get the current sequence high-water mark composed with the hint.
-    pub fn current(&self) -> NodeId {
-        NodeId::compose(self.shard_hint, self.counter.load(Ordering::SeqCst))
-    }
-
-    /// Advance to at least the given ID's sequence (for recovery).
-    ///
-    /// The hint must match — advancing across hints is a logic error
-    /// (sequence space is per-shard).
-    pub fn advance_to(&self, id: NodeId) {
-        assert_eq!(
-            id.origin_shard_hint(),
-            self.shard_hint,
-            "advance_to received NodeId from shard_hint {} but allocator is for {}",
-            id.origin_shard_hint(),
-            self.shard_hint,
-        );
-        self.counter.fetch_max(id.sequence(), Ordering::SeqCst);
+        let epoch = ((exhausted >> LEASE_EPOCH_SHIFT) + 2) & LEASE_EPOCH_MASK;
+        let tagged = |sequence: u64| (epoch << LEASE_EPOCH_SHIFT) | sequence;
+        if self
+            .ceiling
+            .compare_exchange(
+                exhausted,
+                tagged(lease.ceiling),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.counter.store(tagged(lease.base), Ordering::Release);
+        }
+        Ok(())
     }
 
     /// The shard hint this allocator is configured for.

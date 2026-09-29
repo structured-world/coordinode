@@ -22,6 +22,7 @@ For new applications: prefer `elementId`. The integer form exists because the Ne
 - **Crockford normalisations.** The characters `I` and `L` are normalised to `1`, and `O` is normalised to `0`. This is a deliberate property of the Crockford alphabet — it lets humans transcribe IDs verbally without ambiguity. So `01ARZ3NDEKTSV` and `OLARZ3NDEKTSV` parse to the same node.
 - **Sort-stable within a shard.** When two nodes are created on the same shard, the one allocated first has a lexicographically smaller `elementId` (when stripped of the shard prefix). This is a consequence of the underlying `u64` being monotone per shard.
 - **Roundtrip-safe.** Every valid `elementId` decodes to exactly one `u64`, and every `u64` encodes to exactly one canonical 13-character string.
+- **Never reissued.** An identifier, once handed out, is never given to another node, including after a process crash, a restart or a change of cluster leader. Identifiers are handed out from ranges the cluster has agreed on before they are used, so a crash can leave gaps in the numbering but never repeats a number. Do not read meaning into gaps or into the distance between two identifiers.
 
 The 64-bit space is split into two windows:
 

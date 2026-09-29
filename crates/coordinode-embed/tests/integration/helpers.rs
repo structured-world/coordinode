@@ -29,6 +29,7 @@ pub fn make_ctx_legacy<'a>(
     ExecutionContext {
         engine,
         interner,
+        field_registrar: None,
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,
@@ -39,6 +40,7 @@ pub fn make_ctx_legacy<'a>(
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
+        key_claims: Default::default(),
         text_index: None,
         text_index_registry: None,
         vector_indexes: None,
@@ -96,6 +98,7 @@ pub fn make_ctx_mvcc<'a>(
     ExecutionContext {
         engine,
         interner,
+        field_registrar: None,
         id_allocator: allocator,
         shard_id: 0,
         scan_paging: None,
@@ -106,6 +109,7 @@ pub fn make_ctx_mvcc<'a>(
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
+        key_claims: Default::default(),
         text_index: None,
         text_index_registry: None,
         vector_indexes: None,
@@ -164,6 +168,7 @@ pub fn make_ctx_with_pipeline<'a>(
     ExecutionContext {
         engine,
         interner,
+        field_registrar: None,
         id_allocator: allocator,
         shard_id: 0,
         scan_paging: None,
@@ -174,6 +179,7 @@ pub fn make_ctx_with_pipeline<'a>(
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
+        key_claims: Default::default(),
         text_index: None,
         text_index_registry: None,
         vector_indexes: None,

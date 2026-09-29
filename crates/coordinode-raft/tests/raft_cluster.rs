@@ -12,13 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
-    Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+    MetadataCommand, Mutation, PartitionId, ProposalError, ProposalIdGenerator, ProposalPipeline,
+    RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::{RaftNode, RaftNodeError};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
 use coordinode_storage::engine::partition::Partition;
+use openraft::async_runtime::watch::WatchReceiver as _;
 
 /// Hard timeout for cluster tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -189,6 +192,58 @@ async fn cluster_3_node_bootstrap() {
         result.is_ok(),
         "cluster_3_node_bootstrap TIMED OUT after {TEST_TIMEOUT:?} — \
          likely streaming AppendEntries not working, openraft can't replicate"
+    );
+}
+
+/// A member added by a bare `host:port`, the form the operator guide gives
+/// for `admin node join --addr`, receives the leader's writes. The leader
+/// dialled the address as given, a URI without a scheme, so nothing ever
+/// reached the member and its promotion waited forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_added_by_host_and_port_receives_the_log() {
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        await_leadership(&n1.node).await;
+
+        n1.node
+            .add_node(2, format!("127.0.0.1:{p2}"))
+            .await
+            .expect("add 2");
+        n1.node
+            .change_membership(vec![1, 2])
+            .await
+            .expect("membership");
+
+        let proposal = RaftProposal {
+            id: ProposalIdGenerator::with_base(1u64 << 48).next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:1:bare-addr".to_vec(),
+                value: b"arrived".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(100),
+            start_ts: Timestamp::from_raw(99),
+            bypass_rate_limiter: false,
+        };
+        n1.node
+            .pipeline()
+            .propose_and_wait(&proposal)
+            .expect("propose on leader");
+        assert!(
+            await_replicated(&n2.engine, b"node:1:bare-addr", b"arrived").await,
+            "the member never received the write"
+        );
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "a member added by host:port never became a voter"
     );
 }
 
@@ -948,6 +1003,19 @@ async fn cluster_crash_recovery() {
             n1.shutdown().await.expect("s1");
             n2.shutdown().await.expect("s2");
             n3.shutdown().await.expect("s3");
+            drop(pipeline);
+            drop((n1, n2, n3));
+            // A shutdown waits out everything that holds the node's engine,
+            // so the directory reopens as soon as it returns. The last node
+            // down leads a group whose peers are gone, with its replication
+            // tasks still in calls to them.
+            for engine in [&e1, &e2, &e3] {
+                assert_eq!(
+                    Arc::strong_count(engine),
+                    1,
+                    "a stopped node still holds its engine"
+                );
+            }
         }
         // All dropped, files flushed
 
@@ -1010,8 +1078,17 @@ async fn cluster_crash_recovery() {
             .await
             .expect("reopen n3");
 
-            // Wait for leader election
-            tokio::time::sleep(Duration::from_millis(2000)).await;
+            // Wait for any member to win the election, bounded as
+            // `await_leadership` is: a fixed sleep fails on a loaded machine.
+            let mut any_leader = false;
+            for _ in 0..150 {
+                if n1.is_leader().await || n2.is_leader().await || n3.is_leader().await {
+                    any_leader = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(any_leader, "cluster should elect a leader after restart");
 
             // Verify data survived on all nodes
             for (label, engine) in [("n1", &e1), ("n2", &e2), ("n3", &e3)] {
@@ -1027,10 +1104,7 @@ async fn cluster_crash_recovery() {
                 }
             }
 
-            // Verify cluster is functional: find leader and propose
-            let any_leader = n1.is_leader().await || n2.is_leader().await || n3.is_leader().await;
-            assert!(any_leader, "cluster should elect a leader after restart");
-
+            // Verify cluster is functional: propose through the leader
             let leader = if n1.is_leader().await {
                 &n1
             } else if n2.is_leader().await {
@@ -1327,7 +1401,8 @@ async fn cluster_background_snapshot_trigger() {
 
         let snap_config = SnapshotTriggerConfig {
             check_interval: Duration::from_secs(1),
-            disk_space_threshold: 0, // always above threshold
+            log_bytes: 0, // any growth is enough
+            ..Default::default()
         };
 
         let n1 = RaftNode::open_cluster_with_snapshot_config(
@@ -1386,10 +1461,85 @@ async fn cluster_background_snapshot_trigger() {
     );
 }
 
+/// A log that grows past the size threshold is snapshotted, with the entry
+/// count and the timer both out of reach: a few large entries compact the
+/// log as a count of small ones would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
+    use coordinode_raft::cluster::SnapshotTriggerConfig;
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let p1 = alloc_port();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir.path(),
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )]);
+        let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+        let n1 = RaftNode::open_cluster_with_snapshot_config(
+            1,
+            Arc::clone(&engine),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+            SnapshotTriggerConfig {
+                logs_since_last: u64::MAX,
+                log_bytes: 64 * 1024,
+                check_interval: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .expect("open leader");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // A handful of entries, each far larger than the count would matter
+        // for, together well past the size threshold.
+        let pipeline = n1.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        for i in 1..=8u64 {
+            let proposal = RaftProposal {
+                id: id_gen.next(),
+                mutations: vec![Mutation::Put {
+                    partition: PartitionId::Node,
+                    key: format!("node:1:size-trigger-{i}").into_bytes(),
+                    value: vec![b'x'; 32 * 1024],
+                }],
+                commit_ts: Timestamp::from_raw(100 + i),
+                start_ts: Timestamp::from_raw(99 + i),
+                bypass_rate_limiter: false,
+            };
+            pipeline.propose_and_wait(&proposal).expect("propose");
+        }
+
+        let mut snapshotted = false;
+        for _ in 0..50 {
+            if n1
+                .raft()
+                .get_snapshot()
+                .await
+                .expect("get_snapshot")
+                .is_some()
+            {
+                snapshotted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(snapshotted, "the size threshold never triggered a snapshot");
+        n1.shutdown().await.expect("shutdown");
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — a_log_grown_past_its_size_threshold_is_snapshotted"
+    );
+}
+
 /// The background trigger must NOT rebuild a snapshot when no entries
-/// were applied since the last build. Every build serializes ALL
-/// partitions (hundreds of MB on real data) and was observed to starve
-/// raft ticks and cause leader churn when rebuilt every check interval.
+/// were applied since the last build: every build captures ALL partitions,
+/// pausing applies while it flushes them.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
     use coordinode_raft::cluster::SnapshotTriggerConfig;
@@ -1409,7 +1559,8 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
 
         let snap_config = SnapshotTriggerConfig {
             check_interval: Duration::from_secs(1),
-            disk_space_threshold: 0, // disk criterion always satisfied
+            log_bytes: 0, // the size criterion is always satisfied
+            ..Default::default()
         };
         let n1 = RaftNode::open_cluster_with_snapshot_config(
             1,
@@ -1437,10 +1588,12 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         };
         pipeline.propose_and_wait(&proposal).expect("propose");
 
-        // Let the trigger fire and build the first snapshot. Polled rather
-        // than slept on: under a loaded machine a build takes longer than
-        // any fixed pause.
-        let builds_after_first = await_builds_above(&n1, 0).await;
+        // Let the trigger build a snapshot that covers this entry. A build the
+        // trigger started before the entry applied covers less, and the
+        // rebuild that follows is owed, not idle; counting builds alone would
+        // take that owed rebuild for a spurious one. Polled rather than slept
+        // on: under a loaded machine a build takes longer than any fixed pause.
+        let builds_after_first = await_snapshot_covering(&n1, n1.applied_index()).await;
 
         // NO new entries: several more check intervals must not rebuild.
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1478,6 +1631,23 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
 
 /// Wait until the node has built more than `builds` snapshots, returning the
 /// new count; panics (through the caller's timeout) if it never does.
+/// Block until the node's last snapshot covers `index`, then return how many
+/// snapshots it has built.
+async fn await_snapshot_covering(node: &RaftNode, index: u64) -> u64 {
+    loop {
+        let covered = node
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .snapshot
+            .map(|id| id.index);
+        if covered.is_some_and(|c| c >= index) {
+            return node.snapshot_builds();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn await_builds_above(node: &RaftNode, builds: u64) -> u64 {
     loop {
         let now = node.snapshot_builds();
@@ -1516,7 +1686,8 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
         );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600), // disable periodic
-            disk_space_threshold: u64::MAX,            // disable disk-based
+            log_bytes: u64::MAX,                       // disable size-based
+            ..Default::default()
         };
 
         let n1 = RaftNode::open_cluster_with_snapshot_config(
@@ -1748,6 +1919,17 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
             .purge_log(last)
             .await
             .expect("trigger purge");
+        // The trigger only asks: openraft purges later. A node 3 back before
+        // then would be caught up from the log instead.
+        await_condition(Duration::from_secs(10), "leader purges its log", || {
+            n1.node
+                .raft()
+                .metrics()
+                .borrow_watched()
+                .purged
+                .is_some_and(|id| id.index >= last)
+        })
+        .await;
 
         // Restart node 3. The port was free during the downtime, so another
         // test may hold it for a moment; retry the bind.
@@ -1803,6 +1985,202 @@ async fn follower_caught_up_by_snapshot_serves_causal_reads_while_idle() {
     );
 }
 
+/// A leader shutting down hands its leadership to a voter that is still
+/// there. The first voter in the membership may already be stopped: handing
+/// leadership to it waits out the whole transfer timeout, and the group then
+/// has to find its leader by election after all.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_hands_leadership_to_a_live_voter() {
+    use openraft::async_runtime::watch::WatchReceiver;
+
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters");
+
+        // Node 2, the first voter after the leader, stops, and the leader
+        // goes on without hearing from it for longer than an election takes.
+        n2.node.shutdown().await.expect("shutdown 2");
+        let election = Duration::from_millis(n1.node.raft().config().election_timeout_max);
+        tokio::time::sleep(election * 2).await;
+
+        let started = tokio::time::Instant::now();
+        n1.node.shutdown().await.expect("shutdown 1");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(4),
+            "the leader took {took:?} to stop: it handed leadership to a stopped voter"
+        );
+        await_condition(Duration::from_secs(5), "node 3 takes over", || {
+            n3.node.raft().metrics().borrow_watched().current_leader == Some(3)
+        })
+        .await;
+
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: shutdown_hands_leadership_to_a_live_voter"
+    );
+}
+
+/// A node shutting down while a call to a peer hangs must neither wait the
+/// call out nor leave anything holding its engine. A peer that accepts the
+/// connection and never answers keeps a replication task inside its call,
+/// with a reader of the log, and so the engine, in hand; the directory must
+/// still reopen as soon as the shutdown returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_does_not_wait_out_a_peer_that_never_answers() {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        // Accepts connections and never reads from or answers them.
+        let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hole = black_hole.local_addr().expect("local addr");
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = black_hole.accept().await {
+                held.push(conn);
+            }
+        });
+
+        let n1 = create_leader(1, alloc_port()).await;
+        await_leadership(&n1.node).await;
+        // Not blocking: the learner never catches up.
+        n1.node
+            .raft()
+            .add_learner(
+                2,
+                openraft::impls::BasicNode {
+                    addr: format!("http://{hole}"),
+                },
+                false,
+            )
+            .await
+            .expect("add learner");
+        // Let replication reach the peer and stall there.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let started = tokio::time::Instant::now();
+        n1.node.shutdown().await.expect("shutdown");
+        let took = started.elapsed();
+        let TestNode { node, engine, _dir } = n1;
+        drop(node);
+
+        assert_eq!(
+            Arc::strong_count(&engine),
+            1,
+            "the stopped node's tasks still hold the engine"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown waited {took:?} on a peer that never answers"
+        );
+        holder.abort();
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: shutdown_does_not_wait_out_a_peer_that_never_answers"
+    );
+}
+
+/// A node whose consensus has stopped cannot answer an append stream, and
+/// the stream must end with an error rather than cleanly. A leader reading a
+/// cleanly ended stream keeps waiting on the entries it sent: it neither
+/// retries nor falls back to a snapshot, so a follower that restarts in the
+/// same process is never caught up.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_stream_to_stopped_node_ends_with_an_error() {
+    use coordinode_raft::proto::replication::RaftPayload;
+    use coordinode_raft::proto::replication::raft_service_client::RaftServiceClient;
+    use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
+    use coordinode_raft::storage::TypeConfig;
+    use futures_util::StreamExt;
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = Arc::new(
+            StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]))
+            .expect("open"),
+        );
+        let (node, handler) = RaftNode::open_cluster_embedded(
+            1,
+            Arc::clone(&engine),
+            "http://127.0.0.1:1".to_string(),
+        )
+        .await
+        .expect("open node");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(RaftServiceServer::new(handler))
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        );
+
+        node.shutdown().await.expect("shutdown");
+
+        let mut client = RaftServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect");
+        let request = openraft::raft::AppendEntriesRequest::<TypeConfig> {
+            vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 1),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let payload = RaftPayload {
+            data: rmp_serde::to_vec(&request).expect("encode"),
+        };
+        let mut replies = client
+            .stream_append(futures_util::stream::iter([payload]))
+            .await
+            .expect("the stream opens")
+            .into_inner();
+
+        let first = replies.next().await;
+        assert!(
+            matches!(&first, Some(Err(status)) if status.code() == tonic::Code::Unavailable),
+            "a stopped node must fail the stream, got {first:?}"
+        );
+
+        server.abort();
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: append_stream_to_stopped_node_ends_with_an_error"
+    );
+}
+
 /// Multi-chunk gRPC snapshot transfer.
 /// Same pattern as cluster_snapshot_grpc_transfer_to_new_node but with
 /// large payload (>4MB) to verify chunked transfer protocol works
@@ -1831,7 +2209,8 @@ async fn cluster_snapshot_multi_chunk_transfer() {
         );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600),
-            disk_space_threshold: u64::MAX,
+            log_bytes: u64::MAX,
+            ..Default::default()
         };
 
         let n1 = RaftNode::open_cluster_with_snapshot_config(
@@ -2461,6 +2840,57 @@ async fn a_transfer_to_a_stopped_member_reports_the_timeout() {
     );
 }
 
+/// A leader that can no longer reach a quorum still leads by its own account,
+/// and a transfer it is asked for must be tried and reported, not skipped as
+/// if it did not lead: whether the group confirms the lease is not the
+/// question, and asking it waits on peers that may be gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_by_a_leader_without_its_quorum_reports_the_timeout() {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let (p1, p2, p3) = (alloc_port(), alloc_port(), alloc_port());
+        let n1 = create_leader(1, p1).await;
+        let n2 = create_follower(2, p2).await;
+        let n3 = create_follower(3, p3).await;
+
+        await_leadership(&n1.node).await;
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add 2");
+        n1.node
+            .add_node(3, format!("http://127.0.0.1:{p3}"))
+            .await
+            .expect("add 3");
+        n1.node
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters");
+
+        n2.node.shutdown().await.expect("stop 2");
+        n3.node.shutdown().await.expect("stop 3");
+        // Past any lease the leader held from its last quorum.
+        let election = Duration::from_millis(n1.node.raft().config().election_timeout_max);
+        tokio::time::sleep(election * 2).await;
+
+        let outcome = n1.node.transfer_leadership_to(3).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(RaftNodeError::TransferTimeout { target: 3, .. })
+            ),
+            "a transfer the leader could not make must be reported, got {outcome:?}"
+        );
+
+        n1.node.shutdown().await.expect("stop 1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_transfer_by_a_leader_without_its_quorum_reports_the_timeout"
+    );
+}
+
 /// Graceful shutdown transfers leadership automatically.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_graceful_shutdown_transfers_leadership() {
@@ -2608,7 +3038,8 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
 
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
             check_interval: Duration::from_secs(3600),
-            disk_space_threshold: u64::MAX,
+            log_bytes: u64::MAX,
+            ..Default::default()
         };
         let n1 = RaftNode::open_cluster_with_snapshot_config(
             1,
@@ -2833,7 +3264,7 @@ async fn cluster_replication_status_tracking() {
                 id: id_gen.next(),
                 mutations: vec![Mutation::Put {
                     partition: PartitionId::Node,
-                    key: format!("node:0:r140-{i}").into_bytes(),
+                    key: format!("node:0:status-{i}").into_bytes(),
                     value: format!("val-{i}").into_bytes(),
                 }],
                 commit_ts: Timestamp::from_raw(100 + i),
@@ -2881,7 +3312,7 @@ async fn cluster_replication_status_tracking() {
                 fs.lag_entries
             );
             assert!(
-                fs.matched_index > 0,
+                fs.matched_index.is_some_and(|m| m > 0),
                 "follower should have matched some entries"
             );
         }
@@ -2893,7 +3324,9 @@ async fn cluster_replication_status_tracking() {
         );
 
         // ── Test 3: Staleness check on follower ──
-        let leader_last = leader_status.matched_index;
+        let leader_last = leader_status
+            .matched_index
+            .expect("the leader holds its own log");
         assert!(
             n2.is_within_staleness(leader_last, 100),
             "follower with lag < 5 should be within staleness of 100"
@@ -3526,6 +3959,103 @@ async fn cluster_join_monitor_and_promote() {
         result.is_ok(),
         "TIMED OUT — cluster_join_monitor_and_promote"
     );
+}
+
+/// A learner that has not acknowledged a single entry is not caught up, however
+/// short the leader's log is: it is never promoted. Counting its match as
+/// index 0 made a member nothing had reached look a few entries behind, below
+/// the readiness threshold, and the promotion then waited on it forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_learner_that_never_answered_is_not_promoted() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let n1 = create_leader(1, alloc_port()).await;
+        await_leadership(&n1.node).await;
+        // Nothing listens on this port: the learner never answers.
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()))
+            .await
+            .expect("add_node");
+
+        let node = Arc::new(n1.node);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let monitor = {
+            let node = Arc::clone(&node);
+            tokio::spawn(async move { node.monitor_and_promote(2, tx).await })
+        };
+
+        let mut phases = Vec::new();
+        let watch = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(watch);
+        loop {
+            tokio::select! {
+                () = &mut watch => break,
+                ev = rx.recv() => match ev {
+                    Ok(ev) => phases.push(ev.phase),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+        monitor.abort();
+
+        use coordinode_raft::cluster::JoinPhase;
+        assert!(
+            !phases
+                .iter()
+                .any(|p| matches!(p, JoinPhase::ReadyCheck | JoinPhase::Promoting)),
+            "an unreached learner was taken for caught up: {phases:?}"
+        );
+        let learner = node
+            .replication_status()
+            .expect("leader status")
+            .into_iter()
+            .find(|s| s.node_id == 2)
+            .expect("learner listed");
+        assert_eq!(learner.role, coordinode_raft::cluster::NodeRole::Learner);
+        node.shutdown().await.expect("shutdown");
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
+/// A join that cannot catch its learner up fails once the node's join timeout
+/// passes, and says so, instead of waiting the built-in half hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_that_cannot_catch_up_fails_at_the_configured_timeout() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let n1 = create_leader(1, alloc_port()).await;
+        await_leadership(&n1.node).await;
+        assert_eq!(n1.node.join_timeout(), Duration::from_secs(30 * 60));
+        assert_eq!(n1.node.join_readiness_lag(), 1_000);
+        n1.node.set_join_timeout(Duration::from_secs(1));
+        n1.node.set_join_readiness_lag(5);
+        assert_eq!(n1.node.join_readiness_lag(), 5);
+
+        n1.node
+            .add_node(2, format!("http://127.0.0.1:{}", alloc_port()))
+            .await
+            .expect("add_node");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+        let started = std::time::Instant::now();
+        let outcome = n1.node.monitor_and_promote(2, tx).await;
+        assert!(
+            outcome.is_err(),
+            "an unreachable learner cannot be promoted"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the join ran past its timeout: {:?}",
+            started.elapsed()
+        );
+        let mut failed = false;
+        while let Ok(ev) = rx.try_recv() {
+            failed |= ev.phase == coordinode_raft::cluster::JoinPhase::Failed;
+        }
+        assert!(failed, "the join must report that it failed");
+        n1.node.shutdown().await.expect("shutdown");
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
 }
 
 /// The last voter of a group shuts down after its peer is gone. Whether it
@@ -4188,5 +4718,290 @@ async fn open_cluster_rejects_busy_port() {
     assert!(
         result.is_err(),
         "open_cluster on a busy port must fail eagerly instead of starting a deaf node"
+    );
+}
+
+/// A field registration proposal: get-or-create ids for `names`.
+fn register_fields(id_gen: &ProposalIdGenerator, names: &[&str], ts: u64) -> RaftProposal {
+    RaftProposal {
+        id: id_gen.next(),
+        mutations: vec![Mutation::Command(MetadataCommand::RegisterFields {
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+        })],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts - 1),
+        bypass_rate_limiter: false,
+    }
+}
+
+/// Every binding a member holds, by name, after checking its records agree.
+fn dictionary_of(engine: &StorageEngine, names: &[&str]) -> Vec<(String, Option<u32>)> {
+    let dict = load_field_dictionary(engine).expect("the member's dictionary is consistent");
+    names
+        .iter()
+        .map(|n| ((*n).to_owned(), dict.lookup(n)))
+        .collect()
+}
+
+/// Block until `engine` binds every one of `names`.
+async fn await_bound(engine: &StorageEngine, names: &[&str], what: &str) {
+    await_condition(Duration::from_secs(20), what, || {
+        dictionary_of(engine, names)
+            .iter()
+            .all(|(_, id)| id.is_some())
+    })
+    .await;
+}
+
+/// Field ids are decided by the ordered apply, so proposers racing on
+/// overlapping names through one leader, and a new leader after the old one
+/// dies, all end with one binding per name, dense ids, and the same bindings
+/// on every member. A binding decided under the old leader keeps its id under
+/// the new one; a name the new leader registers takes the next id above the
+/// frontier the old leader left, never one already bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn field_bindings_agree_on_every_member_across_a_leader_change() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+        await_leadership(&n1.node).await;
+
+        // Eight proposers with overlapping batches: every name is asked for
+        // by more than one of them, so an id decided at the proposer instead
+        // of at apply would bind one name twice.
+        let batches: [&[&str]; 8] = [
+            &["name", "age", "email"],
+            &["age", "city"],
+            &["email", "name", "zip"],
+            &["city", "phone"],
+            &["zip", "age"],
+            &["phone", "name", "country"],
+            &["country", "city"],
+            &["email", "zip", "phone"],
+        ];
+        let first: Vec<&str> = vec!["name", "age", "email", "city", "zip", "phone", "country"];
+        let pipelines: Vec<_> = (0..batches.len()).map(|_| n1.node.pipeline()).collect();
+        tokio::task::block_in_place(|| {
+            std::thread::scope(|s| {
+                for (i, (batch, pipeline)) in batches.iter().zip(&pipelines).enumerate() {
+                    s.spawn(move || {
+                        let id_gen = ProposalIdGenerator::with_base(((i as u64) + 1) << 48);
+                        pipeline
+                            .propose_and_wait(&register_fields(&id_gen, batch, 100 + i as u64))
+                            .expect("a registration commits");
+                    });
+                }
+            });
+        });
+
+        for (engine, who) in [(&n1.engine, "n1"), (&n2.engine, "n2"), (&n3.engine, "n3")] {
+            await_bound(engine, &first, &format!("{who} binds every raced name")).await;
+        }
+        let on_leader = dictionary_of(&n1.engine, &first);
+        let mut ids: Vec<u32> = on_leader.iter().map(|(_, id)| id.expect("bound")).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (1..=first.len() as u32).collect::<Vec<_>>(),
+            "one id per name, dense from 1: {on_leader:?}"
+        );
+        assert_eq!(dictionary_of(&n2.engine, &first), on_leader, "n2 agrees");
+        assert_eq!(dictionary_of(&n3.engine, &first), on_leader, "n3 agrees");
+
+        // Kill the leader; the survivors elect one of themselves.
+        n1.node.shutdown().await.expect("shutdown leader");
+        drop(n1);
+        let mut new_leader = None;
+        for _ in 0..150 {
+            if n2.node.is_leader().await {
+                new_leader = Some((&n2, &n3));
+                break;
+            }
+            if n3.node.is_leader().await {
+                new_leader = Some((&n3, &n2));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (leader, follower) = new_leader.expect("a survivor becomes leader");
+
+        // "city" is already bound; "street" and "region" are new.
+        let id_gen = ProposalIdGenerator::with_base(20u64 << 48);
+        leader
+            .node
+            .pipeline()
+            .propose_and_wait(&register_fields(
+                &id_gen,
+                &["city", "street", "region"],
+                300,
+            ))
+            .expect("the new leader registers");
+
+        let all: Vec<&str> = first.iter().copied().chain(["street", "region"]).collect();
+        await_bound(&follower.engine, &all, "the follower binds the new names").await;
+        let after = dictionary_of(&leader.engine, &all);
+        for (name, id) in &on_leader {
+            assert_eq!(
+                after.iter().find(|(n, _)| n == name).map(|(_, i)| *i),
+                Some(*id),
+                "{name} keeps the id the old leader decided"
+            );
+        }
+        let lookup = |n: &str| after.iter().find(|(k, _)| k == n).and_then(|(_, i)| *i);
+        let frontier = first.len() as u32;
+        assert_eq!(
+            lookup("street"),
+            Some(frontier + 1),
+            "next id above the frontier"
+        );
+        assert_eq!(lookup("region"), Some(frontier + 2), "in batch order");
+        assert_eq!(
+            dictionary_of(&follower.engine, &all),
+            after,
+            "survivors agree"
+        );
+        assert_eq!(
+            field_frontier(&follower.engine).expect("frontier"),
+            frontier + 2
+        );
+
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: field_bindings_agree_on_every_member_across_a_leader_change"
+    );
+}
+
+/// A member that joins after the log was purged takes the dictionary from the
+/// snapshot and the rest from the log, and once it leads, the names it
+/// registers continue above the frontier it received: a snapshot that lost a
+/// binding would hand an id already in use to a new name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let p1 = alloc_port();
+        let p2 = alloc_port();
+        let open = |dir: &tempfile::TempDir| {
+            Arc::new(
+                StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                    "default",
+                    dir.path(),
+                    Media::Hdd,
+                    Durability::Durable,
+                    Tier::Warm,
+                )]))
+                .expect("open"),
+            )
+        };
+        let dir1 = tempfile::tempdir().expect("d1");
+        let e1 = open(&dir1);
+        let n1 = RaftNode::open_cluster_with_snapshot_config(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("a"),
+            format!("http://127.0.0.1:{p1}"),
+            coordinode_raft::cluster::SnapshotTriggerConfig {
+                check_interval: Duration::from_secs(3600),
+                log_bytes: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("leader");
+        await_leadership(&n1).await;
+        let id_gen = ProposalIdGenerator::with_base(1u64 << 48);
+        let pipeline = n1.pipeline();
+
+        // In the snapshot only.
+        pipeline
+            .propose_and_wait(&register_fields(&id_gen, &["a", "b", "c"], 100))
+            .expect("register before the snapshot");
+        n1.raft().trigger().snapshot().await.expect("snapshot");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let applied = n1.applied_index();
+        n1.raft().trigger().purge_log(applied).await.expect("purge");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // In the log only.
+        pipeline
+            .propose_and_wait(&register_fields(&id_gen, &["b", "d"], 200))
+            .expect("register after the snapshot");
+
+        let dir2 = tempfile::tempdir().expect("d2");
+        let e2 = open(&dir2);
+        let n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("a"),
+        )
+        .await
+        .expect("joining");
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add n2");
+
+        let names = ["a", "b", "c", "d"];
+        await_bound(
+            &e2,
+            &names,
+            "the joined member binds snapshot and log names",
+        )
+        .await;
+        let expected = dictionary_of(&e1, &names);
+        assert_eq!(
+            expected.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "the leader's bindings"
+        );
+        assert_eq!(
+            dictionary_of(&e2, &names),
+            expected,
+            "the joined member agrees"
+        );
+
+        // The joined member leads and registers.
+        n1.change_membership(vec![1, 2]).await.expect("membership");
+        n1.transfer_leadership_to(2).await.expect("transfer to n2");
+        await_leadership(&n2).await;
+        let id_gen2 = ProposalIdGenerator::with_base(2u64 << 48);
+        n2.pipeline()
+            .propose_and_wait(&register_fields(&id_gen2, &["a", "e"], 300))
+            .expect("the joined member registers");
+
+        let all = ["a", "b", "c", "d", "e"];
+        await_bound(&e1, &all, "the old leader binds the new name").await;
+        let after = dictionary_of(&e2, &all);
+        assert_eq!(
+            after.last().and_then(|(_, id)| *id),
+            Some(5),
+            "the new name takes the id above the received frontier"
+        );
+        assert_eq!(
+            &after[..4],
+            expected.as_slice(),
+            "earlier bindings unchanged"
+        );
+        assert_eq!(dictionary_of(&e1, &all), after, "both members agree");
+
+        n2.shutdown().await.expect("s2");
+        n1.shutdown().await.expect("s1");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_member_bootstrapped_from_a_snapshot_continues_the_dictionary"
     );
 }

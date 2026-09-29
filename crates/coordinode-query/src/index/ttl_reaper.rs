@@ -27,8 +27,8 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{
-    EdgeStore as _, LocalEdgeStore, LocalNodeStore, LocalSchemaStore, NodeStore as _,
-    SchemaStore as _,
+    EdgeStore as _, LocalEdgeStore, LocalNodeStore, LocalSchemaStore, LocalTableKeyStore,
+    NodeStore as _, SchemaStore as _, TableKeyStore as _,
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::merge::encode_remove;
@@ -94,6 +94,89 @@ struct TtlTarget {
     /// Resolved field ID for `target_field` (from interner).
     /// `None` when no interner or field not yet interned.
     target_field_id: Option<u32>,
+    /// How a deleted row frees its table key.
+    key: RowKeyRelease,
+    /// The B-tree indexes a reaped row's entries leave with it.
+    indexes: Arc<BtreeIndexes>,
+}
+
+/// The B-tree indexes in force for a reap pass, and how to read the values
+/// they index from a stored record.
+struct BtreeIndexes {
+    registry: super::IndexRegistry,
+    /// Field ids of the indexed property names the dictionary knows; a name
+    /// it does not know can only be stored by name, in the record's overflow.
+    fields: std::collections::HashMap<String, u32>,
+    /// Whether values can be read at all: a pass without the dictionary
+    /// cannot tell what a record holds under an id.
+    readable: bool,
+}
+
+impl BtreeIndexes {
+    fn load(
+        engine: &StorageEngine,
+        interner: Option<&coordinode_core::graph::intern::FieldInterner>,
+    ) -> Result<Self, String> {
+        let registry = super::IndexRegistry::new();
+        registry.load_all(engine).map_err(|e| e.to_string())?;
+        let mut fields = std::collections::HashMap::new();
+        if let Some(interner) = interner {
+            for index in registry.all() {
+                let filter = index.filter.as_ref().map(|f| f.property().to_string());
+                for name in index.properties.iter().cloned().chain(filter) {
+                    if let Some(id) = interner.lookup(&name) {
+                        fields.insert(name, id);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            readable: interner.is_some() || registry.is_empty(),
+            registry,
+            fields,
+        })
+    }
+
+    /// The mutations removing a reaped node's entries, or `None` when its
+    /// values cannot be read and so its entries cannot be named.
+    fn delete_mutations(
+        &self,
+        engine: &StorageEngine,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Option<Vec<Mutation>> {
+        let label = record.primary_label();
+        if !self.registry.has_btree_for(label) {
+            return Some(Vec::new());
+        }
+        if !self.readable {
+            return None;
+        }
+        let lookup = |name: &str| {
+            self.fields
+                .get(name)
+                .and_then(|id| record.props.get(id).cloned())
+                .or_else(|| record.get_extra(name).cloned())
+        };
+        let field_of = |name: &str| self.fields.get(name).copied();
+        let node = super::registry::NodeState {
+            node_id,
+            label,
+            value_of: &lookup,
+        };
+        Some(self.registry.delete_mutations(engine, &node, &field_of))
+    }
+}
+
+/// What deleting a row of a TTL target does to its table's key index.
+enum RowKeyRelease {
+    /// Not a table with declared key columns: nothing to free.
+    None,
+    /// The key columns, as field ids and names in key order.
+    Columns(Vec<(u32, String)>),
+    /// A keyed table whose key columns the dictionary could not resolve: its
+    /// rows are not deleted, because a deleted row would leave its key held.
+    Unresolved,
 }
 
 /// Run a single COMPUTED TTL reap pass (no interner, no pipeline — direct engine writes).
@@ -214,10 +297,23 @@ fn discover_ttl_targets(
     let schemas = LocalSchemaStore::new(engine)
         .list_labels()
         .map_err(|e| e.to_string())?;
+    let indexes = Arc::new(BtreeIndexes::load(engine, interner)?);
 
     let mut targets = Vec::new();
     for schema in schemas {
         let label_name = schema.name.clone();
+        let key = match schema.key_columns() {
+            [] => RowKeyRelease::None,
+            columns => columns
+                .iter()
+                .map(|c| {
+                    interner
+                        .and_then(|int| int.lookup(c))
+                        .map(|id| (id, c.clone()))
+                })
+                .collect::<Option<Vec<_>>>()
+                .map_or(RowKeyRelease::Unresolved, RowKeyRelease::Columns),
+        };
         for (prop_name, prop_def) in &schema.properties {
             if let PropertyType::Computed(ComputedSpec::Ttl {
                 duration_secs,
@@ -238,6 +334,12 @@ fn discover_ttl_targets(
                     scope: *scope,
                     target_field: target_field.clone(),
                     target_field_id,
+                    key: match &key {
+                        RowKeyRelease::None => RowKeyRelease::None,
+                        RowKeyRelease::Columns(c) => RowKeyRelease::Columns(c.clone()),
+                        RowKeyRelease::Unresolved => RowKeyRelease::Unresolved,
+                    },
+                    indexes: Arc::clone(&indexes),
                 });
             }
         }
@@ -316,9 +418,50 @@ fn reap_label(
             let nid_raw = node_id.as_raw();
             match target.scope {
                 TtlScope::Node => {
+                    let key_release = match &target.key {
+                        RowKeyRelease::None => None,
+                        RowKeyRelease::Unresolved => {
+                            result.errors.push(format!(
+                                "label {}: key columns not in the field dictionary; \
+                                 row {nid_raw} kept so its key is not left held",
+                                target.label
+                            ));
+                            return Ok(std::ops::ControlFlow::Continue(()));
+                        }
+                        RowKeyRelease::Columns(columns) => {
+                            let values: Option<Vec<Value>> = columns
+                                .iter()
+                                .map(|(id, _)| record.props.get(id).cloned())
+                                .collect();
+                            match values
+                                .map(|v| LocalTableKeyStore.release_mutation(&target.label, &v))
+                            {
+                                Some(Ok(mutation)) => Some(mutation),
+                                _ => {
+                                    result.errors.push(format!(
+                                        "label {}: row {nid_raw} has no usable key; kept",
+                                        target.label
+                                    ));
+                                    return Ok(std::ops::ControlFlow::Continue(()));
+                                }
+                            }
+                        }
+                    };
+                    let Some(index_release) =
+                        target.indexes.delete_mutations(engine, node_id, record)
+                    else {
+                        result.errors.push(format!(
+                            "label {}: indexed values unreadable without the field \
+                             dictionary; row {nid_raw} kept so its index entries are not left",
+                            target.label
+                        ));
+                        return Ok(std::ops::ControlFlow::Continue(()));
+                    };
                     match collect_node_deletion_mutations(engine, nid_raw, key, edge_types) {
                         Ok(mutations) => {
                             pending.extend(mutations);
+                            pending.extend(key_release);
+                            pending.extend(index_release);
                             // Statistics counters ride the same proposal as
                             // the deletion: total -1, each label -1.
                             {
@@ -345,6 +488,9 @@ fn reap_label(
                     }
                 }
                 TtlScope::Field => {
+                    if property_is_indexed(target, record, &target.anchor_field, &mut result) {
+                        return Ok(std::ops::ControlFlow::Continue(()));
+                    }
                     match collect_property_removal_mutations(
                         engine,
                         key,
@@ -400,6 +546,9 @@ fn reap_label(
                         };
 
                     if let Some((del_field_id, del_field_name)) = to_delete {
+                        if property_is_indexed(target, record, del_field_name, &mut result) {
+                            return Ok(std::ops::ControlFlow::Continue(()));
+                        }
                         match collect_property_removal_mutations(
                             engine,
                             key,
@@ -439,6 +588,36 @@ fn reap_label(
     }
 
     result
+}
+
+/// Whether expiring `property` of `record` would move an index entry: a
+/// B-tree entry, or the row's table key. Such a property is kept, with a
+/// diagnostic: removing it by mutation would leave the entry of the old value
+/// behind, and a key column cannot change at all.
+fn property_is_indexed(
+    target: &TtlTarget,
+    record: &NodeRecord,
+    property: &str,
+    result: &mut ComputedTtlReapResult,
+) -> bool {
+    let key_column = match &target.key {
+        RowKeyRelease::None => false,
+        RowKeyRelease::Columns(columns) => columns.iter().any(|(_, name)| name == property),
+        // The key columns are unknown, so this may be one of them.
+        RowKeyRelease::Unresolved => true,
+    };
+    let indexed = key_column
+        || target
+            .indexes
+            .registry
+            .reads_property(record.primary_label(), property);
+    if indexed {
+        result.errors.push(format!(
+            "label {}: TTL would remove indexed property '{property}'; kept",
+            target.label
+        ));
+    }
+    indexed
 }
 
 /// Submit collected mutations: via pipeline if available, else direct engine writes.
@@ -703,14 +882,14 @@ impl TtlReaperHandle {
     /// Start the background COMPUTED TTL reaper thread.
     ///
     /// The thread runs until `shutdown()` is called or the handle is dropped.
-    /// `interner`: cloned snapshot of the `FieldInterner` at Database open time.
+    /// `fields`: the database's field dictionary, read afresh each pass.
     /// `pipeline`: proposal pipeline for cluster-replicated writes.
     /// `id_gen`: proposal ID generator (shared with other pipeline users).
     pub fn start(
         engine: Arc<StorageEngine>,
         shard_id: u16,
         config: TtlReaperConfig,
-        interner: coordinode_core::graph::intern::FieldInterner,
+        fields: Arc<dyn coordinode_core::graph::intern::FieldRegistrar>,
         pipeline: Arc<dyn ProposalPipeline>,
         id_gen: Arc<ProposalIdGenerator>,
     ) -> Self {
@@ -725,7 +904,7 @@ impl TtlReaperHandle {
                     shard_id,
                     &config,
                     &shutdown_clone,
-                    &interner,
+                    fields.as_ref(),
                     pipeline.as_ref(),
                     &id_gen,
                 );
@@ -761,7 +940,7 @@ fn reaper_loop(
     shard_id: u16,
     config: &TtlReaperConfig,
     shutdown: &AtomicBool,
-    interner: &coordinode_core::graph::intern::FieldInterner,
+    fields: &dyn coordinode_core::graph::intern::FieldRegistrar,
     pipeline: &dyn ProposalPipeline,
     id_gen: &ProposalIdGenerator,
 ) {
@@ -790,11 +969,20 @@ fn reaper_loop(
             return;
         }
 
+        // Each pass reads the dictionary as it stands, so a TTL property
+        // registered since the last pass is reaped too.
+        let interner = match fields.view() {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::error!("ttl_reaper: field dictionary unavailable, pass skipped: {e}");
+                continue;
+            }
+        };
         let result = reap_computed_ttl_via_pipeline(
             engine,
             shard_id,
             config.batch_size,
-            interner,
+            &interner,
             pipeline,
             id_gen,
         );

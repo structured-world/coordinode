@@ -27,6 +27,7 @@
 use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::OplogEntry;
 
@@ -260,6 +261,57 @@ fn read_frame_prefix(data: &[u8]) -> FramePrefix {
     prefix
 }
 
+/// Decode `count` consecutive frames filling `data` exactly.
+///
+/// Unlike [`read_frame_prefix`], any bad frame is an error: the caller asks
+/// for frames it knows were written whole.
+fn decode_frames(data: &[u8], count: usize, path: &Path) -> StorageResult<Vec<OplogEntry>> {
+    let mut cursor = Cursor::new(data);
+    let mut entries = Vec::with_capacity(count);
+    for entry_idx in 0..count {
+        let payload_len = decode_varint(&mut cursor)
+            .map_err(|e| StorageError::Io(format!("varint at entry {entry_idx}: {e}")))?;
+        let payload_start = cursor.position();
+        let frame_end = payload_len
+            .checked_add(4)
+            .and_then(|n| payload_start.checked_add(n))
+            .filter(|&end| end <= data.len() as u64)
+            .ok_or_else(|| {
+                StorageError::Io(format!(
+                    "segment {path:?}: entry {entry_idx} claims {payload_len} bytes past the frames read"
+                ))
+            })?;
+        // Bounded by `data.len()` just above.
+        let payload = &data[payload_start as usize..(frame_end - 4) as usize];
+        let crc_at = (frame_end - 4) as usize;
+        let actual = u32::from_le_bytes([
+            data[crc_at],
+            data[crc_at + 1],
+            data[crc_at + 2],
+            data[crc_at + 3],
+        ]);
+        let expected = crc32fast::hash(payload);
+        if expected != actual {
+            return Err(StorageError::ChecksumMismatch {
+                expected,
+                actual,
+                context: format!("entry {entry_idx} in {path:?}"),
+            });
+        }
+        entries.push(
+            OplogEntry::decode(payload).map_err(|e| StorageError::Serialization(e.to_string()))?,
+        );
+        cursor.set_position(frame_end);
+    }
+    if cursor.position() != data.len() as u64 {
+        return Err(StorageError::Io(format!(
+            "segment {path:?}: {} bytes after the last frame read",
+            data.len() as u64 - cursor.position()
+        )));
+    }
+    Ok(entries)
+}
+
 /// What [`SegmentWriter::recover_tail`] found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailRecovery {
@@ -291,17 +343,116 @@ pub struct SegmentWriter {
     last_ts: u64,
     /// Total bytes written to the entries section.
     total_bytes: u64,
+    /// `(index, file offset of its frame)` of every entry, ascending by
+    /// index: a read of the live tail seeks straight to what it asks for.
+    frames: Vec<(u64, u64)>,
+    /// Read handle of this file, opened on the first read. A handle of its
+    /// own keeps its file position apart from the writer's.
+    reader: Option<std::fs::File>,
+    /// How an append is made durable.
+    sync: SyncMethod,
+    /// Handed out by [`Self::flush_to_os`]; the file is duplicated once per
+    /// segment, not once per batch.
+    sync_handle: Option<SyncHandle>,
+}
+
+/// Create `path`, which must not exist, for writing under `sync`.
+fn create_file(path: &Path, sync: SyncMethod) -> std::io::Result<std::fs::File> {
+    if sync != SyncMethod::OpenDatasync {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::DSYNC | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        Ok(std::fs::File::from(fd))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_WRITE_THROUGH (CreateFileW, Win32 API): writes go
+        // through the cache to the medium before the call returns.
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH)
+            .open(path)
+    }
+}
+
+/// What makes a segment's written bytes durable, apart from the writer: a
+/// log that syncs on another thread takes this under the append lock and
+/// syncs after releasing it, so appends go on while the sync runs.
+#[derive(Clone, Debug)]
+pub struct SyncHandle {
+    file: std::sync::Arc<std::fs::File>,
+    sync: SyncMethod,
+}
+
+impl SyncHandle {
+    /// A handle that syncs `file` under `sync`, for a log that owns its file
+    /// outside a [`SegmentWriter`].
+    pub fn new(file: std::fs::File, sync: SyncMethod) -> Self {
+        Self {
+            file: std::sync::Arc::new(file),
+            sync,
+        }
+    }
+
+    /// Make every byte written to the segment before this handle was taken
+    /// durable under the segment's sync method.
+    ///
+    /// # Errors
+    ///
+    /// The sync fails.
+    pub fn sync(&self) -> StorageResult<()> {
+        sync_file(&self.file, self.sync).map_err(|e| StorageError::Io(format!("sync segment: {e}")))
+    }
+}
+
+/// Make everything written to `file` durable under `sync`.
+fn sync_file(file: &std::fs::File, sync: SyncMethod) -> std::io::Result<()> {
+    match sync {
+        // Each write already went out with O_DSYNC / write-through.
+        SyncMethod::OpenDatasync => Ok(()),
+        // std reaches the medium: F_FULLFSYNC on Apple, fdatasync on Linux,
+        // FlushFileBuffers on Windows.
+        SyncMethod::Full => file.sync_data(),
+        SyncMethod::Fsync => {
+            // Apple's fsync(2) stops at the drive's cache; elsewhere the plain
+            // call already reaches the medium, so it is the full one.
+            #[cfg(target_vendor = "apple")]
+            {
+                rustix::fs::fsync(file).map_err(std::io::Error::from)
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                file.sync_data()
+            }
+        }
+    }
 }
 
 impl SegmentWriter {
-    /// Create a new segment file at `path` and write the 18-byte header.
+    /// Create a new segment file at `path` and write the 18-byte header;
+    /// appends are made durable under `sync`.
     ///
     /// The file must not already exist (`create_new` semantics).
-    pub fn create(path: &Path, shard_id: u32, first_index: u64) -> StorageResult<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+    pub fn create(
+        path: &Path,
+        shard_id: u32,
+        first_index: u64,
+        sync: SyncMethod,
+    ) -> StorageResult<Self> {
+        let file = create_file(path, sync)
             .map_err(|e| StorageError::Io(format!("create segment {:?}: {e}", path)))?;
 
         let mut w = BufWriter::new(file);
@@ -315,6 +466,10 @@ impl SegmentWriter {
             first_ts: 0,
             last_ts: 0,
             total_bytes: 0,
+            frames: Vec::new(),
+            reader: None,
+            sync,
+            sync_handle: None,
         })
     }
 
@@ -333,8 +488,9 @@ impl SegmentWriter {
         path: &Path,
         shard_id: u32,
         first_index: u64,
+        sync: SyncMethod,
     ) -> StorageResult<Self> {
-        match Self::create(path, shard_id, first_index) {
+        match Self::create(path, shard_id, first_index, sync) {
             Ok(writer) => return Ok(writer),
             // Anything other than a pre-existing file is a genuine I/O failure.
             Err(e) if !path.exists() => return Err(e),
@@ -356,7 +512,7 @@ impl SegmentWriter {
 
         std::fs::remove_file(path)
             .map_err(|e| StorageError::Io(format!("remove empty segment {:?}: {e}", path)))?;
-        Self::create(path, shard_id, first_index)
+        Self::create(path, shard_id, first_index, sync)
     }
 
     /// Seal the segment at `path` if a crash left it unsealed.
@@ -448,7 +604,20 @@ impl SegmentWriter {
     /// Append one [`OplogEntry`] to the segment.
     ///
     /// Frame layout: `varint(payload_len) || msgpack_bytes || crc32_le(4B)`.
+    ///
+    /// # Errors
+    ///
+    /// An index not above the last one appended here (reads find entries by
+    /// index), a serialization failure or an I/O failure.
     pub fn append(&mut self, entry: &OplogEntry) -> StorageResult<()> {
+        if let Some(&(last, _)) = self.frames.last() {
+            if entry.index <= last {
+                return Err(StorageError::Io(format!(
+                    "oplog entry {} appended after entry {last} in {:?}",
+                    entry.index, self.path
+                )));
+            }
+        }
         let payload = entry
             .encode()
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -465,6 +634,8 @@ impl SegmentWriter {
             .map_err(io_err)?;
 
         let frame_bytes = (varint_buf.len() + payload.len() + 4) as u64;
+        self.frames
+            .push((entry.index, HEADER_SIZE + self.total_bytes));
         self.total_bytes += frame_bytes;
         self.entry_count += 1;
 
@@ -474,6 +645,61 @@ impl SegmentWriter {
         self.last_ts = entry.ts;
 
         Ok(())
+    }
+
+    /// Entries with `index ∈ [from_index, to_index)`, read back from this
+    /// still-open segment.
+    ///
+    /// Reads only the frames in range, so reading the live tail costs what
+    /// it returns, not the size of the segment.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures, and a frame in range that fails its checksum or does not
+    /// decode (this process wrote it, so that is corruption, not a torn write).
+    pub fn read_range(&mut self, from_index: u64, to_index: u64) -> StorageResult<Vec<OplogEntry>> {
+        let first = self
+            .frames
+            .partition_point(|&(index, _)| index < from_index);
+        let last = self.frames.partition_point(|&(index, _)| index < to_index);
+        if first >= last {
+            return Ok(Vec::new());
+        }
+        let start = self.frames[first].1;
+        let end = self
+            .frames
+            .get(last)
+            .map_or(HEADER_SIZE + self.total_bytes, |&(_, offset)| offset);
+
+        // What the reader sees must include every frame appended so far.
+        self.file
+            .flush()
+            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        let reader = match &mut self.reader {
+            Some(reader) => reader,
+            slot => slot.insert(std::fs::File::open(&self.path).map_err(|e| {
+                StorageError::Io(format!("open segment {:?} for reading: {e}", self.path))
+            })?),
+        };
+        // Offsets are within a file this process wrote; they fit in memory.
+        let len = usize::try_from(end - start).map_err(io_err)?;
+        let mut data = vec![0u8; len];
+        reader.seek(SeekFrom::Start(start)).map_err(io_err)?;
+        reader.read_exact(&mut data).map_err(|e| {
+            StorageError::Io(format!("read segment {:?} at {start}: {e}", self.path))
+        })?;
+        decode_frames(&data, last - first, &self.path)
+    }
+
+    /// Index of the first entry written here, if any.
+    pub fn first_entry_index(&self) -> Option<u64> {
+        self.frames.first().map(|&(index, _)| index)
+    }
+
+    /// How this writer makes appends durable.
+    #[cfg(test)]
+    pub(crate) fn sync_method(&self) -> SyncMethod {
+        self.sync
     }
 
     /// Number of entries written so far.
@@ -499,14 +725,36 @@ impl SegmentWriter {
         self.file
             .flush()
             .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
-        // Step 2: fsync the kernel buffer to the storage device.
-        // sync_data() skips metadata update (atime, etc.) — faster than sync_all()
-        // and sufficient for crash safety of written data.
-        self.file
-            .get_ref()
-            .sync_data()
-            .map_err(|e| StorageError::Io(format!("sync_data segment: {e}")))?;
+        // Step 2: make the written bytes durable under the configured method.
+        sync_file(self.file.get_ref(), self.sync)
+            .map_err(|e| StorageError::Io(format!("sync segment: {e}")))?;
         Ok(())
+    }
+
+    /// Hand everything appended so far to the kernel and return the handle
+    /// that makes it durable: [`flush_and_sync`](Self::flush_and_sync) split
+    /// in two, so the sync can run without holding this writer.
+    ///
+    /// # Errors
+    ///
+    /// The flush fails, or the file cannot be duplicated for the handle.
+    pub fn flush_to_os(&mut self) -> StorageResult<SyncHandle> {
+        self.file
+            .flush()
+            .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
+        if let Some(handle) = &self.sync_handle {
+            return Ok(handle.clone());
+        }
+        let file = self
+            .file
+            .get_ref()
+            .try_clone()
+            .map_err(|e| StorageError::Io(format!("duplicate segment {:?}: {e}", self.path)))?;
+        let handle = SyncHandle {
+            file: std::sync::Arc::new(file),
+            sync: self.sync,
+        };
+        Ok(self.sync_handle.insert(handle).clone())
     }
 
     /// Seal the segment: write the 32-byte footer, flush, and fsync.
@@ -524,12 +772,10 @@ impl SegmentWriter {
         self.file
             .flush()
             .map_err(|e| StorageError::Io(format!("flush segment: {e}")))?;
-        // Also fsync on seal — the footer must be durable before we remove
+        // Also sync on seal — the footer must be durable before we remove
         // the active-writer reference and add the path to sealed[].
-        self.file
-            .get_ref()
-            .sync_data()
-            .map_err(|e| StorageError::Io(format!("sync_data on seal: {e}")))?;
+        sync_file(self.file.get_ref(), self.sync)
+            .map_err(|e| StorageError::Io(format!("sync on seal: {e}")))?;
         Ok(self.path)
     }
 }

@@ -69,6 +69,17 @@ impl query::text_service_server::TextService for TextServiceImpl {
             n => n,
         };
 
+        super::blocking(|| self.search(&req, limit))
+    }
+}
+
+impl TextServiceImpl {
+    /// Search the label's text indexes for `req`, keeping `limit` results.
+    fn search(
+        &self,
+        req: &query::TextSearchRequest,
+        limit: usize,
+    ) -> Result<Response<query::TextSearchResponse>, Status> {
         let db = self.database.read();
 
         let registry = db.text_index_registry();

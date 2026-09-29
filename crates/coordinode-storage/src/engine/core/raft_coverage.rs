@@ -17,6 +17,7 @@ use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::AbstractTree;
 
 use super::{Rows, StorageEngine, claim_checkpoint_dir};
+use crate::engine::MAX_DERIVED_EFFECTS;
 use crate::engine::coverage::{self, Domain, Mark, TreeCoverage};
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
@@ -261,11 +262,22 @@ impl StorageEngine {
             index,
             sub,
         };
+        // Derive before choosing partitions: DERIVED entries are read from
+        // the unit's own data effects, which a partition that already holds
+        // the entry skips. A data tree ahead of the index tree must not cost
+        // the index its entries.
+        let resolved =
+            coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
+        let mutations = resolved.as_ref();
         let partition_of = |m: &Mutation| match m {
             Mutation::Put { partition, .. }
             | Mutation::Delete { partition, .. }
             | Mutation::Merge { partition, .. }
             | Mutation::RemoveRange { partition, .. } => Partition::from(*partition),
+            // A command's effects are Schema records.
+            Mutation::Command(_) => Partition::Schema,
+            // Resolved above; its entries are index records.
+            Mutation::Derive(_) => Partition::Idx,
         };
         if mutations.iter().any(|m| skip(partition_of(m))) {
             let kept: Vec<Mutation> = mutations
@@ -576,6 +588,7 @@ impl StorageEngine {
         // A snapshot now stands in the store in place of whatever the
         // applies had built: followers of the applies read it afresh.
         self.applied_feed.replaced(None);
+        self.note_field_dictionary_change();
         Ok(())
     }
 

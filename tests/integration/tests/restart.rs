@@ -168,6 +168,86 @@ async fn vector_zero_dimensions_survives_restart() {
     assert_eq!(rows.len(), 2, "both nodes must survive restart");
 }
 
+/// A vector written before a crash is there after it: the write was
+/// acknowledged, so every property of it is in the log and comes back with
+/// the node, not only the node itself.
+#[tokio::test]
+async fn a_vector_property_survives_a_crash() {
+    let proc = CoordinodeProcess::start().await;
+    let mut sc = proc.schema_client().await;
+    sc.create_label(CreateLabelRequest {
+        name: "VecCrash".to_string(),
+        properties: vec![PropertyDefinition {
+            name: "emb".to_string(),
+            r#type: PropertyType::Vector as i32,
+            required: false,
+            unique: false,
+        }],
+        computed_properties: vec![],
+        schema_mode: SchemaMode::Strict as i32,
+    })
+    .await
+    .expect("create_label");
+    let mut params = HashMap::new();
+    params.insert("vec".to_string(), pv_vector(vec![1.0, 0.0, 0.0]));
+    cypher(&proc, "CREATE (n:VecCrash {emb: $vec})", params)
+        .await
+        .expect("write before the kill");
+
+    let proc = proc.restart_unclean().await;
+
+    let rows = cypher_q(&proc, "MATCH (n:VecCrash) RETURN n.emb AS emb")
+        .await
+        .expect("read after the restart");
+    assert_eq!(rows.len(), 1, "the node survives");
+    match &rows[0]["emb"].value {
+        Some(PvKind::VectorValue(v)) => assert_eq!(v.values, [1.0, 0.0, 0.0]),
+        other => panic!("the vector did not survive the crash: {other:?}"),
+    }
+}
+
+/// Property names a statement learns only while it runs, from the keys of a
+/// map parameter, read back after a crash like any other: each name is
+/// registered before the write that uses it, not repaired after it.
+#[tokio::test]
+async fn properties_named_by_a_map_survive_a_crash() {
+    let proc = CoordinodeProcess::start().await;
+    cypher_q(&proc, "CREATE (n:DynCrash {k: 1})")
+        .await
+        .expect("create before the kill");
+    let entries = HashMap::from([
+        ("colour".to_string(), pv_string("red")),
+        ("size".to_string(), pv_string("large")),
+    ]);
+    let params = HashMap::from([(
+        "m".to_string(),
+        PropertyValue {
+            value: Some(PvKind::MapValue(
+                coordinode_integration::proto::common::PropertyMap { entries },
+            )),
+        },
+    )]);
+    cypher(&proc, "MATCH (n:DynCrash) SET n += $m", params)
+        .await
+        .expect("set from a map before the kill");
+
+    let proc = proc.restart_unclean().await;
+
+    let rows = cypher_q(
+        &proc,
+        "MATCH (n:DynCrash) RETURN n.colour AS colour, n.size AS size",
+    )
+    .await
+    .expect("read after the restart");
+    assert_eq!(rows.len(), 1, "the node survives");
+    assert_eq!(
+        rows[0]["colour"],
+        pv_string("red"),
+        "colour after the crash"
+    );
+    assert_eq!(rows[0]["size"], pv_string("large"), "size after the crash");
+}
+
 // ── MERGE on a unique key ─────────────────────────────────────────────────────
 
 /// MERGE on an existing unique node must take the ON MATCH branch, not raise
@@ -400,6 +480,59 @@ async fn sigkill_restart_survives_without_crash() {
     );
 }
 
+/// A server killed mid-life must never hand out a NodeId that a live node
+/// already carries. The identifiers it issued before the kill are in use by
+/// committed nodes, so a node created after the restart has to get a new one
+/// and leave every existing node in place (a reissued id overwrites a node).
+#[tokio::test]
+async fn a_crash_never_reissues_a_live_node_id() {
+    let proc = CoordinodeProcess::start().await;
+    for i in 0u32..5 {
+        let mut params = HashMap::new();
+        params.insert("i".to_string(), pv_string(&format!("before-{i}")));
+        cypher(&proc, "CREATE (n:IdReuse {v: $i})", params)
+            .await
+            .expect("create before the kill");
+    }
+
+    let proc = proc.restart_unclean().await;
+
+    let mut params = HashMap::new();
+    params.insert("i".to_string(), pv_string("after"));
+    cypher(&proc, "CREATE (n:IdReuse {v: $i})", params)
+        .await
+        .expect("create after the restart");
+
+    let rows = cypher_q(&proc, "MATCH (n:IdReuse) RETURN id(n) AS nid, n.v AS v")
+        .await
+        .expect("read back");
+    let mut values: Vec<String> = rows
+        .iter()
+        .map(|row| match &row["v"].value {
+            Some(PvKind::StringValue(s)) => s.clone(),
+            other => panic!("unexpected value {other:?}"),
+        })
+        .collect();
+    values.sort();
+    assert_eq!(
+        values,
+        [
+            "after", "before-0", "before-1", "before-2", "before-3", "before-4"
+        ],
+        "every node written before the kill survives and the new one is added"
+    );
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|row| match row["nid"].value {
+            Some(PvKind::IntValue(id)) => id,
+            ref other => panic!("unexpected id {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 6, "six distinct ids");
+}
+
 // ── MATCH visibility in FLEXIBLE mode across a restart ────────────────────────
 
 /// After a restart, a node on a FLEXIBLE label must be visible to every read
@@ -498,6 +631,51 @@ async fn flexible_match_visible_after_restart() {
     assert!(
         dup.is_err(),
         "CREATE with same unique key must fail after restart (unique constraint). \
-         Got: Ok — node is query-invisible AND constraint-invisible (data lost entirely)"
+         Got: Ok: node is query-invisible AND constraint-invisible (data lost entirely)"
+    );
+}
+
+/// A unique constraint holds across a crash: the index entry an acknowledged
+/// write made is recovered with the write, so a duplicate is still refused.
+///
+/// A clean stop flushes every tree and cannot tell an entry that was part of
+/// the write from one written beside it.
+#[tokio::test]
+async fn a_unique_constraint_survives_a_crash() {
+    let proc = CoordinodeProcess::start().await;
+    let mut sc = proc.schema_client().await;
+    sc.create_label(CreateLabelRequest {
+        name: "CrashUnique".to_string(),
+        properties: vec![PropertyDefinition {
+            name: "key".to_string(),
+            r#type: PropertyType::String as i32,
+            required: false,
+            unique: true,
+        }],
+        computed_properties: vec![],
+        schema_mode: SchemaMode::Flexible as i32,
+    })
+    .await
+    .expect("create_label");
+    cypher_q(&proc, "CREATE (:CrashUnique {key: 'k1'})")
+        .await
+        .expect("create before the crash");
+
+    let proc = proc.restart_unclean().await;
+
+    let rows = cypher_q(&proc, "MATCH (s:CrashUnique) RETURN count(s) AS cnt")
+        .await
+        .expect("scan after the crash");
+    assert_eq!(
+        rows.first().and_then(|r| r.get("cnt")).cloned(),
+        Some(PropertyValue {
+            value: Some(PvKind::IntValue(1))
+        }),
+        "the acknowledged node survives the crash"
+    );
+    let dup = cypher_q(&proc, "CREATE (:CrashUnique {key: 'k1'})").await;
+    assert!(
+        dup.is_err(),
+        "a duplicate of a key written before the crash must be refused"
     );
 }

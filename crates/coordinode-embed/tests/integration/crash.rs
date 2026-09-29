@@ -66,6 +66,96 @@ fn acknowledged_write_survives_process_kill() {
     assert_eq!(rows.len(), 1, "the acknowledged write was lost");
 }
 
+/// Set by the parent of the replayed-index test; the child does nothing
+/// without it.
+const INDEX_CHILD_DIR: &str = "COORDINODE_CRASH_INDEX_CHILD_DIR";
+
+/// Move `:G {scope}` from revision `from` to `to` in one interactive
+/// transaction, first creating the nodes of `creates`; returns the rows the
+/// MATCH found.
+fn bump_revision(db: &Database, creates: &[&str], scope: &str, from: i64, to: i64) -> usize {
+    use coordinode_core::graph::types::Value;
+    let txn = db.begin_transaction();
+    for create in creates {
+        db.execute_in_transaction(txn, create, None)
+            .expect("create in the transaction");
+    }
+    let params = std::collections::HashMap::from([
+        ("scope".to_string(), Value::String(scope.to_string())),
+        ("from".to_string(), Value::Int(from)),
+        ("to".to_string(), Value::Int(to)),
+    ]);
+    let rows = db
+        .execute_in_transaction(
+            txn,
+            "MATCH (g:G {scope: $scope, revision: $from}) SET g.revision = $to RETURN g.revision",
+            Some(params),
+        )
+        .expect("match and set in the transaction");
+    db.commit_transaction(txn).expect("commit");
+    rows.len()
+}
+
+/// Child half of `an_indexed_node_is_found_after_replay_behind_a_create`: an
+/// indexed node, one transaction moving it, then death without destructors.
+#[test]
+fn crash_child_moves_an_indexed_node_then_aborts() {
+    let Some(dir) = std::env::var_os(INDEX_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE INDEX g_scope ON :G(scope)")
+        .expect("index in child");
+    db.execute_cypher("CREATE (:G {scope: 'i', revision: 0})")
+        .expect("node in child");
+    assert_eq!(
+        bump_revision(&db, &[], "i", 0, 1),
+        1,
+        "the child moves the node"
+    );
+    std::process::abort();
+}
+
+/// After a kill and the journal replay that follows it, a transaction that
+/// creates a node of a label and then matches an existing indexed node of the
+/// same label still finds it, as it does before the kill.
+#[test]
+fn an_indexed_node_is_found_after_replay_behind_a_create() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::crash::crash_child_moves_an_indexed_node_then_aborts",
+            "--nocapture",
+        ])
+        .env(INDEX_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after its writes, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let db = Database::open(dir.path()).expect("reopen after the kill");
+    assert_eq!(
+        bump_revision(&db, &[], "i", 1, 2),
+        1,
+        "the replayed node is found alone"
+    );
+    assert_eq!(
+        bump_revision(&db, &["CREATE (:G {scope: 'n', revision: 0})"], "i", 2, 3),
+        1,
+        "the replayed node is found behind a create of its label"
+    );
+}
+
 // ── Close/Reopen persistence ────────────────────────────────────────
 
 #[test]

@@ -43,5 +43,13 @@ coordinode-test-fixtures = { workspace = true }
 metrics = { workspace = true }
 metrics-util = "0.20"
 
+[[bench]]
+name = "field_names"
+harness = false
+
+[[bench]]
+name = "index_write"
+harness = false
+
 [lints]
 workspace = true

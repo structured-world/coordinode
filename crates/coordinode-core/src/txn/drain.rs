@@ -79,23 +79,13 @@ pub struct DrainEntry {
 impl DrainEntry {
     /// Create a new drain entry from transaction mutations.
     pub fn new(mutations: Vec<Mutation>, commit_ts: Timestamp, start_ts: Timestamp) -> Self {
-        let size_bytes = mutations.iter().map(mutation_size).sum();
+        let size_bytes = mutations.iter().map(Mutation::size_estimate).sum();
         Self {
             mutations,
             commit_ts,
             start_ts,
             size_bytes,
         }
-    }
-}
-
-/// Approximate byte size of a mutation (for buffer capacity tracking).
-fn mutation_size(m: &Mutation) -> usize {
-    match m {
-        Mutation::Put { key, value, .. } => 1 + key.len() + value.len(),
-        Mutation::Delete { key, .. } => 1 + key.len(),
-        Mutation::Merge { key, operand, .. } => 1 + key.len() + operand.len(),
-        Mutation::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
     }
 }
 
@@ -373,9 +363,18 @@ fn drain_once(
     let mut all_ok = true;
 
     for entry in entries {
+        // A unit with DERIVED index work is proposed on its own: its record
+        // sources are positions within the unit, and the entries it derives
+        // apply after the unit's other writes, so joined to another unit it
+        // would derive from the wrong record, or land after a later unit's
+        // write of the same entry.
+        let derives = entry
+            .mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Derive(_)));
         // If this entry would exceed batch size, flush current batch first.
         if !current_mutations.is_empty()
-            && current_mutations.len() + entry.mutations.len() > batch_max as usize
+            && (derives || current_mutations.len() + entry.mutations.len() > batch_max as usize)
             && submit_proposal(
                 pipeline,
                 id_gen,
@@ -386,6 +385,21 @@ fn drain_once(
             .is_err()
         {
             all_ok = false;
+        }
+
+        if derives {
+            if submit_proposal(
+                pipeline,
+                id_gen,
+                entry.mutations,
+                entry.commit_ts,
+                entry.start_ts,
+            )
+            .is_err()
+            {
+                all_ok = false;
+            }
+            continue;
         }
 
         // Use the latest commit_ts in the batch (highest = most recent).

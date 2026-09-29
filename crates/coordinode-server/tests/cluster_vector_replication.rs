@@ -249,10 +249,9 @@ async fn follower_vector_search_matches_leader() {
     let mut last_state = String::new();
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        // The server binary refreshes derived state on every applied
-        // entry (subscribe_applied task in main); this poll loop stands
-        // in for that wiring at the Database level.
-        n2.db.refresh_field_interner().unwrap();
+        // The server binary brings replicated vector indexes live on every
+        // applied entry (subscribe_applied task in main); this poll loop
+        // stands in for that wiring at the Database level.
         n2.db.refresh_vector_indexes().unwrap();
         let mut total_overlap = 0.0;
         let mut min_overlap = f64::MAX;
@@ -365,7 +364,6 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
     // as the server does on every applied entry.
     let mut started = false;
     for _ in 0..40 {
-        n2.db.refresh_field_interner().unwrap();
         if n2.db.refresh_vector_indexes().unwrap() > 0 {
             started = true;
             break;
@@ -491,13 +489,11 @@ async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
     );
 
     // The body's write replicates: the follower must observe the same audit
-    // node once the entry applies. The follower decodes the new `action` field
-    // only after its interner catches up — the server does this on every apply
-    // (`refresh_field_interner`); the bare harness has no such task, so we drive
-    // the refresh the server would. Poll with a generous bound.
+    // node once the entry applies. Its statements read the field dictionary
+    // as the applies left it, so the new `action` binding needs no refresh
+    // task. Poll with a generous bound.
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = n2.db.refresh_field_interner();
         let follower_audit = n2
             .db
             .execute_cypher("MATCH (e:AuditEntry) RETURN e.action AS act")

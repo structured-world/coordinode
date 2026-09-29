@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use coordinode_core::txn::frame::check_proposal;
 use coordinode_core::txn::proposal::{
     PartitionId, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
 };
@@ -380,6 +381,7 @@ impl RaftProposalPipeline {
         &self,
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
+        check_proposal(proposal)?;
         {
             use openraft::rt::watch::WatchReceiver;
             let rx = self.raft.metrics();
@@ -420,6 +422,7 @@ impl RaftProposalPipeline {
     ) -> Result<ProposalOutcome, ProposalError> {
         use openraft::rt::watch::WatchReceiver;
 
+        check_proposal(proposal)?;
         let mut metrics_rx = self.raft.metrics();
         let (members, majority) = {
             let m = metrics_rx.borrow_watched();
@@ -536,6 +539,7 @@ impl RaftProposalPipeline {
         &self,
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
+        check_proposal(proposal)?;
         let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 

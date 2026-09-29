@@ -369,6 +369,7 @@ fn make_ctx<'a>(
     ExecutionContext {
         engine,
         interner,
+        field_registrar: None,
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,
@@ -379,6 +380,7 @@ fn make_ctx<'a>(
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
+        key_claims: Default::default(),
         text_index: None,
         text_index_registry: None,
         vector_indexes: None,
@@ -1378,8 +1380,8 @@ fn create_multiple_nodes() {
     };
     execute(&plan2, &mut ctx).expect("create b");
 
-    // Verify both exist with unique IDs
-    assert_eq!(allocator.current().as_raw(), 2);
+    // Two ids were used: the next one handed out is the third.
+    assert_eq!(allocator.next().expect("id").as_raw(), 3);
 }
 
 // ====== MERGE / UPSERT ======
@@ -1490,8 +1492,9 @@ fn merge_no_duplicate_on_existing() {
 
     execute(&plan, &mut ctx).expect("execute");
 
-    // Allocator should NOT have advanced (no new node created)
-    assert_eq!(allocator.current().as_raw(), 100);
+    // Allocator should NOT have advanced (no new node created): the next id is
+    // the first above the starting point.
+    assert_eq!(allocator.next().expect("id").as_raw(), 101);
 }
 
 #[test]
@@ -1577,8 +1580,9 @@ fn upsert_updates_when_found() {
     let result = execute(&plan, &mut ctx).expect("execute");
     assert_eq!(result.len(), 1);
 
-    // Verify no new node was created
-    assert_eq!(allocator.current().as_raw(), 100);
+    // Verify no new node was created: the next id is the first above the
+    // starting point.
+    assert_eq!(allocator.next().expect("id").as_raw(), 101);
 
     // Verify age was updated
     let node_id = result[0].get("n").and_then(|v| v.as_int()).expect("id");
@@ -5538,6 +5542,7 @@ fn create_index_registers_and_backfills() {
             unique: false,
             sparse: false,
             filter: None,
+            maintenance: None,
         },
         &mut ctx,
     )
@@ -5578,9 +5583,7 @@ fn create_unique_index_enforces_constraint_on_insert() {
 
     // Register a unique index on User.name (skip backfill — insert two fresh nodes).
     let unique_def = crate::index::IndexDefinition::btree("u_name", "User", "name").unique();
-    registry
-        .register(&engine, unique_def)
-        .expect("register unique index");
+    registry.register_in_memory(unique_def);
 
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
 
@@ -5636,7 +5639,7 @@ fn drop_index_removes_from_registry() {
 
     // Pre-register an index.
     let def = crate::index::IndexDefinition::btree("to_drop", "User", "age");
-    registry.register(&engine, def).expect("register");
+    registry.register_in_memory(def);
     assert!(registry.get("to_drop").is_some());
 
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
@@ -5691,7 +5694,7 @@ fn create_index_duplicate_name_returns_error() {
 
     // Register once.
     let def = crate::index::IndexDefinition::btree("dup_idx", "User", "age");
-    registry.register(&engine, def).expect("register");
+    registry.register_in_memory(def);
 
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
 
@@ -5704,6 +5707,7 @@ fn create_index_duplicate_name_returns_error() {
             unique: false,
             sparse: false,
             filter: None,
+            maintenance: None,
         },
         &mut ctx,
     );
@@ -5873,6 +5877,7 @@ fn index_scan_returns_correct_node() {
             unique: false,
             sparse: false,
             filter: None,
+            maintenance: None,
         },
         &mut ctx,
     )
@@ -6018,6 +6023,7 @@ fn index_scan_resolves_correlated_key() {
             unique: false,
             sparse: false,
             filter: None,
+            maintenance: None,
         },
         &mut ctx,
     )

@@ -83,6 +83,10 @@ rlimit = "0.11"
 [build-dependencies]
 tonic-prost-build = "0.14"
 
+[[bench]]
+name = "replicated_writes"
+harness = false
+
 [dev-dependencies]
 tempfile = { workspace = true }
 coordinode-client = { workspace = true }

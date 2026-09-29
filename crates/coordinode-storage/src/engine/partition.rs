@@ -80,6 +80,25 @@ impl From<coordinode_core::txn::proposal::PartitionId> for Partition {
 }
 
 impl Partition {
+    /// The proposal partition a mutation of this partition names, or `None`
+    /// for the Raft partition, which no proposal writes.
+    pub fn proposal_id(self) -> Option<coordinode_core::txn::proposal::PartitionId> {
+        use coordinode_core::txn::proposal::PartitionId;
+        Some(match self {
+            Self::Node => PartitionId::Node,
+            Self::Adj => PartitionId::Adj,
+            Self::EdgeProp => PartitionId::EdgeProp,
+            Self::Blob => PartitionId::Blob,
+            Self::BlobRef => PartitionId::BlobRef,
+            Self::Schema => PartitionId::Schema,
+            Self::Idx => PartitionId::Idx,
+            Self::Raft => return None,
+            Self::Counter => PartitionId::Counter,
+            Self::VectorF32 => PartitionId::VectorF32,
+            Self::Registry => PartitionId::Registry,
+        })
+    }
+
     /// The storage partition name for this logical partition.
     pub fn name(self) -> &'static str {
         match self {
@@ -131,6 +150,13 @@ impl Partition {
             Self::Schema => Some(b"schema:"),
             _ => Some(b""),
         }
+    }
+
+    /// Whether `key` in this partition is data a user put there, by the
+    /// measure of [`Self::user_data_prefix`].
+    pub fn is_user_key(self, key: &[u8]) -> bool {
+        self.user_data_prefix()
+            .is_some_and(|prefix| key.starts_with(prefix))
     }
 
     /// All partitions in creation order.

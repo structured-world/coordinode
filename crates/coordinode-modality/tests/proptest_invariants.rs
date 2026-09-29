@@ -13,8 +13,8 @@ use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
-    Bbox, Crs, IndexStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore, NodeStore, Point,
-    SpatialStore,
+    Bbox, Crs, IndexDefinition, IndexStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
+    NodeStore, Point, SpatialStore,
 };
 use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use proptest::prelude::*;
@@ -48,25 +48,26 @@ proptest! {
         let fx = open_engine();
         let engine = &fx.engine;
         let store = LocalIndexStore::new(engine);
+        let index = IndexDefinition::btree("p", "L", "p");
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let mut txn = Transaction::begin(engine, Some(&oracle), oracle.next());
+        let no_fields = |_: &str| None;
         store
-            .put_entry("p", &[Value::Int(a)], NodeId::from_raw(1))
+            .stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(1), None, Some(&[Value::Int(a)]))
             .unwrap();
         store
-            .put_entry("p", &[Value::Int(b)], NodeId::from_raw(2))
+            .stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(2), None, Some(&[Value::Int(b)]))
             .unwrap();
-        let all = store.scan_all("p").unwrap();
-        // Two entries regardless of value equality — they share the
+        let all = store.scan_entry_ids(&mut txn, &index).unwrap();
+        // Two entries regardless of value equality: they share the
         // encoded value but have distinct node_id suffixes.
         prop_assert_eq!(all.len(), 2);
         // Same-name index: keys sorted by (encoded value, node_id).
         // a vs b numeric order => key byte order.
         if a < b {
-            // node 1 (a) comes before node 2 (b)
-            let first_id = all[0].1.as_raw();
-            prop_assert_eq!(first_id, 1);
+            prop_assert_eq!(all[0].as_raw(), 1);
         } else if a > b {
-            let first_id = all[0].1.as_raw();
-            prop_assert_eq!(first_id, 2);
+            prop_assert_eq!(all[0].as_raw(), 2);
         }
     }
 

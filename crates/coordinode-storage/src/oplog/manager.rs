@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, ShardId};
 use crate::oplog::segment::{SegmentReader, SegmentWriter, TailRecovery};
@@ -46,6 +47,8 @@ pub struct OplogManager {
     current: Option<SegmentWriter>,
     /// `(first_index, path)` of sealed segments, sorted by first_index.
     pub(crate) sealed: Vec<(u64, PathBuf)>,
+    /// How appends to new segments are made durable.
+    sync: SyncMethod,
 }
 
 impl OplogManager {
@@ -167,7 +170,16 @@ impl OplogManager {
             retention_secs,
             current: None,
             sealed: paths,
+            sync: SyncMethod::default(),
         })
+    }
+
+    /// Make appends durable under `sync` from the next segment on; the
+    /// default is [`SyncMethod::Full`]. Set it right after opening.
+    #[must_use]
+    pub fn with_sync_method(mut self, sync: SyncMethod) -> Self {
+        self.sync = sync;
+        self
     }
 
     /// Append an entry to the active segment.
@@ -185,7 +197,23 @@ impl OplogManager {
         // Open a new segment on the entry's index
         if self.current.is_none() {
             let path = segment_path(&self.dir, entry.index);
-            let writer = SegmentWriter::create_or_replace_empty(&path, self.shard_id, entry.index)?;
+            // Reads locate a segment by its first index, so a new segment
+            // must start above every earlier one. A header-only leftover at
+            // this very index is replaced below and does not count.
+            if let Some((first, earlier)) = self.sealed.last() {
+                if entry.index <= *first && *earlier != path {
+                    return Err(StorageError::Io(format!(
+                        "oplog entry {} appended below segment {:?}",
+                        entry.index, earlier
+                    )));
+                }
+            }
+            let writer = SegmentWriter::create_or_replace_empty(
+                &path,
+                self.shard_id,
+                entry.index,
+                self.sync,
+            )?;
             // `open` registers every file it finds as sealed, including a
             // header-only leftover from a crash. That file has just been
             // replaced by the active writer, so drop the stale registration or
@@ -214,6 +242,22 @@ impl OplogManager {
         } else {
             Ok(())
         }
+    }
+
+    /// [`flush`](Self::flush) split in two: hand the active segment's
+    /// appends to the kernel now and return what makes them durable, to sync
+    /// without holding this manager. Entries in segments rotated out since
+    /// the last sync are already durable (sealing syncs them). `None` when
+    /// no segment is active.
+    ///
+    /// # Errors
+    ///
+    /// The flush fails, or the segment cannot be duplicated for the handle.
+    pub fn flush_to_os(&mut self) -> StorageResult<Option<crate::oplog::SyncHandle>> {
+        self.current
+            .as_mut()
+            .map(crate::oplog::SegmentWriter::flush_to_os)
+            .transpose()
     }
 
     /// Seal and close the active segment.
@@ -252,21 +296,26 @@ impl Drop for OplogManager {
 }
 
 impl OplogManager {
-    /// Return all entries with `index ∈ [from_index, to_index)`.
+    /// Return all entries with `index ∈ [from_index, to_index)`, ascending.
     ///
-    /// **Side effect:** if there is an active (unsealed) writer, it is rotated
-    /// first so its entries are visible. The next `append` will start a new
-    /// segment.
+    /// Only the segments that can hold the range are read, and the active
+    /// segment is read in place: a read of the tail costs what it returns,
+    /// however long the log is.
     pub fn read_range(&mut self, from_index: u64, to_index: u64) -> StorageResult<Vec<OplogEntry>> {
-        // Seal the active writer so we can read its entries from disk.
-        if self.current.is_some() {
-            self.rotate()?;
-        }
-
         let mut result = Vec::new();
 
-        for (first_idx, path) in &self.sealed {
-            // Segments whose first_index >= to_index cannot contain entries in range.
+        // Segments are ordered by first index and each holds the indexes up
+        // to the next one's first, so the range starts in the last segment
+        // that begins at or before `from_index`.
+        let start = match self
+            .sealed
+            .partition_point(|&(first_idx, _)| first_idx <= from_index)
+        {
+            // Every segment begins after `from_index`: read from the first.
+            0 => 0,
+            n => n - 1,
+        };
+        for (first_idx, path) in &self.sealed[start..] {
             if *first_idx >= to_index {
                 break;
             }
@@ -278,14 +327,17 @@ impl OplogManager {
                 continue;
             }
 
-            for entry in reader.into_entries() {
-                if entry.index >= from_index && entry.index < to_index {
-                    result.push(entry);
-                }
-            }
+            result.extend(
+                reader
+                    .into_entries()
+                    .into_iter()
+                    .filter(|entry| entry.index >= from_index && entry.index < to_index),
+            );
         }
 
-        result.sort_by_key(|e| e.index);
+        if let Some(writer) = &mut self.current {
+            result.extend(writer.read_range(from_index, to_index)?);
+        }
         Ok(result)
     }
 
@@ -420,25 +472,41 @@ impl OplogManager {
     ///
     /// Returns the number of segments removed.
     pub fn purge_before(&mut self, below: u64) -> StorageResult<usize> {
-        let mut purged = 0usize;
-        let mut remaining = Vec::new();
-
-        for (first_idx, path) in self.sealed.drain(..) {
-            let reader = SegmentReader::open(&path)?;
-            // next_index is the exclusive upper bound for this segment's entries.
-            let next_index = first_idx + u64::from(reader.footer.entry_count);
-            if next_index <= below {
-                std::fs::remove_file(&path).map_err(|e| {
-                    StorageError::Io(format!("remove purged segment {:?}: {e}", path))
-                })?;
-                purged += 1;
-            } else {
-                remaining.push((first_idx, path));
+        // Segments hold ascending indexes, so the purgeable ones are a prefix.
+        let mut purgeable = 0usize;
+        for (i, (first_idx, path)) in self.sealed.iter().enumerate() {
+            // Exclusive upper bound of this segment's entries: the next
+            // segment starts above every one of them, so its first index
+            // bounds them without reading this one. Only the newest segment,
+            // with nothing after it, has its footer read.
+            let successor = match self.sealed.get(i + 1) {
+                Some(&(next_first, _)) => Some(next_first),
+                None => self
+                    .current
+                    .as_ref()
+                    .and_then(SegmentWriter::first_entry_index),
+            };
+            let next_index = match successor {
+                Some(next_first) => next_first,
+                None => first_idx + u64::from(SegmentReader::open(path)?.footer.entry_count),
+            };
+            if next_index > below {
+                break;
             }
+            purgeable += 1;
         }
 
-        self.sealed = remaining;
-        Ok(purged)
+        for removed in 0..purgeable {
+            let path = &self.sealed[removed].1;
+            if let Err(e) = std::fs::remove_file(path) {
+                let message = format!("remove purged segment {:?}: {e}", path);
+                // Forget only what is gone, so the list still matches the disk.
+                self.sealed.drain(..removed);
+                return Err(StorageError::Io(message));
+            }
+        }
+        self.sealed.drain(..purgeable);
+        Ok(purgeable)
     }
 
     /// Delete all sealed segments.

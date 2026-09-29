@@ -319,18 +319,32 @@ pub struct LabelSchema {
     /// path. Default: `false` (point-in-time only, MVCC history alone).
     pub temporal: bool,
 
-    /// Declared primary-key columns. Non-empty marks this label as a
-    /// relational TABLE: the primary key is the row identity (bridged to a
-    /// NodeId) and the relational/SQL surface plans against it. Empty for a
-    /// plain graph label. Ordered as declared (composite keys allowed).
+    /// Declared key columns of a relational TABLE, in declaration order
+    /// (composite keys allowed). Read through [`LabelSchema::table_key`].
     #[serde(default)]
-    pub primary_key: Vec<String>,
+    primary_key: Vec<String>,
 
     /// Physical storage layout for a table label. `Row` (default) stores
     /// each row on the node path; `Columnar` stores rows in the engine's native
     /// columnar block type. Ignored for non-table labels.
     #[serde(default)]
     pub storage_layout: StorageLayout,
+
+    /// A TABLE declared without key columns, whose rows are keyed by their
+    /// NodeId. Read through [`LabelSchema::table_key`].
+    #[serde(default)]
+    keyed_by_row_id: bool,
+}
+
+/// How a relational TABLE addresses its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKey<'a> {
+    /// No declared key: a row is addressed by its NodeId, and every insert is
+    /// a new row.
+    RowId,
+    /// Declared key columns: the key is unique across the table and never
+    /// changes for a row; inserting an existing key is refused.
+    Columns(&'a [String]),
 }
 
 impl LabelSchema {
@@ -364,12 +378,31 @@ impl LabelSchema {
             temporal: false,
             primary_key: Vec::new(),
             storage_layout: StorageLayout::Row,
+            keyed_by_row_id: false,
         }
     }
 
-    /// Whether this label is a relational TABLE (has a declared primary key).
+    /// How this label addresses its rows when it is a relational TABLE;
+    /// `None` for a plain graph label.
+    pub fn table_key(&self) -> Option<TableKey<'_>> {
+        if !self.primary_key.is_empty() {
+            Some(TableKey::Columns(&self.primary_key))
+        } else if self.keyed_by_row_id {
+            Some(TableKey::RowId)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this label is a relational TABLE.
     pub fn is_table(&self) -> bool {
-        !self.primary_key.is_empty()
+        self.table_key().is_some()
+    }
+
+    /// The declared key columns; empty for a table keyed by row id and for a
+    /// graph label.
+    pub fn key_columns(&self) -> &[String] {
+        &self.primary_key
     }
 
     /// Whether this table stores its rows in the columnar layout.
@@ -377,8 +410,10 @@ impl LabelSchema {
         self.storage_layout == StorageLayout::Columnar
     }
 
-    /// Declare the primary-key columns, marking this label as a table.
-    pub fn set_primary_key(&mut self, columns: Vec<String>) {
+    /// Mark this label as a relational TABLE keyed by `columns`, or by row id
+    /// when `columns` is empty.
+    pub fn make_table(&mut self, columns: Vec<String>) {
+        self.keyed_by_row_id = columns.is_empty();
         self.primary_key = columns;
     }
 

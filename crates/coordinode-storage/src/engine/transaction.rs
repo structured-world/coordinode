@@ -125,6 +125,17 @@ pub enum CommitError {
         /// The counter key whose staged deltas overflowed.
         key: String,
     },
+    /// The DERIVED index work this attempt seals derives more entry effects
+    /// than a member derives for one unit. Nothing was applied: every member
+    /// would refuse the unit when it derives it.
+    #[error(
+        "the transaction changes more than {limit} derived index entries; \
+         nothing was written"
+    )]
+    IndexFanOut {
+        /// The bound on entry effects per unit.
+        limit: usize,
+    },
     /// A record this attempt wrote on the condition of its version has a
     /// different one. Nothing was applied.
     ///
@@ -285,6 +296,9 @@ pub struct Transaction<'a> {
     /// creation until its last state drops. `None` only once
     /// [`Self::take_state`] has moved it to the parked state.
     open: Option<OpenTransaction>,
+    /// DERIVED index work: entries staged in the write buffer that the unit
+    /// logs as sealed work rather than as mutations.
+    derived: derived::DerivedLedger,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -318,6 +332,8 @@ pub struct TransactionState {
     validate_from: Option<StorageSnapshot>,
     /// Parked with the rest: the transaction stays open between statements.
     open: Option<OpenTransaction>,
+    /// Parked with the write buffer whose index entries it describes.
+    derived: derived::DerivedLedger,
 }
 
 /// One staged adjacency operand. Kept as a sequence rather than as two sets
@@ -467,6 +483,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin,
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
             open: Some(engine.open_transaction()),
+            derived: derived::DerivedLedger::default(),
         }
     }
 
@@ -516,6 +533,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: self.snapshot_pin,
             validate_from: self.validate_from,
             open: self.open,
+            derived: self.derived,
         }
     }
 
@@ -543,6 +561,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: self.snapshot_pin.take(),
             validate_from: self.validate_from,
             open: self.open.take(),
+            derived: std::mem::take(&mut self.derived),
         }
     }
 
@@ -575,6 +594,7 @@ impl<'a> Transaction<'a> {
             snapshot_pin: state.snapshot_pin,
             validate_from: state.validate_from,
             open: state.open,
+            derived: state.derived,
         }
     }
 
@@ -963,6 +983,62 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
+    /// Bind this transaction's index effects to the definition stored at
+    /// `key` as it was at `version`: a transition or drop of the index
+    /// before this commit refuses it, so no effect lands under a retired
+    /// binding. Conditioned once per definition, however many effects follow.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::expect_version`].
+    pub fn bind_index_definition(&mut self, key: &[u8], version: Option<u64>) -> StorageResult<()> {
+        if self.derived.bind(key) {
+            self.expect_version(Partition::Schema, key, version)?;
+        }
+        Ok(())
+    }
+
+    /// Stage one node's membership change in a DERIVED index: the entry
+    /// effects go to the write buffer, as for any index, so this transaction
+    /// reads them and its unique values conflict with a concurrent writer of
+    /// the same value; the unit logs the change as sealed work under
+    /// `binding` instead of the entries. `old` is the membership the node
+    /// had before this change, `new` the one it has after.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::put`] and [`Self::delete`].
+    pub fn stage_derived(
+        &mut self,
+        binding: &coordinode_core::txn::proposal::IndexBinding,
+        node_id: u64,
+        old: Option<Vec<coordinode_core::graph::types::Value>>,
+        new: Option<Vec<coordinode_core::graph::types::Value>>,
+        effects: &[coordinode_core::index::derive::EntryEffect],
+    ) -> StorageResult<()> {
+        for effect in effects {
+            match &effect.value {
+                Some(value) => self.put(Partition::Idx, &effect.key, value)?,
+                None => self.delete(Partition::Idx, &effect.key)?,
+            }
+        }
+        self.derived.stage(
+            binding,
+            node_id,
+            old,
+            new,
+            effects.iter().map(|e| e.key.clone()),
+        );
+        Ok(())
+    }
+
+    /// The committed version of a record now, the number
+    /// [`Self::expect_version`] compares against. See
+    /// [`StorageEngine::record_version`].
+    pub fn record_version(&self, part: Partition, key: &[u8]) -> StorageResult<Option<u64>> {
+        self.engine.record_version(part, key)
+    }
+
     /// The conditions stated so far, for a caller that has to report them.
     pub fn expected_versions(&self) -> &[(Partition, Vec<u8>, Option<u64>)] {
         &self.expected_versions
@@ -1151,6 +1227,10 @@ impl<'a> Transaction<'a> {
                 key: String::from_utf8_lossy(key).into_owned(),
             });
         }
+        // Likewise work every member would refuse to derive.
+        self.derived
+            .check_fan_out(crate::engine::MAX_DERIVED_EFFECTS)
+            .map_err(|limit| CommitError::IndexFanOut { limit })?;
 
         // Write-admission gate: under Stop pressure (storage over its
         // compaction-debt stop threshold) a commit carrying writes is
@@ -1400,44 +1480,7 @@ impl<'a> Transaction<'a> {
 
             // Step 2: Buffer for drain (if drain buffer is available).
             if let Some(drain_buf) = ctx.drain_buffer {
-                let mut mutations: Vec<Mutation> = wb
-                    .drain()
-                    .map(|((part, key), value)| match value {
-                        Some(v) => Mutation::Put {
-                            partition: partition_to_id(part),
-                            key,
-                            value: v,
-                        },
-                        None => Mutation::Delete {
-                            partition: partition_to_id(part),
-                            key,
-                        },
-                    })
-                    .collect();
-
-                let staged = std::mem::take(&mut self.merge_adj_ops);
-                for (key, operand) in encode_staged_adj(&staged) {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Adj,
-                        key: key.to_vec(),
-                        operand,
-                    });
-                }
-                for (key, operand) in self.merge_node_deltas.drain(..) {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Node,
-                        key,
-                        operand,
-                    });
-                }
-                for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
-                    mutations.push(Mutation::Merge {
-                        partition: PartitionId::Counter,
-                        key,
-                        operand: encode_counter_delta(delta),
-                    });
-                }
-
+                let mutations = self.seal_unit(wb);
                 let entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
 
                 // j:cache: persist to NVMe before ACK for process-crash recovery.
@@ -1459,6 +1502,7 @@ impl<'a> Transaction<'a> {
                 self.merge_adj_ops.clear();
                 self.merge_node_deltas.clear();
                 self.merge_counter_deltas.clear();
+                self.derived = derived::DerivedLedger::default();
             }
 
             self.publish_schema_change();
@@ -1480,55 +1524,7 @@ impl<'a> Transaction<'a> {
         // written directly to the engine.
         // One mutation list for both application paths below: proposed
         // through the pipeline, or applied directly at commit_ts.
-        let mutations: Vec<Mutation> = {
-            let mut mutations: Vec<Mutation> = wb
-                .drain()
-                .map(|((part, key), value)| match value {
-                    Some(v) => Mutation::Put {
-                        partition: partition_to_id(part),
-                        key,
-                        value: v,
-                    },
-                    None => Mutation::Delete {
-                        partition: partition_to_id(part),
-                        key,
-                    },
-                })
-                .collect();
-
-            // Adj merge operands: bypass MVCC, raw keys, staged order kept.
-            let staged = std::mem::take(&mut self.merge_adj_ops);
-            for (key, operand) in encode_staged_adj(&staged) {
-                mutations.push(Mutation::Merge {
-                    partition: PartitionId::Adj,
-                    key: key.to_vec(),
-                    operand,
-                });
-            }
-            for (key, operand) in self.merge_node_deltas.drain(..) {
-                mutations.push(Mutation::Merge {
-                    partition: PartitionId::Node,
-                    key,
-                    operand,
-                });
-            }
-            for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
-                mutations.push(Mutation::Merge {
-                    partition: PartitionId::Counter,
-                    key,
-                    operand: encode_counter_delta(delta),
-                });
-            }
-
-            // Coalesce dense runs of point deletes into range deletes before
-            // proposing: a bulk delete ("delete all relationships between
-            // these nodes", DROP) replicates + PITR-logs as a few range ops
-            // instead of N point tombstones. Non-deletes / short runs untouched.
-            coordinode_core::txn::coalesce::coalesce_delete_mutations(
-                mutations,
-                coordinode_core::txn::coalesce::DEFAULT_MIN_RUN,
-            )
-        };
+        let mutations = self.seal_unit(wb);
 
         let mut applied_index: Option<u64> = None;
         if let (Some(pipeline), Some(id_gen)) = (ctx.pipeline, ctx.id_gen) {
@@ -1594,6 +1590,67 @@ impl<'a> Transaction<'a> {
             commit_ts: Some(commit_ts),
             applied_index,
         })
+    }
+
+    /// The unit this attempt commits, from its drained write buffer `wb` and
+    /// merge buffers: point writes (a DERIVED index's entries left out),
+    /// merge operands in their staged order, dense delete runs coalesced into
+    /// range deletes, and last the sealed DERIVED work, whose record sources
+    /// name positions of this final list.
+    fn seal_unit(&mut self, wb: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>) -> Vec<Mutation> {
+        let derived = std::mem::take(&mut self.derived);
+        let mut mutations: Vec<Mutation> = wb
+            .into_iter()
+            .filter(|((part, key), _)| !(*part == Partition::Idx && derived.owns(key)))
+            .map(|((part, key), value)| match value {
+                Some(v) => Mutation::Put {
+                    partition: partition_to_id(part),
+                    key,
+                    value: v,
+                },
+                None => Mutation::Delete {
+                    partition: partition_to_id(part),
+                    key,
+                },
+            })
+            .collect();
+
+        // Adj merge operands: bypass MVCC, raw keys, staged order kept.
+        let staged = std::mem::take(&mut self.merge_adj_ops);
+        for (key, operand) in encode_staged_adj(&staged) {
+            mutations.push(Mutation::Merge {
+                partition: PartitionId::Adj,
+                key: key.to_vec(),
+                operand,
+            });
+        }
+        for (key, operand) in self.merge_node_deltas.drain(..) {
+            mutations.push(Mutation::Merge {
+                partition: PartitionId::Node,
+                key,
+                operand,
+            });
+        }
+        for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
+            mutations.push(Mutation::Merge {
+                partition: PartitionId::Counter,
+                key,
+                operand: encode_counter_delta(delta),
+            });
+        }
+
+        // Coalesce dense runs of point deletes into range deletes before
+        // proposing: a bulk delete ("delete all relationships between these
+        // nodes", DROP) replicates + PITR-logs as a few range ops instead of N
+        // point tombstones. Non-deletes / short runs untouched.
+        let mut mutations = coordinode_core::txn::coalesce::coalesce_delete_mutations(
+            mutations,
+            coordinode_core::txn::coalesce::DEFAULT_MIN_RUN,
+        );
+        if !derived.is_empty() {
+            derived.seal(&mut mutations);
+        }
+        mutations
     }
 
     /// Move the engine's schema generation if this attempt changed a
@@ -1750,6 +1807,8 @@ fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
     end.push(0xFF);
     end
 }
+
+mod derived;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

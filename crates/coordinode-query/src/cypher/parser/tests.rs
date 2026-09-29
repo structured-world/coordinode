@@ -887,7 +887,7 @@ fn merge_nodes_default_keep_first() {
     assert_eq!(mn.duplicate, MergeNodesDuplicateStrategy::KeepBoth);
     assert!(
         mn.transfer_edge_properties,
-        "edge properties transfer is on by default per arch spec"
+        "edge properties transfer is on by default"
     );
 }
 
@@ -1050,10 +1050,7 @@ fn clone_node_minimal_defaults_copy_properties() {
     assert_eq!(cn.source, "a");
     assert_eq!(cn.target, "b");
     assert!(!cn.with_edges, "WITH EDGES is off by default");
-    assert!(
-        cn.with_properties,
-        "properties are copied by default per arch spec"
-    );
+    assert!(cn.with_properties, "properties are copied by default");
     assert!(cn.set_items.is_empty());
 }
 
@@ -2231,6 +2228,85 @@ fn create_index_with_where_clause() {
             );
         }
         other => panic!("expected CreateIndex, got {other:?}"),
+    }
+}
+
+/// The maintenance option names a profile, case-insensitively; without the
+/// option the index takes the namespace default.
+#[test]
+fn create_index_with_a_maintenance_profile() {
+    for (query, expected) in [
+        (
+            "CREATE INDEX e ON :User(email) OPTIONS { maintenance: 'derived' }",
+            Some(ProfileChoice::Derived),
+        ),
+        (
+            "CREATE UNIQUE INDEX e ON :User(email) OPTIONS {maintenance: 'RESOLVED',}",
+            Some(ProfileChoice::Resolved),
+        ),
+        (
+            "CREATE INDEX e ON :User(email) WHERE n.active = true \
+             OPTIONS { maintenance: 'derived' }",
+            Some(ProfileChoice::Derived),
+        ),
+        ("CREATE INDEX e ON :User(email)", None),
+    ] {
+        match &parse_ok(query).clauses[0] {
+            Clause::CreateIndex(c) => assert_eq!(c.maintenance, expected, "{query}"),
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+    }
+}
+
+/// An option other than `maintenance`, or a profile other than the two,
+/// does not parse into an index.
+#[test]
+fn create_index_refuses_unknown_maintenance_settings() {
+    for query in [
+        "CREATE INDEX e ON :User(email) OPTIONS { maintenance: 'lazy' }",
+        "CREATE INDEX e ON :User(email) OPTIONS { colour: 'red' }",
+        "CREATE INDEX e ON :User(email) OPTIONS { maintenance: 1 }",
+    ] {
+        assert!(parse(query).is_err(), "{query}");
+    }
+}
+
+/// `ALTER INDEX ... SET MAINTENANCE` names a profile or INHERIT, and
+/// `ALTER NAMESPACE SET INDEX MAINTENANCE` a profile.
+#[test]
+fn alter_index_and_namespace_maintenance() {
+    for (query, expected) in [
+        (
+            "ALTER INDEX e SET MAINTENANCE DERIVED",
+            IndexMaintenanceChoice::Profile(ProfileChoice::Derived),
+        ),
+        (
+            "alter index e set maintenance resolved",
+            IndexMaintenanceChoice::Profile(ProfileChoice::Resolved),
+        ),
+        (
+            "ALTER INDEX e SET MAINTENANCE INHERIT",
+            IndexMaintenanceChoice::Inherit,
+        ),
+    ] {
+        match &parse_ok(query).clauses[0] {
+            Clause::AlterIndex(c) => {
+                assert_eq!(c.name, "e");
+                assert_eq!(c.maintenance, expected, "{query}");
+            }
+            other => panic!("expected AlterIndex, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        parse_ok("ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED").clauses[0],
+        Clause::AlterNamespaceIndexDefault(ProfileChoice::Derived)
+    ));
+    for query in [
+        "ALTER INDEX e SET MAINTENANCE LAZY",
+        "ALTER INDEX e SET MAINTENANCE DERIVEDX",
+        "ALTER INDEX SET MAINTENANCE DERIVED",
+    ] {
+        assert!(parse(query).is_err(), "{query}");
     }
 }
 

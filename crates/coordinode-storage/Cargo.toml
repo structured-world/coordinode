@@ -70,6 +70,10 @@ crc32c = "0.6"
 rayon = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
+# Safe open(O_DSYNC) and plain fsync(2) for the oplog sync methods.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
@@ -126,6 +130,10 @@ harness = false
 
 [[bench]]
 name = "apply_coverage"
+harness = false
+
+[[bench]]
+name = "field_registration"
 harness = false
 
 [lints]

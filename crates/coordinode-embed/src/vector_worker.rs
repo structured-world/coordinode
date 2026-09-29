@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -26,7 +26,6 @@ use coordinode_query::index::{BuildTarget, BuildToken, VectorBuild, VectorIndexR
 use coordinode_storage::engine::applied::{AppliedEvent, AppliedSubscription};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
-use parking_lot::RwLock;
 use rustc_hash::FxHashSet;
 
 /// How long the worker waits for an entry before checking whether it should
@@ -53,7 +52,7 @@ impl VectorIndexWorker {
         engine: Arc<StorageEngine>,
         applied: AppliedSubscription,
         registry: Arc<VectorIndexRegistry>,
-        interner: Arc<RwLock<FieldInterner>>,
+        fields: Arc<dyn FieldRegistrar>,
         shard_id: u16,
     ) -> Self {
         let stop = registry.new_build_token();
@@ -61,7 +60,7 @@ impl VectorIndexWorker {
             engine,
             applied,
             registry,
-            interner,
+            fields,
             shard_id,
             stop: stop.clone(),
         };
@@ -99,7 +98,9 @@ struct Worker {
     engine: Arc<StorageEngine>,
     applied: AppliedSubscription,
     registry: Arc<VectorIndexRegistry>,
-    interner: Arc<RwLock<FieldInterner>>,
+    /// Read afresh for each fold: an entry can carry a property registered
+    /// after the worker started.
+    fields: Arc<dyn FieldRegistrar>,
     shard_id: u16,
     /// Cancelled when the worker is asked to stop; also stops its rebuilds.
     stop: BuildToken,
@@ -174,7 +175,13 @@ impl Worker {
                 return;
             }
         };
-        let interner = self.interner.read();
+        let interner = match self.fields.view() {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::error!(error = %e, "vector index worker cannot read the field dictionary");
+                return;
+            }
+        };
         for (node_id, record) in ids.into_iter().zip(records) {
             // A deleted node stays in the graph as a stale entry the read path
             // re-validates, the same as a write-path delete leaves it.
@@ -201,7 +208,13 @@ impl Worker {
     /// Rebuild every index from the store: what changed is not known.
     fn rebuild(&self) {
         let definitions = self.registry.all_definitions();
-        let interner = self.interner.read();
+        let interner = match self.fields.view() {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::error!(error = %e, "vector index worker cannot read the field dictionary");
+                return;
+            }
+        };
         let mut members = Vec::with_capacity(definitions.len());
         for def in &definitions {
             let (Some(hnsw), Some(health), Some(field_id)) = (

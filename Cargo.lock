@@ -893,10 +893,12 @@ name = "coordinode-core"
 version = "0.6.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "criterion",
  "rmp",
  "rmp-serde",
  "rmpv",
+ "rustc-hash",
  "serde",
  "sha2 0.11.0",
  "smallvec",
@@ -951,13 +953,14 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "coordinode-lsm-tree"
-version = "5.11.5"
+version = "5.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6051c40a7dc660a6690386895eef877b4ce1287e573642ec949119a879d48e74"
+checksum = "8d870c4d72bd84e643a8bc7e85a820348488fc17c7c478f5b547c396f7fe6f98"
 dependencies = [
  "aes-gcm 0.11.1",
  "arc-swap",
@@ -1052,6 +1055,7 @@ dependencies = [
  "futures-util",
  "metrics",
  "openraft",
+ "parking_lot",
  "prost",
  "rcgen",
  "rmp-serde",
@@ -1227,6 +1231,7 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "rustc-hash",
+ "rustix",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -3863,7 +3868,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6009,9 +6014,9 @@ dependencies = [
 
 [[package]]
 name = "structured-zstd"
-version = "0.0.56"
+version = "0.0.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5c90fa82a76dcd1e909b13f649e34b83d664c3a53f28f46f54dc6ce92b48739"
+checksum = "fa4880f142810e12037627f0cedb7f3e811b282306308315ed9e73299ff64d6e"
 dependencies = [
  "fastrand",
  "twox-hash",

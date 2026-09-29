@@ -3,6 +3,7 @@
 
 pub mod coalesce;
 pub mod drain;
+pub mod frame;
 pub mod invariant;
 pub mod proposal;
 pub mod read_concern;

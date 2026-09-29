@@ -14,6 +14,20 @@ use coordinode_embed::DatabaseError;
 use coordinode_storage::error::StorageError;
 use tonic::Status;
 
+/// Run a synchronous database call from a request handler without holding a
+/// runtime worker: on a multi-thread runtime the worker hands its queue to
+/// another thread while `f` blocks. A call blocks on its commit through Raft,
+/// and on locks another call holds while it waits for its own commit; done on
+/// a worker, enough such calls in flight take every worker, and the Raft tasks
+/// those commits wait for never run. On a current-thread runtime there is no
+/// other worker to hand to, and `f` runs in place.
+pub(crate) fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// Convert a [`DatabaseError`] from the embedded database into a
 /// [`tonic::Status`] preserving operator-actionable error categories.
 ///

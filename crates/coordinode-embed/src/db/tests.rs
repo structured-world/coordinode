@@ -299,41 +299,90 @@ fn node_ids_persist_across_multiple_reopens() {
     }
 }
 
-/// Batch exhaustion triggers a new persistent batch.
+/// The ceiling of the last lease the log granted.
+fn lease_ceiling(db: &Database) -> u64 {
+    coordinode_storage::engine::metadata::node_lease_ceiling(db.engine())
+        .expect("read the lease records")
+}
+
+fn created_id(results: &[Row]) -> u64 {
+    match results.first().and_then(|row| row.get("id")) {
+        Some(coordinode_core::graph::types::Value::Int(id)) => u64::try_from(*id).expect("id"),
+        other => panic!("expected an id, got {other:?}"),
+    }
+}
+
+/// A NodeId is handed out only after the lease covering it is recorded in
+/// the log: a crash right after the CREATE cannot let it be issued again.
 #[test]
-fn batch_exhaustion_persists_new_ceiling() {
+fn a_lease_is_recorded_before_its_ids_are_used() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let id = created_id(
+        &db.execute_cypher("CREATE (n:User {name: 'a'}) RETURN id(n) AS id")
+            .expect("create"),
+    );
+    let ceiling = lease_ceiling(&db);
+    assert!(id <= ceiling, "id {id} above the granted ceiling {ceiling}");
+    assert_eq!(ceiling % super::id_lease::NODE_LEASE_SIZE, 0);
+}
 
-    {
+/// One statement creating more nodes than a lease holds takes further leases
+/// as it goes, and no two nodes share an identifier.
+#[test]
+fn ids_stay_unique_across_several_leases() {
+    let count = 2 * super::id_lease::NODE_LEASE_SIZE + 500;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher(&format!(
+        "UNWIND range(1, {count}) AS i CREATE (:Many {{i: i}})"
+    ))
+    .expect("create");
+
+    let rows = db
+        .execute_cypher("MATCH (n:Many) RETURN id(n) AS id")
+        .expect("read ids");
+    let mut ids: Vec<u64> = rows
+        .iter()
+        .map(|row| created_id(std::slice::from_ref(row)))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len() as u64, count, "every node has its own id");
+    let ceiling = lease_ceiling(&db);
+    assert!(
+        ids.iter().all(|id| *id <= ceiling),
+        "an id lies above every granted lease ({ceiling})"
+    );
+}
+
+/// After a reopen the database holds no lease and draws above every range
+/// granted before, including the spare it had prefetched and never used.
+#[test]
+fn a_reopened_database_draws_above_every_granted_lease() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let granted = {
         let mut db = Database::open(dir.path()).expect("open");
-        // Create enough nodes to exhaust the first batch (1000 IDs).
-        // Each CREATE allocates 1 ID.
-        for i in 0..50 {
-            db.execute_cypher(&format!("CREATE (n:User {{idx: {i}}})"))
-                .expect("create");
+        db.execute_cypher("CREATE (n:User {name: 'before'})")
+            .expect("create");
+        // Let the background worker record its spare lease too.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while lease_ceiling(&db) < 2 * super::id_lease::NODE_LEASE_SIZE {
+            assert!(std::time::Instant::now() < deadline, "no spare lease");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // Verify ceiling was persisted correctly
-        let ceiling_bytes = db
-            .engine()
-            .get(
-                coordinode_storage::engine::partition::Partition::Schema,
-                SCHEMA_KEY_NEXT_NODE_ID,
-            )
-            .expect("get ceiling")
-            .expect("ceiling should exist");
-        let ceiling = u64::from_be_bytes(ceiling_bytes[..8].try_into().expect("8 bytes"));
-        assert!(
-            ceiling >= 1000,
-            "ceiling ({ceiling}) should be at least ID_BATCH_SIZE"
-        );
-    }
+        lease_ceiling(&db)
+    };
 
-    // Reopen and verify we can continue creating nodes
-    {
-        let mut db = Database::open(dir.path()).expect("reopen");
-        db.execute_cypher("CREATE (n:User {name: 'AfterReopen'})")
-            .expect("create after reopen");
-    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let id = created_id(
+        &db.execute_cypher("CREATE (n:User {name: 'after'}) RETURN id(n) AS id")
+            .expect("create after reopen"),
+    );
+    assert!(
+        id > granted,
+        "id {id} reused a range granted before ({granted})"
+    );
 }
 
 #[test]
@@ -541,13 +590,15 @@ fn engine_shared_multiple_arcs() {
     let arc1 = db.engine_shared();
     let arc2 = db.engine_shared();
 
-    // Both point to the same allocation (Arc strong count = 6:
+    // Both point to the same allocation (Arc strong count = 8:
     // one in Database, one in OwnedLocalProposalPipeline (drain),
     // one in TtlReaperHandle (background thread), one in the
     // LsmVectorTier backing VectorIndexRegistry (f32 truth tier),
+    // one in the NodeId lease reserver (it reads the lease record),
+    // one in the field dictionary (it reads the bindings),
     // two here).
-    assert_eq!(Arc::strong_count(&arc1), 6);
-    assert_eq!(Arc::strong_count(&arc2), 6);
+    assert_eq!(Arc::strong_count(&arc1), 8);
+    assert_eq!(Arc::strong_count(&arc2), 8);
 
     // Write through arc1, read through arc2
     arc1.put(
@@ -833,7 +884,8 @@ fn vector_schema_dimension_survives_restart() {
                 dimensions: 3,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create vector index");
 
         let mut params = std::collections::HashMap::new();
         params.insert("vec".into(), Value::Vector(vec![1.0, 0.0, 0.0]));
@@ -933,7 +985,8 @@ fn hnsw_rebuilt_for_flexible_mode_overflow_vectors() {
                 dimensions: 3,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create vector index");
 
         // Write two nodes with clearly distinct embeddings.
         let mut p1 = std::collections::HashMap::new();
@@ -1025,7 +1078,8 @@ fn vector_set_updates_hnsw_index() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Insert a node with embedding A = [1,0,0,0].
     db.execute_cypher("CREATE (:VecTest {id: 'v-1', embedding: [1.0, 0.0, 0.0, 0.0]})")
@@ -1089,7 +1143,8 @@ fn combined_stats_returns_real_vector_index_metadata() {
             ef_search: None,
             rerank_candidates: None,
         },
-    );
+    )
+    .expect("create vector index");
     // Seed one vector so size > 0.
     db.execute_cypher(
         "CREATE (d:Doc {embedding: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, \
@@ -1146,7 +1201,8 @@ fn combined_stats_crossover_lower_under_quantization() {
             ef_search: None,
             rerank_candidates: None,
         },
-    );
+    )
+    .expect("create vector index");
     let graph_stats = db.compute_stats().expect("compute_stats");
     let combined = CombinedStats {
         graph: &graph_stats,
@@ -1183,7 +1239,8 @@ fn explain_annotates_vector_index_health() {
             ef_search: None,
             rerank_candidates: None,
         },
-    );
+    )
+    .expect("create vector index");
     // Drive the index into a non-ready state so EXPLAIN shows more than the
     // default "ready".
     db.vector_index_registry()
@@ -1610,6 +1667,43 @@ fn damaged_planner_counter_disables_stats_not_queries() {
             .expect("stats")
             .node_count_for_label("User"),
         Some(2)
+    );
+}
+
+/// Statements whose plan no statistic steers never compute them: with every
+/// write invalidating the cache, computing them per statement would put a
+/// storage read behind one shared lock on every write. EXPLAIN still reads
+/// them, fresh after the writes.
+#[test]
+fn statements_that_no_statistic_steers_never_compute_them() {
+    use coordinode_core::graph::stats::StorageStats;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_stats_ttl(Duration::ZERO);
+    let computed = |db: &Database| db.stats_computations.load(Ordering::Relaxed);
+
+    for i in 0..3 {
+        db.execute_cypher(&format!("CREATE (:User {{email: 'u{i}@example.com'}})"))
+            .expect("create");
+    }
+    db.execute_cypher("MATCH (u:User) RETURN u.email AS email")
+        .expect("read");
+    assert_eq!(
+        computed(&db),
+        0,
+        "a write or a plain read computed statistics"
+    );
+
+    db.explain_cypher("MATCH (u:User) RETURN u")
+        .expect("explain");
+    assert_eq!(computed(&db), 1, "EXPLAIN computes them");
+    assert_eq!(
+        db.compute_stats()
+            .expect("stats")
+            .node_count_for_label("User"),
+        Some(3),
+        "and sees every write"
     );
 }
 

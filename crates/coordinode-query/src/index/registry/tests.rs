@@ -1,4 +1,5 @@
 use super::*;
+use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
 fn test_engine(dir: &std::path::Path) -> StorageEngine {
@@ -12,14 +13,101 @@ fn test_engine(dir: &std::path::Path) -> StorageEngine {
     StorageEngine::open(&config).expect("open engine")
 }
 
+/// A direct-mode transaction: its writes land as they are staged, so each
+/// step below sees the ones before it.
+fn txn(engine: &StorageEngine) -> Transaction<'_> {
+    Transaction::new(engine, None, Timestamp::ZERO, None)
+}
+
+fn props(pairs: &[(&str, Value)]) -> Vec<(String, Value)> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect()
+}
+
+fn s(v: &str) -> Value {
+    Value::String(v.into())
+}
+
+/// No property is bound to a field id: the tests keep values by name.
+fn no_fields(_: &str) -> Option<u32> {
+    None
+}
+
+fn create(
+    reg: &IndexRegistry,
+    engine: &StorageEngine,
+    id: u64,
+    pairs: &[(&str, Value)],
+) -> Result<(), IndexWriteError> {
+    let props = props(pairs);
+    let lookup = props_lookup(&props);
+    let mut t = txn(engine);
+    reg.on_node_created(
+        engine,
+        &mut t,
+        &NodeState {
+            node_id: NodeId::from_raw(id),
+            label: "User",
+            value_of: &lookup,
+        },
+        &no_fields,
+        &mut Vec::new(),
+    )
+}
+
+fn change(
+    reg: &IndexRegistry,
+    engine: &StorageEngine,
+    id: u64,
+    property: &str,
+    before: &[(&str, Value)],
+    after: &[(&str, Value)],
+) -> Result<(), IndexWriteError> {
+    let (before, after) = (props(before), props(after));
+    let (before, after) = (props_lookup(&before), props_lookup(&after));
+    let mut t = txn(engine);
+    reg.on_property_changed(
+        engine,
+        &mut t,
+        &PropertyChange {
+            node_id: NodeId::from_raw(id),
+            label: "User",
+            properties: &[property],
+            before: &before,
+            after: &after,
+        },
+        &no_fields,
+        &mut Vec::new(),
+    )
+}
+
+fn lookup(engine: &StorageEngine, index: &IndexDefinition, values: &[Value]) -> Vec<u64> {
+    let mut ids: Vec<u64> = LocalIndexStore::new(engine)
+        .scan_exact(&mut txn(engine), index, values)
+        .expect("scan")
+        .expect("indexable")
+        .into_iter()
+        .map(|n| n.as_raw())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn all_ids(engine: &StorageEngine, index: &IndexDefinition) -> Vec<u64> {
+    LocalIndexStore::new(engine)
+        .scan_entry_ids(&mut txn(engine), index)
+        .expect("scan")
+        .into_iter()
+        .map(|n| n.as_raw())
+        .collect()
+}
+
 #[test]
 fn register_and_lookup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-
-    let idx = IndexDefinition::btree("user_email", "User", "email").unique();
-    reg.register(&engine, idx).expect("register");
+    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
 
     assert_eq!(reg.len(), 1);
     assert!(reg.get("user_email").is_some());
@@ -29,17 +117,9 @@ fn register_and_lookup() {
 
 #[test]
 fn indexes_for_property() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-
-    reg.register(
-        &engine,
-        IndexDefinition::btree("user_email", "User", "email"),
-    )
-    .expect("register");
-    reg.register(&engine, IndexDefinition::btree("user_name", "User", "name"))
-        .expect("register");
+    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email"));
+    reg.register_in_memory(IndexDefinition::btree("user_name", "User", "name"));
 
     let email_idxs = reg.indexes_for_property("User", "email");
     assert_eq!(email_idxs.len(), 1);
@@ -47,224 +127,168 @@ fn indexes_for_property() {
 }
 
 #[test]
-fn on_node_created_unique_ok() {
+fn distinct_unique_values_are_accepted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
 
-    reg.register(
-        &engine,
-        IndexDefinition::btree("user_email", "User", "email").unique(),
-    )
-    .expect("register");
-
-    // Create first node — should succeed
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
-    )
-    .expect("first create");
-
-    // Create second node with different email — should succeed
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[("email".to_string(), Value::String("bob@test.com".into()))],
-    )
-    .expect("second create");
+    create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("first create");
+    create(&reg, &engine, 2, &[("email", s("bob@test.com"))]).expect("second create");
 }
 
+/// A second node taking a unique value is refused, naming the index and the
+/// node that holds the value.
 #[test]
-fn on_node_created_unique_violation() {
+fn a_taken_unique_value_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
 
-    reg.register(
-        &engine,
-        IndexDefinition::btree("user_email", "User", "email").unique(),
-    )
-    .expect("register");
+    create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("first");
+    let err =
+        create(&reg, &engine, 2, &[("email", s("alice@test.com"))]).expect_err("duplicate email");
 
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
-    )
-    .expect("first");
-
-    // Duplicate email — should fail
-    let result = reg.on_node_created(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
+    assert!(
+        matches!(&err, IndexWriteError::Unique(v) if v.holder == NodeId::from_raw(1)),
+        "expected a unique violation held by node 1, got {err:?}"
     );
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
     assert!(err.to_string().contains("unique constraint violated"));
     assert!(err.to_string().contains("user_email"));
 }
 
 #[test]
-fn on_property_changed_updates_index() {
+fn a_changed_value_moves_its_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    reg.register_in_memory(index.clone());
 
-    reg.register(
+    create(&reg, &engine, 1, &[("email", s("old@test.com"))]).expect("create");
+    change(
+        &reg,
         &engine,
-        IndexDefinition::btree("user_email", "User", "email").unique(),
-    )
-    .expect("register");
-
-    // Create initial entry
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("old@test.com".into()))],
-    )
-    .expect("create");
-
-    // Update property
-    reg.on_property_changed(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
+        1,
         "email",
-        Some(&Value::String("old@test.com".into())),
-        &Value::String("new@test.com".into()),
+        &[("email", s("old@test.com"))],
+        &[("email", s("new@test.com"))],
     )
     .expect("update");
 
-    // Old value should not be findable
-    let old = super::super::ops::index_scan_exact(
-        &engine,
-        "user_email",
-        &Value::String("old@test.com".into()),
-    )
-    .expect("scan");
-    assert!(old.is_empty());
-
-    // New value should be findable
-    let new = super::super::ops::index_scan_exact(
-        &engine,
-        "user_email",
-        &Value::String("new@test.com".into()),
-    )
-    .expect("scan");
-    assert_eq!(new, vec![1]);
+    assert!(lookup(&engine, &index, &[s("old@test.com")]).is_empty());
+    assert_eq!(lookup(&engine, &index, &[s("new@test.com")]), vec![1]);
 }
 
 #[test]
-fn on_property_changed_unique_violation() {
+fn changing_to_a_taken_unique_value_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
 
-    reg.register(
+    create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("create 1");
+    create(&reg, &engine, 2, &[("email", s("bob@test.com"))]).expect("create 2");
+    let result = change(
+        &reg,
         &engine,
-        IndexDefinition::btree("user_email", "User", "email").unique(),
-    )
-    .expect("register");
-
-    // Two nodes with different emails
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
-    )
-    .expect("create 1");
-
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[("email".to_string(), Value::String("bob@test.com".into()))],
-    )
-    .expect("create 2");
-
-    // Try to change node 2's email to alice's — should fail
-    let result = reg.on_property_changed(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
+        2,
         "email",
-        Some(&Value::String("bob@test.com".into())),
-        &Value::String("alice@test.com".into()),
+        &[("email", s("bob@test.com"))],
+        &[("email", s("alice@test.com"))],
     );
-    assert!(result.is_err());
+    assert!(matches!(result, Err(IndexWriteError::Unique(_))));
 }
 
+/// A compound index reads several properties; changing one of them moves
+/// the node's single entry to the new combination.
 #[test]
-fn on_node_deleted_removes_index() {
+fn a_compound_entry_moves_when_one_of_its_properties_changes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index =
+        IndexDefinition::compound("user_city_age", "User", vec!["city".into(), "age".into()]);
+    reg.register_in_memory(index.clone());
 
-    reg.register(
-        &engine,
-        IndexDefinition::btree("user_email", "User", "email"),
-    )
-    .expect("register");
+    let before = [("city", s("Oslo")), ("age", Value::Int(30))];
+    let after = [("city", s("Oslo")), ("age", Value::Int(31))];
+    create(&reg, &engine, 1, &before).expect("create");
+    change(&reg, &engine, 1, "age", &before, &after).expect("change");
 
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
-    )
-    .expect("create");
+    assert!(lookup(&engine, &index, &[s("Oslo"), Value::Int(30)]).is_empty());
+    assert_eq!(
+        lookup(&engine, &index, &[s("Oslo"), Value::Int(31)]),
+        vec![1]
+    );
+}
 
-    // Delete
+#[test]
+fn a_deleted_node_leaves_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("user_email", "User", "email");
+    reg.register_in_memory(index.clone());
+
+    create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("create");
+    let props = props(&[("email", s("alice@test.com"))]);
     reg.on_node_deleted(
         &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("email".to_string(), Value::String("alice@test.com".into()))],
+        &mut txn(&engine),
+        &NodeState {
+            node_id: NodeId::from_raw(1),
+            label: "User",
+            value_of: &props_lookup(&props),
+        },
+        &no_fields,
     )
     .expect("delete");
 
-    // Should not be findable
-    let results = super::super::ops::index_scan_exact(
-        &engine,
-        "user_email",
-        &Value::String("alice@test.com".into()),
-    )
-    .expect("scan");
-    assert!(results.is_empty());
+    assert!(lookup(&engine, &index, &[s("alice@test.com")]).is_empty());
+}
+
+/// Only B-tree indexes have entries: a vector index registered alongside
+/// for planning and advice is not maintained here.
+#[test]
+fn a_vector_index_in_the_registry_gets_no_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let vector = IndexDefinition::hnsw(
+        "user_vec",
+        "User",
+        "email",
+        crate::index::definition::VectorIndexConfig::default(),
+    );
+    reg.register_in_memory(vector.clone());
+
+    assert!(!reg.has_btree_for("User"));
+    create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("create");
+    assert!(all_ids(&engine, &vector).is_empty());
 }
 
 #[test]
 fn load_all_from_storage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
+    super::super::ops::save_index_definition(
+        &engine,
+        &IndexDefinition::btree("idx1", "User", "email").unique(),
+    )
+    .expect("save");
+    super::super::ops::save_index_definition(
+        &engine,
+        &IndexDefinition::btree("idx2", "User", "name"),
+    )
+    .expect("save");
 
-    // Save definitions
-    {
-        let reg = IndexRegistry::new();
-        reg.register(
-            &engine,
-            IndexDefinition::btree("idx1", "User", "email").unique(),
-        )
-        .expect("register");
-        reg.register(&engine, IndexDefinition::btree("idx2", "User", "name"))
-            .expect("register");
-    }
-
-    // Load in new registry
-    let reg2 = IndexRegistry::new();
-    reg2.load_all(&engine).expect("load");
-    assert_eq!(reg2.len(), 2);
-    assert!(reg2.get("idx1").is_some());
-    assert!(reg2.get("idx2").is_some());
+    let reg = IndexRegistry::new();
+    reg.load_all(&engine).expect("load");
+    assert_eq!(reg.len(), 2);
+    assert!(reg.get("idx1").is_some());
+    assert!(reg.get("idx2").is_some());
 }
 
 #[test]
@@ -272,25 +296,11 @@ fn sparse_index_skips_null_on_create() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("user_bio", "User", "bio").sparse();
+    reg.register_in_memory(index.clone());
 
-    reg.register(
-        &engine,
-        IndexDefinition::btree("user_bio", "User", "bio").sparse(),
-    )
-    .expect("register");
-
-    // Create node with null bio — should be skipped
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[("bio".to_string(), Value::Null)],
-    )
-    .expect("create");
-
-    let idx = reg.get("user_bio").expect("get");
-    let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
-    assert!(results.is_empty());
+    create(&reg, &engine, 1, &[("bio", Value::Null)]).expect("create");
+    assert!(all_ids(&engine, &index).is_empty());
 }
 
 // ====== Partial index ======
@@ -300,48 +310,53 @@ fn partial_index_filters_on_create() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("active_email", "User", "email").with_filter(
+        super::super::definition::PartialFilter::PropertyEquals {
+            property: "status".into(),
+            value: "active".into(),
+        },
+    );
+    reg.register_in_memory(index.clone());
 
-    // Index only active users
-    reg.register(
+    create(
+        &reg,
         &engine,
-        IndexDefinition::btree("active_email", "User", "email").with_filter(
-            super::super::definition::PartialFilter::PropertyEquals {
-                property: "status".into(),
-                value: "active".into(),
-            },
-        ),
-    )
-    .expect("register");
-
-    // Active user — should be indexed
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[
-            ("email".to_string(), Value::String("alice@test.com".into())),
-            ("status".to_string(), Value::String("active".into())),
-        ],
+        1,
+        &[("email", s("alice@test.com")), ("status", s("active"))],
     )
     .expect("create active");
-
-    // Inactive user — should NOT be indexed
-    reg.on_node_created(
+    create(
+        &reg,
         &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[
-            ("email".to_string(), Value::String("bob@test.com".into())),
-            ("status".to_string(), Value::String("inactive".into())),
-        ],
+        2,
+        &[("email", s("bob@test.com")), ("status", s("inactive"))],
     )
     .expect("create inactive");
 
-    // Only active user should be in index
-    let idx = reg.get("active_email").expect("get");
-    let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 1); // Only Alice
+    assert_eq!(all_ids(&engine, &index), vec![1]);
+}
+
+/// Changing the property a partial index filters on moves the node into or
+/// out of the index, though no indexed value changed.
+#[test]
+fn a_node_leaves_a_partial_index_when_its_filter_stops_matching() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("active_email", "User", "email").with_filter(
+        super::super::definition::PartialFilter::PropertyEquals {
+            property: "status".into(),
+            value: "active".into(),
+        },
+    );
+    reg.register_in_memory(index.clone());
+
+    let active = [("email", s("alice@test.com")), ("status", s("active"))];
+    let inactive = [("email", s("alice@test.com")), ("status", s("inactive"))];
+    create(&reg, &engine, 1, &active).expect("create");
+    change(&reg, &engine, 1, "status", &active, &inactive).expect("deactivate");
+
+    assert!(all_ids(&engine, &index).is_empty());
 }
 
 #[test]
@@ -349,46 +364,36 @@ fn partial_index_bool_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("verified_email", "User", "email").with_filter(
+        super::super::definition::PartialFilter::PropertyEqualsBool {
+            property: "verified".into(),
+            value: true,
+        },
+    );
+    reg.register_in_memory(index.clone());
 
-    reg.register(
+    create(
+        &reg,
         &engine,
-        IndexDefinition::btree("verified_email", "User", "email").with_filter(
-            super::super::definition::PartialFilter::PropertyEqualsBool {
-                property: "verified".into(),
-                value: true,
-            },
-        ),
-    )
-    .expect("register");
-
-    // Verified user
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(1),
-        "User",
+        1,
         &[
-            ("email".to_string(), Value::String("alice@test.com".into())),
-            ("verified".to_string(), Value::Bool(true)),
+            ("email", s("alice@test.com")),
+            ("verified", Value::Bool(true)),
+        ],
+    )
+    .expect("create");
+    create(
+        &reg,
+        &engine,
+        2,
+        &[
+            ("email", s("bob@test.com")),
+            ("verified", Value::Bool(false)),
         ],
     )
     .expect("create");
 
-    // Unverified user
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[
-            ("email".to_string(), Value::String("bob@test.com".into())),
-            ("verified".to_string(), Value::Bool(false)),
-        ],
-    )
-    .expect("create");
-
-    let idx = reg.get("verified_email").expect("get");
-    let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 1);
+    assert_eq!(all_ids(&engine, &index), vec![1]);
 }
 
 #[test]
@@ -396,45 +401,29 @@ fn partial_index_exists_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
+    let index = IndexDefinition::btree("user_bio_idx", "User", "bio").with_filter(
+        super::super::definition::PartialFilter::PropertyExists {
+            property: "bio".into(),
+        },
+    );
+    reg.register_in_memory(index.clone());
 
-    reg.register(
+    create(
+        &reg,
         &engine,
-        IndexDefinition::btree("user_bio_idx", "User", "bio").with_filter(
-            super::super::definition::PartialFilter::PropertyExists {
-                property: "bio".into(),
-            },
-        ),
+        1,
+        &[("name", s("Alice")), ("bio", s("Developer"))],
     )
-    .expect("register");
-
-    // User WITH bio
-    reg.on_node_created(
+    .expect("create");
+    create(
+        &reg,
         &engine,
-        NodeId::from_raw(1),
-        "User",
-        &[
-            ("name".to_string(), Value::String("Alice".into())),
-            ("bio".to_string(), Value::String("Developer".into())),
-        ],
+        2,
+        &[("name", s("Bob")), ("bio", Value::Null)],
     )
     .expect("create");
 
-    // User WITHOUT bio (null)
-    reg.on_node_created(
-        &engine,
-        NodeId::from_raw(2),
-        "User",
-        &[
-            ("name".to_string(), Value::String("Bob".into())),
-            ("bio".to_string(), Value::Null),
-        ],
-    )
-    .expect("create");
-
-    let idx = reg.get("user_bio_idx").expect("get");
-    let results = super::super::ops::index_scan(&engine, &idx).expect("scan");
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0], 1);
+    assert_eq!(all_ids(&engine, &index), vec![1]);
 }
 
 #[test]
@@ -446,7 +435,6 @@ fn partial_filter_matches_function() {
         ("age".to_string(), Value::Int(30)),
     ];
 
-    // String equality
     assert!(
         PartialFilter::PropertyEquals {
             property: "status".into(),
@@ -454,7 +442,6 @@ fn partial_filter_matches_function() {
         }
         .matches(&props)
     );
-
     assert!(
         !PartialFilter::PropertyEquals {
             property: "status".into(),
@@ -462,8 +449,6 @@ fn partial_filter_matches_function() {
         }
         .matches(&props)
     );
-
-    // Int equality
     assert!(
         PartialFilter::PropertyEqualsInt {
             property: "age".into(),
@@ -471,16 +456,12 @@ fn partial_filter_matches_function() {
         }
         .matches(&props)
     );
-
-    // Exists
     assert!(
         PartialFilter::PropertyExists {
             property: "status".into(),
         }
         .matches(&props)
     );
-
-    // Not exists
     assert!(
         !PartialFilter::PropertyExists {
             property: "missing".into(),

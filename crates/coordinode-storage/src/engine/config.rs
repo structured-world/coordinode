@@ -377,6 +377,44 @@ pub enum FlushPolicy {
     Manual,
 }
 
+/// How an oplog append is made durable: which call, not when (that is
+/// [`FlushPolicy`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMethod {
+    /// Flush through the drive's own write cache: `F_FULLFSYNC` on macOS,
+    /// `fdatasync` on Linux, `FlushFileBuffers` on Windows. The same calls
+    /// MongoDB's WiredTiger journal makes. An acknowledged write survives a
+    /// power loss.
+    #[default]
+    Full,
+    /// `fsync(2)`: the data reaches the drive, which may still hold it in its
+    /// volatile cache. On macOS that is much cheaper than [`Self::Full`] and a
+    /// power loss can take acknowledged writes; elsewhere it is the same as
+    /// [`Self::Full`].
+    Fsync,
+    /// Every write goes out with `O_DSYNC` (write-through on Windows) and no
+    /// separate flush call follows. Durable where the OS honours the flag down
+    /// to the medium, which macOS does not.
+    OpenDatasync,
+}
+
+impl SyncMethod {
+    /// The sync mode of the LSM trees under an oplog with this method.
+    ///
+    /// The oplog is purged once a flush returns, so a flushed table must be
+    /// at least as durable as the oplog entries it replaces: a full-flush
+    /// oplog over plain-fsync tables would lose acknowledged writes to a
+    /// power cut on macOS. The trees write in batches and sync once, so they
+    /// take the full flush rather than `O_DSYNC`.
+    pub(crate) fn tree_sync_mode(self) -> lsm_tree::fs::SyncMode {
+        match self {
+            Self::Full | Self::OpenDatasync => lsm_tree::fs::SyncMode::Full,
+            Self::Fsync => lsm_tree::fs::SyncMode::Normal,
+        }
+    }
+}
+
 /// Compression codec for LSM block compression.
 ///
 /// The architecture specifies lz4 for hot levels (L0-L3) and zstd for cold
@@ -631,6 +669,9 @@ pub struct StorageConfig {
     /// Oplog retention window in seconds. Segments with all entries older than
     /// `now - oplog_retention_secs` are eligible for purge. Default: 7 days.
     pub oplog_retention_secs: u64,
+
+    /// How an oplog append is made durable. Default: [`SyncMethod::Full`].
+    pub oplog_sync_method: SyncMethod,
 
     /// MVCC time-travel retention window in seconds. On an engine whose seqno
     /// is the HLC commit timestamp (every oracle-backed open) the GC watermark
@@ -887,6 +928,7 @@ impl StorageConfig {
             oplog_segment_max_bytes: 64 * 1024 * 1024,
             oplog_segment_max_entries: 50_000,
             oplog_retention_secs: 7 * 24 * 3600,
+            oplog_sync_method: SyncMethod::default(),
             retention_window_secs: 7 * 24 * 3600,
             max_invariant_claims: 100_000,
             max_commits_in_flight: 10_000,
@@ -1144,7 +1186,8 @@ impl StorageConfig {
             Arc::clone(&seqno),
             Arc::clone(&seqno), // visible_seqno = seqno: all writes immediately visible
         )
-        .data_block_compression_policy(compression_policy);
+        .data_block_compression_policy(compression_policy)
+        .sync_mode(self.oplog_sync_method.tree_sync_mode());
 
         // Custom filesystem backend (e.g., MemFs for in-memory tests)
         let fs_for_routes: Arc<dyn lsm_tree::fs::Fs> = if let Some(ref fs) = self.fs {

@@ -61,6 +61,7 @@
 use std::path::PathBuf;
 
 use crate::error::{StorageError, StorageResult};
+use crate::oplog::convert::expand_units;
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
 use crate::oplog::segment::SegmentReader;
 
@@ -238,13 +239,24 @@ impl OplogTailer {
                     return Ok(result);
                 }
                 self.next = entry.index + 1;
-                if passes_filter(entry, filters) {
+                // A reader sees the operations a unit frame encodes.
+                let ops = expand_units(&entry.ops)?;
+                if passes_filter(entry, &ops, filters) {
                     let token = ResumeToken {
                         shard_id: self.shard_id,
                         segment_id: *seg_first_index,
                         entry_offset: self.next - seg_first_index,
                     };
-                    result.push((entry.clone(), token));
+                    let entry = OplogEntry {
+                        ts: entry.ts,
+                        term: entry.term,
+                        index: entry.index,
+                        shard: entry.shard,
+                        ops: ops.into_owned(),
+                        is_migration: entry.is_migration,
+                        pre_images: entry.pre_images.clone(),
+                    };
+                    result.push((entry, token));
                 }
             }
         }
@@ -283,8 +295,9 @@ impl OplogTailer {
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
-/// Returns `true` if `entry` passes all active filters.
-fn passes_filter(entry: &OplogEntry, filters: &CdcFilters) -> bool {
+/// Returns `true` if `entry`, whose operations are `ops`, passes all active
+/// filters.
+fn passes_filter(entry: &OplogEntry, ops: &[OplogOp], filters: &CdcFilters) -> bool {
     // is_migration filter
     if let Some(expected_migration) = filters.is_migration {
         if entry.is_migration != expected_migration {
@@ -297,7 +310,7 @@ fn passes_filter(entry: &OplogEntry, filters: &CdcFilters) -> bool {
     // Adj forward key: `adj:<TYPE>:out:<node_id BE>`
     // Adj reverse key: `adj:<TYPE>:in:<node_id BE>`
     if !filters.edge_types.is_empty() {
-        let matches = entry.ops.iter().any(|op| {
+        let matches = ops.iter().any(|op| {
             let key = match op {
                 OplogOp::Insert { key, .. }
                 | OplogOp::Delete { key, .. }

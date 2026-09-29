@@ -30,7 +30,6 @@ use coordinode_storage::placement::{
 use coordinode_swarm::{
     Freshness, NodeId, PieceEncoding, PieceSource, SourceCandidate, split_segment, swarm_download,
 };
-use tonic::transport::Channel;
 
 use crate::transfer::proto::SegmentDescriptorRef;
 use crate::transfer::{BuiltSegment, GrpcPieceSource, SegmentSink, SegmentSource};
@@ -269,21 +268,10 @@ pub async fn drain_segment_to_peer(
     let frames =
         crate::transfer::frames_for(&store, seg).map_err(|e| DrainError::Pieces(e.to_string()))?;
 
-    let mut ep =
-        tonic::transport::Endpoint::from_shared(endpoint.to_string()).map_err(|source| {
-            DrainError::Connect {
-                endpoint: endpoint.to_string(),
-                source,
-            }
-        })?;
-    // Encrypt the drain connection when inter-node TLS is configured
-    // (process-global, set once at startup). Off = plaintext.
-    if let Some(tls) = coordinode_wire::wire_client_tls() {
-        ep = ep.tls_config(tls).map_err(|source| DrainError::Connect {
-            endpoint: endpoint.to_string(),
-            source,
-        })?;
-    }
+    let ep = coordinode_wire::peer_endpoint(endpoint).map_err(|source| DrainError::Connect {
+        endpoint: endpoint.to_string(),
+        source,
+    })?;
     let channel = ep.connect().await.map_err(|source| DrainError::Connect {
         endpoint: endpoint.to_string(),
         source,
@@ -510,15 +498,9 @@ impl SegmentInstaller {
         let mut sources: Vec<GrpcPieceSource> = Vec::new();
         let mut manifest = None;
         for (i, endpoint) in peers.iter().enumerate() {
-            let Ok(mut ep) = Channel::from_shared(endpoint.clone()) else {
+            let Ok(ep) = coordinode_wire::peer_endpoint(endpoint) else {
                 continue;
             };
-            if let Some(tls) = coordinode_wire::wire_client_tls() {
-                let Ok(with_tls) = ep.tls_config(tls) else {
-                    continue;
-                };
-                ep = with_tls;
-            }
             let Ok(channel) = ep.connect().await else {
                 continue;
             };

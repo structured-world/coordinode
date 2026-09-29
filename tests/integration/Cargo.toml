@@ -40,6 +40,11 @@ coordinode-client = { path = "../../crates/coordinode-client" }
 coordinode-test-fixtures = { path = "../../crates/coordinode-test-fixtures" }
 coordinode-workspace-hack = { version = "0.1", path = "../../crates/coordinode-workspace-hack" }
 
+# Asks a spawned server to stop with a console control event, the Windows
+# counterpart of SIGTERM.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -47,5 +52,14 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 [build-dependencies]
 tonic-prost-build = "0.14"
 
-[lints]
-workspace = true
+# The workspace lints, except that unsafe code is denied rather than
+# forbidden: sending a console control event to a child on Windows is one FFI
+# call, allowed at that call site alone (`harness::request_shutdown`).
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+disallowed_types = "allow"

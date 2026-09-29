@@ -135,6 +135,56 @@ fn all_ff_tail_stays_points() {
     assert_eq!(out, vec![prev, max]);
 }
 
+/// DERIVED work keeps naming the record it derives from when runs before
+/// that record fold into ranges: its position is renumbered, not kept.
+#[test]
+fn derived_record_sources_follow_their_record() {
+    use crate::index::derive::{IndexInterpretation, KEY_CODEC};
+    use crate::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding};
+    let derive = |ordinal| {
+        Mutation::Derive(DerivedIndexWork {
+            binding: IndexBinding {
+                epoch: 1,
+                interpretation: IndexInterpretation {
+                    codec: KEY_CODEC,
+                    name: "i".into(),
+                    unique: false,
+                    sparse: false,
+                    properties: Vec::new(),
+                    filter: None,
+                },
+            },
+            node_id: 9,
+            old: None,
+            new: DerivedSource::UnitRecord(ordinal),
+        })
+    };
+    let muts = vec![
+        put(PartitionId::Node, 1),
+        del(PartitionId::Adj, 1),
+        del(PartitionId::Adj, 2),
+        del(PartitionId::Adj, 3),
+        del(PartitionId::Adj, 4),
+        put(PartitionId::Node, 9),
+        del(PartitionId::Idx, 5),
+        del(PartitionId::Idx, 6),
+        derive(5),
+        derive(0),
+    ];
+    let out = coalesce_delete_mutations(muts, 2);
+    assert_eq!(
+        out,
+        vec![
+            put(PartitionId::Node, 1),
+            range(PartitionId::Adj, 1, 4),
+            put(PartitionId::Node, 9),
+            range(PartitionId::Idx, 5, 6),
+            derive(2),
+            derive(0),
+        ]
+    );
+}
+
 #[test]
 fn empty_passes_through() {
     assert!(coalesce_delete_mutations(vec![], 4).is_empty());

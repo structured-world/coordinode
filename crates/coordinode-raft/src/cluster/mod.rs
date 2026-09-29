@@ -45,27 +45,47 @@ pub const DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS: u64 = 30_000;
 /// Type alias for the openraft Raft instance with our config + state machine.
 type RaftInstance = openraft::Raft<TypeConfig, CoordinodeStateMachine>;
 
-/// Configuration for the background snapshot trigger task.
+/// When a node snapshots its state so the Raft log before it can go.
 ///
-/// openraft only supports entry-count-based triggers (`LogsSinceLast`).
-/// This config adds WAL-size and periodic timer triggers, so a log that
-/// grows through a few large entries is still compacted.
+/// A snapshot is taken when any of the three is reached: entries applied
+/// since the last one, bytes the log grew by since the last one (a few
+/// large entries compact the log as a count of small ones would), or the
+/// periodic timer while anything new was applied.
 pub struct SnapshotTriggerConfig {
-    /// Check interval for periodic trigger (default: 60s).
+    /// Entries applied since the last snapshot (default 10 000).
+    pub logs_since_last: u64,
+    /// Bytes the Raft log's segments grew by since the last snapshot
+    /// (default 256 MiB).
+    pub log_bytes: u64,
+    /// Longest time between snapshots while entries are applied (default
+    /// 60 s).
     pub check_interval: std::time::Duration,
-    /// Disk space threshold in bytes to trigger snapshot (default: 256MB).
-    /// Uses `StorageEngine::disk_space()` as proxy for WAL size.
-    pub disk_space_threshold: u64,
 }
 
 impl Default for SnapshotTriggerConfig {
     fn default() -> Self {
         Self {
+            logs_since_last: 10_000,
+            log_bytes: 256 * 1024 * 1024,
             check_interval: std::time::Duration::from_secs(60),
-            disk_space_threshold: 256 * 1024 * 1024, // 256MB
         }
     }
 }
+
+impl SnapshotTriggerConfig {
+    /// The openraft configuration under this snapshot policy: the entry
+    /// count is openraft's own trigger; the other two are the trigger task's.
+    fn raft_config(&self) -> openraft::Config {
+        openraft::Config {
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(self.logs_since_last),
+            ..default_raft_config()
+        }
+    }
+}
+
+/// How long opening a node that is its group's only voter waits for it to
+/// elect itself: one vote made durable, so seconds only on a stalled disk.
+const SINGLE_NODE_ELECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a shutdown waits for snapshot work still holding the engine: a
 /// full build of a large store takes minutes, and cutting it short would
@@ -125,14 +145,74 @@ pub struct RaftNode {
     /// indefinitely — without the abort the port stays bound and a
     /// restarting node is locked out of its own address.
     grpc_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by `shutdown()` once the consensus stops, failing every call to a
+    /// peer still in flight so the tasks waiting on them let go of the
+    /// engine.
+    closing: tokio::sync::watch::Sender<bool>,
     /// Snapshot trigger background task abort handle.
     _snapshot_trigger: Option<tokio::task::JoinHandle<()>>,
     /// How long a membership change waits for the previous one to settle,
     /// in ms. See [`Self::set_membership_settle_timeout`].
     membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
+    /// When a joining learner is promoted, and how long a join may take. See
+    /// [`Self::set_join_readiness_lag`] and [`Self::set_join_timeout`].
+    join: JoinTuning,
+}
+
+/// Default for [`RaftNode::join_readiness_lag`]: close enough that the
+/// remaining gap replicates within a few heartbeats once the member votes.
+const DEFAULT_JOIN_READINESS_LAG: u64 = 1_000;
+/// Default for [`RaftNode::join_timeout`].
+const DEFAULT_JOIN_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+
+/// The join settings an operator may retune while the node runs.
+struct JoinTuning {
+    readiness_lag: core::sync::atomic::AtomicU64,
+    timeout_ms: core::sync::atomic::AtomicU64,
+}
+
+impl Default for JoinTuning {
+    fn default() -> Self {
+        Self {
+            readiness_lag: core::sync::atomic::AtomicU64::new(DEFAULT_JOIN_READINESS_LAG),
+            timeout_ms: core::sync::atomic::AtomicU64::new(DEFAULT_JOIN_TIMEOUT_MS),
+        }
+    }
 }
 
 impl RaftNode {
+    /// How many entries a joining learner may still lack when it is promoted
+    /// to a voter.
+    pub fn join_readiness_lag(&self) -> u64 {
+        self.join
+            .readiness_lag
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Change the promotion threshold without a restart; joins already
+    /// waiting pick it up on their next poll.
+    pub fn set_join_readiness_lag(&self, entries: u64) {
+        self.join
+            .readiness_lag
+            .store(entries, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How long a join may take to catch its learner up before it fails.
+    pub fn join_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.join
+                .timeout_ms
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Change that bound without a restart, for joins started afterwards.
+    pub fn set_join_timeout(&self, timeout: std::time::Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.join
+            .timeout_ms
+            .store(ms, core::sync::atomic::Ordering::Relaxed);
+    }
     /// How long a membership change waits for the previous one to commit.
     pub fn membership_settle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
@@ -173,7 +253,23 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
     ) -> Result<Self, RaftNodeError> {
-        let config = Arc::new(default_raft_config());
+        Self::open_with_oracle_and_snapshot_config(
+            node_id,
+            engine,
+            oracle,
+            SnapshotTriggerConfig::default(),
+        )
+        .await
+    }
+
+    /// Like `open_with_oracle` but with custom snapshot trigger configuration.
+    pub async fn open_with_oracle_and_snapshot_config(
+        node_id: u64,
+        engine: Arc<StorageEngine>,
+        oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+        snap_config: SnapshotTriggerConfig,
+    ) -> Result<Self, RaftNodeError> {
+        let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -185,7 +281,8 @@ impl RaftNode {
         // for why the state machine must advance it).
         let oracle = oracle.or_else(|| engine.oracle());
         let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle)
-            .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+            .map_err(|e| RaftNodeError::Init(e.to_string()))?
+            .with_engine_work(log_store.engine_work());
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -236,7 +333,35 @@ impl RaftNode {
             }
         }
 
+        // A node that is its group's only voter elects itself; it takes
+        // writes once its vote is durable and the entry opening its term is
+        // applied. Returned before that, it would refuse its first writes as
+        // not the leader, so the election is waited for here.
+        // The metrics catch up with the membership just initialized or
+        // restored, so the wait starts once they name the voters: a group of
+        // others is left to elect its own leader.
+        raft.wait(Some(SINGLE_NODE_ELECTION_WAIT))
+            .metrics(
+                |m| {
+                    let joint = m.membership_config.membership().get_joint_config();
+                    let Some(voters) = joint.first().filter(|v| !v.is_empty()) else {
+                        return false;
+                    };
+                    if voters.iter().any(|&id| id != node_id) {
+                        return true;
+                    }
+                    m.state.is_leader()
+                        && m.vote.is_committed()
+                        && m.last_applied.map(|id| id.index) >= m.last_log_index
+                },
+                "the only voter elects itself",
+            )
+            .await
+            .map_err(|e| RaftNodeError::Init(format!("the node did not become leader: {e}")))?;
+
         let raft = Arc::new(raft);
+        let snap_handle =
+            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
 
         Ok(Self {
             raft,
@@ -250,10 +375,13 @@ impl RaftNode {
             append_notifier,
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
-            _snapshot_trigger: None,
+            // No peers to call.
+            closing: tokio::sync::watch::Sender::new(false),
+            _snapshot_trigger: Some(snap_handle),
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            join: JoinTuning::default(),
         })
     }
 
@@ -304,7 +432,7 @@ impl RaftNode {
         advertise_addr: String,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<Self, RaftNodeError> {
-        let config = Arc::new(default_raft_config());
+        let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -318,13 +446,16 @@ impl RaftNode {
         // replicated data.
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?
+                .with_engine_work(log_store.engine_work());
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
 
+        let (closing, closing_rx) = tokio::sync::watch::channel(false);
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
+            closing: network::Closing::new(closing_rx),
         };
 
         let raft: RaftInstance =
@@ -408,10 +539,12 @@ impl RaftNode {
             append_notifier,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
+            closing,
             _snapshot_trigger: Some(snap_handle),
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            join: JoinTuning::default(),
         })
     }
 
@@ -460,7 +593,7 @@ impl RaftNode {
         advertise_addr: String,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        let config = Arc::new(default_raft_config());
+        let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -474,13 +607,16 @@ impl RaftNode {
         // replicated data.
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?
+                .with_engine_work(log_store.engine_work());
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
 
+        let (closing, closing_rx) = tokio::sync::watch::channel(false);
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
+            closing: network::Closing::new(closing_rx),
         };
 
         let raft: RaftInstance =
@@ -540,10 +676,12 @@ impl RaftNode {
             // no internal server — caller manages the router
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
+            closing,
             _snapshot_trigger: Some(snap_handle),
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            join: JoinTuning::default(),
         };
 
         Ok((node, handler))
@@ -575,8 +713,7 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        refuse_join_with_local_data(&engine)?;
-        let config = Arc::new(default_raft_config());
+        let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -590,13 +727,17 @@ impl RaftNode {
         // replicated data.
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?
+                .with_engine_work(log_store.engine_work());
+        refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
 
+        let (closing, closing_rx) = tokio::sync::watch::channel(false);
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
+            closing: network::Closing::new(closing_rx),
         };
 
         let raft: RaftInstance =
@@ -633,10 +774,12 @@ impl RaftNode {
             // no internal server — caller manages the router
             grpc_shutdown: std::sync::Mutex::new(None),
             grpc_task: std::sync::Mutex::new(None),
+            closing,
             _snapshot_trigger: Some(snap_handle),
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            join: JoinTuning::default(),
         };
 
         Ok((node, handler))
@@ -670,8 +813,7 @@ impl RaftNode {
         listen_addr: std::net::SocketAddr,
         snap_config: SnapshotTriggerConfig,
     ) -> Result<Self, RaftNodeError> {
-        refuse_join_with_local_data(&engine)?;
-        let config = Arc::new(default_raft_config());
+        let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
         // Clone the oplog handle before openraft consumes the LogStore, so
@@ -685,13 +827,17 @@ impl RaftNode {
         // replicated data.
         let state_machine =
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
-                .map_err(|e| RaftNodeError::Init(e.to_string()))?;
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?
+                .with_engine_work(log_store.engine_work());
+        refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
 
+        let (closing, closing_rx) = tokio::sync::watch::channel(false);
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
+            closing: network::Closing::new(closing_rx),
         };
 
         let raft: RaftInstance =
@@ -745,10 +891,12 @@ impl RaftNode {
             append_notifier,
             grpc_shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
+            closing,
             _snapshot_trigger: Some(snap_handle),
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
+            join: JoinTuning::default(),
         })
     }
 
@@ -1364,7 +1512,10 @@ impl RaftNode {
     ///
     /// No-op if this node is not the leader.
     pub async fn transfer_leadership_to(&self, target_id: u64) -> Result<(), RaftNodeError> {
-        if !self.is_leader().await {
+        // The node's own account, not a quorum-confirmed lease: a leader cut
+        // off from its peers still holds leadership to hand over, and asking
+        // them would wait on peers that may be gone.
+        if !self.leads_by_its_own_account() {
             tracing::debug!(
                 node_id = self.node_id,
                 "not leader, skipping transfer_leadership_to"
@@ -1517,26 +1668,60 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Trigger a graceful shutdown.
+    /// The voter to hand leadership to: one that acknowledged this leader
+    /// within an election timeout, the most caught-up of them (the lowest id
+    /// among equals). `None` when this node does not lead or no other voter
+    /// is live.
     ///
-    /// If this node is a cluster member (has peers), performs graceful shutdown
-    /// with leadership transfer. Otherwise, does a simple shutdown.
-    /// Find a voter peer to transfer leadership to.
-    ///
-    /// Returns the first voter ID that isn't this node, or None if
-    /// this is a single-node cluster.
+    /// A voter the leader has not heard from for that long is taken as gone,
+    /// as a follower takes its leader: handing leadership to it would wait
+    /// out the transfer timeout and leave the group to an election anyway.
     pub fn find_transfer_target(&self) -> Option<u64> {
+        use openraft::Instant as _;
+        use openraft::async_runtime::watch::WatchReceiver;
+
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let heartbeat = metrics.heartbeat.as_ref()?;
+        let replication = metrics.replication.as_ref()?;
+        let live_within = std::time::Duration::from_millis(self.raft.config().election_timeout_max);
+        let joint = metrics.membership_config.membership().get_joint_config();
+        let voters = joint.first()?;
+        voters
+            .iter()
+            .copied()
+            .filter(|&id| id != self.node_id)
+            .filter(|id| {
+                heartbeat
+                    .get(id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|acked| acked.elapsed() <= live_within)
+            })
+            .max_by_key(|id| {
+                let matched = replication
+                    .get(id)
+                    .and_then(Option::as_ref)
+                    .map(|log| log.index);
+                (matched, core::cmp::Reverse(*id))
+            })
+    }
+
+    /// Whether the membership has a voter besides this node.
+    fn has_voter_peers(&self) -> bool {
         use openraft::async_runtime::watch::WatchReceiver;
 
         let metrics = self.raft.metrics().borrow_watched().clone();
         let joint = metrics.membership_config.membership().get_joint_config();
-        let voters = joint.first()?;
-        voters.iter().find(|&&id| id != self.node_id).copied()
+        joint
+            .first()
+            .is_some_and(|voters| voters.iter().any(|&id| id != self.node_id))
     }
 
+    /// Stop the node. A member of a group with other voters shuts down
+    /// gracefully, handing leadership over if it leads; a node alone just
+    /// stops.
     pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
-        // Check if we have peers (cluster mode vs single-node)
-        let has_peers = self.find_transfer_target().is_some();
+        let has_peers = self.has_voter_peers();
 
         let result = if has_peers {
             self.graceful_shutdown().await
@@ -1550,6 +1735,11 @@ impl RaftNode {
                 .await
                 .map_err(|e| RaftNodeError::Shutdown(e.to_string()))
         };
+
+        // The consensus is down, but a replication task may still sit in a
+        // call to a peer that never answers, holding a reader of the log
+        // until the call times out. Fail such calls now.
+        self.closing.send_replace(true);
 
         // Free the listen port deterministically. Dropping the sender stops
         // the accept loop, but tonic then holds the LISTENER until every open
@@ -1570,15 +1760,16 @@ impl RaftNode {
             }
         }
 
-        // A snapshot capture or build started before the consensus stopped
-        // keeps running on its blocking thread and holds the engine, so the
-        // directory stays locked until it ends. Wait for it: a caller that
+        // What openraft spawned can outlive its core and hold the engine: a
+        // replication task still in a call to a peer keeps its log reader, a
+        // snapshot capture or build runs on to its end. The directory stays
+        // locked until the last of them lets go. Wait for it: a caller that
         // reopens the directory after this returns must find it free.
         if !self.engine_work.wait_idle(SNAPSHOT_WORK_DRAIN).await {
             tracing::warn!(
                 node_id = self.node_id,
                 ?SNAPSHOT_WORK_DRAIN,
-                "snapshot work still holds the engine after shutdown"
+                "consensus work still holds the engine after shutdown"
             );
         }
 
@@ -1616,7 +1807,10 @@ impl RaftNode {
             return None;
         }
 
-        let leader_last_log = metrics.last_log_index.unwrap_or(0);
+        // Entries held, counted from index 0 (the bootstrap entry): a log whose
+        // last index is `i` holds `i + 1`. Log indexes never approach u64::MAX.
+        let held = |last: Option<u64>| last.map_or(0, |index| index + 1);
+        let leader_last_log = metrics.last_log_index;
         let replication = metrics.replication.as_ref()?;
         let heartbeat = metrics.heartbeat.as_ref();
 
@@ -1637,9 +1831,11 @@ impl RaftNode {
                 continue; // Skip self
             }
 
-            let matched_index = matched_log_id.as_ref().map(|id| id.index).unwrap_or(0);
-
-            let lag = leader_last_log.saturating_sub(matched_index);
+            let matched_index = matched_log_id.as_ref().map(|id| id.index);
+            // A member never holds more than the leader it replicates from:
+            // the leader's metrics report both from one state.
+            debug_assert!(held(matched_index) <= held(leader_last_log));
+            let lag = held(leader_last_log) - held(matched_index);
 
             let last_hb_ago = heartbeat.and_then(|hb| {
                 hb.get(&node_id).and_then(|ts| {
@@ -1695,9 +1891,11 @@ pub struct NodeReplicationStatus {
     pub node_id: u64,
     /// Role in the cluster.
     pub role: NodeRole,
-    /// Last log index confirmed replicated to this node.
-    pub matched_index: u64,
-    /// Number of log entries behind the leader's last log.
+    /// Last log index confirmed replicated to this node; `None` while the node
+    /// has not acknowledged any entry (it may be unreachable).
+    pub matched_index: Option<u64>,
+    /// Number of the leader's log entries this node does not hold: all of them
+    /// while it has acknowledged none.
     pub lag_entries: u64,
     /// Milliseconds since last heartbeat acknowledgment (None if unknown).
     pub last_heartbeat_ago_ms: Option<u64>,
@@ -1938,8 +2136,8 @@ impl RaftNode {
     /// Monitor replication lag for a Learner node and promote it to Voter when ready.
     ///
     /// Called after the node has been added as a Learner via [`Self::add_node`].
-    /// Polls replication metrics every 500ms until lag drops below
-    /// `READINESS_LAG_THRESHOLD` (1 000 entries), then calls
+    /// Polls replication metrics every 500ms until the node has answered and
+    /// lacks at most [`Self::join_readiness_lag`] entries, then calls
     /// [`Self::change_membership`] to promote the node to a Voter.
     ///
     /// Broadcasts [`JoinProgressEvent`] at each phase transition and every lag
@@ -1953,24 +2151,20 @@ impl RaftNode {
     ///
     /// # Timeout
     ///
-    /// Aborts with an error after 30 minutes if the node has not caught up.
-    /// This protects against permanently stale nodes blocking the join lifecycle.
+    /// Aborts with an error once [`Self::join_timeout`] passes without the
+    /// node catching up, so a permanently stale node cannot hold the join.
     pub async fn monitor_and_promote(
         &self,
         node_id: u64,
         progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
     ) -> Result<(), RaftNodeError> {
-        // Number of entries a Learner may be behind before it is considered
-        // ready for Voter promotion: close enough that the remaining gap
-        // replicates within a few heartbeats once it starts voting.
-        const READINESS_LAG_THRESHOLD: u64 = 1_000;
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60); // 30 min
 
-        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let timeout = self.join_timeout();
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut initial_lag: Option<u64> = None;
 
-        // Step 1: poll until lag ≤ READINESS_LAG_THRESHOLD.
+        // Step 1: poll until the node has answered and lags little enough.
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let _ = progress_tx.send(JoinProgressEvent {
@@ -1978,11 +2172,15 @@ impl RaftNode {
                     phase: JoinPhase::Failed,
                     lag_entries: 0,
                     percent: 0,
-                    message: "Join timed out after 30 minutes — node failed to catch up".into(),
+                    message: format!(
+                        "Join timed out after {} s: node failed to catch up",
+                        timeout.as_secs()
+                    ),
                 });
-                return Err(RaftNodeError::Membership(
-                    "join timed out: node did not catch up within 30 minutes".into(),
-                ));
+                return Err(RaftNodeError::Membership(format!(
+                    "join timed out: node did not catch up within {} s",
+                    timeout.as_secs()
+                )));
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -2005,14 +2203,15 @@ impl RaftNode {
             // Record initial lag for percentage calculation (set once, on first measurement).
             let start = *initial_lag.get_or_insert(lag.max(1));
 
-            if lag <= READINESS_LAG_THRESHOLD {
+            let threshold = self.join_readiness_lag();
+            if lag <= threshold {
                 let _ = progress_tx.send(JoinProgressEvent {
                     node_id,
                     phase: JoinPhase::ReadyCheck,
                     lag_entries: lag,
                     percent: 99,
                     message: format!(
-                        "Lag {lag} entries — below threshold ({READINESS_LAG_THRESHOLD}), promoting to Voter"
+                        "Lag {lag} entries — below threshold ({threshold}), promoting to Voter"
                     ),
                 });
                 break;
@@ -2083,22 +2282,24 @@ impl RaftNode {
 
     /// Replication lag for a specific node ID, if available in leader metrics.
     ///
-    /// Returns `None` if this node is not the leader or if the target node is
-    /// not yet in the replication metrics (still initializing).
+    /// Returns `None` if this node is not the leader, if the target node is
+    /// not yet in the replication metrics, or if it has not acknowledged any
+    /// entry: a lag is only known once replication has reached the node.
     fn lag_for_node(&self, node_id: u64) -> Option<u64> {
         let statuses = self.replication_status()?;
         statuses
             .into_iter()
             .find(|s| s.node_id == node_id)
-            .map(|s| s.lag_entries)
+            .and_then(|s| s.matched_index.map(|_| s.lag_entries))
     }
 }
 
 /// Spawn a background task that periodically checks snapshot triggers.
 ///
-/// Complements openraft's built-in `LogsSinceLast(10_000)` with:
-/// - **Disk space trigger**: if total disk space exceeds threshold (proxy for WAL size)
-/// - **Periodic timer**: ensures snapshots happen even during read-only periods
+/// Complements openraft's own entry-count trigger with the other two of
+/// [`SnapshotTriggerConfig`]: the bytes the log grew by since the last
+/// snapshot, probed every second, and the periodic timer. Neither fires
+/// while nothing was applied since the last snapshot.
 ///
 /// The task runs until the Raft instance is shut down (detected via `trigger()` error).
 fn spawn_snapshot_trigger(
@@ -2109,21 +2310,22 @@ fn spawn_snapshot_trigger(
     tokio::spawn(async move {
         use openraft::rt::watch::WatchReceiver;
 
-        let mut interval = tokio::time::interval(config.check_interval);
+        let probe = config.check_interval.min(SNAPSHOT_SIZE_PROBE);
+        let mut interval = tokio::time::interval(probe);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Don't fire immediately on startup
         interval.tick().await;
         let metrics_rx = raft.metrics();
+        let mut last = tokio::time::Instant::now();
+        // The log's size when the last snapshot was asked for; growth is
+        // measured from it. A purge that shrinks the log lowers it.
+        let mut base = crate::storage::raft_log_bytes(&engine).unwrap_or(0);
 
         loop {
             interval.tick().await;
 
-            // A manual trigger().snapshot() builds UNCONDITIONALLY (it
-            // is not filtered by the snapshot policy), and every build
-            // serializes ALL partitions. Rebuilding when nothing was
-            // applied since the last snapshot is pure waste and was
-            // observed to starve raft ticks under load (185MB builds
-            // every check interval -> heartbeat lag -> leader churn).
-            // Gate the trigger on actual log progress.
+            // A snapshot captures every partition, so asking for one when
+            // nothing was applied since the last is pure waste.
             let (applied, snapped) = {
                 let m = metrics_rx.borrow_watched();
                 (
@@ -2135,25 +2337,28 @@ fn spawn_snapshot_trigger(
                 continue;
             }
 
-            // Disk pressure makes the trigger eager; otherwise the
-            // periodic timer compacts whatever new entries exist.
-            if let Ok(space) = engine.disk_space() {
-                if space >= config.disk_space_threshold {
-                    tracing::info!(
-                        disk_space_bytes = space,
-                        threshold = config.disk_space_threshold,
-                        "snapshot trigger: disk space threshold exceeded"
-                    );
+            let size = match crate::storage::raft_log_bytes(&engine) {
+                Ok(size) => size,
+                Err(e) => {
+                    tracing::warn!(%e, "snapshot trigger: cannot size the raft log");
+                    base
                 }
-            }
+            };
+            base = base.min(size);
+            let Some(reason) = snapshot_due(size - base, last.elapsed(), &config) else {
+                continue;
+            };
 
             match raft.trigger().snapshot().await {
                 Ok(()) => {
                     tracing::debug!(
                         applied,
                         snapshot = snapped,
+                        reason,
                         "snapshot trigger: requested snapshot build"
                     );
+                    last = tokio::time::Instant::now();
+                    base = size;
                 }
                 Err(_fatal) => {
                     // Raft instance shut down — exit the trigger loop
@@ -2163,6 +2368,25 @@ fn spawn_snapshot_trigger(
             }
         }
     })
+}
+
+/// How often the trigger task sizes the Raft log.
+const SNAPSHOT_SIZE_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Why a snapshot is due, given the bytes the log grew by and the time since
+/// the last one was asked for; `None` when neither threshold is reached.
+fn snapshot_due(
+    grown: u64,
+    since_last: std::time::Duration,
+    config: &SnapshotTriggerConfig,
+) -> Option<&'static str> {
+    if grown >= config.log_bytes {
+        Some("log size")
+    } else if since_last >= config.check_interval {
+        Some("interval")
+    } else {
+        None
+    }
 }
 
 /// Errors from RaftNode lifecycle operations.
@@ -2201,13 +2425,23 @@ pub enum RaftNodeError {
 
 /// Refuse to join a group while this store holds data of its own.
 ///
-/// The check reads one key at most per partition, so it costs nothing on the
-/// empty store a joining node is supposed to have.
-fn refuse_join_with_local_data(engine: &StorageEngine) -> Result<(), RaftNodeError> {
-    let holds = engine
-        .holds_user_data()
-        .map_err(|e| RaftNodeError::Init(e.to_string()))?;
-    if holds {
+/// What the store holds is what its trees hold plus what its log will replay
+/// into them: after a crash an acknowledged write may live only in the log.
+/// Both reads are cheap on the empty store a joining node is supposed to
+/// have: one key at most per partition, and a log with nothing to replay.
+fn refuse_join_with_local_data(
+    engine: &StorageEngine,
+    log_store: &LogStore,
+    state_machine: &CoordinodeStateMachine,
+) -> Result<(), RaftNodeError> {
+    fn init(e: impl std::fmt::Display) -> RaftNodeError {
+        RaftNodeError::Init(e.to_string())
+    }
+    if engine.holds_user_data().map_err(init)? {
+        return Err(RaftNodeError::JoinWithLocalData);
+    }
+    let from = state_machine.next_to_apply().map_err(init)?;
+    if log_store.writes_user_data_from(from).map_err(init)? {
         return Err(RaftNodeError::JoinWithLocalData);
     }
     Ok(())

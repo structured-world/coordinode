@@ -121,3 +121,43 @@ fn client_tls_global_unset_then_set() {
     set_wire_client_tls(cfg);
     assert!(wire_client_tls().is_some(), "client TLS visible after set");
 }
+
+/// A member given as `host:port` is dialled over plain HTTP when inter-node
+/// TLS is off; an address that names its scheme is kept as it is.
+#[test]
+fn a_bare_peer_address_gets_the_plaintext_scheme() {
+    // nextest per-test process: inter-node TLS is not set here.
+    assert_eq!(peer_uri("n2:7080"), "http://n2:7080");
+    assert_eq!(peer_uri("10.0.0.2:7080"), "http://10.0.0.2:7080");
+    assert_eq!(peer_uri("http://n2:7080"), "http://n2:7080");
+    assert_eq!(peer_uri("https://n2:7080"), "https://n2:7080");
+    let endpoint = peer_endpoint("n2:7080").expect("a bare address makes an endpoint");
+    assert_eq!(endpoint.uri().scheme_str(), Some("http"));
+    assert_eq!(
+        endpoint.uri().authority().map(|a| a.as_str()),
+        Some("n2:7080")
+    );
+}
+
+/// With inter-node TLS on, a bare member address is dialled over TLS: a
+/// plaintext default would leave that hop unencrypted.
+#[test]
+fn a_bare_peer_address_gets_https_under_inter_node_tls() {
+    let key = rcgen::KeyPair::generate().expect("keypair");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("self-sign");
+    set_wire_client_tls(build_client_tls(cert.pem().as_bytes(), None));
+
+    assert_eq!(peer_uri("n2:7080"), "https://n2:7080");
+    assert_eq!(peer_uri("http://n2:7080"), "http://n2:7080");
+    let endpoint = peer_endpoint("n2:7080").expect("endpoint");
+    assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+}
+
+/// An address that is not a URI even with a scheme is refused, not dialled.
+#[test]
+fn a_malformed_peer_address_is_refused() {
+    assert!(peer_endpoint("not an address").is_err());
+}

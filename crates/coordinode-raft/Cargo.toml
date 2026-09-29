@@ -12,6 +12,8 @@ coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 openraft = { workspace = true }
 metrics = { workspace = true }
+# The log flush thread's queue: an uncontended lock stays in user space.
+parking_lot = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -39,6 +41,10 @@ tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Generate an in-memory CA + node certs for the inter-node mTLS integration test.
 rcgen = "0.14"
+
+[[bench]]
+name = "index_profiles_replicated"
+harness = false
 
 [build-dependencies]
 tonic-prost-build = "0.14"

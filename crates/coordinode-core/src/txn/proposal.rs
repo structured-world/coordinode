@@ -160,9 +160,133 @@ pub enum Mutation {
         /// Exclusive end bound.
         end: Vec<u8>,
     },
+    /// A metadata change whose effects the ordered application decides
+    /// against the state it applies to, rather than the proposer against the
+    /// state it last read. Its effects land in the Schema partition.
+    Command(MetadataCommand),
+    /// Entry maintenance of a DERIVED index: every member derives the
+    /// entries from the sealed interpretation and exact inputs carried here,
+    /// never from its current catalog or rows.
+    Derive(DerivedIndexWork),
+}
+
+/// The maintenance binding a DERIVED effect was sealed under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexBinding {
+    /// The index's maintenance-policy epoch when the effect was sealed.
+    pub epoch: u64,
+    /// Everything that decides the index's entries.
+    pub interpretation: crate::index::derive::IndexInterpretation,
+}
+
+/// Where a DERIVED effect finds a node's new membership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DerivedSource {
+    /// The node record put by the operation at this position of the same
+    /// unit: members extract the membership from that record.
+    UnitRecord(u32),
+    /// The membership itself, when the unit holds no whole record to extract
+    /// it from (a merge-operand update), or `None` when the node leaves the
+    /// index.
+    Values(Option<Vec<crate::graph::types::Value>>),
+}
+
+/// One node's membership change in one DERIVED index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedIndexWork {
+    /// The binding the change was sealed under.
+    pub binding: IndexBinding,
+    /// The node.
+    pub node_id: u64,
+    /// Its membership before the unit, or `None` when it had no entry.
+    pub old: Option<Vec<crate::graph::types::Value>>,
+    /// Its membership after the unit.
+    pub new: DerivedSource,
+}
+
+/// A metadata change decided at ordered application.
+///
+/// Two proposers reading the same state would pick the same new id; applying
+/// the decision in log order is what makes one of them win and the other see
+/// the winner. Each command's effects are write-once records (one key per
+/// binding, one per lease), so the order commit timestamps put them in never
+/// matters, only the order they were applied in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MetadataCommand {
+    /// Get-or-create field bindings: each name without one gets the next id
+    /// above the dictionary's frontier, in the order given. The whole batch
+    /// is refused, publishing nothing, when it is invalid or the id space
+    /// cannot hold it.
+    RegisterFields {
+        /// Names to bind, at most
+        /// [`MAX_REGISTRATION_BATCH`](crate::graph::intern::MAX_REGISTRATION_BATCH).
+        names: Vec<String>,
+    },
+    /// Publish exactly these bindings, for data already encoded with them.
+    /// Refused as a whole when any contradicts a published binding.
+    AdoptFields {
+        /// `(name, id)` pairs to publish.
+        bindings: Vec<(String, u32)>,
+    },
+    /// Grant the NodeId range `(base, ceiling]` to the proposer identified by
+    /// `token`, only while the granted ceiling is still `base`.
+    GrantNodeLease {
+        /// The ceiling the proposer read.
+        base: u64,
+        /// The ceiling it asks for.
+        ceiling: u64,
+        /// Identifies the grant, so the proposer can tell it won.
+        token: [u8; crate::graph::node::NODE_LEASE_TOKEN_LEN],
+    },
+}
+
+impl MetadataCommand {
+    /// Approximate encoded size, for rate limiting and dedup.
+    pub fn size_estimate(&self) -> usize {
+        match self {
+            Self::RegisterFields { names } => names.iter().map(|n| n.len() + 2).sum(),
+            Self::AdoptFields { bindings } => bindings.iter().map(|(n, _)| n.len() + 6).sum(),
+            Self::GrantNodeLease { token, .. } => 16 + token.len(),
+        }
+    }
+}
+
+impl DerivedIndexWork {
+    /// Approximate encoded size, for rate limiting and buffer accounting.
+    pub fn size_estimate(&self) -> usize {
+        // An indexed value is rarely more than a short string.
+        const VALUE_ESTIMATE: usize = 16;
+        let interpretation = &self.binding.interpretation;
+        let names: usize = interpretation
+            .properties
+            .iter()
+            .map(|p| p.name.len() + 5)
+            .sum();
+        let values = |v: &Option<Vec<crate::graph::types::Value>>| {
+            v.as_ref().map_or(1, |v| v.len() * VALUE_ESTIMATE)
+        };
+        let new = match &self.new {
+            DerivedSource::UnitRecord(_) => 5,
+            DerivedSource::Values(v) => values(v),
+        };
+        16 + interpretation.name.len() + names + values(&self.old) + new
+    }
 }
 
 impl Mutation {
+    /// Approximate encoded size, for rate limiting, dedup and buffer
+    /// accounting.
+    pub fn size_estimate(&self) -> usize {
+        match self {
+            Self::Put { key, value, .. } => 1 + key.len() + value.len(),
+            Self::Delete { key, .. } => 1 + key.len(),
+            Self::Merge { key, operand, .. } => 1 + key.len() + operand.len(),
+            Self::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
+            Self::Command(command) => 1 + command.size_estimate(),
+            Self::Derive(work) => 1 + work.size_estimate(),
+        }
+    }
+
     /// Build a delete mutation for the edge-property body of a
     /// specific `(edge_type, src, tgt)` triple.
     ///
@@ -246,11 +370,11 @@ pub enum PartitionId {
 ///
 /// ## Serialization
 ///
-/// In distributed mode, the proposal is serialized as:
-/// `[proposal_id: 8 bytes BE][bincode(RaftProposal)]`
-/// The 8-byte prefix enables O(1) dedup lookup without deserializing
-/// the full payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Serializes as one [compact frame](super::frame), the encoding the log,
+/// replication and recovery share. Deserialization also reads the field-wise
+/// form proposals were written in before frames, so a log tail written by an
+/// earlier release replays; nothing writes that form any more.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RaftProposal {
     /// Unique proposal ID for deduplication.
     pub id: ProposalId,
@@ -268,8 +392,68 @@ pub struct RaftProposal {
     ///
     /// Throttling these would stall the very commits that release the
     /// limiter's permits, so they skip it entirely.
-    #[serde(default)]
     pub bypass_rate_limiter: bool,
+}
+
+impl Serialize for RaftProposal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let frame = super::frame::encode_proposal(self).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_bytes(&frame)
+    }
+}
+
+impl<'de> Deserialize<'de> for RaftProposal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ProposalVisitor)
+    }
+}
+
+/// The field-wise form of a proposal written before frames.
+#[derive(Deserialize)]
+struct FieldWiseProposal {
+    id: ProposalId,
+    mutations: Vec<Mutation>,
+    commit_ts: Timestamp,
+    start_ts: Timestamp,
+    #[serde(default)]
+    bypass_rate_limiter: bool,
+}
+
+impl From<FieldWiseProposal> for RaftProposal {
+    fn from(p: FieldWiseProposal) -> Self {
+        Self {
+            id: p.id,
+            mutations: p.mutations,
+            commit_ts: p.commit_ts,
+            start_ts: p.start_ts,
+            bypass_rate_limiter: p.bypass_rate_limiter,
+        }
+    }
+}
+
+struct ProposalVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProposalVisitor {
+    type Value = RaftProposal;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a proposal frame")
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, frame: &[u8]) -> Result<RaftProposal, E> {
+        super::frame::decode_proposal(frame, &super::frame::DecodeLimits::DEFAULT)
+            .map_err(E::custom)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<RaftProposal, A::Error> {
+        FieldWiseProposal::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            .map(Into::into)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<RaftProposal, A::Error> {
+        FieldWiseProposal::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(Into::into)
+    }
 }
 
 impl RaftProposal {
@@ -280,16 +464,12 @@ impl RaftProposal {
 
     /// Approximate serialized size (for dedup and rate limiting).
     pub fn size_estimate(&self) -> usize {
-        let mut size = 24; // id(8) + commit_ts(8) + start_ts(8)
-        for m in &self.mutations {
-            size += match m {
-                Mutation::Put { key, value, .. } => 1 + key.len() + value.len(),
-                Mutation::Delete { key, .. } => 1 + key.len(),
-                Mutation::Merge { key, operand, .. } => 1 + key.len() + operand.len(),
-                Mutation::RemoveRange { start, end, .. } => 1 + start.len() + end.len(),
-            };
-        }
-        size
+        // id(8) + commit_ts(8) + start_ts(8)
+        24 + self
+            .mutations
+            .iter()
+            .map(Mutation::size_estimate)
+            .sum::<usize>()
     }
 }
 
@@ -359,6 +539,11 @@ pub enum ProposalError {
     /// internal retry attempts were exhausted (Raft-level timeout).
     #[error("write concern timeout: {timeout_ms}ms exceeded")]
     WriteConcernTimeout { timeout_ms: u32 },
+
+    /// The proposal cannot be written to the log: it exceeds a frame bound,
+    /// or carries DERIVED work no member could derive. Nothing was proposed.
+    #[error("proposal refused before the log: {0}")]
+    Unencodable(#[from] crate::txn::frame::FrameError),
 }
 
 /// Outcome of a successfully applied proposal.

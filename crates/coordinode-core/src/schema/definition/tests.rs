@@ -489,7 +489,7 @@ fn table_schema_round_trip_with_primary_key_and_layout() {
     let mut schema = LabelSchema::new("Trade", PlacementPolicy::NodeId);
     schema.add_property(PropertyDef::new("trade_id", PropertyType::Int).not_null());
     schema.add_property(PropertyDef::new("symbol", PropertyType::String).not_null());
-    schema.set_primary_key(vec!["trade_id".into()]);
+    schema.make_table(vec!["trade_id".into()]);
     schema.set_storage_layout(StorageLayout::Columnar);
 
     assert!(schema.is_table());
@@ -498,10 +498,25 @@ fn table_schema_round_trip_with_primary_key_and_layout() {
     let bytes = schema.to_msgpack().expect("serialize");
     let restored = LabelSchema::from_msgpack(&bytes).expect("deserialize");
 
-    assert_eq!(restored.primary_key, vec!["trade_id".to_string()]);
+    let key = ["trade_id".to_string()];
+    assert_eq!(restored.table_key(), Some(TableKey::Columns(&key)));
     assert_eq!(restored.storage_layout, StorageLayout::Columnar);
-    assert!(restored.is_table());
     assert!(restored.is_columnar());
+}
+
+/// A table without declared key columns is keyed by row id, and stays a
+/// table through a round trip: an empty key list alone would read back as a
+/// plain graph label.
+#[test]
+fn a_table_keyed_by_row_id_round_trips() {
+    let mut schema = LabelSchema::new("Event", PlacementPolicy::NodeId);
+    schema.make_table(Vec::new());
+    assert_eq!(schema.table_key(), Some(TableKey::RowId));
+
+    let bytes = schema.to_msgpack().expect("serialize");
+    let restored = LabelSchema::from_msgpack(&bytes).expect("deserialize");
+    assert_eq!(restored.table_key(), Some(TableKey::RowId));
+    assert!(restored.key_columns().is_empty());
 }
 
 #[test]
@@ -510,5 +525,5 @@ fn plain_label_is_not_a_table_and_defaults_to_row() {
     assert!(!schema.is_table());
     assert!(!schema.is_columnar());
     assert_eq!(schema.storage_layout, StorageLayout::Row);
-    assert!(schema.primary_key.is_empty());
+    assert_eq!(schema.table_key(), None);
 }

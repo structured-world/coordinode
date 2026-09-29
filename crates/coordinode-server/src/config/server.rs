@@ -20,10 +20,10 @@
 //! bootstrap-critical ones) is the one added in all three places.
 
 use std::collections::BTreeMap;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use coordinode_storage::engine::config::{
-    Durability, EndpointConfig, EndpointConfigError, Media, StorageConfig, Tier,
+    Durability, EndpointConfig, EndpointConfigError, Media, StorageConfig, SyncMethod, Tier,
 };
 use serde::Deserialize;
 
@@ -57,6 +57,26 @@ pub struct StorageTopology {
     /// ever sleeps on the verdict.
     #[serde(default)]
     pub backpressure: coordinode_storage::engine::config::BackpressureLimits,
+    /// The oplog (Raft log, or the embedded journal of a standalone node):
+    /// segment rotation, retention and how an append is made durable.
+    #[serde(default)]
+    pub oplog: OplogSettings,
+}
+
+/// Oplog settings from the config file; an unset key keeps the engine default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OplogSettings {
+    /// Bytes of entries per segment before it rotates (`None` = 64 MiB).
+    pub segment_max_bytes: Option<NonZeroU64>,
+    /// Entries per segment before it rotates (`None` = 50000).
+    pub segment_max_entries: Option<NonZeroU32>,
+    /// Age in seconds past which a segment may be purged, when nothing else
+    /// still needs it (`None` = 7 days).
+    pub retention_secs: Option<u64>,
+    /// How an append is made durable: `full`, `fsync` or `open_datasync`
+    /// (`None` = `full`).
+    pub sync_method: Option<SyncMethod>,
 }
 
 /// Errors from loading the YAML config file.
@@ -127,6 +147,22 @@ pub struct ServerConfig {
     /// How long a membership change (join, promotion, decommission) waits for
     /// the previous one to commit before it is refused, in seconds (`None` = 30).
     pub membership_change_timeout_secs: Option<u64>,
+    /// How many log entries a joining member may still lack when it is
+    /// promoted from learner to voter (`None` = 1000). A member that has not
+    /// answered at all is never promoted, whatever this says.
+    pub join_readiness_lag_entries: Option<u64>,
+    /// How long a join may take to catch the new member up before it fails,
+    /// in seconds (`None` = 1800).
+    pub join_timeout_secs: Option<NonZeroU64>,
+    /// Entries applied since the last Raft snapshot that trigger the next
+    /// (`None` = 10000).
+    pub raft_snapshot_entries: Option<NonZeroU64>,
+    /// Bytes the Raft log grows by since the last snapshot that trigger the
+    /// next (`None` = 256 MiB).
+    pub raft_snapshot_log_bytes: Option<NonZeroU64>,
+    /// Longest time between Raft snapshots while entries are applied, in
+    /// seconds (`None` = 60).
+    pub raft_snapshot_interval_secs: Option<NonZeroU64>,
     /// How long the planner's storage statistics are reused before they are
     /// read again, in seconds (`None` = 60). A read that fails is remembered
     /// for the same time.
@@ -268,6 +304,11 @@ impl Default for ServerConfig {
             storage: StorageTopology::default(),
             peers: Vec::new(),
             membership_change_timeout_secs: None,
+            join_readiness_lag_entries: None,
+            join_timeout_secs: None,
+            raft_snapshot_entries: None,
+            raft_snapshot_log_bytes: None,
+            raft_snapshot_interval_secs: None,
             planner_stats_ttl_secs: None,
             vector_build_wait_ms: None,
             nofile: None,
@@ -513,6 +554,19 @@ impl ServerConfig {
     pub fn resolve_storage_config(&self) -> Result<StorageConfig, EndpointConfigError> {
         let mut cfg = StorageConfig::try_with_endpoints(self.storage_endpoints())?;
         cfg.backpressure = self.storage.backpressure;
+        let oplog = self.storage.oplog;
+        if let Some(bytes) = oplog.segment_max_bytes {
+            cfg.oplog_segment_max_bytes = bytes.get();
+        }
+        if let Some(entries) = oplog.segment_max_entries {
+            cfg.oplog_segment_max_entries = entries.get();
+        }
+        if let Some(secs) = oplog.retention_secs {
+            cfg.oplog_retention_secs = secs;
+        }
+        if let Some(sync) = oplog.sync_method {
+            cfg.oplog_sync_method = sync;
+        }
         // The MVCC time-travel window is an engine setting: the engine holds
         // its GC watermark back by it on every node, registry or not.
         if let Some(secs) = self.retention_window_secs {

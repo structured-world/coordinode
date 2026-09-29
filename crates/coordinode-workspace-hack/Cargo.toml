@@ -348,7 +348,7 @@ streamvbyte64 = { version = "0.2", default-features = false }
 stringprep = { version = "0.1", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-proxy = { version = "4" }
-structured-zstd = { version = "0.0.56" }
+structured-zstd = { version = "0.0.57" }
 subtle = { version = "2", default-features = false, features = ["i128"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 sysinfo = { version = "0.39" }
@@ -808,7 +808,7 @@ streamvbyte64 = { version = "0.2", default-features = false }
 stringprep = { version = "0.1", default-features = false }
 strsim = { version = "0.11", default-features = false }
 structured-proxy = { version = "4" }
-structured-zstd = { version = "0.0.56" }
+structured-zstd = { version = "0.0.57" }
 subtle = { version = "2", default-features = false, features = ["i128"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }

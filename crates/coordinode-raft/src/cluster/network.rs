@@ -49,6 +49,52 @@ fn tonic_to_rpc_error(status: tonic::Status) -> RPCError<C> {
     )))
 }
 
+// ── Shutdown ───────────────────────────────────────────────────────
+
+/// Whether this node is shutting down. openraft's replication tasks can
+/// outlive its core, each inside a call to a peer and holding a reader of the
+/// log; a call to a peer that never answers would keep one there until the
+/// call times out, and the node's shutdown waits for it. Once this is set,
+/// every call in flight or made after fails at once.
+#[derive(Clone)]
+pub(crate) struct Closing(tokio::sync::watch::Receiver<bool>);
+
+impl Closing {
+    pub(crate) fn new(rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self(rx)
+    }
+
+    /// Resolves once the node shuts down, or once the node is gone.
+    async fn closed(mut self) {
+        // An error means the sender, and with it the node, is gone.
+        let _ = self.0.wait_for(|closing| *closing).await;
+    }
+
+    fn is_closed(&self) -> bool {
+        *self.0.borrow()
+    }
+}
+
+fn shutting_down() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "this node is shutting down",
+    )
+}
+
+/// `rpc`, unless the node starts shutting down first.
+async fn unless_closing<T>(
+    closing: &Closing,
+    rpc: impl Future<Output = Result<T, RPCError<C>>>,
+) -> Result<T, RPCError<C>> {
+    tokio::select! {
+        result = rpc => result,
+        () = closing.clone().closed() => {
+            Err(RPCError::Unreachable(Unreachable::new(&shutting_down())))
+        }
+    }
+}
+
 // ── Network Factory ────────────────────────────────────────────────
 
 /// gRPC-based network factory for multi-node cluster.
@@ -56,6 +102,8 @@ pub struct GrpcNetworkFactory {
     /// This node's id — paired with the per-client target id so the test-only
     /// [`nemesis`](super::nemesis) partition matrix can gate directed RPCs.
     pub(crate) local_node_id: u64,
+    /// Fails every peer call once this node shuts down.
+    pub(crate) closing: Closing,
 }
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
@@ -71,6 +119,7 @@ impl RaftNetworkFactory<C> for GrpcNetworkFactory {
             target_node_id: target,
             addr: node.addr.clone(),
             client: None,
+            closing: self.closing.clone(),
         }
     }
 }
@@ -100,6 +149,8 @@ pub struct GrpcNetwork {
     target_node_id: u64,
     addr: String,
     client: Option<RaftServiceClient<tonic::transport::Channel>>,
+    /// Fails this peer's calls once this node shuts down.
+    closing: Closing,
 }
 
 impl GrpcNetwork {
@@ -138,26 +189,15 @@ impl GrpcNetwork {
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {
         if self.client.is_none() {
-            let mut endpoint = tonic::transport::Endpoint::from_shared(self.addr.clone())
+            let endpoint = coordinode_wire::peer_endpoint(&self.addr)
                 .map_err(|e| {
                     RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("invalid peer address '{}': {e}", self.addr),
+                        format!("peer address '{}': {e}", self.addr),
                     )))
                 })?
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(30));
-
-            // Encrypt the peer connection when inter-node TLS is configured
-            // (process-global, set once at startup). Off = plaintext.
-            if let Some(tls) = coordinode_wire::wire_client_tls() {
-                endpoint = endpoint.tls_config(tls).map_err(|e| {
-                    RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("peer TLS config for '{}': {e}", self.addr),
-                    )))
-                })?;
-            }
 
             // connect_lazy() returns immediately without establishing a TCP
             // connection. The underlying hyper Channel will connect on first
@@ -195,12 +235,16 @@ impl NetVote<C> for GrpcNetwork {
         if let Some(e) = self.partitioned() {
             return Err(e);
         }
-        let client = self.get_client().await?;
-        let payload = RaftPayload {
-            data: serialize(&rpc)?,
-        };
-        let response = client.vote(payload).await.map_err(tonic_to_rpc_error)?;
-        deserialize(&response.into_inner().data)
+        let closing = self.closing.clone();
+        unless_closing(&closing, async {
+            let client = self.get_client().await?;
+            let payload = RaftPayload {
+                data: serialize(&rpc)?,
+            };
+            let response = client.vote(payload).await.map_err(tonic_to_rpc_error)?;
+            deserialize(&response.into_inner().data)
+        })
+        .await
     }
 }
 
@@ -221,6 +265,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
     {
         let partition = self.partitioned();
         let (local, target) = (self.local_node_id, self.target_node_id);
+        let closing = self.closing.clone();
         Box::pin(async move {
             if let Some(e) = partition {
                 return Err(e);
@@ -240,10 +285,13 @@ impl NetStreamAppend<C> for GrpcNetwork {
                 });
 
             // Call bidi streaming RPC
-            let response = client
-                .stream_append(request_stream)
-                .await
-                .map_err(tonic_to_rpc_error)?;
+            let response = unless_closing(&closing, async {
+                client
+                    .stream_append(request_stream)
+                    .await
+                    .map_err(tonic_to_rpc_error)
+            })
+            .await?;
 
             // Map response stream: RaftPayload → deserialize → StreamAppendResult.
             // A reply across a blocked link is lost, as it would be on the wire.
@@ -260,6 +308,18 @@ impl NetStreamAppend<C> for GrpcNetwork {
                 let stream_result: StreamAppendResult<C> = deserialize(&payload.data)?;
                 Ok(stream_result)
             });
+
+            // A shutdown cuts the replies short with an error, not a clean
+            // end: a clean end would leave the entries sent awaiting replies.
+            let cut = closing.clone();
+            let output = output.take_until(closing.closed()).chain(
+                futures_util::stream::once(async move { cut.is_closed() }).filter_map(
+                    |closed| async move {
+                        closed
+                            .then(|| Err(RPCError::Unreachable(Unreachable::new(&shutting_down()))))
+                    },
+                ),
+            );
 
             Ok(Box::pin(output) as BoxStream<'s, _>)
         })
@@ -288,6 +348,7 @@ impl NetSnapshot<C> for GrpcNetwork {
             ));
         }
         let target_addr = self.addr.clone();
+        let closing = self.closing.clone();
         let client = self.get_client().await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e.to_string());
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
@@ -297,7 +358,15 @@ impl NetSnapshot<C> for GrpcNetwork {
         // stream is consumed: the snapshot is never in memory whole.
         let io_unreachable =
             |e: std::io::Error| openraft::error::StreamingError::Unreachable(Unreachable::new(&e));
-        let mut file = snapshot.snapshot;
+        // A snapshot kept as a capture is serialized here, the one time a
+        // peer needs its bytes; that reads the whole store, off the runtime.
+        let mut file = tokio::task::spawn_blocking(move || {
+            let mut file = snapshot.snapshot;
+            file.materialize().map(|()| file)
+        })
+        .await
+        .map_err(|e| io_unreachable(std::io::Error::other(e)))?
+        .map_err(io_unreachable)?;
         let data_size = file.size().map_err(io_unreachable)?;
         {
             use std::io::Seek;
@@ -378,6 +447,11 @@ impl NetSnapshot<C> for GrpcNetwork {
                 );
                 return Err(openraft::error::StreamingError::Closed(closed));
             }
+            () = closing.closed() => {
+                return Err(openraft::error::StreamingError::Unreachable(Unreachable::new(
+                    &shutting_down(),
+                )));
+            }
         };
 
         let resp_data = response.into_inner().data;
@@ -405,18 +479,22 @@ impl NetTransferLeader<C> for GrpcNetwork {
         if let Some(e) = self.partitioned() {
             return Err(e);
         }
-        let client = self.get_client().await?;
-        let payload = RaftPayload {
-            data: serialize(&req)?,
-        };
-        // The server maps any application-level transfer error to a gRPC
-        // Status (→ outer RPCError below); a successful RPC means the remote
-        // accepted the transfer, so the inner result is Ok.
-        client
-            .transfer_leader(payload)
-            .await
-            .map_err(tonic_to_rpc_error)?;
-        Ok(Ok(()))
+        let closing = self.closing.clone();
+        unless_closing(&closing, async {
+            let client = self.get_client().await?;
+            let payload = RaftPayload {
+                data: serialize(&req)?,
+            };
+            // The server maps any application-level transfer error to a gRPC
+            // Status (→ outer RPCError below); a successful RPC means the
+            // remote accepted the transfer, so the inner result is Ok.
+            client
+                .transfer_leader(payload)
+                .await
+                .map_err(tonic_to_rpc_error)?;
+            Ok(Ok(()))
+        })
+        .await
     }
 }
 

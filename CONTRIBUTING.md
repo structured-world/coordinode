@@ -46,6 +46,29 @@ cargo hakari manage-deps
 dependencies so that building one crate (`-p`) and building the workspace
 compile the same artefacts instead of a second copy of each.
 
+The hack crate also pins versions, so moving a dependency to a
+semver-incompatible release (any new `0.0.x`, for one) cannot go through
+`cargo update` alone. Empty the hack first, update, then regenerate:
+
+```bash
+cargo hakari disable
+cargo update -p <crate>@<old version> --precise <new version>
+cargo hakari generate
+```
+
+**Windows.** File locking, path handling and socket teardown differ on
+Windows. To run the same gate there before pushing, point the script at a
+Windows machine reachable over SSH (PowerShell as the default shell, with git,
+Rust, cargo-nextest and protoc installed):
+
+```bash
+COORDINODE_WINDOWS_HOST=<ssh target> scripts/windows/check.sh
+```
+
+It ships the working tree as it is, uncommitted changes included, without
+touching your index or branches, and leaves the logs in
+`target/windows-check/` and nothing on the machine.
+
 **Debugging.** The everyday `dev` profile keeps file and line information for
 panics and backtraces but leaves out what a debugger needs. To step through
 code, build with the `debugger` profile; it goes to `target/debugger` and does

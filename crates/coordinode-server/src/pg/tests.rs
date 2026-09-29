@@ -166,3 +166,36 @@ async fn invalid_sql_returns_error_not_disconnect() {
         .await
         .expect("connection still usable after error");
 }
+
+/// A driver sees a duplicate key as `23505 unique_violation`, the code it
+/// branches on for exactly this, and a key change as `42P10`.
+#[tokio::test(flavor = "multi_thread")]
+async fn key_errors_carry_their_sqlstate() {
+    use tokio_postgres::error::SqlState;
+
+    let (client, _dir) = connect().await;
+    client
+        .simple_query("CREATE TABLE Account (id BIGINT PRIMARY KEY, name VARCHAR)")
+        .await
+        .expect("create");
+    client
+        .simple_query("INSERT INTO Account (id, name) VALUES (1, 'a')")
+        .await
+        .expect("insert");
+
+    let err = client
+        .simple_query("INSERT INTO Account (id, name) VALUES (1, 'b')")
+        .await
+        .expect_err("duplicate key");
+    assert_eq!(err.code(), Some(&SqlState::UNIQUE_VIOLATION), "{err:?}");
+
+    let err = client
+        .simple_query("UPDATE Account SET id = 2 WHERE id = 1")
+        .await
+        .expect_err("key change");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::INVALID_COLUMN_REFERENCE),
+        "{err:?}"
+    );
+}

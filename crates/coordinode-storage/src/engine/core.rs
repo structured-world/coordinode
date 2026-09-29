@@ -14,7 +14,7 @@ use coordinode_core::txn::proposal::Mutation;
 use lsm_tree::{AbstractTree, Guard};
 use tracing::info;
 
-use super::{SeekableStorageIter, StorageIter};
+use super::{MAX_DERIVED_EFFECTS, SeekableStorageIter, StorageIter};
 use crate::cache::access::AccessTracker;
 use crate::cache::tiered::TieredCache;
 use crate::engine::batch::WriteBatch;
@@ -111,6 +111,20 @@ pub struct StorageEngine {
     /// running at the same time, and no attempt outlives the process. Giving
     /// it durable identity would buy nothing and cost a write on every DDL.
     schema_generation: AtomicU64,
+    /// Held while a metadata command is decided and applied, so each decision
+    /// reads every earlier one; on the journalled path it also spans the
+    /// journal append, which makes the decisions' order the journal's order.
+    /// Field dictionary reads and snapshot installs take it too, so a reader
+    /// never sees a binding's two records half written.
+    metadata_decisions: parking_lot::Mutex<()>,
+    /// Counts changes to the field dictionary this process has seen applied
+    /// or installed. A view of the dictionary taken at one value covers every
+    /// binding applied before it, so a reader compares it once per query.
+    field_dictionary_generation: AtomicU64,
+    /// Counts the dictionary changes that can bind ids below the frontier
+    /// (adopted bindings, installed snapshots): a view extended only above
+    /// its frontier stays correct while this holds still.
+    field_dictionary_epoch: AtomicU64,
     /// Commits admitted here and not yet applied. Validation reads committed
     /// state, which is exactly what these are not part of yet, so they are
     /// consulted beside it.
@@ -124,6 +138,9 @@ pub struct StorageEngine {
     /// runtime because the layer that knows it is built after the engine.
     node_shard: std::sync::atomic::AtomicU16,
     flush_policy: FlushPolicy,
+    /// The operator's oplog settings, shared by the embedded journal and the
+    /// Raft log opened over this engine.
+    oplog_config: OplogJournalConfig,
     /// Optional tiered block cache (DRAM → NVMe → SSD cascade).
     tiered_cache: Option<TieredCache>,
     /// Per-key access tracker for cache eviction and heat map.
@@ -223,6 +240,17 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 /// One `STORAGE COLUMNAR` table as a whole-store snapshot carries it: its id
 /// and its `(key, value)` rows in key order.
 pub type ColumnarTable = (String, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// What an applied metadata command did to the field dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictionaryChange {
+    /// Nothing.
+    None,
+    /// Bindings above the frontier were added.
+    Extended,
+    /// Bindings may have landed anywhere, below the frontier included.
+    Replaced,
+}
 
 /// The engine's cached write-pressure verdict, refreshed by the compaction
 /// monitor each poll cycle from the worst per-partition backpressure signal
@@ -364,7 +392,7 @@ impl StorageEngine {
             seqno,
             gc_watermark,
             Some(oracle),
-            Some(OplogJournalConfig::default()),
+            Some(OplogJournalConfig::from(config)),
         )
     }
 
@@ -603,9 +631,12 @@ impl StorageEngine {
                     for entry in &entries {
                         // Group the entry's data ops per partition so each
                         // partition receives them as one batch at the entry's
-                        // ts, with the entry's marker last.
+                        // ts, with the entry's marker last. DERIVED work is
+                        // derived first, from the whole entry: the data
+                        // partition it reads may already hold the entry.
+                        let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
                         let mut per_partition: HashMap<Partition, Vec<&OplogOp>> = HashMap::new();
-                        for op in &entry.ops {
+                        for op in ops.iter() {
                             #[cfg(feature = "columnar")]
                             if let OplogOp::ColumnarInsert {
                                 table_id,
@@ -852,6 +883,7 @@ impl StorageEngine {
                 fs,
                 Arc::clone(&seqno),
                 Arc::clone(&cache),
+                config.oplog_sync_method.tree_sync_mode(),
             )?
         };
 
@@ -943,10 +975,14 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
+            metadata_decisions: parking_lot::Mutex::new(()),
+            field_dictionary_generation: AtomicU64::new(0),
+            field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
+            oplog_config: OplogJournalConfig::from(config),
             tiered_cache,
             access_tracker: AccessTracker::new(),
             data_dir: config.data_dir().to_path_buf(),
@@ -1478,7 +1514,10 @@ impl StorageEngine {
             if held.contains(entry.index, 0) {
                 continue;
             }
-            for op in &entry.ops {
+            // A rebuilt index partition derives its DERIVED entries from the
+            // journal entry's own data ops, which it does not replay itself.
+            let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
+            for op in ops.iter() {
                 if op_partition(op) != Some(partition) {
                     continue;
                 }
@@ -1549,6 +1588,10 @@ impl StorageEngine {
     fn finish_rebuild(&self, partition: Partition) -> StorageResult<()> {
         use lsm_tree::AbstractTree;
         self.tree(partition)?.flush_active_memtable(0)?;
+        if partition == Partition::Schema {
+            // The dictionary was rebuilt: views read before it reread it.
+            self.note_field_dictionary_change();
+        }
         let dir = self.data_dir.join(REBUILD_INTENT_DIR);
         let io = |what: &str, e: std::io::Error| {
             StorageError::Io(format!(
@@ -1574,6 +1617,7 @@ impl StorageEngine {
             | OplogOp::RaftEntry { .. }
             | OplogOp::RaftTruncation { .. }
             | OplogOp::ColumnarInsert { .. } => Ok(()),
+            OplogOp::Derive { .. } | OplogOp::Unit { .. } => Err(unresolved_unit()),
         }
     }
 
@@ -1647,12 +1691,13 @@ impl StorageEngine {
         }
 
         // 3. Replay the ops the base lacks that intersect the lost ranges, in
-        //    journal order.
+        //    journal order, DERIVED work derived from the whole entry first.
         for entry in oplog_since {
             if held.contains(entry.index, 0) {
                 continue;
             }
-            for op in &entry.ops {
+            let ops = crate::oplog::convert::resolve_entry_ops(&entry.ops)?;
+            for op in ops.iter() {
                 if op_partition(op) != Some(partition) {
                     continue;
                 }
@@ -1686,6 +1731,9 @@ impl StorageEngine {
                     | OplogOp::RaftEntry { .. }
                     | OplogOp::RaftTruncation { .. }
                     | OplogOp::ColumnarInsert { .. } => {}
+                    OplogOp::Derive { .. } | OplogOp::Unit { .. } => {
+                        return Err(unresolved_unit());
+                    }
                 }
             }
         }
@@ -2248,7 +2296,107 @@ impl StorageEngine {
                 start,
                 end,
             } => self.remove_range(Partition::from(*partition), start, end),
+            // Both are resolved by the unit they belong to.
+            Mutation::Command(_) | Mutation::Derive(_) => {
+                self.apply_proposal_at(std::slice::from_ref(mutation), 0)
+            }
         }
+    }
+
+    /// `mutations` with its metadata command replaced by the effects it has
+    /// against the state held now, and whether those effects publish field
+    /// bindings. Runs under `metadata_decisions`.
+    ///
+    /// A proposal carries at most one command: a second one in the same
+    /// proposal would decide against state that lacks the first one's
+    /// effects, so it is refused (it publishes nothing), the same way on
+    /// every member.
+    fn decide_commands(
+        &self,
+        mutations: &[Mutation],
+    ) -> StorageResult<(Vec<Mutation>, DictionaryChange)> {
+        use coordinode_core::txn::proposal::MetadataCommand;
+        let mut effects = Vec::with_capacity(mutations.len() + 1);
+        let mut decided = false;
+        let mut dictionary = DictionaryChange::None;
+        for mutation in mutations {
+            let Mutation::Command(command) = mutation else {
+                effects.push(mutation.clone());
+                continue;
+            };
+            if decided {
+                tracing::warn!(
+                    ?command,
+                    "a second metadata command in one proposal is refused"
+                );
+                continue;
+            }
+            decided = true;
+            let decided_effects = crate::engine::metadata::decide(self, command)?;
+            if !decided_effects.is_empty() {
+                dictionary = match command {
+                    MetadataCommand::RegisterFields { .. } => DictionaryChange::Extended,
+                    MetadataCommand::AdoptFields { .. } => DictionaryChange::Replaced,
+                    MetadataCommand::GrantNodeLease { .. } => DictionaryChange::None,
+                };
+            }
+            effects.extend(decided_effects);
+        }
+        Ok((effects, dictionary))
+    }
+
+    /// Publish a dictionary change that has landed.
+    fn note_dictionary(&self, change: DictionaryChange) {
+        use std::sync::atomic::Ordering::AcqRel;
+        match change {
+            DictionaryChange::None => {}
+            DictionaryChange::Extended => {
+                self.field_dictionary_generation.fetch_add(1, AcqRel);
+            }
+            // The epoch moves first, so a reader that sees the new
+            // generation also sees that it must reread everything.
+            DictionaryChange::Replaced => {
+                self.field_dictionary_epoch.fetch_add(1, AcqRel);
+                self.field_dictionary_generation.fetch_add(1, AcqRel);
+            }
+        }
+    }
+
+    /// The field dictionary generation: it moves whenever a binding is
+    /// applied here or a snapshot replaces the dictionary. A view of the
+    /// dictionary read at one value covers every binding applied before it.
+    pub fn field_dictionary_generation(&self) -> u64 {
+        self.field_dictionary_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The field dictionary epoch: it moves when bindings may have landed
+    /// below the frontier, which a view can only pick up by rereading all.
+    pub fn field_dictionary_epoch(&self) -> u64 {
+        self.field_dictionary_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Hold off metadata commands: none is decided or applied, and no field
+    /// dictionary is read, until the guard drops. The two records of a binding
+    /// land key by key, so a reader running beside their writer can find one
+    /// without the other.
+    pub(crate) fn metadata_exclusive(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.metadata_decisions.lock()
+    }
+
+    /// Run `f` with metadata commands held off, for a writer that replaces
+    /// field dictionary records outside an applied command (a snapshot
+    /// install): no dictionary read sees the replacement half done.
+    pub fn with_metadata_exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _exclusive = self.metadata_exclusive();
+        f()
+    }
+
+    /// Record that the stored field dictionary changed other than through an
+    /// applied command (a snapshot or restore installed records directly).
+    pub fn note_field_dictionary_change(&self) {
+        self.note_dictionary(DictionaryChange::Replaced);
     }
 
     /// Apply every mutation of one committed proposal at a single seqno: its
@@ -2293,6 +2441,27 @@ impl StorageEngine {
     /// journalled but failed to apply stays uncovered and is replayed on the
     /// next open.
     pub fn commit_journaled(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
+            // The decision, the journal append and the apply happen under one
+            // lock: the journal then records each decision's effects in the
+            // order they were decided, and replay reproduces them exactly.
+            let _decisions = self.metadata_exclusive();
+            let (effects, dictionary) = self.decide_commands(mutations)?;
+            // Nothing decided (names already bound, or a refusal) leaves the
+            // state as it is, so there is nothing to journal or replay.
+            if effects.is_empty() {
+                return Ok(());
+            }
+            self.journal_and_apply(&effects, commit_ts)?;
+            self.note_dictionary(dictionary);
+            return Ok(());
+        }
+        self.journal_and_apply(mutations, commit_ts)
+    }
+
+    /// Journal `mutations`, then apply them at `commit_ts` with their coverage
+    /// marker. None of them is a metadata command.
+    fn journal_and_apply(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
         let (Some(oplog), Some(coverage)) = (&self.oplog, &self.coverage) else {
             return Err(StorageError::InvalidConfig(
                 "commit_journaled on an engine without a retained journal".into(),
@@ -2309,7 +2478,11 @@ impl StorageEngine {
             index,
             sub: 0,
         };
-        self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
+        // The journal keeps the sealed DERIVED work and its inputs; the trees
+        // receive the entries derived from them, under the same marker.
+        let resolved =
+            coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
+        self.apply_effects_covered(&resolved, commit_ts, Some(mark))?;
         self.note_applied(coverage, index);
         Ok(())
     }
@@ -2357,6 +2530,29 @@ impl StorageEngine {
         commit_ts: u64,
         cover: Option<coverage::Mark>,
     ) -> StorageResult<()> {
+        // DERIVED entries are derived from the unit itself and land in the
+        // same batch, under the same coverage marker, as the data they index.
+        let mutations =
+            coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
+        let mutations = mutations.as_ref();
+        if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
+            let _decisions = self.metadata_exclusive();
+            let (effects, dictionary) = self.decide_commands(mutations)?;
+            self.apply_effects_covered(&effects, commit_ts, cover)?;
+            self.note_dictionary(dictionary);
+            return Ok(());
+        }
+        self.apply_effects_covered(mutations, commit_ts, cover)
+    }
+
+    /// Apply `mutations`, none of them a metadata command, as one batch at
+    /// `commit_ts` together with `cover`.
+    fn apply_effects_covered(
+        &self,
+        mutations: &[Mutation],
+        commit_ts: u64,
+        cover: Option<coverage::Mark>,
+    ) -> StorageResult<()> {
         if mutations.is_empty() {
             return Ok(());
         }
@@ -2381,6 +2577,16 @@ impl StorageEngine {
                     start,
                     end,
                 } => batch.remove_range(Partition::from(*partition), start.clone(), end.clone()),
+                Mutation::Command(_) => {
+                    return Err(StorageError::InvalidConfig(
+                        "a metadata command reached the write batch undecided".into(),
+                    ));
+                }
+                Mutation::Derive(_) => {
+                    return Err(StorageError::InvalidConfig(
+                        "derived index work reached the write batch unresolved".into(),
+                    ));
+                }
             }
         }
         let seqno = match (&self.oracle, commit_ts) {
@@ -2589,6 +2795,18 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// [`persist`](Self::persist) for one partition: every write to `part`
+    /// made before the call is durable when it returns. For state that has
+    /// no journal behind it, such as a Raft vote.
+    ///
+    /// # Errors
+    ///
+    /// The partition does not exist or its flush fails.
+    pub fn persist_partition(&self, part: Partition) -> StorageResult<()> {
+        self.tree(part)?.flush_active_memtable(0)?;
+        Ok(())
+    }
+
     /// Journal a proposal without applying it, leaving the journal as its
     /// only copy. Returns `Some(index)` if a record was written, `None` when
     /// no journal is configured.
@@ -2649,6 +2867,12 @@ impl StorageEngine {
     /// Get the configured flush policy.
     pub fn flush_policy(&self) -> FlushPolicy {
         self.flush_policy
+    }
+
+    /// The oplog settings (segment rotation, retention, sync method) this
+    /// engine was opened with: a log opened over the engine uses them.
+    pub fn oplog_config(&self) -> &OplogJournalConfig {
+        &self.oplog_config
     }
 
     /// Get the shared block cache.
@@ -3004,22 +3228,23 @@ impl StorageEngine {
     }
 
     /// Wait until no transaction opened at or before `boundary` (a value of
-    /// [`Self::snapshot_boundary`]) is still open, polling every `poll`, for
-    /// at most `timeout`. Returns how many are still open when the time ran
-    /// out.
+    /// [`Self::snapshot_boundary`]) is still open, other than the caller's
+    /// own `own` transactions opened before it, polling every `poll`, for at
+    /// most `timeout`. Returns how many are still open when the time ran out.
     ///
     /// Only transactions are waited for: a long-lived reader (a backup, a
     /// CDC consumer) writes nothing and is not one.
     pub fn await_transactions_through(
         &self,
         boundary: lsm_tree::SeqNo,
+        own: usize,
         poll: std::time::Duration,
         timeout: std::time::Duration,
     ) -> Result<(), usize> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let open = self.open_transactions.open_through(boundary);
-            if open == 0 {
+            if open <= own {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -3631,6 +3856,12 @@ fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
 /// Directory under the data dir holding one empty file per partition whose
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
+
+/// A journalled op applied without deriving its entry first: the entry's
+/// DERIVED work would otherwise be skipped silently.
+fn unresolved_unit() -> StorageError {
+    StorageError::InvalidConfig("a journal entry replayed without its unit resolved".into())
+}
 
 /// The partitions with a rebuild intent under `data_dir`.
 fn read_rebuild_intents(data_dir: &Path) -> StorageResult<Vec<Partition>> {

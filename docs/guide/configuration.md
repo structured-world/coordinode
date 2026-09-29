@@ -93,6 +93,11 @@ the key is unset.
 | `max_commits_in_flight` | `10000` | restart | Ceiling on the commits admitted and not yet applied on this node. A commit registers the keys it will write before it validates them and holds that registration until its writes are local state, so the table holds one entry per commit in flight: bounded by write concurrency, not by data size. At the ceiling a commit is refused as retryable backpressure (`RESOURCE_EXHAUSTED` / `WRITE_BACKPRESSURE`) rather than the table growing without limit. Reaching it means commits are not finishing (a stalled replication wait, a member that stopped acknowledging), not that the node is merely busy. |
 | `snapshot_wait_ms` | `5` | live (`StorageEngine::set_snapshot_wait_ms`) | How long a read waits for commits that are still landing before it is answered from a view that stops behind them. A snapshot must not cover a commit that has not applied, or the reader sees neither the write nor any sign of it; waiting keeps the view fresh for the microseconds a commit needs to apply, stepping behind is instant but hands back a view older than the reader's own last write, which then conflicts with itself. Raise it to favour freshness under heavy write load, lower it to favour read latency. Zero is the step-behind-only behaviour, measured at 59% false conflicts between writers that shared no keys. |
 | `membership_change_timeout_secs` | `30` | live (`RaftNode::set_membership_settle_timeout`) | How long a membership change (`admin node join`, the promotion that follows it, `admin node decommission`) waits for the previous change to commit before it is refused. Status shows a new member as soon as its change is proposed, before the change commits, and the cluster takes one change at a time, so a command issued the moment status shows the previous result waits here instead of failing. A change commits in one replication round, so running out of this means the cluster has lost the quorum to commit; the command is refused naming the change still in progress. |
+| `join_readiness_lag_entries` | `1000` | live (`RaftNode::set_join_readiness_lag`) | How many log entries a joining member may still lack when it is promoted from learner to voter. Small enough that the rest replicates within a few heartbeats once it votes; `0` promotes only a member that holds everything. A member that has not answered at all is never promoted, whatever this is set to. |
+| `join_timeout_secs` | `1800` | live, for joins started afterwards (`RaftNode::set_join_timeout`) | How long `admin node join` may take to catch the new member up before the join fails and reports it. Zero is refused. |
+| `raft_snapshot_entries` | `10000` | restart | Entries applied since the last Raft snapshot that trigger the next. A snapshot lets the log before it be dropped. Taking one pauses applying entries while every partition is flushed and hard-linked (no pass over the data; its bytes are produced only when a member far behind needs it sent), so a busy node snapshots every `entries / write rate` seconds: raise it to pause less often, at the cost of a longer log to keep and to replay after a restart. Zero is refused. |
+| `raft_snapshot_log_bytes` | `268435456` (256 MiB) | restart | Bytes the Raft log's segments grow by since the last snapshot that trigger the next, so a few large entries compact the log as a count of small ones would. Sized every second. Zero is refused. |
+| `raft_snapshot_interval_secs` | `60` | restart | Longest time between Raft snapshots while entries are applied. A node that applied nothing since its last snapshot takes none. Zero is refused. |
 | `planner_stats_ttl_secs` | `60` | restart (`Database::set_stats_ttl` in embedded mode) | How long the query planner reuses its storage statistics (node counts per label, edge fan-out) before reading them again. Shorter keeps estimates closer to fresh writes at the cost of a counter read and a bounded adjacency sample on each refresh. The statistics steer the choice of plan, never its result. When they cannot be read because a counter or an adjacency list is damaged, the failure is logged as an error naming the key and remembered for the same time, and queries plan with defaults until the next refresh. |
 | `vector_build_wait_ms` | `30000` | restart (`Database::set_vector_build_wait` or `SET vector_build_wait` in embedded mode) | How long a query waits for a vector index still being built, under the `block` online-during-build policy, before it is refused. It is the default for queries that name no bound: a query's own `/*+ vector_build_wait('5s') */` hint overrides it, so a query that can wait longer, or should not wait at all, says so itself. `0` refuses a building index at once. |
 | `node_shard` | `0` | restart | The shard whose node rows this engine holds. Node keys carry the shard ahead of the id, and the invariant guard is the one place inside the engine that resolves a node from its id alone, so it needs this to find the row. It must match the shard the statements above run against; the embedded database sets it from its own handle. |
@@ -236,6 +241,8 @@ data_dir: /var/lib/coordinode/data
 #   endpoints:
 #     - { id: nvme-hot, path: /mnt/nvme0, media: nvme, durability: durable, tier: hot }
 #     - { id: hdd-cold, path: /mnt/hdd0,  media: hdd,  durability: degraded, tier: cold }
+#   oplog:                  # see "Oplog" above
+#     sync_method: full
 storage:
   endpoints: []
 
@@ -246,6 +253,13 @@ storage:
 peers: []
 # How long a membership change waits for the previous one to commit.
 # membership_change_timeout_secs: 30
+# Entries a joining member may lack when it is promoted, and how long a join may take.
+# join_readiness_lag_entries: 1000
+# join_timeout_secs: 1800
+# When a Raft snapshot is taken: entries, log growth (bytes), or time (s).
+# raft_snapshot_entries: 10000
+# raft_snapshot_log_bytes: 268435456
+# raft_snapshot_interval_secs: 60
 # How long the planner reuses its storage statistics.
 # planner_stats_ttl_secs: 60
 # How long a query waits for a vector index still being built (ms).
@@ -400,6 +414,43 @@ drivers back off and retry on it automatically. The server never sleeps
 inside the write path on either tier, read-only traffic is unaffected, and
 replicated (Raft) entry application is never gated. Changing the thresholds
 requires a restart.
+
+### Oplog
+
+The oplog is the Raft log on a cluster member and the retained journal on a
+standalone node. A write is acknowledged once its oplog append is durable.
+On a cluster member the append is flushed by a thread of its own: consensus
+goes on replicating while the disk flushes, and one flush makes durable every
+append made while the previous one ran, so under load a flush is shared by a
+group of writes instead of paid by each. The settings sit under
+`storage.oplog`; every key is optional and changing one requires a restart:
+
+```yaml
+storage:
+  oplog:
+    sync_method: full            # default
+    segment_max_bytes: 67108864  # 64 MiB, default
+    segment_max_entries: 50000   # default
+    retention_secs: 604800       # 7 days, default
+```
+
+`sync_method` chooses how an append is made durable:
+
+| Value | Call | Survives a power loss |
+|-------|------|-----------------------|
+| `full` (default) | `F_FULLFSYNC` on macOS, `fdatasync` on Linux, `FlushFileBuffers` on Windows: the drive flushes its own write cache. The same calls MongoDB's WiredTiger journal makes. | yes |
+| `fsync` | `fsync(2)`. On macOS the data reaches the drive but may stay in its volatile cache, which makes an append much cheaper there; on Linux and Windows it is the same as `full`. | on Linux and Windows; not guaranteed on macOS |
+| `open_datasync` | The segment is opened with `O_DSYNC` (write-through on Windows) and no separate flush follows. | where the OS honours the flag down to the medium; not on macOS |
+
+The same setting governs the storage tables: an oplog entry is dropped only
+once the table it went into is flushed, so tables sync at least as strongly
+as the oplog (`full` and `open_datasync` flush tables the full way, `fsync`
+the plain way).
+
+Segments rotate at whichever size limit is reached first. `retention_secs` is
+a floor, not a promise to delete: a segment is kept while a change stream, a
+checkpoint or a member that has not caught up still needs it. Zero sizes and
+unknown keys are refused when the file is read.
 
 ## Storage topology
 
@@ -570,7 +621,13 @@ place, without export or import.
 3. Add the members from the first one, one at a time:
    `coordinode admin node join --node node1:7080 --id 2 --addr node2:7080`,
    then the same for node 3. A member joins as a learner, receives the
-   group's state, and is promoted to a voter once it has caught up.
+   group's state, and is promoted to a voter once it has caught up. A
+   member that has not answered yet is never promoted, and the cluster
+   status shows it as `DOWN` until it does.
+
+Member addresses are given as `host:port`. Members dial them over TLS when
+inter-node TLS is configured and in plain text otherwise; an address that
+names its scheme (`http://` or `https://`) is used as given.
 
 Only the member a group is formed around brings data into it. A machine that
 still holds data of its own is refused when it starts as a joiner, and the

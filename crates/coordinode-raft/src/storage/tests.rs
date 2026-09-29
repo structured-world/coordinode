@@ -46,6 +46,90 @@ async fn log_store_save_and_read_vote() {
     assert_eq!(loaded, vote);
 }
 
+/// Only a write under a user-data prefix counts as the user's data in the
+/// log: a node whose log carries its own bookkeeping, removals and metadata
+/// commands still joins, while one that acknowledged a write does not, even
+/// if that write reached no tree before a crash.
+#[tokio::test]
+async fn only_user_writes_in_the_log_count_as_data() {
+    use openraft::entry::RaftEntry;
+
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(engine).unwrap();
+
+    let bookkeeping = RaftProposal {
+        id: coordinode_core::txn::proposal::ProposalId::from_raw(1),
+        mutations: vec![
+            Mutation::Command(
+                coordinode_core::txn::proposal::MetadataCommand::RegisterFields {
+                    names: vec!["name".to_string()],
+                },
+            ),
+            Mutation::Put {
+                partition: PartitionId::Schema,
+                key: b"meta:routing".to_vec(),
+                value: b"x".to_vec(),
+            },
+            Mutation::Delete {
+                partition: PartitionId::Node,
+                key: b"node:1:9".to_vec(),
+            },
+        ],
+        commit_ts: Timestamp::from_raw(1001),
+        start_ts: Timestamp::from_raw(1000),
+        bypass_rate_limiter: false,
+    };
+    store
+        .append(
+            vec![Entry::new_normal(
+                log_id(1, 1),
+                Request::single(bookkeeping),
+            )],
+            IOFlushed::noop(),
+        )
+        .await
+        .unwrap();
+    assert!(!store.writes_user_data_from(0).unwrap());
+
+    store
+        .append(vec![make_entry(2, 1, "mine")], IOFlushed::noop())
+        .await
+        .unwrap();
+    assert!(store.writes_user_data_from(0).unwrap());
+    assert!(store.writes_user_data_from(2).unwrap());
+    // Past the write: replay starts after it, so the trees answer for it.
+    assert!(!store.writes_user_data_from(3).unwrap());
+}
+
+/// The Raft log takes its segment rotation from the engine's configuration:
+/// it used fixed constants, so an operator's oplog settings reached the
+/// embedded journal and not the log of a replicated node.
+#[tokio::test]
+async fn the_raft_log_rotates_by_the_engine_configuration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.oplog_segment_max_entries = 3;
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    let mut store = LogStore::open(engine).expect("log store");
+
+    let entries: Vec<Entry> = (1..=10).map(|i| make_entry(i, 1, "row")).collect();
+    store
+        .append(entries, IOFlushed::noop())
+        .await
+        .expect("append");
+
+    let sealed = store.oplog.lock().expect("lock").sealed_segment_count();
+    assert_eq!(sealed, 3, "10 entries at 3 per segment seal three segments");
+    let read = store.try_get_log_entries(1..=10).await.expect("read");
+    assert_eq!(read.len(), 10);
+}
+
 #[tokio::test]
 async fn log_store_append_and_read_entries() {
     let (_dir, engine) = test_engine();
@@ -120,6 +204,85 @@ async fn oplog_record_carries_commit_ts_and_term() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].ts, 1005, "the proposal's commit timestamp");
     assert_eq!(records[0].term, 3, "the term of the entry's leader");
+}
+
+/// A log record holds each proposal once, as its unit frame after a small
+/// envelope, and reads back as the entry that was appended. The record
+/// carried the proposals twice before: inside the envelope and again as
+/// operations for change streams.
+#[tokio::test]
+async fn a_log_record_holds_each_proposal_once_as_its_frame() {
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(engine).unwrap();
+    let proposals = vec![
+        node_put(1, 1000, &[7u8; 256]),
+        node_put(2, 1001, &[9u8; 256]),
+    ];
+    let entry = Entry::new_normal(log_id(1, 4), Request::batch(proposals.clone()));
+    store
+        .append(vec![entry.clone()], IOFlushed::noop())
+        .await
+        .unwrap();
+
+    let record = store
+        .oplog
+        .lock()
+        .unwrap()
+        .read_range(4, 5)
+        .unwrap()
+        .pop()
+        .expect("the record");
+    let expected: Vec<OplogOp> = proposals
+        .iter()
+        .map(|p| OplogOp::Unit {
+            frame: encode_proposal(p).unwrap(),
+        })
+        .collect();
+    assert!(
+        matches!(record.ops.first(), Some(OplogOp::RaftEntry { data }) if data.len() < 64),
+        "a small envelope comes first: {:?}",
+        record.ops.first()
+    );
+    assert_eq!(
+        record.ops[1..],
+        expected[..],
+        "each proposal follows once, as its frame"
+    );
+
+    let read = store.try_get_log_entries(4..=4).await.unwrap();
+    assert_eq!(read, vec![entry]);
+}
+
+/// A record written before proposals were stored as unit frames, with the
+/// proposals in its envelope and their operations after it, still reads as
+/// the entry it recorded: retained log tails outlive the upgrade.
+#[tokio::test]
+async fn a_log_record_from_before_unit_frames_still_reads() {
+    let (_dir, engine) = test_engine();
+    let mut store = LogStore::open(engine).unwrap();
+    let entry = Entry::new_normal(log_id(1, 1), Request::single(node_put(1, 1000, b"v")));
+    let old = OplogEntry {
+        ts: 1000,
+        term: 1,
+        index: 1,
+        shard: 0,
+        ops: vec![
+            OplogOp::RaftEntry {
+                data: rmp_serde::to_vec(&entry).unwrap(),
+            },
+            OplogOp::Insert {
+                partition: 0,
+                key: b"node:1:1".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ],
+        is_migration: false,
+        pre_images: None,
+    };
+    store.oplog.lock().unwrap().append(&old).unwrap();
+
+    let read = store.try_get_log_entries(1..=1).await.unwrap();
+    assert_eq!(read, vec![entry]);
 }
 
 #[tokio::test]
@@ -758,6 +921,94 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
     );
 }
 
+/// A vote is durable once `save_vote` returns: openraft answers the
+/// candidate right after, and a node that forgot its vote in a crash could
+/// grant a second one in the same term, electing two leaders.
+#[tokio::test]
+async fn a_saved_vote_survives_a_crash() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let vote = Vote::new(7, 3);
+    {
+        let (engine, _) = open_rig_engine(&rig);
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        log.save_vote(&vote).await.expect("save vote");
+        drop(log);
+        rig.cut(engine);
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    assert_eq!(log.read_vote().await.expect("read vote"), Some(vote));
+}
+
+/// Append `entries` and wait until the log reports them durable, as openraft
+/// does before it counts on them.
+async fn append_durable(log: &mut LogStore, entries: Vec<Entry>) {
+    let (tx, rx) = <TypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
+    log.append(entries, IOFlushed::signal(tx))
+        .await
+        .expect("append");
+    rx.await.expect("answered").expect("durable");
+}
+
+/// The end of the log after a crash is where the log on disk ends, never an
+/// older end recorded beside it: a vote persists the Raft metadata with the
+/// last log id of its time, and a log that reopened there would drop every
+/// acknowledged entry after it.
+#[tokio::test]
+async fn the_log_reopens_at_its_durable_end_after_a_crash() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    {
+        let (engine, _) = open_rig_engine(&rig);
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        append_durable(
+            &mut log,
+            (1..=3).map(|i| make_entry(i, 1, "before")).collect(),
+        )
+        .await;
+        log.save_vote(&Vote::new(1, 1)).await.expect("vote");
+        append_durable(
+            &mut log,
+            (4..=6).map(|i| make_entry(i, 1, "after")).collect(),
+        )
+        .await;
+        drop(log);
+        rig.cut(engine);
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    let state = log.get_log_state().await.expect("log state");
+    assert_eq!(
+        state.last_log_id.map(|id| id.index),
+        Some(6),
+        "the log ends at its last durable entry"
+    );
+}
+
+/// A purge is recorded durably before it drops a segment: after a crash the
+/// log reopens purged where it was, never promising entries already gone.
+#[tokio::test]
+async fn a_purge_survives_a_crash() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    {
+        let (engine, _) = open_rig_engine(&rig);
+        let mut log = LogStore::open(Arc::clone(&engine)).expect("open log");
+        append_durable(&mut log, (1..=5).map(|i| make_entry(i, 1, "x")).collect()).await;
+        engine.reset_raft_coverage(5, &[]).expect("coverage");
+        log.purge(log_id(1, 3)).await.expect("purge");
+        drop(log);
+        rig.cut(engine);
+    }
+    let (engine, _) = open_rig_engine(&rig);
+    let mut log = LogStore::open(Arc::clone(&engine)).expect("reopen log");
+    let state = log.get_log_state().await.expect("log state");
+    assert_eq!(
+        state.last_purged_log_id.map(|id| id.index),
+        Some(3),
+        "the purge point survives the crash"
+    );
+    assert_eq!(state.last_log_id.map(|id| id.index), Some(5));
+}
+
 fn open_rig_engine(
     rig: &coordinode_test_fixtures::PowerRig,
 ) -> (
@@ -825,6 +1076,84 @@ async fn an_entry_one_tree_flushed_is_replayed_only_into_the_other() {
     );
 }
 
+/// A field registration committed to the log but lost from the memtable is
+/// decided again when openraft re-delivers it, and the re-decision binds the
+/// same ids: it reads only what earlier entries bound, and an entry whose
+/// bindings already reached disk decides nothing new. A registration that
+/// re-decided against a different frontier would give a name an id other
+/// data already means something else by.
+#[tokio::test]
+async fn a_registration_lost_before_flush_replays_to_the_same_ids() {
+    use coordinode_core::txn::proposal::MetadataCommand;
+    use coordinode_storage::engine::metadata::load_field_dictionary;
+    use lsm_tree::AbstractTree;
+    use openraft::entry::RaftEntry;
+
+    let register = |index: u64, ts: u64, names: &[&str]| {
+        Entry::new_normal(
+            log_id(1, index),
+            Request::single(RaftProposal {
+                id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+                mutations: vec![Mutation::Command(MetadataCommand::RegisterFields {
+                    names: names.iter().map(|n| (*n).to_owned()).collect(),
+                })],
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::from_raw(ts - 1),
+                bypass_rate_limiter: false,
+            }),
+        )
+    };
+    let bindings = |engine: &StorageEngine| {
+        let dictionary = load_field_dictionary(engine).expect("a consistent dictionary");
+        ["b", "a", "c", "d"].map(|n| dictionary.lookup(n))
+    };
+
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let (ts1, ts2);
+    let before = {
+        let (engine, oracle) = open_rig_engine(&rig);
+        let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle.clone()))
+            .expect("open");
+        ts1 = oracle.current().as_raw() + 1_000;
+        ts2 = ts1 + 1;
+        apply_entries(&mut sm, vec![register(1, ts1, &["b", "a"])]).await;
+        // Entry 1 reaches disk; entry 2 stays in the memtable the cut loses.
+        engine
+            .tree(Partition::Schema)
+            .unwrap()
+            .flush_active_memtable(0)
+            .unwrap();
+        apply_entries(&mut sm, vec![register(2, ts2, &["a", "c", "d"])]).await;
+        let before = bindings(&engine);
+        drop(sm);
+        rig.cut(engine);
+        before
+    };
+    assert_eq!(before, [Some(1), Some(2), Some(3), Some(4)]);
+
+    let (engine, oracle) = open_rig_engine(&rig);
+    let mut sm =
+        CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(oracle)).expect("reopen");
+    assert_eq!(
+        bindings(&engine),
+        [Some(1), Some(2), None, None],
+        "the cut lost entry 2's bindings"
+    );
+    apply_entries(
+        &mut sm,
+        vec![
+            register(1, ts1, &["b", "a"]),
+            register(2, ts2, &["a", "c", "d"]),
+        ],
+    )
+    .await;
+    assert_eq!(
+        bindings(&engine),
+        before,
+        "the re-delivered registrations bind what they bound before the cut"
+    );
+}
+
 // -- Crash campaign --
 
 const RAFT_CAMPAIGN_ENTRIES: u64 = 24;
@@ -872,10 +1201,13 @@ async fn run_raft_campaign(
     let mut applied = Vec::new();
     for i in 1..=RAFT_CAMPAIGN_ENTRIES {
         let entry = raft_campaign_entry(i, base_ts + i);
+        // openraft applies an entry only once the log reports it durable.
+        let (durable_tx, durable) = <TypeConfig as openraft::type_config::TypeConfigExt>::oneshot();
         if log
-            .append(vec![entry.clone()], IOFlushed::noop())
+            .append(vec![entry.clone()], IOFlushed::signal(durable_tx))
             .await
             .is_err()
+            || !matches!(durable.await, Ok(Ok(())))
         {
             return applied;
         }
@@ -1142,20 +1474,65 @@ async fn snapshot_build_persists_to_storage() {
     assert!(snap.meta.last_log_id.is_some());
     assert_eq!(snap.meta.last_log_id.unwrap().index, 5);
 
-    // The metadata is recorded in the store, the bytes in one file beside it.
+    // The metadata is recorded in the store; the build keeps the capture it
+    // was made from and serializes nothing, so its cost does not grow with
+    // the data.
     let snap_meta = engine.get(Partition::Schema, KEY_SNAPSHOT_META).unwrap();
     assert!(snap_meta.is_some(), "snapshot meta should be persisted");
+    drop(snap);
     let files = snapshot_files(&engine);
-    assert_eq!(files.len(), 1, "one published snapshot file: {files:?}");
-    let data = std::fs::read(&files[0]).unwrap();
-    assert!(data.len() > 10, "snapshot data should be non-empty");
-    assert_eq!(&data[..4], b"CNSN", "snapshot data should have CNSN magic");
+    assert_eq!(files.len(), 1, "one published snapshot: {files:?}");
+    assert!(files[0].is_dir(), "kept as the capture: {files:?}");
 
+    // Read, the capture serializes into a snapshot holding the data, which
+    // installs on another store.
     let (current_meta, mut current) = sm.snapshots.current().unwrap().expect("a current snapshot");
-    assert_eq!(current_meta.last_log_id, snap.meta.last_log_id);
-    let mut read = Vec::new();
-    current.read_to_end(&mut read).unwrap();
-    assert_eq!(read, data, "the current snapshot is the built file");
+    assert_eq!(current_meta.last_log_id, Some(log_id(1, 5)));
+    let mut data = Vec::new();
+    current.read_to_end(&mut data).unwrap();
+    assert_eq!(&data[..4], b"CNSN", "snapshot data should have CNSN magic");
+    let (_other_dir, other) = test_engine();
+    crate::snapshot::install_full_snapshot_from_reader(&other, &mut std::io::Cursor::new(&data))
+        .unwrap();
+    assert_eq!(
+        other.get(Partition::Node, b"node:0:1").unwrap().as_deref(),
+        Some(&b"alice"[..])
+    );
+    drop(current);
+    assert_eq!(
+        snapshot_files(&engine),
+        files,
+        "reading leaves only the published capture"
+    );
+}
+
+/// A capture the record names but a crash lost reads as no snapshot, which
+/// openraft answers by building a new one, never as an error that would stop
+/// the node from starting.
+#[tokio::test]
+async fn a_lost_snapshot_capture_reads_as_no_snapshot() {
+    let (_dir, engine) = test_engine();
+    engine.put(Partition::Node, b"node:0:1", b"alice").unwrap();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open state machine");
+    *sm.last_applied.lock().unwrap() = Some(log_id(1, 5));
+    drop(
+        sm.get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap(),
+    );
+
+    let files = snapshot_files(&engine);
+    assert_eq!(files.len(), 1, "{files:?}");
+    std::fs::remove_dir_all(&files[0]).unwrap();
+
+    assert!(sm.snapshots.current().unwrap().is_none());
+    assert!(sm.get_current_snapshot().await.unwrap().is_none());
+    assert!(
+        snapshot_files(&engine).is_empty(),
+        "no half-made copy is left behind"
+    );
 }
 
 /// Every file in `engine`'s snapshot directory.
@@ -1648,17 +2025,15 @@ fn multi_mutation_entry_is_atomic_at_its_commit_ts() {
 // Bug: CoordiNode 0.3.17 crashed on restart with:
 //   "create segment /data/oplog/0/oplog-00000000000000000000.bin: File exists (os error 17)"
 //
-// Root cause: after crash between oplog.flush() and put(KEY_LAST_LOG_ID),
-// the LSM key was absent but the segment file existed. On restart,
+// Root cause: the end of the log was read from a key recorded beside it,
+// absent after the crash while the segment file existed. On restart,
 // last_log_id=None → openraft called initialize() → SegmentWriter::create
 // with create_new(true) on the existing segment → EEXIST.
 //
-// Fix: LogStore::open() now recovers last_log_id from oplog segments when
-// the LSM key is missing.
+// Fix: LogStore::open() reads the end of the log from its segments.
 
-/// Simulate crash between fsync and LSM key write: segment file exists but
-/// KEY_LAST_LOG_ID was never persisted.  On re-open, last_log_id must be
-/// reconstructed from the segment (not None), preventing the EEXIST crash.
+/// On re-open, last_log_id is read from the segment the entries went to
+/// (not None), preventing the EEXIST crash.
 #[tokio::test]
 async fn restart_after_crash_recovers_last_log_id_from_oplog() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1670,7 +2045,7 @@ async fn restart_after_crash_recovers_last_log_id_from_oplog() {
         Tier::Warm,
     )]);
 
-    // ── First "run": write entries, then simulate crash (delete LSM key) ──
+    // ── First "run": write entries ──
     {
         let engine = Arc::new(StorageEngine::open(&config).expect("open engine"));
         let mut store = LogStore::open(Arc::clone(&engine)).expect("open store");
@@ -1691,14 +2066,6 @@ async fn restart_after_crash_recovers_last_log_id_from_oplog() {
             state.last_log_id.expect("last_log_id after append").index,
             3
         );
-
-        // Simulate crash: remove the LSM key that was persisted by append().
-        // The oplog segment files (in <oplog_endpoint>/oplog/<shard>/) remain on disk.
-        engine
-            .delete(Partition::Raft, KEY_LAST_LOG_ID)
-            .expect("delete LSM key to simulate crash");
-
-        // engine and store drop here — on a real crash the process dies instead.
     }
 
     // ── Restart: re-open the same data directory ──────────────────────────
@@ -1751,11 +2118,6 @@ async fn restart_after_crash_with_sealed_segment_recovers_last_log_id() {
 
         // Force segment rotation so the active writer gets a footer.
         store.oplog.lock().expect("lock").rotate().expect("rotate");
-
-        // Simulate crash: delete LSM key after rotation.
-        engine
-            .delete(Partition::Raft, KEY_LAST_LOG_ID)
-            .expect("delete LSM key");
     }
 
     {

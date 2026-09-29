@@ -56,6 +56,55 @@ fn embedded_engine_has_journal_on_durable_endpoint() {
     );
 }
 
+/// Segment files under `root`, at any depth.
+fn journal_segments(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    journal_segments(&path)
+                } else {
+                    usize::from(
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("oplog-") && n.ends_with(".bin")),
+                    )
+                }
+            })
+            .sum()
+    })
+}
+
+/// The embedded journal takes its segment rotation from the storage
+/// configuration: it was opened with fixed defaults, so the operator's oplog
+/// settings never reached it.
+#[test]
+fn the_embedded_journal_rotates_by_the_storage_configuration() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut config = durable_cfg(&dir);
+    config.oplog_segment_max_entries = 2;
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&config, oracle.clone()).expect("open");
+    for i in 0..5u8 {
+        write_batch(
+            &engine,
+            &oracle,
+            &[Mutation::Put {
+                partition: PartitionId::Node,
+                key: vec![b'k', i],
+                value: vec![i],
+            }],
+        );
+    }
+    assert!(
+        journal_segments(dir.path()) >= 3,
+        "5 entries at 2 per segment need at least three segments, found {}",
+        journal_segments(dir.path())
+    );
+}
+
 #[test]
 fn put_survives_crash_via_journal_replay() {
     let dir = TempDir::new().expect("temp dir");
@@ -1176,4 +1225,109 @@ fn in_memory_engine_has_no_journal() {
         !engine.has_journal(),
         "a fully volatile config must not create a disk journal"
     );
+}
+
+mod derived {
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef};
+    use coordinode_core::index::encoding::{encode_index_key, encode_tuple};
+    use coordinode_core::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding};
+
+    use super::*;
+
+    fn email_index() -> IndexInterpretation {
+        IndexInterpretation {
+            codec: KEY_CODEC,
+            name: "user_email".into(),
+            unique: false,
+            sparse: false,
+            properties: vec![PropertyRef {
+                field: Some(1),
+                name: "email".into(),
+            }],
+            filter: None,
+        }
+    }
+
+    fn entry_key(email: &str, node_id: u64) -> Vec<u8> {
+        let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
+        encode_index_key("user_email", &tuple, node_id)
+    }
+
+    /// A node record put for `email`, then the DERIVED work moving the node's
+    /// entry from `old` to what that record holds.
+    fn unit(node_id: u64, email: &str, old: Option<&str>) -> Vec<Mutation> {
+        let mut record = NodeRecord::new("User");
+        record.set(1, Value::String(email.into()));
+        vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:00:{node_id:04}").into_bytes(),
+                value: record.to_msgpack().expect("record"),
+            },
+            Mutation::Derive(DerivedIndexWork {
+                binding: IndexBinding {
+                    epoch: 1,
+                    interpretation: email_index(),
+                },
+                node_id,
+                old: old.map(|o| vec![Value::String(o.into())]),
+                new: DerivedSource::UnitRecord(0),
+            }),
+        ]
+    }
+
+    fn has(engine: &StorageEngine, key: &[u8]) -> bool {
+        engine.get(Partition::Idx, key).expect("get").is_some()
+    }
+
+    /// The entries a unit's DERIVED work derives land with the unit: the
+    /// new value's entry is there, the old value's is gone.
+    #[test]
+    fn derived_entries_land_with_their_unit() {
+        let dir = TempDir::new().expect("temp dir");
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        write_batch(&engine, &oracle, &unit(1, "a@x", None));
+        assert!(has(&engine, &entry_key("a@x", 1)));
+        write_batch(&engine, &oracle, &unit(1, "b@x", Some("a@x")));
+        assert!(has(&engine, &entry_key("b@x", 1)));
+        assert!(!has(&engine, &entry_key("a@x", 1)));
+    }
+
+    /// The node partition reaches disk, the index partition does not, and
+    /// power is lost. Recovery skips the entry for the node partition, which
+    /// holds it, yet still derives the index entry from the journalled node
+    /// record: data already on disk must not cost the index its entry.
+    #[test]
+    fn an_index_behind_its_data_is_derived_again_from_the_journal() {
+        let rig = PowerRig::new();
+        {
+            let (engine, oracle) = rig.open();
+            write_batch(&engine, &oracle, &unit(7, "late@x", None));
+            engine
+                .tree(Partition::Node)
+                .expect("node tree")
+                .flush_active_memtable(0)
+                .expect("flush the node partition alone");
+            rig.cut(engine);
+        }
+        for attempt in 0..2 {
+            let (engine, _) = rig.open();
+            assert!(
+                engine
+                    .get(Partition::Node, b"node:00:0007")
+                    .expect("get")
+                    .is_some(),
+                "the node record was on disk"
+            );
+            assert!(
+                has(&engine, &entry_key("late@x", 7)),
+                "recovery {attempt} must derive the entry of a node already on disk"
+            );
+            rig.cut(engine);
+        }
+    }
 }

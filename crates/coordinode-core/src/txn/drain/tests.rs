@@ -226,6 +226,153 @@ fn drain_handle_start_and_shutdown() {
     assert!(buffer.is_empty());
 }
 
+mod derived {
+    use super::*;
+    use crate::graph::node::NodeRecord;
+    use crate::graph::types::Value;
+    use crate::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef, entry, resolve_unit};
+    use crate::index::encoding::encode_tuple;
+    use crate::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding};
+    use std::collections::BTreeMap;
+
+    fn unique_email() -> IndexInterpretation {
+        IndexInterpretation {
+            codec: KEY_CODEC,
+            name: "u_email".into(),
+            unique: true,
+            sparse: false,
+            properties: vec![PropertyRef {
+                field: Some(1),
+                name: "email".into(),
+            }],
+            filter: None,
+        }
+    }
+
+    /// The entry key and value of `node_id` holding `email`.
+    fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
+        let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
+        entry("u_email", true, &tuple, node_id)
+    }
+
+    /// A unit that writes `node_id`'s record with `email` and derives its
+    /// entry from that record, as a committed transaction seals it.
+    fn derived_entry(node_id: u64, email: &str, ts: u64) -> DrainEntry {
+        let mut record = NodeRecord::new("U");
+        record.set(1, Value::String(email.into()));
+        let mutations = vec![
+            Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("node:0:{node_id}").into_bytes(),
+                value: record.to_msgpack().expect("record"),
+            },
+            Mutation::Derive(DerivedIndexWork {
+                binding: IndexBinding {
+                    epoch: 1,
+                    interpretation: unique_email(),
+                },
+                node_id,
+                old: None,
+                new: DerivedSource::UnitRecord(0),
+            }),
+        ];
+        DrainEntry::new(mutations, Timestamp::from_raw(ts), Timestamp::from_raw(1))
+    }
+
+    /// The index entries a member holds after applying `proposals` in order.
+    fn applied(proposals: &[RaftProposal]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut idx = BTreeMap::new();
+        for proposal in proposals {
+            crate::txn::frame::encode_proposal(proposal).expect("the unit reaches a log");
+            for mutation in resolve_unit(&proposal.mutations, usize::MAX)
+                .expect("every member derives the unit")
+                .iter()
+            {
+                match mutation {
+                    Mutation::Put {
+                        partition: PartitionId::Idx,
+                        key,
+                        value,
+                    } => {
+                        idx.insert(key.clone(), value.clone());
+                    }
+                    Mutation::Delete {
+                        partition: PartitionId::Idx,
+                        key,
+                    } => {
+                        idx.remove(key);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        idx
+    }
+
+    /// Each drained unit's DERIVED work keeps deriving from its own record:
+    /// batched after another unit, a record position would name the other
+    /// unit's record and index the wrong value for the node.
+    #[test]
+    fn drained_derived_work_derives_from_its_own_record() {
+        let buf = DrainBuffer::new(1 << 20);
+        buf.append(derived_entry(1, "a@x", 100)).expect("a");
+        buf.append(derived_entry(2, "b@x", 200)).expect("b");
+        let pipeline = RecordingPipeline::new();
+        drain_once(&buf, &pipeline, &ProposalIdGenerator::new(), 10_000, None);
+
+        let proposals = pipeline.proposals.lock().unwrap();
+        assert_eq!(
+            applied(&proposals),
+            BTreeMap::from([claim(1, "a@x"), claim(2, "b@x")])
+        );
+    }
+
+    /// A unit whose index moved back to RESOLVED after an earlier drained
+    /// unit derived an entry applies after it: the earlier claim is removed
+    /// by the later delete, as it is when the units apply one by one.
+    #[test]
+    fn a_later_resolved_unit_applies_after_earlier_derived_work() {
+        let buf = DrainBuffer::new(1 << 20);
+        buf.append(derived_entry(7, "a@x", 100)).expect("claim");
+        let (key, _) = claim(7, "a@x");
+        buf.append(DrainEntry::new(
+            vec![Mutation::Delete {
+                partition: PartitionId::Idx,
+                key,
+            }],
+            Timestamp::from_raw(200),
+            Timestamp::from_raw(1),
+        ))
+        .expect("release");
+        let pipeline = RecordingPipeline::new();
+        drain_once(&buf, &pipeline, &ProposalIdGenerator::new(), 10_000, None);
+
+        let proposals = pipeline.proposals.lock().unwrap();
+        assert_eq!(applied(&proposals), BTreeMap::new());
+    }
+
+    /// Units without DERIVED work still batch into one proposal.
+    #[test]
+    fn units_without_derived_work_still_batch() {
+        let buf = DrainBuffer::new(1 << 20);
+        buf.append(test_entry(2, 100)).expect("a");
+        buf.append(derived_entry(1, "a@x", 150)).expect("derived");
+        buf.append(test_entry(2, 200)).expect("b");
+        buf.append(test_entry(3, 300)).expect("c");
+        let pipeline = RecordingPipeline::new();
+        drain_once(&buf, &pipeline, &ProposalIdGenerator::new(), 10_000, None);
+
+        let sizes: Vec<usize> = pipeline
+            .proposals
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.mutations.len())
+            .collect();
+        assert_eq!(sizes, vec![2, 2, 5]);
+    }
+}
+
 /// Failed pipeline should not crash the drain thread.
 #[test]
 fn drain_tolerates_pipeline_errors() {

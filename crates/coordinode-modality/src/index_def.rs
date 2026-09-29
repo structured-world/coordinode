@@ -108,6 +108,16 @@ pub enum PartialFilter {
 }
 
 impl PartialFilter {
+    /// The property the filter tests.
+    pub fn property(&self) -> &str {
+        match self {
+            Self::PropertyEquals { property, .. }
+            | Self::PropertyEqualsInt { property, .. }
+            | Self::PropertyEqualsBool { property, .. }
+            | Self::PropertyExists { property } => property,
+        }
+    }
+
     /// Evaluate the filter against a set of property values.
     pub fn matches(&self, properties: &[(String, coordinode_core::graph::types::Value)]) -> bool {
         match self {
@@ -168,7 +178,102 @@ pub struct IndexDefinition {
     /// [`OnlineDuringBuild::Block`] for backward compatibility.
     #[serde(default)]
     pub online_during_build: OnlineDuringBuild,
+    /// Key layout the index's entries are written in. A definition stored
+    /// before the field existed decodes as `0`, the layout whose entries were
+    /// written outside the transaction; such an index is rebuilt in
+    /// [`ENTRY_LAYOUT`] before it is used.
+    #[serde(default)]
+    pub layout: u32,
+    /// How a key-shaped index's entries reach every member, and under which
+    /// policy epoch. A definition stored before the field existed decodes as
+    /// RESOLVED, inherited, epoch 0: what its entries have always been.
+    #[serde(default)]
+    pub maintenance: IndexMaintenance,
 }
+
+/// How a key-shaped index's entry effects travel with the data they index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexProfile {
+    /// The executing member computes the entries and the log carries them.
+    #[default]
+    Resolved,
+    /// The log carries the sealed interpretation and exact inputs, and every
+    /// member derives the entries itself.
+    Derived,
+}
+
+/// Where an index's effective profile comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileSource {
+    /// Inherited from the namespace default, as it stood at this revision
+    /// of the namespace policy.
+    Namespace {
+        /// The policy revision the profile was resolved from.
+        revision: u64,
+    },
+    /// Declared on the index itself.
+    Override,
+}
+
+impl Default for ProfileSource {
+    fn default() -> Self {
+        Self::Namespace { revision: 0 }
+    }
+}
+
+/// The namespace's default profile for key-shaped indexes, replicated with
+/// the catalog. Changing it affects indexes created after the change; an
+/// existing index moves only through its own explicit transition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceIndexPolicy {
+    /// The profile a new index without an override takes.
+    pub default: IndexProfile,
+    /// Moves on every change of the default; an inheriting index records
+    /// the revision it resolved.
+    pub revision: u64,
+}
+
+impl NamespaceIndexPolicy {
+    /// Schema catalog key of the policy.
+    pub const KEY: &'static [u8] = b"schema:index_policy";
+
+    /// The binding a new index gets: `requested` as an override, or the
+    /// namespace default at this revision.
+    pub fn resolve(&self, requested: Option<IndexProfile>, epoch: u64) -> IndexMaintenance {
+        match requested {
+            Some(profile) => IndexMaintenance {
+                profile,
+                source: ProfileSource::Override,
+                epoch,
+            },
+            None => IndexMaintenance {
+                profile: self.default,
+                source: ProfileSource::Namespace {
+                    revision: self.revision,
+                },
+                epoch,
+            },
+        }
+    }
+}
+
+/// An index's effective maintenance binding: the profile, where it comes
+/// from, and the epoch every effect staged under it is sealed with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexMaintenance {
+    /// The effective profile.
+    pub profile: IndexProfile,
+    /// Its source.
+    pub source: ProfileSource,
+    /// The maintenance-policy epoch: moves on every profile transition, so
+    /// effects sealed under an earlier binding are told apart.
+    pub epoch: u64,
+}
+
+/// The entry layout every index is written in: entries staged in the
+/// writing transaction, unique indexes keyed by value alone, values in the
+/// injective tuple encoding. The key codec the shared derivation writes.
+pub const ENTRY_LAYOUT: u32 = coordinode_core::index::derive::KEY_CODEC;
 
 /// Per-field analyzer configuration for text indexes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +372,8 @@ impl IndexDefinition {
             text_config: None,
             state: IndexState::Ready,
             online_during_build: OnlineDuringBuild::Block,
+            layout: ENTRY_LAYOUT,
+            maintenance: IndexMaintenance::default(),
         }
     }
 
@@ -290,6 +397,8 @@ impl IndexDefinition {
             text_config: None,
             state: IndexState::Ready,
             online_during_build: OnlineDuringBuild::Block,
+            layout: ENTRY_LAYOUT,
+            maintenance: IndexMaintenance::default(),
         }
     }
 
@@ -314,6 +423,8 @@ impl IndexDefinition {
             text_config: None,
             state: IndexState::Ready,
             online_during_build: OnlineDuringBuild::Block,
+            layout: ENTRY_LAYOUT,
+            maintenance: IndexMaintenance::default(),
         }
     }
 
@@ -338,6 +449,8 @@ impl IndexDefinition {
             text_config: Some(config),
             state: IndexState::Ready,
             online_during_build: OnlineDuringBuild::Block,
+            layout: ENTRY_LAYOUT,
+            maintenance: IndexMaintenance::default(),
         }
     }
 
@@ -359,12 +472,6 @@ impl IndexDefinition {
         self
     }
 
-    /// Set TTL expiration in seconds.
-    pub fn with_ttl(mut self, seconds: u64) -> Self {
-        self.ttl_seconds = Some(seconds);
-        self
-    }
-
     /// Check if a node matches this index's partial filter.
     /// Returns true if no filter (all nodes match) or if filter is satisfied.
     pub fn matches_filter(
@@ -377,6 +484,53 @@ impl IndexDefinition {
         }
     }
 
+    /// The interpretation that decides this B-tree index's entries, with
+    /// each property resolved to the field id `field_of` binds it to now:
+    /// what a DERIVED effect is sealed with, so no member consults the
+    /// catalog or the dictionary to derive it.
+    pub fn interpretation(
+        &self,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+    ) -> coordinode_core::index::derive::IndexInterpretation {
+        use coordinode_core::index::derive::{IndexInterpretation, MembershipFilter, PropertyRef};
+        let property = |name: &str| PropertyRef {
+            field: field_of(name),
+            name: name.to_owned(),
+        };
+        IndexInterpretation {
+            codec: self.layout,
+            name: self.name.clone(),
+            unique: self.unique,
+            sparse: self.sparse,
+            properties: self.properties.iter().map(|p| property(p)).collect(),
+            filter: self.filter.as_ref().map(|f| match f {
+                PartialFilter::PropertyEquals { property: p, value } => {
+                    MembershipFilter::EqualsString(property(p), value.clone())
+                }
+                PartialFilter::PropertyEqualsInt { property: p, value } => {
+                    MembershipFilter::EqualsInt(property(p), *value)
+                }
+                PartialFilter::PropertyEqualsBool { property: p, value } => {
+                    MembershipFilter::EqualsBool(property(p), *value)
+                }
+                PartialFilter::PropertyExists { property: p } => {
+                    MembershipFilter::Exists(property(p))
+                }
+            }),
+        }
+    }
+
+    /// The binding a DERIVED effect of this index is sealed under.
+    pub fn binding(
+        &self,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+    ) -> coordinode_core::txn::proposal::IndexBinding {
+        coordinode_core::txn::proposal::IndexBinding {
+            epoch: self.maintenance.epoch,
+            interpretation: self.interpretation(field_of),
+        }
+    }
+
     /// Whether this is a compound index (2+ properties).
     pub fn is_compound(&self) -> bool {
         self.properties.len() > 1
@@ -385,15 +539,6 @@ impl IndexDefinition {
     /// First (or only) property name. For backwards compatibility.
     pub fn property(&self) -> &str {
         self.properties.first().map_or("", |s| s.as_str())
-    }
-
-    /// Storage key prefix for this index: `idx:<name>:`.
-    pub fn key_prefix(&self) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(4 + self.name.len() + 1);
-        prefix.extend_from_slice(b"idx:");
-        prefix.extend_from_slice(self.name.as_bytes());
-        prefix.push(b':');
-        prefix
     }
 
     /// Schema storage key for this index definition.

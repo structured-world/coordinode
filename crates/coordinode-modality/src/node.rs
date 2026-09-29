@@ -173,6 +173,20 @@ pub trait NodeStore {
         limit: usize,
     ) -> StoreResult<PagedScan>;
 
+    /// Make `txn`'s commit conditional on the node rows under `keys` (store
+    /// keys from a scan) being unchanged since its snapshot. Returns `false`
+    /// when one already changed, so the caller reads again without waiting
+    /// for the commit to refuse.
+    ///
+    /// A transaction that derived data from rows it only read (an index
+    /// backfill) needs this: at the default level a commit validates its own
+    /// writes, and a concurrent write to a row it read would go unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn condition_unchanged(&self, txn: &mut Transaction, keys: &[Vec<u8>]) -> StoreResult<bool>;
+
     /// Read the temporal version of a node valid at `at_ms`: returns
     /// the version whose `valid_from <= at_ms` is largest. Returns
     /// `None` if the node has no version at-or-before that instant.
@@ -537,6 +551,20 @@ impl NodeStore for LocalNodeStore {
         limit: usize,
     ) -> StoreResult<PagedScan> {
         Ok(txn.prefix_scan_paged(Partition::Node, prefix, start_after, limit)?)
+    }
+
+    fn condition_unchanged(&self, txn: &mut Transaction, keys: &[Vec<u8>]) -> StoreResult<bool> {
+        // A snapshot at S sees the versions below S; a row whose latest
+        // version is at or above it changed after the rows were read.
+        let seen_below = txn.snapshot();
+        for key in keys {
+            let version = txn.record_version(Partition::Node, key)?;
+            if seen_below.is_some_and(|s| version.is_some_and(|v| v >= s)) {
+                return Ok(false);
+            }
+            txn.expect_version(Partition::Node, key, version)?;
+        }
+        Ok(true)
     }
 
     fn get_at(

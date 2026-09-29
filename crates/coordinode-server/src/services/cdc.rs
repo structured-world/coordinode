@@ -313,7 +313,11 @@ fn oplog_entry_to_proto(
     entry: coordinode_storage::oplog::entry::OplogEntry,
     token: ResumeToken,
 ) -> ChangeEvent {
-    let ops = entry.ops.into_iter().map(oplog_op_to_proto).collect();
+    let ops = entry
+        .ops
+        .into_iter()
+        .filter_map(oplog_op_to_proto)
+        .collect();
 
     ChangeEvent {
         ts: entry.ts,
@@ -330,8 +334,11 @@ fn oplog_entry_to_proto(
     }
 }
 
-fn oplog_op_to_proto(op: OplogOp) -> ChangeOp {
-    match op {
+/// The change a journalled op shows a CDC reader, or `None` for DERIVED
+/// index work: index maintenance is not a change of its own, and the data
+/// change it follows is already on the stream.
+fn oplog_op_to_proto(op: OplogOp) -> Option<ChangeOp> {
+    Some(match op {
         OplogOp::Insert {
             partition,
             key,
@@ -398,5 +405,7 @@ fn oplog_op_to_proto(op: OplogOp) -> ChangeOp {
             key: vec![],
             value: vec![],
         },
-    }
+        // The tailer hands out a unit frame expanded into its operations.
+        OplogOp::Derive { .. } | OplogOp::Unit { .. } => return None,
+    })
 }

@@ -472,6 +472,208 @@ async fn eviction_sweep_removes_expired_and_lifts_floor() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A heartbeat that has not been flushed yet still counts: the sweep may run
+/// before the flush that would persist it, and a consumer that just proved it
+/// is alive must not be evicted for the flush's timing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_buffered_heartbeat_keeps_its_consumer_from_eviction() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
+    let h = reg
+        .register(registration("reader", TopologyScope::Cluster, 2_000))
+        .expect("register");
+
+    let bg = reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000, // the heartbeat stays buffered
+        eviction_interval_ms: 30,
+    });
+    // Let the service take its first, immediate ticks, so the next flush is
+    // a window away.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    clock.set(2_500);
+    reg.heartbeat(&h).expect("buffer heartbeat");
+    // Past the persisted heartbeat's TTL (1000 + 2000), inside the
+    // buffered one's (2500 + 2000).
+    clock.set(4_000);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let listed = reg.list_consumers();
+    assert_eq!(
+        listed.len(),
+        1,
+        "a consumer with a fresh buffered heartbeat was evicted"
+    );
+    assert_eq!(listed[0].last_heartbeat_ts_ms, 2_500);
+
+    bg.shutdown().await;
+    node.shutdown().await.expect("shutdown");
+}
+
+/// A pipeline whose every proposal takes `delay`, as a slow fsync does.
+struct SlowPipeline {
+    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    delay: Duration,
+}
+
+impl ProposalPipeline for SlowPipeline {
+    fn propose_and_wait(
+        &self,
+        proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        std::thread::sleep(self.delay);
+        self.inner.propose_and_wait(proposal)
+    }
+}
+
+/// A reader that keeps heartbeating stays registered when every registry
+/// write is slow and the background service shares a single-thread runtime
+/// with the reader's stream, as a change stream does.
+#[tokio::test]
+async fn a_slow_flush_does_not_starve_the_heartbeats_it_persists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            oracle,
+        )
+        .expect("open engine"),
+    );
+    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(SlowPipeline {
+        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        delay: Duration::from_millis(300),
+    });
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        pipeline,
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
+        Arc::new(SystemClock),
+    );
+    let ttl_ms = 400;
+    let h = reg
+        .register(registration("reader", TopologyScope::Cluster, ttl_ms))
+        .expect("register");
+    let bg = reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 20,
+        eviction_interval_ms: 50,
+    });
+
+    // The reader's stream: a heartbeat every 50 ms for several TTLs.
+    let beating = {
+        let reg = reg.clone();
+        tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + Duration::from_millis(4 * ttl_ms);
+            while tokio::time::Instant::now() < until {
+                reg.heartbeat(&h).expect("heartbeat");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    };
+    beating.await.expect("heartbeats");
+
+    assert!(
+        reg.list_consumers()
+            .iter()
+            .any(|c| c.consumer_id == "reader"),
+        "a reader that kept heartbeating was evicted"
+    );
+    bg.shutdown().await;
+}
+
+/// A pipeline that runs a one-shot hook inside the next proposal: what
+/// happens elsewhere while a registry write is in flight.
+struct HookPipeline {
+    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl ProposalPipeline for HookPipeline {
+    fn propose_and_wait(
+        &self,
+        proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        let hook = self.hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.inner.propose_and_wait(proposal)
+    }
+}
+
+/// The sweep persists buffered heartbeats before judging expiry, and that
+/// write can take longer than a TTL. A heartbeat that arrives meanwhile is
+/// still only in the buffer: the reader is alive and must not be evicted.
+#[test]
+fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            oracle,
+        )
+        .expect("open engine"),
+    );
+    let pipeline = Arc::new(HookPipeline {
+        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        hook: Mutex::new(None),
+    });
+    let clock = Arc::new(ManualClock::new(1_000));
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::clone(&pipeline) as Arc<dyn ProposalPipeline>,
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    );
+    let h = reg
+        .register(registration("reader", TopologyScope::Cluster, 400))
+        .expect("register");
+    let pinned = reg.shard_floor();
+    reg.core.batching_on.store(true, Ordering::Release);
+    reg.heartbeat(&h).expect("heartbeat");
+
+    // While the sweep's flush is being written, a TTL passes and the reader
+    // heartbeats again.
+    *pipeline.hook.lock() = Some(Box::new({
+        let (reg, h, clock) = (reg.clone(), h.clone(), Arc::clone(&clock));
+        move || {
+            clock.set(2_000);
+            reg.heartbeat(&h).expect("heartbeat during the flush");
+        }
+    }));
+    let evicted = reg.core.sweep_evictions().expect("sweep");
+
+    assert_eq!(evicted, 0, "a reader with a buffered heartbeat was evicted");
+    assert!(
+        reg.core.read_entry("reader").expect("read").is_some(),
+        "the reader's registration is gone"
+    );
+    assert_eq!(
+        reg.shard_floor(),
+        pinned,
+        "the live reader stopped pinning retention"
+    );
+}
+
 /// EE enable path: `with_topology_scopes()` accepts `dc` / `rack` scopes
 /// that CE rejects (complements `ce_rejects_dc_and_rack_scopes`).
 #[tokio::test(flavor = "multi_thread")]

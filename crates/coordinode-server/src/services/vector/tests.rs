@@ -195,7 +195,9 @@ fn test_service_with_index(
         ef_search: None,
         rerank_candidates: None,
     };
-    database.create_vector_index("test_vec_idx", label, property, config);
+    database
+        .create_vector_index("test_vec_idx", label, property, config)
+        .expect("create vector index");
 
     let database = Arc::new(RwLock::new(database));
     (VectorServiceImpl::new(database), dir)

@@ -1,4 +1,5 @@
 pub mod cluster;
+mod log_sync;
 pub mod proposal;
 pub mod read_fence;
 pub mod snapshot;

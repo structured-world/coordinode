@@ -361,6 +361,7 @@ fn document_dot_notation_e2e_cypher_pipeline() {
     // Step 2: Replace the placeholder with a real Document value in storage
     let config_field_id = db
         .interner()
+        .expect("dictionary")
         .lookup("config")
         .expect("config should be interned from CREATE");
 

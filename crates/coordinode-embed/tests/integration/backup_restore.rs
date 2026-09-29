@@ -13,11 +13,9 @@
 //! 2. `export_binary` (or `_json`) into a `Vec<u8>` against a
 //!    consistent snapshot.
 //! 3. Open a fresh `db2` in a separate tempdir.
-//! 4. `restore_binary` into `db2.engine()`, then install the
-//!    returned `FieldInterner` into `db2` via `interner_arc()` —
-//!    without this swap, the restored payload's interned property /
-//!    label ids reference strings the fresh interner has never seen,
-//!    so any Cypher query against `db2` would read garbage.
+//! 4. `restore_binary` into `db2.engine()` through `db2`'s field
+//!    registrar, which publishes the dump's bindings before the records
+//!    encoded with them are written.
 //! 5. Run MATCH queries on `db2`, assert each property / label /
 //!    edge endpoint matches what `db1` had.
 
@@ -27,28 +25,31 @@ use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 use coordinode_embed::backup::{export, restore};
 
-/// Build `(db2, _tempdir_keepalive)` from `db1`'s binary dump with the
-/// restored interner properly installed. The tempdir handle must stay
-/// alive (held by the caller) for the duration of the test — dropping
-/// it removes the on-disk state of `db2`.
+/// Build `(db2, _tempdir_keepalive)` from `db1`'s binary dump. The tempdir
+/// handle must stay alive (held by the caller) for the duration of the
+/// test: dropping it removes the on-disk state of `db2`.
 fn dump_restore_binary(db1: &Database) -> (Database, tempfile::TempDir) {
     let mut buf = Vec::new();
     let snapshot = db1.engine().snapshot();
-    export::export_binary(db1.engine(), &db1.interner(), 1, &snapshot, &mut buf)
-        .expect("export_binary");
+    export::export_binary(
+        db1.engine(),
+        &db1.interner().expect("dictionary"),
+        1,
+        &snapshot,
+        &mut buf,
+    )
+    .expect("export_binary");
 
     let dir2 = tempfile::tempdir().expect("tempdir for db2");
     let db2 = Database::open(dir2.path()).expect("open db2");
     let mut cursor = std::io::Cursor::new(&buf);
-    let (_stats, restored_interner) =
-        restore::restore_binary(db2.engine(), &mut cursor, false).expect("restore_binary");
-
-    // Install the restored interner so Cypher queries against db2 can
-    // resolve the property / label ids in the restored payload.
-    if let Some(interner) = restored_interner {
-        let arc = db2.interner_arc();
-        *arc.write() = interner;
-    }
+    restore::restore_binary(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .expect("restore_binary");
 
     (db2, dir2)
 }
@@ -59,15 +60,20 @@ fn dump_restore_binary(db1: &Database) -> (Database, tempfile::TempDir) {
 fn dump_restore_cypher(db1: &Database) -> (Database, tempfile::TempDir) {
     let mut buf = Vec::new();
     let snapshot = db1.engine().snapshot();
-    export::export_cypher(db1.engine(), &db1.interner(), 1, &snapshot, &mut buf)
-        .expect("export_cypher");
+    export::export_cypher(
+        db1.engine(),
+        &db1.interner().expect("dictionary"),
+        1,
+        &snapshot,
+        &mut buf,
+    )
+    .expect("export_cypher");
 
     let dir2 = tempfile::tempdir().expect("tempdir for db2");
     let db2 = Database::open(dir2.path()).expect("open db2");
-    let mut interner = db2.interner().clone();
     let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_cypher(db2.engine(), &mut interner, 1, &mut cursor).expect("restore_cypher");
-    *db2.interner_arc().write() = interner;
+    restore::restore_cypher(db2.engine(), db2.field_registrar().as_ref(), 1, &mut cursor)
+        .expect("restore_cypher");
     (db2, dir2)
 }
 

@@ -391,7 +391,61 @@ fn read_entries(reader: &mut impl IoRead) -> io::Result<PartitionEntries> {
 ///
 /// **Columnar tables** are then made exactly the snapshot's, when it lists
 /// them.
+/// Check the field dictionary a snapshot carries before any of it is
+/// installed: every id record has the name record that points back at it and
+/// the reverse, so the data installed with it can be read.
+fn verify_field_dictionary(parsed: &ParsedSnapshot) -> io::Result<()> {
+    use coordinode_core::graph::intern::{
+        FIELD_ID_KEY_PREFIX, FIELD_NAME_KEY_PREFIX, FieldInterner, decode_field_id,
+        decode_field_id_key,
+    };
+    let invalid = |what: String| io::Error::other(format!("snapshot field dictionary: {what}"));
+    let mut by_id = Vec::new();
+    let mut by_name = std::collections::HashMap::new();
+    for (partition, entries) in &parsed.partitions {
+        if *partition != Partition::Schema {
+            continue;
+        }
+        for (key, value) in entries {
+            if key.starts_with(FIELD_ID_KEY_PREFIX) {
+                let id = decode_field_id_key(key)
+                    .ok_or_else(|| invalid("an id record key names no id".into()))?;
+                let name = String::from_utf8(value.clone())
+                    .map_err(|_| invalid(format!("the name of id {id} is not UTF-8")))?;
+                by_id.push((name, id));
+            } else if let Some(name) = key.strip_prefix(FIELD_NAME_KEY_PREFIX) {
+                let id = decode_field_id(value)
+                    .ok_or_else(|| invalid("a name record holds no id".into()))?;
+                by_name.insert(name.to_vec(), id);
+            }
+        }
+    }
+    if by_id.len() != by_name.len() {
+        return Err(invalid(format!(
+            "{} id records but {} name records",
+            by_id.len(),
+            by_name.len()
+        )));
+    }
+    for (name, id) in &by_id {
+        if by_name.get(name.as_bytes()) != Some(id) {
+            return Err(invalid(format!(
+                "id {id} and {name:?} do not point at each other"
+            )));
+        }
+    }
+    FieldInterner::from_bindings(by_id).map_err(|e| invalid(e.to_string()))?;
+    Ok(())
+}
+
 fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
+    verify_field_dictionary(&parsed)?;
+    // The install replaces dictionary records in two steps; a dictionary read
+    // between them would see the old and the new mixed.
+    engine.with_metadata_exclusive(|| install_verified(engine, parsed))
+}
+
+fn install_verified(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> {
     let mut batch = WriteBatch::new(engine);
     let mut total_written = 0usize;
     // Values move into the batch; only the keys are kept, for the cleanup.
@@ -432,6 +486,8 @@ fn apply_full(engine: &StorageEngine, parsed: ParsedSnapshot) -> io::Result<()> 
     }
 
     let tables = install_tables(engine, parsed.tables)?;
+    // Views of the dictionary taken before the install reread it.
+    engine.note_field_dictionary_change();
     tracing::info!(
         total_written,
         stale_deleted,

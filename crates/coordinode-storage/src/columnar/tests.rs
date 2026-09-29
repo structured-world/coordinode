@@ -48,7 +48,7 @@ fn new_registry(base: &std::path::Path) -> ColumnarTableRegistry {
     let seqno: SharedSequenceNumberGenerator =
         std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
     let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(8 * 1024 * 1024));
-    ColumnarTableRegistry::open(base.to_path_buf(), fs, seqno, cache).unwrap()
+    ColumnarTableRegistry::open(base.to_path_buf(), fs, seqno, cache, SyncMode::Full).unwrap()
 }
 
 #[test]
@@ -104,4 +104,46 @@ fn registry_recovers_tables_on_reopen() {
         reopened.table_ids(),
         vec!["orders".to_string(), "trades".to_string()]
     );
+}
+
+/// A columnar table's tree syncs at the registry's mode, the same as the
+/// engine's partition trees, both on first creation and on reopen.
+#[test]
+fn table_trees_sync_at_the_registry_mode() {
+    for mode in [SyncMode::Normal, SyncMode::Full] {
+        let dir = tempfile::tempdir().unwrap();
+        let injector = std::sync::Arc::new(lsm_tree::fs::FaultInjector::new());
+        let open = || {
+            let fs: std::sync::Arc<dyn lsm_tree::fs::Fs> =
+                std::sync::Arc::new(lsm_tree::fs::FaultFs::with_injector(
+                    lsm_tree::fs::StdFs,
+                    std::sync::Arc::clone(&injector),
+                ));
+            let seqno: SharedSequenceNumberGenerator =
+                std::sync::Arc::new(lsm_tree::SequenceNumberCounter::default());
+            let cache = std::sync::Arc::new(lsm_tree::Cache::with_capacity_bytes(1024 * 1024));
+            ColumnarTableRegistry::open(dir.path().to_path_buf(), fs, seqno, cache, mode).unwrap()
+        };
+
+        let tree = open().create_or_open("orders").unwrap();
+        let rows = [ColumnarRow {
+            key: b"k1",
+            value: b"v1",
+        }];
+        write_columnar_rows(&tree, &rows).unwrap();
+        drop(tree);
+        let reopened = open().get("orders").expect("reopened table");
+        let rows = [ColumnarRow {
+            key: b"k2",
+            value: b"v2",
+        }];
+        write_columnar_rows(&reopened, &rows).unwrap();
+
+        let modes = injector.sync_modes_for("orders");
+        assert!(!modes.is_empty(), "{mode:?}: nothing was synced");
+        assert!(
+            modes.iter().all(|m| *m == mode),
+            "{mode:?}: table files synced at {modes:?}"
+        );
+    }
 }

@@ -11,6 +11,7 @@ pub mod core;
 pub(crate) mod coverage;
 pub(crate) mod flush;
 pub mod merge;
+pub mod metadata;
 pub mod open_txns;
 pub mod oplog_journal;
 pub mod partition;
@@ -21,6 +22,11 @@ pub mod stats;
 pub mod tap;
 pub mod transaction;
 pub mod vector_keys;
+
+/// Most index entry effects one unit's DERIVED work may derive, on apply and
+/// on journal replay alike: a small unit cannot fan out without bound on
+/// every member.
+pub(crate) const MAX_DERIVED_EFFECTS: usize = 1 << 22;
 
 /// Snapshot type: a sequence number used as a read visibility bound.
 ///

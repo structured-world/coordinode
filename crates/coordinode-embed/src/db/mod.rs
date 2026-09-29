@@ -6,12 +6,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-// no-std: spin::RwLock (drop-in, same API). parking_lot::RwLock: smaller than
-// std's and its uncontended path never enters the kernel.
-use parking_lot::{RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
-use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::intern::{FieldInterner, FieldRegistrar};
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::txn::proposal::ProposalIdGenerator;
@@ -171,22 +168,6 @@ pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::
 /// worker rebuilds its indexes from the store.
 const APPLIED_QUEUE_CAPACITY: usize = 16_384;
 
-/// Number of node IDs to pre-allocate per batch.
-///
-/// On startup, the database reserves `ID_BATCH_SIZE` IDs by persisting
-/// the batch ceiling to disk. IDs within the batch are allocated in-memory
-/// (lock-free). When the batch is exhausted, a new batch is persisted.
-///
-/// On crash recovery, unused IDs in the last batch are skipped (gaps are
-/// acceptable — the invariant is no duplicates, not contiguity).
-const ID_BATCH_SIZE: u64 = 1000;
-
-/// Schema partition key for the persisted node ID high-water mark.
-///
-/// Stores a big-endian u64: the ceiling of the current ID batch.
-/// On open, the allocator resumes from this value.
-const SCHEMA_KEY_NEXT_NODE_ID: &[u8] = b"meta:next_node_id";
-
 /// A starting point for this process's proposal ids: random, so it repeats
 /// neither an earlier incarnation's ids (whose log the state machine
 /// re-applies after a restart) nor another member's.
@@ -203,12 +184,6 @@ pub fn fresh_proposal_id_base() -> u64 {
     hasher.write_u128(now);
     hasher.finish()
 }
-
-/// Schema partition key for the persisted field interner.
-///
-/// Stores the serialized FieldInterner (field name ↔ u32 ID mapping).
-/// Loaded on Database::open, updated after queries that intern new fields.
-const SCHEMA_KEY_FIELD_INTERNER: &[u8] = b"meta:field_interner";
 
 /// Canonical f32-vector coercion (handles `Value::Vector` and numeric
 /// `Value::Array`). Re-exported so `crate::db::try_extract_vector` callers
@@ -327,15 +302,11 @@ enum TxnMode {
 /// Embedded database instance.
 pub struct Database {
     engine: Arc<StorageEngine>,
-    // Wrapped in Arc<RwLock<…>> so concurrent gRPC handlers can hold a
-    // shared `Database` (under `Arc<RwLock<Database>>`) and still mutate
-    // the interner from any per-request execute path: lookup-heavy
-    // read paths take `.read()`, the rare "new property name" path
-    // takes `.write()`. FieldInterner itself stays alloc-clean in
-    // coordinode-core — the lock is bolted on here by the std-only
-    // consumer, per the tier policy.
-    // no-std: spin::RwLock (drop-in).
-    interner: Arc<RwLock<FieldInterner>>,
+    /// The field dictionary: each statement takes its verified view without
+    /// a lock held for the statement, and new names are registered through
+    /// the write pipeline before any data uses them.
+    fields: Arc<fields::FieldDictionary>,
+    /// Hands out NodeIds from leases the proposal pipeline grants.
     allocator: NodeIdAllocator,
     shard_id: u16,
     /// Live session registry for operational introspection, injected by the
@@ -348,9 +319,6 @@ pub struct Database {
     nplus1_detector: Arc<NPlus1Detector>,
     /// Dismissed suggestion fingerprints for `db.advisor.dismiss()`.
     dismissed: Arc<DismissedSet>,
-    /// Pre-allocated ID batch ceiling. When `allocator.current() >= ceiling`,
-    /// a new batch must be persisted before allocating more IDs.
-    id_batch_ceiling: AtomicU64,
     /// MVCC timestamp oracle — allocates monotonic timestamps for
     /// snapshot isolation reads and commit ordering.
     oracle: Arc<TimestampOracle>,
@@ -378,19 +346,28 @@ pub struct Database {
     /// One-shot snapshot timestamp for the next query (consumed on use).
     /// Set by `execute_cypher_with_read_concern` with Snapshot level.
     snapshot_read_ts: Option<u64>,
-    /// Cached storage statistics for EXPLAIN cost estimation.
-    /// `None` = never computed or invalidated.  Refreshed when
-    /// the TTL expires (see `STATS_CACHE_TTL_SECS`). A failed computation is
-    /// cached as `(None, at)` for the same TTL, so a damaged counter is
+    /// Cached storage statistics for EXPLAIN cost estimation, with the time
+    /// and the [`Self::stats_generation`] they were computed at. `None` =
+    /// never computed. Refreshed when the TTL expires (see
+    /// `STATS_CACHE_TTL_SECS`) or the generation moved. A failed computation
+    /// is cached as `(None, ..)` for the same TTL, so a damaged counter is
     /// reported once per window rather than recomputed on every query.
     cached_stats: Mutex<
         Option<(
             Option<coordinode_storage::engine::stats::StorageStatsComputer>,
             Instant,
+            u64,
         )>,
     >,
+    /// Bumped by every invalidation. A write invalidates with one atomic add
+    /// instead of taking the cache lock, which every concurrent writer would
+    /// otherwise queue on.
+    stats_generation: AtomicU64,
     /// How long cached storage statistics remain valid.
     stats_ttl: Duration,
+    /// Times the statistics were recomputed from storage.
+    #[cfg(test)]
+    stats_computations: AtomicU64,
     /// Session-level write concern. Default: Majority.
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
     /// Index registry — tracks active indexes for EXPLAIN SUGGEST false-positive prevention.
@@ -718,6 +695,22 @@ pub enum DatabaseError {
     Other(String),
 }
 
+/// What a B-tree index build that fails leaves behind.
+#[derive(Debug, Clone, Copy)]
+enum FailedBuild {
+    /// Nothing: the index being created is withdrawn.
+    Withdraw,
+    /// The index being rebuilt, marked failed: its constraint still holds
+    /// for new writes, lookups stop using it.
+    Keep,
+}
+
+impl From<coordinode_modality::StoreError> for DatabaseError {
+    fn from(e: coordinode_modality::StoreError) -> Self {
+        DatabaseError::Execution(e.into())
+    }
+}
+
 impl From<coordinode_query::frontend::FrontendError> for DatabaseError {
     fn from(e: coordinode_query::frontend::FrontendError) -> Self {
         use coordinode_query::frontend::FrontendError as FE;
@@ -936,44 +929,18 @@ impl Database {
             }
         }
 
-        // Recover node ID allocator from persisted high-water mark.
-        // The HWM is the ceiling of the last reserved batch — on crash,
-        // some IDs in the batch may be unused (gaps), but no duplicates.
-        let hwm = match engine.get(Partition::Schema, SCHEMA_KEY_NEXT_NODE_ID)? {
-            Some(bytes) if bytes.len() >= 8 => {
-                let arr: [u8; 8] = bytes[..8]
-                    .try_into()
-                    .map_err(|_| DatabaseError::Semantic("corrupt node ID HWM".into()))?;
-                u64::from_be_bytes(arr)
-            }
-            _ => 0,
-        };
+        let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
 
-        // Reserve next batch: persist ceiling BEFORE allocating any IDs.
-        // This guarantees crash safety — worst case we skip unused IDs.
-        let ceiling = hwm + ID_BATCH_SIZE;
-        engine.put(
-            Partition::Schema,
-            SCHEMA_KEY_NEXT_NODE_ID,
-            &ceiling.to_be_bytes(),
-        )?;
-
-        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(hwm));
-
-        // Recover field interner from persisted state.
-        // If no persisted state exists (fresh database), start with empty interner.
-        let interner = match engine.get(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER)? {
-            Some(bytes) => FieldInterner::from_bytes(&bytes).unwrap_or_else(|| {
-                tracing::warn!("corrupt field interner data, starting fresh");
-                FieldInterner::new()
-            }),
-            None => FieldInterner::new(),
-        };
-        // Wrap the interner in the shared Arc<RwLock<_>> early so the
-        // vector registry can use the same instance to resolve label /
-        // property ids when binding the per-index tier handle. The
-        // Database struct stores the same Arc below (line 632 region).
-        let shared_interner: Arc<RwLock<FieldInterner>> = Arc::new(RwLock::new(interner));
+        // The verified field dictionary, before anything reads stored data:
+        // a damaged or missing one refuses the open rather than serving
+        // stored properties as absent.
+        let fields = Arc::new(fields::FieldDictionary::open(
+            Arc::clone(&engine),
+            Arc::clone(&pipeline),
+            Arc::clone(&proposal_id_gen),
+            Arc::clone(&oracle),
+        )?);
+        let opened_view = fields.current()?;
 
         // Load index registry from storage for EXPLAIN SUGGEST accuracy.
         let index_registry = coordinode_query::index::IndexRegistry::new();
@@ -991,12 +958,11 @@ impl Database {
         // Load vector index definitions from schema: partition and rebuild
         // HNSW graphs from stored vectors (eager rebuild). The registry is
         // tier-backed: every index it registers persists f32 to LSM, which
-        // stays the source of truth for reranking. Interning happens inside `load_vector_indexes` under a
-        // brief write guard; the registry itself holds no interner ref
-        // (would cause reentrant write deadlocks against execute_cypher).
+        // stays the source of truth for reranking. The rebuild resolves the
+        // ids its data was written with and registers none.
         let vector_index_registry = Arc::new(Self::load_vector_indexes(
             engine.clone(),
-            &shared_interner,
+            &opened_view,
             1, /* shard_id */
         ));
 
@@ -1007,7 +973,7 @@ impl Database {
                 Arc::clone(&engine),
                 applied,
                 Arc::clone(&vector_index_registry),
-                Arc::clone(&shared_interner),
+                Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
                 1, /* shard_id */
             )
         });
@@ -1016,12 +982,22 @@ impl Database {
         let text_index_base = path.join("text_indexes");
         let text_index_registry = Self::load_text_indexes(
             &engine,
-            &shared_interner.read(),
+            &opened_view,
             1, /* shard_id */
             &text_index_base,
         );
 
-        let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
+        // Every NodeId comes from a lease the log granted, taken on the first
+        // CREATE and then kept one lease ahead in the background, so a crash
+        // or a change of leader never reissues one (CE single-shard: hint 0).
+        let reserver = id_lease::PrefetchingReserver::start(id_lease::LogLeaseReserver::new(
+            Arc::clone(&engine),
+            Arc::clone(&pipeline),
+            Arc::clone(&proposal_id_gen),
+            Arc::clone(&oracle),
+        ))
+        .map_err(|e| DatabaseError::Other(format!("start the NodeId lease worker: {e}")))?;
+        let allocator = NodeIdAllocator::leased(0, Arc::new(reserver));
 
         // Create drain buffer and background drain thread for volatile writes.
         // The pipeline is either OwnedLocalProposalPipeline (embedded) or
@@ -1076,7 +1052,7 @@ impl Database {
                 Arc::clone(&engine),
                 1, // shard_id
                 ttl_reaper_config,
-                shared_interner.read().clone(),
+                Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
                 Arc::clone(&pipeline),
                 Arc::clone(&proposal_id_gen),
             ))
@@ -1090,16 +1066,15 @@ impl Database {
         // does the lookup.
         engine.set_node_shard(1);
 
-        Ok(Self {
+        let db = Self {
             engine,
-            interner: shared_interner,
+            fields,
             allocator,
             shard_id: 1,
             operations: None,
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
             dismissed: Arc::new(DismissedSet::new()),
-            id_batch_ceiling: AtomicU64::new(ceiling),
             oracle,
             proposal_id_gen,
             pipeline,
@@ -1108,7 +1083,10 @@ impl Database {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             cached_stats: Mutex::new(None),
+            stats_generation: AtomicU64::new(0),
             stats_ttl: Duration::from_secs(STATS_CACHE_TTL_SECS),
+            #[cfg(test)]
+            stats_computations: AtomicU64::new(0),
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
             index_registry,
             vector_index_registry,
@@ -1132,7 +1110,14 @@ impl Database {
             next_txn_id: AtomicU64::new(0),
             interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
-        })
+        };
+        // A store that owns its log rebuilds its legacy-layout indexes now; a
+        // cluster member does it once it leads, since the rebuild is written
+        // through the log.
+        if !follow_raft_applies {
+            db.rebuild_legacy_btree_indexes()?;
+        }
+        Ok(db)
     }
 
     /// Load persisted vector index definitions from `schema:idx:*` and
@@ -1141,15 +1126,13 @@ impl Database {
     /// Called during `Database::open()` for eager HNSW rebuild.
     fn load_vector_indexes(
         engine: Arc<StorageEngine>,
-        interner_arc: &Arc<RwLock<FieldInterner>>,
+        fields: &FieldInterner,
         shard_id: u16,
     ) -> coordinode_query::index::VectorIndexRegistry {
         use coordinode_query::index::IndexType;
 
         // Tier-backed registry: every registered HNSW index gets a
         // VectorTierHandle scoped to its `(label_id, property_id)`.
-        // Interning is done here (caller-side) so the registry never
-        // touches a shared interner lock and stays reentrancy-safe.
         let registry =
             coordinode_query::index::VectorIndexRegistry::with_vector_tier(engine.clone());
         let engine_arc = engine;
@@ -1184,7 +1167,7 @@ impl Database {
 
         Self::register_and_populate_hnsw(
             &registry,
-            interner_arc,
+            fields,
             &engine_arc,
             shard_id,
             &hnsw_defs,
@@ -1198,7 +1181,7 @@ impl Database {
     /// a leader's CREATE VECTOR INDEX) and bring them live: register in
     /// the in-memory registry and rebuild the local HNSW from stored
     /// nodes. Returns the number of indexes brought up. Cluster
-    /// deployments call this alongside [`Self::refresh_field_interner`]
+    /// deployments call this alongside [`Self::refresh_btree_indexes`]
     /// whenever the applied index advances.
     pub fn refresh_vector_indexes(&self) -> Result<usize, DatabaseError> {
         use coordinode_query::index::IndexType;
@@ -1213,7 +1196,7 @@ impl Database {
         }
         Self::register_and_populate_hnsw(
             &self.vector_index_registry,
-            &self.interner,
+            &self.fields.current()?,
             &self.engine,
             self.shard_id,
             &new_defs,
@@ -1232,29 +1215,36 @@ impl Database {
     /// cancels it; the caller runs on the async runtime and must not block.
     fn register_and_populate_hnsw(
         registry: &coordinode_query::index::VectorIndexRegistry,
-        interner_arc: &Arc<RwLock<FieldInterner>>,
+        fields: &FieldInterner,
         engine: &Arc<StorageEngine>,
         shard_id: u16,
         hnsw_defs: &[coordinode_query::index::IndexDefinition],
         mode: PopulateMode,
     ) {
-        // Resolve (label, property) → interned ids in one short
-        // write-locked pass, build per-index tier handles, then register
-        // each HNSW with its tier bound.
-        let mut field_ids = Vec::with_capacity(hnsw_defs.len());
-        {
-            let mut g = interner_arc.write();
-            for def in hnsw_defs {
-                let label_id = g.intern(&def.label);
-                let property_id = g.intern(def.property());
-                let tier = registry.tier_handle(label_id, property_id);
-                registry.register_for_build(def.clone(), tier);
-                field_ids.push(property_id);
-            }
+        // Resolve (label, property) to the ids the definition was published
+        // with, build per-index tier handles, then register each HNSW with
+        // its tier bound. A rebuild only resolves: it registers nothing, so
+        // it can never give a name an id its data was not written with.
+        let mut resolved = Vec::with_capacity(hnsw_defs.len());
+        for def in hnsw_defs {
+            let (Some(label_id), Some(property_id)) =
+                (fields.lookup(&def.label), fields.lookup(def.property()))
+            else {
+                tracing::error!(
+                    index = %def.name,
+                    label = %def.label,
+                    property = %def.property(),
+                    "vector index names have no field binding; the index stays offline"
+                );
+                continue;
+            };
+            let tier = registry.tier_handle(label_id, property_id);
+            registry.register_for_build(def.clone(), tier);
+            resolved.push((def, property_id));
         }
 
-        let mut members = Vec::with_capacity(hnsw_defs.len());
-        for (def, field_id) in hnsw_defs.iter().zip(field_ids) {
+        let mut members = Vec::with_capacity(resolved.len());
+        for (def, field_id) in resolved {
             let (Some(hnsw), Some(health)) = (
                 registry.get(&def.label, def.property()),
                 registry.health_handle(&def.label, def.property()),
@@ -1929,6 +1919,8 @@ impl Database {
             CommitError::CounterOverflow { key } => DatabaseError::Other(format!(
                 "counter '{key}' would leave the i64 range; nothing was written"
             )),
+            // Not retryable either: the transaction has to change fewer entries.
+            e @ CommitError::IndexFanOut { .. } => DatabaseError::Other(e.to_string()),
             // Retryable from begin, like a conflict, but for a different
             // reason: the condition is re-evaluated against the state the
             // retry reads.
@@ -2484,16 +2476,27 @@ impl Database {
         // by a Traverse, annotate with strategy decision (graph_first /
         // acorn_filtered / vector_first) from the push-down cost model. The
         // invariant — no unfiltered VectorFilter after Traverse — is
-        // contract-tested in the planner regression suite.
-        let stats = self.compute_stats();
-        let combined_for_push_down = stats.as_ref().map(|g| CombinedStats {
-            graph: g,
-            vector: &self.vector_index_registry,
-        });
-        let stats_ref = combined_for_push_down
-            .as_ref()
-            .map(|c| c as &dyn coordinode_core::graph::stats::StorageStats);
-        plan.root = planner::optimize_push_down(plan.root, stats_ref);
+        // contract-tested in the planner regression suite. The statistics are
+        // computed only when such a decision is made: every write invalidates
+        // them, so computing them for each statement would put a storage read
+        // behind one shared lock on the write path.
+        let graph_stats = core::cell::OnceCell::new();
+        let combined_stats = core::cell::OnceCell::new();
+        let stats = || {
+            combined_stats
+                .get_or_init(|| {
+                    graph_stats
+                        .get_or_init(|| self.compute_stats())
+                        .as_ref()
+                        .map(|g| CombinedStats {
+                            graph: g,
+                            vector: &self.vector_index_registry,
+                        })
+                })
+                .as_ref()
+                .map(|c| c as &dyn coordinode_core::graph::stats::StorageStats)
+        };
+        plan.root = planner::optimize_push_down_lazy(plan.root, &stats);
 
         // Bind parameters: replace $name references with literal values.
         if let Some(ref p) = params {
@@ -2597,22 +2600,18 @@ impl Database {
                 None,
             ),
         };
-        // Snapshot of the current interner is handed to the vector
-        // loader (HNSW property lookups). The write-lock is then
-        // acquired for the duration of execute, so the executor can
-        // intern new property names without re-entering the same
-        // RwLock through the loader (parking_lot RwLock is not
-        // re-entrant — that would deadlock).
-        let vector_loader = StorageVectorLoader::new(
-            Arc::clone(&self.engine),
-            self.interner.read().clone(),
-            self.shard_id,
-        );
-        let mut interner_guard = self.interner.write();
-        let interner_len_before = interner_guard.len();
+        // The statement's view of the field dictionary: every binding
+        // applied before it started, refreshed here when one has landed
+        // since (a registration, a replica apply, a replay, a snapshot).
+        // Names the statement introduces are registered through the
+        // pipeline and join this view only; no lock is held while it runs.
+        let mut fields_view = self.fields.current()?;
+        let vector_loader =
+            StorageVectorLoader::new(Arc::clone(&self.engine), fields_view.clone(), self.shard_id);
         let mut ctx = ExecutionContext {
             engine: &self.engine,
-            interner: &mut interner_guard,
+            interner: &mut fields_view,
+            field_registrar: Some(self.fields.as_ref()),
             id_allocator: &self.allocator,
             shard_id: self.shard_id,
             scan_paging: scan_paging.clone(),
@@ -2623,6 +2622,7 @@ impl Database {
             snapshot_pin: None,
             warnings: Vec::new(),
             write_stats: WriteStats::default(),
+            key_claims: Default::default(),
             text_index: None,
             text_index_registry: Some(&self.text_index_registry),
             vector_indexes: Some(coordinode_query::executor::runner::VectorIndexes {
@@ -2717,63 +2717,14 @@ impl Database {
             }
         }
 
-        // Capture write_stats before dropping ctx (which borrows the
-        // interner_guard via &mut *).
-        let mut write_stats = ctx.write_stats.clone();
-        let nodes_created = write_stats.nodes_created;
+        let write_stats = ctx.write_stats.clone();
         let had_mutations = write_stats.has_mutations();
         // Hand the executor-updated keyset state (last_key + exhausted) back to
         // the caller through the in/out channel. `None` stays `None` for a
         // non-paged execution; the cursor path reads this to build the next
         // page's resume token.
         *scan_paging = ctx.scan_paging.clone();
-        // Drop ctx, then snapshot the interner state under the same
-        // write guard before releasing it so we don't race with another
-        // query that might intern between unlock and persist.
         drop(ctx);
-        let interner_len_after = interner_guard.len();
-        let interner_bytes = if interner_len_after > interner_len_before {
-            Some(interner_guard.to_bytes())
-        } else {
-            None
-        };
-        drop(interner_guard);
-
-        // Persist a new ID batch if nodes were created and we're near the ceiling.
-        if nodes_created > 0 {
-            self.ensure_id_batch()?;
-        }
-
-        // Persist field interner if new fields were interned during this
-        // query. Goes through the proposal pipeline (not a direct engine
-        // put): property values are encoded against interner ids, so the
-        // mapping must replicate to every node that applies the data.
-        if let Some(bytes) = interner_bytes {
-            let proposal = coordinode_core::txn::proposal::RaftProposal {
-                id: self.proposal_id_gen.next(),
-                mutations: vec![coordinode_core::txn::proposal::Mutation::Put {
-                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
-                    key: SCHEMA_KEY_FIELD_INTERNER.to_vec(),
-                    value: bytes,
-                }],
-                commit_ts: self.oracle.next(),
-                start_ts: Timestamp::from_raw(0),
-                bypass_rate_limiter: false,
-            };
-            let outcome = self
-                .pipeline
-                .propose_and_wait(&proposal)
-                .map_err(|e| DatabaseError::Other(format!("persist field interner: {e}")))?;
-            // The interner mapping for a newly-seen field commits at a HIGHER
-            // Raft index than the user write it accompanies. operationTime must
-            // cover it: a causal read fencing on the returned index has to
-            // observe both the written data AND the interner entry needed to
-            // decode the write's new property names on a follower. Take the
-            // max so the token spans every Raft entry this statement produced.
-            // (`Option` orders `None < Some`, so this is a no-op in embedded /
-            // non-replicated mode where both are `None`.)
-            write_stats.applied_index = write_stats.applied_index.max(outcome.applied_index);
-        }
 
         // Invalidate cached storage statistics after any mutation so that
         // the next EXPLAIN reflects the current state of the database.
@@ -2792,77 +2743,19 @@ impl Database {
         Ok((results, write_stats, out_state))
     }
 
-    /// Ensure the allocator has a persisted batch reservation.
+    /// Publish exactly the bindings `bytes` carries (a dictionary written by
+    /// [`FieldInterner::to_bytes`]), for data restored already encoded with
+    /// them. Must run before that data is installed.
     ///
-    /// If the current allocator position has reached or exceeded the batch
-    /// ceiling, reserves a new batch by persisting the new ceiling to disk.
-    /// This is called after CREATE operations to guarantee crash safety.
+    /// # Errors
     ///
-    /// In cluster mode (distributed), this will be replaced by Raft-based
-    /// ID range allocation from the leader.
-    fn ensure_id_batch(&self) -> Result<(), DatabaseError> {
-        let current = self.allocator.current().as_raw();
-        let ceiling = self.id_batch_ceiling.load(Ordering::Relaxed);
-        if current >= ceiling {
-            let new_ceiling = current + ID_BATCH_SIZE;
-            self.engine.put(
-                Partition::Schema,
-                SCHEMA_KEY_NEXT_NODE_ID,
-                &new_ceiling.to_be_bytes(),
-            )?;
-            self.id_batch_ceiling.store(new_ceiling, Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
-    /// Reload the in-memory field interner from the Schema partition if
-    /// the persisted mapping has grown. Returns `true` when a refresh
-    /// was applied.
-    ///
-    /// Property values are encoded against interner ids. On a Raft
-    /// follower the persisted mapping advances through entry apply
-    /// (replicated by the leader), but this Database instance's
-    /// in-memory copy does not — without a refresh, follower reads
-    /// resolve every property to null. Cluster deployments call this
-    /// whenever the applied index advances; embedded single-node
-    /// deployments never need it (the only writer is this instance).
-    pub fn refresh_field_interner(&self) -> Result<bool, DatabaseError> {
-        let Some(bytes) = self
-            .engine
-            .get(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER)?
-        else {
-            return Ok(false);
-        };
-        let Some(persisted) = FieldInterner::from_bytes(&bytes) else {
-            tracing::warn!("corrupt persisted field interner, refresh skipped");
-            return Ok(false);
-        };
-        // Cheap pre-check under the read lock: the interner only grows,
-        // so a same-size persisted mapping cannot differ.
-        if persisted.len() <= self.interner.read().len() {
-            return Ok(false);
-        }
-        let mut guard = self.interner.write();
-        if persisted.len() <= guard.len() {
-            return Ok(false); // raced with another refresher
-        }
-        *guard = persisted;
-        Ok(true)
-    }
-
-    /// Persist field-interner bytes (e.g. recovered from a snapshot-based
-    /// restore) to the Schema partition so a later open reloads them, and
-    /// update this instance's in-memory copy. A full Raft snapshot excludes
-    /// `meta:` Schema keys, so the interner must be carried and restored
-    /// alongside it for a self-contained backup.
-    pub fn persist_field_interner_bytes(&self, bytes: &[u8]) -> Result<(), DatabaseError> {
-        let Some(interner) = FieldInterner::from_bytes(bytes) else {
-            return Err(DatabaseError::Other("corrupt field interner bytes".into()));
-        };
-        self.engine
-            .put(Partition::Schema, SCHEMA_KEY_FIELD_INTERNER, bytes)?;
-        *self.interner.write() = interner;
-        Ok(())
+    /// The bytes are not a dictionary, or a binding contradicts one this
+    /// database already holds; nothing of the batch is published then.
+    pub fn adopt_field_bindings(&self, bytes: &[u8]) -> Result<(), DatabaseError> {
+        let bindings = FieldInterner::from_bytes(bytes).map_err(ExecutionError::from)?;
+        self.fields
+            .adopt(&bindings)
+            .map_err(|e| DatabaseError::Execution(e.into()))
     }
 
     /// Return EXPLAIN plan text for a Cypher query.
@@ -2963,13 +2856,18 @@ impl Database {
     /// failure itself is logged as an error, because the usual cause is a
     /// damaged counter or adjacency list, which is worth an operator's look.
     pub fn compute_stats(&self) -> Option<coordinode_storage::engine::stats::StorageStatsComputer> {
+        // Read before computing: a write that lands during the computation
+        // moves the generation past this one, so its result is not reused.
+        let generation = self.stats_generation.load(Ordering::Acquire);
         let mut guard = self.cached_stats.lock().ok()?;
-        if let Some((ref stats, computed_at)) = *guard {
-            if computed_at.elapsed() < self.stats_ttl {
+        if let Some((ref stats, computed_at, computed_for)) = *guard {
+            if computed_for == generation && computed_at.elapsed() < self.stats_ttl {
                 return stats.clone();
             }
         }
         // Cache miss or expired — recompute.
+        #[cfg(test)]
+        self.stats_computations.fetch_add(1, Ordering::Relaxed);
         let fresh =
             match coordinode_storage::engine::stats::StorageStatsComputer::compute(&self.engine) {
                 Ok(fresh) => Some(fresh),
@@ -2981,7 +2879,7 @@ impl Database {
                     None
                 }
             };
-        *guard = Some((fresh.clone(), Instant::now()));
+        *guard = Some((fresh.clone(), Instant::now(), generation));
         fresh
     }
 
@@ -2990,9 +2888,7 @@ impl Database {
     /// The next `explain_cypher()` or `explain_suggest()` call will
     /// trigger a fresh scan.  Useful after bulk imports or schema changes.
     pub fn invalidate_stats_cache(&self) {
-        if let Ok(mut guard) = self.cached_stats.lock() {
-            *guard = None;
-        }
+        self.stats_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Override the storage statistics cache TTL.
@@ -3025,52 +2921,88 @@ impl Database {
         Arc::clone(&self.engine)
     }
 
+    /// Publish `mutations` as one Schema change through the write pipeline,
+    /// so it replicates, survives a crash and is replayed like any write:
+    /// catalog records are never put beside the history that recovers them.
+    fn publish_schema(
+        &self,
+        mutations: Vec<coordinode_core::txn::proposal::Mutation>,
+    ) -> Result<(), DatabaseError> {
+        let proposal = coordinode_core::txn::proposal::RaftProposal {
+            id: self.proposal_id_gen.next(),
+            mutations,
+            commit_ts: self.oracle.next(),
+            start_ts: Timestamp::from_raw(0),
+            bypass_rate_limiter: false,
+        };
+        self.pipeline
+            .propose_and_wait(&proposal)
+            .map_err(|e| DatabaseError::Other(format!("publish schema change: {e}")))?;
+        self.engine.note_schema_change();
+        Ok(())
+    }
+
+    /// A Schema put for `publish_schema`.
+    fn schema_put(key: Vec<u8>, value: Vec<u8>) -> coordinode_core::txn::proposal::Mutation {
+        coordinode_core::txn::proposal::Mutation::Put {
+            partition: coordinode_core::txn::proposal::PartitionId::Schema,
+            key,
+            value,
+        }
+    }
+
     /// Create a vector (HNSW) index on a label's vector property.
     ///
     /// After creation, queries using `vector_similarity(n.prop, $q)` will
     /// use the HNSW index instead of brute-force distance computation.
     /// Call `populate_vector_index` to backfill existing vectors.
+    ///
+    /// # Errors
+    ///
+    /// The label or property name could not be registered, or the
+    /// definition could not be published; the index is not created then.
     pub fn create_vector_index(
         &mut self,
         name: impl Into<String>,
         label: impl Into<String>,
         property: impl Into<String>,
         config: coordinode_query::index::VectorIndexConfig,
-    ) {
+    ) -> Result<(), DatabaseError> {
         let def = coordinode_query::index::IndexDefinition::hnsw(name, label, property, config);
 
-        // Persist the index definition to schema: partition so it survives restart.
-        let key = def.schema_key();
-        if let Ok(bytes) = rmp_serde::to_vec(&def) {
-            if let Err(e) = self.engine.put(Partition::Schema, &key, &bytes) {
-                tracing::error!("failed to persist vector index definition: {e}");
-            }
-        }
+        // The names the index is keyed by are bound before its definition is
+        // published, so every member that sees the definition resolves them.
+        let ids = self
+            .fields
+            .register(&[&def.label, def.property()])
+            .map_err(ExecutionError::from)?;
+        let bytes = rmp_serde::to_vec(&def)
+            .map_err(|e| DatabaseError::Other(format!("serialize vector index: {e}")))?;
+        self.publish_schema(vec![Self::schema_put(def.schema_key(), bytes)])?;
 
         // Register in both registries: VectorIndexRegistry holds the live HNSW
         // graph for query acceleration; IndexRegistry mirrors the definition so
         // advisors and planners can see all indexes (scalar + vector) through
-        // a single source of truth. Tier handle is resolved locally so the
-        // registry never touches the shared interner lock.
-        let tier = {
-            let mut g = self.interner.write();
-            let label_id = g.intern(&def.label);
-            let property_id = g.intern(def.property());
-            self.vector_index_registry
-                .tier_handle(label_id, property_id)
-        };
+        // a single source of truth.
+        let tier = self.vector_index_registry.tier_handle(ids[0], ids[1]);
         self.vector_index_registry
             .register_with_tier(def.clone(), tier);
         self.index_registry.register_in_memory(def);
+        Ok(())
     }
 
     /// Persist a label schema to storage and auto-create unique B-tree indexes.
     ///
     /// Idempotent: existing schema for this label is replaced. For each property
     /// with `unique = true`, a B-tree unique index is created (if not already
-    /// present) and existing nodes are backfilled into the index.
+    /// present) from the nodes already stored.
     ///
     /// Returns the schema revision after persistence.
+    ///
+    /// # Errors
+    ///
+    /// Stored nodes already share a value of a property declared unique: the
+    /// index cannot be built and the schema is not published.
     pub fn create_label_schema(
         &mut self,
         schema: coordinode_core::schema::definition::LabelSchema,
@@ -3079,114 +3011,186 @@ impl Database {
             encode_label_current_revision_key, encode_label_schema_key,
         };
 
-        // 1. Persist the schema to storage. Version-prefixed key carries the
-        //    immutable snapshot; the current_revision pointer names the active
-        //    one. Both writes are part of this commit, so a reader never
-        //    sees a pointer to a revision that is not stored.
-        let key = encode_label_schema_key(&schema.name, schema.schema_revision);
-        let bytes = schema
-            .to_msgpack()
-            .map_err(|e| DatabaseError::Other(format!("serialize label schema: {e}")))?;
-        self.engine.put(Partition::Schema, &key, &bytes)?;
-        let pointer_key = encode_label_current_revision_key(&schema.name);
-        self.engine.put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )?;
-
-        let version = schema.schema_revision;
+        // 1. The unique indexes first: a schema that declares a property
+        //    unique is published only once the index enforcing it exists.
         let label_name = schema.name.clone();
-
-        // 2. For each unique property, register a B-tree unique index.
-        // Collect first to avoid borrowing schema while mutably borrowing registries.
         let unique_props: Vec<String> = schema
             .properties
             .values()
             .filter(|p| p.unique)
             .map(|p| p.name.clone())
             .collect();
-
         for prop_name in unique_props {
             let idx_name = format!("{}_{}", label_name.to_lowercase(), prop_name.to_lowercase());
             if self.index_registry.get(&idx_name).is_some() {
-                continue; // index already registered — skip
+                continue;
             }
-
-            let idx =
+            self.build_btree_index(
                 coordinode_query::index::IndexDefinition::btree(&idx_name, &label_name, &prop_name)
-                    .unique();
-            self.index_registry
-                .register(&self.engine, idx)
-                .map_err(DatabaseError::Storage)?;
-
-            // Backfill existing nodes of this label into the new index.
-            // Duplicate values in pre-existing data are logged as warnings —
-            // we do not reject the schema creation because of historical data.
-            self.backfill_btree_index(&label_name, &prop_name);
+                    .unique(),
+                FailedBuild::Withdraw,
+            )?;
         }
 
-        Ok(version)
+        // 2. Publish the schema. Version-prefixed key carries the immutable
+        //    snapshot; the current_revision pointer names the active one.
+        //    Both travel in one proposal, so no member ever holds a pointer
+        //    to a revision it does not have, and a crash keeps both or
+        //    neither.
+        let key = encode_label_schema_key(&schema.name, schema.schema_revision);
+        let bytes = schema
+            .to_msgpack()
+            .map_err(|e| DatabaseError::Other(format!("serialize label schema: {e}")))?;
+        let pointer_key = encode_label_current_revision_key(&schema.name);
+        self.publish_schema(vec![
+            Self::schema_put(key, bytes),
+            Self::schema_put(pointer_key, schema.schema_revision.to_be_bytes().to_vec()),
+        ])?;
+
+        Ok(schema.schema_revision)
     }
 
-    /// Backfill a B-tree index for nodes of `label` that are already in storage.
+    /// Create the B-tree index `def` from the nodes already stored.
     ///
-    /// Called after a new unique B-tree index is registered via `create_label_schema`.
-    /// Unique violations in pre-existing data are logged as warnings, not errors.
-    fn backfill_btree_index(&self, label: &str, property: &str) {
-        use coordinode_core::graph::node::{NodeRecord, decode_node_key};
-        use coordinode_core::graph::types::Value;
-
-        let node_prefix = {
-            let mut p = Vec::with_capacity(8);
-            p.extend_from_slice(b"node:");
-            p.extend_from_slice(&self.shard_id.to_be_bytes());
-            p.push(b':');
-            p
+    /// The definition is published as building, with range tombstones over
+    /// any entries left under its name, in one log entry; writers maintain
+    /// the index from then on while the backfill fills in the stored nodes;
+    /// the definition is then published as ready. A backfill that fails
+    /// withdraws a new index; an existing one being rebuilt (`on_failure`
+    /// [`FailedBuild::Keep`]) stays, marked failed, so its constraint still
+    /// holds for new writes while lookups stop using it. Returns the number
+    /// of nodes indexed.
+    fn build_btree_index(
+        &self,
+        mut def: coordinode_query::index::IndexDefinition,
+        on_failure: FailedBuild,
+    ) -> Result<u64, DatabaseError> {
+        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
+        use coordinode_query::index::IndexState;
+        let store = LocalIndexStore::new(&self.engine);
+        let name = def.name.clone();
+        def.layout = ENTRY_LAYOUT;
+        if def.maintenance.epoch == 0 {
+            // A new index, or one from before maintenance bindings: it takes
+            // the namespace default, recorded, as any index created now.
+            let (policy, _) = store.index_policy()?;
+            def.maintenance = policy.resolve(None, 1);
+        }
+        def.state = IndexState::Building {
+            written: 0,
+            estimated_total: 0,
         };
+        let mut publish = vec![store.definition_put_mutation(&def)?];
+        publish.extend(store.clear_mutations(&name));
+        self.publish_schema(publish)?;
+        self.index_registry
+            .register_published(&self.engine, def.clone())?;
 
-        let iter = match self.engine.prefix_scan(Partition::Node, &node_prefix) {
-            Ok(it) => it,
+        let fields = self.fields.current()?;
+        let wc = self.write_concern;
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &wc,
+            pipeline: Some(self.pipeline.as_ref()),
+            id_gen: Some(&self.proposal_id_gen),
+            drain_buffer: Some(&self.drain_buffer),
+            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
+        };
+        let built = coordinode_query::index::build::Backfill {
+            engine: &self.engine,
+            oracle: Some(&self.oracle),
+            interner: &fields,
+            shard_id: self.shard_id,
+            own_open: 0,
+        }
+        .run(&def, &mut |txn| txn.commit(&commit_ctx).map(|_| ()));
+
+        match built {
+            Ok(indexed) => {
+                def.state = IndexState::Ready;
+                self.publish_schema(vec![store.definition_put_mutation(&def)?])?;
+                self.index_registry.register_published(&self.engine, def)?;
+                Ok(indexed)
+            }
             Err(e) => {
-                tracing::warn!(
-                    "backfill_btree_index: failed to scan nodes for {label}.{property}: {e}"
-                );
-                return;
-            }
-        };
-
-        let field_id = self.interner.read().lookup(property);
-
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-            if record.primary_label() != label {
-                continue;
-            }
-            let Some((_, node_id)) = decode_node_key(&_key) else {
-                continue;
-            };
-
-            let prop_val = if let Some(fid) = field_id {
-                record.props.get(&fid).cloned().unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            };
-
-            let props = [(property.to_string(), prop_val)];
-            if let Err(e) =
-                self.index_registry
-                    .on_node_created(&self.engine, node_id, label, &props)
-            {
-                tracing::warn!(
-                    "backfill_btree_index: unique violation for {label}.{property} on node {node_id:?}: {e}"
-                );
+                match on_failure {
+                    FailedBuild::Withdraw => {
+                        self.index_registry.unregister(&name);
+                        let mut withdraw = vec![store.definition_delete_mutation(&name)];
+                        withdraw.extend(store.clear_mutations(&name));
+                        self.publish_schema(withdraw)?;
+                    }
+                    FailedBuild::Keep => {
+                        def.state = IndexState::Failed {
+                            reason: e.to_string(),
+                        };
+                        self.publish_schema(vec![store.definition_put_mutation(&def)?])?;
+                        self.index_registry.register_published(&self.engine, def)?;
+                    }
+                }
+                Err(match e {
+                    coordinode_query::index::build::BackfillError::Duplicate(v) => {
+                        DatabaseError::Execution(v.into())
+                    }
+                    other => DatabaseError::Other(format!("build index '{name}': {other}")),
+                })
             }
         }
+    }
+
+    /// Rebuild every B-tree index still in the entry layout that preceded
+    /// transactional entries.
+    ///
+    /// Those entries were written outside the log on whichever member ran the
+    /// statement, so they are this member's own: they are cleared here, and
+    /// the index is built again through the log like a new one. Until then a
+    /// lookup does not use the index; writers already maintain it in the
+    /// current layout. An index whose stored data breaks it (a unique index
+    /// with duplicates the old layout let in) is kept, marked failed, and
+    /// reported. Returns how many indexes were rebuilt.
+    ///
+    /// # Errors
+    ///
+    /// Publishing through the log failed (this member is not the leader).
+    pub fn rebuild_legacy_btree_indexes(&self) -> Result<usize, DatabaseError> {
+        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
+        use coordinode_query::index::IndexType;
+        let legacy: Vec<_> = self
+            .index_registry
+            .all()
+            .into_iter()
+            .filter(|d| d.index_type == IndexType::BTree && d.layout < ENTRY_LAYOUT)
+            .collect();
+        let store = LocalIndexStore::new(&self.engine);
+        let mut rebuilt = 0;
+        for def in &legacy {
+            store.clear_legacy(&def.name)?;
+            match self.build_btree_index(def.clone(), FailedBuild::Keep) {
+                Ok(_) => {
+                    rebuilt += 1;
+                    tracing::info!(index = %def.name, "rebuilt a B-tree index in the current entry layout");
+                }
+                Err(DatabaseError::Execution(e @ ExecutionError::UniqueViolation { .. })) => {
+                    tracing::error!(
+                        index = %def.name,
+                        error = %e,
+                        "the stored data breaks this index; it stays failed until the data is \
+                         fixed and the index is dropped and created again"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(rebuilt)
+    }
+
+    /// Reload the index definitions from the schema partition, so a member
+    /// that applied another member's CREATE or DROP INDEX maintains and uses
+    /// the same indexes. Cluster deployments call this whenever the applied
+    /// index advances.
+    pub fn refresh_btree_indexes(&self) -> Result<(), DatabaseError> {
+        self.index_registry
+            .load_all(&self.engine)
+            .map_err(DatabaseError::Storage)
     }
 
     /// Persist an edge type schema to storage.
@@ -3205,13 +3209,12 @@ impl Database {
         let bytes = schema
             .to_msgpack()
             .map_err(|e| DatabaseError::Other(format!("serialize edge type schema: {e}")))?;
-        self.engine.put(Partition::Schema, &key, &bytes)?;
         let pointer_key = encode_edge_type_current_revision_key(&schema.name);
-        self.engine.put(
-            Partition::Schema,
-            &pointer_key,
-            &schema.schema_revision.to_be_bytes(),
-        )?;
+        // Revision and pointer in one proposal, as for a label schema.
+        self.publish_schema(vec![
+            Self::schema_put(key, bytes),
+            Self::schema_put(pointer_key, schema.schema_revision.to_be_bytes().to_vec()),
+        ])?;
         Ok(schema.schema_revision)
     }
 
@@ -3240,12 +3243,12 @@ impl Database {
             config,
         );
 
-        // Persist the index definition to schema: partition.
+        // Publish the index definition before the local index exists.
         let key = def.schema_key();
         let bytes = rmp_serde::to_vec(&def).map_err(|e| {
             DatabaseError::Other(format!("failed to serialize text index def: {e}"))
         })?;
-        self.engine.put(Partition::Schema, &key, &bytes)?;
+        self.publish_schema(vec![Self::schema_put(key, bytes)])?;
 
         // Register in the text index registry (creates empty tantivy index).
         self.text_index_registry
@@ -3263,6 +3266,8 @@ impl Database {
         };
 
         let mut count = 0usize;
+        // No binding: no stored node carries the property yet.
+        let field_id = self.fields.current()?.lookup(&property);
         let iter = self.engine.prefix_scan(Partition::Node, &node_prefix)?;
         for guard in iter {
             let Ok((_key, value)) = guard.into_inner() else {
@@ -3281,7 +3286,7 @@ impl Database {
                 None => continue,
             };
 
-            if let Some(field_id) = self.interner.read().lookup(&property) {
+            if let Some(field_id) = field_id {
                 if let Some(val) = record.props.get(&field_id) {
                     if let Some(text) = val.as_str() {
                         self.text_index_registry
@@ -3308,22 +3313,22 @@ impl Database {
         &mut self.text_index_registry
     }
 
-    /// Get a read-locked view of the field interner.
+    /// The verified field dictionary as it stands: every binding applied so
+    /// far. The view is immutable and cheap to clone; holding it blocks
+    /// nothing.
     ///
-    /// Returned guard derefs to `&FieldInterner` so existing callers
-    /// using `db.interner().lookup(..)` / `db.interner().resolve(..)`
-    /// continue to work via deref coercion. Don't hold the guard
-    /// across long-running operations — writers (new property name
-    /// interns) wait until it's dropped.
-    pub fn interner(&self) -> RwLockReadGuard<'_, FieldInterner> {
-        self.interner.read()
+    /// # Errors
+    ///
+    /// The stored dictionary is inconsistent.
+    pub fn interner(&self) -> Result<FieldInterner, DatabaseError> {
+        Ok(self.fields.current()?)
     }
 
-    /// Get an Arc-shared handle to the interner, for components that
-    /// need to keep their own snapshot or hand off ownership (e.g.
-    /// background reapers, cluster recovery).
-    pub fn interner_arc(&self) -> Arc<RwLock<FieldInterner>> {
-        Arc::clone(&self.interner)
+    /// The authority new property names are registered with, for a writer
+    /// outside the query path (a restore, an import) that encodes data
+    /// itself.
+    pub fn field_registrar(&self) -> Arc<dyn FieldRegistrar> {
+        Arc::clone(&self.fields) as Arc<dyn FieldRegistrar>
     }
 
     /// Get the query advisor registry for performance analysis.
@@ -3387,7 +3392,10 @@ impl Database {
 }
 
 mod after_commit;
+mod fields;
+mod id_lease;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
+pub use fields::FieldDictionary;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

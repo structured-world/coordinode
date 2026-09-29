@@ -317,6 +317,64 @@ CREATE INDEX active_users ON :User(name) WHERE active = true
 DROP INDEX user_email
 ```
 
+- **Entries commit with the data.** An index entry is written by the same
+  transaction as the node it indexes: a failed or rolled-back statement leaves
+  none, a crash keeps both or neither, and every replica holds the same
+  entries. A member that takes over as leader enforces the same unique
+  indexes.
+- **Unique.** A write that gives a unique index's value a second node fails
+  with `unique constraint violated`, naming the node that holds the value
+  (gRPC `ALREADY_EXISTS` with reason `DUPLICATE_KEY`; SQLSTATE `23505` over the
+  PostgreSQL wire). Two concurrent writers of one value: exactly one commits.
+  A node without the property holds NULL, and NULL is a value, so a unique
+  index allows one such node; declare it `SPARSE` to skip them.
+- **Building.** `CREATE INDEX` indexes the nodes already stored before it
+  returns, and serves lookups once built. `CREATE UNIQUE INDEX` over data that
+  already has a duplicate fails and leaves no index.
+- **Lists.** A list value is indexed by each element, so a unique index keeps
+  an element to one node. An equality on the property still means the whole
+  value: `n.tags = 'x'` does not match a node whose `tags` is `['x', 'y']`.
+- **Values with no key.** A map, a vector or `NaN` is not indexed; an
+  equality on such a value is answered by scanning the label. An equality
+  with `NULL` matches nothing, as everywhere in Cypher.
+
+**Maintenance profile.** How a write carries its index changes to the log
+that replication and crash recovery read. Both profiles hold the same entries
+and answer the same queries; they differ in what the log records.
+
+| Profile | The log records | Suits |
+|---------|-----------------|-------|
+| `RESOLVED` (default) | the index entries themselves | members that should apply entries without reading the record |
+| `DERIVED` | the index change and its exact inputs; every member derives the entries when it applies the write | smaller log entries, wide or many indexes |
+
+```cypher
+CREATE INDEX user_email ON :User(email) OPTIONS { maintenance: 'derived' }
+ALTER INDEX user_email SET MAINTENANCE RESOLVED   -- or DERIVED, or INHERIT
+ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED     -- default for new indexes
+```
+
+- An index without `OPTIONS { maintenance: ... }` takes the namespace
+  default when it is created and keeps it: changing the default later does
+  not move existing indexes. `ALTER INDEX ... SET MAINTENANCE INHERIT` binds
+  an index to the current default.
+- `ALTER INDEX` changes the profile under a new maintenance epoch without
+  rewriting any entry. A transaction that staged index changes under the
+  previous epoch is refused at commit with `record version mismatch`, and
+  succeeds when retried. Only a built B-tree index can be altered.
+- `CREATE INDEX` and `ALTER INDEX` return `maintenance` (`RESOLVED` or
+  `DERIVED`), `maintenance_source` (`OVERRIDE`, or `NAMESPACE@<revision>`
+  for an index bound to the namespace default) and `maintenance_epoch`;
+  `ALTER INDEX` also returns `previous_epoch`. `ALTER NAMESPACE` returns
+  `index_maintenance_default` and its `revision`.
+- A `DERIVED` index enforces uniqueness, reads its own writes inside a
+  transaction and rolls back with it exactly as a `RESOLVED` one does. Its
+  entries are not change events: a change stream carries the node writes
+  they follow.
+- A transaction whose `DERIVED` index changes exceed 4,194,304 entries is
+  refused at commit; nothing is written.
+- An unknown option, or a profile other than `resolved` / `derived`, is
+  refused.
+
 #### CREATE VECTOR INDEX / DROP VECTOR INDEX ✅
 
 HNSW approximate nearest-neighbor index.

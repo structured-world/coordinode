@@ -456,10 +456,23 @@ pub enum LogicalOp {
         sparse: bool,
         /// Optional partial-index filter predicate.
         filter: Option<crate::index::definition::PartialFilter>,
+        /// The index's own maintenance profile; `None` inherits the
+        /// namespace default.
+        maintenance: Option<crate::index::IndexProfile>,
     },
 
     /// DROP INDEX: remove a B-tree index by name.
     DropIndex { name: String },
+
+    /// An explicit maintenance-profile transition of one B-tree index:
+    /// `profile`, or the namespace default when `None`.
+    AlterIndexMaintenance {
+        name: String,
+        profile: Option<crate::index::IndexProfile>,
+    },
+
+    /// Set the namespace default profile for key-shaped indexes.
+    SetNamespaceIndexDefault { profile: crate::index::IndexProfile },
 
     /// CREATE VECTOR INDEX: build an HNSW index on a label's vector property.
     ///
@@ -1181,6 +1194,8 @@ impl LogicalOp {
             | LogicalOp::DropEncryptedIndex { .. }
             | LogicalOp::CreateIndex { .. }
             | LogicalOp::DropIndex { .. }
+            | LogicalOp::AlterIndexMaintenance { .. }
+            | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
             | LogicalOp::CreateEdgeType { .. }
@@ -1807,6 +1822,8 @@ fn estimate_op_cost(
         | LogicalOp::DropEncryptedIndex { .. }
         | LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
+        | LogicalOp::AlterIndexMaintenance { .. }
+        | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
         | LogicalOp::CreateEdgeType { .. }
@@ -2474,6 +2491,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             unique,
             sparse,
             filter,
+            maintenance,
         } => {
             let mut flags = String::new();
             if *unique {
@@ -2487,12 +2505,23 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             } else {
                 String::new()
             };
+            let maintenance_str = match maintenance {
+                Some(p) => format!(", maintenance={p:?}"),
+                None => String::new(),
+            };
             output.push_str(&format!(
-                "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str})\n"
+                "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str}{maintenance_str})\n"
             ));
         }
         LogicalOp::DropIndex { name } => {
             output.push_str(&format!("{prefix}DropIndex({name})\n"));
+        }
+        LogicalOp::AlterIndexMaintenance { name, profile } => {
+            let to = profile.map_or_else(|| "Inherit".to_string(), |p| format!("{p:?}"));
+            output.push_str(&format!("{prefix}AlterIndexMaintenance({name} -> {to})\n"));
+        }
+        LogicalOp::SetNamespaceIndexDefault { profile } => {
+            output.push_str(&format!("{prefix}SetNamespaceIndexDefault({profile:?})\n"));
         }
         LogicalOp::CreateVectorIndex {
             name,

@@ -1,5 +1,5 @@
 //! Single-source segment transfer: stream a segment's wire pieces from a
-//! [`PieceStore`] through a [`SegmentWriter`](crate::SegmentWriter) into a sink,
+//! [`PieceStore`] through a [`SegmentWriter`] into a sink,
 //! verifying and decoding each piece as it arrives.
 //!
 //! This is the transport-agnostic core. The gRPC transport (the

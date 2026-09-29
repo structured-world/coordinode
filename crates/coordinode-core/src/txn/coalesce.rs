@@ -16,7 +16,7 @@
 //! an exact encoding of "delete exactly these keys". Non-delete mutations and
 //! short runs pass through unchanged, preserving order.
 
-use super::proposal::Mutation;
+use super::proposal::{DerivedIndexWork, DerivedSource, Mutation};
 
 /// Default minimum run length to coalesce into a range. Shorter runs stay point
 /// deletes (a 2-3 key range tombstone is not worth its read cost).
@@ -48,15 +48,28 @@ fn is_adjacent(a: &[u8], b: &[u8]) -> bool {
 ///
 /// Non-delete mutations (`Put` / `Merge` / existing `RemoveRange`) act as run
 /// boundaries and pass through untouched, so deletes are only ever coalesced
-/// among themselves and the proposal's apply order is preserved.
+/// among themselves and the proposal's apply order is preserved. DERIVED work
+/// that names a record by its position is renumbered to that record's new
+/// position.
 pub fn coalesce_delete_mutations(mutations: Vec<Mutation>, min_run: usize) -> Vec<Mutation> {
     let min_run = min_run.max(2);
     let mut out = Vec::with_capacity(mutations.len());
+    // For each folded run, the input position after it and the positions
+    // removed up to there; empty unless a run folds.
+    let mut folded: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < mutations.len() {
         // Only a Delete can start a run.
         let Mutation::Delete { partition, key } = &mutations[i] else {
-            out.push(mutations[i].clone());
+            let mut kept = mutations[i].clone();
+            if let Mutation::Derive(DerivedIndexWork {
+                new: DerivedSource::UnitRecord(ordinal),
+                ..
+            }) = &mut kept
+            {
+                *ordinal = renumbered(*ordinal, &folded);
+            }
+            out.push(kept);
             i += 1;
             continue;
         };
@@ -98,6 +111,8 @@ pub fn coalesce_delete_mutations(mutations: Vec<Mutation>, min_run: usize) -> Ve
                         start,
                         end,
                     });
+                    let removed = folded.last().map_or(0, |&(_, r)| r) + run_len - 1;
+                    folded.push((j, removed));
                 }
                 // All-0xFF tail: no same-length end bound — keep as point deletes.
                 None => out.extend(mutations[i..j].iter().cloned()),
@@ -108,6 +123,18 @@ pub fn coalesce_delete_mutations(mutations: Vec<Mutation>, min_run: usize) -> Ve
         i = j;
     }
     out
+}
+
+/// The output position of the input position `ordinal`, given the runs
+/// `folded` before it. A record source names a put, never a folded delete,
+/// so the position is past every run it is shifted by and the result stays
+/// non-negative.
+fn renumbered(ordinal: u32, folded: &[(usize, usize)]) -> u32 {
+    let at = ordinal as usize;
+    let before = folded.partition_point(|&(after, _)| after <= at);
+    let removed = before.checked_sub(1).map_or(0, |last| folded[last].1);
+    // `removed` counts positions below `ordinal`, which is a u32.
+    (at - removed) as u32
 }
 
 #[cfg(test)]

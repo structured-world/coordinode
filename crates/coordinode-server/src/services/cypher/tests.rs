@@ -2016,6 +2016,48 @@ fn index_not_historical_maps_to_failed_precondition_with_the_index() {
     assert!(details.retry_info().is_none(), "terminal: no retry advice");
 }
 
+/// An insert of an existing table key is ALREADY_EXISTS / DUPLICATE_KEY, with
+/// the table, the key and the row holding it in the metadata, and no retry
+/// advice: the same insert is refused again.
+#[test]
+fn a_duplicate_key_maps_to_already_exists_with_the_holder() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::DuplicateKey {
+        table: "Account".into(),
+        key: "7".into(),
+        element_id: "0000000000007".into(),
+    }));
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "DUPLICATE_KEY");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("table"), Some("Account"));
+    assert_eq!(meta("key"), Some("7"));
+    assert_eq!(meta("element_id"), Some("0000000000007"));
+    assert!(details.retry_info().is_none(), "terminal: no retry advice");
+}
+
+/// Changing a key column is FAILED_PRECONDITION / KEY_IMMUTABLE, naming the
+/// table and the column.
+#[test]
+fn a_key_change_maps_to_failed_precondition_with_the_column() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::KeyImmutable {
+        table: "Account".into(),
+        column: "id".into(),
+    }));
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "KEY_IMMUTABLE");
+    assert_eq!(info.metadata.get("column").map(String::as_str), Some("id"));
+}
+
 /// SNAPSHOT read pinned at `u64::MAX` sees everything ever committed: the
 /// inclusive pin saturates at the top instead of wrapping to an empty past.
 #[tokio::test]

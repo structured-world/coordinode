@@ -414,6 +414,8 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
 
         LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
+        | LogicalOp::AlterIndexMaintenance { .. }
+        | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::IndexScan { .. } => vec![],
     }
 }

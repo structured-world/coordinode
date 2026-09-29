@@ -22,10 +22,12 @@ mod integration {
     mod document;
     mod drain;
     mod encrypted_search;
+    mod field_dictionary;
     mod from_engine;
     mod helpers;
     mod historical_index;
     mod hnsw;
+    mod index_profiles;
     mod interactive_txn;
     mod merge_stress;
     mod multi_endpoint;
@@ -37,6 +39,7 @@ mod integration {
     mod per_level_routing;
     mod retention;
     mod schema;
+    mod schema_publication;
     mod shared_engine;
     mod text_index;
     mod tiered_cache;

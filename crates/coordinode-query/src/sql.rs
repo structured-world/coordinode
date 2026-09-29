@@ -170,9 +170,7 @@ fn lower_create_table(create: &SqlCreateTable) -> Result<LogicalOp, FrontendErro
             }
         }
     }
-    if primary_key.is_empty() {
-        return Err(unsupported("CREATE TABLE requires a PRIMARY KEY"));
-    }
+    // Without a PRIMARY KEY the table is keyed by row id.
     Ok(LogicalOp::CreateTable {
         name,
         columns,

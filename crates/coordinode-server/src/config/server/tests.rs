@@ -99,6 +99,66 @@ fn membership_change_timeout_parses_from_the_config_file() {
     assert_eq!(c.membership_change_timeout_secs, Some(90));
 }
 
+/// The join settings are config-file settings: unset they leave the node's
+/// defaults, set they carry the values given, and a zero timeout is refused.
+#[test]
+fn join_settings_parse_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(d.join_readiness_lag_entries.is_none() && d.join_timeout_secs.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "join_readiness_lag_entries: 0\njoin_timeout_secs: 120\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.join_readiness_lag_entries, Some(0));
+    assert_eq!(c.join_timeout_secs.map(|v| v.get()), Some(120));
+
+    std::fs::write(&path, "join_timeout_secs: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
+/// The Raft snapshot triggers are config-file settings: unset they leave the
+/// node's defaults, set they carry the values given, and a zero, which would
+/// snapshot on every entry, byte or moment, is refused.
+#[test]
+fn raft_snapshot_settings_parse_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(
+        d.raft_snapshot_entries.is_none()
+            && d.raft_snapshot_log_bytes.is_none()
+            && d.raft_snapshot_interval_secs.is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "raft_snapshot_entries: 500000\nraft_snapshot_log_bytes: 1073741824\nraft_snapshot_interval_secs: 300\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.raft_snapshot_entries.map(|v| v.get()), Some(500_000));
+    assert_eq!(
+        c.raft_snapshot_log_bytes.map(|v| v.get()),
+        Some(1_073_741_824)
+    );
+    assert_eq!(c.raft_snapshot_interval_secs.map(|v| v.get()), Some(300));
+
+    for zero in [
+        "raft_snapshot_entries: 0\n",
+        "raft_snapshot_log_bytes: 0\n",
+        "raft_snapshot_interval_secs: 0\n",
+    ] {
+        std::fs::write(&path, zero).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "{zero:?} is refused"
+        );
+    }
+}
+
 /// The planner-statistics reuse window is a config-file setting: unset it
 /// leaves the database default, set it carries the seconds given.
 #[test]
@@ -482,4 +542,64 @@ fn backpressure_thresholds_parse_and_reach_the_storage_config() {
         ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
         "a typoed backpressure key must be rejected"
     );
+}
+
+/// The oplog section reaches the storage config; unset keys keep the engine
+/// defaults, which are the full flush and the 64 MiB / 50000 rotation.
+#[test]
+fn oplog_settings_parse_and_reach_the_storage_config() {
+    use coordinode_storage::engine::config::SyncMethod;
+
+    let defaults = ServerConfig::default()
+        .resolve_storage_config()
+        .expect("valid");
+    assert_eq!(defaults.oplog_sync_method, SyncMethod::Full);
+    assert_eq!(defaults.oplog_segment_max_bytes, 64 * 1024 * 1024);
+    assert_eq!(defaults.oplog_segment_max_entries, 50_000);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "storage:\n  oplog:\n    sync_method: open_datasync\n    segment_max_entries: 1000\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    let sc = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(sc.oplog_sync_method, SyncMethod::OpenDatasync);
+    assert_eq!(sc.oplog_segment_max_entries, 1000);
+    assert_eq!(sc.oplog_segment_max_bytes, defaults.oplog_segment_max_bytes);
+    assert_eq!(sc.oplog_retention_secs, defaults.oplog_retention_secs);
+
+    for method in ["full", "fsync"] {
+        std::fs::write(
+            &path,
+            format!("storage:\n  oplog:\n    sync_method: {method}\n"),
+        )
+        .unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_ok(),
+            "{method}"
+        );
+    }
+}
+
+/// A sync method the engine does not have, a zero-sized segment and an
+/// unknown key are refused when the file is read, not met at the first write.
+#[test]
+fn bad_oplog_settings_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    for body in [
+        "storage:\n  oplog:\n    sync_method: sometimes\n",
+        "storage:\n  oplog:\n    segment_max_bytes: 0\n",
+        "storage:\n  oplog:\n    segment_max_entries: 0\n",
+        "storage:\n  oplog:\n    sync_mode: full\n",
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "accepted: {body}"
+        );
+    }
 }

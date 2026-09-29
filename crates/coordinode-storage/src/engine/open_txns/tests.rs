@@ -38,13 +38,18 @@ fn the_wait_covers_the_transactions_opened_before_the_boundary() {
     let newer = Transaction::begin(&engine, Some(&oracle), oracle.next());
 
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Err(1),
         "the transaction opened before the boundary is still open"
     );
+    assert_eq!(
+        engine.await_transactions_through(boundary, 1, POLL, SHORT),
+        Ok(()),
+        "a caller waiting from inside the older transaction does not wait for itself"
+    );
     drop(older);
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Ok(()),
         "only the newer transaction is open, and it is not waited for"
     );
@@ -62,12 +67,12 @@ fn a_transaction_without_a_snapshot_is_waited_for() {
     let txn = Transaction::new(&engine, Some(&oracle), Timestamp::ZERO, None);
     let boundary = engine.snapshot_boundary();
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Err(1)
     );
     drop(txn);
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Ok(())
     );
 }
@@ -85,21 +90,21 @@ fn a_parked_transaction_stays_open_until_its_state_drops() {
     drop(txn);
     let boundary = engine.snapshot_boundary();
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Err(1),
         "parked"
     );
 
     let resumed = Transaction::resume(&engine, Some(&oracle), parked);
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Err(1),
         "resumed"
     );
     let parked = resumed.into_state();
     drop(parked);
     assert_eq!(
-        engine.await_transactions_through(boundary, POLL, SHORT),
+        engine.await_transactions_through(boundary, 0, POLL, SHORT),
         Ok(())
     );
 }

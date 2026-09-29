@@ -109,6 +109,126 @@ fn test_snapshot_roundtrip_with_data() {
     );
 }
 
+fn command(command: coordinode_core::txn::proposal::MetadataCommand) -> Vec<Mutation> {
+    vec![Mutation::Command(command)]
+}
+
+fn grant(base: u64, ceiling: u64, token: u8) -> Vec<Mutation> {
+    command(
+        coordinode_core::txn::proposal::MetadataCommand::GrantNodeLease {
+            base,
+            ceiling,
+            token: [token; 16],
+        },
+    )
+}
+
+use coordinode_core::txn::proposal::Mutation;
+use coordinode_storage::engine::metadata::{
+    load_field_dictionary, node_lease_ceiling, node_lease_holder,
+};
+
+#[test]
+fn the_node_id_lease_record_travels_with_a_snapshot() {
+    // A member caught up by a snapshot must see every lease granted before
+    // it, or as leader it would grant the same ranges again.
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine.apply_proposal_at(&grant(0, 10_000, 1), 0).unwrap();
+    engine
+        .apply_proposal_at(&grant(10_000, 20_000, 2), 0)
+        .unwrap();
+    let data = build_full_snapshot(&engine).unwrap();
+
+    let dir2 = tempdir().unwrap();
+    let engine2 = open_engine(dir2.path());
+    install_full_snapshot(&engine2, &data).unwrap();
+    assert_eq!(node_lease_ceiling(&engine2).unwrap(), 20_000);
+    assert_eq!(node_lease_holder(&engine2, 20_000).unwrap(), Some([2; 16]));
+
+    // A grant from the base the snapshot carried applies on the new member;
+    // one from a base below it does not.
+    engine2.apply_proposal_at(&grant(0, 10_000, 3), 0).unwrap();
+    engine2
+        .apply_proposal_at(&grant(20_000, 30_000, 4), 0)
+        .unwrap();
+    assert_eq!(node_lease_ceiling(&engine2).unwrap(), 30_000);
+    assert_eq!(node_lease_holder(&engine2, 30_000).unwrap(), Some([4; 16]));
+    assert_eq!(node_lease_holder(&engine2, 10_000).unwrap(), Some([1; 16]));
+}
+
+/// A member caught up by a snapshot alone can read the data the snapshot
+/// carries: the field dictionary travels with it, and registration continues
+/// above the frontier it installed.
+#[test]
+fn the_field_dictionary_travels_with_a_snapshot() {
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine
+        .apply_proposal_at(
+            &command(
+                coordinode_core::txn::proposal::MetadataCommand::RegisterFields {
+                    names: vec!["name".into(), "age".into()],
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let data = build_full_snapshot(&engine).unwrap();
+
+    let dir2 = tempdir().unwrap();
+    let engine2 = open_engine(dir2.path());
+    let before = engine2.field_dictionary_generation();
+    install_full_snapshot(&engine2, &data).unwrap();
+    assert!(
+        engine2.field_dictionary_generation() > before,
+        "an install tells readers to reread the dictionary"
+    );
+    let dictionary = load_field_dictionary(&engine2).unwrap();
+    assert_eq!(dictionary.lookup("name"), Some(1));
+    assert_eq!(dictionary.lookup("age"), Some(2));
+
+    engine2
+        .apply_proposal_at(
+            &command(
+                coordinode_core::txn::proposal::MetadataCommand::RegisterFields {
+                    names: vec!["email".into()],
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        load_field_dictionary(&engine2).unwrap().lookup("email"),
+        Some(3)
+    );
+}
+
+/// A snapshot whose dictionary records disagree is refused before any of it
+/// is installed: data it carries would be read under the wrong names.
+#[test]
+fn a_snapshot_with_a_contradictory_dictionary_is_refused() {
+    use coordinode_core::graph::intern::{field_id_key, field_name_key};
+    let dir = tempdir().unwrap();
+    let engine = open_engine(dir.path());
+    engine
+        .put(Partition::Schema, &field_name_key("a"), &1u32.to_be_bytes())
+        .unwrap();
+    engine
+        .put(Partition::Schema, &field_id_key(1), b"b")
+        .unwrap();
+    engine.put(Partition::Node, b"node:0:1", b"x").unwrap();
+    let data = build_full_snapshot(&engine).unwrap();
+
+    let dir2 = tempdir().unwrap();
+    let engine2 = open_engine(dir2.path());
+    assert!(install_full_snapshot(&engine2, &data).is_err());
+    assert!(
+        engine2.get(Partition::Node, b"node:0:1").unwrap().is_none(),
+        "nothing of a refused snapshot is installed"
+    );
+}
+
 #[test]
 fn test_snapshot_preserves_raft_keys_in_schema() {
     let dir = tempdir().unwrap();

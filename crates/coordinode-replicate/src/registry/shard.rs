@@ -204,7 +204,9 @@ impl RegistryCore {
         Ok(seqno_floor)
     }
 
-    /// Collect every live (non-expired at `now_ms`) registration.
+    /// Collect every live registration: not expired at `now_ms`, or with a
+    /// heartbeat still in the buffer, a sign of life the stored entry does
+    /// not show yet.
     fn scan_entries(&self, now_ms: u64) -> Result<Vec<RegistryEntry>, RegistryError> {
         let mut out = Vec::new();
         let iter = self
@@ -217,7 +219,8 @@ impl RegistryCore {
                 .map_err(|e| RegistryError::Replication(e.to_string()))?;
             let entry = RegistryEntry::decode(&value)
                 .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
-            if !entry.is_expired(now_ms) {
+            if !entry.is_expired(now_ms) || self.pending_hb.lock().contains_key(&entry.consumer_id)
+            {
                 out.push(entry);
             }
         }
@@ -250,6 +253,11 @@ impl RegistryCore {
     /// Evict registrations past their TTL via one Delete proposal, then
     /// refresh the floor (a dead consumer must stop pinning retention).
     fn sweep_evictions(&self) -> Result<usize, RegistryError> {
+        // A heartbeat still in the buffer is a sign of life the stored entry
+        // does not show yet: persist it first, or a live consumer whose TTL is
+        // close to the flush window is evicted between its heartbeat and the
+        // next flush.
+        self.flush_pending_heartbeats()?;
         let now = self.clock.now_ms();
         let mut to_evict = Vec::new();
         let iter = self
@@ -262,7 +270,9 @@ impl RegistryCore {
                 .map_err(|e| RegistryError::Replication(e.to_string()))?;
             let entry = RegistryEntry::decode(&value)
                 .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
-            if entry.is_expired(now) {
+            // The flush above can outlast a TTL; a heartbeat that arrived
+            // meanwhile is only in the buffer, and it is a sign of life.
+            if entry.is_expired(now) && !self.pending_hb.lock().contains_key(&entry.consumer_id) {
                 to_evict.push(Mutation::Delete {
                     partition: PartitionId::Registry,
                     key: encode_registry_key(&entry.consumer_id),
@@ -387,19 +397,38 @@ impl ShardConsumerRegistry {
         let core = Arc::clone(&self.core);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let stop = Arc::clone(&shutdown);
+        // Registry writes wait on a proposal, an fsync at least: they run on
+        // the blocking pool, or the runtime thread they would hold is the one
+        // the consumers' streams heartbeat from.
+        let blocking =
+            |core: &Arc<RegistryCore>, work: fn(&RegistryCore) -> Result<usize, RegistryError>| {
+                let core = Arc::clone(core);
+                async move {
+                    tokio::task::spawn_blocking(move || work(&core))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(RegistryError::Replication(format!("registry task: {e}")))
+                        })
+                }
+            };
+        let flush = |core: &RegistryCore| core.flush_pending_heartbeats().map(|()| 0);
         let handle = tokio::spawn(async move {
             let mut hb = tokio::time::interval(Duration::from_millis(cfg.heartbeat_window_ms));
             let mut evict = tokio::time::interval(Duration::from_millis(cfg.eviction_interval_ms));
+            // A write slower than the window must not queue a burst of catch-up
+            // ticks behind it.
+            hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            evict.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = stop.notified() => break,
                     _ = hb.tick() => {
-                        if let Err(e) = core.flush_pending_heartbeats() {
+                        if let Err(e) = blocking(&core, flush).await {
                             tracing::warn!(error = %e, "registry heartbeat flush failed");
                         }
                     }
                     _ = evict.tick() => {
-                        match core.sweep_evictions() {
+                        match blocking(&core, RegistryCore::sweep_evictions).await {
                             Ok(n) if n > 0 => tracing::debug!(evicted = n, "registry TTL sweep"),
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "registry eviction sweep failed"),
@@ -408,7 +437,9 @@ impl ShardConsumerRegistry {
                 }
             }
             // Final flush so no buffered heartbeat is lost on graceful stop.
-            let _ = core.flush_pending_heartbeats();
+            if let Err(e) = blocking(&core, flush).await {
+                tracing::warn!(error = %e, "registry final heartbeat flush failed");
+            }
         });
         RegistryBackground {
             shutdown,

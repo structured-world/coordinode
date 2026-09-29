@@ -18,6 +18,10 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 streamvbyte64 = "0.2"
 smallvec = "1"
+# Integrity of the compact application-unit frame.
+crc32c = "0.6"
+# Identical-slice lookup while encoding a frame: internal byte keys, no DoS hasher needed.
+rustc-hash = { workspace = true }
 # Async primitives for MaxAssignedWatermark (tokio::sync::watch + timeout).
 # Minimal feature set — no runtime dependency dragged in; downstream crates
 # that drive the watermark (raft, query) provide their own runtime.

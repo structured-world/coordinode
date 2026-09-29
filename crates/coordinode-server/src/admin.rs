@@ -89,12 +89,17 @@ pub(crate) fn run_backup(
         .open(&output)
         .map_err(|e| format!("failed to create output file '{output}': {e}"))?;
     let mut writer = std::io::BufWriter::new(file);
+    // Taken after the snapshot: it covers every binding the snapshot's
+    // records use.
+    let dictionary = db
+        .interner()
+        .map_err(|e| format!("read the field dictionary: {e}"))?;
 
     let stats = match format {
         coordinode_embed::backup::BackupFormat::Json => {
             coordinode_embed::backup::export::export_json(
                 db.engine(),
-                &db.interner(),
+                &dictionary,
                 shard_id,
                 &snapshot,
                 &mut writer,
@@ -104,7 +109,7 @@ pub(crate) fn run_backup(
         coordinode_embed::backup::BackupFormat::Cypher => {
             coordinode_embed::backup::export::export_cypher(
                 db.engine(),
-                &db.interner(),
+                &dictionary,
                 shard_id,
                 &snapshot,
                 &mut writer,
@@ -114,7 +119,7 @@ pub(crate) fn run_backup(
         coordinode_embed::backup::BackupFormat::Binary => {
             coordinode_embed::backup::export::export_binary(
                 db.engine(),
-                &db.interner(),
+                &dictionary,
                 shard_id,
                 &snapshot,
                 &mut writer,
@@ -130,14 +135,16 @@ pub(crate) fn run_backup(
         }
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
             // Self-contained whole-database blob, not the entity-counted
-            // logical export. The Raft snapshot omits the `meta:` Schema
-            // keys (per-node config) including the field interner, so a
-            // standalone backup frames the interner and a mode byte ahead
-            // of it: [mode u8][u32 interner_len][interner][snapshot]. The
-            // mode byte is always 0 (a whole database); it stays in the
-            // frame so dumps taken with 0.6 still restore.
+            // logical export. The frame is [mode u8][u32 interner_len]
+            // [interner][snapshot]: the dictionary ahead of the records, so
+            // restore publishes its bindings before it installs anything
+            // encoded with them. The mode byte is always 0 (a whole
+            // database); it stays in the frame so dumps taken with 0.6 still
+            // restore.
             use std::io::Write;
-            let interner_bytes = db.interner().to_bytes();
+            let interner_bytes = dictionary
+                .to_bytes()
+                .map_err(|e| format!("serialize the field dictionary: {e}"))?;
             let interner_len = u32::try_from(interner_bytes.len())
                 .map_err(|_| "field interner too large to frame".to_string())?;
             // The snapshot streams into the file, which it seeks and reads
@@ -210,13 +217,15 @@ pub(crate) fn run_restore(
     let mut reader = decompressing_reader(file)
         .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
 
+    // Every restore path publishes the bindings its records need through the
+    // database's registrar before writing them.
+    let fields = db.field_registrar();
     match format {
         coordinode_embed::backup::BackupFormat::Json => {
-            let mut interner = db.interner().clone();
             let shard_id = 1u16;
             let stats = coordinode_embed::backup::restore::restore_json(
                 db.engine(),
-                &mut interner,
+                fields.as_ref(),
                 shard_id,
                 &mut reader,
                 label_filter.as_ref(),
@@ -230,9 +239,13 @@ pub(crate) fn run_restore(
             );
         }
         coordinode_embed::backup::BackupFormat::Binary => {
-            let (stats, _interner) =
-                coordinode_embed::backup::restore::restore_binary(db.engine(), &mut reader, force)
-                    .map_err(|e| format!("restore failed: {e}"))?;
+            let stats = coordinode_embed::backup::restore::restore_binary(
+                db.engine(),
+                fields.as_ref(),
+                &mut reader,
+                force,
+            )
+            .map_err(|e| format!("restore failed: {e}"))?;
             info!(
                 nodes = stats.nodes,
                 edges = stats.edges,
@@ -241,16 +254,14 @@ pub(crate) fn run_restore(
             );
         }
         coordinode_embed::backup::BackupFormat::Cypher => {
-            let mut interner = db.interner().clone();
             let shard_id = 1u16;
             let stats = coordinode_embed::backup::restore::restore_cypher(
                 db.engine(),
-                &mut interner,
+                fields.as_ref(),
                 shard_id,
                 &mut reader,
             )
             .map_err(|e| format!("restore failed: {e}"))?;
-            *db.interner_arc().write() = interner;
             info!(
                 nodes = stats.nodes,
                 edges = stats.edges,
@@ -259,17 +270,15 @@ pub(crate) fn run_restore(
             );
         }
         coordinode_embed::backup::BackupFormat::ApocJson => {
-            let mut interner = db.interner().clone();
             let shard_id = 1u16;
             let stats = coordinode_embed::backup::restore::restore_apoc_json(
                 db.engine(),
-                &mut interner,
+                fields.as_ref(),
                 shard_id,
                 &mut reader,
                 label_filter.as_ref(),
             )
             .map_err(|e| format!("restore failed: {e}"))?;
-            *db.interner_arc().write() = interner;
             info!(
                 nodes = stats.nodes,
                 edges = stats.edges,
@@ -278,16 +287,14 @@ pub(crate) fn run_restore(
             );
         }
         coordinode_embed::backup::BackupFormat::ApocCypher => {
-            let mut interner = db.interner().clone();
             let shard_id = 1u16;
             let stats = coordinode_embed::backup::restore::restore_apoc_cypher(
                 db.engine(),
-                &mut interner,
+                fields.as_ref(),
                 shard_id,
                 &mut reader,
             )
             .map_err(|e| format!("restore failed: {e}"))?;
-            *db.interner_arc().write() = interner;
             info!(
                 nodes = stats.nodes,
                 edges = stats.edges,
@@ -296,17 +303,15 @@ pub(crate) fn run_restore(
             );
         }
         coordinode_embed::backup::BackupFormat::HetioJson => {
-            let mut interner = db.interner().clone();
             let shard_id = 1u16;
             let stats = coordinode_embed::backup::restore::restore_hetio_json(
                 db.engine(),
-                &mut interner,
+                fields.as_ref(),
                 shard_id,
                 &mut reader,
                 label_filter.as_ref(),
             )
             .map_err(|e| format!("restore failed: {e}"))?;
-            *db.interner_arc().write() = interner;
             info!(
                 nodes = stats.nodes,
                 edges = stats.edges,
@@ -317,8 +322,12 @@ pub(crate) fn run_restore(
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
             use std::io::Read;
             // Frame: [mode u8][u32 interner_len][interner][snapshot].
-            // Restore the framed interner first (the snapshot omits it),
-            // then install the whole database, read as it is parsed.
+            // The snapshot is installed first, then the framed dictionary's
+            // exact bindings are published: installing replaces the Schema
+            // partition wholesale and would drop bindings a snapshot taken
+            // by 0.6 does not carry. This tool runs offline, so nothing reads
+            // the store in between; an interrupted restore leaves a store
+            // that refuses to open and is restored again.
             let mut frame = [0u8; 5];
             reader
                 .read_exact(&mut frame)
@@ -347,10 +356,10 @@ pub(crate) fn run_restore(
             if interner_bytes.len() as u64 != u64::from(interner_len) {
                 return Err("raft-snapshot file truncated (interner body)".into());
             }
-            db.persist_field_interner_bytes(&interner_bytes)
-                .map_err(|e| format!("restore interner failed: {e}"))?;
             coordinode_raft::snapshot::install_full_snapshot_from_reader(db.engine(), &mut reader)
                 .map_err(|e| format!("restore failed: {e}"))?;
+            db.adopt_field_bindings(&interner_bytes)
+                .map_err(|e| format!("restore the field dictionary failed: {e}"))?;
             info!(
                 interner_bytes = interner_len,
                 "restore complete (raft-snapshot)"
@@ -430,11 +439,7 @@ pub(crate) async fn admin_node_decommission(
         std::process::exit(1);
     }
 
-    let endpoint = if cluster_addr.starts_with("http://") || cluster_addr.starts_with("https://") {
-        cluster_addr.clone()
-    } else {
-        format!("http://{cluster_addr}")
-    };
+    let endpoint = coordinode_wire::peer_uri(&cluster_addr);
 
     eprintln!("Connecting to cluster at {endpoint} ...");
 
@@ -492,12 +497,7 @@ pub(crate) async fn admin_node_join(
         cluster_service_client::ClusterServiceClient,
     };
 
-    // Normalize cluster_addr to include http:// scheme for tonic.
-    let endpoint = if cluster_addr.starts_with("http://") || cluster_addr.starts_with("https://") {
-        cluster_addr.clone()
-    } else {
-        format!("http://{cluster_addr}")
-    };
+    let endpoint = coordinode_wire::peer_uri(&cluster_addr);
 
     eprintln!("Connecting to cluster at {endpoint} ...");
 

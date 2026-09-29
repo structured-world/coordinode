@@ -11,9 +11,6 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
-
 use crate::proto::{
     admin::cluster_service_client::ClusterServiceClient,
     graph::schema_service_client::SchemaServiceClient,
@@ -27,6 +24,9 @@ use crate::proto::{
 pub struct CoordinodeProcess {
     child: Child,
     pub port: u16,
+    /// Ops port, whose `/ready` says the server is serving: the listeners
+    /// are bound before storage opens, so an open port proves nothing yet.
+    ops_port: u16,
     // Wrapped in Option so `restart()` can take it without needing unsafe.
     // Always `Some` except briefly during `restart()`.
     data_dir: Option<tempfile::TempDir>,
@@ -38,7 +38,11 @@ impl CoordinodeProcess {
     /// Waits up to 15 seconds for the gRPC port to become available.
     pub async fn start() -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
-        Self::spawn_on_free_port(data_dir, spawn_binary).await
+        let proc = Self::spawn_on_free_port(data_dir, spawn_binary).await;
+        // A standalone server serves before it has elected itself; every
+        // caller of `start` expects a node that takes writes.
+        proc.wait_for_leader(Duration::from_secs(15)).await;
+        proc
     }
 
     /// Spawn on a port the harness picks, retrying on a fresh port when the
@@ -50,18 +54,19 @@ impl CoordinodeProcess {
     /// instead of a timeout or a test that talks to someone else's server.
     async fn spawn_on_free_port(
         data_dir: tempfile::TempDir,
-        spawn: impl Fn(u16, PathBuf) -> Child,
+        spawn: impl Fn(u16, u16, PathBuf) -> Child,
     ) -> Self {
         const ATTEMPTS: u32 = 5;
         let mut last_exit = None;
         for _ in 0..ATTEMPTS {
-            let port = free_port();
+            let (port, ops_port) = (free_port(), free_port());
             let mut proc = Self {
-                child: spawn(port, data_dir.path().to_path_buf()),
+                child: spawn(port, ops_port, data_dir.path().to_path_buf()),
                 port,
+                ops_port,
                 data_dir: None,
             };
-            match proc.wait_for_grpc(Duration::from_secs(15)).await {
+            match proc.wait_until_ready(Duration::from_secs(15)).await {
                 Ok(()) => {
                     proc.data_dir = Some(data_dir);
                     return proc;
@@ -73,7 +78,7 @@ impl CoordinodeProcess {
     }
 
     /// Spawn a cluster member: `serve --node-id N --addr [::1]:port
-    /// --advertise-addr http://[::1]:port --peers <peer advertise addrs> ...`.
+    /// --advertise-addr [::1]:port --peers <peer advertise addrs> ...`.
     ///
     /// `node_id == 1` bootstraps as the single-voter leader (the cluster grows
     /// via `JoinNode`); `node_id > 1` starts in joining-wait state until the
@@ -86,19 +91,24 @@ impl CoordinodeProcess {
     /// for it.
     pub async fn start_cluster_member(node_id: u64, port: u16, peer_ports: &[u16]) -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
-        let peers: Vec<String> = peer_ports
-            .iter()
-            .map(|p| format!("http://[::1]:{p}"))
-            .collect();
-        let child = spawn_cluster_binary(node_id, port, &peers, data_dir.path().to_path_buf());
+        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
+        let ops_port = free_port();
+        let child = spawn_cluster_binary(
+            node_id,
+            port,
+            ops_port,
+            &peers,
+            data_dir.path().to_path_buf(),
+        );
         let mut proc = Self {
             child,
             port,
+            ops_port,
             data_dir: Some(data_dir),
         };
         // The port is fixed by the caller (peers already name it), so a
         // process that lost it cannot move to another one.
-        if let Err(status) = proc.wait_for_grpc(Duration::from_secs(15)).await {
+        if let Err(status) = proc.wait_until_ready(Duration::from_secs(15)).await {
             panic!("cluster member {node_id} exited during startup on port {port}: {status}");
         }
         proc
@@ -186,12 +196,9 @@ impl CoordinodeProcess {
             .data_dir
             .take()
             .expect("data_dir missing: restart called twice?");
-        let peers: Vec<String> = peer_ports
-            .iter()
-            .map(|p| format!("http://[::1]:{p}"))
-            .collect();
-        Self::spawn_on_free_port(data_dir, |port, data| {
-            spawn_cluster_binary(node_id, port, &peers, data)
+        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
+        Self::spawn_on_free_port(data_dir, |port, ops_port, data| {
+            spawn_cluster_binary(node_id, port, ops_port, &peers, data)
         })
         .await
     }
@@ -199,6 +206,11 @@ impl CoordinodeProcess {
     /// gRPC endpoint URL for use with tonic.
     pub fn endpoint(&self) -> String {
         format!("http://[::1]:{}", self.port)
+    }
+
+    /// This process's address as a cluster member (see [`member_addr`]).
+    pub fn member_addr(&self) -> String {
+        member_addr(self.port)
     }
 
     /// Build a `SchemaServiceClient` connected to this process.
@@ -231,34 +243,33 @@ impl CoordinodeProcess {
         ClusterServiceClient::new(channel)
     }
 
-    /// Block (async) until this process's gRPC port accepts TCP connections,
-    /// or return the exit status if the process ended first.
+    /// Block (async) until the server answers `/ready` with 200 on its ops
+    /// port, or return the exit status if the process ended first.
     ///
-    /// A connection alone does not prove the port is ours: another holder may
-    /// answer while this process fails its bind. The server binds before
-    /// opening storage and exits at once when the port is taken, so the
-    /// process still running a moment after the port answers is the check.
-    async fn wait_for_grpc(&mut self, timeout: Duration) -> Result<(), std::process::ExitStatus> {
+    /// The listeners are bound before storage opens (a taken port fails the
+    /// start right away), so an open gRPC port only says the process is
+    /// starting. `/ready` turns 200 once it serves: storage, consensus and
+    /// the query engine are open. A server that lost a port to another holder
+    /// exits at its bind, which the exit check catches first.
+    async fn wait_until_ready(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(status);
             }
-            if std::net::TcpStream::connect(format!("[::1]:{}", self.port)).is_ok() {
-                // Small extra sleep to let gRPC handshake initialise.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return match self.child.try_wait() {
-                    Ok(Some(status)) => Err(status),
-                    _ => Ok(()),
-                };
+            if answers_ready(self.ops_port) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 panic!(
-                    "coordinode did not start on port {} within {:?}",
+                    "coordinode on port {} was not ready within {:?}",
                     self.port, timeout
                 );
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -316,6 +327,15 @@ impl CoordinodeProcess {
             .take()
             .expect("data_dir missing: the process was already restarted")
     }
+
+    /// Kill the process outright (no flush, no shutdown path) and hand the
+    /// data directory over, as a crash would leave it.
+    pub fn kill_keeping_data(mut self) -> tempfile::TempDir {
+        force_reap(&mut self.child);
+        self.data_dir
+            .take()
+            .expect("data_dir missing: the process was already restarted")
+    }
 }
 
 /// Start a cluster member that is expected to refuse to start, and return what
@@ -329,10 +349,7 @@ pub async fn start_cluster_member_expecting_refusal(
     peer_ports: &[u16],
     data_dir: &std::path::Path,
 ) -> (std::process::ExitStatus, String) {
-    let peers: Vec<String> = peer_ports
-        .iter()
-        .map(|p| format!("http://[::1]:{p}"))
-        .collect();
+    let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
@@ -341,7 +358,7 @@ pub async fn start_cluster_member_expecting_refusal(
         .arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--advertise-addr")
-        .arg(format!("http://[::1]:{port}"))
+        .arg(member_addr(port))
         .arg("--peers")
         .arg(peers.join(","))
         .arg("--ops-addr")
@@ -356,24 +373,50 @@ pub async fn start_cluster_member_expecting_refusal(
         )
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    own_process_group(&mut cmd);
 
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e));
-    let out = tokio::task::spawn_blocking(move || {
-        child
-            .wait_with_output()
-            .expect("wait for the refusing process")
-    })
-    .await
-    .expect("join the wait task");
+    let stderr = drain(child.stderr.take());
+    let stdout = drain(child.stdout.take());
 
-    let mut printed = String::from_utf8_lossy(&out.stderr).into_owned();
-    printed.push_str(&String::from_utf8_lossy(&out.stdout));
-    (out.status, printed)
+    // A process that does not refuse keeps serving; bound the wait so that
+    // failure reports what the process printed instead of hanging the run.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            force_reap(&mut child);
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let mut printed = stderr.join().expect("join the stderr reader");
+    printed.push_str(&stdout.join().expect("join the stdout reader"));
+    match status {
+        Some(status) => (status, printed),
+        None => panic!("the process never exited, so it did not refuse; it printed: {printed}"),
+    }
+}
+
+/// Read a child's pipe to the end on its own thread, so a full pipe never
+/// blocks the child while the caller waits for it to exit.
+fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            // A read error ends the capture early; what was read still counts,
+            // and the error is part of what the test reports.
+            if let Err(e) = pipe.read_to_end(&mut bytes) {
+                bytes.extend_from_slice(format!("\n[pipe read failed: {e}]").as_bytes());
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
 }
 
 impl Drop for CoordinodeProcess {
@@ -398,11 +441,65 @@ impl Drop for CoordinodeProcess {
     }
 }
 
-/// SIGTERM via the system `kill` utility: no `nix` crate, no unsafe.
+/// Ask `child` to stop, the way a service manager does. A request that could
+/// not be sent is reported; the callers go on to wait and then force-reap.
 fn send_sigterm(child: &Child) {
-    let _ = Command::new("kill")
-        .args(["-s", "TERM", &child.id().to_string()])
-        .status();
+    if let Err(e) = request_shutdown(child) {
+        eprintln!("could not ask the server to stop: {e}");
+    }
+}
+
+/// Ask `child` to shut down gracefully: SIGTERM on Unix (what `docker stop`
+/// and systemd send), CTRL_BREAK on Windows (what reaches a console process
+/// in its own process group; Ctrl+C is disabled for such a group). The child
+/// must have been started through [`own_process_group`].
+///
+/// # Errors
+///
+/// The request could not be delivered.
+pub fn request_shutdown(child: &Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // The system `kill` utility: no `nix` crate, no unsafe.
+        let status = Command::new("kill")
+            .args(["-s", "TERM", &child.id().to_string()])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("kill exited with {status}")))
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+        // SAFETY: an FFI call taking two integers and no pointers. The group
+        // id is the child's process id, which names the process group
+        // `own_process_group` started it in; the event reaches that group
+        // only, never this process.
+        #[allow(unsafe_code)]
+        let delivered = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+        if delivered != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// Start the child in a process group of its own, so a shutdown request (and
+/// a signal the test runner receives) reaches the child alone.
+pub fn own_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    }
 }
 
 /// Non-blocking "has the child exited?" probe. A `try_wait` error (a transient
@@ -468,20 +565,42 @@ pub fn binary_path() -> PathBuf {
     );
 }
 
-/// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:0
+/// Whether the ops endpoint on `[::1]:port` answers `GET /ready` with 200.
+fn answers_ready(port: u16) -> bool {
+    use std::io::{Read, Write};
+
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+    else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .is_err()
+        || stream
+            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .is_err()
+    {
+        return false;
+    }
+    let mut status_line = [0u8; 12];
+    stream.read_exact(&mut status_line).is_ok() && status_line.ends_with(b" 200")
+}
+
+/// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:OPS_PORT
 /// --rest-addr [::1]:0 --data DATA_DIR`.
 ///
-/// Port 0 lets the OS assign an ephemeral port for the ops and REST HTTP
-/// servers: concurrent test servers would otherwise fight over the defaults
-/// (:7084, :7081), and a taken port fails the start.
-fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
+/// The ops port is chosen by the harness so it can ask `/ready`; the REST
+/// port is left to the OS. Concurrent test servers would otherwise fight
+/// over the defaults (:7084, :7081), and a taken port fails the start.
+fn spawn_binary(port: u16, ops_port: u16, data_dir: PathBuf) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
         .arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--ops-addr")
-        .arg("[::1]:0")
+        .arg(format!("[::1]:{ops_port}"))
         .arg("--rest-addr")
         .arg("[::1]:0")
         .arg("--data")
@@ -501,16 +620,28 @@ fn spawn_binary(port: u16, data_dir: PathBuf) -> Child {
     // is based on the inherited stdout/stderr pipes, not on process groups:
     // the only thing that prevents a LEAKY verdict is actually reaping the
     // child before the test exits, which the Drop impl guarantees.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    own_process_group(&mut cmd);
 
     cmd.spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))
 }
 
+/// A member's address in the form the operator guide gives for
+/// `--advertise-addr`, `--peers` and `admin node join --addr`: `host:port`,
+/// no scheme. Every cluster test goes through this form.
+pub fn member_addr(port: u16) -> String {
+    format!("[::1]:{port}")
+}
+
 /// Spawn a cluster member with explicit `--node-id`, `--advertise-addr`, and
 /// `--peers`. See [`CoordinodeProcess::start_cluster_member`].
-fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: PathBuf) -> Child {
+fn spawn_cluster_binary(
+    node_id: u64,
+    port: u16,
+    ops_port: u16,
+    peers: &[String],
+    data_dir: PathBuf,
+) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
@@ -519,11 +650,11 @@ fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: Pat
         .arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--advertise-addr")
-        .arg(format!("http://[::1]:{port}"))
+        .arg(member_addr(port))
         .arg("--peers")
         .arg(peers.join(","))
         .arg("--ops-addr")
-        .arg("[::1]:0")
+        .arg(format!("[::1]:{ops_port}"))
         .arg("--rest-addr")
         .arg("[::1]:0")
         .arg("--data")
@@ -532,9 +663,7 @@ fn spawn_cluster_binary(node_id: u64, port: u16, peers: &[String], data_dir: Pat
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
         );
-
-    #[cfg(unix)]
-    cmd.process_group(0);
+    own_process_group(&mut cmd);
 
     cmd.spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", bin.display(), e))

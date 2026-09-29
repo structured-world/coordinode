@@ -586,6 +586,198 @@ fn reap_multi_timestamp_uses_interner_for_correct_anchor() {
     );
 }
 
+/// Claim `key` of `table` for `node_id` in its own committed transaction.
+fn seed_table_key(engine: &StorageEngine, table: &str, key: &[Value], node_id: NodeId) {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut txn = Transaction::begin(engine, Some(&oracle), oracle.next());
+    LocalTableKeyStore
+        .claim(&mut txn, table, key, node_id)
+        .expect("claim");
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).expect("commit key");
+}
+
+fn key_holder(engine: &StorageEngine, table: &str, key: &[Value]) -> Option<NodeId> {
+    LocalTableKeyStore
+        .committed_holder(engine, table, key)
+        .expect("holder")
+}
+
+/// An expired row of a keyed table frees its key with it, so the key can be
+/// inserted again; a row that has not expired keeps its key.
+#[test]
+fn reaping_a_table_row_frees_its_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let mut schema = make_ttl_schema("Session", 3600, TtlScope::Node);
+    schema.make_table(vec!["content".into()]);
+    persist_schema(&engine, &schema);
+
+    let now = now_us();
+    let content = interner.intern("content");
+    let created = interner.intern("created_at");
+    for (id, key, age_us) in [
+        (1u64, "old", 2 * 3600 * 1_000_000),
+        (2, "new", 60 * 1_000_000),
+    ] {
+        let mut record = NodeRecord::new("Session");
+        record.set(content, Value::String(key.into()));
+        record.set(created, Value::Timestamp(now - age_us));
+        seed_node_record(&engine, 1, NodeId::from_raw(id), &record);
+        seed_table_key(
+            &engine,
+            "Session",
+            &[Value::String(key.into())],
+            NodeId::from_raw(id),
+        );
+    }
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+    assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
+    assert_eq!(
+        key_holder(&engine, "Session", &[Value::String("old".into())]),
+        None,
+        "the reaped row's key is free"
+    );
+    assert_eq!(
+        key_holder(&engine, "Session", &[Value::String("new".into())]),
+        Some(NodeId::from_raw(2)),
+        "the live row keeps its key"
+    );
+}
+
+/// Seed a unique index on `Session.content` holding `values` for `node`.
+fn seed_unique_content(engine: &StorageEngine, value: &str, node: NodeId) {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_storage::engine::transaction::Transaction;
+    let index = super::super::IndexDefinition::btree("s_content", "Session", "content").unique();
+    let mut txn = Transaction::new(engine, None, Timestamp::ZERO, None);
+    let no_fields = |_: &str| None;
+    LocalIndexStore::new(engine)
+        .stage_membership(
+            &mut txn,
+            &index,
+            &no_fields,
+            node,
+            None,
+            Some(&[Value::String(value.into())]),
+        )
+        .expect("seed entry");
+}
+
+fn content_holder(engine: &StorageEngine, value: &str) -> Option<NodeId> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let index = super::super::IndexDefinition::btree("s_content", "Session", "content").unique();
+    LocalIndexStore::new(engine)
+        .committed_conflict(&index, &[Value::String(value.into())], NodeId::from_raw(0))
+        .expect("holder")
+}
+
+/// A reaped node's B-tree entries go with it: its unique value is free for
+/// a new node, the live node keeps its own.
+#[test]
+fn reaping_a_node_frees_its_unique_index_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    super::super::ops::save_index_definition(
+        &engine,
+        &super::super::IndexDefinition::btree("s_content", "Session", "content").unique(),
+    )
+    .expect("define index");
+
+    let now = now_us();
+    let content = interner.intern("content");
+    let created = interner.intern("created_at");
+    for (id, value, age_us) in [
+        (1u64, "old", 2 * 3600 * 1_000_000),
+        (2, "new", 60 * 1_000_000),
+    ] {
+        let mut record = NodeRecord::new("Session");
+        record.set(content, Value::String(value.into()));
+        record.set(created, Value::Timestamp(now - age_us));
+        seed_node_record(&engine, 1, NodeId::from_raw(id), &record);
+        seed_unique_content(&engine, value, NodeId::from_raw(id));
+    }
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+    assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
+    assert_eq!(
+        content_holder(&engine, "old"),
+        None,
+        "the reaped value is free"
+    );
+    assert_eq!(content_holder(&engine, "new"), Some(NodeId::from_raw(2)));
+}
+
+/// Expiring a property an index reads would leave the entry of its old
+/// value behind, so the row keeps the property and the reaper says why.
+#[test]
+fn an_indexed_property_is_not_expired_by_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Field));
+    super::super::ops::save_index_definition(
+        &engine,
+        &super::super::IndexDefinition::btree("s_created", "Session", "created_at"),
+    )
+    .expect("define index");
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Session",
+        now_us() - 2 * 3600 * 1_000_000,
+        &mut interner,
+    );
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+    assert_eq!(result.fields_removed, 0);
+    assert!(
+        result.errors.iter().any(|e| e.contains("indexed property")),
+        "{:?}",
+        result.errors
+    );
+}
+
+/// Without the field dictionary the reaper cannot name a row's key, so it
+/// keeps the rows of a keyed table rather than leave their keys held.
+#[test]
+fn a_keyed_table_is_not_reaped_without_its_key_columns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    let mut schema = make_ttl_schema("Session", 3600, TtlScope::Node);
+    schema.make_table(vec!["content".into()]);
+    persist_schema(&engine, &schema);
+    insert_node(
+        &engine,
+        1,
+        1,
+        "Session",
+        now_us() - 2 * 3600 * 1_000_000,
+        &mut interner,
+    );
+
+    let result = reap_computed_ttl(&engine, 1, 1000);
+    assert_eq!(result.nodes_deleted, 0);
+    assert!(!result.errors.is_empty(), "the kept row is reported");
+    assert!(node_exists(&engine, 1, 1));
+}
+
 // ── interner-aware anchor lookup ─────────────────────────────────
 
 #[test]

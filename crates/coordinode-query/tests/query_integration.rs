@@ -33,6 +33,7 @@ fn make_test_ctx<'a>(
     ExecutionContext {
         engine,
         interner,
+        field_registrar: None,
         id_allocator: allocator,
         shard_id: 1,
         scan_paging: None,
@@ -43,6 +44,7 @@ fn make_test_ctx<'a>(
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
+        key_claims: Default::default(),
         text_index: None,
         text_index_registry: None,
         vector_indexes: None,

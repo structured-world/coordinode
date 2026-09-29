@@ -180,6 +180,20 @@ impl AppliedFeed {
                             replaced = true;
                         }
                     }
+                    // The keys a command writes are decided as it applies and
+                    // are not in the entry, so a Schema follower rereads.
+                    Mutation::Command(_) => {
+                        if subscriber.partition == Partition::Schema {
+                            replaced = true;
+                        }
+                    }
+                    // Derived entry keys are likewise decided as the unit
+                    // applies, so an index-partition follower rereads.
+                    Mutation::Derive(_) => {
+                        if subscriber.partition == Partition::Idx {
+                            replaced = true;
+                        }
+                    }
                 }
             }
             if replaced {

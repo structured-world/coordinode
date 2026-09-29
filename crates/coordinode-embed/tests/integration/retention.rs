@@ -258,13 +258,23 @@ fn window_comes_from_storage_config() {
     let db = Database::open_with_config(config).expect("open");
     assert_eq!(db.retention_window(), Duration::from_secs(42));
     // Republish against the current clock: opening allocated timestamps
-    // after the last recompute.
-    db.engine().advance_gc_watermark();
-    let now = db.engine().snapshot();
-    assert_eq!(
-        db.oldest_readable_timestamp().as_raw(),
-        now - 42_000_000 - 1
-    );
+    // after the last recompute. The watermark is taken from the snapshot at
+    // the moment of the republish, so it is compared with a snapshot no
+    // background commit moved while it was computed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (now, oldest) = loop {
+        let before = db.engine().snapshot();
+        db.engine().advance_gc_watermark();
+        let oldest = db.oldest_readable_timestamp().as_raw();
+        if db.engine().snapshot() == before {
+            break (before, oldest);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the snapshot never held still across a republish"
+        );
+    };
+    assert_eq!(oldest, now - 42_000_000 - 1);
 }
 
 /// A live snapshot pin (an open interactive transaction reading at its

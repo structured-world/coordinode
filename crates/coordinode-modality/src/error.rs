@@ -41,6 +41,13 @@ pub enum StoreError {
     /// programmer errors, not storage failures.
     #[error("invariant violation: {0}")]
     Invariant(String),
+
+    /// A value that cannot be a table key was given as one.
+    #[error(
+        "{0} cannot be a table key: a key is a boolean, integer, float, string, \
+         timestamp or binary value"
+    )]
+    UnsupportedKey(&'static str),
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

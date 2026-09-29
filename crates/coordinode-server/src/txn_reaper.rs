@@ -27,7 +27,7 @@ pub(crate) fn spawn(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            database.read().reap_idle_transactions(idle_timeout);
+            crate::services::blocking(|| database.read().reap_idle_transactions(idle_timeout));
             registry.reap_idle();
         }
     })

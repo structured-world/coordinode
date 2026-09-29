@@ -12,7 +12,7 @@ fn put_maps_to_insert_with_partition_tag() {
         key: b"k".to_vec(),
         value: b"v".to_vec(),
     };
-    match mutation_to_op(&m) {
+    match mutation_to_op(&m).unwrap() {
         OplogOp::Insert {
             partition,
             key,
@@ -32,7 +32,7 @@ fn delete_maps_to_delete() {
         partition: PartitionId::Adj,
         key: b"e".to_vec(),
     };
-    match mutation_to_op(&m) {
+    match mutation_to_op(&m).unwrap() {
         OplogOp::Delete { partition, key } => {
             assert_eq!(partition, partition_wire_tag(Partition::Adj));
             assert_eq!(key, b"e");
@@ -48,7 +48,7 @@ fn merge_maps_to_merge() {
         key: b"src".to_vec(),
         operand: b"op".to_vec(),
     };
-    match mutation_to_op(&m) {
+    match mutation_to_op(&m).unwrap() {
         OplogOp::Merge {
             partition,
             key,
@@ -69,7 +69,7 @@ fn remove_range_maps_to_remove_range() {
         start: b"a".to_vec(),
         end: b"z".to_vec(),
     };
-    match mutation_to_op(&m) {
+    match mutation_to_op(&m).unwrap() {
         OplogOp::RemoveRange {
             partition,
             start,
@@ -96,10 +96,21 @@ fn batch_preserves_order_and_count() {
             key: b"2".to_vec(),
         },
     ];
-    let ops = mutations_to_ops(&muts);
+    let ops = mutations_to_ops(&muts).unwrap();
     assert_eq!(ops.len(), 2);
     assert!(matches!(ops[0], OplogOp::Insert { .. }));
     assert!(matches!(ops[1], OplogOp::Delete { .. }));
+}
+
+/// The journal records what a command decided, never the command: a replay
+/// that decided it again could reach another outcome than the first apply.
+#[test]
+fn a_command_never_reaches_the_journal() {
+    use coordinode_core::txn::proposal::MetadataCommand;
+    let m = Mutation::Command(MetadataCommand::RegisterFields {
+        names: vec!["a".into()],
+    });
+    assert!(mutation_to_op(&m).is_err());
 }
 
 #[test]

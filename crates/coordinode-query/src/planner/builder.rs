@@ -737,10 +737,21 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 unique: c.unique,
                 sparse: c.sparse,
                 filter,
+                maintenance: c.maintenance.map(index_profile),
             })
         }
         Clause::DropIndex(c) => Ok(LogicalOp::DropIndex {
             name: c.name.clone(),
+        }),
+        Clause::AlterIndex(c) => Ok(LogicalOp::AlterIndexMaintenance {
+            name: c.name.clone(),
+            profile: match c.maintenance {
+                crate::cypher::ast::IndexMaintenanceChoice::Profile(p) => Some(index_profile(p)),
+                crate::cypher::ast::IndexMaintenanceChoice::Inherit => None,
+            },
+        }),
+        Clause::AlterNamespaceIndexDefault(choice) => Ok(LogicalOp::SetNamespaceIndexDefault {
+            profile: index_profile(*choice),
         }),
         Clause::CreateVectorIndex(c) => {
             // A trailing extension clause (e.g. an engine-extension's `SHARDED BY
@@ -1043,6 +1054,14 @@ pub fn vector_index_definition_from_clause(
 ///
 /// Returns `None` for unsupported expressions (index is still created; filter
 /// is simply not applied during backfill or at write time).
+/// The engine profile a DDL profile names.
+fn index_profile(choice: crate::cypher::ast::ProfileChoice) -> crate::index::IndexProfile {
+    match choice {
+        crate::cypher::ast::ProfileChoice::Resolved => crate::index::IndexProfile::Resolved,
+        crate::cypher::ast::ProfileChoice::Derived => crate::index::IndexProfile::Derived,
+    }
+}
+
 fn expr_to_partial_filter(expr: &Expr) -> Option<crate::index::definition::PartialFilter> {
     use crate::index::definition::PartialFilter;
     use coordinode_core::graph::types::Value;
@@ -1699,7 +1718,7 @@ fn try_index_rewrite(
 /// or a property access on `var`). Rejects self-referential equality
 /// (`a.x = a.y`) from index point-lookup rewriting while allowing literals,
 /// parameters, and correlated outer references.
-fn expr_references_var(expr: &crate::plan::expr::Expr, var: &str) -> bool {
+pub(crate) fn expr_references_var(expr: &crate::plan::expr::Expr, var: &str) -> bool {
     use crate::plan::expr::Expr as PExpr;
     match expr {
         PExpr::Variable(name) => {
@@ -1720,7 +1739,10 @@ fn expr_references_var(expr: &crate::plan::expr::Expr, var: &str) -> bool {
 /// Extract a property name from an expression that references `variable.property`.
 ///
 /// Matches `PropertyAccess { expr: Variable(var), property }` and `Variable("var.prop")`.
-fn extract_index_property(expr: &crate::plan::expr::Expr, variable: &str) -> Option<String> {
+pub(crate) fn extract_index_property(
+    expr: &crate::plan::expr::Expr,
+    variable: &str,
+) -> Option<String> {
     use crate::plan::expr::Expr as PExpr;
     match expr {
         PExpr::Property { base, key } => {
@@ -2479,6 +2501,16 @@ pub fn optimize_push_down(
     op: LogicalOp,
     stats: Option<&dyn coordinode_core::graph::stats::StorageStats>,
 ) -> LogicalOp {
+    optimize_push_down_with_limit(op, None, &|| stats)
+}
+
+/// [`optimize_push_down`] that asks `stats` for the statistics only when a
+/// decision needs them, so a plan with no `VectorFilter` over a `Traverse`
+/// (every write, most reads) never pays for computing them.
+pub fn optimize_push_down_lazy<'s>(
+    op: LogicalOp,
+    stats: &dyn Fn() -> Option<&'s dyn coordinode_core::graph::stats::StorageStats>,
+) -> LogicalOp {
     optimize_push_down_with_limit(op, None, stats)
 }
 
@@ -2486,10 +2518,10 @@ pub fn optimize_push_down(
 /// a `Limit { count }` operator is visited, its literal value replaces
 /// the enclosing value for all descendants — so a `VectorFilter` beneath
 /// it sees the correct top-K for cost estimation.
-fn optimize_push_down_with_limit(
+fn optimize_push_down_with_limit<'s>(
     op: LogicalOp,
     enclosing_limit: Option<usize>,
-    stats: Option<&dyn coordinode_core::graph::stats::StorageStats>,
+    stats: &dyn Fn() -> Option<&'s dyn coordinode_core::graph::stats::StorageStats>,
 ) -> LogicalOp {
     match op {
         LogicalOp::VectorFilter {
@@ -2517,7 +2549,7 @@ fn optimize_push_down_with_limit(
                     threshold,
                     less_than,
                     enclosing_limit,
-                    stats,
+                    stats(),
                 ))
             } else {
                 None

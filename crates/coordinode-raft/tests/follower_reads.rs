@@ -146,8 +146,15 @@ async fn bootstrap_leader() -> (tempfile::TempDir, RaftNode) {
     let (_dir, engine) = test_engine();
     // Keep dir alive alongside node
     let node = RaftNode::single_node(engine).await.expect("bootstrap");
-    // Wait for leader election (single node becomes leader immediately)
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A single node elects itself, but not within a fixed time on a loaded
+    // machine: poll with a generous bound instead of sleeping a constant.
+    for _ in 0..150 {
+        if node.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(node.is_leader().await, "a single node never became leader");
     (_dir, node)
 }
 

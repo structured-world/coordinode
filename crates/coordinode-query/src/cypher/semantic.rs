@@ -332,6 +332,8 @@ impl<'a> Analyzer<'a> {
             | Clause::DropEncryptedIndex(_)
             | Clause::CreateIndex(_)
             | Clause::DropIndex(_)
+            | Clause::AlterIndex(_)
+            | Clause::AlterNamespaceIndexDefault(_)
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)
             | Clause::CreateEdgeType(_)

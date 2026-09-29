@@ -91,8 +91,9 @@ pub enum OplogOp {
     /// separate columnar-mode tree, keyed by `table_id`), so their writes
     /// cannot be tagged with a partition discriminant like the ops above.
     /// Recovery routes this op to the columnar table registry by `table_id`
-    /// rather than to a partition tree. Always last in the enum so the serde
-    /// variant indices of the older ops stay stable for on-disk entries.
+    /// rather than to a partition tree. Kept before [`Self::Derive`] so the
+    /// serde variant indices of the older ops stay stable for on-disk
+    /// entries.
     ColumnarInsert {
         /// The columnar table this row belongs to.
         table_id: String,
@@ -100,6 +101,24 @@ pub enum OplogOp {
         key: Vec<u8>,
         #[serde(with = "serde_bytes")]
         value: Vec<u8>,
+    },
+    /// Sealed entry maintenance of a DERIVED index: the MessagePack encoding
+    /// of a [`DerivedIndexWork`](coordinode_core::txn::proposal::DerivedIndexWork).
+    /// The journal keeps the work and its inputs, not the entries, so replay
+    /// derives them again from the entry itself; a record source names the
+    /// position of a node record insert among the entry's ops. Last in the
+    /// enum, for the same reason as above.
+    Derive {
+        #[serde(with = "serde_bytes")]
+        work: Vec<u8>,
+    },
+    /// One application unit in its compact frame
+    /// ([`coordinode_core::txn::frame`]): the form a journal records and a
+    /// Raft log entry carries each proposal in. Readers expand it into the
+    /// operations it encodes. Last in the enum, for the same reason as above.
+    Unit {
+        #[serde(with = "serde_bytes")]
+        frame: Vec<u8>,
     },
 }
 

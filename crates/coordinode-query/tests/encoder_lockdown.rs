@@ -56,7 +56,6 @@ const SCAN_FILES: &[&str] = &[
     "src/executor/vector_predicate.rs",
     "src/index/ops.rs",
     "src/index/build.rs",
-    "src/index/ttl.rs",
     "src/index/ttl_reaper.rs",
     "src/index/registry.rs",
 ];
@@ -89,10 +88,6 @@ const ALLOWED: &[(&str, usize)] = &[
     // build.rs: cfg(test) `insert_node` helper routes through
     // LocalNodeStore. 0 raw encoder usages.
     ("src/index/build.rs", 0),
-    // ttl.rs: cfg(test) `insert_node_with_timestamp` helper
-    // + verify-deleted assertions route through LocalNodeStore.
-    // 0 raw encoder usages.
-    ("src/index/ttl.rs", 0),
     // ttl_reaper.rs: cfg(test) fixtures route through
     // LocalNodeStore; the production `prepare_subtree_mutations` builds
     // its EdgeProp delete via the typed `Mutation::delete_edge_props`

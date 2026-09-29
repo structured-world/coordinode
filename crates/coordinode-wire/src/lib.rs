@@ -52,6 +52,36 @@ pub fn wire_client_tls() -> Option<ClientTlsConfig> {
     WIRE_CLIENT_TLS.get().cloned()
 }
 
+/// A peer address as a URI to dial. Operators give members as `host:port`; that
+/// gets the scheme this node's inter-node transport uses (`https` when
+/// inter-node TLS is on, `http` otherwise). An address that names its scheme is
+/// kept as given.
+#[must_use]
+pub fn peer_uri(addr: &str) -> String {
+    if addr.contains("://") {
+        addr.to_owned()
+    } else if WIRE_CLIENT_TLS.get().is_some() {
+        format!("https://{addr}")
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+/// An endpoint for dialing the peer at `addr`: [`peer_uri`], with the outbound
+/// inter-node TLS applied when it is on. Every inter-node client builds its
+/// connection here, so no hop is left plaintext or unreachable by address form.
+///
+/// # Errors
+///
+/// `addr` is not a valid URI, or the TLS config does not apply to it.
+pub fn peer_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
+    let endpoint = tonic::transport::Endpoint::from_shared(peer_uri(addr))?;
+    match wire_client_tls() {
+        Some(tls) => endpoint.tls_config(tls),
+        None => Ok(endpoint),
+    }
+}
+
 /// Build an outbound [`ClientTlsConfig`] from PEM bytes: `ca_pem` is the trust
 /// root that verifies the peer's certificate; `identity` is this node's
 /// `(cert_pem, key_pem)`, presented when the peer enforces mutual TLS (harmless

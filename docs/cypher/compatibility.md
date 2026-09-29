@@ -74,7 +74,7 @@ The common Neo4j scalar surface is implemented. See the [functions reference](./
 |------|--------|-------|
 | B-tree (single property) | ✅ Supported | Standard performance index |
 | Composite (multi-property) | 📋 Planned | |
-| Unique constraint | ✅ Supported | Enforced at commit time |
+| Unique constraint | ✅ Supported | Checked by the writing statement; concurrent writers of one value are arbitrated at commit |
 | Sparse (skip nulls) | ✅ Supported | `CREATE SPARSE INDEX` |
 | Partial (filtered) | ✅ Supported | `CREATE INDEX ... WHERE predicate` |
 | Text index (full-text BM25) | ✅ Supported | 30+ languages, fuzzy, phrase |

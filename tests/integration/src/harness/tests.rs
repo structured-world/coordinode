@@ -9,7 +9,7 @@ async fn a_server_that_exits_during_startup_is_restarted_on_another_port() {
     let attempts = std::sync::atomic::AtomicU32::new(0);
     let first_port = std::sync::atomic::AtomicU32::new(0);
 
-    let proc = CoordinodeProcess::spawn_on_free_port(data_dir, |port, data| {
+    let proc = CoordinodeProcess::spawn_on_free_port(data_dir, |port, ops_port, data| {
         if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             first_port.store(u32::from(port), std::sync::atomic::Ordering::Relaxed);
             // A start that fails before binding: an unknown mode.
@@ -18,7 +18,7 @@ async fn a_server_that_exits_during_startup_is_restarted_on_another_port() {
                 .spawn()
                 .expect("spawn a failing start");
         }
-        spawn_binary(port, data)
+        spawn_binary(port, ops_port, data)
     })
     .await;
 

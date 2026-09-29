@@ -1148,7 +1148,8 @@ fn vector_threshold_query_is_unaffected_by_index_presence() {
             metric: VectorMetric::Cosine,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create nodes with vector properties.
     db.execute_cypher("CREATE (m:Movie {title: 'Matrix', embedding: [1.0, 0.0, 0.0]})")
@@ -1311,7 +1312,8 @@ fn create_node_auto_inserts_into_hnsw() {
             metric: VectorMetric::Cosine,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // HNSW should be empty before any writes
     let reg = db.vector_index_registry();
@@ -1365,7 +1367,8 @@ fn set_vector_property_updates_hnsw() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create a node with initial vector
     db.execute_cypher("CREATE (a:Item {name: 'A', v: [0.0, 0.0, 0.0]})")
@@ -1417,7 +1420,8 @@ fn create_nonvector_node_does_not_affect_hnsw() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create a node WITHOUT a vector property
     db.execute_cypher("CREATE (a:Item {name: 'NoVector', score: 42})")
@@ -1452,7 +1456,8 @@ fn hnsw_search_after_auto_inserts() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create 10 points spread across the space
     for i in 0..10u32 {
@@ -1496,7 +1501,8 @@ fn delete_node_calls_on_vector_deleted() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create and then delete a node
     db.execute_cypher("CREATE (a:Item {name: 'Ephemeral', v: [1.0, 2.0, 3.0]})")
@@ -1544,7 +1550,8 @@ fn remove_vector_property_wiring() {
             metric: VectorMetric::L2,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Create node with vector, then REMOVE the vector property
     db.execute_cypher("CREATE (a:Item {name: 'A', v: [1.0, 0.0, 0.0]})")
@@ -1588,7 +1595,8 @@ fn hnsw_persists_across_restart() {
                 metric: VectorMetric::Cosine,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create vector index");
 
         db.execute_cypher("CREATE (a:Movie {title: 'Matrix', embedding: [1.0, 0.0, 0.0, 0.0]})")
             .expect("create Matrix");
@@ -1650,7 +1658,8 @@ fn multiple_indexes_persist() {
                 metric: VectorMetric::L2,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create movie index");
         db.create_vector_index(
             "user_vec",
             "User",
@@ -1660,7 +1669,8 @@ fn multiple_indexes_persist() {
                 metric: VectorMetric::Cosine,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create user index");
 
         db.execute_cypher("CREATE (m:Movie {title: 'X', v: [1.0, 2.0, 3.0]})")
             .expect("create movie");
@@ -1731,7 +1741,8 @@ fn new_vectors_indexed_after_reopen() {
                 metric: VectorMetric::L2,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create vector index");
         db.execute_cypher("CREATE (a:Item {name: 'A', v: [1.0, 0.0, 0.0]})")
             .expect("create A");
     }
@@ -1800,7 +1811,7 @@ fn storage_vector_loader_reads_from_node_partition() {
     // Create StorageVectorLoader and verify it can load vectors
     let loader = StorageVectorLoader::new(
         db.engine_shared(),
-        db.interner().clone(),
+        db.interner().expect("dictionary"),
         1, // shard_id
     );
 
@@ -1853,7 +1864,8 @@ fn offloaded_hnsw_search_e2e_through_cypher() {
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Insert enough vectors to trigger SQ8 auto-calibration (threshold=1000 default)
     // and offloading. Use lower-level API to set calibration threshold lower.
@@ -1930,7 +1942,8 @@ fn forced_offload_search_through_registry() {
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Insert 20 nodes with vector properties
     for i in 0..20 {
@@ -1976,7 +1989,8 @@ fn forced_offload_search_through_registry() {
     }
 
     // Search through registry with StorageVectorLoader — full offload path
-    let loader = StorageVectorLoader::new(db.engine_shared(), db.interner().clone(), 1);
+    let loader =
+        StorageVectorLoader::new(db.engine_shared(), db.interner().expect("dictionary"), 1);
 
     let reg = db.vector_index_registry();
     let results = reg
@@ -2047,7 +2061,8 @@ fn forced_offload_cypher_e2e() {
             offload_vectors: true,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // Insert 15 nodes
     for i in 0..15 {
@@ -2131,7 +2146,8 @@ fn threshold_filter_fixture(
                 metric: VectorMetric::Cosine,
                 ..VectorIndexConfig::default()
             },
-        );
+        )
+        .expect("create vector index");
     }
 
     db.execute_cypher("CREATE (u:User {name: 'reader'})")
@@ -2342,7 +2358,8 @@ fn decay_weighted_threshold_is_exact_with_an_index() {
             metric: VectorMetric::Cosine,
             ..VectorIndexConfig::default()
         },
-    );
+    )
+    .expect("create vector index");
 
     // 150 decoys at similarity 1.0 crowd the index head; two scored notes sit
     // behind them. Both pass the bare similarity threshold, so any difference

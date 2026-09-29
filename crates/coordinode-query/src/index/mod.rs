@@ -1,13 +1,11 @@
-//! B-tree index system: single-field property indexes stored in the `idx:` partition.
-//!
-//! Indexes accelerate property lookups from O(N) full scan to O(log N) B-tree lookup.
-//! Key format: `idx:<index_name>:<encoded_value>:<node_id>`
+//! Index system: B-tree property indexes whose entries live in the index
+//! partition and are maintained through the writing transaction, plus the
+//! vector and full-text registries.
 
 pub mod build;
 pub mod definition;
 pub mod ops;
 pub mod registry;
-pub mod ttl;
 pub mod ttl_reaper;
 
 pub mod vector_build;
@@ -17,14 +15,12 @@ pub mod text_registry;
 
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
 pub use definition::{
-    IndexDefinition, IndexState, IndexType, OnlineDuringBuild, TextFieldConfig, TextIndexConfig,
-    VectorIndexConfig,
+    IndexDefinition, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
+    OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
-pub use ops::{
-    create_index_entries, create_index_entry, delete_index_entries, delete_index_entry, index_scan,
-    index_scan_exact,
+pub use registry::{
+    IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };
-pub use registry::{IndexRegistry, UniqueViolation};
 pub use text_registry::TextIndexRegistry;
 pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};
 pub use vector_registry::{BuildToken, VectorIndexRegistry};

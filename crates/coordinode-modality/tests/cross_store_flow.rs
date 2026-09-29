@@ -14,7 +14,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
-    BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexStore, LocalBlobStore,
+    BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexDefinition, IndexStore, LocalBlobStore,
     LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
     LocalTimeSeriesStore, Measurement, NodeStore, Point, SpatialStore, TimeSeriesStore,
 };
@@ -116,13 +116,35 @@ fn node_edge_index_document_flow() {
     bob_rec.set_extra("name", Value::String("bob".into()));
     put_node(engine, 0, bob, &bob_rec);
 
-    // 2. Index both by name.
-    indexes
-        .put_entry("by_name", &[Value::String("alice".into())], alice)
-        .expect("idx alice");
-    indexes
-        .put_entry("by_name", &[Value::String("bob".into())], bob)
-        .expect("idx bob");
+    // 2. Index both by name (buffered, committed).
+    let by_name = IndexDefinition::btree("by_name", "User", "name");
+    {
+        let read_ts = oracle.next();
+        let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
+        // The names are kept by name, outside the dictionary.
+        let no_fields = |_: &str| None;
+        indexes
+            .stage_membership(
+                &mut txn,
+                &by_name,
+                &no_fields,
+                alice,
+                None,
+                Some(&[Value::String("alice".into())]),
+            )
+            .expect("idx alice");
+        indexes
+            .stage_membership(
+                &mut txn,
+                &by_name,
+                &no_fields,
+                bob,
+                None,
+                Some(&[Value::String("bob".into())]),
+            )
+            .expect("idx bob");
+        commit(&mut txn);
+    }
 
     // 3. Edge alice --KNOWS--> bob with a property (buffered, committed).
     let mut props = EdgeProperties::new();
@@ -177,18 +199,18 @@ fn node_edge_index_document_flow() {
     }
 
     // IndexStore lookups for both names return the expected node.
+    let read_ts = oracle.next();
+    let mut rtxn = Transaction::begin(engine, Some(&oracle), read_ts);
     let alice_via_idx = indexes
-        .scan_exact("by_name", &[Value::String("alice".into())])
+        .scan_exact(&mut rtxn, &by_name, &[Value::String("alice".into())])
         .expect("scan");
-    assert_eq!(alice_via_idx, vec![alice]);
+    assert_eq!(alice_via_idx, Some(vec![alice]));
     let bob_via_idx = indexes
-        .scan_exact("by_name", &[Value::String("bob".into())])
+        .scan_exact(&mut rtxn, &by_name, &[Value::String("bob".into())])
         .expect("scan");
-    assert_eq!(bob_via_idx, vec![bob]);
+    assert_eq!(bob_via_idx, Some(vec![bob]));
 
     // EdgeStore: alice's forward neighbours include bob.
-    let read_ts = oracle.next();
-    let rtxn = Transaction::begin(engine, Some(&oracle), read_ts);
     let out = edges
         .scan_neighbors_out(&rtxn, "KNOWS", alice)
         .expect("scan");

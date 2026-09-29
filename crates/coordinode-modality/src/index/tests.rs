@@ -1,353 +1,412 @@
 use super::*;
 
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_core::txn::write_concern::WriteConcern;
+use coordinode_storage::engine::transaction::{CommitContext, CommitError};
+
+use crate::index_def::IndexMaintenance;
+
 /// Logic-test fixture (memory backing, env-flippable).
 fn open_engine() -> coordinode_test_fixtures::EngineFixture {
     coordinode_test_fixtures::engine_for_logic()
 }
 
-#[test]
-fn single_value_round_trip() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let v = vec![Value::String("alice".into())];
-    store
-        .put_entry("user_name", &v, NodeId::from_raw(1))
-        .expect("put");
-    let hits = store.scan_exact("user_name", &v).expect("scan");
-    assert_eq!(hits, vec![NodeId::from_raw(1)]);
+fn commit(t: &mut Transaction) -> Result<(), CommitError> {
+    let wc = WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    t.commit(&ctx).map(|_| ())
 }
 
-#[test]
-fn clear_removes_every_entry_and_reports_count() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    for id in [1u64, 2, 3] {
-        store
-            .put_entry(
-                "user_name",
-                &[Value::String(format!("u{id}"))],
-                NodeId::from_raw(id),
-            )
-            .expect("put");
-    }
-    // A second index must survive the clear (prefix isolation).
-    store
-        .put_entry("user_age", &[Value::Int(30)], NodeId::from_raw(9))
-        .expect("put other");
-
-    let removed = store.clear("user_name").expect("clear");
-    assert_eq!(removed, 3, "clear reports the number of entries removed");
-    assert!(
-        store.scan_all("user_name").expect("scan").is_empty(),
-        "cleared index has no entries left",
-    );
-    assert_eq!(
-        store.scan_all("user_age").expect("scan other").len(),
-        1,
-        "clear is prefix-isolated to the named index",
-    );
+fn s(v: &str) -> Vec<Value> {
+    vec![Value::String(v.into())]
 }
 
+fn id(raw: u64) -> NodeId {
+    NodeId::from_raw(raw)
+}
+
+/// No property is bound to a field id: every value is looked up by name.
+fn no_fields(_: &str) -> Option<u32> {
+    None
+}
+
+/// Stage `node` entering `index` holding `values`; the entries put.
+fn enter(
+    store: &LocalIndexStore,
+    t: &mut Transaction,
+    index: &IndexDefinition,
+    values: &[Value],
+    node: NodeId,
+) -> usize {
+    store
+        .stage_membership(t, index, &no_fields, node, None, Some(values))
+        .unwrap()
+}
+
+/// Stage `node` leaving `index`, where it held `values`.
+fn leave(
+    store: &LocalIndexStore,
+    t: &mut Transaction,
+    index: &IndexDefinition,
+    values: &[Value],
+    node: NodeId,
+) {
+    store
+        .stage_membership(t, index, &no_fields, node, Some(values), None)
+        .unwrap();
+}
+
+fn derived(mut index: IndexDefinition) -> IndexDefinition {
+    index.maintenance = IndexMaintenance {
+        profile: crate::index_def::IndexProfile::Derived,
+        ..IndexMaintenance::default()
+    };
+    index
+}
+
+/// Entries of a non-unique index commit with their transaction and are
+/// found by value, one per node.
 #[test]
-fn clear_empty_index_is_zero() {
+fn non_unique_entries_are_found_by_value() {
     let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    assert_eq!(store.clear("never_written").expect("clear"), 0);
+    let index = IndexDefinition::btree("user_name", "User", "name");
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("alice"), id(1));
+    enter(&store, &mut t, &index, &s("alice"), id(2));
+    enter(&store, &mut t, &index, &s("bob"), id(3));
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    let mut hits = store
+        .scan_exact(&mut t, &index, &s("alice"))
+        .unwrap()
+        .unwrap();
+    hits.sort_unstable_by_key(|n| n.as_raw());
+    assert_eq!(hits, vec![id(1), id(2)]);
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("carol")).unwrap(),
+        Some(Vec::new())
+    );
 }
 
+/// Nothing is written before the transaction commits: a rolled-back
+/// statement leaves no entry behind.
 #[test]
-fn delete_raw_removes_a_scanned_entry() {
+fn an_uncommitted_entry_is_invisible_outside_its_transaction() {
     let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    for id in [1u64, 2] {
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_name", "User", "name");
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("alice"), id(1));
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        Some(vec![id(1)]),
+        "the transaction sees its own entry"
+    );
+    drop(t);
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        Some(Vec::new())
+    );
+}
+
+/// A removal staged in the transaction hides the entry from the
+/// transaction's own lookups.
+#[test]
+fn a_staged_removal_hides_the_entry_from_its_transaction() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_name", "User", "name");
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("alice"), id(1));
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    leave(&store, &mut t, &index, &s("alice"), id(1));
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        Some(Vec::new())
+    );
+}
+
+/// A unique entry names its holder; another node's insert of the value
+/// sees the conflict, the holder's own re-insert does not.
+#[test]
+fn a_unique_value_has_one_holder() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("a@x"), id(1));
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
         store
-            .put_entry(
-                "by_name",
-                &[Value::String("dup".into())],
-                NodeId::from_raw(id),
-            )
-            .expect("put");
-    }
-    // Scan, then selectively delete node 1's entry by its raw key.
-    let entries = store.scan_all("by_name").expect("scan");
-    let (raw_key, _) = entries
-        .iter()
-        .find(|(_, nid)| *nid == NodeId::from_raw(1))
-        .cloned()
-        .expect("entry for node 1");
-    store.delete_raw(&raw_key).expect("delete_raw");
-
-    let remaining = store.scan_all("by_name").expect("rescan");
-    assert_eq!(remaining.len(), 1, "exactly one entry removed");
-    assert_eq!(
-        remaining[0].1,
-        NodeId::from_raw(2),
-        "node 2's entry survives"
+            .unique_conflict(&mut t, &index, &s("a@x"), id(2))
+            .unwrap(),
+        Some(id(1))
     );
-}
-
-#[test]
-fn duplicate_values_return_all_nodes() {
-    // Index value "alice" maps to two nodes — scan_exact returns
-    // both, sorted by node_id (because the key suffix is BE u64).
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let v = vec![Value::String("alice".into())];
-    for id in [1u64, 2, 3] {
+    assert_eq!(
         store
-            .put_entry("user_name", &v, NodeId::from_raw(id))
-            .expect("put");
-    }
-    let hits = store.scan_exact("user_name", &v).expect("scan");
+            .unique_conflict(&mut t, &index, &s("a@x"), id(1))
+            .unwrap(),
+        None
+    );
     assert_eq!(
-        hits,
-        vec![
-            NodeId::from_raw(1),
-            NodeId::from_raw(2),
-            NodeId::from_raw(3)
-        ],
+        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        Some(id(1))
+    );
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("a@x")).unwrap(),
+        Some(vec![id(1)])
     );
 }
 
+/// Two transactions that both found a value free and both claim it write
+/// one key, so only the first to commit succeeds, in either profile.
 #[test]
-fn delete_removes_specific_entry() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let v = vec![Value::String("alice".into())];
-    store
-        .put_entry("user_name", &v, NodeId::from_raw(1))
-        .expect("put");
-    store
-        .put_entry("user_name", &v, NodeId::from_raw(2))
-        .expect("put");
+fn two_concurrent_claims_of_one_value_conflict() {
+    for index in [
+        IndexDefinition::btree("user_email", "User", "email").unique(),
+        derived(IndexDefinition::btree("user_email", "User", "email").unique()),
+    ] {
+        let fx = open_engine();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(&fx.engine);
 
-    store
-        .delete_entry("user_name", &v, NodeId::from_raw(1))
-        .expect("delete");
-
-    let hits = store.scan_exact("user_name", &v).expect("scan");
-    assert_eq!(hits, vec![NodeId::from_raw(2)]);
-}
-
-#[test]
-fn delete_missing_entry_is_idempotent() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let v = vec![Value::Int(7)];
-    // Never put — delete must still succeed.
-    store
-        .delete_entry("noise", &v, NodeId::from_raw(99))
-        .expect("delete missing");
-}
-
-#[test]
-fn compound_index_distinguishes_by_secondary_column() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let alice_us = vec![Value::String("alice".into()), Value::String("US".into())];
-    let alice_uk = vec![Value::String("alice".into()), Value::String("UK".into())];
-
-    store
-        .put_entry("by_name_country", &alice_us, NodeId::from_raw(1))
-        .expect("put");
-    store
-        .put_entry("by_name_country", &alice_uk, NodeId::from_raw(2))
-        .expect("put");
-
-    // Exact match on (alice, US) returns only node 1.
-    let us_hits = store
-        .scan_exact("by_name_country", &alice_us)
-        .expect("scan");
-    assert_eq!(us_hits, vec![NodeId::from_raw(1)]);
-
-    // Exact match on (alice, UK) returns only node 2.
-    let uk_hits = store
-        .scan_exact("by_name_country", &alice_uk)
-        .expect("scan");
-    assert_eq!(uk_hits, vec![NodeId::from_raw(2)]);
-}
-
-#[test]
-fn scan_all_returns_every_entry() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let alice = vec![Value::String("alice".into())];
-    let bob = vec![Value::String("bob".into())];
-    store
-        .put_entry("nm", &alice, NodeId::from_raw(1))
-        .expect("put");
-    store
-        .put_entry("nm", &bob, NodeId::from_raw(2))
-        .expect("put");
-    store
-        .put_entry("nm", &alice, NodeId::from_raw(3))
-        .expect("put");
-
-    let all = store.scan_all("nm").expect("scan all");
-    assert_eq!(all.len(), 3);
-    // Sorted by (encoded value, node_id): alice/1, alice/3, bob/2.
-    let ids: Vec<u64> = all.iter().map(|(_, id)| id.as_raw()).collect();
-    assert_eq!(ids, vec![1, 3, 2]);
-}
-
-#[test]
-fn compound_index_three_columns() {
-    // N=3 compound: confirm encode/scan symmetry beyond N=2. Two
-    // entries differ only in the third column.
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let key_a = vec![
-        Value::String("alice".into()),
-        Value::String("US".into()),
-        Value::Int(30),
-    ];
-    let key_b = vec![
-        Value::String("alice".into()),
-        Value::String("US".into()),
-        Value::Int(40),
-    ];
-    store
-        .put_entry("triple", &key_a, NodeId::from_raw(1))
-        .expect("put a");
-    store
-        .put_entry("triple", &key_b, NodeId::from_raw(2))
-        .expect("put b");
-
-    // Exact match on key_a returns only node 1; key_b only 2.
-    assert_eq!(
-        store.scan_exact("triple", &key_a).expect("scan"),
-        vec![NodeId::from_raw(1)],
-    );
-    assert_eq!(
-        store.scan_exact("triple", &key_b).expect("scan"),
-        vec![NodeId::from_raw(2)],
-    );
-
-    // scan_all walks both, in encoded-key order (key_a's Int=30
-    // sorts before key_b's Int=40).
-    let all = store.scan_all("triple").expect("scan all");
-    let ids: Vec<u64> = all.iter().map(|(_, id)| id.as_raw()).collect();
-    assert_eq!(ids, vec![1, 2]);
-}
-
-#[test]
-fn scan_exact_missing_returns_empty() {
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let hits = store
-        .scan_exact("nonexistent", &[Value::Int(42)])
-        .expect("scan");
-    assert!(hits.is_empty());
-}
-
-#[test]
-fn sortable_type_ordering_null_lt_bool_lt_int_lt_string() {
-    // Index key contract: Value ordering Null < Bool < Int < Float <
-    // String < Timestamp. scan_all walks in encoded-key order so
-    // we can read the type ordering off directly. One entry per
-    // type, all under the same index name and node_id 1.
-    let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let id = NodeId::from_raw(1);
-    let entries: Vec<Vec<Value>> = vec![
-        vec![Value::Null],
-        vec![Value::Bool(true)],
-        vec![Value::Int(0)],
-        vec![Value::String("z".into())],
-    ];
-    // Insert in reverse to prove ordering comes from key
-    // encoding, not insertion order.
-    for v in entries.iter().rev() {
-        store.put_entry("mix", v, id).expect("put");
-    }
-    let all = store.scan_all("mix").expect("scan");
-    assert_eq!(all.len(), 4);
-    // The keys themselves carry the encoded value bytes — verify
-    // their order matches that contract by comparing prefixes
-    // pairwise (each later key sorts >= the previous one).
-    for pair in all.windows(2) {
+        let mut first = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        let mut second = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        for (t, node) in [(&mut first, id(1)), (&mut second, id(2))] {
+            assert_eq!(
+                store.unique_conflict(t, &index, &s("a@x"), node).unwrap(),
+                None
+            );
+            enter(&store, t, &index, &s("a@x"), node);
+        }
+        commit(&mut first).unwrap();
         assert!(
-            pair[0].0 <= pair[1].0,
-            "index keys not sorted: {:?} vs {:?}",
-            pair[0].0,
-            pair[1].0,
+            commit(&mut second).is_err(),
+            "{:?}: the second claim of one value must not commit",
+            index.maintenance.profile
+        );
+        assert_eq!(
+            store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+            Some(id(1)),
+            "{:?}",
+            index.maintenance.profile
         );
     }
 }
 
+/// Removing another node's unique entry leaves it: the entry of a stale
+/// value is only removed by its holder.
 #[test]
-fn scan_all_isolates_per_index_name() {
-    // Two indexes share the partition; each scan returns only
-    // its own entries.
+fn a_unique_entry_is_removed_only_by_its_holder() {
     let fx = open_engine();
-    let engine = &fx.engine;
-    let store = LocalIndexStore::new(engine);
-    let v = vec![Value::Int(42)];
-    store.put_entry("a", &v, NodeId::from_raw(1)).expect("put");
-    store.put_entry("b", &v, NodeId::from_raw(2)).expect("put");
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_email", "User", "email").unique();
 
-    let a = store.scan_all("a").expect("scan a");
-    let b = store.scan_all("b").expect("scan b");
-    assert_eq!(a.len(), 1);
-    assert_eq!(b.len(), 1);
-    assert_eq!(a[0].1, NodeId::from_raw(1));
-    assert_eq!(b[0].1, NodeId::from_raw(2));
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("a@x"), id(1));
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    leave(&store, &mut t, &index, &s("a@x"), id(2));
+    commit(&mut t).unwrap();
+    assert_eq!(
+        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        Some(id(1))
+    );
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    leave(&store, &mut t, &index, &s("a@x"), id(1));
+    commit(&mut t).unwrap();
+    assert_eq!(
+        store.committed_conflict(&index, &s("a@x"), id(2)).unwrap(),
+        None
+    );
+}
+
+/// A list indexes each element; a value with no key indexes nothing and a
+/// lookup of it reports that the index cannot answer.
+#[test]
+fn lists_index_their_elements_and_unkeyed_values_nothing() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_tag", "User", "tags").unique();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    let tags = vec![Value::Array(vec![
+        Value::String("x".into()),
+        Value::String("y".into()),
+        Value::String("x".into()),
+    ])];
+    assert_eq!(enter(&store, &mut t, &index, &tags, id(1)), 2);
+    assert_eq!(
+        store.unique_conflict(&mut t, &index, &tags, id(1)).unwrap(),
+        None,
+        "a list repeating an element does not conflict with itself"
+    );
+    assert_eq!(
+        store
+            .unique_conflict(&mut t, &index, &s("y"), id(2))
+            .unwrap(),
+        Some(id(1))
+    );
+
+    let map = vec![Value::Map(Default::default())];
+    assert_eq!(enter(&store, &mut t, &index, &map, id(3)), 0);
+    assert_eq!(store.scan_exact(&mut t, &index, &map).unwrap(), None);
+}
+
+/// Compound entries are told apart by every column.
+#[test]
+fn compound_entries_are_told_apart_by_every_column() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::compound("by_city_age", "User", vec!["city".into(), "age".into()]);
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    let a = vec![Value::String("Oslo".into()), Value::Int(30)];
+    let b = vec![Value::String("Oslo".into()), Value::Int(31)];
+    enter(&store, &mut t, &index, &a, id(1));
+    enter(&store, &mut t, &index, &b, id(2));
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &a).unwrap(),
+        Some(vec![id(1)])
+    );
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &b).unwrap(),
+        Some(vec![id(2)])
+    );
+}
+
+/// The clear mutations cover every entry of the index, in both shapes, and
+/// no entry of another index.
+#[test]
+fn clearing_an_index_removes_its_entries_only() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let plain = IndexDefinition::btree("i", "User", "name");
+    let unique = IndexDefinition::btree("i", "User", "name").unique();
+    let other = IndexDefinition::btree("ij", "User", "name");
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &plain, &s("a"), id(1));
+    enter(&store, &mut t, &unique, &s("b"), id(2));
+    enter(&store, &mut t, &other, &s("a"), id(3));
+    commit(&mut t).unwrap();
+
+    for mutation in store.clear_mutations("i") {
+        let Mutation::RemoveRange { start, end, .. } = mutation else {
+            panic!("a clear is range tombstones");
+        };
+        fx.engine
+            .remove_range(Partition::Idx, &start, &end)
+            .unwrap();
+    }
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert!(store.scan_entry_ids(&mut t, &plain).unwrap().is_empty());
+    assert!(store.scan_entry_ids(&mut t, &unique).unwrap().is_empty());
+    assert_eq!(store.scan_entry_ids(&mut t, &other).unwrap(), vec![id(3)]);
+}
+
+/// A DERIVED index reads its own entries before commit, holds them after,
+/// moves them on a change and leaves nothing of a rolled-back statement:
+/// the same view a RESOLVED index gives.
+#[test]
+fn a_derived_index_gives_the_resolved_view() {
+    let fx = open_engine();
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = derived(IndexDefinition::btree("user_name", "User", "name"));
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    enter(&store, &mut t, &index, &s("alice"), id(1));
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        Some(vec![id(1)]),
+        "the transaction sees its own entry"
+    );
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    store
+        .stage_membership(
+            &mut t,
+            &index,
+            &no_fields,
+            id(1),
+            Some(&s("alice")),
+            Some(&s("bob")),
+        )
+        .unwrap();
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("bob")).unwrap(),
+        Some(vec![id(1)])
+    );
+    enter(&store, &mut t, &index, &s("carol"), id(2));
+    drop(t);
+
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &s("carol")).unwrap(),
+        Some(Vec::new()),
+        "a rolled-back statement leaves no entry"
+    );
 }
 
 #[test]
 fn definition_txn_round_trip() {
-    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-    use coordinode_core::txn::write_concern::WriteConcern;
-    use coordinode_storage::engine::transaction::CommitContext;
-
     let fx = open_engine();
     let engine = &fx.engine;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(engine);
-
-    let commit = |t: &mut Transaction| {
-        let wc = WriteConcern::majority();
-        let ctx = CommitContext {
-            write_concern: &wc,
-            pipeline: None,
-            id_gen: None,
-            drain_buffer: None,
-            nvme_write_buffer: None,
-        };
-        t.commit(&ctx).expect("commit");
-    };
-
     let def = IndexDefinition::btree("user_email", "User", "email").unique();
 
-    // CREATE INDEX: persist the definition through a statement transaction.
-    let read_ts = oracle.next();
-    let mut t = Transaction::begin(engine, Some(&oracle), read_ts);
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
     store.put_definition_txn(&mut t, &def).expect("put txn");
-    commit(&mut t);
+    commit(&mut t).unwrap();
     let loaded = store
         .load_definition("user_email")
         .expect("load")
         .expect("present after commit");
-    assert_eq!(loaded.name, "user_email");
     assert!(loaded.unique);
 
-    // DROP INDEX: delete the definition through a statement transaction.
-    let read_ts = oracle.next();
-    let mut t = Transaction::begin(engine, Some(&oracle), read_ts);
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
     store
         .delete_definition_txn(&mut t, "user_email")
         .expect("delete txn");
-    commit(&mut t);
+    commit(&mut t).unwrap();
     assert!(store.load_definition("user_email").expect("load").is_none());
 }

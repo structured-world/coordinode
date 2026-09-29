@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 use coordinode_core::graph::edge::{AdjDirection, AdjKeyParts, PostingList, decode_edge_props};
-use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::intern::{DictionaryError, FieldInterner};
 use coordinode_core::graph::node::NodeIdAllocator;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
@@ -95,6 +95,18 @@ pub enum ExecutionError {
 
     #[error("serialization error: {0}")]
     Serialization(String),
+
+    /// No NodeId could be handed out for a created node: the log granted no
+    /// lease (this member does not lead, or the grant failed) or the shard's
+    /// identifier space is used up. Nothing was written.
+    #[error("{0}")]
+    NodeIdLease(#[from] coordinode_core::graph::node::IdLeaseError),
+
+    /// A property name could not be given an id, or stored data carries an
+    /// id the dictionary cannot name. Nothing encoded with the missing
+    /// binding was written or served.
+    #[error("{0}")]
+    FieldDictionary(#[from] coordinode_core::graph::intern::DictionaryError),
 
     #[error("unsupported operation: {0}")]
     Unsupported(String),
@@ -192,6 +204,50 @@ pub enum ExecutionError {
     #[error("schema violation: {0}")]
     SchemaViolation(String),
 
+    /// An insert named a key that a row of the table already holds. Nothing
+    /// was written; the existing row is unchanged.
+    #[error(
+        "table `{table}` already has a row with key {key} (row {element_id}): key already exists"
+    )]
+    DuplicateKey {
+        /// The table.
+        table: String,
+        /// The key, rendered.
+        key: String,
+        /// The elementId of the row that holds the key.
+        element_id: String,
+    },
+
+    /// A write would give a value of a unique index a second holder. Nothing
+    /// was written.
+    #[error(
+        "unique constraint violated on index `{index}`: property `{property}` already has \
+         value {value} (node {element_id})"
+    )]
+    UniqueViolation {
+        /// The unique index.
+        index: String,
+        /// The indexed properties, comma-separated.
+        property: String,
+        /// The value, rendered.
+        value: String,
+        /// The elementId of the node that holds the value.
+        element_id: String,
+    },
+
+    /// A statement tried to change the key of an existing row. A row's key is
+    /// its identity and does not change; delete the row and insert a new one.
+    #[error(
+        "column `{column}` is part of the key of table `{table}` and cannot be changed; \
+         delete the row and insert a new one"
+    )]
+    KeyImmutable {
+        /// The table.
+        table: String,
+        /// The key column the statement targeted.
+        column: String,
+    },
+
     /// L1 cycle protection trip: cumulative trigger cascade depth
     /// for the current originating mutation exceeded its limit. `chain` lists
     /// the trigger names that fired, in firing order, to help diagnose the
@@ -213,6 +269,93 @@ pub enum ExecutionError {
         count: u32,
         limit: u32,
     },
+}
+
+/// Unique keys a statement claimed, kept until it commits.
+#[derive(Debug, Default)]
+pub struct KeyClaims {
+    /// Table keys, as (table, key, row).
+    pub tables: Vec<(String, Vec<Value>, NodeId)>,
+    /// Values of unique indexes.
+    pub indexes: Vec<crate::index::UniqueClaim>,
+}
+
+impl KeyClaims {
+    /// Whether the statement claimed nothing.
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty() && self.indexes.is_empty()
+    }
+}
+
+impl From<crate::index::UniqueViolation> for ExecutionError {
+    fn from(v: crate::index::UniqueViolation) -> Self {
+        unique_violation(v)
+    }
+}
+
+/// The refusal of a write that breaks a unique index.
+fn unique_violation(v: crate::index::UniqueViolation) -> ExecutionError {
+    ExecutionError::UniqueViolation {
+        value: match &v.value {
+            Value::Array(values) => render_key(values),
+            one => render_key(std::slice::from_ref(one)),
+        },
+        index: v.index_name,
+        property: v.property,
+        element_id: v.holder.to_element_id(),
+    }
+}
+
+fn index_write_error(e: crate::index::IndexWriteError) -> ExecutionError {
+    match e {
+        crate::index::IndexWriteError::Unique(v) => unique_violation(v),
+        crate::index::IndexWriteError::Store(e) => e.into(),
+    }
+}
+
+/// The refusal of an insert whose key `holder` already holds in `table`.
+fn duplicate_key(table: &str, key: &[Value], holder: NodeId) -> ExecutionError {
+    ExecutionError::DuplicateKey {
+        table: table.to_string(),
+        key: render_key(key),
+        element_id: holder.to_element_id(),
+    }
+}
+
+/// A key as a reader writes it: the value alone, or a parenthesised tuple for
+/// a compound key.
+fn render_key(key: &[Value]) -> String {
+    fn one(value: &Value) -> String {
+        match value {
+            Value::String(s) => format!("'{}'", s.replace('\'', "\\'")),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Timestamp(t) => format!("timestamp {t}"),
+            Value::Binary(b) => format!("binary of {} bytes", b.len()),
+            other => format!("{other:?}"),
+        }
+    }
+    match key {
+        [single] => one(single),
+        _ => format!("({})", key.iter().map(one).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// The key of `record` under `columns`, or `None` when the record lacks one
+/// of them.
+fn row_key(
+    columns: &[String],
+    record: &NodeRecord,
+    interner: &FieldInterner,
+) -> Option<Vec<Value>> {
+    columns
+        .iter()
+        .map(|column| {
+            let id = interner.lookup(column)?;
+            record.props.get(&id).cloned()
+        })
+        .collect()
 }
 
 /// Configuration for adaptive query plan behavior.
@@ -458,7 +601,13 @@ pub struct VectorIndexes<'a> {
 
 pub struct ExecutionContext<'a> {
     pub engine: &'a StorageEngine,
+    /// This statement's view of the field dictionary: the verified bindings
+    /// when it started, plus those it registered since.
     pub interner: &'a mut FieldInterner,
+    /// The authority new property names are registered with before data
+    /// encoded with them is written. `None` when `interner` is itself the
+    /// only authority (a context over a bare engine, as in tests).
+    pub field_registrar: Option<&'a dyn coordinode_core::graph::intern::FieldRegistrar>,
     /// Node ID allocator for CREATE operations.
     pub id_allocator: &'a NodeIdAllocator,
     /// Default shard ID for single-node deployment.
@@ -493,6 +642,9 @@ pub struct ExecutionContext<'a> {
     pub warnings: Vec<String>,
     /// Write statistics accumulated during this statement.
     pub write_stats: WriteStats,
+    /// Unique keys this statement claimed. A commit that loses a race for one
+    /// of them is reported as the key existing, not as a bare write conflict.
+    pub key_claims: KeyClaims,
     /// Optional full-text search index for text_match()/text_score() queries.
     /// Uses MultiLanguageTextIndex which wraps TextIndex with per-language support.
     /// 2-arg text_match(field, query) uses default language; 3-arg adds explicit language.
@@ -693,7 +845,63 @@ pub struct ExecutionContext<'a> {
     pub pending_vector_writes: Vec<(String, String, NodeId, Vec<f32>)>,
 }
 
+/// Ids of the engine-managed fields a temporal version carries:
+/// `[valid_from, valid_to, __ingestion_ts__]`, registered together.
+fn temporal_field_ids(ctx: &mut ExecutionContext<'_>) -> Result<[u32; 3], ExecutionError> {
+    let ids = ctx.field_ids(&["valid_from", "valid_to", "__ingestion_ts__"])?;
+    Ok([ids[0], ids[1], ids[2]])
+}
+
 impl<'a> ExecutionContext<'a> {
+    /// The id of `name` for data this statement writes, registering the name
+    /// first when it has none. The binding is durable before the id is
+    /// returned, so no write encoded with it can outlive its meaning.
+    ///
+    /// # Errors
+    ///
+    /// The registration was refused or could not be published.
+    #[inline]
+    pub fn field_id(&mut self, name: &str) -> Result<u32, ExecutionError> {
+        if let Some(id) = self.interner.lookup(name) {
+            return Ok(id);
+        }
+        Ok(self.register_fields(&[name])?[0])
+    }
+
+    /// The ids of `names`, in order, registering the missing ones in one
+    /// batch: a write that introduces several names pays one registration.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::field_id`].
+    pub fn field_ids(&mut self, names: &[&str]) -> Result<Vec<u32>, ExecutionError> {
+        if let Some(ids) = names.iter().map(|n| self.interner.lookup(n)).collect() {
+            return Ok(ids);
+        }
+        self.register_fields(names)
+    }
+
+    #[cold]
+    fn register_fields(&mut self, names: &[&str]) -> Result<Vec<u32>, ExecutionError> {
+        let Some(registrar) = self.field_registrar else {
+            return Ok(names.iter().map(|n| self.interner.intern(n)).collect());
+        };
+        let ids = registrar.register(names)?;
+        // Callers index the result by position.
+        if ids.len() != names.len() {
+            return Err(DictionaryError::Registration(format!(
+                "{} ids returned for {} names",
+                ids.len(),
+                names.len()
+            ))
+            .into());
+        }
+        for (name, &id) in names.iter().zip(&ids) {
+            self.interner.insert_binding(name, id)?;
+        }
+        Ok(ids)
+    }
+
     /// The vector index registry, when this context has vector indexes.
     pub fn vector_index_registry(&self) -> Option<&'a crate::index::VectorIndexRegistry> {
         self.vector_indexes.map(|v| v.registry)
@@ -1092,6 +1300,377 @@ impl<'a> ExecutionContext<'a> {
     pub fn mvcc_delete(&mut self, part: Partition, key: &[u8]) -> Result<(), ExecutionError> {
         self.sync_txn_state();
         Ok(self.txn.delete(part, key)?)
+    }
+
+    /// Claim `key` of `table` for the row `node_id`. A key another row holds,
+    /// committed or claimed earlier in this statement, is refused.
+    pub fn claim_table_key(
+        &mut self,
+        table: &str,
+        key: Vec<Value>,
+        node_id: NodeId,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_modality::{LocalTableKeyStore, TableKeyStore as _};
+        self.sync_txn_state();
+        if let Some(holder) = LocalTableKeyStore.lookup(&mut self.txn, table, &key)? {
+            return Err(duplicate_key(table, &key, holder));
+        }
+        LocalTableKeyStore.claim(&mut self.txn, table, &key, node_id)?;
+        self.key_claims
+            .tables
+            .push((table.to_string(), key, node_id));
+        Ok(())
+    }
+
+    /// Stage the B-tree index entries of `record`, a node being created. A
+    /// unique value another node holds refuses the write.
+    pub fn index_node_created(
+        &mut self,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let label = record.primary_label();
+        if label.is_empty() || !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let lookup = crate::index::registry::record_lookup(record, interner);
+        let field_of = |name: &str| interner.lookup(name);
+        registry
+            .on_node_created(
+                self.engine,
+                &mut self.txn,
+                &crate::index::registry::NodeState {
+                    node_id,
+                    label,
+                    value_of: &lookup,
+                },
+                &field_of,
+                &mut self.key_claims.indexes,
+            )
+            .map_err(index_write_error)
+    }
+
+    /// Move the B-tree index entries of `record` as its `property` changes to
+    /// `new_value` (`None`: the property is removed). Called before the
+    /// record changes; a unique value another node holds refuses the write.
+    pub fn index_property_changed(
+        &mut self,
+        node_id: NodeId,
+        record: &NodeRecord,
+        property: &str,
+        new_value: Option<&Value>,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let label = record.primary_label();
+        if !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let before = crate::index::registry::record_lookup(record, interner);
+        let after = |name: &str| {
+            if name == property {
+                new_value.cloned()
+            } else {
+                before(name)
+            }
+        };
+        let field_of = |name: &str| interner.lookup(name);
+        registry
+            .on_property_changed(
+                self.engine,
+                &mut self.txn,
+                &crate::index::PropertyChange {
+                    node_id,
+                    label,
+                    properties: &[property],
+                    before: &before,
+                    after: &after,
+                },
+                &field_of,
+                &mut self.key_claims.indexes,
+            )
+            .map_err(index_write_error)
+    }
+
+    /// Move the B-tree index entries of a node whose declared properties go
+    /// from `old` to `new` (keyed by field id), as a node merge rewrites its
+    /// target. A unique value another node holds refuses the write.
+    pub fn index_fields_changed(
+        &mut self,
+        node_id: NodeId,
+        label: &str,
+        old: &HashMap<u32, Value>,
+        new: &HashMap<u32, Value>,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        if !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let changed: Vec<&str> = old
+            .keys()
+            .chain(new.keys())
+            .filter(|field| old.get(field) != new.get(field))
+            .filter_map(|field| interner.resolve(*field))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let before = |name: &str| interner.lookup(name).and_then(|f| old.get(&f).cloned());
+        let after = |name: &str| interner.lookup(name).and_then(|f| new.get(&f).cloned());
+        let field_of = |name: &str| interner.lookup(name);
+        registry
+            .on_property_changed(
+                self.engine,
+                &mut self.txn,
+                &crate::index::PropertyChange {
+                    node_id,
+                    label,
+                    properties: &changed,
+                    before: &before,
+                    after: &after,
+                },
+                &field_of,
+                &mut self.key_claims.indexes,
+            )
+            .map_err(index_write_error)
+    }
+
+    /// The nodes whose entry in the B-tree index `index_name` holds exactly
+    /// `value`, as this statement sees the index. `None` when the index
+    /// cannot answer: it is not active here, not fully built, or `value` has
+    /// no key.
+    pub fn index_lookup(
+        &mut self,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<NodeId>>, ExecutionError> {
+        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
+        let Some(index) = self.btree_index_registry.and_then(|r| r.get(index_name)) else {
+            return Ok(None);
+        };
+        if index.index_type != crate::index::IndexType::BTree
+            || index.state != IndexState::Ready
+            || index.layout != ENTRY_LAYOUT
+        {
+            return Ok(None);
+        }
+        self.sync_txn_state();
+        Ok(LocalIndexStore::new(self.engine).scan_exact(
+            &mut self.txn,
+            &index,
+            std::slice::from_ref(value),
+        )?)
+    }
+
+    /// Stage the removal of the B-tree index entries of `record`, a node
+    /// being deleted.
+    pub fn index_node_deleted(
+        &mut self,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let label = record.primary_label();
+        if !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let lookup = crate::index::registry::record_lookup(record, interner);
+        let field_of = |name: &str| interner.lookup(name);
+        Ok(registry.on_node_deleted(
+            self.engine,
+            &mut self.txn,
+            &crate::index::registry::NodeState {
+                node_id,
+                label,
+                value_of: &lookup,
+            },
+            &field_of,
+        )?)
+    }
+
+    /// Fill `index` from the stored nodes, one log entry per page through
+    /// this statement's commit path. Call once the index is registered with
+    /// the writers.
+    pub fn backfill_index(
+        &mut self,
+        index: &crate::index::IndexDefinition,
+    ) -> Result<u64, crate::index::build::BackfillError> {
+        let write_concern = self.write_concern;
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &write_concern,
+            pipeline: self.proposal_pipeline,
+            id_gen: self.proposal_id_gen,
+            drain_buffer: self.drain_buffer,
+            nvme_write_buffer: self.nvme_write_buffer,
+        };
+        crate::index::build::Backfill {
+            engine: self.engine,
+            oracle: self.mvcc_oracle,
+            interner: self.interner,
+            shard_id: self.shard_id,
+            // This statement's own transaction is open throughout.
+            own_open: 1,
+        }
+        .run(index, &mut |txn| txn.commit(&commit_ctx).map(|_| ()))
+    }
+
+    /// Stage and commit one catalog change in a transaction of its own,
+    /// through this statement's commit path, outside the statement
+    /// transaction: DDL whose record is written on the condition of its
+    /// version, so two concurrent changes cannot both build on one state.
+    pub fn commit_catalog_change(
+        &mut self,
+        stage: impl FnOnce(
+            &mut coordinode_storage::engine::transaction::Transaction<'_>,
+        ) -> Result<(), coordinode_modality::StoreError>,
+    ) -> Result<(), ExecutionError> {
+        use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
+        let mut txn = match self.mvcc_oracle {
+            Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
+            None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
+        };
+        stage(&mut txn)?;
+        let write_concern = self.write_concern;
+        let outcome = txn
+            .commit(&CommitContext {
+                write_concern: &write_concern,
+                pipeline: self.proposal_pipeline,
+                id_gen: self.proposal_id_gen,
+                drain_buffer: self.drain_buffer,
+                nvme_write_buffer: self.nvme_write_buffer,
+            })
+            .map_err(|e| match e {
+                CommitError::RevisionMismatch { .. } | CommitError::Conflict(_) => {
+                    ExecutionError::Unsupported(
+                        "the catalog record changed concurrently; retry the statement".into(),
+                    )
+                }
+                other => ExecutionError::Unsupported(format!("commit DDL: {other}")),
+            })?;
+        if let Some(index) = outcome.applied_index {
+            self.write_stats.applied_index = self.write_stats.applied_index.max(Some(index));
+        }
+        Ok(())
+    }
+
+    /// Commit `mutations` as one log entry of their own, outside the
+    /// statement transaction: DDL whose effects land together or not at all,
+    /// such as an index definition and the range tombstone clearing the
+    /// entries left under its name.
+    pub fn propose_mutations(
+        &mut self,
+        mutations: Vec<coordinode_core::txn::proposal::Mutation>,
+    ) -> Result<(), ExecutionError> {
+        let (Some(pipeline), Some(id_gen)) = (self.proposal_pipeline, self.proposal_id_gen) else {
+            // A context without a log (unit tests) has nothing to replicate to.
+            use coordinode_modality::{IndexStore as _, LocalIndexStore};
+            return Ok(LocalIndexStore::new(self.engine).apply_unreplicated(&mutations)?);
+        };
+        let proposal = coordinode_core::txn::proposal::RaftProposal {
+            id: id_gen.next(),
+            mutations,
+            commit_ts: self
+                .mvcc_oracle
+                .map(|o| o.next())
+                .unwrap_or(self.mvcc_read_ts),
+            start_ts: self.mvcc_read_ts,
+            bypass_rate_limiter: false,
+        };
+        let outcome = pipeline
+            .propose_and_wait(&proposal)
+            .map_err(|e| ExecutionError::Unsupported(format!("commit DDL: {e}")))?;
+        // A causal read after the statement fences past this entry too.
+        self.write_stats.applied_index = self.write_stats.applied_index.max(outcome.applied_index);
+        Ok(())
+    }
+
+    /// Free the key of `record`, a row being deleted, when its label is a
+    /// table with declared key columns.
+    pub fn release_table_key(&mut self, record: &NodeRecord) -> Result<(), ExecutionError> {
+        use coordinode_core::schema::definition::TableKey;
+        use coordinode_modality::{LocalTableKeyStore, TableKeyStore as _};
+        let table = record.primary_label().to_string();
+        let Some(schema) = self.load_current_label_schema(&table)? else {
+            return Ok(());
+        };
+        let Some(TableKey::Columns(columns)) = schema.table_key() else {
+            return Ok(());
+        };
+        let Some(key) = row_key(columns, record, self.interner) else {
+            return Ok(());
+        };
+        self.sync_txn_state();
+        LocalTableKeyStore.release(&mut self.txn, &table, &key)?;
+        Ok(())
+    }
+
+    /// Free every key of `table` (DROP TABLE).
+    pub fn release_all_table_keys(&mut self, table: &str) -> Result<(), ExecutionError> {
+        use coordinode_modality::{LocalTableKeyStore, TableKeyStore as _};
+        self.sync_txn_state();
+        LocalTableKeyStore.release_all(&mut self.txn, table)?;
+        Ok(())
+    }
+
+    /// Turn a commit refused for contention into [`ExecutionError::DuplicateKey`]
+    /// when a key this statement claimed is now held by another row: two
+    /// writers inserted one key and this one lost, so the key exists.
+    fn explain_lost_key_race(&self, error: ExecutionError) -> ExecutionError {
+        use coordinode_modality::{
+            IndexStore as _, LocalIndexStore, LocalTableKeyStore, TableKeyStore as _,
+        };
+        if !matches!(error, ExecutionError::Conflict(_)) || self.key_claims.is_empty() {
+            return error;
+        }
+        // The winner may have taken its timestamp and not applied yet; let the
+        // commits already numbered land before asking who holds the key. This
+        // is a read of the key's outcome, so it waits as long as a read does.
+        if let Some(oracle) = self.mvcc_oracle {
+            if self
+                .engine
+                .pending_commits()
+                .await_complete_at(oracle.current().as_raw(), self.read_timeout)
+                .is_err()
+            {
+                return error;
+            }
+        }
+        for (table, key, claimed_for) in &self.key_claims.tables {
+            if let Ok(Some(holder)) = LocalTableKeyStore.committed_holder(self.engine, table, key) {
+                if holder != *claimed_for {
+                    return duplicate_key(table, key, holder);
+                }
+            }
+        }
+        let indexes = LocalIndexStore::new(self.engine);
+        for claim in &self.key_claims.indexes {
+            if let Ok(Some(holder)) =
+                indexes.committed_conflict(&claim.index, &claim.values, claim.node_id)
+            {
+                return unique_violation(crate::index::UniqueViolation::new(
+                    &claim.index,
+                    &claim.values,
+                    holder,
+                ));
+            }
+        }
+        error
     }
 
     /// Persist an index definition transactionally (CREATE INDEX DDL). Buffers
@@ -1705,7 +2284,10 @@ impl<'a> ExecutionContext<'a> {
             drain_buffer: self.drain_buffer,
             nvme_write_buffer: self.nvme_write_buffer,
         };
-        let outcome = self.txn.commit(&ctx).map_err(commit_err_to_execution)?;
+        let outcome = match self.txn.commit(&ctx) {
+            Ok(outcome) => outcome,
+            Err(e) => return Err(self.explain_lost_key_race(commit_err_to_execution(e))),
+        };
         // operationTime spans every Raft entry the statement produced — `max`,
         // not assign: a statement may have issued an earlier in-execute
         // proposal (e.g. CREATE VECTOR INDEX schema persist) whose index must
@@ -2448,7 +3030,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         }
 
         LogicalOp::Filter { input, predicate } => {
-            let rows = execute_op(input, ctx)?;
+            // `WHERE t.key = v` over a keyed table: the key index names the
+            // one candidate row. The full predicate is still applied below.
+            let keyed = match input.as_ref() {
+                LogicalOp::NodeScan {
+                    variable,
+                    labels,
+                    property_filters,
+                } => {
+                    let mut key_filters = property_filters.clone();
+                    equality_filters(predicate, variable, &mut key_filters);
+                    scan_by_table_key(variable, labels, &key_filters, property_filters, ctx)?
+                }
+                _ => None,
+            };
+            let rows = match keyed {
+                Some(rows) => rows,
+                None => execute_op(input, ctx)?,
+            };
             let corr = ctx.correlated_row.clone();
             if neutral_contains_subplan(predicate) {
                 // Storage-aware path: correlated subplans need edge lookups.
@@ -3081,6 +3680,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             unique,
             sparse,
             filter,
+            maintenance,
         } => execute_create_btree_index(
             name,
             label,
@@ -3088,10 +3688,19 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             *unique,
             *sparse,
             filter.as_ref(),
+            *maintenance,
             ctx,
         ),
 
         LogicalOp::DropIndex { name } => execute_drop_btree_index(name, ctx),
+
+        LogicalOp::AlterIndexMaintenance { name, profile } => {
+            execute_alter_index_maintenance(name, *profile, ctx)
+        }
+
+        LogicalOp::SetNamespaceIndexDefault { profile } => {
+            execute_set_namespace_index_default(*profile, ctx)
+        }
 
         LogicalOp::CreateVectorIndex {
             name,
@@ -3461,6 +4070,11 @@ fn execute_node_scan(
     property_filters: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    if let Some(rows) =
+        scan_by_table_key(variable, labels, property_filters, property_filters, ctx)?
+    {
+        return Ok(rows);
+    }
     let mut results = Vec::new();
 
     // A COLUMNAR table's rows live in its own columnar tree, not the node path;
@@ -3511,77 +4125,305 @@ fn execute_node_scan(
         let record = NodeRecord::from_msgpack(value_bytes).map_err(|e| {
             ExecutionError::Serialization(format!("node deserialization error: {e}"))
         })?;
-
-        // Label filter: if labels specified, node must match one of them
-        if !labels.is_empty() && !labels.iter().any(|l| record.has_label(l)) {
-            continue;
-        }
-
-        // Extract node ID from key
         let node_id = decode_node_id_from_key(key_bytes);
-
-        // Build row with node variable and its properties
-        let mut row = Row::new();
-        row.insert(variable.to_string(), Value::Int(node_id as i64));
-
-        // Add interned properties as variable.property columns
-        for (field_id, value) in &record.props {
-            if let Some(field_name) = ctx.interner.resolve(*field_id) {
-                let col_name = format!("{variable}.{field_name}");
-                row.insert(col_name, value.clone());
-            }
-        }
-        // Add extra overflow properties (VALIDATED mode undeclared props)
-        if let Some(extra) = &record.extra {
-            for (name, value) in extra {
-                let col_name = format!("{variable}.{name}");
-                row.insert(col_name, value.clone());
-            }
-        }
-
-        // Add label info
-        let primary_label = record.primary_label().to_string();
-        row.insert(
-            format!("{variable}.__label__"),
-            Value::String(primary_label.clone()),
-        );
-
-        // Inject COMPUTED property values from schema.
-        inject_computed_properties(&mut row, variable, &primary_label, ctx);
-
-        // Apply inline property filters from pattern. When this scan runs
-        // inside a correlated join (e.g. `UNWIND ... AS e MATCH (a {p: e.x})`)
-        // the filter value can reference outer-bound variables; evaluate it
-        // against the correlated row extended with this node's bindings so
-        // `e.x` resolves. An inline `{p: e.x}` is semantically identical to
-        // `WHERE a.p = e.x`, which already works through the post-join Filter
-        // path — this closes the asymmetry.
-        let mut matches = true;
-        for (prop_name, filter_expr) in property_filters {
-            let actual = row
-                .get(&format!("{variable}.{prop_name}"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let expected = match &ctx.correlated_row {
-                Some(corr) => {
-                    let mut eval_row = corr.clone();
-                    eval_row.extend(row.clone());
-                    eval_neutral(filter_expr, &eval_row)?
-                }
-                None => eval_neutral(filter_expr, &row)?,
-            };
-            if actual != expected {
-                matches = false;
-                break;
-            }
-        }
-
-        if matches {
+        if let Some(row) =
+            node_row_if_matching(variable, labels, node_id, &record, property_filters, ctx)?
+        {
             results.push(row);
         }
     }
 
     Ok(results)
+}
+
+/// The row a node scan produces for `record`, or `None` when the record has
+/// none of `labels` or fails one of the inline `property_filters`.
+fn node_row_if_matching(
+    variable: &str,
+    labels: &[String],
+    node_id: u64,
+    record: &NodeRecord,
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<Row>, ExecutionError> {
+    if !labels.is_empty() && !labels.iter().any(|l| record.has_label(l)) {
+        return Ok(None);
+    }
+
+    let mut row = Row::new();
+    row.insert(variable.to_string(), Value::Int(node_id as i64));
+    for (field_id, value) in &record.props {
+        if let Some(field_name) = ctx.interner.resolve(*field_id) {
+            row.insert(format!("{variable}.{field_name}"), value.clone());
+        }
+    }
+    // Overflow properties (undeclared properties of a VALIDATED label).
+    if let Some(extra) = &record.extra {
+        for (name, value) in extra {
+            row.insert(format!("{variable}.{name}"), value.clone());
+        }
+    }
+    let primary_label = record.primary_label().to_string();
+    row.insert(
+        format!("{variable}.__label__"),
+        Value::String(primary_label.clone()),
+    );
+    inject_computed_properties(&mut row, variable, &primary_label, ctx);
+
+    // Inline property filters. Inside a correlated join (e.g. `UNWIND ... AS
+    // e MATCH (a {p: e.x})`) a filter value can reference outer bindings, so
+    // it is evaluated against the correlated row extended with this node's:
+    // an inline `{p: e.x}` means the same as `WHERE a.p = e.x`.
+    for (prop_name, filter_expr) in property_filters {
+        let actual = row
+            .get(&format!("{variable}.{prop_name}"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let expected = match &ctx.correlated_row {
+            Some(corr) => {
+                let mut eval_row = corr.clone();
+                eval_row.extend(row.clone());
+                eval_neutral(filter_expr, &eval_row)?
+            }
+            None => eval_neutral(filter_expr, &row)?,
+        };
+        if actual != expected {
+            return Ok(None);
+        }
+    }
+    Ok(Some(row))
+}
+
+/// Serve a scan of one row-stored table whose key columns `key_filters` all
+/// pin to values independent of the row: the key index names the one row that
+/// can match, so one read replaces a scan of the shard. `property_filters`
+/// still apply to that row. `None` when the scan is not such a lookup, and
+/// then the caller scans.
+///
+/// A value whose type differs from its key column's declared type is left to
+/// the scan, which compares as the query language does; the key index only
+/// holds values of the declared types.
+fn scan_by_table_key(
+    variable: &str,
+    labels: &[String],
+    key_filters: &[(String, crate::plan::expr::Expr)],
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<Vec<Row>>, ExecutionError> {
+    use coordinode_core::schema::definition::TableKey;
+    use coordinode_modality::{LocalTableKeyStore, StoreError, TableKeyStore as _};
+
+    // A server-side cursor pages through the scan's own key order.
+    if ctx.scan_paging.is_some() {
+        return Ok(None);
+    }
+    let [label] = labels else {
+        return Ok(None);
+    };
+    let Some(schema) = ctx.load_current_label_schema(label)? else {
+        return Ok(None);
+    };
+    if schema.is_columnar() || schema.temporal {
+        return Ok(None);
+    }
+    let Some(TableKey::Columns(columns)) = schema.table_key() else {
+        return Ok(None);
+    };
+    let mut key = Vec::with_capacity(columns.len());
+    for column in columns {
+        let Some((_, expr)) = key_filters.iter().find(|(p, _)| p == column) else {
+            return Ok(None);
+        };
+        if crate::planner::builder::expr_references_var(expr, variable) {
+            return Ok(None);
+        }
+        let value = match &ctx.correlated_row {
+            Some(corr) => eval_neutral(expr, corr)?,
+            None => eval_neutral(expr, &Row::new())?,
+        };
+        let declared = schema.get_property(column);
+        if declared.is_none_or(|def| validate_one(column, &value, def).is_err()) {
+            return Ok(None);
+        }
+        key.push(value);
+    }
+
+    ctx.sync_txn_state();
+    let holder = match LocalTableKeyStore.lookup(&mut ctx.txn, label, &key) {
+        Ok(holder) => holder,
+        Err(StoreError::UnsupportedKey(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(node_id) = holder else {
+        return Ok(Some(Vec::new()));
+    };
+    let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? else {
+        return Ok(Some(Vec::new()));
+    };
+    Ok(Some(
+        node_row_if_matching(
+            variable,
+            labels,
+            node_id.as_raw(),
+            &record,
+            property_filters,
+            ctx,
+        )?
+        .into_iter()
+        .collect(),
+    ))
+}
+
+/// The table and key columns of the node `variable` binds in `row`, when it
+/// is a row of a table with declared key columns.
+fn bound_table_key(
+    row: &Row,
+    variable: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<(String, Vec<String>)>, ExecutionError> {
+    use coordinode_core::schema::definition::TableKey;
+    if !matches!(row.get(variable), Some(Value::Int(_))) {
+        return Ok(None);
+    }
+    let Some(Value::String(label)) = row.get(&format!("{variable}.__label__")) else {
+        return Ok(None);
+    };
+    let label = label.clone();
+    let Some(schema) = ctx.load_current_label_schema(&label)? else {
+        return Ok(None);
+    };
+    Ok(match schema.table_key() {
+        Some(TableKey::Columns(columns)) => Some((label, columns.to_vec())),
+        _ => None,
+    })
+}
+
+/// Refuse a table label given to, or taken from, an existing node: a node
+/// becomes a table row only by being inserted into the table.
+fn refuse_table_label_change(
+    label: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    if ctx
+        .load_current_label_schema(label)?
+        .is_some_and(|s| s.is_table())
+    {
+        return Err(ExecutionError::Unsupported(format!(
+            "`{label}` is a table: a row joins or leaves it only by insert or delete, \
+             not by adding or removing the label"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse SET items that would change the key of a table row bound in `row`.
+/// A row's key is its identity and does not change.
+fn refuse_key_changes_in_set(
+    row: &Row,
+    items: &[crate::plan::SetItem],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::plan::SetItem;
+    for item in items {
+        let (variable, touched): (&str, Option<&str>) = match item {
+            SetItem::Property {
+                variable, property, ..
+            } => (variable, Some(property)),
+            SetItem::PropertyPath { variable, path, .. }
+            | SetItem::DocFunction { variable, path, .. } => {
+                (variable, path.first().map(String::as_str))
+            }
+            SetItem::ReplaceProperties { variable, .. }
+            | SetItem::MergeProperties { variable, .. } => (variable, None),
+            SetItem::AddLabel { label, .. } => {
+                refuse_table_label_change(label, ctx)?;
+                continue;
+            }
+        };
+        let Some((table, columns)) = bound_table_key(row, variable, ctx)? else {
+            continue;
+        };
+        let changed = match (item, touched) {
+            (_, Some(column)) => columns.iter().find(|c| c.as_str() == column),
+            // Replacing every property replaces the key with them.
+            (SetItem::ReplaceProperties { .. }, None) => columns.first(),
+            (SetItem::MergeProperties { expr, .. }, None) => match eval_neutral(expr, row)? {
+                Value::Map(map) => columns.iter().find(|c| map.contains_key(c.as_str())),
+                Value::Document(rmpv::Value::Map(entries)) => columns
+                    .iter()
+                    .find(|c| entries.iter().any(|(k, _)| k.as_str() == Some(c.as_str()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(column) = changed {
+            return Err(ExecutionError::KeyImmutable {
+                table,
+                column: column.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse REMOVE items that would take the key from a table row bound in
+/// `row`, or take a table label from a node.
+fn refuse_key_changes_in_remove(
+    row: &Row,
+    items: &[crate::plan::RemoveItem],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    use crate::plan::RemoveItem;
+    for item in items {
+        let (variable, column) = match item {
+            RemoveItem::Property { variable, property } => (variable, property.as_str()),
+            RemoveItem::PropertyPath { variable, path } => match path.first() {
+                Some(first) => (variable, first.as_str()),
+                None => continue,
+            },
+            RemoveItem::Label { label, .. } => {
+                refuse_table_label_change(label, ctx)?;
+                continue;
+            }
+        };
+        if let Some((table, columns)) = bound_table_key(row, variable, ctx)? {
+            if columns.iter().any(|c| c == column) {
+                return Err(ExecutionError::KeyImmutable {
+                    table,
+                    column: column.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `variable.column = value` conjuncts of `predicate`, as scan filters.
+fn equality_filters(
+    predicate: &crate::plan::expr::Expr,
+    variable: &str,
+    out: &mut Vec<(String, crate::plan::expr::Expr)>,
+) {
+    use crate::plan::expr::{BinOp, Expr};
+    let Expr::Binary { left, op, right } = predicate else {
+        return;
+    };
+    match op {
+        BinOp::And => {
+            equality_filters(left, variable, out);
+            equality_filters(right, variable, out);
+        }
+        BinOp::Eq => {
+            for (side, value) in [(left, right), (right, left)] {
+                if let Some(column) =
+                    crate::planner::builder::extract_index_property(side, variable)
+                {
+                    out.push((column, (**value).clone()));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Execute a B-tree index point-lookup (`IndexScan` logical operator).
@@ -3594,7 +4436,7 @@ fn execute_btree_index_scan(
     variable: &str,
     label: &str,
     index_name: &str,
-    _property: &str,
+    property: &str,
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
@@ -3620,21 +4462,37 @@ fn execute_btree_index_scan(
         None => eval_neutral(value_expr, &Row::new())?,
     };
 
-    // Use index_scan_exact to find node IDs matching the lookup value.
-    let node_ids = crate::index::ops::index_scan_exact(ctx.engine, index_name, &lookup_val)
-        .map_err(ExecutionError::Storage)?;
+    // An equality with NULL is never true.
+    if lookup_val.is_null() {
+        return Ok(Vec::new());
+    }
 
-    let mut results = Vec::with_capacity(node_ids.len());
+    // The entries as this statement sees them: its snapshot, its own writes.
+    // An index that cannot answer (not built, or a value with no key) leaves
+    // the equality to a scan, which applies the query's own comparison.
+    let Some(ids) = ctx.index_lookup(index_name, &lookup_val)? else {
+        return execute_node_scan(
+            variable,
+            &[label.to_string()],
+            &[(
+                property.to_string(),
+                crate::plan::expr::Expr::Literal(lookup_val),
+            )],
+            ctx,
+        );
+    };
+
+    let mut results = Vec::with_capacity(ids.len());
 
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
 
     // Materialize every matching node in one batched multi_get (single version
     // snapshot + batched bloom/SST traversal) rather than a per-id lookup loop.
-    let ids: Vec<NodeId> = node_ids.iter().map(|&raw| NodeId::from_raw(raw)).collect();
     let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
 
-    for (raw_id, record_opt) in node_ids.into_iter().zip(records) {
+    for (id, record_opt) in ids.into_iter().zip(records) {
+        let raw_id = id.as_raw();
         let Some(record) = record_opt else {
             // Node was deleted since the index entry was created — skip stale entry.
             continue;
@@ -3642,6 +4500,12 @@ fn execute_btree_index_scan(
 
         // Verify label matches (guards against stale index entries for deleted/relabeled nodes).
         if !record.has_label(label) {
+            continue;
+        }
+        // The index finds a list by each of its elements; the equality the
+        // query asked holds only for the value itself.
+        let held = crate::index::registry::record_lookup(&record, ctx.interner)(property);
+        if held.as_ref() != Some(&lookup_val) {
             continue;
         }
 
@@ -8141,9 +9005,10 @@ fn execute_merge_relationship_create(
     // overwrite the old (upsert semantics within a single-edge-per-type data model).
     let mut resolved_props: Vec<(String, Value)> = Vec::with_capacity(edge_filters.len());
     if !edge_filters.is_empty() {
+        let names: Vec<&str> = edge_filters.iter().map(|(n, _)| n.as_str()).collect();
+        let field_ids = ctx.field_ids(&names)?;
         let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(edge_filters.len());
-        for (prop_name, expr) in edge_filters {
-            let field_id = ctx.interner.intern(prop_name);
+        for ((prop_name, expr), field_id) in edge_filters.iter().zip(field_ids) {
             let value = eval_neutral(expr, correlated)?;
             prop_map.push((field_id, value.clone()));
             resolved_props.push((prop_name.clone(), value.clone()));
@@ -8330,13 +9195,15 @@ fn execute_upsert(
                 let mut current_row = row.clone();
                 for element in elements {
                     if let PatternElement::Node(np) = element {
-                        let node_id = ctx.id_allocator.next();
+                        let node_id = ctx.id_allocator.next()?;
                         let label = np.labels.first().cloned().unwrap_or_default();
 
                         let mut record = NodeRecord::new(&label);
-                        for (prop_name, expr) in &np.properties {
+                        let names: Vec<&str> =
+                            np.properties.iter().map(|(n, _)| n.as_str()).collect();
+                        let field_ids = ctx.field_ids(&names)?;
+                        for ((_, expr), field_id) in np.properties.iter().zip(field_ids) {
                             let val = eval_neutral(expr, &current_row)?;
-                            let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val);
                         }
 
@@ -8504,36 +9371,21 @@ fn execute_create_from_pattern(
                 }
             }
 
-            let node_id = ctx.id_allocator.next();
+            let node_id = ctx.id_allocator.next()?;
             let label = labels.first().cloned().unwrap_or_default();
 
             let mut record = NodeRecord::new(&label);
             let empty_row = Row::new();
-            for (prop_name, expr) in property_filters {
+            let names: Vec<&str> = property_filters.iter().map(|(n, _)| n.as_str()).collect();
+            let field_ids = ctx.field_ids(&names)?;
+            for ((_, expr), field_id) in property_filters.iter().zip(field_ids) {
                 let val = eval_neutral(expr, &empty_row)?;
-                let field_id = ctx.interner.intern(prop_name);
                 record.set(field_id, val);
             }
 
-            // Enforce unique constraints via B-tree index registry.
-            if let Some(btree_reg) = ctx.btree_index_registry {
-                if !label.is_empty() {
-                    let mut props_for_index: Vec<(String, Value)> =
-                        Vec::with_capacity(property_filters.len());
-                    for (name, expr) in property_filters.iter() {
-                        props_for_index.push((name.clone(), eval_neutral(expr, &empty_row)?));
-                    }
-                    btree_reg
-                        .on_node_created(ctx.engine, node_id, &label, &props_for_index)
-                        .map_err(|v| {
-                            ExecutionError::Conflict(format!(
-                                "unique constraint violated on index `{}`: \
-                                 property `{}` already has value {:?}",
-                                v.index_name, v.property, v.value
-                            ))
-                        })?;
-                }
-            }
+            // Index entries, in the statement transaction; a unique value
+            // another node holds refuses the write.
+            ctx.index_node_created(node_id, &record)?;
 
             ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
             // MERGE-created nodes count like CREATE-created ones: the write
@@ -8764,42 +9616,58 @@ fn execute_create_node(
         }
     }
 
-    // A relational table bridges its declared primary key to a NodeId, so
-    // the same key maps to the same node (identity + upsert-by-key). A ROW table
-    // writes that node on the node path; a COLUMNAR table writes it to its own
-    // columnar tree (`table_columnar`).
-    let (table_pk, table_columnar): (Option<Vec<String>>, bool) = match schema.as_ref() {
-        Some(s) if s.is_table() => (Some(s.primary_key.clone()), s.is_columnar()),
-        _ => (None, false),
+    // Every row, of a table or not, is a node with an id from the lease. A
+    // table with declared key columns also holds each row's key in its key
+    // index, which refuses a key another row holds. A ROW table writes the
+    // node on the node path; a COLUMNAR table writes it to its own columnar
+    // tree (`table_columnar`).
+    let (key_columns, table_columnar): (Vec<String>, bool) = match schema.as_ref() {
+        Some(s) if s.is_table() => (s.key_columns().to_vec(), s.is_columnar()),
+        _ => (Vec::new(), false),
     };
     let table_label = labels.first().cloned().unwrap_or_default();
 
     for input_row in input_rows {
-        // Table rows take their identity from the primary key; plain graph
-        // nodes get a freshly allocated id.
-        let node_id = match &table_pk {
-            Some(pk_cols) => {
-                let mut key_buf = Vec::new();
-                for pk in pk_cols {
-                    let Some((_, expr)) = properties.iter().find(|(n, _)| n == pk) else {
-                        return Err(ExecutionError::SchemaViolation(format!(
-                            "primary key column '{pk}' is required to insert into table '{}'",
-                            labels.first().map_or("?", String::as_str)
-                        )));
-                    };
-                    let v = eval_neutral(expr, input_row)?;
-                    let enc = rmp_serde::to_vec(&v).map_err(|e| {
-                        ExecutionError::Serialization(format!("encode primary key '{pk}': {e}"))
-                    })?;
-                    key_buf.extend_from_slice(&enc);
-                }
-                NodeId::from_primary_key(labels.first().map_or("", String::as_str), &key_buf)
-            }
-            None => ctx.id_allocator.next(),
-        };
+        let node_id = ctx.id_allocator.next()?;
+        let mut row_key = Vec::with_capacity(key_columns.len());
+        for column in &key_columns {
+            let Some((_, expr)) = properties.iter().find(|(n, _)| n == column) else {
+                return Err(ExecutionError::SchemaViolation(format!(
+                    "key column '{column}' is required to insert into table '{table_label}'"
+                )));
+            };
+            row_key.push(eval_neutral(expr, input_row)?);
+        }
 
         let mut record = NodeRecord::with_labels(labels.to_vec());
-        for (prop_name, expr) in properties {
+        // Every name stored under an id is registered in one batch up front.
+        // An undeclared property of a VALIDATED label is stored by name in the
+        // overflow map, so it takes no id.
+        let takes_id = |name: &str| {
+            !matches!(mode, SchemaMode::Validated)
+                || schema
+                    .as_ref()
+                    .is_some_and(|s| s.get_property(name).is_some())
+        };
+        let registered: Vec<&str> = properties
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| takes_id(n))
+            .collect();
+        let mut registered_ids = ctx.field_ids(&registered)?.into_iter();
+        // Aligned with `properties`; the reserved id marks a name stored by
+        // name, whose branch never reads it.
+        let field_ids: Vec<u32> = properties
+            .iter()
+            .map(|(n, _)| {
+                if takes_id(n) {
+                    registered_ids.next().unwrap_or(FieldInterner::RESERVED_ID)
+                } else {
+                    FieldInterner::RESERVED_ID
+                }
+            })
+            .collect();
+        for ((prop_name, expr), field_id) in properties.iter().zip(field_ids) {
             // Map literals → Document for full dot-notation support in storage.
             let val = eval_neutral(expr, input_row)?.map_to_document();
 
@@ -8815,10 +9683,9 @@ fn execute_create_node(
                             )));
                         }
                         Some(def) => {
-                            // Declared non-computed property → validate type, then intern and set.
+                            // Declared non-computed property → validate type, then set.
                             validate_one(prop_name, &val, def)
                                 .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
-                            let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val.clone());
                         }
                         None => {
@@ -8841,17 +9708,15 @@ fn execute_create_node(
                             )));
                         }
                         Some(def) => {
-                            // Declared non-computed property → validate type, then intern and set.
+                            // Declared non-computed property → validate type, then set.
                             validate_one(prop_name, &val, def)
                                 .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))?;
-                            let field_id = ctx.interner.intern(prop_name);
                             record.set(field_id, val.clone());
                         }
                     }
                 }
                 SchemaMode::Flexible => {
-                    // No schema enforcement — intern and set unconditionally.
-                    let field_id = ctx.interner.intern(prop_name);
+                    // No schema enforcement: set unconditionally.
                     record.set(field_id, val.clone());
                 }
             }
@@ -8952,29 +9817,16 @@ fn execute_create_node(
             // lookup. Microseconds (HLC native unit) — same precision as
             // `current_hlc_us` used by the trigger machinery.
             let ingestion_us = current_hlc_us() as i64;
-            let field_id = ctx.interner.intern("__ingestion_ts__");
+            let field_id = ctx.field_id("__ingestion_ts__")?;
             record.set(field_id, Value::Int(ingestion_us));
         }
 
-        // Enforce unique constraints via B-tree index registry BEFORE writing
-        // the node to storage. If a constraint would be violated, fail early.
-        if let Some(btree_reg) = ctx.btree_index_registry {
-            if let Some(primary_label) = labels.first() {
-                let mut props_for_index: Vec<(String, Value)> =
-                    Vec::with_capacity(properties.len());
-                for (name, expr) in properties.iter() {
-                    props_for_index.push((name.clone(), eval_neutral(expr, input_row)?));
-                }
-                btree_reg
-                    .on_node_created(ctx.engine, node_id, primary_label, &props_for_index)
-                    .map_err(|v| {
-                        ExecutionError::Conflict(format!(
-                            "unique constraint violated on index `{}`: \
-                             property `{}` already has value {:?}",
-                            v.index_name, v.property, v.value
-                        ))
-                    })?;
-            }
+        // Index entries, in the statement transaction, from the values as
+        // stored; a unique value another node holds refuses the write.
+        ctx.index_node_created(node_id, &record)?;
+
+        if !row_key.is_empty() {
+            ctx.claim_table_key(&table_label, row_key, node_id)?;
         }
 
         if table_columnar {
@@ -9157,16 +10009,21 @@ fn execute_create_edge(
             let mut prop_map: Vec<(u32, Value)> = Vec::with_capacity(properties.len());
             let mut valid_from_value: Option<i64> = None;
             let mut valid_to_value: Option<i64> = None;
-            for (prop_name, expr) in properties {
-                // Reject writes to reserved metadata field names that would
-                // otherwise collide with engine-internal row columns.
-                if matches!(prop_name.as_str(), "__src__" | "__tgt__" | "__type__") {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "edge property name '{prop_name}' is reserved for engine-internal \
-                         metadata; choose a different name"
-                    )));
-                }
-                let field_id = ctx.interner.intern(prop_name);
+            // Reject writes to reserved metadata field names that would
+            // otherwise collide with engine-internal row columns, before any
+            // name of the edge is registered.
+            if let Some((prop_name, _)) = properties
+                .iter()
+                .find(|(n, _)| matches!(n.as_str(), "__src__" | "__tgt__" | "__type__"))
+            {
+                return Err(ExecutionError::Unsupported(format!(
+                    "edge property name '{prop_name}' is reserved for engine-internal \
+                     metadata; choose a different name"
+                )));
+            }
+            let names: Vec<&str> = properties.iter().map(|(n, _)| n.as_str()).collect();
+            let field_ids = ctx.field_ids(&names)?;
+            for ((prop_name, expr), field_id) in properties.iter().zip(field_ids) {
                 let value = eval_neutral(expr, row)?.map_to_document();
                 if is_temporal && prop_name == "valid_from" {
                     // Accept both Int and Timestamp, both read as epoch
@@ -9280,6 +10137,9 @@ fn execute_update(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let skip_on_violation = matches!(violation_mode, ViolationMode::Skip);
+    for row in input_rows {
+        refuse_key_changes_in_set(row, items, ctx)?;
+    }
 
     let mut results = Vec::new();
 
@@ -9451,7 +10311,7 @@ fn execute_update(
                     match item {
                         crate::plan::SetItem::Property { property, expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?.map_to_document();
-                            let field_id = ctx.interner.intern(property);
+                            let field_id = ctx.field_id(property)?;
                             new_record.set(field_id, val);
                         }
                         crate::plan::SetItem::AddLabel { label, .. } => {
@@ -9460,13 +10320,14 @@ fn execute_update(
                         crate::plan::SetItem::ReplaceProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
+                                let names: Vec<&str> = map.keys().map(String::as_str).collect();
+                                let fids = ctx.field_ids(&names)?;
                                 // Clear existing user props, keep engine-managed
                                 // fields (__ingestion_ts__, valid_from, valid_to
                                 // are reapplied below).
                                 new_record.props.clear();
                                 new_record.extra = None;
-                                for (k, v) in map {
-                                    let fid = ctx.interner.intern(&k);
+                                for (v, fid) in map.into_values().zip(fids) {
                                     new_record.set(fid, v.map_to_document());
                                 }
                             }
@@ -9474,8 +10335,9 @@ fn execute_update(
                         crate::plan::SetItem::MergeProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
-                                for (k, v) in map {
-                                    let fid = ctx.interner.intern(&k);
+                                let names: Vec<&str> = map.keys().map(String::as_str).collect();
+                                let fids = ctx.field_ids(&names)?;
+                                for (v, fid) in map.into_values().zip(fids) {
                                     new_record.set(fid, v.map_to_document());
                                 }
                             }
@@ -9492,7 +10354,7 @@ fn execute_update(
                                     "SET on temporal node `{var}`: empty property path"
                                 )));
                             }
-                            let field_id = ctx.interner.intern(&path[0]);
+                            let field_id = ctx.field_id(&path[0])?;
                             let sub_path = path[1..].to_vec();
                             let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
                                 target: coordinode_core::graph::doc_delta::PathTarget::PropField(
@@ -9522,9 +10384,9 @@ fn execute_update(
                             // but applied in-memory to `new_record`.
                             let val = eval_neutral(value_expr, &out_row)?;
                             let (field_id, sub_path) = if path.is_empty() {
-                                (ctx.interner.intern(var), vec![])
+                                (ctx.field_id(var)?, vec![])
                             } else {
-                                (ctx.interner.intern(&path[0]), path[1..].to_vec())
+                                (ctx.field_id(&path[0])?, path[1..].to_vec())
                             };
                             let target =
                                 coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
@@ -9582,9 +10444,7 @@ fn execute_update(
                 // - new record: valid_from = NOW, valid_to = NULL (open),
                 //   refreshed __ingestion_ts__.
                 // - closing record: valid_to = NOW.
-                let vf_fid = ctx.interner.intern("valid_from");
-                let vt_fid = ctx.interner.intern("valid_to");
-                let its_fid = ctx.interner.intern("__ingestion_ts__");
+                let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
                 new_record.set(vf_fid, Value::Int(new_valid_from));
                 new_record.props.remove(&vt_fid);
                 new_record.set(its_fid, Value::Int(now_us));
@@ -9867,7 +10727,7 @@ fn execute_update(
                                      valid_from={valid_from})"
                                 ))
                             })?;
-                        let field_id = ctx.interner.intern("valid_to");
+                        let field_id = ctx.field_id("valid_to")?;
                         match new_valid_to {
                             Some(vt) => record.set(field_id, Value::Int(vt)),
                             None => {
@@ -9948,35 +10808,12 @@ fn execute_update(
                             return Err(err);
                         }
 
-                        let field_id = ctx.interner.intern(property);
+                        let field_id = ctx.field_id(property)?;
 
-                        // Capture old value BEFORE updating the record, so
-                        // the B-tree index can remove the stale entry.
-                        let old_value: Option<Value> = record.get(field_id).cloned();
-
-                        // Update B-tree index: remove old entry, add new entry
-                        // (which also enforces uniqueness on the new value).
-                        // Must happen BEFORE writing the record to storage so
-                        // that a unique violation rolls back cleanly.
-                        if let Some(btree_reg) = ctx.btree_index_registry {
-                            let label = record.primary_label().to_string();
-                            btree_reg
-                                .on_property_changed(
-                                    ctx.engine,
-                                    node_id,
-                                    &label,
-                                    property,
-                                    old_value.as_ref(),
-                                    &val,
-                                )
-                                .map_err(|v| {
-                                    ExecutionError::Conflict(format!(
-                                        "unique constraint violated on index `{}`: \
-                                         property `{}` already has value {:?}",
-                                        v.index_name, v.property, v.value
-                                    ))
-                                })?;
-                        }
+                        // Move the node's index entries from the old value to
+                        // the new one before the record changes; a unique
+                        // value another node holds refuses the write.
+                        ctx.index_property_changed(node_id, &record, property, Some(&val))?;
 
                         record.set(field_id, val.clone());
 
@@ -10075,7 +10912,7 @@ fn execute_update(
                     // O(1) write via merge operand.
                     // path[0] = property name → resolved to field_id via interner
                     // path[1..] = nested path within the DOCUMENT value
-                    let field_id = ctx.interner.intern(&path[0]);
+                    let field_id = ctx.field_id(&path[0])?;
                     let sub_path = &path[1..];
 
                     let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
@@ -10164,9 +11001,9 @@ fn execute_update(
                     let (field_id, sub_path) = if path.is_empty() {
                         // Bare variable — treat variable as property name on itself.
                         // This is an edge case; normally path has at least one element.
-                        (ctx.interner.intern(variable), vec![])
+                        (ctx.field_id(variable)?, vec![])
                     } else {
-                        (ctx.interner.intern(&path[0]), path[1..].to_vec())
+                        (ctx.field_id(&path[0])?, path[1..].to_vec())
                     };
 
                     let target = coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
@@ -10298,12 +11135,15 @@ fn execute_update(
                         }
 
                         // Clear existing props and set new ones from map
-                        record.props.clear();
                         if let Value::Map(ref map) = map_val {
-                            for (k, v) in map {
-                                let field_id = ctx.interner.intern(k);
+                            let names: Vec<&str> = map.keys().map(String::as_str).collect();
+                            let field_ids = ctx.field_ids(&names)?;
+                            record.props.clear();
+                            for (v, field_id) in map.values().zip(field_ids) {
                                 record.set(field_id, v.clone());
                             }
+                        } else {
+                            record.props.clear();
                         }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
@@ -10431,8 +11271,9 @@ fn execute_update(
                         }
 
                         if let Value::Map(ref map) = map_val {
-                            for (k, v) in map {
-                                let field_id = ctx.interner.intern(k);
+                            let names: Vec<&str> = map.keys().map(String::as_str).collect();
+                            let field_ids = ctx.field_ids(&names)?;
+                            for (v, field_id) in map.values().zip(field_ids) {
                                 record.set(field_id, v.clone());
                             }
                         }
@@ -10602,6 +11443,9 @@ fn execute_remove(
     //     new, with the path removed by a DocDelta applied in memory to
     //     the new record (the merge-operand path is keyed on the
     //     non-temporal key).
+    for row in input_rows {
+        refuse_key_changes_in_remove(row, items, ctx)?;
+    }
     let mut temporal_remove_vars: std::collections::HashSet<(usize, String)> =
         std::collections::HashSet::new();
     for (row_idx, row) in input_rows.iter().enumerate() {
@@ -10732,40 +11576,39 @@ fn execute_remove(
                                     "REMOVE on temporal node `{var}`: empty property path"
                                 )));
                             }
-                            let field_id = ctx.interner.intern(&path[0]);
-                            let sub_path = path[1..].to_vec();
-                            let delta = if sub_path.is_empty() {
-                                // Top-level prop removal — RemoveProperty
-                                // (no sub-path traversal).
-                                coordinode_core::graph::doc_delta::DocDelta::RemoveProperty {
-                                    target:
-                                        coordinode_core::graph::doc_delta::PathTarget::PropField(
-                                            field_id,
-                                        ),
-                                    key: None,
-                                }
-                            } else {
-                                coordinode_core::graph::doc_delta::DocDelta::DeletePath {
-                                    target:
-                                        coordinode_core::graph::doc_delta::PathTarget::PropField(
-                                            field_id,
-                                        ),
-                                    path: sub_path,
-                                }
-                            };
-                            coordinode_storage::engine::merge::apply_doc_deltas_to_record(
-                                &mut new_record,
-                                &[delta],
-                            );
+                            // A name with no binding is on no record: nothing to
+                            // remove, and removing registers nothing.
+                            if let Some(field_id) = ctx.interner.lookup(&path[0]) {
+                                let sub_path = path[1..].to_vec();
+                                let target =
+                                    coordinode_core::graph::doc_delta::PathTarget::PropField(
+                                        field_id,
+                                    );
+                                let delta = if sub_path.is_empty() {
+                                    // Top-level prop removal: RemoveProperty
+                                    // (no sub-path traversal).
+                                    coordinode_core::graph::doc_delta::DocDelta::RemoveProperty {
+                                        target,
+                                        key: None,
+                                    }
+                                } else {
+                                    coordinode_core::graph::doc_delta::DocDelta::DeletePath {
+                                        target,
+                                        path: sub_path,
+                                    }
+                                };
+                                coordinode_storage::engine::merge::apply_doc_deltas_to_record(
+                                    &mut new_record,
+                                    &[delta],
+                                );
+                            }
                             ctx.write_stats.properties_removed += 1;
                         }
                     }
                     processed_temporal_items.insert(item_idx);
                 }
 
-                let vf_fid = ctx.interner.intern("valid_from");
-                let vt_fid = ctx.interner.intern("valid_to");
-                let its_fid = ctx.interner.intern("__ingestion_ts__");
+                let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
                 new_record.set(vf_fid, Value::Int(new_valid_from));
                 new_record.props.remove(&vt_fid);
                 new_record.set(its_fid, Value::Int(now_us));
@@ -10837,22 +11680,10 @@ fn execute_remove(
                         if let Some(field_id) = ctx.interner.lookup(property) {
                             let old_value: Option<Value> = record.props.get(&field_id).cloned();
 
-                            // Remove B-tree index entry for the old value so
-                            // unique constraints don't block future nodes with
-                            // the same property value.
-                            if let Some(btree_reg) = ctx.btree_index_registry {
-                                if let Some(ref old_val) = old_value {
-                                    let label = record.primary_label().to_string();
-                                    btree_reg
-                                        .on_node_deleted(
-                                            ctx.engine,
-                                            node_id,
-                                            &label,
-                                            &[(property.to_string(), old_val.clone())],
-                                        )
-                                        .map_err(ExecutionError::Storage)?;
-                                }
-                            }
+                            // The node's index entries move to the property's
+                            // absence: the old value's entry goes, and an
+                            // index that keeps missing values gets one.
+                            ctx.index_property_changed(node_id, &record, property, None)?;
 
                             // Notify vector index if removing a vector property.
                             if let Some(registry) = ctx.vector_index_registry() {
@@ -10884,18 +11715,21 @@ fn execute_remove(
                         _ => continue,
                     };
 
-                    // O(1) delete via merge operand — no read required.
-                    let field_id = ctx.interner.intern(&path[0]);
-                    let sub_path = &path[1..];
-
-                    let delta = coordinode_core::graph::doc_delta::DocDelta::DeletePath {
-                        target: coordinode_core::graph::doc_delta::PathTarget::PropField(field_id),
-                        path: sub_path.to_vec(),
-                    };
-                    let operand = delta.encode().map_err(|e| {
-                        ExecutionError::Serialization(format!("DocDelta encode: {e}"))
-                    })?;
-                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+                    // O(1) delete via merge operand, no read required. A name
+                    // with no binding is on no record, so there is nothing to
+                    // delete and nothing is registered.
+                    if let Some(field_id) = ctx.interner.lookup(&path[0]) {
+                        let delta = coordinode_core::graph::doc_delta::DocDelta::DeletePath {
+                            target: coordinode_core::graph::doc_delta::PathTarget::PropField(
+                                field_id,
+                            ),
+                            path: path[1..].to_vec(),
+                        };
+                        let operand = delta.encode().map_err(|e| {
+                            ExecutionError::Serialization(format!("DocDelta encode: {e}"))
+                        })?;
+                        ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+                    }
                     ctx.write_stats.properties_removed += 1;
 
                     let path_str = path.join(".");
@@ -11062,7 +11896,8 @@ fn execute_delete(
                 // Already gone — skip (idempotent).
                 continue;
             };
-            let vt_fid = ctx.interner.intern("valid_to");
+            let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
+            let deleted_fid = ctx.field_id("__deleted__")?;
             let was_open = !closing_record.props.contains_key(&vt_fid);
             if was_open {
                 closing_record.set(vt_fid, Value::Int(new_valid_from));
@@ -11081,11 +11916,8 @@ fn execute_delete(
             // tombstone has `valid_from = NOW`, `valid_to = NULL` —
             // the deletion is "current" from NOW onward.
             let mut tombstone = NodeRecord::with_labels(closing_record.labels.clone());
-            let deleted_fid = ctx.interner.intern("__deleted__");
             tombstone.set(deleted_fid, Value::Bool(true));
-            let vf_fid = ctx.interner.intern("valid_from");
             tombstone.set(vf_fid, Value::Int(new_valid_from));
-            let its_fid = ctx.interner.intern("__ingestion_ts__");
             tombstone.set(its_fid, Value::Int(now_us));
             ctx.mvcc_put_node_temporal(ctx.shard_id, *node_id, new_valid_from, &tombstone)?;
             ctx.write_stats.nodes_deleted += 1;
@@ -11326,23 +12158,9 @@ fn execute_delete(
                     {
                         let label = record.primary_label().to_string();
 
-                        // B-tree index cleanup: remove all indexed property
-                        // entries so unique constraints don't block re-creation
-                        // of a node with the same property values.
-                        if let Some(btree_reg) = ctx.btree_index_registry {
-                            let props: Vec<(String, Value)> = record
-                                .props
-                                .iter()
-                                .filter_map(|(&field_id, value)| {
-                                    ctx.interner
-                                        .resolve(field_id)
-                                        .map(|name| (name.to_string(), value.clone()))
-                                })
-                                .collect();
-                            btree_reg
-                                .on_node_deleted(ctx.engine, node_id, &label, &props)
-                                .map_err(ExecutionError::Storage)?;
-                        }
+                        // The node's B-tree entries go with it, so its unique
+                        // values are free for a new node.
+                        ctx.index_node_deleted(node_id, &record)?;
 
                         for (&field_id, value) in &record.props {
                             if let Some(prop_name) = ctx.interner.resolve(field_id) {
@@ -11360,6 +12178,9 @@ fn execute_delete(
                         }
                     }
                 }
+            }
+            if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                ctx.release_table_key(&record)?;
             }
             ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
             ctx.write_stats.nodes_deleted += 1;
@@ -12174,7 +12995,7 @@ fn apply_merge_nodes_set_item(
     match item {
         SetItem::Property { property, expr, .. } => {
             let val = eval_neutral(expr, row)?.map_to_document();
-            let field_id = ctx.interner.intern(property);
+            let field_id = ctx.field_id(property)?;
             target.set(field_id, val);
         }
         SetItem::PropertyPath { path, expr, .. } => {
@@ -12185,7 +13006,7 @@ fn apply_merge_nodes_set_item(
             // with a dotted string key — matches existing executor behavior.
             let val = eval_neutral(expr, row)?.map_to_document();
             if path.len() == 1 {
-                let field_id = ctx.interner.intern(&path[0]);
+                let field_id = ctx.field_id(&path[0])?;
                 target.set(field_id, val);
             } else {
                 target.set_extra(path.join("."), val);
@@ -12224,9 +13045,12 @@ fn notify_indexes_for_target_change(
     new: &HashMap<u32, Value>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    // Collect old entries that changed/disappeared, and the full new set
-    // (insert is idempotent on the registries — re-inserting an unchanged
-    // value is a no-op cost-wise but no-harm semantically).
+    // B-tree entries move from the old values to the new ones in one pass;
+    // a unique value another node holds refuses the merge.
+    ctx.index_fields_changed(target_id, label, old, new)?;
+
+    // Vector and text registries: old entries that changed or disappeared,
+    // then the new ones.
     for (field_id, old_val) in old {
         let unchanged = new.get(field_id) == Some(old_val);
         if unchanged {
@@ -12236,16 +13060,6 @@ fn notify_indexes_for_target_change(
             continue;
         };
         let name = name.to_string();
-        if let Some(btree_reg) = ctx.btree_index_registry {
-            btree_reg
-                .on_node_deleted(
-                    ctx.engine,
-                    target_id,
-                    label,
-                    &[(name.clone(), old_val.clone())],
-                )
-                .map_err(ExecutionError::Storage)?;
-        }
         if let Some(registry) = ctx.vector_index_registry() {
             if try_extract_vector(old_val).is_some() {
                 registry.on_vector_deleted(label, target_id, &name);
@@ -12266,22 +13080,6 @@ fn notify_indexes_for_target_change(
             continue;
         };
         let name = name.to_string();
-        if let Some(btree_reg) = ctx.btree_index_registry {
-            btree_reg
-                .on_node_created(
-                    ctx.engine,
-                    target_id,
-                    label,
-                    &[(name.clone(), new_val.clone())],
-                )
-                .map_err(|v| {
-                    ExecutionError::Conflict(format!(
-                        "MERGE NODES would violate unique constraint on `{}`: \
-                         property `{}` already has value {:?}",
-                        v.index_name, v.property, v.value
-                    ))
-                })?;
-        }
         if let Some(registry) = ctx.vector_index_registry() {
             if let Some(vec_data) = try_extract_vector(new_val) {
                 registry.on_vector_written(label, target_id, &name, &vec_data);
@@ -12560,20 +13358,7 @@ fn detach_delete_node(
     if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
         {
             let label = record.primary_label().to_string();
-            if let Some(btree_reg) = ctx.btree_index_registry {
-                let props: Vec<(String, Value)> = record
-                    .props
-                    .iter()
-                    .filter_map(|(&field_id, value)| {
-                        ctx.interner
-                            .resolve(field_id)
-                            .map(|name| (name.to_string(), value.clone()))
-                    })
-                    .collect();
-                btree_reg
-                    .on_node_deleted(ctx.engine, node_id, &label, &props)
-                    .map_err(ExecutionError::Storage)?;
-            }
+            ctx.index_node_deleted(node_id, &record)?;
             for (&field_id, value) in &record.props {
                 if let Some(prop_name) = ctx.interner.resolve(field_id) {
                     if let Some(registry) = ctx.vector_index_registry() {
@@ -12680,7 +13465,10 @@ fn detach_delete_node(
         ctx.mvcc_purge_adj(edge_type, node_id, direction)?;
         ctx.write_stats.edges_deleted += 1;
     }
-    // Drop the primary node record.
+    // Drop the primary node record, and its table key if it is a table row.
+    if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+        ctx.release_table_key(&record)?;
+    }
     ctx.mvcc_delete_node(ctx.shard_id, node_id)?;
     ctx.write_stats.nodes_deleted += 1;
     // Statistics counters: decrement by the pre-delete labels (no row
@@ -12933,9 +13721,7 @@ fn execute_detach_document(
             );
 
             // Refresh bitemporal axis fields on both records.
-            let vf_fid = ctx.interner.intern("valid_from");
-            let vt_fid = ctx.interner.intern("valid_to");
-            let its_fid = ctx.interner.intern("__ingestion_ts__");
+            let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
             closing_record.set(vt_fid, Value::Int(new_valid_from));
             new_record.set(vf_fid, Value::Int(new_valid_from));
             new_record.props.remove(&vt_fid);
@@ -13495,7 +14281,7 @@ fn execute_attach_document(
             // produces, but applied in-memory.
             use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
             let first = &target_property_path[0];
-            let field_id = ctx.interner.intern(first);
+            let field_id = ctx.field_id(first)?;
             let sub_path = target_property_path[1..].to_vec();
             let delta = DocDelta::SetPath {
                 target: PathTarget::PropField(field_id),
@@ -13507,9 +14293,7 @@ fn execute_attach_document(
                 &[delta],
             );
 
-            let vf_fid = ctx.interner.intern("valid_from");
-            let vt_fid = ctx.interner.intern("valid_to");
-            let its_fid = ctx.interner.intern("__ingestion_ts__");
+            let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
             closing_record.set(vt_fid, Value::Int(new_valid_from));
             new_record.set(vf_fid, Value::Int(new_valid_from));
             new_record.props.remove(&vt_fid);
@@ -13633,7 +14417,7 @@ fn emit_attach_set_path(
     // First segment → interned field id (matches the write-path used by
     // `SET n.address.x = y`).
     let first = &path[0];
-    let field_id = ctx.interner.intern(first);
+    let field_id = ctx.field_id(first)?;
     let sub: Vec<String> = path[1..].to_vec();
 
     let delta = DocDelta::SetPath {
@@ -13866,20 +14650,7 @@ fn cascade_delete_source_node(
         if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
             {
                 let label = record.primary_label().to_string();
-                if let Some(btree_reg) = ctx.btree_index_registry {
-                    let props: Vec<(String, Value)> = record
-                        .props
-                        .iter()
-                        .filter_map(|(&fid, v)| {
-                            ctx.interner
-                                .resolve(fid)
-                                .map(|name| (name.to_string(), v.clone()))
-                        })
-                        .collect();
-                    btree_reg
-                        .on_node_deleted(ctx.engine, source_id, &label, &props)
-                        .map_err(ExecutionError::Storage)?;
-                }
+                ctx.index_node_deleted(source_id, &record)?;
                 for (&fid, value) in &record.props {
                     if let Some(prop_name) = ctx.interner.resolve(fid) {
                         if let Some(registry) = ctx.vector_index_registry() {
@@ -13896,6 +14667,9 @@ fn cascade_delete_source_node(
                 }
             }
         }
+    }
+    if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
+        ctx.release_table_key(&record)?;
     }
     ctx.mvcc_delete_node(ctx.shard_id, source_id)?;
     ctx.write_stats.nodes_deleted += 1;
@@ -14039,7 +14813,7 @@ fn update_edge_property(
     let mut prop_map = ctx
         .mvcc_get_edge_props_either(edge_type, src, tgt, valid_from_for_key)?
         .unwrap_or_default();
-    let field_id = ctx.interner.intern(property);
+    let field_id = ctx.field_id(property)?;
     let mut replaced = false;
     for entry in &mut prop_map {
         if entry.0 == field_id {
@@ -14137,8 +14911,9 @@ fn update_edge_properties_from_map(
         EdgeMapAssign::Merge => previous.clone(),
         EdgeMapAssign::Replace => Vec::with_capacity(map.len()),
     };
-    for (key, value) in map {
-        let field_id = ctx.interner.intern(key);
+    let names: Vec<&str> = map.keys().map(String::as_str).collect();
+    let field_ids = ctx.field_ids(&names)?;
+    for (value, field_id) in map.values().zip(field_ids) {
         match prop_map.iter_mut().find(|entry| entry.0 == field_id) {
             Some(entry) => entry.1 = value.clone(),
             None => prop_map.push((field_id, value.clone())),
@@ -14528,11 +15303,6 @@ fn execute_create_table(
             "label '{name}' already exists"
         )));
     }
-    if primary_key.is_empty() {
-        return Err(ExecutionError::Unsupported(format!(
-            "CREATE TABLE '{name}' requires a PRIMARY KEY"
-        )));
-    }
 
     let mut schema = LabelSchema::new(name, PlacementPolicy::NodeId);
     for col in columns {
@@ -14560,7 +15330,8 @@ fn execute_create_table(
             )));
         }
     }
-    schema.set_primary_key(primary_key.to_vec());
+    // Without declared key columns the table is keyed by row id.
+    schema.make_table(primary_key.to_vec());
     if columnar {
         schema.set_storage_layout(StorageLayout::Columnar);
     }
@@ -14601,6 +15372,18 @@ fn execute_drop_table(
     }
     let columnar = schema.is_columnar();
 
+    // A row table's rows are nodes on the node path: they go with the table,
+    // their edges with them, or a table created again under the name would
+    // find them.
+    if !columnar {
+        let rows = execute_node_scan("__row", &[name.to_string()], &[], ctx)?;
+        for row in &rows {
+            if let Some(Value::Int(id)) = row.get("__row") {
+                detach_delete_node(NodeId::from_raw(*id as u64), ctx)?;
+            }
+        }
+    }
+    ctx.release_all_table_keys(name)?;
     ctx.drop_current_label_schema(name)?;
     if columnar {
         ctx.engine.drop_columnar_table(name)?;
@@ -15523,6 +16306,11 @@ fn execute_create_vector_index(
     let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
     def.online_during_build = online_during_build;
 
+    // The names the index is keyed by are bound before its definition is
+    // published, so every member that sees the definition can resolve them.
+    let ids = ctx.field_ids(&[label, property])?;
+    let (label_id, property_id) = (ids[0], ids[1]);
+
     // Persist the definition to the schema partition THROUGH the
     // proposal pipeline: replicas discover the index by observing this
     // key in their applied stream and run their own local backfill
@@ -15562,14 +16350,8 @@ fn execute_create_vector_index(
         })?;
     }
 
-    // Register the empty HNSW graph in memory with its tier handle
-    // resolved from the executor's interner. Building the tier here
-    // (rather than inside `register`) keeps the registry free of any
-    // shared interner reference — register would otherwise need to
-    // re-enter the same parking_lot RwLock the executor already
-    // holds write-locked, which deadlocks on parking_lot.
-    let label_id = ctx.interner.intern(label);
-    let property_id = ctx.interner.intern(property);
+    // Register the empty HNSW graph in memory with its tier handle,
+    // keyed by the ids bound above.
     let tier = registry.tier_handle(label_id, property_id);
     registry.register_for_build(def.clone(), tier);
 
@@ -15748,11 +16530,13 @@ fn execute_drop_vector_index(
 
 /// Execute `CREATE [UNIQUE] [SPARSE] INDEX idx ON :Label(prop) [WHERE pred]`.
 ///
-/// 1. Validates the registry is available.
-/// 2. Checks for duplicate index name.
-/// 3. Builds an `IndexDefinition` with optional `.unique()` / `.sparse()` / `.with_filter()`.
-/// 4. Persists the definition to the `Schema` partition via the registry.
-/// 5. Backfills existing nodes of the target label into the new index.
+/// The definition is published as building, with range tombstones over any
+/// entries a dropped index of the same name left, in one log entry. Writers
+/// maintain the index from then on; the backfill fills in the nodes already
+/// stored; the definition is then published as ready, and only then answers
+/// lookups. Stored data that breaks a unique index fails the statement and
+/// withdraws the index.
+#[allow(clippy::too_many_arguments)]
 fn execute_create_btree_index(
     name: &str,
     label: &str,
@@ -15760,8 +16544,10 @@ fn execute_create_btree_index(
     unique: bool,
     sparse: bool,
     filter: Option<&crate::index::definition::PartialFilter>,
+    maintenance: Option<crate::index::IndexProfile>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
     let Some(registry) = ctx.btree_index_registry else {
         return Err(ExecutionError::Unsupported(
             "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
@@ -15775,7 +16561,7 @@ fn execute_create_btree_index(
         )));
     }
 
-    // Build the index definition.
+    let store = LocalIndexStore::new(ctx.engine);
     let mut def = crate::index::IndexDefinition::btree(name, label, property);
     if unique {
         def = def.unique();
@@ -15786,53 +16572,40 @@ fn execute_create_btree_index(
     if let Some(f) = filter {
         def = def.with_filter(f.clone());
     }
+    // The binding is resolved once, here, and recorded: a later change of
+    // the namespace default does not reinterpret this index.
+    let (policy, _) = store.index_policy()?;
+    def.maintenance = policy.resolve(maintenance, 1);
+    def.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
 
-    // Persist to storage and update in-memory registry.
-    registry
-        .register(ctx.engine, def)
-        .map_err(|e| ExecutionError::Unsupported(format!("register index '{name}': {e}")))?;
+    let mut publish = vec![store.definition_put_mutation(&def)?];
+    publish.extend(store.clear_mutations(name));
+    ctx.propose_mutations(publish)?;
+    registry.register_published(ctx.engine, def.clone())?;
 
-    // Backfill existing nodes that match the label, scanned through the
-    // node store (it owns the partition + key encoding).
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let field_id = ctx.interner.lookup(property);
-    let engine = ctx.engine;
-    let mut backfilled = 0u64;
-    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
-        engine,
-        None,
-        ctx.shard_id,
-        &mut |node_id, _key, record| {
-            if record.primary_label() != label {
-                return Ok(std::ops::ControlFlow::Continue(()));
-            }
-            let prop_val = if let Some(fid) = field_id {
-                record.props.get(&fid).cloned().unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            };
-            // Sparse indexes skip null values.
-            if sparse && prop_val.is_null() {
-                return Ok(std::ops::ControlFlow::Continue(()));
-            }
-            // Apply partial filter if any.
-            if let Some(f) = filter {
-                let props = [(property.to_string(), prop_val.clone())];
-                if !f.matches(&props) {
-                    return Ok(std::ops::ControlFlow::Continue(()));
-                }
-            }
-            let props = [(property.to_string(), prop_val)];
-            if let Err(e) = registry.on_node_created(engine, node_id, label, &props) {
-                tracing::warn!(
-                    "CREATE INDEX backfill: unique violation on node {node_id:?} ({label}.{property}): {e}"
-                );
-            } else {
-                backfilled += 1;
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        },
-    );
+    let backfilled = match ctx.backfill_index(&def) {
+        Ok(n) => n,
+        Err(e) => {
+            // Withdraw the index everywhere: the definition and whatever
+            // entries the backfill and the writers staged under it.
+            registry.unregister(name);
+            let mut withdraw = vec![store.definition_delete_mutation(name)];
+            withdraw.extend(store.clear_mutations(name));
+            ctx.propose_mutations(withdraw)?;
+            return Err(match e {
+                crate::index::build::BackfillError::Duplicate(v) => unique_violation(v),
+                other => ExecutionError::Unsupported(format!("build index '{name}': {other}")),
+            });
+        }
+    };
+
+    def.state = IndexState::Ready;
+    ctx.propose_mutations(vec![store.definition_put_mutation(&def)?])?;
+    let maintenance = def.maintenance;
+    registry.register_published(ctx.engine, def)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -15841,14 +16614,128 @@ fn execute_create_btree_index(
     row.insert("unique".to_string(), Value::Bool(unique));
     row.insert("sparse".to_string(), Value::Bool(sparse));
     row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
+    insert_maintenance(&mut row, &maintenance);
     Ok(vec![row])
 }
 
-/// Execute `DROP INDEX idx`: removes a B-tree index by name.
-///
-/// 1. Looks up the definition in the registry.
-/// 2. Drops all index entries from storage (`ops::drop_index`).
-/// 3. Unregisters from the in-memory registry.
+/// The maintenance binding of an index as result columns: the effective
+/// profile, where it comes from, and its epoch.
+fn insert_maintenance(row: &mut Row, maintenance: &crate::index::IndexMaintenance) {
+    let profile = match maintenance.profile {
+        crate::index::IndexProfile::Resolved => "RESOLVED",
+        crate::index::IndexProfile::Derived => "DERIVED",
+    };
+    let source = match maintenance.source {
+        crate::index::ProfileSource::Override => "OVERRIDE".to_string(),
+        crate::index::ProfileSource::Namespace { revision } => {
+            format!("NAMESPACE@{revision}")
+        }
+    };
+    row.insert("maintenance".to_string(), Value::String(profile.into()));
+    row.insert("maintenance_source".to_string(), Value::String(source));
+    row.insert(
+        "maintenance_epoch".to_string(),
+        Value::Int(i64::try_from(maintenance.epoch).unwrap_or(i64::MAX)),
+    );
+}
+
+/// Execute `ALTER INDEX idx SET MAINTENANCE ...`: an explicit transition to
+/// `profile`, or to the namespace default when `None`, under a new policy
+/// epoch. The entries' layout is the same in both profiles, so no entry is
+/// rewritten: effects sealed under the old epoch keep their own binding, and
+/// a writer whose effects were staged under it is refused at commit and
+/// retried under the new one.
+fn execute_alter_index_maintenance(
+    name: &str,
+    profile: Option<crate::index::IndexProfile>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let Some(registry) = ctx.btree_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "ALTER INDEX requires btree_index_registry in ExecutionContext".into(),
+        ));
+    };
+    let store = LocalIndexStore::new(ctx.engine);
+    let mut def = store
+        .load_definition(name)?
+        .ok_or_else(|| ExecutionError::Unsupported(format!("index '{name}' not found")))?;
+    if def.index_type != crate::index::IndexType::BTree {
+        return Err(ExecutionError::Unsupported(format!(
+            "index '{name}' is not key-shaped: its maintenance follows its own class"
+        )));
+    }
+    if def.state != IndexState::Ready {
+        return Err(ExecutionError::Unsupported(format!(
+            "index '{name}' is still being built; change its maintenance once it is ready"
+        )));
+    }
+    let version = store.definition_version(name)?;
+    let (policy, _) = store.index_policy()?;
+    let epoch = def.maintenance.epoch.checked_add(1).ok_or_else(|| {
+        ExecutionError::Unsupported(format!("index '{name}' has no maintenance epoch left"))
+    })?;
+    let from = def.maintenance;
+    def.maintenance = policy.resolve(profile, epoch);
+    let staged = def.clone();
+    ctx.commit_catalog_change(|txn| {
+        txn.expect_version(
+            coordinode_storage::engine::partition::Partition::Schema,
+            &staged.schema_key(),
+            version,
+        )?;
+        store.put_definition_txn(txn, &staged)
+    })?;
+    let to = def.maintenance;
+    registry.register_published(ctx.engine, def)?;
+
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert(
+        "previous_epoch".to_string(),
+        Value::Int(i64::try_from(from.epoch).unwrap_or(i64::MAX)),
+    );
+    insert_maintenance(&mut row, &to);
+    Ok(vec![row])
+}
+
+/// Execute `ALTER NAMESPACE SET INDEX MAINTENANCE ...`: the default for
+/// indexes created from now on, at a new policy revision. Existing indexes
+/// keep their binding until their own transition.
+fn execute_set_namespace_index_default(
+    profile: crate::index::IndexProfile,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let store = LocalIndexStore::new(ctx.engine);
+    let (current, version) = store.index_policy()?;
+    let revision = current.revision.checked_add(1).ok_or_else(|| {
+        ExecutionError::Unsupported("the namespace index policy has no revision left".into())
+    })?;
+    let policy = crate::index::NamespaceIndexPolicy {
+        default: profile,
+        revision,
+    };
+    ctx.commit_catalog_change(|txn| store.put_index_policy_txn(txn, &policy, version))?;
+
+    let mut row = Row::new();
+    let name = match profile {
+        crate::index::IndexProfile::Resolved => "RESOLVED",
+        crate::index::IndexProfile::Derived => "DERIVED",
+    };
+    row.insert(
+        "index_maintenance_default".to_string(),
+        Value::String(name.into()),
+    );
+    row.insert(
+        "revision".to_string(),
+        Value::Int(i64::try_from(revision).unwrap_or(i64::MAX)),
+    );
+    Ok(vec![row])
+}
+
+/// Execute `DROP INDEX idx`: the definition and every entry go in one log
+/// entry, and the index stops being maintained here.
 fn execute_drop_btree_index(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
@@ -15867,11 +16754,11 @@ fn execute_drop_btree_index(
     let label = def.label.clone();
     let property = def.property().to_string();
 
-    // Drop definition + all index entries from storage.
-    crate::index::ops::drop_index(ctx.engine, &def)
-        .map_err(|e| ExecutionError::Unsupported(format!("drop index '{name}': {e}")))?;
-
-    // Remove from in-memory registry.
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let store = LocalIndexStore::new(ctx.engine);
+    let mut drop = vec![store.definition_delete_mutation(name)];
+    drop.extend(store.clear_mutations(name));
+    ctx.propose_mutations(drop)?;
     registry.unregister(name);
 
     let mut row = Row::new();
@@ -15949,6 +16836,8 @@ fn commit_err_to_execution(
         CommitError::CounterOverflow { key } => ExecutionError::Serialization(format!(
             "counter '{key}' would leave the i64 range; nothing was written"
         )),
+        // Also the same on retry: the statement has to change fewer entries.
+        e @ CommitError::IndexFanOut { .. } => ExecutionError::Serialization(e.to_string()),
         CommitError::InvariantRefused { reason } => ExecutionError::InvariantRefused(reason),
         CommitError::RevisionMismatch { expected, current } => {
             ExecutionError::RevisionMismatch { expected, current }

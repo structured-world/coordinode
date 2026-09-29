@@ -101,12 +101,13 @@ async fn the_last_leader_of_a_group_shuts_down_without_a_quorum() {
     assert!(result.is_ok(), "TIMED OUT — shutdown without a quorum");
 }
 
-/// Stopping does not ask the group anything. Whether to hand leadership over
-/// is decided from what the node itself knows. The last member of a group
-/// that was shut down leader first is no leader at all: its leader is gone,
-/// it stands for election and nobody answers. Asking the group whether it
-/// leads is then a question with no one to answer it, so the member stops in
-/// about the time its local checkpoint takes, not after the question gives up.
+/// Stopping does not ask the group anything. Whether to hand leadership over,
+/// and to whom, is decided from what the node itself knows. In a rolling stop
+/// each leader hands over to the next member, so the last one is left leading
+/// a group whose other voters are gone: asking them whether it leads, or
+/// handing leadership to one of them, is a question with no one to answer it.
+/// The member stops in about the time its local checkpoint takes, not after
+/// the question gives up.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_member_stops_without_waiting_on_the_group() {
     let result = tokio::time::timeout(Duration::from_secs(120), async {
@@ -152,12 +153,12 @@ async fn the_last_member_stops_without_waiting_on_the_group() {
             .expect("three voters");
 
         // Leader first, as a rolling stop does: node 1 hands leadership on,
-        // then node 2 goes too. Node 3 is left with no leader and no quorum,
-        // and once its election timer fires it stands for an election nobody
-        // can answer.
+        // then node 2 goes too. Node 3 is left without a quorum, and its
+        // peers stay silent for longer than an election takes.
         n1.shutdown().await.expect("shutdown 1");
         n2.shutdown().await.expect("shutdown 2");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let election = Duration::from_millis(n3.raft().config().election_timeout_max);
+        tokio::time::sleep(election * 2).await;
 
         let started = std::time::Instant::now();
         n3.shutdown().await.expect("shutdown 3");

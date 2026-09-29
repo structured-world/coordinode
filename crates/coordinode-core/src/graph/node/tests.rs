@@ -26,28 +26,14 @@ fn node_id_display() {
 #[test]
 fn allocator_starts_from_one() {
     let alloc = NodeIdAllocator::new(0);
-    assert_eq!(alloc.next().as_raw(), 1);
-    assert_eq!(alloc.next().as_raw(), 2);
+    assert_eq!(alloc.next().expect("id").as_raw(), 1);
+    assert_eq!(alloc.next().expect("id").as_raw(), 2);
 }
 
 #[test]
 fn allocator_resume() {
     let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    assert_eq!(alloc.next().as_raw(), 101);
-}
-
-#[test]
-fn allocator_current_does_not_advance() {
-    let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(50));
-    assert_eq!(alloc.current().as_raw(), 50);
-    assert_eq!(alloc.current().as_raw(), 50);
-}
-
-#[test]
-fn allocator_advance_to() {
-    let alloc = NodeIdAllocator::resume_from(NodeId::from_raw(10));
-    alloc.advance_to(NodeId::from_raw(100));
-    assert_eq!(alloc.next().as_raw(), 101);
+    assert_eq!(alloc.next().expect("id").as_raw(), 101);
 }
 
 #[test]
@@ -61,7 +47,9 @@ fn allocator_concurrent() {
     for _ in 0..8 {
         let alloc = Arc::clone(&alloc);
         handles.push(std::thread::spawn(move || {
-            (0..500).map(|_| alloc.next().as_raw()).collect::<Vec<_>>()
+            (0..500)
+                .map(|_| alloc.next().expect("id").as_raw())
+                .collect::<Vec<_>>()
         }));
     }
 
@@ -72,6 +60,165 @@ fn allocator_concurrent() {
         }
     }
     assert_eq!(all.len(), 4000);
+}
+
+/// Grants leases of `size` sequences, each `gap` past the previous one's
+/// ceiling (as if other members had taken the ranges in between), and records
+/// them; refuses once `refuse` is set.
+struct TestReserver {
+    size: u64,
+    gap: u64,
+    next_base: std::sync::Mutex<u64>,
+    granted: std::sync::Mutex<Vec<IdLease>>,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+impl TestReserver {
+    fn new(size: u64, gap: u64) -> Self {
+        Self {
+            size,
+            gap,
+            next_base: std::sync::Mutex::new(0),
+            granted: std::sync::Mutex::new(Vec::new()),
+            refuse: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn granted(&self) -> Vec<IdLease> {
+        self.granted.lock().expect("lock").clone()
+    }
+}
+
+impl IdLeaseReserver for TestReserver {
+    fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(IdLeaseError::NotGranted("not the leader".into()));
+        }
+        let mut next_base = self.next_base.lock().expect("lock");
+        let lease = IdLease {
+            base: *next_base,
+            ceiling: *next_base + self.size,
+        };
+        *next_base = lease.ceiling + self.gap;
+        self.granted.lock().expect("lock").push(lease);
+        Ok(lease)
+    }
+}
+
+/// A leased allocator holds nothing until the first draw, which takes a lease
+/// and hands out its sequences in order; the next lease need not follow the
+/// previous one, and draws continue from its base.
+#[test]
+fn leased_allocator_draws_only_inside_granted_leases() {
+    let reserver = std::sync::Arc::new(TestReserver::new(3, 100));
+    let alloc = NodeIdAllocator::leased(0, reserver.clone());
+    assert!(reserver.granted().is_empty(), "no lease before a draw");
+
+    let ids: Vec<u64> = (0..7)
+        .map(|_| alloc.next().expect("id").sequence())
+        .collect();
+    assert_eq!(ids, [1, 2, 3, 104, 105, 106, 207]);
+    assert_eq!(reserver.granted().len(), 3);
+}
+
+/// The hint of a leased allocator is carried in every identifier.
+#[test]
+fn leased_allocator_carries_its_hint() {
+    let reserver = std::sync::Arc::new(TestReserver::new(10, 0));
+    let alloc = NodeIdAllocator::leased(7, reserver);
+    let id = alloc.next().expect("id");
+    assert_eq!(id.origin_shard_hint(), 7);
+    assert_eq!(id.sequence(), 1);
+}
+
+/// A lease the log does not grant fails the draw instead of handing out a
+/// sequence no lease covers.
+#[test]
+fn leased_allocator_fails_when_no_lease_is_granted() {
+    let reserver = std::sync::Arc::new(TestReserver::new(2, 0));
+    let alloc = NodeIdAllocator::leased(0, reserver.clone());
+    reserver
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        alloc.next(),
+        Err(IdLeaseError::NotGranted("not the leader".into()))
+    );
+
+    // Once a lease is granted again the draws resume inside it.
+    reserver
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(alloc.next().expect("id").sequence(), 1);
+}
+
+/// A reserver answering with an empty or out-of-space range is refused.
+#[test]
+fn leased_allocator_rejects_an_invalid_lease() {
+    struct Broken(IdLease);
+    impl IdLeaseReserver for Broken {
+        fn reserve(&self) -> Result<IdLease, IdLeaseError> {
+            Ok(self.0)
+        }
+    }
+    for lease in [
+        IdLease {
+            base: 5,
+            ceiling: 5,
+        },
+        IdLease {
+            base: 0,
+            ceiling: NODE_ID_MAX_SEQUENCE + 1,
+        },
+    ] {
+        let alloc = NodeIdAllocator::leased(0, std::sync::Arc::new(Broken(lease)));
+        assert_eq!(
+            alloc.next(),
+            Err(IdLeaseError::InvalidLease {
+                base: lease.base,
+                ceiling: lease.ceiling,
+            })
+        );
+    }
+}
+
+/// Many threads drawing through many lease changes never share an
+/// identifier, and every identifier lies inside a lease that was granted.
+/// Small leases force the changes to race with the draws.
+#[test]
+fn leased_allocator_concurrent_draws_across_lease_changes() {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let reserver = Arc::new(TestReserver::new(7, 13));
+    let alloc = Arc::new(NodeIdAllocator::leased(0, reserver.clone()));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let alloc = Arc::clone(&alloc);
+            std::thread::spawn(move || {
+                (0..2_000)
+                    .map(|_| alloc.next().expect("id").sequence())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let mut all = BTreeSet::new();
+    for handle in handles {
+        for id in handle.join().expect("thread panicked") {
+            assert!(all.insert(id), "duplicate id {id}");
+        }
+    }
+    assert_eq!(all.len(), 16_000);
+    let granted = reserver.granted();
+    for id in &all {
+        assert!(
+            granted
+                .iter()
+                .any(|lease| lease.base < *id && *id <= lease.ceiling),
+            "id {id} lies in no granted lease"
+        );
+    }
 }
 
 // -- u20/u44 layout tests --
@@ -113,7 +260,7 @@ fn node_id_compose_panics_on_oversized_sequence() {
 fn allocator_ce_default_uses_hint_zero() {
     let alloc = NodeIdAllocator::new(0);
     assert_eq!(alloc.shard_hint(), 0);
-    let id = alloc.next();
+    let id = alloc.next().expect("id");
     assert_eq!(id.origin_shard_hint(), 0);
     assert_eq!(id.sequence(), 1);
 }
@@ -121,8 +268,8 @@ fn allocator_ce_default_uses_hint_zero() {
 #[test]
 fn allocator_ee_hint_carried_in_emitted_ids() {
     let alloc = NodeIdAllocator::new(42);
-    let id1 = alloc.next();
-    let id2 = alloc.next();
+    let id1 = alloc.next().expect("id");
+    let id2 = alloc.next().expect("id");
     assert_eq!(id1.origin_shard_hint(), 42);
     assert_eq!(id2.origin_shard_hint(), 42);
     assert_eq!(id1.sequence(), 1);
@@ -131,33 +278,28 @@ fn allocator_ee_hint_carried_in_emitted_ids() {
 
 #[test]
 fn allocator_resume_from_preserves_hint() {
-    // EE shard 7 persisted a high-water mark at sequence 1000.
     let persisted = NodeId::compose(7, 1000);
     let alloc = NodeIdAllocator::resume_from(persisted);
     assert_eq!(alloc.shard_hint(), 7);
-    let next = alloc.next();
+    let next = alloc.next().expect("id");
     assert_eq!(next.origin_shard_hint(), 7);
     assert_eq!(next.sequence(), 1001);
 }
 
+/// The last sequence of the space is handed out; past it the allocator
+/// refuses rather than let sequence bits leak into the hint and route the
+/// node to a phantom shard. It keeps refusing: a draw that overran the space
+/// must not come back as a small sequence.
 #[test]
-#[should_panic(expected = "advance_to received NodeId from shard_hint")]
-fn allocator_advance_to_rejects_cross_hint_id() {
-    let alloc = NodeIdAllocator::new(3);
-    // Trying to advance against an id from a different shard is a logic
-    // bug — sequence space is per-shard.
-    alloc.advance_to(NodeId::compose(5, 100));
-}
-
-#[test]
-#[should_panic(expected = "sequence wrap")]
-fn allocator_panics_on_sequence_wrap() {
-    // Resume from the last possible sequence value in the 44-bit window.
-    // The next `next()` call should detect wrap and panic — without this
-    // guard sequence bits would leak into the 20-bit hint window and
-    // corrupt routing (phantom shards).
-    let alloc = NodeIdAllocator::resume_from(NodeId::compose(0, NODE_ID_MAX_SEQUENCE));
-    let _ = alloc.next();
+fn allocator_refuses_past_the_end_of_the_sequence_space() {
+    let alloc = NodeIdAllocator::resume_from(NodeId::compose(3, NODE_ID_MAX_SEQUENCE - 1));
+    assert_eq!(
+        alloc.next().expect("the last sequence").sequence(),
+        NODE_ID_MAX_SEQUENCE
+    );
+    for _ in 0..3 {
+        assert_eq!(alloc.next(), Err(IdLeaseError::Exhausted { shard_hint: 3 }));
+    }
 }
 
 #[test]
@@ -541,24 +683,6 @@ fn node_write_key_picks_correct_form() {
     let temp = node_write_key(3, nid, Some(1234));
     assert_eq!(non_temp, encode_node_key(3, nid));
     assert_eq!(temp, encode_temporal_node_key(3, nid, 1234));
-}
-
-#[test]
-fn from_primary_key_is_deterministic_and_namespaced() {
-    // Same (label, key) -> same id, every time.
-    let a = NodeId::from_primary_key("Trade", b"1001");
-    let b = NodeId::from_primary_key("Trade", b"1001");
-    assert_eq!(a, b);
-
-    // Different key -> (almost surely) different id.
-    assert_ne!(a, NodeId::from_primary_key("Trade", b"1002"));
-
-    // Same key bytes under a different table must not collide.
-    assert_ne!(a, NodeId::from_primary_key("Order", b"1001"));
-
-    // CE invariant: derived ids carry a zero origin shard hint.
-    assert_eq!(a.origin_shard_hint(), 0);
-    assert_eq!(a.sequence(), a.as_raw());
 }
 
 /// Equal records must encode to equal bytes. Properties live in hash maps

@@ -1,239 +1,310 @@
-//! Index store — secondary B-tree-style entries in [`Partition::Idx`]
-//! plus the index-definition catalog in [`Partition::Schema`].
+//! Index store: secondary B-tree entries in [`Partition::Idx`] and the
+//! index-definition catalog in [`Partition::Schema`].
 //!
-//! Entries take the form `idx:<name>:<sortable_value>:<node_id>`
-//! (value-bytes encoded by [`coordinode_core::index::encoding`] for
-//! correct lexicographic ordering). Supports point lookup
-//! ([`IndexStore::scan_exact`]) and full-index walk
-//! ([`IndexStore::scan_all`]).
+//! Entries are staged in the writing statement's [`Transaction`], so they
+//! commit in the same log entry and at the same version as the data they
+//! index: a crash keeps both or neither, a replica applies them like any other
+//! key, a rolled-back statement leaves none behind, and a scan inside the
+//! transaction sees its own writes.
 //!
-//! The store also owns the index-DEFINITION catalog: the serializable
-//! [`IndexDefinition`] records keyed by `schema:idx:<name>`. This
-//! mirrors how mature engines place the schema/index catalog below the
-//! query engine (the query layer issues logical DDL and reads the
-//! catalog for planning, but does not own the definition keyspace or
-//! its encoding). Definition CRUD lives in
-//! [`IndexStore::put_definition`] / [`IndexStore::load_definition`] /
-//! [`IndexStore::list_definitions`] / [`IndexStore::delete_definition`].
+//! Two entry shapes, keyed by the values' tuple encoding
+//! ([`coordinode_core::index::encoding`]):
 //!
-//! ## Single-column vs compound
+//! - a non-unique index writes `idx:<name>:<tuple>:<node_id>` with an empty
+//!   value, one entry per node, found by a prefix scan;
+//! - a unique index writes `uidx:<name>:<tuple>` whose value is the holder's
+//!   node id. Keyed by the value alone, the entry is its own uniqueness claim:
+//!   two transactions inserting one value write one key, and write-write
+//!   conflict detection lets only one of them commit. Checking the value is a
+//!   point read the partition's bloom filters answer without touching tables
+//!   that cannot hold it.
 //!
-//! Both layouts share the same key shape (`idx:name:encoded:id`);
-//! compound uses [`encode_compound_value`] to pack multiple [`Value`]s
-//! with a separator byte. The store exposes both via
-//! [`IndexStore::put_entry`] (slice of values) so the caller doesn't
-//! need to branch on arity.
+//! A list value indexes each of its elements (multikey). A value with no key
+//! (NaN, a map, a vector) is not indexed; a lookup of it reports so, and the
+//! caller answers with a scan.
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_core::index::derive::{membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_node_id_from_index_key, encode_compound_index_key, encode_compound_value,
+    decode_node_id, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
+    legacy_index_prefix, unique_index_prefix,
 };
+use coordinode_core::txn::proposal::{DerivedIndexWork, DerivedSource, Mutation, PartitionId};
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
 use crate::error::{StoreError, StoreResult};
-use crate::index_def::{IndexDefinition, IndexState};
+use crate::index_def::{IndexDefinition, IndexProfile, IndexState, NamespaceIndexPolicy};
 
-/// Layer 4 index store: entry-level B-tree index ops over
-/// [`Partition::Idx`].
+/// Layer 4 store for secondary B-tree entries and the index catalog.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not store index entries",
+    label = "an index store is required here",
+    note = "use `LocalIndexStore`, the CE implementation over a statement transaction"
+)]
 pub trait IndexStore {
-    /// Insert a (values → node) entry under the named index. Both
-    /// single-column (slice of 1) and compound (slice of N) work.
-    /// Idempotent: re-putting the same `(name, values, node_id)` is a
-    /// no-op semantically.
+    /// Stage the entry changes of `node_id`'s membership in `index` moving
+    /// from `old` to `new` (`None`: no entry), in the index's profile. A
+    /// RESOLVED index stages the entries as writes the unit logs; a DERIVED
+    /// one stages them for this transaction's reads and conflicts, and the
+    /// unit logs the change sealed under `index`'s binding, with property
+    /// field ids from `field_of`. A unique entry is removed only while
+    /// `node_id` holds it; for a unique value the caller has checked
+    /// [`Self::unique_conflict`] first. Returns how many entries were put.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
-    /// # use coordinode_core::graph::{node::NodeId, types::Value};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
-    /// store.put_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn put_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()>;
+    /// A storage failure or an undecodable unique entry.
+    fn stage_membership(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+        node_id: NodeId,
+        old: Option<&[Value]>,
+        new: Option<&[Value]>,
+    ) -> StoreResult<usize>;
 
-    /// Remove a specific entry. Returns Ok even if the entry was
-    /// already absent (matches storage tombstone semantics).
+    /// The node other than `node_id` that holds one of the entries `values`
+    /// would take in the unique `index`, as the transaction sees it.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
-    /// # use coordinode_core::graph::{node::NodeId, types::Value};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
-    /// store.delete_entry("by_name", &[Value::String("alice".into())], NodeId::from_raw(1))?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn delete_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()>;
+    /// A storage failure or an undecodable entry.
+    fn unique_conflict(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> StoreResult<Option<NodeId>>;
 
-    /// Return all node ids whose entry has the exact given value(s).
-    /// Empty `Vec` means "no matches".
+    /// [`Self::unique_conflict`] against the latest committed state, outside
+    /// any transaction. Tells a transaction that lost a race for a value
+    /// which node won it.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
-    /// # use coordinode_core::graph::types::Value;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
-    /// let hits = store.scan_exact("by_name", &[Value::String("alice".into())])?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn scan_exact(&self, name: &str, values: &[Value]) -> StoreResult<Vec<NodeId>>;
+    /// As [`Self::unique_conflict`].
+    fn committed_conflict(
+        &self,
+        index: &IndexDefinition,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> StoreResult<Option<NodeId>>;
 
-    /// Return all (sortable bytes, node id) pairs in the named index,
-    /// without value filtering. Useful for full-index walks (TTL
-    /// reaper, index rebuild, count). For large indexes the caller
-    /// should prefer a streaming form once Layer 4 grows one — for
-    /// PR-scope simplicity this materialises into a `Vec`.
+    /// The nodes whose entry holds exactly `values`, as the transaction sees
+    /// it. `None` when the values have no key, so the index cannot answer.
     ///
-    /// # Examples
+    /// # Errors
     ///
-    /// ```no_run
-    /// # use coordinode_modality::{LocalIndexStore, IndexStore};
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/x"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// # let store = LocalIndexStore::new(&engine);
-    /// let _all = store.scan_all("by_name")?;
-    /// # Ok::<_, Box<dyn std::error::Error>>(())
-    /// ```
-    fn scan_all(&self, name: &str) -> StoreResult<Vec<(Vec<u8>, NodeId)>>;
+    /// A storage failure or an undecodable entry.
+    fn scan_exact(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+    ) -> StoreResult<Option<Vec<NodeId>>>;
 
-    /// Delete every entry under the named index prefix. Returns the
-    /// number of entries removed. Used for DROP INDEX and the abort
-    /// path of an index build (roll back partially-written entries
-    /// after a unique-constraint violation).
-    fn clear(&self, name: &str) -> StoreResult<usize>;
+    /// Every node with an entry in `index`, in key order.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable entry.
+    fn scan_entry_ids(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+    ) -> StoreResult<Vec<NodeId>>;
 
-    /// Delete a single index entry by its raw key — the opaque bytes
-    /// handed back from [`IndexStore::scan_all`]. Lets a full-index walk
-    /// (e.g. the TTL reaper) selectively drop the entries it decided are
-    /// expired without reconstructing the `(values, node_id)` tuple. The
-    /// caller never builds the key; it only passes back one it scanned.
-    fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()>;
+    /// The mutations removing the entries of `node_id` holding `values`, for
+    /// a writer that deletes nodes by submitting mutations directly (the TTL
+    /// reaper). The node is being deleted, so its entries go unconditionally:
+    /// as deletes for a RESOLVED index, as sealed work for a DERIVED one.
+    fn entry_delete_mutations(
+        &self,
+        index: &IndexDefinition,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> Vec<Mutation>;
 
-    /// Return every entry's node id under the named index in key order,
-    /// without value filtering. Backs full-index walks (range queries,
-    /// SHOW INDEX). Distinct from [`IndexStore::scan_all`] in that it
-    /// does not allocate a key buffer per entry.
-    fn scan_entry_ids(&self, name: &str) -> StoreResult<Vec<NodeId>>;
+    /// The mutations removing every entry of the index `name`, of both
+    /// shapes: one range tombstone each.
+    fn clear_mutations(&self, name: &str) -> Vec<Mutation>;
+
+    /// The mutation storing `def` in the catalog, for DDL that commits it in
+    /// one log entry with other effects.
+    ///
+    /// # Errors
+    ///
+    /// An encoding failure.
+    fn definition_put_mutation(&self, def: &IndexDefinition) -> StoreResult<Mutation>;
+
+    /// The mutation removing the definition `name` from the catalog.
+    fn definition_delete_mutation(&self, name: &str) -> Mutation;
+
+    /// Apply one unit of mutations straight to the engine as one batch, for a
+    /// context that has no log to replicate them through.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or DERIVED work that cannot be derived.
+    fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()>;
+
+    /// Remove every entry the index `name` wrote in the layout that preceded
+    /// transactional entries. Local: those entries were written outside the
+    /// log on the member that ran the statement, so each member removes its
+    /// own before rebuilding the index.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn clear_legacy(&self, name: &str) -> StoreResult<()>;
 
     /// Persist an index definition into the schema catalog (keyed by
-    /// `schema:idx:<name>`). Overwrites any existing definition with the
-    /// same name. The store owns both the catalog keyspace and the
-    /// MessagePack encoding — callers pass the typed definition only.
+    /// `schema:idx:<name>`) directly, outside the log. For state this member
+    /// keeps about itself (a vector index's build state).
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
     fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()>;
 
-    /// Load a persisted index definition by name. `Ok(None)` when no
-    /// definition is stored under that name.
+    /// Load a persisted index definition by name.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable definition.
     fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>>;
 
-    /// List every persisted index definition in `schema:idx:` key order.
-    /// A definition whose stored bytes fail to decode is skipped (with a
-    /// tracing warning) rather than aborting the whole listing — one
-    /// corrupt record must not take down registry rebuild on open.
+    /// Every persisted index definition in `schema:idx:` key order. A
+    /// definition whose bytes do not decode is skipped with a warning, so one
+    /// corrupt record does not take down the registry on open.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
     fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>>;
 
-    /// Delete a persisted index definition by name. Returns `Ok(())`
-    /// even when no definition was stored (tombstone semantics).
-    fn delete_definition(&self, name: &str) -> StoreResult<()>;
-
-    /// Update only the build `state` of a persisted definition, leaving
-    /// every other field intact. Returns `Ok(false)` when no definition
-    /// is stored under `name` (the caller handles the race). Used by the
-    /// backfill task to publish progress / terminal states.
+    /// Update only the build `state` of a persisted definition, directly.
+    /// `Ok(false)` when no definition is stored under `name`.
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
     fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool>;
 
-    /// Persist an index definition through a statement [`Transaction`]
-    /// (OCC-tracked, read-your-own-writes) — the CREATE INDEX DDL path. Same
-    /// `schema:idx:<name>` keyspace and encoding as [`Self::put_definition`],
-    /// but the write buffers on the transaction and applies atomically at
-    /// commit, so a CREATE INDEX racing a conflicting schema change is
-    /// detected like any other write. Mirrors the `SchemaStore::*_txn` family.
+    /// Persist an index definition through a statement [`Transaction`]: it
+    /// commits, and replicates, with the statement.
+    ///
+    /// # Errors
+    ///
+    /// An encoding failure.
     fn put_definition_txn(&self, txn: &mut Transaction, def: &IndexDefinition) -> StoreResult<()>;
 
-    /// Delete a persisted index definition by name through a statement
-    /// [`Transaction`] — the DROP INDEX DDL path. Tombstone semantics (no error
-    /// when absent).
+    /// Delete a persisted index definition through a statement
+    /// [`Transaction`]. Tombstone semantics: no error when absent.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
     fn delete_definition_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+
+    /// The namespace index policy and the version of its record (`None`
+    /// before the first change: the RESOLVED default at revision 0).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn index_policy(&self) -> StoreResult<(NamespaceIndexPolicy, Option<u64>)>;
+
+    /// Stage `policy` through a statement [`Transaction`], only while its
+    /// record is still at `version`: two concurrent changes cannot both
+    /// build on one revision.
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
+    fn put_index_policy_txn(
+        &self,
+        txn: &mut Transaction,
+        policy: &NamespaceIndexPolicy,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// The version of the stored definition `name`, the value a writer binds
+    /// its effects to so a transition between staging and commit refuses it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn definition_version(&self, name: &str) -> StoreResult<Option<u64>>;
 }
 
-/// CE single-shard implementation of [`IndexStore`].
+/// CE implementation of [`IndexStore`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use coordinode_modality::{IndexDefinition, IndexStore, LocalIndexStore};
+/// use coordinode_core::graph::{node::NodeId, types::Value};
+/// # use coordinode_storage::engine::{config::*, core::StorageEngine, transaction::Transaction};
+/// # use coordinode_core::txn::timestamp::Timestamp;
+/// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+/// #     "ep", std::path::Path::new("/tmp/x"),
+/// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
+/// # let engine = StorageEngine::open(&cfg)?;
+/// # let mut txn = Transaction::begin(&engine, None, Timestamp::from_raw(1));
+/// let index = IndexDefinition::btree("user_email", "User", "email").unique();
+/// let email = [Value::String("a@x".into())];
+/// let store = LocalIndexStore::new(&engine);
+/// assert_eq!(store.unique_conflict(&mut txn, &index, &email, NodeId::from_raw(1))?, None);
+/// let no_fields = |_: &str| None;
+/// store.stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(1), None, Some(&email))?;
+/// assert_eq!(
+///     store.unique_conflict(&mut txn, &index, &email, NodeId::from_raw(2))?,
+///     Some(NodeId::from_raw(1))
+/// );
+/// # Ok::<_, Box<dyn std::error::Error>>(())
+/// ```
 pub struct LocalIndexStore<'a> {
     engine: &'a StorageEngine,
 }
 
 impl<'a> LocalIndexStore<'a> {
     /// Wrap a storage engine for index-store operations.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use coordinode_modality::{LocalIndexStore, IndexStore};
-    /// use coordinode_core::graph::node::NodeId;
-    /// use coordinode_core::graph::types::Value;
-    /// # use coordinode_storage::engine::{config::*, core::StorageEngine};
-    /// # let cfg = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-    /// #     "ep", std::path::Path::new("/tmp/store"),
-    /// #     Media::Hdd, Durability::Durable, Tier::Warm,
-    /// # )]);
-    /// # let engine = StorageEngine::open(&cfg)?;
-    /// let store = LocalIndexStore::new(&engine);
-    /// let key = [Value::String("alice".into())];
-    /// store.put_entry("by_name", &key, NodeId::from_raw(1))?;
-    /// let hits = store.scan_exact("by_name", &key)?;
-    /// assert_eq!(hits, vec![NodeId::from_raw(1)]);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     pub fn new(engine: &'a StorageEngine) -> Self {
         Self { engine }
     }
 }
 
-fn index_prefix(name: &str) -> Vec<u8> {
-    let mut p = Vec::with_capacity(4 + name.len() + 1);
-    p.extend_from_slice(b"idx:");
-    p.extend_from_slice(name.as_bytes());
-    p.push(b':');
-    p
+fn decode_holder(bytes: &[u8]) -> StoreResult<NodeId> {
+    match <[u8; 8]>::try_from(bytes) {
+        Ok(raw) => Ok(NodeId::from_raw(u64::from_be_bytes(raw))),
+        Err(_) => Err(StoreError::Decode {
+            kind: "unique index entry",
+            message: format!("{} bytes, expected 8", bytes.len()),
+        }),
+    }
 }
 
-/// Smallest key strictly greater than every key with `prefix` — the exclusive
-/// upper bound of the prefix range `[prefix, upper)`. Increments the last
-/// non-`0xFF` byte and drops the `0xFF` tail. `None` when every byte is `0xFF`
-/// (no finite upper bound); `index_prefix` always ends in `:` so this is only a
-/// theoretical guard.
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+/// Smallest key strictly greater than every key starting with `prefix`, the
+/// exclusive end of the prefix's range. Every prefix built here ends in `:`,
+/// so an end always exists.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.last_mut() {
         if *last < 0xFF {
             *last += 1;
-            return Some(end);
+            return end;
         }
         end.pop();
     }
-    None
+    end
 }
 
 fn definition_key(name: &str) -> Vec<u8> {
@@ -243,152 +314,250 @@ fn definition_key(name: &str) -> Vec<u8> {
     key
 }
 
-fn index_value_prefix(name: &str, values: &[Value]) -> Vec<u8> {
-    let encoded = encode_compound_value(values);
-    let mut p = Vec::with_capacity(4 + name.len() + 1 + encoded.len() + 1);
-    p.extend_from_slice(b"idx:");
-    p.extend_from_slice(name.as_bytes());
-    p.push(b':');
-    p.extend_from_slice(&encoded);
-    p.push(b':');
-    p
-}
-
 impl IndexStore for LocalIndexStore<'_> {
-    fn put_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()> {
-        let key = encode_compound_index_key(name, values, node_id.as_raw());
-        self.engine.put(Partition::Idx, &key, &[])?;
-        Ok(())
+    fn stage_membership(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+        node_id: NodeId,
+        old: Option<&[Value]>,
+        new: Option<&[Value]>,
+    ) -> StoreResult<usize> {
+        let mut effects = membership_effects(&index.name, index.unique, node_id.as_raw(), old, new);
+        if index.unique {
+            // A value another node holds now (taken in this transaction) is
+            // not this node's to release.
+            let mut kept = Vec::with_capacity(effects.len());
+            for effect in effects {
+                let keep = effect.value.is_some()
+                    || match txn.get(Partition::Idx, &effect.key)? {
+                        Some(bytes) => decode_holder(&bytes)? == node_id,
+                        None => false,
+                    };
+                if keep {
+                    kept.push(effect);
+                }
+            }
+            effects = kept;
+        }
+        let puts = effects.iter().filter(|e| e.value.is_some()).count();
+        match index.maintenance.profile {
+            IndexProfile::Resolved => {
+                for effect in &effects {
+                    match &effect.value {
+                        Some(value) => txn.put(Partition::Idx, &effect.key, value)?,
+                        None => txn.delete(Partition::Idx, &effect.key)?,
+                    }
+                }
+            }
+            IndexProfile::Derived => txn.stage_derived(
+                &index.binding(field_of),
+                node_id.as_raw(),
+                old.map(<[Value]>::to_vec),
+                new.map(<[Value]>::to_vec),
+                &effects,
+            )?,
+        }
+        Ok(puts)
     }
 
-    fn delete_entry(&self, name: &str, values: &[Value], node_id: NodeId) -> StoreResult<()> {
-        let key = encode_compound_index_key(name, values, node_id.as_raw());
-        self.engine.delete(Partition::Idx, &key)?;
-        Ok(())
-    }
-
-    fn scan_exact(&self, name: &str, values: &[Value]) -> StoreResult<Vec<NodeId>> {
-        let prefix = index_value_prefix(name, values);
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        let mut out = Vec::new();
-        for guard in iter {
-            let (key, _) = guard.into_inner()?;
-            if let Some(id) = decode_node_id_from_index_key(&key) {
-                out.push(NodeId::from_raw(id));
+    fn unique_conflict(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> StoreResult<Option<NodeId>> {
+        for tuple in tuples(values) {
+            let key = encode_unique_index_key(&index.name, &tuple);
+            if let Some(bytes) = txn.get(Partition::Idx, &key)? {
+                let holder = decode_holder(&bytes)?;
+                if holder != node_id {
+                    return Ok(Some(holder));
+                }
             }
         }
-        Ok(out)
+        Ok(None)
     }
 
-    fn scan_all(&self, name: &str) -> StoreResult<Vec<(Vec<u8>, NodeId)>> {
-        let prefix = index_prefix(name);
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        let mut out = Vec::new();
-        for guard in iter {
-            let (key, _) = guard.into_inner()?;
-            let Some(id) = decode_node_id_from_index_key(&key) else {
-                continue;
+    fn committed_conflict(
+        &self,
+        index: &IndexDefinition,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> StoreResult<Option<NodeId>> {
+        for tuple in tuples(values) {
+            let key = encode_unique_index_key(&index.name, &tuple);
+            if let Some(bytes) = self.engine.get(Partition::Idx, &key)? {
+                let holder = decode_holder(&bytes)?;
+                if holder != node_id {
+                    return Ok(Some(holder));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn scan_exact(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        values: &[Value],
+    ) -> StoreResult<Option<Vec<NodeId>>> {
+        let Ok(tuple) = encode_tuple(values) else {
+            return Ok(None);
+        };
+        if index.unique {
+            let key = encode_unique_index_key(&index.name, &tuple);
+            return match txn.get(Partition::Idx, &key)? {
+                Some(bytes) => Ok(Some(vec![decode_holder(&bytes)?])),
+                None => Ok(Some(Vec::new())),
             };
-            out.push((key.to_vec(), NodeId::from_raw(id)));
         }
-        Ok(out)
-    }
-
-    fn clear(&self, name: &str) -> StoreResult<usize> {
-        let prefix = index_prefix(name);
-        // Count the entries (for the return) by scanning the prefix.
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-        let mut removed = 0usize;
-        for guard in iter {
-            guard.into_inner()?;
-            removed += 1;
-        }
-        if removed == 0 {
-            return Ok(0);
-        }
-        // Drop the whole `idx:name:` prefix with a single range tombstone
-        // instead of `removed` point tombstones — the index keyspace is a dense
-        // contiguous prefix. Falls back to per-key only for the degenerate
-        // all-0xFF prefix (never produced by `index_prefix`).
-        match prefix_upper_bound(&prefix) {
-            Some(end) => {
-                self.engine.remove_range(Partition::Idx, &prefix, &end)?;
-            }
-            None => {
-                let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
-                let mut keys: Vec<Vec<u8>> = Vec::new();
-                for guard in iter {
-                    let (key, _) = guard.into_inner()?;
-                    keys.push(key.to_vec());
-                }
-                for key in &keys {
-                    self.engine.delete(Partition::Idx, key)?;
-                }
-            }
-        }
-        Ok(removed)
-    }
-
-    fn delete_raw(&self, raw_key: &[u8]) -> StoreResult<()> {
-        self.engine.delete(Partition::Idx, raw_key)?;
-        Ok(())
-    }
-
-    fn scan_entry_ids(&self, name: &str) -> StoreResult<Vec<NodeId>> {
-        let prefix = index_prefix(name);
-        let iter = self.engine.prefix_scan(Partition::Idx, &prefix)?;
+        let prefix = index_value_prefix(&index.name, &tuple);
         let mut out = Vec::new();
-        for guard in iter {
-            let (key, _) = guard.into_inner()?;
-            if let Some(id) = decode_node_id_from_index_key(&key) {
+        for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
+            // The scan overlays buffered values but not buffered tombstones:
+            // an entry this transaction removed is gone for it.
+            if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
+                continue;
+            }
+            if let Some(id) = decode_node_id(&key) {
+                out.push(NodeId::from_raw(id));
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn scan_entry_ids(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+    ) -> StoreResult<Vec<NodeId>> {
+        let prefix = if index.unique {
+            unique_index_prefix(&index.name)
+        } else {
+            index_prefix(&index.name)
+        };
+        // The scan appends this transaction's own entries after the stored
+        // ones; key order is restored here.
+        let mut entries = txn.prefix_scan(Partition::Idx, &prefix)?;
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
+                continue;
+            }
+            if index.unique {
+                out.push(decode_holder(&value)?);
+            } else if let Some(id) = decode_node_id(&key) {
                 out.push(NodeId::from_raw(id));
             }
         }
         Ok(out)
+    }
+
+    fn entry_delete_mutations(
+        &self,
+        index: &IndexDefinition,
+        field_of: &dyn Fn(&str) -> Option<u32>,
+        values: &[Value],
+        node_id: NodeId,
+    ) -> Vec<Mutation> {
+        match index.maintenance.profile {
+            IndexProfile::Resolved => membership_effects(
+                &index.name,
+                index.unique,
+                node_id.as_raw(),
+                Some(values),
+                None,
+            )
+            .into_iter()
+            .map(|effect| Mutation::Delete {
+                partition: PartitionId::Idx,
+                key: effect.key,
+            })
+            .collect(),
+            IndexProfile::Derived => vec![Mutation::Derive(DerivedIndexWork {
+                binding: index.binding(field_of),
+                node_id: node_id.as_raw(),
+                old: Some(values.to_vec()),
+                new: DerivedSource::Values(None),
+            })],
+        }
+    }
+
+    fn clear_mutations(&self, name: &str) -> Vec<Mutation> {
+        [index_prefix(name), unique_index_prefix(name)]
+            .into_iter()
+            .map(|start| Mutation::RemoveRange {
+                partition: PartitionId::Idx,
+                end: prefix_end(&start),
+                start,
+            })
+            .collect()
+    }
+
+    fn definition_put_mutation(&self, def: &IndexDefinition) -> StoreResult<Mutation> {
+        Ok(Mutation::Put {
+            partition: PartitionId::Schema,
+            key: def.schema_key(),
+            value: rmp_serde::to_vec(def)
+                .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?,
+        })
+    }
+
+    fn definition_delete_mutation(&self, name: &str) -> Mutation {
+        Mutation::Delete {
+            partition: PartitionId::Schema,
+            key: definition_key(name),
+        }
+    }
+
+    fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()> {
+        // One batch, as a proposal applies: commands decided, DERIVED work
+        // derived, all effects visible together.
+        Ok(self.engine.apply_proposal_at(mutations, 0)?)
+    }
+
+    fn clear_legacy(&self, name: &str) -> StoreResult<()> {
+        let start = legacy_index_prefix(name);
+        self.engine
+            .remove_range(Partition::Idx, &start, &prefix_end(&start))?;
+        Ok(())
     }
 
     fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()> {
-        let key = def.schema_key();
         let value = rmp_serde::to_vec(def)
             .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?;
-        self.engine.put(Partition::Schema, &key, &value)?;
+        self.engine
+            .put(Partition::Schema, &def.schema_key(), &value)?;
         Ok(())
     }
 
     fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>> {
-        let key = definition_key(name);
-        match self.engine.get(Partition::Schema, &key)? {
-            Some(bytes) => {
-                let def = rmp_serde::from_slice(&bytes).map_err(|e| StoreError::Decode {
+        match self.engine.get(Partition::Schema, &definition_key(name))? {
+            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes).map_err(|e| {
+                StoreError::Decode {
                     kind: "index definition",
                     message: e.to_string(),
-                })?;
-                Ok(Some(def))
-            }
+                }
+            })?)),
             None => Ok(None),
         }
     }
 
     fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>> {
-        let iter = self.engine.prefix_scan(Partition::Schema, b"schema:idx:")?;
         let mut out = Vec::new();
-        for guard in iter {
+        for guard in self.engine.prefix_scan(Partition::Schema, b"schema:idx:")? {
             let (_key, value) = guard.into_inner()?;
             match rmp_serde::from_slice::<IndexDefinition>(&value) {
                 Ok(def) => out.push(def),
-                Err(e) => {
-                    tracing::warn!("list_definitions: skipping corrupt index def: {e}");
-                    continue;
-                }
+                Err(e) => tracing::warn!("list_definitions: skipping corrupt index def: {e}"),
             }
         }
         Ok(out)
-    }
-
-    fn delete_definition(&self, name: &str) -> StoreResult<()> {
-        let key = definition_key(name);
-        self.engine.delete(Partition::Schema, &key)?;
-        Ok(())
     }
 
     fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool> {
@@ -411,8 +580,40 @@ impl IndexStore for LocalIndexStore<'_> {
         txn.delete(Partition::Schema, &definition_key(name))?;
         Ok(())
     }
+
+    fn index_policy(&self) -> StoreResult<(NamespaceIndexPolicy, Option<u64>)> {
+        let key = NamespaceIndexPolicy::KEY;
+        let version = self.engine.record_version(Partition::Schema, key)?;
+        let policy = match self.engine.get(Partition::Schema, key)? {
+            Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| StoreError::Decode {
+                kind: "index policy",
+                message: e.to_string(),
+            })?,
+            None => NamespaceIndexPolicy::default(),
+        };
+        Ok((policy, version))
+    }
+
+    fn put_index_policy_txn(
+        &self,
+        txn: &mut Transaction,
+        policy: &NamespaceIndexPolicy,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        let value = rmp_serde::to_vec(policy)
+            .map_err(|e| StoreError::Invariant(format!("index policy serialize: {e}")))?;
+        txn.expect_version(Partition::Schema, NamespaceIndexPolicy::KEY, version)?;
+        txn.put(Partition::Schema, NamespaceIndexPolicy::KEY, &value)?;
+        Ok(())
+    }
+
+    fn definition_version(&self, name: &str) -> StoreResult<Option<u64>> {
+        Ok(self
+            .engine
+            .record_version(Partition::Schema, &definition_key(name))?)
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests;

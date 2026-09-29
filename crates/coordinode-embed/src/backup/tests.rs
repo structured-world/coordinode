@@ -2,6 +2,13 @@ use super::export;
 use super::restore;
 use crate::Database;
 
+/// The encoded form of a dictionary with no bindings.
+fn empty_dictionary() -> Vec<u8> {
+    coordinode_core::graph::intern::FieldInterner::new()
+        .to_bytes()
+        .unwrap()
+}
+
 #[test]
 fn json_export_nodes_and_edges() {
     let dir = tempfile::tempdir().unwrap();
@@ -18,7 +25,8 @@ fn json_export_nodes_and_edges() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    let stats = export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    let stats =
+        export::export_json(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     assert_eq!(stats.nodes, 2, "should export 2 nodes");
     assert_eq!(stats.edges, 1, "should export 1 edge");
@@ -44,7 +52,8 @@ fn cypher_export_format() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    let stats = export::export_cypher(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    let stats = export::export_cypher(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf)
+        .unwrap();
 
     assert_eq!(stats.nodes, 1);
     let output = String::from_utf8(buf).unwrap();
@@ -72,18 +81,79 @@ fn binary_roundtrip() {
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
     let export_stats =
-        export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+        export::export_binary(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf)
+            .unwrap();
     assert!(export_stats.nodes >= 2);
 
     // Restore to new database
     let dir2 = tempfile::tempdir().unwrap();
-    let db2 = Database::open(dir2.path()).unwrap();
+    let mut db2 = Database::open(dir2.path()).unwrap();
 
     let mut cursor = std::io::Cursor::new(&buf);
-    let (restore_stats, _interner) =
-        restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
+    let restore_stats = restore::restore_binary(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(restore_stats.nodes, export_stats.nodes);
+    // The records are read through the bindings the dump carried.
+    let rows = db2
+        .execute_cypher("MATCH (n:User {name: 'Alice'}) RETURN n.age AS age")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&coordinode_core::graph::types::Value::Int(30))
+    );
+}
+
+/// A binary dump's records carry the source's ids, so the restore publishes
+/// exactly those bindings, and refuses a target whose own bindings give the
+/// same ids other meanings instead of reading the dump under the wrong names.
+#[test]
+fn binary_restore_keeps_the_dump_ids_and_refuses_contradicting_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_cypher("CREATE (:User {name: 'Alice', age: 30})")
+        .unwrap();
+    let mut buf = Vec::new();
+    let snapshot = db.engine().snapshot();
+    let source = db.interner().unwrap();
+    export::export_binary(db.engine(), &source, 1, &snapshot, &mut buf).unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = Database::open(dir2.path()).unwrap();
+    let mut cursor = std::io::Cursor::new(&buf);
+    restore::restore_binary(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .unwrap();
+    let restored = db2.interner().unwrap();
+    for (name, id) in source.iter() {
+        assert_eq!(restored.lookup(name), Some(id), "binding of {name}");
+    }
+
+    // A target that bound these names differently is refused.
+    let dir3 = tempfile::tempdir().unwrap();
+    let mut db3 = Database::open(dir3.path()).unwrap();
+    db3.execute_cypher("CREATE (:Other {zzz: 1, age: 2, name: 'x'})")
+        .unwrap();
+    let mut cursor = std::io::Cursor::new(&buf);
+    let refused = restore::restore_binary(
+        db3.engine(),
+        db3.field_registrar().as_ref(),
+        &mut cursor,
+        true,
+    );
+    assert!(
+        refused.is_err(),
+        "a contradicting target restored: {refused:?}"
+    );
 }
 
 /// A restored database tells the planner how much it holds.
@@ -113,12 +183,18 @@ fn a_restored_database_reports_what_it_holds() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    export::export_binary(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
     let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
+    restore::restore_binary(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .unwrap();
 
     let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
     assert_eq!(
@@ -149,19 +225,27 @@ fn a_json_restore_also_reports_what_it_holds() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    export::export_json(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
-    let mut interner2 = coordinode_core::graph::intern::FieldInterner::new();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
-    restore::restore_json(db2.engine(), &mut interner2, 1, &mut cursor, None).unwrap();
+    restore::restore_json(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        1,
+        &mut cursor,
+        None,
+    )
+    .unwrap();
 
     let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
     assert_eq!(restored.total_node_count(), 2);
     assert_eq!(restored.node_count_for_label("User"), Some(2));
 }
 
+/// A JSON restore registers the names it writes, so the restored properties
+/// read back, and still do after a reopen.
 #[test]
 fn json_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
@@ -173,17 +257,39 @@ fn json_roundtrip() {
     // Export JSON
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    export::export_json(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     // Restore to new database
     let dir2 = tempfile::tempdir().unwrap();
-    let db2 = Database::open(dir2.path()).unwrap();
+    {
+        let db2 = Database::open(dir2.path()).unwrap();
+        let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
+        let stats = restore::restore_json(
+            db2.engine(),
+            db2.field_registrar().as_ref(),
+            1,
+            &mut cursor,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.nodes, 1, "should restore 1 node");
+        db2.persist().unwrap();
+    }
 
-    let mut interner2 = coordinode_core::graph::intern::FieldInterner::new();
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
-    let stats = restore::restore_json(db2.engine(), &mut interner2, 1, &mut cursor, None).unwrap();
-
-    assert_eq!(stats.nodes, 1, "should restore 1 node");
+    let mut db2 = Database::open(dir2.path()).unwrap();
+    let rows = db2
+        .execute_cypher("MATCH (n:User) RETURN n.name AS name, n.age AS age")
+        .unwrap();
+    assert_eq!(
+        rows[0].get("name"),
+        Some(&coordinode_core::graph::types::Value::String(
+            "Alice".into()
+        ))
+    );
+    assert_eq!(
+        rows[0].get("age"),
+        Some(&coordinode_core::graph::types::Value::Int(30))
+    );
 }
 
 #[test]
@@ -200,11 +306,15 @@ fn apoc_json_restore_loads_nodes_edges_and_is_queryable() {
         r#"{"type":"relationship","id":"0","label":"KNOWS","start":{"id":"0"},"end":{"id":"1"},"properties":{"since":2020}}"#,
     );
 
-    let mut interner = db.interner().clone();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats =
-        restore::restore_apoc_json(db.engine(), &mut interner, 1, &mut cursor, None).unwrap();
-    *db.interner_arc().write() = interner;
+    let stats = restore::restore_apoc_json(
+        db.engine(),
+        db.field_registrar().as_ref(),
+        1,
+        &mut cursor,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes");
     assert_eq!(stats.edges, 1, "one relationship");
@@ -234,10 +344,10 @@ fn apoc_cypher_plain_restore_loads_nodes_and_edges() {
         "COMMIT\n",
     );
 
-    let mut interner = db.interner().clone();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats = restore::restore_apoc_cypher(db.engine(), &mut interner, 1, &mut cursor).unwrap();
-    *db.interner_arc().write() = interner;
+    let stats =
+        restore::restore_apoc_cypher(db.engine(), db.field_registrar().as_ref(), 1, &mut cursor)
+            .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes (constraint statements skipped)");
     assert_eq!(stats.edges, 1, "one relationship");
@@ -264,10 +374,10 @@ fn apoc_cypher_unwind_batch_restore_loads_nodes_and_edges() {
         "CREATE (start)-[r:`KNOWS`]->(end) SET r += row.properties;\n",
     );
 
-    let mut interner = db.interner().clone();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats = restore::restore_apoc_cypher(db.engine(), &mut interner, 1, &mut cursor).unwrap();
-    *db.interner_arc().write() = interner;
+    let stats =
+        restore::restore_apoc_cypher(db.engine(), db.field_registrar().as_ref(), 1, &mut cursor)
+            .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes from the UNWIND batch");
     assert_eq!(stats.edges, 1, "one relationship from the UNWIND batch");
@@ -294,11 +404,15 @@ fn hetio_json_restore_maps_kinds_and_resolves_edges() {
         r#"]}"#,
     );
 
-    let mut interner = db.interner().clone();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(doc.as_bytes()));
-    let stats =
-        restore::restore_hetio_json(db.engine(), &mut interner, 1, &mut cursor, None).unwrap();
-    *db.interner_arc().write() = interner;
+    let stats = restore::restore_hetio_json(
+        db.engine(),
+        db.field_registrar().as_ref(),
+        1,
+        &mut cursor,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(stats.nodes, 2, "two hetnet nodes");
     assert_eq!(stats.edges, 1, "one hetnet edge");
@@ -334,11 +448,15 @@ fn json_restore_only_labels_filters_nodes_and_edges() {
         r#"{"type":"edge","source":1,"target":3,"edge_type":"WROTE","properties":{}}"#,
     );
     let only: std::collections::HashSet<String> = ["User".to_string()].into_iter().collect();
-    let mut interner = db.interner().clone();
     let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats =
-        restore::restore_json(db.engine(), &mut interner, 1, &mut cursor, Some(&only)).unwrap();
-    *db.interner_arc().write() = interner;
+    let stats = restore::restore_json(
+        db.engine(),
+        db.field_registrar().as_ref(),
+        1,
+        &mut cursor,
+        Some(&only),
+    )
+    .unwrap();
 
     assert_eq!(stats.nodes, 2, "only the two User nodes are kept");
     assert_eq!(
@@ -363,7 +481,8 @@ fn empty_database_export() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    let stats = export::export_json(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    let stats =
+        export::export_json(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     assert_eq!(stats.nodes, 0);
     assert_eq!(stats.edges, 0);
@@ -393,12 +512,18 @@ fn binary_restore_accepts_manifest_at_current_version() {
 
     let mut buf = Vec::new();
     let snapshot = db.engine().snapshot();
-    export::export_binary(db.engine(), &db.interner(), 1, &snapshot, &mut buf).unwrap();
+    export::export_binary(db.engine(), &db.interner().unwrap(), 1, &snapshot, &mut buf).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
     let mut cursor = std::io::Cursor::new(&buf);
-    let (stats, _interner) = restore::restore_binary(db2.engine(), &mut cursor, false).unwrap();
+    let stats = restore::restore_binary(
+        db2.engine(),
+        db2.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .unwrap();
     assert_eq!(stats.nodes, 1, "restore should accept current-version dump");
 }
 
@@ -413,14 +538,16 @@ fn binary_restore_rejects_newer_format_version() {
             producer: "coordinode-embed/99.0.0".to_string(),
             schema_fingerprint: 0,
         },
-        export::BackupEntry::Interner(Vec::new()),
+        export::BackupEntry::Interner(empty_dictionary()),
     ]);
 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
+    let fields = db.field_registrar();
 
     let mut cursor = std::io::Cursor::new(&dump);
-    let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+    let err =
+        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::IncompatibleVersion(_)),
         "newer format version must be rejected, got {err:?}"
@@ -428,7 +555,7 @@ fn binary_restore_rejects_newer_format_version() {
 
     // Force overrides the version gate for a best-effort restore.
     let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), &mut cursor, true)
+    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
         .expect("force should bypass the version gate");
 }
 
@@ -436,21 +563,54 @@ fn binary_restore_rejects_newer_format_version() {
 fn binary_restore_rejects_missing_manifest() {
     // A pre-versioned or truncated dump that does not lead with a
     // manifest is refused unless forced.
-    let dump = encode_dump(&[export::BackupEntry::Interner(Vec::new())]);
+    let dump = encode_dump(&[export::BackupEntry::Interner(empty_dictionary())]);
 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
+    let fields = db.field_registrar();
 
     let mut cursor = std::io::Cursor::new(&dump);
-    let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+    let err =
+        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::IncompatibleVersion(_)),
         "missing manifest must be rejected, got {err:?}"
     );
 
     let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), &mut cursor, true)
+    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
         .expect("force should bypass the manifest requirement");
+}
+
+/// A dump whose records come before the dictionary that encodes them cannot
+/// be restored safely: the records would land with no meaning.
+#[test]
+fn binary_restore_refuses_records_ahead_of_their_dictionary() {
+    let dump = encode_dump(&[
+        export::BackupEntry::Manifest {
+            format_version: export::BINARY_FORMAT_VERSION,
+            producer: export::producer_tag(),
+            schema_fingerprint: 0xcbf2_9ce4_8422_2325,
+        },
+        export::BackupEntry::Node {
+            key: b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01".to_vec(),
+            value: Vec::new(),
+        },
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    let mut cursor = std::io::Cursor::new(&dump);
+    let err = restore::restore_binary(
+        db.engine(),
+        db.field_registrar().as_ref(),
+        &mut cursor,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, restore::RestoreError::InvalidFormat(_)),
+        "records ahead of the dictionary must be refused, got {err:?}"
+    );
 }
 
 #[test]
@@ -464,6 +624,7 @@ fn binary_restore_rejects_schema_fingerprint_mismatch() {
     db.engine()
         .put(Partition::Schema, b"schema:label:Widget", b"v1")
         .unwrap();
+    let fields = db.field_registrar();
 
     let dump = encode_dump(&[
         export::BackupEntry::Manifest {
@@ -471,11 +632,12 @@ fn binary_restore_rejects_schema_fingerprint_mismatch() {
             producer: export::producer_tag(),
             schema_fingerprint: 0xdead_beef,
         },
-        export::BackupEntry::Interner(Vec::new()),
+        export::BackupEntry::Interner(empty_dictionary()),
     ]);
 
     let mut cursor = std::io::Cursor::new(&dump);
-    let err = restore::restore_binary(db.engine(), &mut cursor, false).unwrap_err();
+    let err =
+        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::SchemaMismatch(_)),
         "differing schema fingerprint must be rejected, got {err:?}"
@@ -483,6 +645,6 @@ fn binary_restore_rejects_schema_fingerprint_mismatch() {
 
     // Force overrides the schema guard.
     let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), &mut cursor, true)
+    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
         .expect("force should bypass the schema fingerprint guard");
 }

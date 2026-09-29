@@ -1,0 +1,56 @@
+# The CI gate for one bundled tree, run on a Windows machine by check.sh.
+#
+# Usage: check.ps1 -Root <work dir> -Bundle <bundle path> -Ref <ref in bundle>
+# Writes status.txt and one log per step into -Root, then removes the checkout
+# and the build output: the machine is shared, nothing stays.
+param(
+    [Parameter(Mandatory)] [string] $Root,
+    [Parameter(Mandatory)] [string] $Bundle,
+    [Parameter(Mandatory)] [string] $Ref
+)
+
+# Keep the machine awake while this process runs (ES_CONTINUOUS |
+# ES_SYSTEM_REQUIRED); the flag dies with the process.
+Add-Type -Namespace Win32 -Name Power -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);
+'@
+[Win32.Power]::SetThreadExecutionState([uint32]2147483649) | Out-Null
+
+$src = Join-Path $Root 'src'
+$target = Join-Path $Root 'target'
+$status = Join-Path $Root 'status.txt'
+
+Remove-Item $status -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $src -ErrorAction SilentlyContinue
+
+git clone -q --no-checkout $Bundle $src
+Set-Location $src
+# A clone takes branches only; the snapshot lives on its own ref.
+git fetch -q $Bundle $Ref
+git checkout -q --detach FETCH_HEAD
+git submodule update --init -q
+"checkout=$LASTEXITCODE" | Out-File $status
+if ($LASTEXITCODE -ne 0) {
+    Set-Location $Root
+    Remove-Item -Recurse -Force $src, $Bundle -ErrorAction SilentlyContinue
+    'done' | Out-File -Append $status
+    exit 1
+}
+
+$env:RUSTFLAGS = '-D warnings'
+$env:COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS = '1'
+$env:CARGO_TARGET_DIR = $target
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings *> (Join-Path $Root 'clippy.log')
+"clippy=$LASTEXITCODE" | Out-File -Append $status
+# The integration tests run the server binary.
+cargo build --all-features -p coordinode-server *> (Join-Path $Root 'build.log')
+"build=$LASTEXITCODE" | Out-File -Append $status
+cargo nextest run --all-features --workspace --no-fail-fast --status-level fail --final-status-level fail --failure-output final *> (Join-Path $Root 'test.log')
+"nextest=$LASTEXITCODE" | Out-File -Append $status
+cargo test --doc --all-features *> (Join-Path $Root 'doctest.log')
+"doctest=$LASTEXITCODE" | Out-File -Append $status
+
+Set-Location $Root
+Remove-Item -Recurse -Force $src, $target, $Bundle -ErrorAction SilentlyContinue
+'done' | Out-File -Append $status

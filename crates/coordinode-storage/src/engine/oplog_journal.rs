@@ -17,13 +17,15 @@
 
 use std::path::Path;
 
+use coordinode_core::txn::frame::encode_unit;
 use coordinode_core::txn::proposal::Mutation;
+use coordinode_core::txn::timestamp::Timestamp;
 use lsm_tree::{AbstractTree, AnyTree};
 
+use crate::engine::config::{StorageConfig, SyncMethod};
 use crate::engine::coverage;
 use crate::engine::partition::Partition;
-use crate::error::StorageResult;
-use crate::oplog::convert::mutations_to_ops;
+use crate::error::{StorageError, StorageResult};
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
 use crate::oplog::manager::OplogManager;
 use crate::placement::partition_from_wire_tag;
@@ -40,6 +42,8 @@ pub struct OplogJournalConfig {
     pub max_segment_bytes: u64,
     /// Maximum entries per segment before rotation.
     pub max_segment_entries: u32,
+    /// How an append is made durable.
+    pub sync_method: SyncMethod,
 }
 
 impl Default for OplogJournalConfig {
@@ -48,6 +52,20 @@ impl Default for OplogJournalConfig {
             retention_secs: 7 * 24 * 3600,
             max_segment_bytes: 64 * 1024 * 1024,
             max_segment_entries: 50_000,
+            sync_method: SyncMethod::default(),
+        }
+    }
+}
+
+impl From<&StorageConfig> for OplogJournalConfig {
+    /// The oplog settings an operator gives the engine, shared by the embedded
+    /// journal and the Raft log.
+    fn from(config: &StorageConfig) -> Self {
+        Self {
+            retention_secs: config.oplog_retention_secs,
+            max_segment_bytes: config.oplog_segment_max_bytes,
+            max_segment_entries: config.oplog_segment_max_entries,
+            sync_method: config.oplog_sync_method,
         }
     }
 }
@@ -74,7 +92,8 @@ impl EmbeddedOplog {
             cfg.max_segment_bytes,
             cfg.max_segment_entries,
             cfg.retention_secs,
-        )?;
+        )?
+        .with_sync_method(cfg.sync_method);
         let next_index = manager
             .recover_last_entry()?
             .map(|e| e.index + 1)
@@ -89,9 +108,18 @@ impl EmbeddedOplog {
     /// Append one proposal's mutations as a single oplog entry stamped at
     /// `commit_ts`, then fsync. Returns the assigned entry index.
     ///
-    /// Must be called BEFORE the mutations are applied to the memtable so a
-    /// record that reached the journal survives a crash and is replayed.
+    /// The entry holds the unit in its compact frame, the encoding the Raft
+    /// log carries a proposal in. Must be called BEFORE the mutations are
+    /// applied to the memtable so a record that reached the journal survives
+    /// a crash and is replayed.
     pub(crate) fn append(&mut self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<u64> {
+        if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
+            return Err(StorageError::InvalidConfig(
+                "a metadata command reached the journal undecided".into(),
+            ));
+        }
+        let frame = encode_unit(mutations, Timestamp::from_raw(commit_ts))?;
+        let ops = vec![OplogOp::Unit { frame }];
         let index = self.next_index;
         self.next_index += 1;
         let entry = OplogEntry {
@@ -99,7 +127,7 @@ impl EmbeddedOplog {
             term: 0,
             index,
             shard: self.shard,
-            ops: mutations_to_ops(mutations),
+            ops,
             is_migration: false,
             pre_images: None,
         };
@@ -189,6 +217,12 @@ pub(crate) fn op_partition(op: &OplogOp) -> Option<Partition> {
         | OplogOp::Delete { partition, .. }
         | OplogOp::Merge { partition, .. }
         | OplogOp::RemoveRange { partition, .. } => *partition,
+        // Its entries are index records. Replay resolves the work before it
+        // routes ops; an unresolved one routed here fails where it applies.
+        OplogOp::Derive { .. } => return Some(Partition::Idx),
+        // A frame spans partitions: replay expands it before it routes ops,
+        // so one reaching here is routed where it fails loudly, not skipped.
+        OplogOp::Unit { .. } => return Some(Partition::Node),
         // ColumnarInsert is routed to the columnar table registry by table_id,
         // not to a partition tree — see the columnar replay pass in `finish_open`.
         OplogOp::Noop
@@ -231,6 +265,11 @@ pub(crate) fn apply_oplog_ops_at(
             | OplogOp::RaftEntry { .. }
             | OplogOp::RaftTruncation { .. }
             | OplogOp::ColumnarInsert { .. } => {}
+            OplogOp::Derive { .. } | OplogOp::Unit { .. } => {
+                return Err(StorageError::InvalidConfig(
+                    "a journal entry replayed without its unit resolved".into(),
+                ));
+            }
         }
     }
     batch.insert(

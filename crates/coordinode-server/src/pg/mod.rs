@@ -153,6 +153,23 @@ fn command_tag(query: &str) -> Tag {
     }
 }
 
+/// The SQLSTATE a PostgreSQL driver branches on for `error` (PostgreSQL
+/// documentation, Appendix A "PostgreSQL Error Codes"). A duplicate key is
+/// `23505 unique_violation`; changing a key column, which PostgreSQL permits
+/// and this server does not, is `42P10 invalid_column_reference`. Everything
+/// else stays `XX000 internal_error`.
+fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::ExecutionError;
+    match error {
+        DatabaseError::Execution(
+            ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
+        ) => "23505",
+        DatabaseError::Execution(ExecutionError::KeyImmutable { .. }) => "42P10",
+        _ => "XX000",
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for PgBackend {
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -166,13 +183,15 @@ impl SimpleQueryHandler for PgBackend {
             return Ok(vec![query_response(&rows)?]);
         }
 
-        let rows = self.database.write().execute_sql(query).map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                e.to_string(),
-            )))
-        })?;
+        let rows = crate::services::blocking(|| self.database.write().execute_sql(query)).map_err(
+            |e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    sqlstate(&e).to_owned(),
+                    e.to_string(),
+                )))
+            },
+        )?;
 
         if !returns_rows(query) {
             return Ok(vec![Response::Execution(command_tag(query))]);

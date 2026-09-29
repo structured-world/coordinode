@@ -127,7 +127,7 @@ pub fn export_json<W: Write>(
         let record = NodeRecord::from_msgpack(value_bytes)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
 
-        let props = resolve_properties(&record.props, interner);
+        let props = resolve_properties(&record.props, interner)?;
 
         let json = serde_json::json!({
             "type": "node",
@@ -226,7 +226,7 @@ pub fn export_cypher<W: Write>(
         let record = NodeRecord::from_msgpack(value_bytes)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
 
-        let props = resolve_properties(&record.props, interner);
+        let props = resolve_properties(&record.props, interner)?;
         let labels = record.labels.join(":");
         let props_str = format_cypher_props(&props);
 
@@ -319,8 +319,11 @@ pub fn export_binary<W: Write>(
     writer.write_all(&(encoded.len() as u32).to_le_bytes())?;
     writer.write_all(&encoded)?;
 
-    // Interner second (needed for restore)
-    let interner_bytes = interner.to_bytes();
+    // The dictionary second: restore publishes these exact bindings before
+    // it installs any record encoded with them.
+    let interner_bytes = interner
+        .to_bytes()
+        .map_err(|e| ExportError::Serialization(e.to_string()))?;
     let header = BackupEntry::Interner(interner_bytes);
     let encoded =
         rmp_serde::to_vec(&header).map_err(|e| ExportError::Serialization(e.to_string()))?;
@@ -462,19 +465,23 @@ pub struct ExportStats {
 // -- Internal helpers --
 
 /// Resolve interned property IDs to human-readable names.
+///
+/// # Errors
+///
+/// A stored id the dictionary cannot name: exporting it under a made-up
+/// name would write a dump that restores as different data.
 fn resolve_properties(
     props: &HashMap<u32, Value>,
     interner: &FieldInterner,
-) -> serde_json::Map<String, serde_json::Value> {
+) -> Result<serde_json::Map<String, serde_json::Value>, ExportError> {
     let mut map = serde_json::Map::new();
     for (&field_id, value) in props {
-        let name = interner
-            .resolve(field_id)
-            .unwrap_or("_unknown_")
-            .to_string();
-        map.insert(name, value_to_json(value));
+        let name = interner.resolve(field_id).ok_or_else(|| {
+            ExportError::Serialization(format!("stored field id {field_id} has no binding"))
+        })?;
+        map.insert(name.to_string(), value_to_json(value));
     }
-    map
+    Ok(map)
 }
 
 /// Convert a CoordiNode Value to serde_json::Value.
@@ -602,7 +609,7 @@ fn load_edge_properties(
         )
         .map_err(|e| ExportError::Storage(e.to_string()))?
     {
-        Some(props) => Ok(resolve_properties(&props.props, interner)),
+        Some(props) => resolve_properties(&props.props, interner),
         None => Ok(serde_json::Map::new()),
     }
 }

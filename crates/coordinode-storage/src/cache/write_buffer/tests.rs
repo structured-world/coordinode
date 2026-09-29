@@ -32,7 +32,7 @@ fn merge_entry(ts: u64) -> DrainEntry {
 #[test]
 fn roundtrip_put_entry() {
     let entry = test_entry(3, 100);
-    let encoded = encode_entry(&entry);
+    let encoded = encode_entry(&entry).unwrap();
     let decoded = decode_entry(&encoded[4..]).unwrap();
 
     assert_eq!(decoded.mutations.len(), 3);
@@ -56,7 +56,7 @@ fn roundtrip_put_entry() {
 #[test]
 fn roundtrip_delete_entry() {
     let entry = delete_entry(200);
-    let encoded = encode_entry(&entry);
+    let encoded = encode_entry(&entry).unwrap();
     let decoded = decode_entry(&encoded[4..]).unwrap();
     assert_eq!(decoded.commit_ts.as_raw(), 200);
     let Mutation::Delete { partition, key } = &decoded.mutations[0] else {
@@ -70,13 +70,31 @@ fn roundtrip_delete_entry() {
 #[test]
 fn roundtrip_merge_entry() {
     let entry = merge_entry(300);
-    let encoded = encode_entry(&entry);
+    let encoded = encode_entry(&entry).unwrap();
     let decoded = decode_entry(&encoded[4..]).unwrap();
     let Mutation::Merge { operand, .. } = &decoded.mutations[0] else {
         assert!(false, "expected Merge variant");
         return;
     };
     assert_eq!(operand, &[1u8, 2, 3, 4]);
+}
+
+/// A metadata command survives the round trip whole, so a recovered entry
+/// is decided against the dictionary it finds, like the original would be.
+#[test]
+fn roundtrip_command_entry() {
+    use coordinode_core::txn::proposal::MetadataCommand;
+    let command = MetadataCommand::RegisterFields {
+        names: vec!["a".into(), "b".into()],
+    };
+    let entry = DrainEntry::new(
+        vec![Mutation::Command(command.clone())],
+        Timestamp::from_raw(400),
+        Timestamp::from_raw(1),
+    );
+    let encoded = encode_entry(&entry).unwrap();
+    let decoded = decode_entry(&encoded[4..]).unwrap();
+    assert_eq!(decoded.mutations, vec![Mutation::Command(command)]);
 }
 
 #[test]
@@ -219,7 +237,7 @@ fn partial_entry_truncation_handled() {
     let current_path = dir.path().join(CURRENT_FILE);
 
     let entry = test_entry(1, 100);
-    let encoded = encode_entry(&entry);
+    let encoded = encode_entry(&entry).unwrap();
 
     // Write complete entry + partial garbage.
     std::fs::write(&current_path, {

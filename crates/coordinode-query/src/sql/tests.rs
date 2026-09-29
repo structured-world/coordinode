@@ -158,13 +158,15 @@ fn create_table_accepts_table_level_primary_key() {
     assert_eq!(primary_key, vec!["a".to_string()]);
 }
 
+/// A table without a PRIMARY KEY is keyed by row id: it lowers with no key
+/// columns rather than being refused.
 #[test]
-fn create_table_without_primary_key_is_rejected() {
-    assert!(
-        SqlFrontend::new()
-            .parse("CREATE TABLE T (a BIGINT, b BIGINT)")
-            .is_err()
-    );
+fn create_table_without_primary_key_is_keyed_by_row_id() {
+    let root = plan("CREATE TABLE T (a BIGINT, b BIGINT)");
+    let LogicalOp::CreateTable { primary_key, .. } = root else {
+        panic!("expected CreateTable");
+    };
+    assert!(primary_key.is_empty());
 }
 
 #[test]

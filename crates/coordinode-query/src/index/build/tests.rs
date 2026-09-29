@@ -1,41 +1,38 @@
 use super::*;
-use coordinode_core::graph::node::NodeRecord;
-use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
+use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::types::Value;
+use coordinode_core::txn::write_concern::WriteConcern;
+use coordinode_modality::{IndexStore as _, LocalIndexStore};
+use coordinode_storage::engine::transaction::CommitContext;
 
-fn test_engine(dir: &std::path::Path) -> StorageEngine {
+struct Fixture {
+    _dir: tempfile::TempDir,
+    engine: StorageEngine,
+    oracle: TimestampOracle,
+    interner: FieldInterner,
+}
+
+fn fixture() -> Fixture {
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
-        dir,
+        dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
     )]);
-    StorageEngine::open(&config).expect("open engine")
+    Fixture {
+        engine: StorageEngine::open(&config).expect("open engine"),
+        _dir: dir,
+        oracle: TimestampOracle::resume_from(Timestamp::from_raw(1)),
+        interner: FieldInterner::new(),
+    }
 }
 
-fn insert_node(
-    engine: &StorageEngine,
-    shard_id: u16,
-    node_id: u64,
-    label: &str,
-    props: &[(&str, Value)],
-    interner: &mut FieldInterner,
-) {
-    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-    use coordinode_core::txn::write_concern::WriteConcern;
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
-    let mut record = NodeRecord::new(label);
-    for (name, value) in props {
-        let field_id = interner.intern(name);
-        record.set(field_id, value.clone());
-    }
-    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
-    let read_ts = oracle.next();
-    let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);
-    LocalNodeStore
-        .put(&mut txn, shard_id, NodeId::from_raw(node_id), &record)
-        .expect("put");
+fn commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
     let wc = WriteConcern::majority();
     let ctx = CommitContext {
         write_concern: &wc,
@@ -44,205 +41,150 @@ fn insert_node(
         drain_buffer: None,
         nvme_write_buffer: None,
     };
-    txn.commit(&ctx).expect("commit");
+    txn.commit(&ctx).map(|_| ())
 }
 
-#[test]
-fn build_index_on_existing_nodes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let mut interner = FieldInterner::new();
-
-    // Create some nodes
-    insert_node(
-        &engine,
-        1,
-        1,
-        "User",
-        &[("email", Value::String("alice@test.com".into()))],
-        &mut interner,
-    );
-    insert_node(
-        &engine,
-        1,
-        2,
-        "User",
-        &[("email", Value::String("bob@test.com".into()))],
-        &mut interner,
-    );
-    insert_node(
-        &engine,
-        1,
-        3,
-        "Movie",
-        &[("title", Value::String("Matrix".into()))],
-        &mut interner,
-    );
-
-    // Build index on User.email
-    let idx = IndexDefinition::btree("user_email", "User", "email");
-    let result = build_index(&engine, &idx, &interner, 1);
-
-    assert_eq!(result.state, Some(IndexBuildState::Committed));
-    assert_eq!(result.scanned, 3); // All nodes scanned
-    assert_eq!(result.indexed, 2); // Only User nodes indexed
-    assert_eq!(result.skipped, 1); // Movie skipped
-    assert!(result.violations.is_empty());
-
-    // Verify index entries exist
-    let alice = super::super::ops::index_scan_exact(
-        &engine,
-        "user_email",
-        &Value::String("alice@test.com".into()),
-    )
-    .expect("scan");
-    assert_eq!(alice, vec![1]);
+fn put_node(fx: &mut Fixture, node_id: u64, label: &str, props: &[(&str, Value)]) {
+    let mut record = NodeRecord::new(label);
+    for (name, value) in props {
+        let field = fx.interner.intern(name);
+        record.set(field, value.clone());
+    }
+    let mut txn = Transaction::begin(&fx.engine, Some(&fx.oracle), fx.oracle.next());
+    LocalNodeStore
+        .put(&mut txn, 1, NodeId::from_raw(node_id), &record)
+        .expect("put");
+    commit(&mut txn).expect("commit");
 }
 
-#[test]
-fn build_unique_index_aborts_on_duplicates() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let mut interner = FieldInterner::new();
-
-    // Two nodes with same email
-    insert_node(
-        &engine,
-        1,
-        1,
-        "User",
-        &[("email", Value::String("same@test.com".into()))],
-        &mut interner,
-    );
-    insert_node(
-        &engine,
-        1,
-        2,
-        "User",
-        &[("email", Value::String("same@test.com".into()))],
-        &mut interner,
-    );
-
-    let idx = IndexDefinition::btree("user_email", "User", "email").unique();
-    let result = build_index(&engine, &idx, &interner, 1);
-
-    assert_eq!(result.state, Some(IndexBuildState::Aborted));
-    assert!(!result.violations.is_empty());
-
-    // Index entries should be cleaned up
-    let entries = super::super::ops::index_scan(&engine, &idx).expect("scan");
-    assert!(entries.is_empty());
+fn backfill(fx: &Fixture) -> Backfill<'_> {
+    Backfill {
+        engine: &fx.engine,
+        oracle: Some(&fx.oracle),
+        interner: &fx.interner,
+        shard_id: 1,
+        own_open: 0,
+    }
 }
 
-#[test]
-fn build_sparse_index_skips_nulls() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let mut interner = FieldInterner::new();
-
-    insert_node(
-        &engine,
-        1,
-        1,
-        "User",
-        &[("bio", Value::String("Developer".into()))],
-        &mut interner,
-    );
-    insert_node(
-        &engine,
-        1,
-        2,
-        "User",
-        &[("name", Value::String("Bob".into()))],
-        &mut interner,
-    ); // No bio
-
-    let idx = IndexDefinition::btree("user_bio", "User", "bio").sparse();
-    let result = build_index(&engine, &idx, &interner, 1);
-
-    assert_eq!(result.state, Some(IndexBuildState::Committed));
-    assert_eq!(result.indexed, 1); // Only node 1 has bio
+fn lookup(fx: &Fixture, index: &IndexDefinition, value: &str) -> Vec<u64> {
+    let mut txn = Transaction::begin(&fx.engine, Some(&fx.oracle), fx.oracle.next());
+    let mut ids: Vec<u64> = LocalIndexStore::new(&fx.engine)
+        .scan_exact(&mut txn, index, &[Value::String(value.into())])
+        .expect("scan")
+        .expect("indexable")
+        .into_iter()
+        .map(|n| n.as_raw())
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
-#[test]
-fn build_index_saves_definition() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let mut interner = FieldInterner::new();
-
-    insert_node(
-        &engine,
-        1,
-        1,
-        "User",
-        &[("name", Value::String("Alice".into()))],
-        &mut interner,
-    );
-
-    let idx = IndexDefinition::btree("user_name", "User", "name");
-    let result = build_index(&engine, &idx, &interner, 1);
-    assert_eq!(result.state, Some(IndexBuildState::Committed));
-
-    // Definition should be loadable
-    let loaded = super::super::ops::load_index_definition(&engine, "user_name")
-        .expect("load")
-        .expect("should exist");
-    assert_eq!(loaded.name, "user_name");
+fn email(v: &str) -> [(&'static str, Value); 1] {
+    [("email", Value::String(v.into()))]
 }
 
+/// The nodes of the index's label are indexed, others are not.
 #[test]
-fn build_empty_label_succeeds() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let interner = FieldInterner::new();
+fn a_backfill_indexes_the_nodes_of_its_label() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("alice@x"));
+    put_node(&mut fx, 2, "User", &email("bob@x"));
+    put_node(&mut fx, 3, "Movie", &email("alice@x"));
 
-    // No nodes exist
-    let idx = IndexDefinition::btree("user_email", "User", "email");
-    let result = build_index(&engine, &idx, &interner, 1);
+    let index = IndexDefinition::btree("user_email", "User", "email");
+    let indexed = backfill(&fx).run(&index, &mut commit).expect("backfill");
 
-    assert_eq!(result.state, Some(IndexBuildState::Committed));
-    assert_eq!(result.scanned, 0);
-    assert_eq!(result.indexed, 0);
+    assert_eq!(indexed, 2);
+    assert_eq!(lookup(&fx, &index, "alice@x"), vec![1]);
+    assert_eq!(lookup(&fx, &index, "bob@x"), vec![2]);
 }
 
+/// Stored data that already breaks a unique index stops its build and names
+/// the node holding the value.
 #[test]
-fn build_index_with_partial_filter() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-    let mut interner = FieldInterner::new();
+fn a_unique_backfill_stops_at_a_duplicate() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("same@x"));
+    put_node(&mut fx, 2, "User", &email("same@x"));
 
-    insert_node(
-        &engine,
-        1,
-        1,
-        "User",
-        &[
-            ("email", Value::String("alice@test.com".into())),
-            ("status", Value::String("active".into())),
-        ],
-        &mut interner,
+    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let err = backfill(&fx)
+        .run(&index, &mut commit)
+        .expect_err("duplicate data");
+    assert!(
+        matches!(&err, BackfillError::Duplicate(v) if v.holder == NodeId::from_raw(1)),
+        "expected a duplicate held by node 1, got {err:?}"
     );
-    insert_node(
-        &engine,
-        1,
-        2,
-        "User",
-        &[
-            ("email", Value::String("bob@test.com".into())),
-            ("status", Value::String("inactive".into())),
-        ],
-        &mut interner,
-    );
+}
 
-    let idx = IndexDefinition::btree("active_email", "User", "email").with_filter(
-        super::super::definition::PartialFilter::PropertyEquals {
-            property: "status".into(),
-            value: "active".into(),
-        },
-    );
+/// A sparse index skips a node missing the property.
+#[test]
+fn a_sparse_backfill_skips_missing_values() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &[("bio", Value::String("dev".into()))]);
+    put_node(&mut fx, 2, "User", &[("name", Value::String("bob".into()))]);
 
-    let result = build_index(&engine, &idx, &interner, 1);
-    assert_eq!(result.state, Some(IndexBuildState::Committed));
-    assert_eq!(result.indexed, 1); // Only active user
-    assert_eq!(result.skipped, 1); // Inactive filtered out
+    let index = IndexDefinition::btree("user_bio", "User", "bio").sparse();
+    assert_eq!(backfill(&fx).run(&index, &mut commit).expect("backfill"), 1);
+}
+
+/// A label larger than a page is indexed whole, one committed transaction
+/// per page.
+#[test]
+fn a_backfill_spans_pages() {
+    let mut fx = fixture();
+    let total = PAGE as u64 * 2 + 7;
+    for id in 1..=total {
+        put_node(&mut fx, id, "User", &email(&format!("u{id}@x")));
+    }
+    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let mut commits = 0;
+    let indexed = backfill(&fx)
+        .run(&index, &mut |txn| {
+            commits += 1;
+            commit(txn)
+        })
+        .expect("backfill");
+    assert_eq!(indexed, total);
+    assert_eq!(commits, 3);
+    assert_eq!(lookup(&fx, &index, &format!("u{total}@x")), vec![total]);
+}
+
+/// A node a writer changes after a page read it makes that page conflict at
+/// commit; the page is read again, so the index holds the node's new value
+/// and no entry for the old one.
+#[test]
+fn a_page_that_read_a_changed_node_is_read_again() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("alice@x"));
+    let field = fx.interner.intern("email");
+
+    let index = IndexDefinition::btree("user_email", "User", "email");
+    let engine = &fx.engine;
+    let oracle = &fx.oracle;
+    let mut first = true;
+    let indexed = backfill(&fx)
+        .run(&index, &mut |txn| {
+            if std::mem::take(&mut first) {
+                // A writer changes the node between the page's read and its
+                // commit.
+                let mut record = NodeRecord::new("User");
+                record.set(field, Value::String("changed@x".into()));
+                let mut writer = Transaction::begin(engine, Some(oracle), oracle.next());
+                LocalNodeStore
+                    .put(&mut writer, 1, NodeId::from_raw(1), &record)
+                    .expect("put");
+                commit(&mut writer).expect("writer commit");
+            }
+            commit(txn)
+        })
+        .expect("backfill");
+
+    assert_eq!(indexed, 1);
+    assert_eq!(lookup(&fx, &index, "changed@x"), vec![1]);
+    assert!(
+        lookup(&fx, &index, "alice@x").is_empty(),
+        "the value the node no longer holds must not be indexed"
+    );
 }

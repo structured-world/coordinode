@@ -35,7 +35,9 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 
-use coordinode_raft::cluster::{JoinPhase, JoinProgressEvent, NodeRole, RaftNode};
+use coordinode_raft::cluster::{
+    JoinPhase, JoinProgressEvent, NodeReplicationStatus, NodeRole, RaftNode,
+};
 
 use crate::proto::admin::cluster::{
     AddNodeRequest, ClusterNode, ClusterStatus, DecommissionNodeRequest, DecommissionNodeResponse,
@@ -103,11 +105,15 @@ fn proto_role(role: NodeRole) -> i32 {
     }
 }
 
-fn proto_state(lag: u64) -> i32 {
-    // Healthy: lag ≤ 1 000 entries (readiness threshold).
+fn proto_state(status: &NodeReplicationStatus) -> i32 {
+    // Down: acknowledged nothing yet (unreachable, or never reached).
+    // Healthy: lag ≤ 1 000 entries.
     // Degraded: lag ≤ 50 000 entries (still catching up but alive).
     // Down: lag > 50 000 (stale or unreachable).
-    if lag <= 1_000 {
+    let lag = status.lag_entries;
+    if status.matched_index.is_none() {
+        ProtoNodeState::Down as i32
+    } else if lag <= 1_000 {
         ProtoNodeState::Healthy as i32
     } else if lag <= 50_000 {
         ProtoNodeState::Degraded as i32
@@ -140,7 +146,7 @@ impl ClusterService for ClusterServiceImpl {
         // Falls back to empty list if this node is not the leader.
         if let Some(statuses) = self.raft_node.replication_status() {
             for s in statuses {
-                let state = proto_state(s.lag_entries);
+                let state = proto_state(&s);
                 nodes.push(ClusterNode {
                     node_id: s.node_id.to_string(),
                     address: String::new(), // address not tracked in NodeReplicationStatus
@@ -185,7 +191,7 @@ impl ClusterService for ClusterServiceImpl {
             "JoinNode: initiating cluster join lifecycle"
         );
 
-        // Step 1 (arch §Cluster Join Protocol, Step 2): add node as Learner.
+        // Step 1: add the node as a learner.
         // This is a Raft proposal and completes quickly. Returns before three-tier
         // recovery starts on the joining node.
         self.raft_node
@@ -216,8 +222,8 @@ impl ClusterService for ClusterServiceImpl {
             ),
         });
 
-        // Step 2 (arch §Cluster Join Protocol, Steps 3-4): background task monitors
-        // replication lag and promotes node when lag < READINESS_LAG_THRESHOLD.
+        // Step 2: a background task watches the learner's replication and
+        // promotes it once it has answered and lags little enough.
         let raft = Arc::clone(&self.raft_node);
         let registry = Arc::clone(&self.join_registry);
         let tx_bg = tx.clone();
@@ -454,22 +460,20 @@ impl ClusterServiceImpl {
         // Forward DecommissionNode to the new leader (the peer we transferred to).
         // The peer now runs the quorum gate and the membership remove and
         // returns the result.
-        let endpoint = if peer_addr.starts_with("http://") || peer_addr.starts_with("https://") {
-            peer_addr.clone()
-        } else {
-            format!("http://{peer_addr}")
+        let unreachable = |e: tonic::transport::Error| {
+            Status::unavailable(format!(
+                "self-decommission: could not connect to new leader at {peer_addr}: {e}"
+            ))
         };
-
-        let mut client =
-            crate::proto::admin::cluster::cluster_service_client::ClusterServiceClient::connect(
-                endpoint,
-            )
+        let channel = coordinode_wire::peer_endpoint(&peer_addr)
+            .map_err(unreachable)?
+            .connect()
             .await
-            .map_err(|e| {
-                Status::unavailable(format!(
-                    "self-decommission: could not connect to new leader at {peer_addr}: {e}"
-                ))
-            })?;
+            .map_err(unreachable)?;
+        let mut client =
+            crate::proto::admin::cluster::cluster_service_client::ClusterServiceClient::new(
+                channel,
+            );
 
         let resp = client
             .decommission_node(DecommissionNodeRequest {
@@ -495,3 +499,6 @@ impl ClusterServiceImpl {
         Ok(Response::new(resp))
     }
 }
+
+#[cfg(test)]
+mod tests;

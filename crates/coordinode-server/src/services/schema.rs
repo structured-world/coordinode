@@ -296,11 +296,8 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             echo_computed.push(cp.clone());
         }
 
-        let schema_revision = {
-            let mut db = self.database.write();
-            db.create_label_schema(schema)
-                .map_err(|e| db_err_to_status("create_label", e))?
-        };
+        let schema_revision = super::blocking(|| self.database.write().create_label_schema(schema))
+            .map_err(|e| db_err_to_status("create_label", e))?;
 
         Ok(Response::new(graph::Label {
             name: req.name,
@@ -331,11 +328,9 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
             schema.add_property(prop);
         }
 
-        let schema_revision = {
-            let mut db = self.database.write();
-            db.create_edge_type_schema(schema)
-                .map_err(|e| db_err_to_status("create_edge_type", e))?
-        };
+        let schema_revision =
+            super::blocking(|| self.database.write().create_edge_type_schema(schema))
+                .map_err(|e| db_err_to_status("create_edge_type", e))?;
 
         Ok(Response::new(graph::EdgeType {
             name: req.name,
@@ -352,95 +347,98 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // then add any undeclared labels discovered from existing nodes.
         const SCHEMA_PREFIX: &[u8] = b"schema:label:";
 
-        let mut db = self.database.write();
+        let labels = super::blocking(|| -> Result<Vec<graph::Label>, Status> {
+            let mut db = self.database.write();
 
-        // Pass 1: scan `schema:label:*` for persisted LabelSchema entries.
-        let mut label_map: std::collections::BTreeMap<String, graph::Label> = {
-            let iter = db
-                .engine()
-                .prefix_scan(Partition::Schema, SCHEMA_PREFIX)
-                .map_err(|e| Status::internal(format!("list_labels scan error: {e}")))?;
+            // Pass 1: scan `schema:label:*` for persisted LabelSchema entries.
+            let mut label_map: std::collections::BTreeMap<String, graph::Label> = {
+                let iter = db
+                    .engine()
+                    .prefix_scan(Partition::Schema, SCHEMA_PREFIX)
+                    .map_err(|e| Status::internal(format!("list_labels scan error: {e}")))?;
 
-            let mut map = std::collections::BTreeMap::new();
-            for guard in iter {
-                let Ok((key, val_bytes)) = guard.into_inner() else {
-                    continue;
-                };
-                let Ok(name) = std::str::from_utf8(&key[SCHEMA_PREFIX.len()..]) else {
-                    continue;
-                };
-                if name.is_empty() {
-                    continue;
-                }
-                // Decode the persisted LabelSchema and convert properties.
-                if let Ok(schema) =
-                    coordinode_core::schema::definition::LabelSchema::from_msgpack(&val_bytes)
-                {
-                    let mut properties = Vec::new();
-                    let mut computed_properties = Vec::new();
-
-                    for p in schema.properties.values() {
-                        if let PropertyType::Computed(ref spec) = p.property_type {
-                            computed_properties.push(computed_spec_to_proto(&p.name, spec));
-                        } else {
-                            properties.push(graph::PropertyDefinition {
-                                name: p.name.clone(),
-                                r#type: property_type_to_proto(&p.property_type),
-                                required: p.not_null,
-                                unique: p.unique,
-                            });
-                        }
+                let mut map = std::collections::BTreeMap::new();
+                for guard in iter {
+                    let Ok((key, val_bytes)) = guard.into_inner() else {
+                        continue;
+                    };
+                    let Ok(name) = std::str::from_utf8(&key[SCHEMA_PREFIX.len()..]) else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
                     }
+                    // Decode the persisted LabelSchema and convert properties.
+                    if let Ok(schema) =
+                        coordinode_core::schema::definition::LabelSchema::from_msgpack(&val_bytes)
+                    {
+                        let mut properties = Vec::new();
+                        let mut computed_properties = Vec::new();
 
-                    map.insert(
-                        schema.name.clone(),
-                        graph::Label {
-                            name: schema.name.clone(),
-                            properties,
-                            schema_revision: schema.schema_revision,
-                            computed_properties,
-                            schema_mode: schema_mode_to_proto(schema.mode),
-                        },
-                    );
-                } else {
-                    // Unreadable schema entry — still expose the name.
-                    map.entry(name.to_string()).or_insert_with(|| graph::Label {
-                        name: name.to_string(),
-                        properties: vec![],
-                        schema_revision: 0,
-                        computed_properties: vec![],
-                        schema_mode: schema_mode_to_proto(SchemaMode::Strict),
-                    });
-                }
-            }
-            map
-        };
+                        for p in schema.properties.values() {
+                            if let PropertyType::Computed(ref spec) = p.property_type {
+                                computed_properties.push(computed_spec_to_proto(&p.name, spec));
+                            } else {
+                                properties.push(graph::PropertyDefinition {
+                                    name: p.name.clone(),
+                                    r#type: property_type_to_proto(&p.property_type),
+                                    required: p.not_null,
+                                    unique: p.unique,
+                                });
+                            }
+                        }
 
-        // Pass 2: discover undeclared labels from existing nodes via Cypher.
-        // Note: `label` is a Cypher reserved keyword — use `lbl` as alias.
-        let rows = db
-            .execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl ORDER BY lbl")
-            .map_err(|e| db_err_to_status("list_labels cypher", e))?;
-
-        for row in rows {
-            if let Some(Value::String(name)) = row.get("lbl") {
-                if !name.is_empty() {
-                    label_map
-                        .entry(name.clone())
-                        .or_insert_with(|| graph::Label {
-                            name: name.clone(),
+                        map.insert(
+                            schema.name.clone(),
+                            graph::Label {
+                                name: schema.name.clone(),
+                                properties,
+                                schema_revision: schema.schema_revision,
+                                computed_properties,
+                                schema_mode: schema_mode_to_proto(schema.mode),
+                            },
+                        );
+                    } else {
+                        // Unreadable schema entry — still expose the name.
+                        map.entry(name.to_string()).or_insert_with(|| graph::Label {
+                            name: name.to_string(),
                             properties: vec![],
                             schema_revision: 0,
                             computed_properties: vec![],
-                            // No declared schema.
-                            schema_mode: graph::SchemaMode::Unspecified as i32,
+                            schema_mode: schema_mode_to_proto(SchemaMode::Strict),
                         });
+                    }
+                }
+                map
+            };
+
+            // Pass 2: discover undeclared labels from existing nodes via Cypher.
+            // Note: `label` is a Cypher reserved keyword — use `lbl` as alias.
+            let rows = db
+                .execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl ORDER BY lbl")
+                .map_err(|e| db_err_to_status("list_labels cypher", e))?;
+
+            for row in rows {
+                if let Some(Value::String(name)) = row.get("lbl") {
+                    if !name.is_empty() {
+                        label_map
+                            .entry(name.clone())
+                            .or_insert_with(|| graph::Label {
+                                name: name.clone(),
+                                properties: vec![],
+                                schema_revision: 0,
+                                computed_properties: vec![],
+                                // No declared schema.
+                                schema_mode: graph::SchemaMode::Unspecified as i32,
+                            });
+                    }
                 }
             }
-        }
 
-        let mut labels: Vec<graph::Label> = label_map.into_values().collect();
-        labels.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut labels: Vec<graph::Label> = label_map.into_values().collect();
+            labels.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(labels)
+        })?;
 
         Ok(Response::new(graph::ListLabelsResponse { labels }))
     }
@@ -456,7 +454,7 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
         // Versioned schema keys are `schema:edge_type:<name>:<version>`.
         // Strip the trailing `:<version>` suffix and dedup by name.
         const PREFIX: &[u8] = b"schema:edge_type:";
-        let names: Vec<String> = {
+        let names: Vec<String> = super::blocking(|| -> Result<Vec<String>, Status> {
             let db = self.database.write();
             let iter = db
                 .engine()
@@ -480,8 +478,8 @@ impl graph::schema_service_server::SchemaService for SchemaServiceImpl {
                 }
             }
             types.sort();
-            types
-        };
+            Ok(types)
+        })?;
 
         let edge_types: Vec<graph::EdgeType> = names
             .into_iter()

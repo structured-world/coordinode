@@ -96,17 +96,114 @@ fn read_range_partial_window() {
     assert_eq!(entries[9].index, 14);
 }
 
+/// The active segment is readable without sealing it, flushed or not.
 #[test]
-fn read_range_forces_rotation_of_active_writer() {
+fn read_range_reads_the_active_writer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut mgr = test_manager(dir.path());
 
     for i in 0..5u64 {
         mgr.append(&make_entry(i, 3000 + i)).expect("append");
     }
-    // Current writer is NOT explicitly rotated — read_range must seal it.
     let entries = mgr.read_range(0, 5).expect("read_range");
-    assert_eq!(entries.len(), 5);
+    assert_eq!(
+        entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4]
+    );
+    let entries = mgr.read_range(2, 4).expect("read_range");
+    assert_eq!(entries.iter().map(|e| e.index).collect::<Vec<_>>(), [2, 3]);
+    assert_eq!(
+        mgr.sealed.len(),
+        0,
+        "a read must not seal the active segment"
+    );
+}
+
+/// A replicated log is read after nearly every append (to ship entries and
+/// to apply them). A read that sealed the active segment left one segment
+/// per read, and every read then decoded the whole log again: each write
+/// cost more than the one before it.
+#[test]
+fn reading_the_tail_does_not_split_the_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+
+    for i in 0..200u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+        mgr.flush().expect("flush");
+        let read = mgr.read_range(i, i + 1).expect("read tail");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].index, i);
+    }
+    assert_eq!(mgr.sealed.len(), 0, "reads split the log into segments");
+    let all = mgr.read_range(0, u64::MAX).expect("read all");
+    assert_eq!(all.len(), 200);
+}
+
+/// A range spanning sealed segments and the active one comes back whole and
+/// in order, and a start inside a later segment skips the earlier ones.
+#[test]
+fn read_range_spans_sealed_and_active_segments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+
+    for i in 0..30u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+        if i % 10 == 9 && i < 29 {
+            mgr.rotate().expect("rotate");
+        }
+    }
+    assert_eq!(mgr.sealed.len(), 2);
+    let indexes = |v: Vec<OplogEntry>| v.iter().map(|e| e.index).collect::<Vec<_>>();
+    assert_eq!(
+        indexes(mgr.read_range(8, 23).expect("span")),
+        (8..23).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        indexes(mgr.read_range(15, u64::MAX).expect("from the middle")),
+        (15..30).collect::<Vec<_>>()
+    );
+    assert!(mgr.read_range(30, 40).expect("past the end").is_empty());
+}
+
+/// The sync method the manager is given is the one each new segment uses,
+/// across a rotation too; unset, it is the full flush.
+#[test]
+fn every_new_segment_uses_the_managers_sync_method() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+    mgr.append(&make_entry(0, 10)).expect("append");
+    assert_eq!(
+        mgr.current.as_ref().expect("writer").sync_method(),
+        SyncMethod::Full
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path()).with_sync_method(SyncMethod::OpenDatasync);
+    mgr.append(&make_entry(0, 10)).expect("append");
+    mgr.rotate().expect("rotate");
+    mgr.append(&make_entry(1, 11)).expect("append");
+    assert_eq!(
+        mgr.current.as_ref().expect("writer").sync_method(),
+        SyncMethod::OpenDatasync
+    );
+}
+
+/// Reads find entries by index, so an index that does not grow is refused.
+#[test]
+fn an_index_that_does_not_grow_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+
+    mgr.append(&make_entry(5, 3000)).expect("append");
+    assert!(mgr.append(&make_entry(5, 3001)).is_err(), "repeated index");
+    assert!(mgr.append(&make_entry(4, 3002)).is_err(), "falling index");
+    mgr.rotate().expect("rotate");
+    assert!(
+        mgr.append(&make_entry(3, 3003)).is_err(),
+        "an index below a sealed segment"
+    );
+    mgr.append(&make_entry(6, 3004)).expect("next index");
 }
 
 #[test]
@@ -414,8 +511,13 @@ fn open_multi_recovers_segments_from_recovery_dirs() {
     // Real sealed segments: open_multi seals or discards a newest segment
     // that an unclean shutdown left open, so placeholders would not survive.
     let sealed_segment = |dir: &Path, first_index: u64| {
-        let mut writer = SegmentWriter::create(&segment_path(dir, first_index), 0, first_index)
-            .expect("create segment");
+        let mut writer = SegmentWriter::create(
+            &segment_path(dir, first_index),
+            0,
+            first_index,
+            SyncMethod::Full,
+        )
+        .expect("create segment");
         writer
             .append(&make_entry(first_index, 1000 + first_index))
             .expect("append");
@@ -523,7 +625,7 @@ fn append_replaces_a_header_only_segment_left_by_a_crash() {
     // Leave exactly what a crash leaves: a segment with a header and nothing
     // after it, never sealed.
     let orphan = segment_path(dir.path(), 4);
-    SegmentWriter::create(&orphan, 0, 4).expect("create orphan");
+    SegmentWriter::create(&orphan, 0, 4, SyncMethod::Full).expect("create orphan");
     assert!(orphan.exists());
 
     let mut mgr = OplogManager::open(dir.path(), 0, 1 << 20, 1000, 3600).expect("open");
@@ -543,12 +645,12 @@ fn append_refuses_to_replace_a_segment_holding_entries() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let occupied = segment_path(dir.path(), 7);
-    let mut writer = SegmentWriter::create(&occupied, 0, 7).expect("create");
+    let mut writer = SegmentWriter::create(&occupied, 0, 7, SyncMethod::Full).expect("create");
     writer.append(&make_entry(7, 100)).expect("append");
     writer.flush_and_sync().expect("flush");
     drop(writer);
 
-    match SegmentWriter::create_or_replace_empty(&occupied, 0, 7) {
+    match SegmentWriter::create_or_replace_empty(&occupied, 0, 7, SyncMethod::Full) {
         Ok(_) => panic!("must not replace a segment that holds entries"),
         Err(e) => assert!(
             e.to_string().contains("holds 1 entries"),
@@ -638,7 +740,7 @@ fn reopen_after_crash_drops_a_torn_final_frame() {
 fn reopen_after_crash_discards_an_entryless_tail() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = segment_path(dir.path(), 5);
-    let mut writer = SegmentWriter::create(&path, 0, 5).expect("create");
+    let mut writer = SegmentWriter::create(&path, 0, 5, SyncMethod::Full).expect("create");
     writer.flush_and_sync().expect("flush header");
     drop(writer);
 

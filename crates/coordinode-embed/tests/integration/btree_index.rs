@@ -460,3 +460,205 @@ fn set_property_unique_conflict_still_enforced() {
         "error must mention unique constraint, got: {msg}"
     );
 }
+
+// ── Entries in the statement transaction ─────────────────────────────
+
+use coordinode_core::graph::types::Value;
+
+fn count(db: &mut Database, query: &str, params: &[(&str, Value)]) -> i64 {
+    let params = params
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    let rows = db
+        .execute_cypher_with_params(query, params)
+        .expect("count query");
+    match rows[0].values().next() {
+        Some(Value::Int(n)) => *n,
+        other => panic!("expected a count, got {other:?}"),
+    }
+}
+
+/// An equality answered by the index finds exactly the nodes holding the
+/// value. The old encoding wrote a string's NUL unescaped, so the entries of
+/// "a" were a prefix of those of "a\0:x" and a lookup of one found both.
+#[test]
+fn an_index_lookup_finds_only_the_value_asked_for() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX u_name ON :U(name)")
+        .expect("index");
+    for name in ["a", "a\0:x"] {
+        db.execute_cypher_with_params(
+            "CREATE (:U {name: $n})",
+            [("n".to_string(), Value::String(name.into()))].into(),
+        )
+        .expect("create");
+    }
+    let query = "MATCH (u:U) WHERE u.name = $n RETURN count(u)";
+    assert_eq!(
+        count(&mut db, query, &[("n", Value::String("a".into()))]),
+        1
+    );
+    assert_eq!(
+        count(&mut db, query, &[("n", Value::String("a\0:x".into()))]),
+        1
+    );
+}
+
+/// A value with no key is not indexed, so it neither collides with another
+/// under a unique index nor hides from an equality.
+#[test]
+fn values_without_a_key_do_not_collide_under_a_unique_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_meta ON :U(meta)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {meta: {a: 1}})")
+        .expect("first map");
+    db.execute_cypher("CREATE (:U {meta: {b: 2}})")
+        .expect("a second, different map is no duplicate");
+}
+
+/// Nothing a failed statement staged survives it: the value its first
+/// write claimed is free once the statement fails.
+#[test]
+fn a_failed_statement_leaves_no_index_entry() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'taken'})")
+        .expect("seed");
+    db.execute_cypher("CREATE (:U {email: 'fresh'}), (:U {email: 'taken'})")
+        .expect_err("the second write breaks the index");
+    db.execute_cypher("CREATE (:U {email: 'fresh'})")
+        .expect("the failed statement's value was never claimed");
+}
+
+/// Two writers inserting one unique value at once: exactly one succeeds,
+/// and the other is told the value exists, not that it conflicted.
+#[test]
+fn concurrent_inserts_of_one_unique_value_leave_one_node() {
+    const WRITERS: usize = 8;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    let db = &db;
+    let outcomes: Vec<Result<(), String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                s.spawn(move || {
+                    db.execute_cypher_shared(
+                        &format!("CREATE (:U {{email: 'same', w: {w}}})"),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(
+        outcomes.iter().filter(|o| o.is_ok()).count(),
+        1,
+        "exactly one writer inserts: {outcomes:?}"
+    );
+    for err in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+        assert!(
+            err.contains("unique constraint violated"),
+            "a loser is told why: {err}"
+        );
+    }
+}
+
+/// A unique index over data that already breaks it is not created: the
+/// statement fails naming a holder, and nothing of the index stays.
+#[test]
+fn a_unique_index_over_duplicates_is_not_created() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:U {email: 'same'})")
+        .expect("first");
+    db.execute_cypher("CREATE (:U {email: 'same'})")
+        .expect("second");
+    let err = db
+        .execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect_err("the data breaks the index");
+    assert!(
+        err.to_string().contains("unique constraint violated"),
+        "{err}"
+    );
+    db.execute_cypher("CREATE (:U {email: 'same'})")
+        .expect("no index was left to refuse a third");
+    db.execute_cypher("CREATE INDEX u_email ON :U(email)")
+        .expect("the name is free again");
+}
+
+/// An index finds a list by each of its elements, but an equality on the
+/// property holds only for the list itself.
+#[test]
+fn an_equality_does_not_match_a_list_holding_the_value() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX u_tags ON :U(tags)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {tags: ['x', 'y']})")
+        .expect("list");
+    db.execute_cypher("CREATE (:U {tags: 'x'})")
+        .expect("scalar");
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:U) WHERE u.tags = $v RETURN count(u)",
+            &[("v", Value::String("x".into()))]
+        ),
+        1
+    );
+}
+
+/// An index stored in the layout that preceded transactional entries is
+/// rebuilt when the store opens: its own entries are cleared, the stored
+/// nodes indexed again, and the index answers lookups.
+#[test]
+fn a_legacy_index_is_rebuilt_on_open() {
+    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::ops::{load_index_definition, save_index_definition};
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+        db.execute_cypher("CREATE (:U {email: 'b@x'})").expect("b");
+        let mut legacy = IndexDefinition::btree("u_email", "U", "email").unique();
+        legacy.layout = 0;
+        save_index_definition(db.engine(), &legacy).expect("plant the legacy definition");
+        db.engine()
+            .put(Partition::Idx, b"idx:u_email:stale", b"")
+            .expect("plant a legacy entry");
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let def = load_index_definition(db.engine(), "u_email")
+        .expect("load")
+        .expect("the index is still defined");
+    assert_eq!(def.layout, coordinode_modality::ENTRY_LAYOUT);
+    assert_eq!(def.state, coordinode_query::index::IndexState::Ready);
+    assert!(
+        db.engine()
+            .get(Partition::Idx, b"idx:u_email:stale")
+            .expect("get")
+            .is_none(),
+        "the legacy entries are cleared"
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:U) WHERE u.email = $e RETURN count(u)",
+            &[("e", Value::String("a@x".into()))]
+        ),
+        1
+    );
+    db.execute_cypher("CREATE (:U {email: 'a@x'})")
+        .expect_err("the rebuilt index enforces the constraint");
+}

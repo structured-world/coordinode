@@ -110,7 +110,23 @@ impl RaftService for RaftGrpcHandler {
             Err(fatal) => Err(Status::internal(format!("fatal: {fatal}"))),
         });
 
-        Ok(Response::new(Box::pin(output_stream)))
+        // openraft ends the reply stream without a word once its consensus
+        // has stopped: the request it could not deliver goes unanswered. A
+        // leader reading a cleanly ended stream keeps waiting on that request
+        // and neither retries nor falls back to a snapshot, so such a stream
+        // ends with an error that makes the leader reconnect. The stop is
+        // already in the metrics by then: the core publishes it before it
+        // drops the queue whose closing ended the stream.
+        let raft = Arc::clone(&self.raft);
+        let stopped = futures_util::stream::once(async move {
+            use openraft::async_runtime::watch::WatchReceiver;
+            raft.metrics().borrow_watched().running_state.clone().err()
+        })
+        .filter_map(|fatal| async move {
+            fatal.map(|fatal| Err(Status::unavailable(format!("raft stopped: {fatal}"))))
+        });
+
+        Ok(Response::new(Box::pin(output_stream.chain(stopped))))
     }
 
     async fn snapshot(
@@ -156,7 +172,7 @@ impl RaftService for RaftGrpcHandler {
         );
 
         // A staged file is removed if the transfer or the install fails.
-        let staged = crate::snapshot::SnapshotFile::stage(&self.snapshot_dir)
+        let mut staged = crate::snapshot::SnapshotFile::stage(&self.snapshot_dir)
             .map_err(|e| Status::internal(format!("stage the snapshot file: {e}")))?;
         let mut writer = tokio::fs::File::from_std(
             staged

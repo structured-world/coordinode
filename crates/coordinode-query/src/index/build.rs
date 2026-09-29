@@ -1,216 +1,185 @@
-//! Online index build: scan existing nodes and create index entries.
+//! Backfill: fill a B-tree index with the entries of the nodes already
+//! stored.
 //!
-//! Three-phase protocol (adapted from MongoDB's hybrid builder):
-//! 1. Setup: validate index definition
-//! 2. InProgress: scan all nodes of the target label, create index entries
-//! 3. Commit: mark index as ready (or Abort on errors)
+//! Writers maintain the index from the moment it is registered with them. A
+//! transaction that opened before then decided what to maintain without it,
+//! so the backfill first waits for every such transaction to end (the wait
+//! PostgreSQL's concurrent index build makes for older snapshots): after it,
+//! every node write is either visible to the scan or maintains the index
+//! itself.
 //!
-//! Current phase scope: direct storage writes (single-node).
-//! CE product (3-node HA): index build runs on Raft leader only.
-//! Commit is a Raft log entry replicated to all nodes.
-//! Side-writes interception for concurrent writers added with Raft (distributed mode).
+//! The shard's nodes are then read a page at a time, each page in a
+//! transaction of its own whose entries commit through the caller's commit
+//! path, so they replicate like any other write and no single transaction
+//! grows with the data. A page that read a node a writer changed before the
+//! page committed conflicts at commit (the page's node keys are in its read
+//! set) and is read again: an entry for a value the node no longer holds
+//! cannot land.
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::NodeId;
-use coordinode_core::graph::types::Value;
-use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_modality::{IndexStore as _, LocalIndexStore, LocalNodeStore, NodeStore};
+use coordinode_core::graph::node::{NodeRecord, decode_node_key};
+use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+use coordinode_modality::{LocalNodeStore, NodeStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
-use coordinode_storage::engine::transaction::Transaction;
+use coordinode_storage::engine::transaction::{CommitError, Transaction};
 
 use super::definition::IndexDefinition;
-use super::ops::{create_index_entry, save_index_definition};
+use super::registry::{IndexWriteError, UniqueViolation, record_lookup, stage_node_entry};
 
-/// Index build state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexBuildState {
-    /// Initial setup: definition validated.
-    Setup,
-    /// Collection scan in progress.
-    InProgress,
-    /// Build completed successfully, index is usable.
-    Committed,
-    /// Build failed, index entries cleaned up.
-    Aborted,
+/// Nodes read per page, and so the most entries one page's transaction
+/// commits.
+const PAGE: usize = 512;
+
+/// Conflicts one page may meet in a row before the backfill gives up. Each
+/// one means a writer changed a node of the page while it was being read.
+const MAX_PAGE_CONFLICTS: u32 = 64;
+
+/// How long the backfill waits for the transactions opened before the index
+/// was registered, and how often it looks.
+const OLDER_TRANSACTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const OLDER_TRANSACTIONS_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Why a backfill stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum BackfillError {
+    /// Two stored nodes hold one value of a unique index: the data breaks
+    /// the constraint the index would enforce.
+    #[error(transparent)]
+    Duplicate(#[from] UniqueViolation),
+    /// Reading nodes or staging entries failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A page's commit failed for a reason retrying does not cure.
+    #[error("index backfill commit: {0}")]
+    Commit(CommitError),
+    /// Writers kept changing the nodes of one page.
+    #[error("index backfill kept conflicting with concurrent writes")]
+    Contended,
+    /// Transactions that opened before the index existed did not end in
+    /// time; they may still write nodes without its entries.
+    #[error(
+        "{0} transactions opened before the index was created are still open; \
+         retry once they have ended"
+    )]
+    OlderTransactions(usize),
 }
 
-/// Progress and result of an index build.
-#[derive(Debug, Default)]
-pub struct IndexBuildResult {
-    /// Current state of the build.
-    pub state: Option<IndexBuildState>,
-    /// Number of nodes scanned.
-    pub scanned: usize,
-    /// Number of index entries created.
-    pub indexed: usize,
-    /// Number of nodes skipped (no matching property, filtered out).
-    pub skipped: usize,
-    /// Unique constraint violations detected.
-    pub violations: Vec<String>,
-    /// Non-fatal errors.
-    pub errors: Vec<String>,
+impl From<IndexWriteError> for BackfillError {
+    fn from(e: IndexWriteError) -> Self {
+        match e {
+            IndexWriteError::Unique(v) => Self::Duplicate(v),
+            IndexWriteError::Store(s) => Self::Store(s),
+        }
+    }
 }
 
-/// Build an index online by scanning existing nodes.
-///
-/// Scans all nodes with the target label in the given shard,
-/// creates index entries for each matching node, and saves
-/// the index definition on success.
-///
-/// For unique indexes, violations are collected during the scan.
-/// If any remain at commit time, the build is aborted.
-///
-/// # Cluster-ready notes
-/// - This function runs on the Raft leader only in CE 3-node HA mode.
-/// - Distributed mode adds side-writes interception for concurrent writers
-///   and Raft log commit for the index definition.
-/// - The scan-drain-commit protocol is compatible with distributed replay.
-pub fn build_index(
-    engine: &StorageEngine,
-    index: &IndexDefinition,
-    interner: &FieldInterner,
-    shard_id: u16,
-) -> IndexBuildResult {
-    let mut result = IndexBuildResult {
-        state: Some(IndexBuildState::Setup),
-        ..Default::default()
-    };
+/// Where a backfill reads and how it opens its transactions.
+pub struct Backfill<'a> {
+    /// The storage engine.
+    pub engine: &'a StorageEngine,
+    /// The timestamp oracle; `None` for a direct-mode engine.
+    pub oracle: Option<&'a TimestampOracle>,
+    /// Resolves property names to the field ids records are keyed by.
+    pub interner: &'a FieldInterner,
+    /// The shard whose nodes are indexed.
+    pub shard_id: u16,
+    /// Transactions of the caller itself that are open while it runs the
+    /// backfill (the statement creating the index), not waited for.
+    pub own_open: usize,
+}
 
-    // Step 1: Setup — validate
-    if index.properties.is_empty() {
-        result
-            .errors
-            .push("index must have at least one property".into());
-        result.state = Some(IndexBuildState::Aborted);
-        return result;
-    }
-
-    // Step 2: InProgress — scan nodes
-    result.state = Some(IndexBuildState::InProgress);
-
-    let nodes = LocalNodeStore;
-    // Index build is a bulk background scan — cheap direct-mode transaction
-    // (no snapshot/OCC); reads the latest committed state, like the engine
-    // prefix scan it replaces.
-    let scan_txn = Transaction::new(engine, None, Timestamp::ZERO, None);
-    let scanned = match nodes.scan_shard(&scan_txn, shard_id) {
-        Ok(v) => v,
-        Err(e) => {
-            result.errors.push(format!("scan error: {e}"));
-            result.state = Some(IndexBuildState::Aborted);
-            return result;
-        }
-    };
-
-    // Resolve property field IDs
-    let field_ids: Vec<Option<u32>> = index
-        .properties
-        .iter()
-        .map(|p| interner.lookup(p))
-        .collect();
-
-    for (node_id_typed, record) in scanned {
-        result.scanned += 1;
-        let node_id = node_id_typed.as_raw();
-
-        // Label filter: only index nodes matching the target label
-        if !record.has_label(&index.label) {
-            result.skipped += 1;
-            continue;
-        }
-
-        // Check partial filter
-        if index.filter.is_some() {
-            let props: Vec<(String, Value)> = record
-                .props
-                .iter()
-                .filter_map(|(fid, val)| {
-                    interner
-                        .resolve(*fid)
-                        .map(|name| (name.to_string(), val.clone()))
-                })
-                .collect();
-
-            if !index.matches_filter(&props) {
-                result.skipped += 1;
+impl<'a> Backfill<'a> {
+    /// Stage and commit the entries of every stored node of `index`'s label,
+    /// committing each page through `commit`. Returns the number of nodes
+    /// read into the index. Call once `index` is registered with the writers.
+    ///
+    /// # Errors
+    ///
+    /// See [`BackfillError`]. Pages committed before the error stay; the
+    /// caller that abandons the index clears them.
+    pub fn run(
+        &self,
+        index: &IndexDefinition,
+        commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
+    ) -> Result<u64, BackfillError> {
+        let boundary = self.engine.snapshot_boundary();
+        self.engine
+            .await_transactions_through(
+                boundary,
+                self.own_open,
+                OLDER_TRANSACTIONS_POLL,
+                OLDER_TRANSACTIONS_WAIT,
+            )
+            .map_err(BackfillError::OlderTransactions)?;
+        let nodes = LocalNodeStore;
+        let prefix = nodes.shard_scan_prefix(self.shard_id);
+        let mut start_after: Option<Vec<u8>> = None;
+        let mut indexed = 0u64;
+        let mut conflicts = 0u32;
+        loop {
+            let mut txn = match self.oracle {
+                Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
+                None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
+            };
+            let page =
+                nodes.prefix_scan_paged_tracked(&mut txn, &prefix, start_after.as_deref(), PAGE)?;
+            let mut claims = Vec::new();
+            let mut read = Vec::with_capacity(page.rows.len());
+            let mut staged = 0u64;
+            for (key, bytes) in &page.rows {
+                // Temporal versions are keyed apart and not indexed.
+                let Some((_, node_id)) = decode_node_key(key) else {
+                    continue;
+                };
+                let record = NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
+                    kind: "node record",
+                    message: e.to_string(),
+                })?;
+                if record.primary_label() != index.label {
+                    continue;
+                }
+                let lookup = record_lookup(&record, self.interner);
+                let field_of = |name: &str| self.interner.lookup(name);
+                if stage_node_entry(
+                    self.engine,
+                    &mut txn,
+                    index,
+                    node_id,
+                    &lookup,
+                    &field_of,
+                    &mut claims,
+                )? {
+                    staged += 1;
+                }
+                read.push(key.clone());
+            }
+            // The page's entries hold only if the rows they came from are
+            // still the rows it read when the page commits.
+            let unchanged = nodes.condition_unchanged(&mut txn, &read)?;
+            let committed = if unchanged {
+                match commit(&mut txn) {
+                    Ok(()) => true,
+                    Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => false,
+                    Err(e) => return Err(BackfillError::Commit(e)),
+                }
+            } else {
+                false
+            };
+            if !committed {
+                conflicts += 1;
+                if conflicts > MAX_PAGE_CONFLICTS {
+                    return Err(BackfillError::Contended);
+                }
                 continue;
             }
-        }
-
-        // For single-field index: get the property value
-        if !index.is_compound() {
-            let value = field_ids[0]
-                .and_then(|fid| record.get(fid))
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            // Sparse check
-            if index.sparse && value.is_null() {
-                result.skipped += 1;
-                continue;
+            indexed += staged;
+            conflicts = 0;
+            if page.exhausted {
+                return Ok(indexed);
             }
-
-            match create_index_entry(engine, index, NodeId::from_raw(node_id), &value) {
-                Ok(()) => result.indexed += 1,
-                Err(coordinode_storage::error::StorageError::Conflict) => {
-                    result
-                        .violations
-                        .push(format!("duplicate key for node {node_id}: {value:?}"));
-                }
-                Err(e) => {
-                    result.errors.push(format!("index write error: {e}"));
-                }
-            }
-        } else {
-            // Compound: collect all property values
-            let values: Vec<Value> = field_ids
-                .iter()
-                .map(|fid| {
-                    fid.and_then(|id| record.get(id))
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                })
-                .collect();
-
-            if index.sparse && values.iter().any(|v| v.is_null()) {
-                result.skipped += 1;
-                continue;
-            }
-
-            // Use compound index entry (Layer-4 store hides the key encoding).
-            match LocalIndexStore::new(engine).put_entry(
-                &index.name,
-                &values,
-                NodeId::from_raw(node_id),
-            ) {
-                Ok(()) => result.indexed += 1,
-                Err(e) => {
-                    result.errors.push(format!("compound index write: {e}"));
-                }
-            }
+            start_after = page.last_key;
         }
     }
-
-    // Step 3: Commit or Abort
-    if !result.violations.is_empty() {
-        // Unique constraint violations — abort
-        // Clean up: drop all created index entries
-        let _ = LocalIndexStore::new(engine).clear(&index.name);
-        result.state = Some(IndexBuildState::Aborted);
-    } else if !result.errors.is_empty() && result.indexed == 0 {
-        result.state = Some(IndexBuildState::Aborted);
-    } else {
-        // Commit: save index definition
-        match save_index_definition(engine, index) {
-            Ok(()) => result.state = Some(IndexBuildState::Committed),
-            Err(e) => {
-                result.errors.push(format!("definition save error: {e}"));
-                result.state = Some(IndexBuildState::Aborted);
-            }
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]

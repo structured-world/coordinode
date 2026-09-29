@@ -66,6 +66,10 @@ const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
 const KIND_MERGE: u8 = 2;
 const KIND_REMOVE_RANGE: u8 = 3;
+/// A metadata command, MessagePack-encoded under the Schema partition tag.
+const KIND_COMMAND: u8 = 4;
+/// DERIVED index work, MessagePack-encoded under the Idx partition tag.
+const KIND_DERIVE: u8 = 5;
 
 // ── NvmeWriteBuffer ───────────────────────────────────────────────
 
@@ -110,7 +114,7 @@ impl NvmeWriteBuffer {
     /// ~100µs (NVMe sequential write + fsync). If the NVMe path is absent
     /// (no cache configured), this buffer should not be created.
     pub fn append(&self, entry: &DrainEntry) -> io::Result<()> {
-        let encoded = encode_entry(entry);
+        let encoded = encode_entry(entry)?;
         let mut file = self.current.lock().unwrap_or_else(|e| e.into_inner());
         file.seek(SeekFrom::End(0))?;
         file.write_all(&encoded)?;
@@ -254,7 +258,7 @@ fn truncate_file(path: &Path) -> io::Result<()> {
 }
 
 /// Encode a `DrainEntry` to bytes for NVMe storage.
-fn encode_entry(entry: &DrainEntry) -> Vec<u8> {
+fn encode_entry(entry: &DrainEntry) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
 
     let mut_count = entry.mutations.len() as u32;
@@ -263,17 +267,17 @@ fn encode_entry(entry: &DrainEntry) -> Vec<u8> {
     body.extend_from_slice(&entry.start_ts.as_raw().to_le_bytes());
 
     for mutation in &entry.mutations {
-        encode_mutation(mutation, &mut body);
+        encode_mutation(mutation, &mut body)?;
     }
 
     // Prepend entry_size (includes the 4-byte size field itself).
     let entry_size = (4 + body.len()) as u32;
     let mut out = entry_size.to_le_bytes().to_vec();
     out.append(&mut body);
-    out
+    Ok(out)
 }
 
-fn encode_mutation(mutation: &Mutation, buf: &mut Vec<u8>) {
+fn encode_mutation(mutation: &Mutation, buf: &mut Vec<u8>) -> io::Result<()> {
     match mutation {
         Mutation::Put {
             partition,
@@ -310,7 +314,20 @@ fn encode_mutation(mutation: &Mutation, buf: &mut Vec<u8>) {
             write_bytes(start, buf);
             write_bytes(end, buf);
         }
+        Mutation::Command(command) => {
+            buf.push(KIND_COMMAND);
+            buf.push(partition_to_u8(PartitionId::Schema));
+            let encoded = rmp_serde::to_vec(command).map_err(io::Error::other)?;
+            write_bytes(&encoded, buf);
+        }
+        Mutation::Derive(work) => {
+            buf.push(KIND_DERIVE);
+            buf.push(partition_to_u8(PartitionId::Idx));
+            let encoded = rmp_serde::to_vec(work).map_err(io::Error::other)?;
+            write_bytes(&encoded, buf);
+        }
     }
+    Ok(())
 }
 
 fn write_bytes(data: &[u8], buf: &mut Vec<u8>) {
@@ -466,6 +483,14 @@ fn decode_entry(data: &[u8]) -> Option<DrainEntry> {
                     start,
                     end,
                 }
+            }
+            KIND_COMMAND => {
+                let encoded = read_bytes(data, &mut pos)?;
+                Mutation::Command(rmp_serde::from_slice(&encoded).ok()?)
+            }
+            KIND_DERIVE => {
+                let encoded = read_bytes(data, &mut pos)?;
+                Mutation::Derive(rmp_serde::from_slice(&encoded).ok()?)
             }
             _ => return None,
         };

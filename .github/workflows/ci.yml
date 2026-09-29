@@ -117,6 +117,44 @@ jobs:
         if: always()
         run: cargo clean
 
+  test-windows:
+    name: Test (Windows)
+    # File locking, path handling and socket teardown differ on Windows, and a
+    # divergence there shows up only when the suite runs on it. The runner's
+    # label is its own, so the Linux-only jobs above never land on it.
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - coordinode-windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc and cargo-nextest
+        # The runner's service account carries a Rust toolchain and nothing
+        # else, so the job brings its own tools.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc,nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Build coordinode binary (required by integration tests)
+        run: cargo build -p coordinode-server --all-features
+      - name: Run unit + integration tests (nextest)
+        # Same reason as the `test` job: the machine is shared with other
+        # runners, so the election-timing-sensitive cluster tests get
+        # generous election timeouts.
+        env:
+          COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS: "1"
+        run: cargo nextest run --all-features --workspace
+      - name: Run doc tests
+        run: cargo test --doc --all-features
+      - name: Clean the build output
+        # The machine is shared with other runners and people; nothing stays.
+        if: always()
+        run: cargo clean
+
   build:
     name: Build
     # See `test` job: the release build is even larger than debug and
@@ -169,3 +207,111 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --all-features
+
+  review-threads:
+    name: Review threads
+    # A required check: a pull request with an unresolved, non-outdated review
+    # thread cannot be merged. CodeQL threads whose alert is dismissed or fixed
+    # do not block. Resolving threads is not an event a workflow can run on,
+    # so the check is re-run by the next push or by re-running this job.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      security-events: read
+    steps:
+      - name: Check for unresolved review threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          OWNER="${REPO%/*}"
+          NAME="${REPO#*/}"
+
+          # Every unresolved, non-outdated thread with the author of its first
+          # comment, which tells a CodeQL thread from the others. The `$`
+          # names are GraphQL variables, not shell ones.
+          # shellcheck disable=SC2016
+          QUERY='query($owner:String!, $name:String!, $number:Int!, $after:String) {
+            repository(owner:$owner, name:$name) {
+              pullRequest(number:$number) {
+                reviewThreads(first:100, after:$after) {
+                  nodes {
+                    isResolved
+                    isOutdated
+                    comments(first:1) { nodes { author { login } body } }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+          }'
+          ALL_THREADS="[]"
+          AFTER=""
+          MAX_PAGES=100
+          PAGE_COUNT=0
+          HAS_NEXT="false"
+          while [ "$PAGE_COUNT" -lt "$MAX_PAGES" ]; do
+            PAGE_COUNT=$((PAGE_COUNT + 1))
+            ARGS=(-f query="$QUERY" -f owner="$OWNER" -f name="$NAME" -F number="$PR_NUMBER")
+            if [ -n "$AFTER" ]; then ARGS+=(-f after="$AFTER"); fi
+            # A failed query blocks: an unknown thread state is not a pass.
+            RESP=$(gh api graphql "${ARGS[@]}")
+            PAGE=$(echo "$RESP" | jq '[.data.repository.pullRequest.reviewThreads.nodes // [] | .[] | select(.isResolved == false and .isOutdated == false)]')
+            ALL_THREADS=$(echo "$ALL_THREADS" "$PAGE" | jq -s '.[0] + .[1]')
+            HAS_NEXT=$(echo "$RESP" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+            if [ "$HAS_NEXT" != "true" ]; then break; fi
+            AFTER=$(echo "$RESP" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // ""')
+            if [ -z "$AFTER" ]; then
+              echo "::error::Thread scan incomplete: no cursor for the next page."
+              exit 1
+            fi
+          done
+          if [ "$HAS_NEXT" = "true" ]; then
+            echo "::error::Thread scan incomplete after $MAX_PAGES pages."
+            exit 1
+          fi
+
+          CODEQL_ACTIVE=0
+          CODEQL_CLOSED=0
+          OTHER=0
+          COUNT=$(echo "$ALL_THREADS" | jq 'length')
+          for i in $(seq 0 $((COUNT - 1))); do
+            [ "$COUNT" -eq 0 ] && break
+            THREAD=$(echo "$ALL_THREADS" | jq ".[$i]")
+            AUTHOR=$(echo "$THREAD" | jq -r '.comments.nodes[0].author.login // ""')
+            if [ "$AUTHOR" = "github-advanced-security" ]; then
+              BODY=$(echo "$THREAD" | jq -r '.comments.nodes[0].body // ""')
+              ALERT=$(echo "$BODY" | grep -oE '/security/code-scanning/[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)
+              STATE="unknown"
+              if [ -n "$ALERT" ]; then
+                STATE=$(gh api "repos/$REPO/code-scanning/alerts/$ALERT" --jq '.state' 2>/dev/null || echo unknown)
+              fi
+              # An alert whose state cannot be read blocks.
+              if [ "$STATE" = "dismissed" ] || [ "$STATE" = "fixed" ]; then
+                CODEQL_CLOSED=$((CODEQL_CLOSED + 1))
+              else
+                CODEQL_ACTIVE=$((CODEQL_ACTIVE + 1))
+              fi
+            else
+              OTHER=$((OTHER + 1))
+            fi
+          done
+
+          BLOCKING=$((CODEQL_ACTIVE + OTHER))
+          {
+            echo "## Review threads"
+            echo ""
+            echo "| Kind | Count |"
+            echo "|------|-------|"
+            echo "| Reviewer threads | $OTHER |"
+            echo "| CodeQL, alert open | $CODEQL_ACTIVE |"
+            echo "| CodeQL, alert dismissed or fixed | $CODEQL_CLOSED |"
+            echo "| **Blocking** | **$BLOCKING** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::$BLOCKING unresolved review thread(s). Resolve them, then re-run this job."
+            exit 1
+          fi

@@ -3,4 +3,5 @@
 self-hosted-runner:
   labels:
     - coordinode
+    - coordinode-windows
     - gpu-private-systems

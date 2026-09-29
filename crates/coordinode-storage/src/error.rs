@@ -97,6 +97,23 @@ pub enum StorageError {
         source_next: u64,
         local_next: u64,
     },
+
+    /// The stored field dictionary is not one consistent set of bindings, or
+    /// a registration could not be applied: stored data cannot be interpreted
+    /// safely, so nothing is served from it.
+    #[error("field dictionary: {0}")]
+    FieldDictionary(#[from] coordinode_core::graph::intern::DictionaryError),
+
+    /// A unit's DERIVED index work cannot be derived as it was sealed: its
+    /// interpretation is unsupported or its inputs are missing or corrupt.
+    /// Nothing of the unit is applied; the index is not guessed at.
+    #[error("index derivation: {0}")]
+    IndexDerivation(#[from] coordinode_core::index::derive::DeriveError),
+
+    /// A unit frame that cannot be written or read: it exceeds a frame
+    /// bound, or its bytes are not a frame this build accepts.
+    #[error("unit frame: {0}")]
+    Frame(#[from] coordinode_core::txn::frame::FrameError),
 }
 
 impl From<lsm_tree::Error> for StorageError {

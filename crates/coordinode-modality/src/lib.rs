@@ -48,6 +48,7 @@
 //! | TimeSeries (bucket + overflow) | [`TimeSeriesStore`] | [`LocalTimeSeriesStore`] | `Transaction` |
 //! | Blob (binary chunks + blob references) | [`BlobStore`] | [`LocalBlobStore`] | split (chunks `engine` data-plane, refs `Transaction`) |
 //! | Index (secondary indexes — btree, hash, fulltext term postings) | [`IndexStore`] | [`LocalIndexStore`] | hybrid (entries `engine`, DDL `Transaction`) |
+//! | Table key (unique declared key → row) | [`TableKeyStore`] | [`LocalTableKeyStore`] | `Transaction` |
 //! | Vector (HNSW KNN index) | [`VectorStore`] | [`LocalVectorStore`] | `engine` (in-memory graph) |
 //!
 //! ## Error model
@@ -74,6 +75,7 @@ pub mod node;
 pub mod schema;
 pub mod spatial;
 pub mod stats;
+pub mod table_key;
 pub mod timeseries;
 pub mod trigger;
 pub mod vector;
@@ -87,13 +89,15 @@ pub use encrypted_index::{
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use index_def::{
-    IndexDefinition, IndexState, IndexType, OnlineDuringBuild, PartialFilter, TextFieldConfig,
+    ENTRY_LAYOUT, IndexDefinition, IndexMaintenance, IndexProfile, IndexState, IndexType,
+    NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource, TextFieldConfig,
     TextIndexConfig, VectorIndexConfig,
 };
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};
 pub use spatial::{Bbox, Crs, LocalSpatialStore, Point, SpatialStore, distance};
 pub use stats::{LocalStatsStore, StatsStore};
+pub use table_key::{LocalTableKeyStore, TableKeyStore};
 pub use timeseries::{
     Bucket, BucketControl, FieldStats, LocalTimeSeriesStore, Measurement, OverflowEntry,
     TimeSeriesStore,

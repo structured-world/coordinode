@@ -61,6 +61,8 @@ impl Query {
                 | Clause::DropEncryptedIndex(_)
                 | Clause::CreateIndex(_)
                 | Clause::DropIndex(_)
+                | Clause::AlterIndex(_)
+                | Clause::AlterNamespaceIndexDefault(_)
                 | Clause::CreateVectorIndex(_)
                 | Clause::DropVectorIndex(_)
                 | Clause::CreateEdgeType(_)
@@ -127,6 +129,10 @@ pub enum Clause {
     DropEncryptedIndex(DropEncryptedIndexClause),
     CreateIndex(CreateIndexClause),
     DropIndex(DropIndexClause),
+    /// `ALTER INDEX <name> SET MAINTENANCE ...`: explicit profile transition.
+    AlterIndex(AlterIndexClause),
+    /// `ALTER NAMESPACE SET INDEX MAINTENANCE ...`: the namespace default.
+    AlterNamespaceIndexDefault(ProfileChoice),
     CreateVectorIndex(CreateVectorIndexClause),
     DropVectorIndex(DropVectorIndexClause),
     CreateEdgeType(CreateEdgeTypeClause),
@@ -341,6 +347,37 @@ pub struct CreateIndexClause {
     pub sparse: bool,
     /// Optional WHERE predicate expression for partial index.
     pub filter_expr: Option<Expr>,
+    /// `OPTIONS { maintenance: ... }`: the index's own profile, overriding
+    /// the namespace default.
+    pub maintenance: Option<ProfileChoice>,
+}
+
+/// A maintenance profile named in index DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileChoice {
+    /// The log carries the resolved entries.
+    Resolved,
+    /// Every member derives the entries.
+    Derived,
+}
+
+/// What `ALTER INDEX ... SET MAINTENANCE` moves an index to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMaintenanceChoice {
+    /// This profile, as the index's own override.
+    Profile(ProfileChoice),
+    /// The namespace default.
+    Inherit,
+}
+
+/// `ALTER INDEX idx SET MAINTENANCE RESOLVED | DERIVED | INHERIT`: an
+/// explicit profile transition of one index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterIndexClause {
+    /// The index.
+    pub name: String,
+    /// The profile it moves to.
+    pub maintenance: IndexMaintenanceChoice,
 }
 
 /// DROP INDEX clause.

@@ -272,6 +272,34 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_index_clause(pair)?;
             clauses.push(Clause::DropIndex(c));
         }
+        Rule::alter_index_clause => {
+            let mut name = String::new();
+            let mut maintenance = None;
+            for inner in pair.into_inner() {
+                match inner.as_rule() {
+                    Rule::identifier => name = inner.as_str().to_string(),
+                    Rule::index_maintenance => {
+                        maintenance = Some(maintenance_choice(inner.as_str())?);
+                    }
+                    _ => {}
+                }
+            }
+            let maintenance = maintenance.ok_or_else(|| {
+                ParseError::Invalid("ALTER INDEX requires a maintenance profile".into())
+            })?;
+            clauses.push(Clause::AlterIndex(AlterIndexClause { name, maintenance }));
+        }
+        Rule::alter_namespace_clause => {
+            let profile = pair
+                .into_inner()
+                .find(|inner| inner.as_rule() == Rule::index_maintenance)
+                .map(|inner| profile_choice(inner.as_str()))
+                .transpose()?
+                .ok_or_else(|| {
+                    ParseError::Invalid("ALTER NAMESPACE requires a maintenance profile".into())
+                })?;
+            clauses.push(Clause::AlterNamespaceIndexDefault(profile));
+        }
         Rule::create_vector_index_clause => {
             let c = build_create_vector_index_clause(pair)?;
             clauses.push(Clause::CreateVectorIndex(c));
@@ -1091,6 +1119,7 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
     let mut sparse = false;
     let mut identifiers: Vec<String> = Vec::new();
     let mut filter_expr: Option<Expr> = None;
+    let mut maintenance = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1100,6 +1129,7 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
             Rule::where_inline => {
                 filter_expr = Some(find_expression(inner)?);
             }
+            Rule::index_options => maintenance = index_options(inner)?,
             _ => {}
         }
     }
@@ -1117,7 +1147,49 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
         unique,
         sparse,
         filter_expr,
+        maintenance,
     })
+}
+
+/// The maintenance profile a B-tree index's OPTIONS name. An option or a
+/// profile this engine does not know is refused, never replaced by a default;
+/// a new index inherits the namespace default by omitting the option.
+fn index_options(pair: Pair<'_, Rule>) -> Result<Option<ProfileChoice>, ParseError> {
+    let mut maintenance = None;
+    for option in pair.into_inner() {
+        let value = extract_string_literal(&option).unwrap_or_default();
+        let Some(key) = option.into_inner().next() else {
+            continue;
+        };
+        match key.as_str().to_ascii_lowercase().as_str() {
+            "maintenance" => maintenance = Some(profile_choice(&value)?),
+            other => {
+                return Err(ParseError::Invalid(format!(
+                    "unknown CREATE INDEX option `{other}`; the known option is `maintenance`"
+                )));
+            }
+        }
+    }
+    Ok(maintenance)
+}
+
+/// `RESOLVED` or `DERIVED`, case-insensitive.
+fn profile_choice(text: &str) -> Result<ProfileChoice, ParseError> {
+    match text.to_ascii_lowercase().as_str() {
+        "resolved" => Ok(ProfileChoice::Resolved),
+        "derived" => Ok(ProfileChoice::Derived),
+        other => Err(ParseError::Invalid(format!(
+            "unknown index maintenance profile `{other}`; expected RESOLVED or DERIVED"
+        ))),
+    }
+}
+
+/// A profile, or `INHERIT` for the namespace default.
+fn maintenance_choice(text: &str) -> Result<IndexMaintenanceChoice, ParseError> {
+    if text.eq_ignore_ascii_case("inherit") {
+        return Ok(IndexMaintenanceChoice::Inherit);
+    }
+    profile_choice(text).map(IndexMaintenanceChoice::Profile)
 }
 
 fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeClause, ParseError> {

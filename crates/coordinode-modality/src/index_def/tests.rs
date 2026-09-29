@@ -31,10 +31,51 @@ fn sparse_definition() {
     assert!(idx.sparse);
 }
 
+/// A definition stored before the layout field existed decodes as layout 0,
+/// the one to rebuild; a new definition carries the current layout.
 #[test]
-fn key_prefix() {
-    let idx = IndexDefinition::btree("user_email", "User", "email");
-    assert_eq!(idx.key_prefix(), b"idx:user_email:");
+fn a_definition_without_a_layout_is_the_legacy_one() {
+    #[derive(serde::Serialize)]
+    struct BeforeLayout {
+        name: String,
+        label: String,
+        properties: Vec<String>,
+        index_type: IndexType,
+        unique: bool,
+        sparse: bool,
+        multikey: bool,
+        filter: Option<PartialFilter>,
+        ttl_seconds: Option<u64>,
+        vector_config: Option<VectorIndexConfig>,
+        text_config: Option<TextIndexConfig>,
+        state: IndexState,
+        online_during_build: OnlineDuringBuild,
+    }
+    let bytes = rmp_serde::to_vec(&BeforeLayout {
+        name: "u_email".into(),
+        label: "User".into(),
+        properties: vec!["email".into()],
+        index_type: IndexType::BTree,
+        unique: true,
+        sparse: false,
+        multikey: false,
+        filter: None,
+        ttl_seconds: None,
+        vector_config: None,
+        text_config: None,
+        state: IndexState::Ready,
+        online_during_build: OnlineDuringBuild::Block,
+    })
+    .expect("encode");
+    let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode");
+    assert_eq!(back.layout, 0);
+    assert!(back.unique);
+
+    let current = IndexDefinition::btree("u_email", "User", "email");
+    assert_eq!(current.layout, ENTRY_LAYOUT);
+    let back: IndexDefinition =
+        rmp_serde::from_slice(&rmp_serde::to_vec(&current).expect("encode")).expect("decode");
+    assert_eq!(back.layout, ENTRY_LAYOUT);
 }
 
 #[test]

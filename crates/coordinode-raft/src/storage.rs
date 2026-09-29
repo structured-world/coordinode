@@ -41,7 +41,8 @@ use openraft::storage::{IOFlushed, LogState, RaftLogStorage, RaftStateMachine};
 use openraft::{OptionalSend, RaftLogReader, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 
-use coordinode_core::txn::proposal::{Mutation, PartitionId, RaftProposal};
+use coordinode_core::txn::frame::{DecodeLimits, decode_proposal, encode_proposal};
+use coordinode_core::txn::proposal::{Mutation, RaftProposal};
 use coordinode_storage::engine::core::{
     RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
 };
@@ -145,13 +146,6 @@ const KEY_COMMITTED: &[u8] = b"raft:committed";
 const KEY_SM_APPLIED: &[u8] = b"raft:sm:applied";
 const KEY_SM_MEMBERSHIP: &[u8] = b"raft:sm:membership";
 const KEY_PURGED: &[u8] = b"raft:purged";
-/// Persisted last_log_id for O(1) recovery after restart.
-const KEY_LAST_LOG_ID: &[u8] = b"raft:oplog:last_log_id";
-
-/// OplogManager defaults for the Raft log oplog.
-const RAFT_OPLOG_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MB per segment
-const RAFT_OPLOG_MAX_ENTRIES: u32 = 50_000;
-const RAFT_OPLOG_RETENTION_SECS: u64 = 7 * 24 * 3600; // 7 days (index-based purge is primary)
 
 /// Rebuild `partition` from the checkpoint at `checkpoint_dir` and this
 /// node's Raft log `log`, with the applies paused: the checkpoint's rows,
@@ -231,26 +225,13 @@ pub fn rebuild_partition_from_checkpoint(
 
 // ── Log Store ─────────────────────────────────────────────────
 
-/// Storage-backed Raft log storage.
-///
-/// Log entries are stored in **oplog segments** (one sealed file per segment),
-/// not in the LSM KV store. This delivers:
-/// - O(1) `last_log_id` via an in-memory cache (eliminates the O(N) scan)
-/// - Segment-granular purge via `OplogManager::purge_before`
-/// - Sequential I/O for `append` and `try_get_log_entries`
-///
-/// Raft metadata (vote, committed, purged, last_log_id) is stored in
-/// `Partition::Raft` to separate it from application data.
-///
-/// All fields use `Arc` so `get_log_reader()` returns a cheap clone that
-/// shares the same oplog handle and caches.
 /// Tells a waiting writer at which log index its proposal became durable in
 /// this member's log.
 ///
-/// The proposal pipeline subscribes by proposal id before it submits; the log
-/// store fires after the batch fsync in [`RaftLogStorage::append`]. This is
-/// what a write concern of `w:1` waits for, and what `w:N` counts from: the
-/// leader's own copy is the first of the N.
+/// The proposal pipeline subscribes by proposal id before it submits; the
+/// log's sync thread fires once the batch holding the proposal is durable.
+/// This is what a write concern of `w:1` waits for, and what `w:N` counts
+/// from: the leader's own copy is the first of the N.
 #[derive(Default)]
 pub struct AppendNotifier {
     waiters: Mutex<
@@ -273,7 +254,7 @@ impl AppendNotifier {
         rx
     }
 
-    fn notify(&self, id: coordinode_core::txn::proposal::ProposalId, index: u64) {
+    pub(crate) fn notify(&self, id: coordinode_core::txn::proposal::ProposalId, index: u64) {
         let waiter = match self.waiters.lock() {
             Ok(mut waiters) => waiters.remove(&id),
             Err(_) => None,
@@ -285,18 +266,40 @@ impl AppendNotifier {
     }
 }
 
+/// Storage-backed Raft log storage.
+///
+/// Log entries are stored in **oplog segments** (one sealed file per segment),
+/// not in the LSM KV store. This delivers:
+/// - O(1) `last_log_id` via an in-memory cache (eliminates the O(N) scan)
+/// - Segment-granular purge via `OplogManager::purge_before`
+/// - Sequential I/O for `append` and `try_get_log_entries`
+///
+/// An append returns once its entries are written; a sync thread makes them
+/// durable and then answers openraft, so the Raft core replicates while the
+/// disk flushes and one sync covers every append queued meanwhile.
+///
+/// Raft metadata (vote, committed, purged, last_log_id) is stored in
+/// `Partition::Raft` to separate it from application data.
+///
+/// All fields use `Arc` so `get_log_reader()` returns a cheap clone that
+/// shares the same oplog handle and caches.
 pub struct LogStore {
     engine: Arc<StorageEngine>,
     /// Oplog manager for log entry segments.
     oplog: Arc<Mutex<OplogManager>>,
     /// Waiters for "my proposal is durable in this log", see [`AppendNotifier`].
     append_notifier: Arc<AppendNotifier>,
+    /// Makes appends durable off the Raft core and answers them.
+    sync: Arc<crate::log_sync::LogSync>,
     /// In-memory cache of the last appended log id. Updated on every
     /// `append()` and persisted to `Partition::Raft` so it survives restarts.
     last_log_id: Arc<Mutex<Option<LogId>>>,
     /// In-memory cache of the last purged log id. Updated on every `purge()`
     /// and persisted to `Partition::Raft`.
     last_purged: Arc<Mutex<Option<LogId>>>,
+    /// This store's (or reader's) share of [`EngineWork`], since it holds
+    /// the engine for as long as it lives.
+    hold: EngineWorkGuard,
 }
 
 /// Where a shard's Raft log lives on disk.
@@ -332,6 +335,30 @@ pub fn raft_oplog_dirs(engine: &StorageEngine, shard_id: u32) -> Result<RaftOplo
     Ok(RaftOplogDirs { active, all })
 }
 
+/// Bytes of `engine`'s Raft log segments on disk, over every directory that
+/// may hold them. A directory that does not exist holds none.
+///
+/// # Errors
+///
+/// No endpoint is eligible to hold the log, or a directory cannot be read.
+pub(crate) fn raft_log_bytes(engine: &StorageEngine) -> Result<u64, io::Error> {
+    let mut bytes = 0u64;
+    for dir in raft_oplog_dirs(engine, 0)?.all {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let meta = entry?.metadata()?;
+            if meta.is_file() {
+                bytes += meta.len();
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 impl LogStore {
     /// A shared handle to the Raft oplog manager. Cloned out before the
     /// `LogStore` is moved into `openraft::Raft` so a subsystem (e.g. WAL-replay
@@ -347,6 +374,14 @@ impl LogStore {
         Arc::clone(&self.append_notifier)
     }
 
+    /// The [`EngineWork`] this store and its readers count in. The state
+    /// machine joins it through
+    /// [`CoordinodeStateMachine::with_engine_work`], so a node waits on one
+    /// handle for everything openraft holds the engine through.
+    pub fn engine_work(&self) -> EngineWork {
+        self.hold.work()
+    }
+
     /// Open the LogStore, routing oplog segments to the oplog-eligible
     /// endpoint chosen for shard 0, so the log lands on media fit to carry
     /// it rather than wherever the data partitions live. Path layout:
@@ -354,8 +389,15 @@ impl LogStore {
     /// Recovery scans every oplog-eligible endpoint's directory for sealed
     /// segments left over from a previous config-driven routing.
     ///
-    /// Loads `last_log_id` and `last_purged` from `Partition::Raft` so
-    /// `get_log_state()` is O(1) even after a restart.
+    /// The log's end is read from its segments, the only record of it that
+    /// is durable exactly when the entries are; `last_purged` comes from
+    /// `Partition::Raft`, recorded durably before any segment goes.
+    ///
+    /// # Errors
+    ///
+    /// The log's directories or its last segment cannot be read. A log that
+    /// cannot be read is refused rather than taken as empty: an empty log
+    /// would let the group start over on top of acknowledged entries.
     pub fn open(engine: Arc<StorageEngine>) -> Result<Self, io::Error> {
         // Shard 0 = single Raft log shard in CE. Multi-shard EE will
         // open one LogStore per shard, each routing to its own
@@ -365,62 +407,42 @@ impl LogStore {
             active: active_dir,
             all: recovery_dirs,
         } = raft_oplog_dirs(&engine, shard_id)?;
+        let settings = engine.oplog_config();
         let oplog = OplogManager::open_multi(
             &active_dir,
             &recovery_dirs,
             shard_id,
-            RAFT_OPLOG_MAX_BYTES,
-            RAFT_OPLOG_MAX_ENTRIES,
-            RAFT_OPLOG_RETENTION_SECS,
+            settings.max_segment_bytes,
+            settings.max_segment_entries,
+            settings.retention_secs,
         )
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .with_sync_method(settings.sync_method);
 
-        // Load persisted caches from Partition::Raft — O(1) recovery.
         let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED);
-        let mut last_log_id = Self::load_log_id_from_partition(&engine, KEY_LAST_LOG_ID);
+        // The last entry in the segments; its recovery reads the last segment
+        // (which a crash may have left without a footer). A log whose entries
+        // are all purged ends where it was purged, as openraft expects of an
+        // empty log (`None` sorts below every id).
+        let recovered = if oplog.has_segments() {
+            Self::recover_last_log_id_from_oplog(&oplog)?
+        } else {
+            None
+        };
+        let last_log_id = recovered.max(last_purged);
 
-        // Crash-recovery path: if the LSM key was not flushed before process
-        // death but oplog segment files exist, reconstruct last_log_id by
-        // scanning the last segment (which may lack a footer).
-        //
-        // Without this, openraft sees an empty log state and calls initialize(),
-        // which tries to create oplog segment 0 — but the file already exists
-        // → I/O error "File exists (os error 17)".
-        if last_log_id.is_none() && oplog.has_segments() {
-            match Self::recover_last_log_id_from_oplog(&oplog) {
-                Ok(Some(recovered_id)) => {
-                    tracing::warn!(
-                        recovered_index = recovered_id.index,
-                        "raft: last_log_id missing from LSM — recovered from oplog segment"
-                    );
-                    // Persist to avoid O(N) re-scan on the next restart.
-                    if let Ok(bytes) = rmp_serde::to_vec(&recovered_id) {
-                        let _ = engine.put(Partition::Raft, KEY_LAST_LOG_ID, &bytes);
-                    }
-                    last_log_id = Some(recovered_id);
-                }
-                Ok(None) => {
-                    // Segments exist but contain no valid entries — leave last_log_id as None.
-                    // openraft will re-initialize the Raft group cleanly.
-                    tracing::warn!(
-                        "raft: oplog segments found but no valid entries readable — treating log as empty"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "raft: failed to recover last_log_id from oplog — treating log as empty"
-                    );
-                }
-            }
-        }
-
+        let append_notifier = Arc::new(AppendNotifier::default());
+        let sync = Arc::new(crate::log_sync::LogSync::start(Arc::clone(
+            &append_notifier,
+        ))?);
         Ok(Self {
             engine,
             oplog: Arc::new(Mutex::new(oplog)),
-            append_notifier: Arc::new(AppendNotifier::default()),
+            append_notifier,
+            sync,
             last_log_id: Arc::new(Mutex::new(last_log_id)),
             last_purged: Arc::new(Mutex::new(last_purged)),
+            hold: EngineWork::default().start(),
         })
     }
 
@@ -473,85 +495,33 @@ impl LogStore {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
-    /// Map `PartitionId` (coordinode-core) to oplog u8 discriminant.
-    fn partition_id_to_u8(id: PartitionId) -> u8 {
-        match id {
-            PartitionId::Node => 0,
-            PartitionId::Adj => 1,
-            PartitionId::EdgeProp => 2,
-            PartitionId::Blob => 3,
-            PartitionId::BlobRef => 4,
-            PartitionId::Schema => 5,
-            PartitionId::Idx => 6,
-            PartitionId::Counter => 7,
-            PartitionId::VectorF32 => 8,
-            PartitionId::Registry => 9,
-        }
-    }
-
     /// Encode a Raft Entry as an OplogEntry.
     ///
-    /// For Normal entries (application proposals), the mutations are decoded
-    /// and stored as OplogOp::Insert/Delete/Merge alongside the original
-    /// RaftEntry (kept for Raft log recovery via `oplog_to_entry`). This
-    /// enables server-side CDC filtering by edge_type and is_migration.
-    ///
-    /// For Membership entries, only the RaftEntry op is stored (no mutations).
+    /// The first op is the entry's envelope; a Normal entry's proposals follow
+    /// it, one unit frame each, so every proposal's bytes are written once, in
+    /// the encoding the embedded journal records a unit in. A change stream
+    /// reads the operations out of those frames.
     fn entry_to_oplog(entry: &Entry) -> Result<OplogEntry, io::Error> {
-        let data = rmp_serde::to_vec(entry).map_err(|e| io::Error::other(e.to_string()))?;
-        let raft_op = OplogOp::RaftEntry { data };
-
-        // Extract decoded mutation ops from Normal entries for CDC filtering.
-        // Batched entries flatten all proposals' mutations into a single ops list.
-        let (mut ops, is_migration) = match &entry.payload {
+        let (envelope, units) = match &entry.payload {
             openraft::entry::EntryPayload::Normal(request) => {
-                let decoded: Vec<OplogOp> = request
+                let units = request
                     .proposals
                     .iter()
-                    .flat_map(|p| p.mutations.iter())
-                    .map(|m| match m {
-                        Mutation::Put {
-                            partition,
-                            key,
-                            value,
-                        } => OplogOp::Insert {
-                            partition: Self::partition_id_to_u8(*partition),
-                            key: key.clone(),
-                            value: value.clone(),
-                        },
-                        Mutation::Delete { partition, key } => OplogOp::Delete {
-                            partition: Self::partition_id_to_u8(*partition),
-                            key: key.clone(),
-                        },
-                        Mutation::Merge {
-                            partition,
-                            key,
-                            operand,
-                        } => OplogOp::Merge {
-                            partition: Self::partition_id_to_u8(*partition),
-                            key: key.clone(),
-                            operand: operand.clone(),
-                        },
-                        Mutation::RemoveRange {
-                            partition,
-                            start,
-                            end,
-                        } => OplogOp::RemoveRange {
-                            partition: Self::partition_id_to_u8(*partition),
-                            start: start.clone(),
-                            end: end.clone(),
-                        },
-                    })
-                    .collect();
-                // is_migration could be derived from proposal metadata in the future;
-                // for now, proposals don't carry migration flags.
-                (decoded, false)
+                    .map(|p| encode_proposal(p).map(|frame| OplogOp::Unit { frame }))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(io::Error::other)?;
+                let envelope = Entry::new_normal(entry.log_id, Request::batch(Vec::new()));
+                (rmp_serde::to_vec(&envelope), units)
             }
-            _ => (Vec::new(), false),
+            _ => (rmp_serde::to_vec(entry), Vec::new()),
         };
-
-        // RaftEntry is always first — oplog_to_entry() relies on ops[0] being RaftEntry.
-        ops.insert(0, raft_op);
+        let data = envelope.map_err(|e| io::Error::other(e.to_string()))?;
+        // RaftEntry is always first: oplog_to_entry() relies on ops[0] being it.
+        let mut ops = Vec::with_capacity(1 + units.len());
+        ops.push(OplogOp::RaftEntry { data });
+        ops.extend(units);
+        // Proposals carry no migration flag yet.
+        let is_migration = false;
 
         // A batched entry commits every proposal; its latest commit
         // timestamp is the entry's. Membership entries carry none.
@@ -578,16 +548,81 @@ impl LogStore {
 
     /// Decode an OplogEntry back into a Raft Entry.
     fn oplog_to_entry(oplog_entry: OplogEntry) -> Result<Entry, io::Error> {
-        match oplog_entry.ops.into_iter().next() {
+        let mut ops = oplog_entry.ops.into_iter();
+        let mut entry: Entry = match ops.next() {
             Some(OplogOp::RaftEntry { data }) => {
-                rmp_serde::from_slice(&data).map_err(|e| io::Error::other(e.to_string()))
+                rmp_serde::from_slice(&data).map_err(|e| io::Error::other(e.to_string()))?
             }
-            Some(op) => Err(io::Error::other(format!(
-                "unexpected oplog op in Raft segment: expected RaftEntry, got {:?}",
-                std::mem::discriminant(&op)
-            ))),
-            None => Err(io::Error::other("oplog entry has no ops in Raft segment")),
+            Some(op) => {
+                return Err(io::Error::other(format!(
+                    "unexpected oplog op in Raft segment: expected RaftEntry, got {:?}",
+                    std::mem::discriminant(&op)
+                )));
+            }
+            None => return Err(io::Error::other("oplog entry has no ops in Raft segment")),
+        };
+        // An entry written before proposals were stored as unit frames holds
+        // them in its envelope, followed by their operations for change
+        // streams; the envelope alone is read then.
+        if let openraft::entry::EntryPayload::Normal(request) = &mut entry.payload {
+            if request.proposals.is_empty() {
+                for op in ops {
+                    if let OplogOp::Unit { frame } = op {
+                        request.proposals.push(
+                            decode_proposal(&frame, &DecodeLimits::DEFAULT)
+                                .map_err(io::Error::other)?,
+                        );
+                    }
+                }
+            }
         }
+        Ok(entry)
+    }
+
+    /// Whether an entry at index `from` or later writes data a user put
+    /// there, by the measure of [`Partition::is_user_key`].
+    ///
+    /// Entries past the state machine's resume point exist only here until
+    /// they are replayed: a crash drops what they applied to unflushed trees,
+    /// so the trees alone understate what this store holds.
+    ///
+    /// # Errors
+    ///
+    /// The log cannot be read or an entry does not decode.
+    pub fn writes_user_data_from(&self, from: u64) -> Result<bool, io::Error> {
+        let entries = self
+            .oplog
+            .lock()
+            .map_err(|_| io::Error::other("raft log mutex poisoned"))?
+            .read_range(from, u64::MAX)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        for oplog_entry in entries {
+            let entry = Self::oplog_to_entry(oplog_entry)?;
+            let openraft::entry::EntryPayload::Normal(request) = &entry.payload else {
+                continue;
+            };
+            let writes = request
+                .proposals
+                .iter()
+                .flat_map(|proposal| &proposal.mutations)
+                .any(|mutation| match mutation {
+                    Mutation::Put { partition, key, .. }
+                    | Mutation::Merge { partition, key, .. } => {
+                        Partition::from(*partition).is_user_key(key)
+                    }
+                    // Removals, metadata commands and index maintenance add
+                    // nothing of the user's: an index entry follows a record
+                    // the same unit or an earlier one wrote.
+                    Mutation::Delete { .. }
+                    | Mutation::RemoveRange { .. }
+                    | Mutation::Command(_)
+                    | Mutation::Derive(_) => false,
+                });
+            if writes {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -692,12 +727,21 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             last_log_id: Arc::clone(&self.last_log_id),
             last_purged: Arc::clone(&self.last_purged),
             append_notifier: Arc::clone(&self.append_notifier),
+            sync: Arc::clone(&self.sync),
+            hold: self.hold.another(),
         }
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
         let bytes = rmp_serde::to_vec(vote).map_err(|e| io::Error::other(e.to_string()))?;
-        self.put(KEY_VOTE, &bytes)
+        self.put(KEY_VOTE, &bytes)?;
+        // openraft answers the candidate once this returns; a vote lost in a
+        // crash would let this node grant a second one in the same term. No
+        // journal covers the Raft partition, so its memtable is flushed here.
+        // Votes change once per election, so the flush is rare.
+        self.engine
+            .persist_partition(Partition::Raft)
+            .map_err(|e| io::Error::other(format!("persist the vote: {e}")))
     }
 
     async fn save_committed(
@@ -738,9 +782,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     {
         let mut last: Option<LogId> = None;
         // (proposal id, log index) of every proposal in this batch, told to
-        // the waiting writers only after the fsync below.
+        // the waiting writers only once the batch is durable.
         let mut appended: Vec<(coordinode_core::txn::proposal::ProposalId, u64)> = Vec::new();
-        {
+        let handle = {
             let mut oplog = self
                 .oplog
                 .lock()
@@ -755,28 +799,29 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                     .append(&oplog_entry)
                     .map_err(|e| io::Error::other(e.to_string()))?;
             }
-            // ONE fsync per write batch: flush user-space buffer → kernel → storage.
-            // All entries above are durable after this call. This is the crash-safety
-            // boundary: a process killed after flush_and_sync() will NOT lose these entries.
-            oplog.flush().map_err(|e| io::Error::other(e.to_string()))?;
-        }
-        for (id, index) in appended {
-            self.append_notifier.notify(id, index);
-        }
+            // Written to the kernel, so a read sees the entries at once; the
+            // sync thread makes them durable, and only then is openraft told
+            // (the crash-safety boundary) and the writers answered. The Raft
+            // core meanwhile replicates the batch instead of waiting on the
+            // disk, and one sync covers every batch appended while it runs.
+            oplog
+                .flush_to_os()
+                .map_err(|e| io::Error::other(e.to_string()))?
+        };
 
-        // Update and persist the last_log_id cache.
         if let Some(log_id) = last {
             *self
                 .last_log_id
                 .lock()
                 .map_err(|_| io::Error::other("last_log_id mutex poisoned"))? = Some(log_id);
-            let bytes = rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?;
-            self.put(KEY_LAST_LOG_ID, &bytes)?;
         }
-
-        // Signal IO completion — entries are durable in the oplog (fsynced above).
-        callback.io_completed(Ok(()));
-
+        self.sync.submit(
+            handle,
+            crate::log_sync::Append {
+                callback,
+                proposals: appended,
+            },
+        );
         Ok(())
     }
 
@@ -785,6 +830,9 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         last_log_id: Option<openraft::type_config::alias::LogIdOf<TypeConfig>>,
     ) -> Result<(), io::Error> {
         let keep_exclusive = last_log_id.map_or(0, |id| id.index + 1);
+
+        // No append may be answered after the entries it covered are gone.
+        self.sync.wait_idle();
 
         // Read entries to keep before wiping the oplog.
         let to_keep = if keep_exclusive > 0 {
@@ -811,22 +859,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                     .append(&oe)
                     .map_err(|e| io::Error::other(e.to_string()))?;
             }
+            // The kept entries were durable before the wipe and must be again
+            // before openraft counts on them.
+            oplog.flush().map_err(|e| io::Error::other(e.to_string()))?;
         }
 
-        // Update and persist the last_log_id cache.
         *self
             .last_log_id
             .lock()
             .map_err(|_| io::Error::other("last_log_id mutex poisoned"))? = last_log_id;
-        match last_log_id {
-            Some(id) => {
-                let bytes = rmp_serde::to_vec(&id).map_err(|e| io::Error::other(e.to_string()))?;
-                self.put(KEY_LAST_LOG_ID, &bytes)?;
-            }
-            None => {
-                self.delete(KEY_LAST_LOG_ID)?;
-            }
-        }
 
         tracing::debug!(
             keep_through = last_log_id.map(|id| id.index),
@@ -867,20 +908,25 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             Self::oplog_to_entry(last)?.log_id
         };
 
+        // Recorded durably before any segment goes: a crash between the two
+        // then leaves segments the record says are purged (skipped on read),
+        // never a record that promises entries already deleted.
+        let bytes = rmp_serde::to_vec(&purged_to).map_err(|e| io::Error::other(e.to_string()))?;
+        self.put(KEY_PURGED, &bytes)?;
+        self.engine
+            .persist_partition(Partition::Raft)
+            .map_err(|e| io::Error::other(format!("persist the purge point: {e}")))?;
+        *self
+            .last_purged
+            .lock()
+            .map_err(|_| io::Error::other("last_purged mutex poisoned"))? = Some(purged_to);
+
         let purged_segments = self
             .oplog
             .lock()
             .map_err(|_| io::Error::other("oplog mutex poisoned"))?
             .purge_before(below)
             .map_err(|e| io::Error::other(e.to_string()))?;
-
-        // Update and persist the last_purged cache.
-        *self
-            .last_purged
-            .lock()
-            .map_err(|_| io::Error::other("last_purged mutex poisoned"))? = Some(purged_to);
-        let bytes = rmp_serde::to_vec(&purged_to).map_err(|e| io::Error::other(e.to_string()))?;
-        self.put(KEY_PURGED, &bytes)?;
 
         tracing::debug!(
             requested = log_id.index,
@@ -976,18 +1022,24 @@ pub struct CoordinodeStateMachine {
     /// Snapshot work holding the engine off the async runtime, which a
     /// shutdown waits out.
     engine_work: EngineWork,
+    /// This state machine's own share of `engine_work`: it holds the engine
+    /// for as long as openraft keeps it.
+    _hold: EngineWorkGuard,
     /// The current snapshot's file and record.
     snapshots: Arc<SnapshotStore>,
 }
 
-/// Work the state machine runs outside openraft's tasks that holds the
-/// engine: a snapshot capture on a blocking thread, a snapshot build.
+/// Everything that holds the engine on openraft's behalf: the log store and
+/// each reader of it, the state machine, and the work the state machine runs
+/// outside openraft's tasks (a snapshot capture on a blocking thread, a
+/// snapshot build).
 ///
-/// Shutting openraft down stops its tasks, but a blocking thread they were
-/// waiting on runs to its end, and a build task can outlive the core. Until
-/// both finish they hold the engine, so the directory stays locked and a
-/// restart in the same process cannot open it. The node waits for this to
-/// go idle after the consensus stops.
+/// Shutting openraft down stops its core, but not everything it spawned: a
+/// replication task waiting on a peer keeps its log reader until that call
+/// returns, a blocking thread runs to its end, and a build task can outlive
+/// the core. Until they finish they hold the engine, so the directory stays
+/// locked and a restart in the same process cannot open it. The node waits
+/// for this to go idle after the consensus stops.
 #[derive(Clone, Default)]
 pub struct EngineWork(Arc<EngineWorkInner>);
 
@@ -1021,6 +1073,20 @@ impl EngineWork {
             }
         };
         tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
+
+impl EngineWorkGuard {
+    /// A second guard on the same work, for a clone of whatever holds this one.
+    fn another(&self) -> Self {
+        self.0
+            .running
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(&self.0))
+    }
+
+    fn work(&self) -> EngineWork {
+        EngineWork(Arc::clone(&self.0))
     }
 }
 
@@ -1186,6 +1252,7 @@ impl CoordinodeStateMachine {
             }),
         });
         engine.register_raft_fence(Arc::clone(&gate) as Arc<dyn RaftApplyFence>);
+        let engine_work = EngineWork::default();
 
         Ok(Self {
             engine,
@@ -1203,9 +1270,19 @@ impl CoordinodeStateMachine {
             folded,
             captures: 0,
             gate,
-            engine_work: EngineWork::default(),
+            _hold: engine_work.start(),
+            engine_work,
             snapshots,
         })
+    }
+
+    /// Count this state machine and its snapshot work in `work`, the log
+    /// store's (see [`LogStore::engine_work`]), so a node waits on one handle
+    /// for everything openraft holds the engine through.
+    pub fn with_engine_work(mut self, work: EngineWork) -> Self {
+        self._hold = work.start();
+        self.engine_work = work;
+        self
     }
 
     /// Handle to the snapshot-build counter (increments on every full
@@ -1395,6 +1472,16 @@ impl CoordinodeStateMachine {
         Ok(Response {
             mutations_applied: count,
         })
+    }
+
+    /// The log index openraft re-delivers from when this state machine opens:
+    /// one past the position every partition tree is known to hold.
+    pub fn next_to_apply(&self) -> Result<u64, io::Error> {
+        let last = *self
+            .last_applied
+            .lock()
+            .map_err(|_| io::Error::other("last_applied mutex poisoned"))?;
+        Ok(last.map_or(0, |id| id.index + 1))
     }
 
     /// [`Self::apply_proposal_under`] with no partition installed ahead.
@@ -1619,13 +1706,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         meta: &openraft::type_config::alias::SnapshotMetaOf<TypeConfig>,
         mut snapshot: SnapshotFile,
     ) -> Result<(), io::Error> {
-        let data_bytes = snapshot.size()?;
-
-        tracing::info!(
-            data_bytes,
-            last_log_index = meta.last_log_id.map(|id| id.index),
-            "installing snapshot"
-        );
+        let last_log_index = meta.last_log_id.map(|id| id.index);
 
         // No partition copy or replacement runs across the install; after
         // it, every partition stands at the snapshot.
@@ -1633,11 +1714,14 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let mut gate = gate.state.lock().await;
 
         // An empty snapshot carries metadata only and leaves the data as it
-        // is. The parse reads the file as it goes, off the async runtime.
+        // is. The parse reads the file as it goes, off the async runtime, as
+        // does the size, which serializes a snapshot kept as a capture.
         let engine = Arc::clone(&self.engine);
         let work = self.engine_work.start();
         let mut snapshot = tokio::task::spawn_blocking(move || {
             let _work = work;
+            let data_bytes = snapshot.size()?;
+            tracing::info!(data_bytes, last_log_index, "installing snapshot");
             if data_bytes > 0 {
                 use std::io::Seek;
                 snapshot.rewind()?;
@@ -1769,42 +1853,46 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         tracing::info!(
             last_log_index = last_log_id.map(|id| id.index),
             last_log_term = last_log_id.map(|id| id.committed_leader_id().term),
-            "building full storage snapshot"
+            "publishing storage snapshot"
         );
 
         self.snapshot_builds
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // Serialize the captured store: every entry up to `last_log_id`, none
-        // after it.
+        // The capture holds every entry up to `last_log_id` and none after
+        // it, which is the whole snapshot: it is published as it stands and
+        // serialized only when a peer needs it sent, so a build costs the
+        // capture's flush and hard links, never a pass over the data.
         let dir = self.capture.clone().map_err(io::Error::other)?;
         let meta = SnapshotMeta {
             last_log_id,
             last_membership: self.last_membership.clone(),
         };
-        // The capture's tables are hard links into the store's; the build
-        // counts as work on the store until it has closed them.
         let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();
-        let (snapshot, bytes) = tokio::task::spawn_blocking(move || {
+        let snapshot = tokio::task::spawn_blocking(move || {
             let _work = work;
-            let captured = StorageEngine::open_checkpoint(&dir)
-                .map_err(|e| io::Error::other(format!("open the snapshot capture: {e}")))?;
-            let mut file = snapshots.stage()?;
-            let bytes = crate::snapshot::write_full_snapshot(&captured, &mut file)?;
             // openraft keeps only the metadata of what it built and asks
             // get_current_snapshot() for the bytes, so the build is
             // published before it is returned.
-            snapshots.publish(&published_meta, &mut file)?;
-            use std::io::Seek;
-            file.rewind()?;
-            Ok::<_, io::Error>((file, bytes))
+            if !snapshots.publish_capture(&published_meta, &dir)? {
+                // An install overtook this build; openraft reads only the
+                // build's metadata, and the newer snapshot stays current.
+                tracing::warn!(
+                    last_log_index = published_meta.last_log_id.map(|id| id.index),
+                    "a newer snapshot was published while this one was built"
+                );
+            }
+            snapshots
+                .current()?
+                .map(|(_, snapshot)| snapshot)
+                .ok_or_else(|| io::Error::other("the published snapshot is missing"))
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot build task: {e}")))??;
 
-        tracing::info!(snapshot_bytes = bytes, "snapshot build complete");
+        tracing::info!("snapshot published");
         Ok(Snapshot { meta, snapshot })
     }
 }

@@ -191,7 +191,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
         // index's health under the same lock so the watermark reported is
         // consistent with the snapshot the query ran against. The registry
         // keys on the raw (unescaped) label/property.
-        let (rows, index_health) = {
+        let (rows, index_health) = super::blocking(|| {
             let db = self.database.read();
             let rows = db
                 .execute_cypher_shared(&cypher, Some(params), None, None, None)
@@ -201,10 +201,10 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                 .vector_index_registry()
                 .health_snapshot(&req.label, &req.property)
                 .map(index_health_to_proto);
-            (rows, health)
-        };
+            Ok::<_, Status>((rows, health))
+        })?;
 
-        let results: Vec<query::VectorResult> = {
+        let results: Vec<query::VectorResult> = super::blocking(|| {
             let db = self.database.read();
             rows.into_iter()
                 .filter_map(|row| {
@@ -216,7 +216,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                     })
                 })
                 .collect()
-        };
+        });
 
         let mut response = Response::new(query::VectorSearchResponse {
             results,
@@ -272,14 +272,15 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
 
         // Hybrid search is read-only — take the shared read lock so
         // concurrent search requests run in parallel.
-        let rows = {
-            let db = self.database.read();
-            db.execute_cypher_shared(&cypher, Some(params), None, None, None)
-                .map_err(|e| db_err_to_status("hybrid search", e))?
-                .rows
-        };
+        let rows = super::blocking(|| {
+            self.database
+                .read()
+                .execute_cypher_shared(&cypher, Some(params), None, None, None)
+        })
+        .map_err(|e| db_err_to_status("hybrid search", e))?
+        .rows;
 
-        let results: Vec<query::VectorResult> = {
+        let results: Vec<query::VectorResult> = super::blocking(|| {
             let db = self.database.read();
             rows.into_iter()
                 .filter_map(|row| {
@@ -291,7 +292,7 @@ impl query::vector_service_server::VectorService for VectorServiceImpl {
                     })
                 })
                 .collect()
-        };
+        });
 
         // The hybrid request carries no label, so the vector phase can span
         // several labels' indexes — there is no single index whose health to

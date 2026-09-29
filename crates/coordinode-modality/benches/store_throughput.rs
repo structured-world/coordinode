@@ -383,17 +383,33 @@ fn bench_spatial_bbox_tight_in_large(c: &mut Criterion) {
 fn bench_index_put_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_put_then_scan_exact");
     group.sample_size(10);
+    let index = coordinode_modality::IndexDefinition::btree("by_id", "L", "id");
     for &n in &[100usize, 1000, 10_000] {
         let (_dir, engine) = mk_engine();
         let store = LocalIndexStore::new(&engine);
+        // Direct mode: each staged entry lands as it is written.
+        let mut txn = Transaction::new(&engine, None, Timestamp::ZERO, None);
+        let no_fields = |_: &str| None;
         for i in 0..n as u64 {
             store
-                .put_entry("by_id", &[Value::Int(i as i64)], NodeId::from_raw(i))
+                .stage_membership(
+                    &mut txn,
+                    &index,
+                    &no_fields,
+                    NodeId::from_raw(i),
+                    None,
+                    Some(&[Value::Int(i as i64)]),
+                )
                 .unwrap();
         }
         let probe = (n / 2) as i64;
         group.bench_with_input(BenchmarkId::from_parameter(n), &probe, |b, p| {
-            b.iter(|| store.scan_exact("by_id", &[Value::Int(*p)]).unwrap())
+            let mut txn = Transaction::new(&engine, None, Timestamp::ZERO, None);
+            b.iter(|| {
+                store
+                    .scan_exact(&mut txn, &index, &[Value::Int(*p)])
+                    .unwrap()
+            })
         });
     }
     group.finish();

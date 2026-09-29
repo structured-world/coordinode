@@ -245,6 +245,48 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 [],
             );
         }
+        DatabaseError::Execution(ExecutionError::DuplicateKey {
+            table,
+            key,
+            element_id,
+        }) => {
+            return status_with_reason(
+                Code::AlreadyExists,
+                rendered,
+                Reason::DuplicateKey,
+                [
+                    ("table", table.clone()),
+                    ("key", key.clone()),
+                    ("element_id", element_id.clone()),
+                ],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::UniqueViolation {
+            index,
+            property,
+            value,
+            element_id,
+        }) => {
+            return status_with_reason(
+                Code::AlreadyExists,
+                rendered,
+                Reason::DuplicateKey,
+                [
+                    ("index", index.clone()),
+                    ("property", property.clone()),
+                    ("key", value.clone()),
+                    ("element_id", element_id.clone()),
+                ],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::KeyImmutable { table, column }) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::KeyImmutable,
+                [("table", table.clone()), ("column", column.clone())],
+            );
+        }
         // Transaction lifecycle. NOT_FOUND rather than INVALID_ARGUMENT: the
         // id was well-formed, there is simply nothing under it any more.
         DatabaseError::UnknownTransaction(id) => {
@@ -618,17 +660,12 @@ impl CypherServiceImpl {
         if let Some(channel) = self.peer_channels.lock().get(addr) {
             return Ok(channel.clone());
         }
-        let mut endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
-            .map_err(|e| Status::internal(format!("invalid peer address '{addr}': {e}")))?
-            .connect_timeout(std::time::Duration::from_secs(5));
-        // Same process-global TLS the Raft and segment-transfer clients use: a
+        // Same address form and TLS as the Raft and segment-transfer clients: a
         // cluster that encrypts peer traffic must not get a plaintext hop here.
-        if let Some(tls) = coordinode_wire::wire_client_tls() {
-            endpoint = endpoint
-                .tls_config(tls)
-                .map_err(|e| Status::internal(format!("peer TLS config for '{addr}': {e}")))?;
-        }
-        let channel = endpoint.connect_lazy();
+        let channel = coordinode_wire::peer_endpoint(addr)
+            .map_err(|e| Status::internal(format!("peer address '{addr}': {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy();
         self.peer_channels
             .lock()
             .insert(addr.to_string(), channel.clone());
@@ -701,11 +738,12 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
-            let rows = self
-                .database
-                .read()
-                .execute_in_transaction(req.transaction_id, &req.query, params)
-                .map_err(db_error_to_status)?;
+            let rows = super::blocking(|| {
+                self.database
+                    .read()
+                    .execute_in_transaction(req.transaction_id, &req.query, params)
+            })
+            .map_err(db_error_to_status)?;
             let columns: Vec<String> = rows
                 .first()
                 .map(|r| r.keys().cloned().collect())
@@ -911,13 +949,15 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
-            match self.writer.execute(
-                &req.query,
-                params,
-                source_ctx.as_ref(),
-                Some(&executor_read_concern),
-                executor_write_concern.as_ref(),
-            ) {
+            match super::blocking(|| {
+                self.writer.execute(
+                    &req.query,
+                    params,
+                    source_ctx.as_ref(),
+                    Some(&executor_read_concern),
+                    executor_write_concern.as_ref(),
+                )
+            }) {
                 Ok(result) => result,
                 Err(e) => {
                     // The write came to a node that cannot replicate it. If we
@@ -1034,7 +1074,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             .map_err(|e| Status::internal(format!("Plan error: {e}")))?;
 
         // Compute storage stats for accurate cost estimation (TTL-cached, MVCC-aware)
-        let stats = self.database.read().compute_stats();
+        let stats = super::blocking(|| self.database.read().compute_stats());
         let stats_ref = stats
             .as_ref()
             .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
@@ -1083,7 +1123,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         _request: Request<query::BeginTransactionRequest>,
     ) -> Result<Response<query::BeginTransactionResponse>, Status> {
-        let transaction_id = self.database.read().begin_transaction();
+        let transaction_id = super::blocking(|| self.database.read().begin_transaction());
         Ok(Response::new(query::BeginTransactionResponse {
             transaction_id,
         }))
@@ -1094,24 +1134,22 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::CommitTransactionRequest>,
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
         let request = request.into_inner();
-        let db = self.database.read();
-
-        // The conditions the caller built its statements on, stated before
-        // the commit that checks them. A condition naming a node the caller
-        // never read is still a condition: the engine decides it against the
-        // state, not against what the caller happens to know.
-        for expect in &request.expect {
-            db.expect_node_version(
-                request.transaction_id,
-                coordinode_core::graph::node::NodeId::from_raw(expect.node_id),
-                expect.version,
-            )
-            .map_err(db_error_to_status)?;
-        }
-
-        let receipt = db
-            .commit_transaction(request.transaction_id)
-            .map_err(db_error_to_status)?;
+        let receipt = super::blocking(|| {
+            let db = self.database.read();
+            // The conditions the caller built its statements on, stated before
+            // the commit that checks them. A condition naming a node the caller
+            // never read is still a condition: the engine decides it against the
+            // state, not against what the caller happens to know.
+            for expect in &request.expect {
+                db.expect_node_version(
+                    request.transaction_id,
+                    coordinode_core::graph::node::NodeId::from_raw(expect.node_id),
+                    expect.version,
+                )?;
+            }
+            db.commit_transaction(request.transaction_id)
+        })
+        .map_err(db_error_to_status)?;
         // `applied_index` 0 = no Raft log (embedded / single node); `commit_ts`
         // is present in every mode.
         Ok(Response::new(query::CommitTransactionResponse {
@@ -1124,9 +1162,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         request: Request<query::RollbackTransactionRequest>,
     ) -> Result<Response<query::RollbackTransactionResponse>, Status> {
-        self.database
-            .read()
-            .rollback_transaction(request.into_inner().transaction_id)
+        let transaction_id = request.into_inner().transaction_id;
+        super::blocking(|| self.database.read().rollback_transaction(transaction_id))
             .map_err(db_error_to_status)?;
         Ok(Response::new(query::RollbackTransactionResponse {}))
     }

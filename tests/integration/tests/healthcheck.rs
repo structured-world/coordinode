@@ -14,7 +14,9 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use coordinode_integration::harness::{binary_path, free_port};
+use coordinode_integration::harness::{
+    binary_path, free_port, own_process_group, request_shutdown,
+};
 use coordinode_integration::proto::session::session_service_client::SessionServiceClient;
 use coordinode_integration::proto::session::{ClientFrame, Configure, client_frame};
 
@@ -31,8 +33,8 @@ impl Server {
     fn start(extra: &[&str]) -> Self {
         let data = tempfile::tempdir().expect("tempdir");
         let (grpc_port, ops_port) = (free_port(), free_port());
-        let child = Command::new(binary_path())
-            .arg("serve")
+        let mut cmd = Command::new(binary_path());
+        cmd.arg("serve")
             .args(extra)
             .arg("--addr")
             .arg(format!("[::1]:{grpc_port}"))
@@ -43,9 +45,9 @@ impl Server {
             .arg("--data")
             .arg(data.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn coordinode serve");
+            .stderr(Stdio::null());
+        own_process_group(&mut cmd);
+        let child = cmd.spawn().expect("spawn coordinode serve");
         Self {
             child,
             grpc_port,
@@ -62,12 +64,9 @@ impl Server {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Ask the server to stop the way a service manager does.
     fn sigterm(&self) {
-        let status = Command::new("kill")
-            .args(["-s", "TERM", &self.child.id().to_string()])
-            .status()
-            .expect("run kill");
-        assert!(status.success(), "SIGTERM the server");
+        request_shutdown(&self.child).expect("ask the server to stop");
     }
 
     /// Wait up to `limit` for the process to exit.

@@ -1326,13 +1326,15 @@ fn trigger_fail_fast_on_capacity_exhausted() {
         "expected capacity-exhausted error from trigger path, got: {msg}",
     );
 
-    // Wall-time guard: a retry loop with exponential backoff would
-    // be many seconds. Fail-fast is single-digit milliseconds in
-    // practice; 200 ms is the conservative CI ceiling.
+    // Wall-time guard: a retry loop with exponential backoff takes
+    // seconds, fail-fast single-digit milliseconds. The ceiling sits
+    // between the two, clear of a debug build on a fully loaded CI
+    // runner (measured at 221 ms there), so it catches the loop and
+    // nothing else.
     assert!(
-        elapsed < std::time::Duration::from_millis(200),
-        "trigger fail-fast must complete in < 200 ms (got {elapsed:?}) \
-         — a longer wall time suggests a hidden retry loop",
+        elapsed < std::time::Duration::from_secs(1),
+        "trigger fail-fast must complete in < 1 s (got {elapsed:?}): \
+         a longer wall time suggests a hidden retry loop",
     );
 }
 

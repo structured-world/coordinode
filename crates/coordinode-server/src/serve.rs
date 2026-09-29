@@ -170,6 +170,11 @@ pub(crate) async fn serve(
         interactive_txn_max_bytes,
         peers: peers_vec,
         membership_change_timeout_secs,
+        join_readiness_lag_entries,
+        join_timeout_secs,
+        raft_snapshot_entries,
+        raft_snapshot_log_bytes,
+        raft_snapshot_interval_secs,
         planner_stats_ttl_secs,
         vector_build_wait_ms,
         mode: _,
@@ -592,6 +597,14 @@ pub(crate) async fn serve(
     //
     // In cases 2 and 3, RaftServiceServer is registered at the end of
     // router construction so inter-node Raft RPCs share the :7080 port.
+    let defaults = coordinode_raft::cluster::SnapshotTriggerConfig::default();
+    let snapshots = coordinode_raft::cluster::SnapshotTriggerConfig {
+        logs_since_last: raft_snapshot_entries.map_or(defaults.logs_since_last, |n| n.get()),
+        log_bytes: raft_snapshot_log_bytes.map_or(defaults.log_bytes, |n| n.get()),
+        check_interval: raft_snapshot_interval_secs.map_or(defaults.check_interval, |n| {
+            std::time::Duration::from_secs(n.get())
+        }),
+    };
     let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
         let peer_count = peers_list.len();
         if node_id == 1 {
@@ -599,33 +612,38 @@ pub(crate) async fn serve(
                 peers = peer_count,
                 node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
             );
-            let (rn, handler) = coordinode_raft::cluster::RaftNode::open_cluster_embedded(
-                node_id,
-                Arc::clone(&engine),
-                effective_advertise,
-            )
-            .await
-            .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
+            let (rn, handler) =
+                coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_snapshot_config(
+                    node_id,
+                    Arc::clone(&engine),
+                    effective_advertise,
+                    snapshots,
+                )
+                .await
+                .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
             (rn, Some(handler))
         } else {
             info!(
                 peers = peer_count,
                 node_id, "cluster mode: joining node (open_joining_embedded)"
             );
-            let (rn, handler) = coordinode_raft::cluster::RaftNode::open_joining_embedded(
-                node_id,
-                Arc::clone(&engine),
-            )
-            .await
-            .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
+            let (rn, handler) =
+                coordinode_raft::cluster::RaftNode::open_joining_embedded_with_snapshot_config(
+                    node_id,
+                    Arc::clone(&engine),
+                    snapshots,
+                )
+                .await
+                .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
             (rn, Some(handler))
         }
     } else {
         info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
-        let rn = coordinode_raft::cluster::RaftNode::open_with_oracle(
+        let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_snapshot_config(
             node_id,
             Arc::clone(&engine),
             Some(Arc::clone(&oracle)),
+            snapshots,
         )
         .await
         .map_err(|e| format!("failed to open Raft node: {e}"))?;
@@ -634,6 +652,12 @@ pub(crate) async fn serve(
 
     if let Some(secs) = membership_change_timeout_secs {
         raft_node.set_membership_settle_timeout(std::time::Duration::from_secs(secs));
+    }
+    if let Some(entries) = join_readiness_lag_entries {
+        raft_node.set_join_readiness_lag(entries);
+    }
+    if let Some(secs) = join_timeout_secs {
+        raft_node.set_join_timeout(std::time::Duration::from_secs(secs.get()));
     }
     let raft_node = Arc::new(raft_node);
 
@@ -773,28 +797,31 @@ pub(crate) async fn serve(
     // after this point.
     let _ = raft_slot.set(Arc::clone(&raft_node));
 
-    // Refresh node-local derived state when replicated entries
-    // apply: property values are encoded against interner ids,
-    // and a follower that never refreshes its in-memory interner
-    // resolves every replicated property to null. The refresh is
-    // a cheap length pre-check unless the mapping actually grew.
-    if peers.is_some() {
+    // Bring vector index definitions live as their entries apply: a
+    // replica's copy of a leader's CREATE VECTOR INDEX, and on a single
+    // node the definitions the log replays after the database opened. The
+    // field dictionary needs no such task: each statement refreshes its
+    // view whenever a binding has applied.
+    {
         let mut applied_rx = raft_node.subscribe_applied();
         let db = Arc::clone(&database);
         tokio::spawn(async move {
             while applied_rx.changed().await.is_ok() {
-                let guard = db.read();
-                if let Err(e) = guard.refresh_field_interner() {
-                    tracing::warn!(%e, "field interner refresh failed");
-                }
-                // Replicated CREATE VECTOR INDEX definitions are
-                // brought live here: register + local HNSW rebuild
-                // (the graph itself is never replicated).
-                match guard.refresh_vector_indexes() {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
-                    Err(e) => tracing::warn!(%e, "vector index refresh failed"),
-                }
+                crate::services::blocking(|| {
+                    // Register + local HNSW rebuild (the graph itself is never
+                    // replicated).
+                    match db.read().refresh_vector_indexes() {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
+                        Err(e) => tracing::warn!(%e, "vector index refresh failed"),
+                    }
+                    // B-tree definitions another member created or dropped:
+                    // their entries arrive in the log, the definitions tell
+                    // this member to maintain and use them.
+                    if let Err(e) = db.read().refresh_btree_indexes() {
+                        tracing::warn!(%e, "B-tree index refresh failed");
+                    }
+                });
             }
         });
     }
@@ -842,6 +869,38 @@ pub(crate) async fn serve(
                     Err(e) => {
                         tracing::warn!(%e, "after-commit dispatch task join error")
                     }
+                }
+            }
+        });
+    }
+
+    // Rebuild the B-tree indexes a store kept in the entry layout that
+    // preceded transactional entries. The rebuild is written through the log,
+    // so the leader runs it; a member that is not leading keeps looking until
+    // it leads or another member's rebuild reaches it through apply.
+    {
+        let db = Arc::clone(&database);
+        let rn = Arc::clone(&raft_node);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if rn.current_leader() != Some(rn.node_id()) {
+                    continue;
+                }
+                let db2 = Arc::clone(&db);
+                match tokio::task::spawn_blocking(move || db2.read().rebuild_legacy_btree_indexes())
+                    .await
+                {
+                    Ok(Ok(rebuilt)) => {
+                        if rebuilt > 0 {
+                            tracing::info!(rebuilt, "B-tree indexes rebuilt in the current layout");
+                        }
+                        break;
+                    }
+                    Ok(Err(e)) => tracing::warn!(%e, "B-tree index rebuild failed; retrying"),
+                    Err(e) => tracing::warn!(%e, "B-tree index rebuild task join error"),
                 }
             }
         });
@@ -1019,16 +1078,58 @@ pub(crate) async fn serve(
         #[cfg(unix)]
         tokio::select! {
             _ = sigterm.recv() => {
-                info!("SIGTERM received — initiating graceful shutdown");
+                info!("SIGTERM received, initiating graceful shutdown");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received — initiating graceful shutdown");
+                info!("Ctrl+C received, initiating graceful shutdown");
             }
         }
-        #[cfg(not(unix))]
+        // A Windows console process is asked to stop by a console control
+        // event, not a signal: Ctrl+C at a terminal, CTRL_BREAK from a
+        // supervisor that started it in its own process group, CTRL_CLOSE
+        // when its console goes away (`docker stop` on a Windows container)
+        // and CTRL_SHUTDOWN when the system shuts down. Each one gets the
+        // same graceful shutdown as SIGTERM.
+        #[cfg(windows)]
         {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Ctrl+C received — initiating graceful shutdown");
+            use tokio::signal::windows;
+            match (
+                windows::ctrl_c(),
+                windows::ctrl_break(),
+                windows::ctrl_close(),
+                windows::ctrl_shutdown(),
+            ) {
+                (Ok(mut c), Ok(mut brk), Ok(mut close), Ok(mut shutdown)) => {
+                    let event = tokio::select! {
+                        _ = c.recv() => "CTRL_C",
+                        _ = brk.recv() => "CTRL_BREAK",
+                        _ = close.recv() => "CTRL_CLOSE",
+                        _ = shutdown.recv() => "CTRL_SHUTDOWN",
+                    };
+                    info!(
+                        event,
+                        "console control event received, initiating graceful shutdown"
+                    );
+                }
+                // Without the handlers the process would still end on these
+                // events, only without draining; Ctrl+C alone is what is left.
+                _ => {
+                    tracing::warn!(
+                        "could not install the console control handlers; only Ctrl+C \
+                         shuts down gracefully"
+                    );
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        tracing::warn!(%e, "Ctrl+C handler failed");
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!(%e, "Ctrl+C handler failed");
+            }
+            info!("Ctrl+C received, initiating graceful shutdown");
         }
         // First, so /ready turns a balancer away while in-flight RPCs drain.
         shutdown_readiness.set(false);

@@ -1252,6 +1252,44 @@ fn optimized_plan(input: &str) -> LogicalOp {
     optimize_push_down(root, None)
 }
 
+/// The lazy pass asks for statistics only when a decision uses them: a write
+/// or a plain read never does, so computing them there is pure cost on the
+/// hot path.
+#[test]
+fn push_down_asks_for_stats_only_when_a_decision_needs_them() {
+    use std::cell::Cell;
+
+    for query in [
+        "CREATE (:User {email: 'a@example.com'})",
+        "MATCH (u:User) WHERE u.email = 'a@example.com' RETURN u",
+        "MATCH (a:User)-[:LIKES]->(b:Movie) RETURN b",
+    ] {
+        let asked = Cell::new(0u32);
+        let stats = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        optimize_push_down_lazy(optimize_edge_vector_search(plan_root(query)), &stats);
+        assert_eq!(asked.get(), 0, "{query}: statistics were computed");
+    }
+
+    let asked = Cell::new(0u32);
+    let stats = || {
+        asked.set(asked.get() + 1);
+        None
+    };
+    let root = optimize_push_down_lazy(
+        optimize_edge_vector_search(plan_root(
+            "MATCH (a:User)-[:LIKES]->(b:Movie) \
+                 WHERE vector_distance(b.embedding, [1.0, 0.0, 0.0]) < 0.5 \
+                 RETURN b",
+        )),
+        &stats,
+    );
+    assert_eq!(asked.get(), 1, "the decision reads the statistics once");
+    assert_push_down_invariant(&root).expect("the lazy pass still decides");
+}
+
 #[test]
 fn push_down_invariant_simple_traverse_then_vector() {
     // (a)-[:LIKES]->(b) WHERE vector_distance(b.embedding, [..]) < 0.5

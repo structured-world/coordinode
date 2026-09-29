@@ -28,6 +28,8 @@ clause = {
   | call_subquery_clause
   | call_clause
   | alter_label_clause
+  | alter_index_clause
+  | alter_namespace_clause
   | create_encrypted_index_clause
   | create_text_index_clause
   | create_vector_index_clause
@@ -234,13 +236,27 @@ drop_vector_index_clause = { kw_drop ~ kw_vector ~ kw_index ~ identifier }
 // --- CREATE/DROP BTREE INDEX ---
 
 // CREATE [UNIQUE] [SPARSE] INDEX idx_name ON :Label(prop) [WHERE pred]
+//     [OPTIONS { maintenance: 'resolved' | 'derived' }]
 create_index_clause = {
     kw_create ~ kw_unique? ~ kw_sparse? ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
     ~ where_inline?
+    ~ (kw_options ~ index_options)?
 }
+
+// B-tree index OPTIONS map: { key: 'value', ... }
+index_options = { "{" ~ index_option ~ ("," ~ index_option)* ~ ","? ~ "}" }
+index_option  = { identifier ~ ":" ~ string_literal }
 
 // DROP INDEX idx_name
 drop_index_clause = { kw_drop ~ kw_index ~ identifier }
+
+// ALTER INDEX idx_name SET MAINTENANCE RESOLVED | DERIVED | INHERIT
+alter_index_clause = { kw_alter ~ kw_index ~ identifier ~ kw_set ~ kw_maintenance ~ index_maintenance }
+index_maintenance  = @{ (^"resolved" | ^"derived" | ^"inherit") ~ !(ASCII_ALPHANUMERIC | "_") }
+
+// ALTER NAMESPACE SET INDEX MAINTENANCE RESOLVED | DERIVED: the default of
+// the namespace the statement runs in.
+alter_namespace_clause = { kw_alter ~ kw_namespace ~ kw_set ~ kw_index ~ kw_maintenance ~ index_maintenance }
 
 // --- CREATE EDGE TYPE ---
 
@@ -328,8 +344,8 @@ create_trigger_clause = {
     ~ trigger_option*
 }
 
-// CASCADE_LIMIT / CASCADE_FANOUT / MAXDEPTH (deprecated alias) / ON ERROR
-// — order-independent option list parsed after the body. See ADR-026A.
+// CASCADE_LIMIT / CASCADE_FANOUT / MAXDEPTH (deprecated alias) / ON ERROR:
+// an option list parsed after the body, in any order.
 trigger_option = {
     trigger_cascade_limit
   | trigger_cascade_fanout
@@ -377,9 +393,11 @@ trigger_body_clause = {
     )
 }
 
-// CASCADE_LIMIT n — L1 cascade depth override (ADR-026A).
+// CASCADE_LIMIT n: this trigger's cap on how deep a chain of triggers it
+// starts may cascade.
 trigger_cascade_limit = { kw_cascade_limit ~ integer_literal }
-// CASCADE_FANOUT n — L2 per-trigger fanout override (ADR-026A).
+// CASCADE_FANOUT n: this trigger's cap on how many triggers one firing of it
+// may fire in turn.
 trigger_cascade_fanout = { kw_cascade_fanout ~ integer_literal }
 // Deprecated: MAXDEPTH n — alias for CASCADE_LIMIT n.
 trigger_maxdepth = { kw_maxdepth ~ integer_literal }
@@ -969,6 +987,8 @@ kw_update      = @{ ^"update" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_show        = @{ ^"show" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_enable      = @{ ^"enable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_disable     = @{ ^"disable" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_maintenance = @{ ^"maintenance" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_namespace   = @{ ^"namespace" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 
