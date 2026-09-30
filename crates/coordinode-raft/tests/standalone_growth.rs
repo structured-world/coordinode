@@ -224,6 +224,11 @@ async fn grow_standalone_directory(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standalone_directory_grows_to_three_voters_and_back() {
+    // Replication and membership events, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=info")
+        .with_test_writer()
+        .try_init();
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dir1 = tempfile::tempdir().expect("d1");
         let dir2 = tempfile::tempdir().expect("d2");
@@ -291,6 +296,11 @@ async fn standalone_directory_grows_to_three_voters_and_back() {
 /// That only works if the membership carries its real address.
 #[tokio::test(flavor = "multi_thread")]
 async fn first_node_of_a_grown_directory_rejoins_after_failover() {
+    // Replication and membership events, shown when the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("coordinode_raft=debug,openraft=info")
+        .with_test_writer()
+        .try_init();
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let dir1 = tempfile::tempdir().expect("d1");
         let dir2 = tempfile::tempdir().expect("d2");

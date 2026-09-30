@@ -700,6 +700,50 @@ async fn cluster_voter_learner_transitions() {
     );
 }
 
+/// A membership change is visible the moment the call that made it returns.
+/// openraft answers a change before it publishes the new membership, so a
+/// caller reading the members straight away could see the old ones, and the
+/// next change, which starts from the members in view, would be computed from
+/// a set that no longer holds. Back-to-back changes with no pause between them
+/// show both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_membership_change_is_visible_when_its_call_returns() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+        let voters = |node: &RaftNode| {
+            let mut ids = node.voter_ids();
+            ids.sort_unstable();
+            ids
+        };
+
+        for round in 0..20 {
+            n1.node.demote_to_learner(3).await.expect("demote node 3");
+            assert_eq!(voters(&n1.node), vec![1, 2], "round {round}: after demote");
+            n1.node.promote_to_voter(3).await.expect("promote node 3");
+            assert_eq!(
+                voters(&n1.node),
+                vec![1, 2, 3],
+                "round {round}: after promote"
+            );
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT — a_membership_change_is_visible_when_its_call_returns"
+    );
+}
+
 /// Remove a node from cluster — membership shrinks, cluster continues working.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_remove_node() {
@@ -1104,16 +1148,11 @@ async fn cluster_crash_recovery() {
                 }
             }
 
-            // Verify cluster is functional: propose through the leader
-            let leader = if n1.is_leader().await {
-                &n1
-            } else if n2.is_leader().await {
-                &n2
-            } else {
-                &n3
-            };
-
-            let pipeline = leader.pipeline();
+            // Verify cluster is functional: propose through the leader. A
+            // restarted group may hold a second election before it settles, so
+            // the leader is looked up again whenever the one asked has stepped
+            // down; the same proposal id makes a retry a replay, never a
+            // second write.
             let id_gen = ProposalIdGenerator::with_base(99u64 << 48);
             let p = RaftProposal {
                 id: id_gen.next(),
@@ -1126,8 +1165,30 @@ async fn cluster_crash_recovery() {
                 start_ts: Timestamp::from_raw(499),
                 bypass_rate_limiter: false,
             };
-            pipeline
-                .propose_and_wait(&p)
+            let mut outcome = None;
+            for _ in 0..150 {
+                let leader = if n1.is_leader().await {
+                    &n1
+                } else if n2.is_leader().await {
+                    &n2
+                } else if n3.is_leader().await {
+                    &n3
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                match leader.pipeline().propose_and_wait(&p) {
+                    Err(ProposalError::NotLeader { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    other => {
+                        outcome = Some(other);
+                        break;
+                    }
+                }
+            }
+            outcome
+                .expect("a leader takes the proposal after cluster restart")
                 .expect("propose after cluster restart");
 
             n1.shutdown().await.expect("s1");
@@ -3778,11 +3839,15 @@ async fn cluster_write_concern_acks_counts_members() {
             "a refused write concern must not write anything"
         );
 
-        // w:1: answered from the leader's own log, not yet committed.
+        // w:1: answered from the leader's own log, not yet committed. The
+        // followers are cut off for the write, so no majority can hold it by
+        // the time the answer is read: on a fast local group they otherwise
+        // may, and a write a majority holds reports its index, rightly.
         let leader_only = proposal(b"node:0:w1", b"leader", 201);
-        let outcome = pipeline
-            .propose_with_ack(&leader_only, WriteAck::Acks(1), None)
-            .expect("w:1 write");
+        coordinode_raft::cluster::nemesis::block(&[(1, 2), (1, 3)]);
+        let outcome = pipeline.propose_with_ack(&leader_only, WriteAck::Acks(1), None);
+        coordinode_raft::cluster::nemesis::heal();
+        let outcome = outcome.expect("w:1 write");
         assert!(
             outcome.applied_index.is_none(),
             "w:1 is answered before a majority holds the entry, so it must not \

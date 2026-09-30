@@ -1022,11 +1022,13 @@ pub struct CoordinodeStateMachine {
     /// Snapshot work holding the engine off the async runtime, which a
     /// shutdown waits out.
     engine_work: EngineWork,
-    /// This state machine's own share of `engine_work`: it holds the engine
-    /// for as long as openraft keeps it.
-    _hold: EngineWorkGuard,
-    /// The current snapshot's file and record.
+    /// The current snapshot's file and record; holds the engine.
     snapshots: Arc<SnapshotStore>,
+    /// This state machine's own share of `engine_work`: it holds the engine
+    /// for as long as openraft keeps it. Declared last, so it is dropped after
+    /// every field holding the engine: a shutdown waiting on it would
+    /// otherwise return while `snapshots` still held the directory.
+    _hold: EngineWorkGuard,
 }
 
 /// Everything that holds the engine on openraft's behalf: the log store and
@@ -1719,7 +1721,9 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let engine = Arc::clone(&self.engine);
         let work = self.engine_work.start();
         let mut snapshot = tokio::task::spawn_blocking(move || {
+            // Locals drop in reverse: the engine before the guard.
             let _work = work;
+            let engine = engine;
             let data_bytes = snapshot.size()?;
             tracing::info!(data_bytes, last_log_index, "installing snapshot");
             if data_bytes > 0 {
@@ -1778,12 +1782,18 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
 
         // The installed file becomes the current snapshot, moved in place;
         // get_current_snapshot() serves it from now on.
+        // Counted as work holding the engine: openraft may stop waiting on
+        // the task at a shutdown, and the task runs on regardless.
+        let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();
-        let published =
-            tokio::task::spawn_blocking(move || snapshots.publish(&published_meta, &mut snapshot))
-                .await
-                .map_err(|e| io::Error::other(format!("snapshot publish task: {e}")))??;
+        let published = tokio::task::spawn_blocking(move || {
+            let _work = work;
+            let snapshots = snapshots;
+            snapshots.publish(&published_meta, &mut snapshot)
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("snapshot publish task: {e}")))??;
         if !published {
             // openraft installs only snapshots past what this node applied,
             // and it builds none past that either.
@@ -1798,10 +1808,16 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot>, io::Error> {
+        // Counted as work holding the engine, as the install above is.
+        let work = self.engine_work.start();
         let snapshots = Arc::clone(&self.snapshots);
-        let current = tokio::task::spawn_blocking(move || snapshots.current())
-            .await
-            .map_err(|e| io::Error::other(format!("snapshot open task: {e}")))??;
+        let current = tokio::task::spawn_blocking(move || {
+            let _work = work;
+            let snapshots = snapshots;
+            snapshots.current()
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("snapshot open task: {e}")))??;
         Ok(current.map(|(meta, snapshot)| Snapshot { meta, snapshot }))
     }
 }
@@ -1872,7 +1888,10 @@ impl RaftSnapshotBuilder<TypeConfig> for CoordinodeSnapshotBuilder {
         let snapshots = Arc::clone(&self.snapshots);
         let published_meta = meta.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
+            // Locals drop in reverse: the store, which holds the engine, goes
+            // before the guard that tells the shutdown it has.
             let _work = work;
+            let snapshots = snapshots;
             // openraft keeps only the metadata of what it built and asks
             // get_current_snapshot() for the bytes, so the build is
             // published before it is returned.

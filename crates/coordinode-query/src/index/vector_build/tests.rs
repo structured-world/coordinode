@@ -175,7 +175,10 @@ fn put(shard: u16, id: u64, record: &NodeRecord) -> Mutation {
 /// Wait until the build has handed maintenance to the writers and is
 /// waiting for the transactions older than the handover.
 fn await_handover(health: &HealthSignal) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The handover follows the scan, which inserts every vector into the graph
+    // of an unoptimised build: seconds alone, several times that on a CI host
+    // shared with other builds. The bound only turns a hang into a failure.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while health.snapshot().is_rebuilding() {
         assert!(Instant::now() < deadline, "the build never handed over");
         std::thread::sleep(Duration::from_millis(1));

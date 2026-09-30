@@ -5,6 +5,10 @@
 #
 # Usage: COORDINODE_LINUX_HOST=<ssh target> scripts/linux/check.sh
 #
+# With COORDINODE_CHECK_NEXTEST set, only nextest runs, with those arguments
+# added (a filter and a stress count to chase a flaky test, for example:
+# COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
+#
 # The host needs git, a Rust toolchain, cargo-nextest and protoc. Logs and the
 # status file land in target/linux-check/ locally; the run's directory on the
 # host, build output included, is removed afterwards.
@@ -15,6 +19,7 @@ host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of th
 # shared machine never meet in it.
 remote_root="/var/tmp/cn-check-$(date +%Y%m%d%H%M%S)-$$"
 ref='refs/check/linux'
+only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 
 repo="$(git rev-parse --show-toplevel)"
 out="$repo/target/linux-check"
@@ -39,6 +44,26 @@ git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
 
 ssh "$host" "mkdir -p '$remote_root'"
 ssh "$host" "cat > '$remote_root/tree.bundle'" < "$bundle"
+
+if [ -n "$only_nextest" ]; then
+  ssh "$host" "set -u
+cd '$remote_root'
+git clone -q --no-checkout tree.bundle src
+cd src
+git fetch -q ../tree.bundle '$ref'
+git checkout -q --detach FETCH_HEAD
+git submodule update --init -q
+echo checkout=\$? > ../status.txt
+export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
+cargo nextest run --all-features --workspace --no-fail-fast --failure-output final $only_nextest > ../test.log 2>&1
+echo nextest=\$? >> ../status.txt
+echo done >> ../status.txt" || true
+  for f in status.txt test.log; do
+    ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
+  done
+  cat "$out/status.txt"
+  exit 0
+fi
 
 # Each step's exit code goes to status.txt; a failing step does not stop the
 # ones after it, and the logs are fetched either way.

@@ -228,15 +228,48 @@ fn allocated_ports_lie_outside_the_ephemeral_range() {
 }
 
 fn reservation_lock(port: u16) -> std::fs::File {
-    let path = std::env::temp_dir()
-        .join("coordinode-test-ports")
-        .join(port.to_string());
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .expect("open the reservation file")
+    open_reservation(&reservation_dir().join(port.to_string()))
+}
+
+/// A reservation file another user left behind (a CI account and a person
+/// running the suite on the same machine) is one this process may read but
+/// not write. Taking the reservation must still work: the lock needs no
+/// write access, and a panic here failed every test that asked for a port.
+#[cfg(unix)]
+#[test]
+fn a_reservation_file_this_user_cannot_write_is_still_taken() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let port = 31_998;
+    let path = reservation_dir().join(port.to_string());
+    drop(reservation_lock(port));
+    let owned = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).is_ok();
+    // Held by a neighbouring test process is an answer too; only a panic fails.
+    let taken = reserve_port(port);
+    if owned {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("give the reservation file its mode back");
+    }
+    assert!(taken || reservation_lock(port).try_lock().is_err());
+}
+
+/// Ports are one resource per machine whoever runs the tests, so the
+/// reservation directory is shared the way `/tmp` is: every user may add a
+/// file, and only its owner may remove one.
+#[cfg(unix)]
+#[test]
+fn the_reservation_directory_is_shared_by_every_user() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = reservation_dir();
+    let meta = std::fs::metadata(dir).expect("stat the reservation directory");
+    // This process's uid, read off a file it creates.
+    let mine = tempfile::NamedTempFile::new().expect("create a file of this user");
+    let uid = mine.as_file().metadata().expect("stat it").uid();
+    // A directory another user created is theirs to share; this user cannot.
+    if meta.uid() == uid {
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o1777);
+    }
 }
 
 /// An allocated port stays reserved against every other test process until

@@ -367,17 +367,8 @@ pub fn alloc_port_on(ip: std::net::IpAddr) -> u16 {
 /// never closed, so a port stays reserved exactly as long as any server this
 /// process may still start on it.
 fn reserve_port(port: u16) -> bool {
-    let dir = std::env::temp_dir().join("coordinode-test-ports");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        panic!("create the port reservation dir {}: {e}", dir.display());
-    }
-    let path = dir.join(port.to_string());
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .unwrap_or_else(|e| panic!("open the port reservation {}: {e}", path.display()));
+    let path = reservation_dir().join(port.to_string());
+    let file = open_reservation(&path);
     match file.try_lock() {
         Ok(()) => {
             // Held for the life of the process; the OS drops the lock at exit.
@@ -388,6 +379,51 @@ fn reserve_port(port: u16) -> bool {
         Err(std::fs::TryLockError::Error(e)) => {
             panic!("lock the port reservation {}: {e}", path.display())
         }
+    }
+}
+
+/// The directory holding one lock file per reserved port.
+fn reservation_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("coordinode-test-ports");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            panic!("create the port reservation dir {}: {e}", dir.display());
+        }
+        #[cfg(unix)]
+        share_with_every_user(&dir);
+        dir
+    })
+}
+
+/// Ports are one resource per machine whoever runs the tests (a CI account
+/// and a person on the same host), so the directory is shared the way `/tmp`
+/// is: every user may add a file, only its owner may remove one.
+#[cfg(unix)]
+fn share_with_every_user(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)) {
+        Ok(()) => {}
+        // Another user created it and shared it then; only they may change it.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => panic!("share the port reservation dir {}: {e}", dir.display()),
+    }
+}
+
+/// Open the lock file of one port, creating it when absent. A file another
+/// user created cannot be opened for writing; the lock needs no write access,
+/// so it is opened for reading instead.
+fn open_reservation(path: &std::path::Path) -> std::fs::File {
+    let writable = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path);
+    match writable {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("open the port reservation {}: {e}", path.display())),
+        Err(e) => panic!("open the port reservation {}: {e}", path.display()),
     }
 }
 

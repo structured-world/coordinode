@@ -311,6 +311,52 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
     }
 }
 
+/// A stopped node leaves its directory free for the next open in the same
+/// process. The snapshot trigger holds the engine while it sizes the log; a
+/// shutdown that only asked it to stop returned while it still did, and the
+/// reopen found the directory locked. A trigger probing every millisecond is
+/// mid-probe at almost any shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_node_leaves_its_directory_free_while_the_trigger_probes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let id_gen = ProposalIdGenerator::new();
+    for round in 0..8u64 {
+        let engine = open_engine(dir.path());
+        let node = RaftNode::open_with_oracle_and_snapshot_config(
+            1,
+            Arc::clone(&engine),
+            None,
+            coordinode_raft::cluster::SnapshotTriggerConfig {
+                check_interval: Duration::from_millis(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("open the node");
+        let proposal = RaftProposal {
+            id: id_gen.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: format!("probe-{round}").into_bytes(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(10_000 + 2 * round + 1),
+            start_ts: Timestamp::from_raw(10_000 + 2 * round),
+            bypass_rate_limiter: false,
+        };
+        node.pipeline()
+            .propose_and_wait(&proposal)
+            .expect("propose");
+        // Past the first probe interval, so the trigger is sizing the log.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        node.shutdown().await.expect("shutdown");
+        drop(node);
+        drop(engine);
+    }
+    // The last round's directory opens too.
+    drop(open_engine(dir.path()));
+}
+
 /// A completed proposal is in its tree together with the record saying so:
 /// the data is readable and the tree's coverage marks the proposal.
 #[tokio::test(flavor = "multi_thread")]

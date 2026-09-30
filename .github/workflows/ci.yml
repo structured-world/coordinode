@@ -127,6 +127,17 @@ jobs:
       - Windows
       - X64
       - coordinode-windows
+    env:
+      PROTOC_VERSION: "36.2"
+      PROTOC_SHA256: f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3
+      NEXTEST_VERSION: "0.9.146"
+    defaults:
+      run:
+        # The machine has Windows PowerShell only (no pwsh), and its policy
+        # refuses the unsigned script file every step is written to; the
+        # policy is lifted for this process alone. A failing native command
+        # fails the step through its exit code.
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; & '{0}'; if ($LASTEXITCODE) { exit $LASTEXITCODE }"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,10 +145,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc and cargo-nextest
         # The runner's service account carries a Rust toolchain and nothing
-        # else, so the job brings its own tools.
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc,nextest
+        # else, so the job brings its own tools, pinned, into a directory of
+        # its own that later runs reuse.
+        run: |
+          $tools = Join-Path $env:USERPROFILE '.cache\coordinode-tools'
+          $protocDir = Join-Path $tools "protoc-$env:PROTOC_VERSION"
+          if (-not (Test-Path (Join-Path $protocDir 'bin\protoc.exe'))) {
+            $zip = Join-Path $env:RUNNER_TEMP "protoc-$env:PROTOC_VERSION-win64.zip"
+            Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+              "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+            $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+            if ($hash -ne $env:PROTOC_SHA256) { throw "protoc archive sha256 $hash, expected $env:PROTOC_SHA256" }
+            Expand-Archive -Force -Path $zip -DestinationPath $protocDir
+            Remove-Item $zip
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $protocDir 'bin')
+          $nextestDir = Join-Path $tools "cargo-nextest-$env:NEXTEST_VERSION"
+          if (-not (Test-Path (Join-Path $nextestDir 'bin\cargo-nextest.exe'))) {
+            cargo install -q --locked --root $nextestDir "cargo-nextest@$env:NEXTEST_VERSION"
+            if ($LASTEXITCODE) { throw "installing cargo-nextest $env:NEXTEST_VERSION failed" }
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $nextestDir 'bin')
       - uses: Swatinem/rust-cache@v2
       - name: Build coordinode binary (required by integration tests)
         run: cargo build -p coordinode-server --all-features

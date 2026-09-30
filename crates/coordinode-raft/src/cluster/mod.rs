@@ -360,8 +360,12 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("the node did not become leader: {e}")))?;
 
         let raft = Arc::new(raft);
-        let snap_handle =
-            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+        let snap_handle = spawn_snapshot_trigger(
+            Arc::clone(&raft),
+            Arc::clone(&engine),
+            &engine_work,
+            snap_config,
+        );
 
         Ok(Self {
             raft,
@@ -524,8 +528,12 @@ impl RaftNode {
         tracing::info!(node_id, %listen_addr, "raft gRPC server started");
 
         // Start background snapshot trigger (WAL size + periodic timer)
-        let snap_handle =
-            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+        let snap_handle = spawn_snapshot_trigger(
+            Arc::clone(&raft),
+            Arc::clone(&engine),
+            &engine_work,
+            snap_config,
+        );
 
         Ok(Self {
             raft,
@@ -660,8 +668,12 @@ impl RaftNode {
         let handler =
             RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
 
-        let snap_handle =
-            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+        let snap_handle = spawn_snapshot_trigger(
+            Arc::clone(&raft),
+            Arc::clone(&engine),
+            &engine_work,
+            snap_config,
+        );
 
         let node = Self {
             raft,
@@ -753,8 +765,12 @@ impl RaftNode {
         let handler =
             RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
 
-        let snap_handle =
-            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+        let snap_handle = spawn_snapshot_trigger(
+            Arc::clone(&raft),
+            Arc::clone(&engine),
+            &engine_work,
+            snap_config,
+        );
 
         tracing::info!(
             node_id,
@@ -876,8 +892,12 @@ impl RaftNode {
 
         tracing::info!(node_id, %listen_addr, "joining node started (waiting for leader)");
 
-        let snap_handle =
-            spawn_snapshot_trigger(Arc::clone(&raft), Arc::clone(&engine), snap_config);
+        let snap_handle = spawn_snapshot_trigger(
+            Arc::clone(&raft),
+            Arc::clone(&engine),
+            &engine_work,
+            snap_config,
+        );
 
         Ok(Self {
             raft,
@@ -948,6 +968,30 @@ impl RaftNode {
             })
     }
 
+    /// Wait until the metrics show the membership written at log `index`.
+    ///
+    /// openraft answers a membership change before it publishes the new
+    /// membership in its metrics. A caller reading the members at once would
+    /// see the old ones, and the next change, which starts from the members in
+    /// view, would be computed from a set that no longer holds.
+    async fn membership_published(&self, index: u64) -> Result<(), RaftNodeError> {
+        use openraft::LogIdOptionExt;
+
+        self.raft
+            .wait(Some(self.membership_settle_timeout()))
+            .metrics(
+                |m| m.membership_config.log_id().index() >= Some(index),
+                "the membership change shows in the metrics",
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                RaftNodeError::Membership(format!(
+                    "the membership change at log {index} did not show: {e}"
+                ))
+            })
+    }
+
     /// Add a new node to the cluster (leader-only).
     ///
     /// Must be called on the leader node. Adds the node as a learner first
@@ -966,10 +1010,12 @@ impl RaftNode {
         let node_info = openraft::impls::BasicNode { addr };
 
         // Add as learner (non-voting, receives log replication)
-        self.raft
+        let written = self
+            .raft
             .add_learner(node_id, node_info, true)
             .await
             .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(node_id, "added node as learner");
         Ok(())
@@ -1010,10 +1056,12 @@ impl RaftNode {
                 addr: advertise.clone(),
             },
         );
-        self.raft
+        let written = self
+            .raft
             .change_membership(openraft::ChangeMembers::SetNodes(nodes), true)
             .await
             .map_err(|e| RaftNodeError::Membership(e.to_string()))?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(node_id = self.node_id, addr = %advertise, "published own address");
         Ok(())
@@ -1027,10 +1075,12 @@ impl RaftNode {
         self.membership_settled().await?;
         let members: std::collections::BTreeSet<u64> = member_ids.into_iter().collect();
 
-        self.raft
+        let written = self
+            .raft
             .change_membership(members, false)
             .await
             .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!("cluster membership updated");
         Ok(())
@@ -1070,10 +1120,12 @@ impl RaftNode {
             ));
         }
 
-        self.raft
+        let written = self
+            .raft
             .change_membership(new_members, false)
             .await
             .map_err(|e| RaftNodeError::Membership(Self::describe_membership_refusal(&e)))?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(node_id, "removed node from cluster");
         Ok(())
@@ -1111,7 +1163,8 @@ impl RaftNode {
         let mut new_members = current_voters;
         new_members.insert(node_id);
 
-        self.raft
+        let written = self
+            .raft
             .change_membership(new_members, false)
             .await
             .map_err(|e| {
@@ -1120,6 +1173,7 @@ impl RaftNode {
                     Self::describe_membership_refusal(&e)
                 ))
             })?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(node_id, "promoted learner to voter");
         Ok(())
@@ -1183,7 +1237,8 @@ impl RaftNode {
             .collect();
 
         // retain = true: the removed voter stays as a learner (keeps replicating).
-        self.raft
+        let written = self
+            .raft
             .change_membership(new_members, true)
             .await
             .map_err(|e| {
@@ -1192,6 +1247,7 @@ impl RaftNode {
                     Self::describe_membership_refusal(&e)
                 ))
             })?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(node_id, "demoted voter to learner");
         Ok(())
@@ -2034,7 +2090,8 @@ impl RaftNode {
             ));
         }
 
-        self.raft
+        let written = self
+            .raft
             .change_membership(new_members, false)
             .await
             .map_err(|e| {
@@ -2043,6 +2100,7 @@ impl RaftNode {
                     Self::describe_membership_refusal(&e)
                 ))
             })?;
+        self.membership_published(written.log_id.index).await?;
 
         tracing::info!(
             node_id,
@@ -2305,10 +2363,20 @@ impl RaftNode {
 fn spawn_snapshot_trigger(
     raft: Arc<RaftInstance>,
     engine: Arc<StorageEngine>,
+    work: &crate::storage::EngineWork,
     config: SnapshotTriggerConfig,
 ) -> tokio::task::JoinHandle<()> {
+    // The task holds the engine until it is dropped, which an abort does
+    // later, on the runtime; the shutdown waits for the work guard to go, and
+    // the engine goes first.
+    let held = TriggerHold {
+        engine,
+        _work: work.start(),
+    };
     tokio::spawn(async move {
         use openraft::rt::watch::WatchReceiver;
+
+        let engine = &held.engine;
 
         let probe = config.check_interval.min(SNAPSHOT_SIZE_PROBE);
         let mut interval = tokio::time::interval(probe);
@@ -2319,7 +2387,7 @@ fn spawn_snapshot_trigger(
         let mut last = tokio::time::Instant::now();
         // The log's size when the last snapshot was asked for; growth is
         // measured from it. A purge that shrinks the log lowers it.
-        let mut base = crate::storage::raft_log_bytes(&engine).unwrap_or(0);
+        let mut base = crate::storage::raft_log_bytes(engine).unwrap_or(0);
 
         loop {
             interval.tick().await;
@@ -2337,7 +2405,7 @@ fn spawn_snapshot_trigger(
                 continue;
             }
 
-            let size = match crate::storage::raft_log_bytes(&engine) {
+            let size = match crate::storage::raft_log_bytes(engine) {
                 Ok(size) => size,
                 Err(e) => {
                     tracing::warn!(%e, "snapshot trigger: cannot size the raft log");
@@ -2368,6 +2436,13 @@ fn spawn_snapshot_trigger(
             }
         }
     })
+}
+
+/// What the snapshot trigger task holds. Fields drop in order: the engine
+/// before the guard that tells the shutdown the task let go of it.
+struct TriggerHold {
+    engine: Arc<StorageEngine>,
+    _work: crate::storage::EngineWorkGuard,
 }
 
 /// How often the trigger task sizes the Raft log.
