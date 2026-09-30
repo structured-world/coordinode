@@ -42,10 +42,12 @@ publish = false
 [workspace.dependencies]
 # Storage: coordinode-lsm-tree from crates.io, the sole LSM engine.
 # The floor is the oldest release the code actually needs (MergeOperator::
-# composes_operands, and manifests with more than 255 runs per level), not the
-# major: a consumer with its own lockfile otherwise keeps an older 5.x that
-# satisfies "5" and fails to build or to reopen a store.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.4", default-features = false }
+# composes_operands, manifests with more than 255 runs per level, and the
+# directory of new blob files and edit logs synced before they count as
+# written), not the major: a consumer with its own lockfile otherwise keeps an
+# older 5.x that satisfies "5" and fails to build, to reopen a store, or to
+# keep a flushed tree across a power cut.
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.10", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.25", features = ["serde"] }

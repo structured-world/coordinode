@@ -1,12 +1,15 @@
 # The CI gate for one bundled tree, run on a Windows machine by check.sh.
 #
 # Usage: check.ps1 -Root <work dir> -Bundle <bundle path> -Ref <ref in bundle>
+#                  [-Nextest <extra nextest arguments>]
 # Writes status.txt and one log per step into -Root, then removes the checkout
-# and the build output: the machine is shared, nothing stays.
+# and the build output: the machine is shared, nothing stays. With -Nextest,
+# only nextest runs, with those arguments added, split at whitespace.
 param(
     [Parameter(Mandatory)] [string] $Root,
     [Parameter(Mandatory)] [string] $Bundle,
-    [Parameter(Mandatory)] [string] $Ref
+    [Parameter(Mandatory)] [string] $Ref,
+    [string] $Nextest = ''
 )
 
 # Keep the machine awake while this process runs (ES_CONTINUOUS |
@@ -40,6 +43,16 @@ if ($LASTEXITCODE -ne 0) {
 $env:RUSTFLAGS = '-D warnings'
 $env:COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS = '1'
 $env:CARGO_TARGET_DIR = $target
+
+if ($Nextest) {
+    $extra = $Nextest -split '\s+' | Where-Object { $_ }
+    cargo nextest run --all-features --workspace --no-fail-fast --failure-output final @extra *> (Join-Path $Root 'test.log')
+    "nextest=$LASTEXITCODE" | Out-File -Append $status
+    Set-Location $Root
+    Remove-Item -Recurse -Force $src, $target, $Bundle -ErrorAction SilentlyContinue
+    'done' | Out-File -Append $status
+    exit 0
+}
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings *> (Join-Path $Root 'clippy.log')
 "clippy=$LASTEXITCODE" | Out-File -Append $status

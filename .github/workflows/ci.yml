@@ -136,8 +136,9 @@ jobs:
         # The machine has Windows PowerShell only (no pwsh), and its policy
         # refuses the unsigned script file every step is written to; the
         # policy is lifted for this process alone. A failing native command
-        # fails the step through its exit code.
-        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; & '{0}'; if ($LASTEXITCODE) { exit $LASTEXITCODE }"
+        # fails the step through its exit code. The runner fills in {0} by
+        # string formatting, so the line holds no other braces.
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; & '{0}'; exit $LASTEXITCODE"
     steps:
       - uses: actions/checkout@v4
         with:

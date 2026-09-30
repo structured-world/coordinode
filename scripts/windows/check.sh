@@ -5,6 +5,10 @@
 #
 # Usage: COORDINODE_WINDOWS_HOST=<ssh target> scripts/windows/check.sh
 #
+# With COORDINODE_CHECK_NEXTEST set, only nextest runs, with those arguments
+# added; they are split at whitespace on the host, so a filter holds none
+# (for example: COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
+#
 # The host needs git, a Rust toolchain, cargo-nextest and protoc, and an
 # OpenSSH server whose default shell is PowerShell. Logs and the status file
 # land in target/windows-check/ locally; nothing stays on the host.
@@ -40,8 +44,18 @@ scp -q "$repo/scripts/windows/check.ps1" "$host:$remote_scp/check.ps1"
 
 # A failing step is reported through status.txt; the logs are fetched and
 # the host cleaned either way.
-ssh "$host" "powershell -NoProfile -ExecutionPolicy Bypass -File '$remote_root\\check.ps1' -Root '$remote_root' -Bundle '$remote_root\\tree.bundle' -Ref '$ref'" || true
+# An empty argument does not survive `powershell -File` over ssh, so the
+# option is passed only when set.
+nextest_arg=''
+if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
+  nextest_arg=" -Nextest '$COORDINODE_CHECK_NEXTEST'"
+fi
+ssh "$host" "powershell -NoProfile -ExecutionPolicy Bypass -File '$remote_root\\check.ps1' -Root '$remote_root' -Bundle '$remote_root\\tree.bundle' -Ref '$ref'$nextest_arg" || true
 
+# A log this run did not write must not be read as its result.
+for f in status.txt clippy.log build.log test.log doctest.log; do
+  rm -f "$out/$f"
+done
 for f in status.txt clippy.log build.log test.log doctest.log; do
   scp -q "$host:$remote_scp/$f" "$out/$f" || true
 done

@@ -30,8 +30,8 @@ coordinode-core = { path = "../../crates/coordinode-core" }
 # Same engine the storage crate binds to: the retention harness drives the
 # tree's own Leveled compaction, as the engine's background worker does.
 # A standalone workspace cannot inherit the production entry, so the floor
-# repeats it: the storage crate needs 5.11.2.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.2", default-features = false }
+# repeats it: the storage crate needs 5.11.10.
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.10", default-features = false }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

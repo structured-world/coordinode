@@ -186,7 +186,7 @@ async fn expired_registration_is_excluded_from_floor() {
     node.shutdown().await.expect("shutdown");
 }
 
-/// S4b: with the background service running, heartbeats buffer and flush
+/// With the background service running, heartbeats buffer and flush
 /// as a coalesced proposal; the persisted `last_heartbeat_ts` advances
 /// without a per-heartbeat Raft round-trip.
 #[tokio::test(flavor = "multi_thread")]
@@ -508,6 +508,34 @@ async fn a_buffered_heartbeat_keeps_its_consumer_from_eviction() {
 
     bg.shutdown().await;
     node.shutdown().await.expect("shutdown");
+}
+
+/// A flush whose proposal fails keeps the heartbeats it took from the buffer.
+/// They were a consumer's sign of life; dropped with the failed write, the
+/// next sweep would evict a consumer that heartbeated in time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_flush_keeps_its_heartbeats_buffered() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
+    let h = reg
+        .register(registration("reader", TopologyScope::Cluster, 2_000))
+        .expect("register");
+    reg.core.batching_on.store(true, Ordering::Release);
+    clock.set(2_500);
+    reg.heartbeat(&h).expect("buffer heartbeat");
+
+    // The consensus is gone: the flush reads the entry and fails to write it.
+    node.shutdown().await.expect("shutdown");
+    assert!(
+        reg.core.flush_pending_heartbeats().is_err(),
+        "a flush with no consensus to write through must fail"
+    );
+
+    assert_eq!(
+        reg.core.pending_hb.lock().get("reader").copied(),
+        Some(2_500),
+        "the heartbeat of a failed flush is still buffered"
+    );
 }
 
 /// A pipeline whose every proposal takes `delay`, as a slow fsync does.

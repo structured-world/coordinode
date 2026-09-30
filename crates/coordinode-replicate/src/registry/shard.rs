@@ -7,7 +7,7 @@
 //! downstream feeds read it without re-scanning.
 //!
 //! Heartbeats and eviction run through an optional background service
-//! ([`RegistryBackground`], S4b): heartbeats buffer in-memory on the leader and
+//! ([`RegistryBackground`]): heartbeats buffer in-memory on the leader and
 //! flush as a single coalesced proposal every `heartbeat_window_ms`
 //! (≤ `1000 / window` proposals/sec regardless of consumer count); expired
 //! registrations are swept and removed by an eviction proposal on a timer.
@@ -227,8 +227,10 @@ impl RegistryCore {
         Ok(out)
     }
 
-    /// Drain the buffered heartbeats into one coalesced proposal (S4b).
-    /// Consumers that vanished since buffering are silently skipped.
+    /// Drain the buffered heartbeats into one coalesced proposal.
+    /// Consumers that vanished since buffering are silently skipped. A flush
+    /// that fails puts its heartbeats back: they are signs of life, and the
+    /// next sweep would otherwise evict a consumer that heartbeated in time.
     fn flush_pending_heartbeats(&self) -> Result<(), RegistryError> {
         let drained: Vec<(String, u64)> = {
             let mut pending = self.pending_hb.lock();
@@ -237,14 +239,30 @@ impl RegistryCore {
             }
             pending.drain().collect()
         };
-        let mut mutations = Vec::with_capacity(drained.len());
-        for (consumer_id, ts) in drained {
-            if let Some(mut entry) = self.read_entry(&consumer_id)? {
-                entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(ts);
+        let written = self.write_heartbeats(&drained);
+        if written.is_err() {
+            let mut pending = self.pending_hb.lock();
+            for (consumer_id, ts) in drained {
+                // A heartbeat buffered meanwhile is newer or the same.
+                pending
+                    .entry(consumer_id)
+                    .and_modify(|t| *t = (*t).max(ts))
+                    .or_insert(ts);
+            }
+        }
+        written
+    }
+
+    /// Persist `heartbeats` in one proposal.
+    fn write_heartbeats(&self, heartbeats: &[(String, u64)]) -> Result<(), RegistryError> {
+        let mut mutations = Vec::with_capacity(heartbeats.len());
+        for (consumer_id, ts) in heartbeats {
+            if let Some(mut entry) = self.read_entry(consumer_id)? {
+                entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(*ts);
                 mutations.push(Self::put_mutation(&entry)?);
             }
         }
-        // S4b observability: one coalesced proposal per drained window.
+        // One coalesced proposal per drained window.
         metrics::counter!("registry_heartbeat_batches_total").increment(1);
         metrics::histogram!("registry_heartbeat_batch_size").record(mutations.len() as f64);
         self.propose(mutations)
@@ -509,7 +527,7 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
     fn heartbeat(&self, handle: &RegisteredHandle) -> Result<(), RegistryError> {
         let now = self.core.clock.now_ms();
         if self.core.batching_on.load(Ordering::Acquire) {
-            // S4b: buffer; the background drain coalesces into one proposal.
+            // Buffer; the background drain coalesces into one proposal.
             // Validation is deferred — a vanished consumer is skipped at flush.
             self.core
                 .pending_hb
