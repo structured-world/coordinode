@@ -607,6 +607,40 @@ ignored. `healthcheck` opens nothing: it asks a running server.
 
 Run `coordinode` with no recognized subcommand to print the full usage summary.
 
+### Restoring a logical dump
+
+A `json`, `cypher` or `binary` restore keeps every node's identifier exactly as
+it was in the source, and every instance of a discriminated or temporal edge
+type and every version of a temporal node under its own discriminator or
+`valid_from`. Imports that bring their own numbering (`apoc-json`,
+`apoc-cypher`, `hetio-json`) keep it too.
+
+- **Restore into a database that has not issued those identifiers.** The
+  restore reads the whole input first and refuses it, writing nothing, when any
+  of its identifiers is already taken in the target: held by a node, or handed
+  out earlier, including to a node that was deleted since. The error names the
+  first identifiers found. A database that never created a node never refuses.
+  `--force` relaxes
+  only the compatibility checks of a binary dump (format version, schema), never
+  this one.
+- **Nodes created afterwards get fresh identifiers.** The target's identifier
+  allocator is moved past every restored identifier before the first write.
+- **An interrupted restore finishes when rerun with the same input.** A restore
+  records the digest of its input before it writes. After a crash or a failed
+  write, running it again with the same file completes it. Once the interrupted
+  restore may have written records, a different input is refused until then.
+- **A `json` or `binary` dump brings its schema.** Node types, edge types and
+  indexes are declared in the target before the data. A target that already
+  declares one of them differently is refused before anything is written. A
+  `cypher` dump is portable OpenCypher and holds nodes and edges only: declare
+  its types and indexes in the target (`CREATE NODE TYPE ...`,
+  `CREATE EDGE TYPE ...`, `CREATE INDEX ...`) before restoring it.
+- **Indexes cover the restored data when the restore returns.** Every B-tree,
+  vector and full-text index is built from the loaded nodes as the last step of
+  the restore. Restored data that breaks a unique index the target declared is
+  reported as an error, and that index is marked failed, so lookups stop using
+  it, until the data is fixed and the index is created again.
+
 ## Growing and shrinking a cluster
 
 A single machine that already holds data becomes a replicated cluster in

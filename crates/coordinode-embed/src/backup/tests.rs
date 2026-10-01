@@ -1,6 +1,15 @@
+use super::BackupFormat;
 use super::export;
-use super::restore;
+use super::restore::{self, RestoreOptions};
 use crate::Database;
+
+/// Options for a binary restore that may override its compatibility gates.
+fn forced() -> RestoreOptions<'static> {
+    RestoreOptions {
+        force: true,
+        ..Default::default()
+    }
+}
 
 /// The encoded form of a dictionary with no bindings.
 fn empty_dictionary() -> Vec<u8> {
@@ -89,14 +98,9 @@ fn binary_roundtrip() {
     let dir2 = tempfile::tempdir().unwrap();
     let mut db2 = Database::open(dir2.path()).unwrap();
 
-    let mut cursor = std::io::Cursor::new(&buf);
-    let restore_stats = restore::restore_binary(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .unwrap();
+    let restore_stats = db2
+        .restore(BackupFormat::Binary, &buf, &RestoreOptions::default())
+        .unwrap();
 
     assert_eq!(restore_stats.nodes, export_stats.nodes);
     // The records are read through the bindings the dump carried.
@@ -125,14 +129,8 @@ fn binary_restore_keeps_the_dump_ids_and_refuses_contradicting_targets() {
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
-    let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_binary(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .unwrap();
+    db2.restore(BackupFormat::Binary, &buf, &RestoreOptions::default())
+        .unwrap();
     let restored = db2.interner().unwrap();
     for (name, id) in source.iter() {
         assert_eq!(restored.lookup(name), Some(id), "binding of {name}");
@@ -143,13 +141,7 @@ fn binary_restore_keeps_the_dump_ids_and_refuses_contradicting_targets() {
     let mut db3 = Database::open(dir3.path()).unwrap();
     db3.execute_cypher("CREATE (:Other {zzz: 1, age: 2, name: 'x'})")
         .unwrap();
-    let mut cursor = std::io::Cursor::new(&buf);
-    let refused = restore::restore_binary(
-        db3.engine(),
-        db3.field_registrar().as_ref(),
-        &mut cursor,
-        true,
-    );
+    let refused = db3.restore(BackupFormat::Binary, &buf, &forced());
     assert!(
         refused.is_err(),
         "a contradicting target restored: {refused:?}"
@@ -187,14 +179,8 @@ fn a_restored_database_reports_what_it_holds() {
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
-    let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_binary(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .unwrap();
+    db2.restore(BackupFormat::Binary, &buf, &RestoreOptions::default())
+        .unwrap();
 
     let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
     assert_eq!(
@@ -229,15 +215,8 @@ fn a_json_restore_also_reports_what_it_holds() {
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
-    restore::restore_json(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        1,
-        &mut cursor,
-        None,
-    )
-    .unwrap();
+    db2.restore(BackupFormat::Json, &buf, &RestoreOptions::default())
+        .unwrap();
 
     let restored = StorageStatsComputer::compute(db2.engine()).unwrap();
     assert_eq!(restored.total_node_count(), 2);
@@ -263,15 +242,9 @@ fn json_roundtrip() {
     let dir2 = tempfile::tempdir().unwrap();
     {
         let db2 = Database::open(dir2.path()).unwrap();
-        let mut cursor = std::io::BufReader::new(std::io::Cursor::new(&buf));
-        let stats = restore::restore_json(
-            db2.engine(),
-            db2.field_registrar().as_ref(),
-            1,
-            &mut cursor,
-            None,
-        )
-        .unwrap();
+        let stats = db2
+            .restore(BackupFormat::Json, &buf, &RestoreOptions::default())
+            .unwrap();
         assert_eq!(stats.nodes, 1, "should restore 1 node");
         db2.persist().unwrap();
     }
@@ -306,15 +279,13 @@ fn apoc_json_restore_loads_nodes_edges_and_is_queryable() {
         r#"{"type":"relationship","id":"0","label":"KNOWS","start":{"id":"0"},"end":{"id":"1"},"properties":{"since":2020}}"#,
     );
 
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats = restore::restore_apoc_json(
-        db.engine(),
-        db.field_registrar().as_ref(),
-        1,
-        &mut cursor,
-        None,
-    )
-    .unwrap();
+    let stats = db
+        .restore(
+            BackupFormat::ApocJson,
+            &dump.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes");
     assert_eq!(stats.edges, 1, "one relationship");
@@ -344,10 +315,13 @@ fn apoc_cypher_plain_restore_loads_nodes_and_edges() {
         "COMMIT\n",
     );
 
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats =
-        restore::restore_apoc_cypher(db.engine(), db.field_registrar().as_ref(), 1, &mut cursor)
-            .unwrap();
+    let stats = db
+        .restore(
+            BackupFormat::ApocCypher,
+            &dump.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes (constraint statements skipped)");
     assert_eq!(stats.edges, 1, "one relationship");
@@ -374,10 +348,13 @@ fn apoc_cypher_unwind_batch_restore_loads_nodes_and_edges() {
         "CREATE (start)-[r:`KNOWS`]->(end) SET r += row.properties;\n",
     );
 
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats =
-        restore::restore_apoc_cypher(db.engine(), db.field_registrar().as_ref(), 1, &mut cursor)
-            .unwrap();
+    let stats = db
+        .restore(
+            BackupFormat::ApocCypher,
+            &dump.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap();
 
     assert_eq!(stats.nodes, 2, "two nodes from the UNWIND batch");
     assert_eq!(stats.edges, 1, "one relationship from the UNWIND batch");
@@ -404,15 +381,13 @@ fn hetio_json_restore_maps_kinds_and_resolves_edges() {
         r#"]}"#,
     );
 
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(doc.as_bytes()));
-    let stats = restore::restore_hetio_json(
-        db.engine(),
-        db.field_registrar().as_ref(),
-        1,
-        &mut cursor,
-        None,
-    )
-    .unwrap();
+    let stats = db
+        .restore(
+            BackupFormat::HetioJson,
+            &doc.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap();
 
     assert_eq!(stats.nodes, 2, "two hetnet nodes");
     assert_eq!(stats.edges, 1, "one hetnet edge");
@@ -448,15 +423,16 @@ fn json_restore_only_labels_filters_nodes_and_edges() {
         r#"{"type":"edge","source":1,"target":3,"edge_type":"WROTE","properties":{}}"#,
     );
     let only: std::collections::HashSet<String> = ["User".to_string()].into_iter().collect();
-    let mut cursor = std::io::BufReader::new(std::io::Cursor::new(dump.as_bytes()));
-    let stats = restore::restore_json(
-        db.engine(),
-        db.field_registrar().as_ref(),
-        1,
-        &mut cursor,
-        Some(&only),
-    )
-    .unwrap();
+    let stats = db
+        .restore(
+            BackupFormat::Json,
+            &dump.as_bytes(),
+            &RestoreOptions {
+                only_labels: Some(&only),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     assert_eq!(stats.nodes, 2, "only the two User nodes are kept");
     assert_eq!(
@@ -516,14 +492,9 @@ fn binary_restore_accepts_manifest_at_current_version() {
 
     let dir2 = tempfile::tempdir().unwrap();
     let db2 = Database::open(dir2.path()).unwrap();
-    let mut cursor = std::io::Cursor::new(&buf);
-    let stats = restore::restore_binary(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .unwrap();
+    let stats = db2
+        .restore(BackupFormat::Binary, &buf, &RestoreOptions::default())
+        .unwrap();
     assert_eq!(stats.nodes, 1, "restore should accept current-version dump");
 }
 
@@ -543,19 +514,17 @@ fn binary_restore_rejects_newer_format_version() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
-    let fields = db.field_registrar();
 
-    let mut cursor = std::io::Cursor::new(&dump);
-    let err =
-        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
+    let err = db
+        .restore(BackupFormat::Binary, &dump, &RestoreOptions::default())
+        .unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::IncompatibleVersion(_)),
         "newer format version must be rejected, got {err:?}"
     );
 
     // Force overrides the version gate for a best-effort restore.
-    let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
+    db.restore(BackupFormat::Binary, &dump, &forced())
         .expect("force should bypass the version gate");
 }
 
@@ -567,18 +536,16 @@ fn binary_restore_rejects_missing_manifest() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
-    let fields = db.field_registrar();
 
-    let mut cursor = std::io::Cursor::new(&dump);
-    let err =
-        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
+    let err = db
+        .restore(BackupFormat::Binary, &dump, &RestoreOptions::default())
+        .unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::IncompatibleVersion(_)),
         "missing manifest must be rejected, got {err:?}"
     );
 
-    let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
+    db.restore(BackupFormat::Binary, &dump, &forced())
         .expect("force should bypass the manifest requirement");
 }
 
@@ -599,14 +566,9 @@ fn binary_restore_refuses_records_ahead_of_their_dictionary() {
     ]);
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(dir.path()).unwrap();
-    let mut cursor = std::io::Cursor::new(&dump);
-    let err = restore::restore_binary(
-        db.engine(),
-        db.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .unwrap_err();
+    let err = db
+        .restore(BackupFormat::Binary, &dump, &RestoreOptions::default())
+        .unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::InvalidFormat(_)),
         "records ahead of the dictionary must be refused, got {err:?}"
@@ -624,7 +586,6 @@ fn binary_restore_rejects_schema_fingerprint_mismatch() {
     db.engine()
         .put(Partition::Schema, b"schema:label:Widget", b"v1")
         .unwrap();
-    let fields = db.field_registrar();
 
     let dump = encode_dump(&[
         export::BackupEntry::Manifest {
@@ -635,16 +596,408 @@ fn binary_restore_rejects_schema_fingerprint_mismatch() {
         export::BackupEntry::Interner(empty_dictionary()),
     ]);
 
-    let mut cursor = std::io::Cursor::new(&dump);
-    let err =
-        restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, false).unwrap_err();
+    let err = db
+        .restore(BackupFormat::Binary, &dump, &RestoreOptions::default())
+        .unwrap_err();
     assert!(
         matches!(err, restore::RestoreError::SchemaMismatch(_)),
         "differing schema fingerprint must be rejected, got {err:?}"
     );
 
     // Force overrides the schema guard.
-    let mut cursor = std::io::Cursor::new(&dump);
-    restore::restore_binary(db.engine(), fields.as_ref(), &mut cursor, true)
+    db.restore(BackupFormat::Binary, &dump, &forced())
         .expect("force should bypass the schema fingerprint guard");
+}
+
+/// The formats CoordiNode writes and reads back.
+const OWN_FORMATS: [BackupFormat; 3] = [
+    BackupFormat::Json,
+    BackupFormat::Cypher,
+    BackupFormat::Binary,
+];
+
+/// A dump of `db` in one of its own formats.
+fn dump(db: &Database, format: BackupFormat) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let snapshot = db.engine().snapshot();
+    let interner = db.interner().unwrap();
+    match format {
+        BackupFormat::Json => export::export_json(db.engine(), &interner, 1, &snapshot, &mut buf),
+        BackupFormat::Cypher => {
+            export::export_cypher(db.engine(), &interner, 1, &snapshot, &mut buf)
+        }
+        BackupFormat::Binary => {
+            export::export_binary(db.engine(), &interner, 1, &snapshot, &mut buf)
+        }
+        other => panic!("not an export format: {other:?}"),
+    }
+    .unwrap();
+    buf
+}
+
+/// A database holding the named people, and their ids in name order.
+fn people(names: &[&str]) -> (Database, tempfile::TempDir, Vec<u64>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    let mut ids = Vec::new();
+    for name in names {
+        let rows = db
+            .execute_cypher(&format!(
+                "CREATE (n:Person {{name: '{name}'}}) RETURN id(n) AS id"
+            ))
+            .unwrap();
+        match rows[0].get("id") {
+            Some(coordinode_core::graph::types::Value::Int(id)) => ids.push(*id as u64),
+            other => panic!("no id: {other:?}"),
+        }
+    }
+    (db, dir, ids)
+}
+
+/// How many nodes `db` holds.
+fn node_count(db: &mut Database) -> i64 {
+    let rows = db.execute_cypher("MATCH (n) RETURN count(n) AS c").unwrap();
+    match rows[0].get("c") {
+        Some(coordinode_core::graph::types::Value::Int(c)) => *c,
+        other => panic!("no count: {other:?}"),
+    }
+}
+
+/// Whether a load is recorded as unfinished on `db`.
+fn load_recorded(db: &Database) -> bool {
+    db.engine()
+        .get(
+            coordinode_storage::engine::partition::Partition::Schema,
+            restore::LOAD_KEY,
+        )
+        .unwrap()
+        .is_some()
+}
+
+/// A restore onto a target that already issued the dump's identifiers is
+/// refused whole, names them, and writes nothing: a written node would replace
+/// the target's own under the same key.
+#[test]
+fn a_restore_onto_issued_identifiers_is_refused_and_writes_nothing() {
+    for format in OWN_FORMATS {
+        let (source, _keep, ids) = people(&["Ada", "Bea", "Cal"]);
+        let buf = dump(&source, format);
+
+        let (mut target, _keep_target, _) = people(&["Zed"]);
+        let refused = target.restore(format, &buf, &forced()).unwrap_err();
+        match refused {
+            restore::RestoreError::IdentifiersIssued { count, first } => {
+                assert_eq!(count, 3, "{format:?}: every issued id counted");
+                assert_eq!(first, ids, "{format:?}: the issued ids named");
+            }
+            other => panic!("{format:?}: expected IdentifiersIssued, got {other:?}"),
+        }
+        assert_eq!(node_count(&mut target), 1, "{format:?}: nothing written");
+        assert!(!load_recorded(&target), "{format:?}: no load recorded");
+        let rows = target
+            .execute_cypher("MATCH (n:Person) RETURN n.name AS name")
+            .unwrap();
+        assert_eq!(
+            rows[0].get("name"),
+            Some(&coordinode_core::graph::types::Value::String("Zed".into())),
+            "{format:?}: the target's own node untouched"
+        );
+    }
+}
+
+/// An identifier the target handed out stays issued after its node is
+/// deleted: loading a node under it would reinstate a deleted identity.
+#[test]
+fn a_deleted_identifier_is_still_issued() {
+    let (mut target, _keep, ids) = people(&["Gone"]);
+    target
+        .execute_cypher("MATCH (n:Person) DETACH DELETE n")
+        .unwrap();
+    assert_eq!(node_count(&mut target), 0);
+
+    let dump = format!(
+        r#"{{"type":"node","id":{},"labels":["Person"],"properties":{{"name":"Back"}}}}"#,
+        ids[0]
+    );
+    let refused = target
+        .restore(
+            BackupFormat::Json,
+            &dump.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            restore::RestoreError::IdentifiersIssued { count: 1, .. }
+        ),
+        "a deleted id must stay issued, got {refused:?}"
+    );
+    assert_eq!(node_count(&mut target), 0, "nothing reinstated");
+}
+
+/// An identifier of another origin hint is never allocated by this target, so
+/// only a node already stored under it makes it issued.
+#[test]
+fn a_foreign_hint_identifier_is_issued_only_by_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    // Hint 3, sequence 5.
+    let foreign = (3u64 << 44) | 5;
+    let dump = format!(
+        r#"{{"type":"node","id":{foreign},"labels":["Person"],"properties":{{"name":"Far"}}}}"#
+    );
+
+    db.restore(
+        BackupFormat::Json,
+        &dump.as_bytes(),
+        &RestoreOptions::default(),
+    )
+    .expect("a foreign id no record holds loads");
+    let again = db
+        .restore(
+            BackupFormat::Json,
+            &dump.as_bytes(),
+            &RestoreOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&again, restore::RestoreError::IdentifiersIssued { count: 1, first } if first == &[foreign]),
+        "a stored foreign id is issued, got {again:?}"
+    );
+
+    let rows = db
+        .execute_cypher("CREATE (n:Person {name: 'Near'}) RETURN id(n) AS id")
+        .unwrap();
+    assert_ne!(
+        rows[0].get("id"),
+        Some(&coordinode_core::graph::types::Value::Int(foreign as i64)),
+        "the local allocator never hands out a foreign id"
+    );
+    assert_eq!(node_count(&mut db), 2);
+}
+
+/// `force` relaxes the compatibility gates of a binary dump, never the
+/// identifier check: overwriting nodes is not a compatibility question.
+#[test]
+fn force_does_not_bypass_the_identifier_check() {
+    let (source, _keep, _) = people(&["Ada"]);
+    let buf = dump(&source, BackupFormat::Binary);
+    let (mut target, _keep_target, _) = people(&["Zed"]);
+
+    let refused = target
+        .restore(BackupFormat::Binary, &buf, &forced())
+        .unwrap_err();
+    assert!(
+        matches!(refused, restore::RestoreError::IdentifiersIssued { .. }),
+        "force must not bypass the identifier check, got {refused:?}"
+    );
+    assert_eq!(node_count(&mut target), 1);
+}
+
+/// Record a load of `input` as unfinished on `db`.
+fn record_load(db: &Database, input: &[u8], max_sequence: u64) {
+    use sha2::Digest as _;
+
+    let digest: [u8; 32] = sha2::Sha256::digest(input).into();
+    db.engine()
+        .put(
+            coordinode_storage::engine::partition::Partition::Schema,
+            restore::LOAD_KEY,
+            &restore::load_record(&digest, max_sequence),
+        )
+        .unwrap();
+}
+
+/// A load interrupted after its record was written completes when the same
+/// input is loaded again, whether none or all of its nodes were already in:
+/// its own nodes are not taken for collisions, and a node created afterwards
+/// still gets a fresh id.
+#[test]
+fn an_interrupted_load_completes_when_rerun_with_the_same_input() {
+    for format in OWN_FORMATS {
+        let (source, _keep, ids) = people(&["Ada", "Bea"]);
+        let buf = dump(&source, format);
+        let max = ids.iter().copied().max().unwrap();
+        let record_load = |db: &Database| record_load(db, &buf, max);
+
+        // Interrupted before it took its sequences, so before any record.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        record_load(&db);
+        db.restore(format, &buf, &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{format:?}: resume from nothing: {e:?}"));
+        assert_eq!(node_count(&mut db), 2, "{format:?}");
+        assert!(!load_recorded(&db), "{format:?}: load finished");
+
+        // Interrupted after the last record, before the load was closed, and
+        // the process gone: its sequences are taken under its own token, so
+        // the rerun after a reopen knows the nodes it finds are its own.
+        record_load(&db);
+        db.persist().unwrap();
+        drop(db);
+        let mut db = Database::open(dir.path()).unwrap();
+        assert!(
+            load_recorded(&db),
+            "{format:?}: the record survives a reopen"
+        );
+        db.restore(format, &buf, &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{format:?}: resume from everything: {e:?}"));
+        assert_eq!(node_count(&mut db), 2, "{format:?}: no node doubled");
+        assert!(!load_recorded(&db), "{format:?}: load finished");
+
+        let rows = db
+            .execute_cypher("CREATE (n:Person {name: 'Cal'}) RETURN id(n) AS id")
+            .unwrap();
+        match rows[0].get("id") {
+            Some(coordinode_core::graph::types::Value::Int(id)) => {
+                assert!(!ids.contains(&(*id as u64)), "{format:?}: fresh id {id}")
+            }
+            other => panic!("no id: {other:?}"),
+        }
+        assert_eq!(node_count(&mut db), 3, "{format:?}");
+    }
+}
+
+/// A load that may have written records holds the target until the same
+/// input completes it: a different input is refused before it writes
+/// anything. A load that stopped before taking its sequences wrote nothing,
+/// so it holds nothing and a different input proceeds.
+#[test]
+fn an_unfinished_load_refuses_a_different_input() {
+    let (source, _keep, _) = people(&["Ada"]);
+    let buf = dump(&source, BackupFormat::Json);
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+
+    // A load of identifiers of other hints only writes from its start.
+    record_load(&db, b"another input", 0);
+    let refused = db
+        .restore(BackupFormat::Json, &buf, &RestoreOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(refused, restore::RestoreError::UnfinishedLoad),
+        "got {refused:?}"
+    );
+    assert_eq!(node_count(&mut db), 0, "nothing written");
+    assert!(load_recorded(&db), "the unfinished load stays recorded");
+
+    // A load whose sequences no grant took never reached its records.
+    record_load(&db, b"another input", 7);
+    db.restore(BackupFormat::Json, &buf, &RestoreOptions::default())
+        .expect("a load that wrote nothing holds nothing");
+    assert_eq!(node_count(&mut db), 1);
+    assert!(!load_recorded(&db), "the load finished");
+}
+
+/// Imports that bring their own numbering (Hetionet from 0, APOC with the
+/// source's ids) keep it, raise the lease past it, and refuse a second load
+/// onto the nodes the first one wrote.
+#[test]
+fn imported_identifiers_are_never_issued_again() {
+    let hetio = concat!(
+        r#"{"nodes":["#,
+        r#"{"kind":"Gene","identifier":1,"name":"A","data":{}},"#,
+        r#"{"kind":"Gene","identifier":2,"name":"B","data":{}}"#,
+        r#"],"edges":[]}"#,
+    );
+    let apoc = concat!(
+        r#"{"type":"node","id":"7","labels":["Gene"],"properties":{"name":"A"}}"#,
+        "\n",
+        r#"{"type":"node","id":"9","labels":["Gene"],"properties":{"name":"B"}}"#,
+    );
+    for (format, input) in [
+        (BackupFormat::HetioJson, hetio),
+        (BackupFormat::ApocJson, apoc),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.restore(format, &input.as_bytes(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{format:?}: {e:?}"));
+        let loaded: Vec<i64> = db
+            .execute_cypher("MATCH (n:Gene) RETURN id(n) AS id")
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r.get("id") {
+                Some(coordinode_core::graph::types::Value::Int(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loaded.len(), 2, "{format:?}");
+
+        let rows = db
+            .execute_cypher("CREATE (n:Gene {name: 'C'}) RETURN id(n) AS id")
+            .unwrap();
+        match rows[0].get("id") {
+            Some(coordinode_core::graph::types::Value::Int(id)) => {
+                assert!(!loaded.contains(id), "{format:?}: fresh id {id}")
+            }
+            other => panic!("no id: {other:?}"),
+        }
+        assert_eq!(node_count(&mut db), 3, "{format:?}: nothing replaced");
+
+        let again = db
+            .restore(format, &input.as_bytes(), &RestoreOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                again,
+                restore::RestoreError::IdentifiersIssued { count: 2, .. }
+            ),
+            "{format:?}: got {again:?}"
+        );
+    }
+}
+
+/// The text formats' hex reads back what it wrote, in either case, and
+/// refuses an odd length or a non-hex character instead of guessing.
+#[test]
+fn hex_round_trips_and_refuses_malformed_text() {
+    use super::export::hex;
+
+    let bytes: Vec<u8> = (0..=255).collect();
+    let text = hex::encode(&bytes);
+    assert_eq!(text.len(), 512);
+    assert_eq!(&text[..8], "00010203");
+    assert_eq!(hex::decode(&text), Some(bytes.clone()));
+    assert_eq!(hex::decode(&text.to_uppercase()), Some(bytes));
+    assert_eq!(hex::decode(""), Some(Vec::new()));
+    assert_eq!(hex::decode("abc"), None, "odd length");
+    assert_eq!(hex::decode("0g"), None, "not a hex digit");
+}
+
+/// A string value that holds the text of a cypher comment marker stays a
+/// value: only a comment that ends the line counts, so the node is not taken
+/// for a temporal version and the edge not for a discriminated instance.
+#[test]
+fn a_string_holding_a_comment_marker_is_not_taken_for_one() {
+    use coordinode_core::graph::types::Value;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).unwrap();
+    db.execute_cypher("CREATE (:Note {body: 'x; // valid_from 5'}), (:Note {body: 'y'})")
+        .unwrap();
+    db.execute_cypher(
+        "MATCH (a:Note {body: 'y'}), (b:Note {body: 'x; // valid_from 5'}) \
+         CREATE (a)-[:REFS {why: 'z; // discriminator ab'}]->(b)",
+    )
+    .unwrap();
+    let buf = dump(&db, BackupFormat::Cypher);
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut db2 = Database::open(dir2.path()).unwrap();
+    db2.restore(BackupFormat::Cypher, &buf, &RestoreOptions::default())
+        .unwrap();
+    let rows = db2
+        .execute_cypher("MATCH (:Note)-[r:REFS]->(b:Note) RETURN b.body AS body, r.why AS why")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].get("body"),
+        Some(&Value::String("x; // valid_from 5".into()))
+    );
+    assert_eq!(
+        rows[0].get("why"),
+        Some(&Value::String("z; // discriminator ab".into()))
+    );
 }

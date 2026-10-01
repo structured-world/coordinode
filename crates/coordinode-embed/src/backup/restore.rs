@@ -1,20 +1,31 @@
 //! Restore graph data from backup files into CoordiNode storage.
 //!
-//! Supports JSON Lines and binary formats for import.
-//! Cypher restore parses CoordiNode's own cypher dump format directly.
+//! Every format keeps the node identifiers of its input. A restore reads the
+//! input twice: the first pass checks that none of its identifiers is issued
+//! in the target and finds the highest one, and only then, with the target's
+//! identifier lease raised above them, the second pass writes. A record of the
+//! load, kept until it is complete, lets a rerun of the same input finish a
+//! load a crash interrupted instead of refusing it as its own collision.
 
+use std::collections::HashSet;
 use std::io::{BufRead, Read};
 
 use coordinode_core::graph::edge::EdgeProperties;
 use coordinode_core::graph::intern::{FieldInterner, FieldRegistrar};
-use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::node::{
+    NODE_KEY_PREFIX, NODE_LEASE_TOKEN_LEN, NodeId, decode_node_key, decode_temporal_node_key,
+    encode_node_key,
+};
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::edge::{EdgeStore, LocalEdgeStore};
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::engine::metadata::{node_lease_ceiling, node_lease_holder};
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
+use sha2::{Digest as _, Sha256};
 
+use super::BackupFormat;
 use super::export::BackupEntry;
 
 /// Errors during restore.
@@ -37,6 +48,39 @@ pub enum RestoreError {
 
     #[error("schema fingerprint mismatch: {0}")]
     SchemaMismatch(String),
+
+    /// Identifiers of the input the target already issued: writing them would
+    /// replace a live node or hand out an identifier twice. A restore goes to
+    /// a new instance.
+    #[error(
+        "{count} node identifier(s) of the input are already issued in the target \
+         (first: {first:?}); restore into a new database"
+    )]
+    IdentifiersIssued { count: u64, first: Vec<u64> },
+
+    /// An earlier restore of a different input did not finish; the target
+    /// holds part of it.
+    #[error(
+        "the target holds an unfinished restore of a different input; rerun that input \
+         to finish it, or restore into a new database"
+    )]
+    UnfinishedLoad,
+
+    /// The target's identifier lease could not be raised above the input's
+    /// identifiers.
+    #[error("raise the node identifier lease: {0}")]
+    Lease(String),
+
+    /// The records are in, but an index over them could not be built, for
+    /// instance a unique index the restored data breaks. The load stays
+    /// recorded; a rerun of the same input after the cause is removed
+    /// finishes it.
+    #[error("the restored nodes are in, but their indexes could not be built: {0}")]
+    Indexes(String),
+
+    /// The format has no logical restore through this path.
+    #[error("{0:?} is not restored record by record; install it as a snapshot")]
+    Unsupported(BackupFormat),
 }
 
 /// Statistics from a restore operation.
@@ -45,6 +89,437 @@ pub struct RestoreStats {
     pub nodes: u64,
     pub edges: u64,
     pub schema_entries: u64,
+}
+
+/// The input of a restore, opened once per pass.
+pub trait RestoreSource {
+    /// A reader positioned at the start of the input.
+    ///
+    /// # Errors
+    ///
+    /// The input cannot be opened.
+    fn open(&self) -> std::io::Result<Box<dyn BufRead + '_>>;
+}
+
+impl RestoreSource for &[u8] {
+    fn open(&self) -> std::io::Result<Box<dyn BufRead + '_>> {
+        Ok(Box::new(*self))
+    }
+}
+
+impl RestoreSource for Vec<u8> {
+    fn open(&self) -> std::io::Result<Box<dyn BufRead + '_>> {
+        Ok(Box::new(self.as_slice()))
+    }
+}
+
+/// How a restore reads its input.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreOptions<'a> {
+    /// The shard of the node keys a text format writes (CE: 1).
+    pub shard_id: u16,
+    /// Keep only nodes carrying one of these labels, and the edges between
+    /// them (json, APOC json, Hetionet).
+    pub only_labels: Option<&'a HashSet<String>>,
+    /// Restore a binary dump whose manifest is missing, newer than this build,
+    /// or made against a different schema. Never lets an issued identifier
+    /// through.
+    pub force: bool,
+}
+
+impl Default for RestoreOptions<'_> {
+    fn default() -> Self {
+        Self {
+            shard_id: 1,
+            only_labels: None,
+            force: false,
+        }
+    }
+}
+
+/// What a restore writes into.
+pub(crate) struct RestoreTarget<'a> {
+    pub(crate) engine: &'a StorageEngine,
+    pub(crate) fields: &'a dyn FieldRegistrar,
+    /// Take the node identifier sequences `(base, target]` through the log
+    /// under the given token, while the granted ceiling is still `base`, so
+    /// no allocator of the group issues them. `false` when another grant
+    /// moved the ceiling first.
+    pub(crate) raise_lease: &'a RaiseLease<'a>,
+    /// Build every declared index from the nodes in the store, once the
+    /// records are in: the load writes them past index maintenance.
+    pub(crate) build_indexes: &'a (dyn Fn() -> Result<(), String> + 'a),
+}
+
+/// See [`RestoreTarget::raise_lease`].
+pub(crate) type RaiseLease<'a> =
+    dyn Fn(u64, u64, [u8; NODE_LEASE_TOKEN_LEN]) -> Result<bool, String> + 'a;
+
+/// The record of a load in progress: the digest of its input and the
+/// highest sequence of hint 0 it holds. A node-local `meta:` key, since the
+/// load writes this member's store directly.
+pub(crate) const LOAD_KEY: &[u8] = b"meta:restore:load";
+
+/// The value of [`LOAD_KEY`] for a load of the input with `digest`.
+pub(crate) fn load_record(digest: &[u8; 32], max_sequence: u64) -> [u8; 40] {
+    let mut record = [0u8; 40];
+    record[..32].copy_from_slice(digest);
+    record[32..].copy_from_slice(&max_sequence.to_be_bytes());
+    record
+}
+
+/// The token a load's lease grant carries: the grant record then tells a
+/// rerun whether that load took its sequences, since it writes nothing before.
+fn lease_token(digest: &[u8; 32]) -> [u8; NODE_LEASE_TOKEN_LEN] {
+    let mut token = [0u8; NODE_LEASE_TOKEN_LEN];
+    token.copy_from_slice(&digest[..NODE_LEASE_TOKEN_LEN]);
+    token
+}
+
+/// Surveys lost to other allocators before a restore gives up: each loss
+/// means a lease was granted between the survey and its own grant.
+const MAX_SURVEYS: u32 = 8;
+
+/// Restore `source` in `format` into `target`.
+pub(crate) fn run(
+    target: &RestoreTarget<'_>,
+    format: BackupFormat,
+    source: &dyn RestoreSource,
+    options: &RestoreOptions<'_>,
+) -> Result<RestoreStats, RestoreError> {
+    let engine = target.engine;
+    let storage = |e: coordinode_storage::error::StorageError| RestoreError::Storage(e.to_string());
+    // A load may have written records once its sequences were taken (or at
+    // once, when it holds no identifier of hint 0).
+    let may_have_written = |digest: &[u8; 32], max_sequence: u64| {
+        if max_sequence == 0 {
+            return Ok(true);
+        }
+        node_lease_holder(engine, max_sequence)
+            .map(|holder| holder == Some(lease_token(digest)))
+            .map_err(storage)
+    };
+    let record_load = |value: &[u8]| {
+        engine
+            .put(Partition::Schema, LOAD_KEY, value)
+            .and_then(|()| engine.persist_partition(Partition::Schema))
+            .map_err(storage)
+    };
+
+    let mut surveys = 0;
+    loop {
+        surveys += 1;
+        // Pass one: read only, so a refusal leaves the target as it was.
+        let ceiling = node_lease_ceiling(engine).map_err(storage)?;
+        let mut checked = Survey::new(engine, ceiling)?;
+        let mut hasher = Sha256::new();
+        read_input(
+            format,
+            source,
+            options,
+            &mut Load::survey(target, &mut checked),
+            Some(&mut hasher),
+        )?;
+        let digest: [u8; 32] = hasher.finalize().into();
+
+        let recorded = engine.get(Partition::Schema, LOAD_KEY).map_err(storage)?;
+        let resume = match recorded.as_deref() {
+            None => false,
+            Some(value) => {
+                let (recorded_digest, recorded_max) = value
+                    .split_first_chunk::<32>()
+                    .and_then(|(d, rest)| Some((*d, u64::from_be_bytes(rest.try_into().ok()?))))
+                    .ok_or(RestoreError::UnfinishedLoad)?;
+                let wrote = may_have_written(&recorded_digest, recorded_max)?;
+                if recorded_digest == digest {
+                    wrote
+                } else if wrote {
+                    return Err(RestoreError::UnfinishedLoad);
+                } else {
+                    // That load stopped before taking its sequences, so it
+                    // wrote nothing and holds nothing.
+                    false
+                }
+            }
+        };
+        if let Some(manifest) = &checked.manifest {
+            // A rerun meets the schema its own interrupted load wrote.
+            validate_manifest(engine, manifest, options.force || resume)?;
+        }
+        if resume {
+            // Its own records are in the store and its sequences are taken.
+            break;
+        }
+        if checked.issued_count > 0 {
+            if recorded.is_some() {
+                engine
+                    .delete(Partition::Schema, LOAD_KEY)
+                    .map_err(storage)?;
+                engine
+                    .persist_partition(Partition::Schema)
+                    .map_err(storage)?;
+            }
+            return Err(RestoreError::IdentifiersIssued {
+                count: checked.issued_count,
+                first: checked.issued,
+            });
+        }
+        // Durable before the grant: a crash after it must find the load, or
+        // the rerun would take the load's own sequences for issued ones.
+        record_load(&load_record(&digest, checked.max_sequence))?;
+        if checked.max_sequence == 0
+            || (target.raise_lease)(ceiling, checked.max_sequence, lease_token(&digest))
+                .map_err(RestoreError::Lease)?
+        {
+            break;
+        }
+        // A lease was granted since the survey read the ceiling, and it may
+        // hold identifiers of the input: check them again against it.
+        if surveys >= MAX_SURVEYS {
+            return Err(RestoreError::Lease(format!(
+                "other allocators took a lease during each of {MAX_SURVEYS} surveys"
+            )));
+        }
+    }
+
+    // Pass two: write.
+    let mut write = Load::write(target);
+    read_input(format, source, options, &mut write, None)?;
+    let stats = write.stats;
+
+    // The rows went in directly, so the planner's counters never saw them,
+    // and no index did. Both are built while the load is still recorded: a
+    // crash before they are whole reruns it, which builds them again.
+    coordinode_storage::engine::stats::rebuild_node_counters(engine).map_err(storage)?;
+    (target.build_indexes)().map_err(RestoreError::Indexes)?;
+    // Every record durable before the load stops being unfinished.
+    engine.persist().map_err(storage)?;
+    engine
+        .delete(Partition::Schema, LOAD_KEY)
+        .map_err(storage)?;
+    engine
+        .persist_partition(Partition::Schema)
+        .map_err(storage)?;
+    Ok(stats)
+}
+
+/// Read `source` in `format` through `load`, hashing the input into `digest`.
+fn read_input(
+    format: BackupFormat,
+    source: &dyn RestoreSource,
+    options: &RestoreOptions<'_>,
+    load: &mut Load<'_, '_>,
+    digest: Option<&mut Sha256>,
+) -> Result<(), RestoreError> {
+    let reader = source.open()?;
+    let mut reader = HashingReader::new(reader, digest);
+    match format {
+        BackupFormat::Binary => restore_binary(load, &mut reader, options.force),
+        BackupFormat::Json => restore_json(load, options, &mut reader),
+        BackupFormat::Cypher => restore_cypher(load, options, &mut reader),
+        BackupFormat::ApocJson => restore_apoc_json(load, options, &mut reader),
+        BackupFormat::ApocCypher => restore_apoc_cypher(load, options, &mut reader),
+        BackupFormat::HetioJson => restore_hetio_json(load, options, &mut reader),
+        BackupFormat::RaftSnapshot => Err(RestoreError::Unsupported(format)),
+    }
+}
+
+/// A reader that hashes every byte it hands out.
+struct HashingReader<'h, R> {
+    inner: R,
+    digest: Option<&'h mut Sha256>,
+}
+
+impl<'h, R> HashingReader<'h, R> {
+    fn new(inner: R, digest: Option<&'h mut Sha256>) -> Self {
+        Self { inner, digest }
+    }
+}
+
+impl<R: BufRead> Read for HashingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl<R: BufRead> BufRead for HashingReader<'_, R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if let Some(digest) = self.digest.as_deref_mut() {
+            // Consumed bytes come from the buffer the last fill_buf returned.
+            if let Ok(buffered) = self.inner.fill_buf() {
+                digest.update(&buffered[..amount.min(buffered.len())]);
+            }
+        }
+        self.inner.consume(amount);
+    }
+}
+
+/// What the first pass found.
+struct Survey {
+    /// The lease ceiling of the target: every sequence of hint 0 at or
+    /// below it is issued.
+    ceiling: u64,
+    /// The highest sequence of hint 0 in the input.
+    max_sequence: u64,
+    /// The first identifiers found issued, for the error.
+    issued: Vec<u64>,
+    issued_count: u64,
+    /// The node checked last: the versions of a temporal node follow one
+    /// another in a dump and are one identifier.
+    last_checked: Option<(u16, NodeId)>,
+    /// Whether the target holds any node record: a restore into a new
+    /// database then probes no key per node.
+    holds_nodes: bool,
+    manifest: Option<Manifest>,
+}
+
+impl Survey {
+    fn new(engine: &StorageEngine, ceiling: u64) -> Result<Self, RestoreError> {
+        use coordinode_storage::Guard as _;
+        let storage = |e: &dyn std::fmt::Display| RestoreError::Storage(e.to_string());
+        let holds_nodes = match engine
+            .prefix_scan(Partition::Node, NODE_KEY_PREFIX)
+            .map_err(|e| storage(&e))?
+            .next()
+        {
+            None => false,
+            Some(record) => record.into_inner().map(|_| true).map_err(|e| storage(&e))?,
+        };
+        Ok(Self {
+            ceiling,
+            max_sequence: 0,
+            issued: Vec::new(),
+            issued_count: 0,
+            last_checked: None,
+            holds_nodes,
+            manifest: None,
+        })
+    }
+}
+
+/// A binary dump's manifest, checked once the pass knows whether it resumes.
+struct Manifest {
+    format_version: u32,
+    producer: String,
+    schema_fingerprint: u64,
+}
+
+/// How many issued identifiers the error names.
+const ISSUED_REPORTED: usize = 10;
+
+/// One pass over the input: a survey that only checks identifiers, or the
+/// write. The format parsers report every record to it and do not know which.
+struct Load<'t, 'a> {
+    target: &'t RestoreTarget<'a>,
+    /// What the survey pass records into; absent in the write pass.
+    survey: Option<&'t mut Survey>,
+    stats: RestoreStats,
+}
+
+impl<'t, 'a> Load<'t, 'a> {
+    fn survey(target: &'t RestoreTarget<'a>, survey: &'t mut Survey) -> Self {
+        Self {
+            target,
+            survey: Some(survey),
+            stats: RestoreStats::default(),
+        }
+    }
+
+    fn write(target: &'t RestoreTarget<'a>) -> Self {
+        Self {
+            target,
+            survey: None,
+            stats: RestoreStats::default(),
+        }
+    }
+
+    fn writes(&self) -> bool {
+        self.survey.is_none()
+    }
+
+    /// Check a node about to be written on `shard_id` (survey pass).
+    fn check_node(&mut self, shard_id: u16, id: NodeId) -> Result<(), RestoreError> {
+        let engine = self.target.engine;
+        let Some(survey) = self.survey.as_mut() else {
+            return Ok(());
+        };
+        if survey.last_checked == Some((shard_id, id)) {
+            return Ok(());
+        }
+        survey.last_checked = Some((shard_id, id));
+        // The plain key prefixes every temporal version of the node, so one
+        // probe finds a record of either kind.
+        let holds_nodes = survey.holds_nodes;
+        let recorded = || -> Result<bool, RestoreError> {
+            use coordinode_storage::Guard as _;
+            if !holds_nodes {
+                return Ok(false);
+            }
+            let storage = |e: &dyn std::fmt::Display| RestoreError::Storage(e.to_string());
+            let mut records = engine
+                .prefix_scan(Partition::Node, &encode_node_key(shard_id, id))
+                .map_err(|e| storage(&e))?;
+            match records.next() {
+                None => Ok(false),
+                Some(record) => record.into_inner().map(|_| true).map_err(|e| storage(&e)),
+            }
+        };
+        let issued = if id.origin_shard_hint() == 0 {
+            let sequence = id.sequence();
+            survey.max_sequence = survey.max_sequence.max(sequence);
+            // Sequence 0 is never allocated, so only a record can hold it.
+            (1..=survey.ceiling).contains(&sequence) || recorded()?
+        } else {
+            // CE allocates from hint 0 only: an identifier of another hint is
+            // issued only as a record here.
+            recorded()?
+        };
+        if issued {
+            survey.issued_count += 1;
+            if survey.issued.len() < ISSUED_REPORTED {
+                survey.issued.push(id.as_raw());
+            }
+        }
+        Ok(())
+    }
+
+    /// A node of a text format: checked in the survey, written in the write
+    /// pass.
+    fn node(
+        &mut self,
+        shard_id: u16,
+        id: u64,
+        write: impl FnOnce(&RestoreTarget<'_>) -> Result<(), RestoreError>,
+    ) -> Result<(), RestoreError> {
+        let node_id = NodeId::from_raw(id);
+        if self.writes() {
+            write(self.target)?;
+            self.stats.nodes += 1;
+            Ok(())
+        } else {
+            self.check_node(shard_id, node_id)
+        }
+    }
+
+    /// An edge: written in the write pass only.
+    fn edge(
+        &mut self,
+        write: impl FnOnce(&RestoreTarget<'_>) -> Result<(), RestoreError>,
+    ) -> Result<(), RestoreError> {
+        if self.writes() {
+            write(self.target)?;
+            self.stats.edges += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Restore from a binary (MessagePack) backup dump.
@@ -57,16 +532,16 @@ pub struct RestoreStats {
 /// carries ahead of them: those exact bindings are published through
 /// `fields` before any record is written, and a dump whose bindings
 /// contradict the target's is refused.
-pub fn restore_binary<R: Read>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+fn restore_binary<R: Read>(
+    load: &mut Load<'_, '_>,
     reader: &mut R,
     force: bool,
-) -> Result<RestoreStats, RestoreError> {
-    let mut stats = RestoreStats::default();
+) -> Result<(), RestoreError> {
+    let storage = |e: coordinode_storage::error::StorageError| RestoreError::Storage(e.to_string());
+    let engine = load.target.engine;
     let mut adopted = false;
     let mut len_buf = [0u8; 4];
-    let mut manifest_seen = false;
+    let mut entries = 0u64;
 
     loop {
         match reader.read_exact(&mut len_buf) {
@@ -84,11 +559,8 @@ pub fn restore_binary<R: Read>(
 
         // The manifest must lead the dump. Any other first entry means a
         // pre-versioned or corrupt file; reject unless forced.
-        let first_entry = stats.nodes == 0
-            && stats.edges == 0
-            && stats.schema_entries == 0
-            && !adopted
-            && !manifest_seen;
+        let first_entry = entries == 0;
+        entries += 1;
         if first_entry && !matches!(entry, BackupEntry::Manifest { .. }) && !force {
             return Err(RestoreError::IncompatibleVersion(
                 "binary dump has no leading manifest (pre-versioned or corrupt); \
@@ -103,15 +575,25 @@ pub fn restore_binary<R: Read>(
                 producer,
                 schema_fingerprint,
             } => {
-                validate_manifest(engine, format_version, &producer, schema_fingerprint, force)?;
-                manifest_seen = true;
+                // Checked after the survey, once the load knows whether it
+                // resumes its own interrupted run.
+                if let Some(survey) = load.survey.as_mut() {
+                    survey.manifest = Some(Manifest {
+                        format_version,
+                        producer,
+                        schema_fingerprint,
+                    });
+                }
             }
             BackupEntry::Interner(data) => {
                 let bindings = FieldInterner::from_bytes(&data)
                     .map_err(|e| RestoreError::Deserialization(e.to_string()))?;
-                fields
-                    .adopt(&bindings)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
+                if load.writes() {
+                    load.target
+                        .fields
+                        .adopt(&bindings)
+                        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+                }
                 adopted = true;
             }
             BackupEntry::Node { .. } | BackupEntry::EdgeProp { .. } if !adopted => {
@@ -122,41 +604,51 @@ pub fn restore_binary<R: Read>(
                 ));
             }
             BackupEntry::Node { key, value } => {
-                engine
-                    .put(Partition::Node, &key, &value)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-                stats.nodes += 1;
+                if load.writes() {
+                    engine.put(Partition::Node, &key, &value).map_err(storage)?;
+                    load.stats.nodes += 1;
+                } else {
+                    let (shard, id) = decode_node_key(&key)
+                        .or_else(|| {
+                            decode_temporal_node_key(&key).map(|(shard, id, _)| (shard, id))
+                        })
+                        .ok_or_else(|| {
+                            RestoreError::InvalidFormat(
+                                "the dump holds a malformed node key".into(),
+                            )
+                        })?;
+                    load.check_node(shard, id)?;
+                }
             }
             BackupEntry::Adj { key, value } => {
-                // Adj keys are raw (no MVCC timestamps) — write directly to engine.
-                engine
-                    .put(Partition::Adj, &key, &value)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-                let key_str = std::str::from_utf8(&key).unwrap_or("");
-                if key_str.contains(":out:") {
-                    stats.edges += 1;
+                if load.writes() {
+                    // Adj keys are raw (no MVCC timestamps) — write directly to engine.
+                    engine.put(Partition::Adj, &key, &value).map_err(storage)?;
+                    let key_str = std::str::from_utf8(&key).unwrap_or("");
+                    if key_str.contains(":out:") {
+                        load.stats.edges += 1;
+                    }
                 }
             }
             BackupEntry::EdgeProp { key, value } => {
-                engine
-                    .put(Partition::EdgeProp, &key, &value)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
+                if load.writes() {
+                    engine
+                        .put(Partition::EdgeProp, &key, &value)
+                        .map_err(storage)?;
+                }
             }
             BackupEntry::Schema { key, value } => {
-                // Schema is not MVCC-versioned — write directly.
-                engine
-                    .put(Partition::Schema, &key, &value)
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-                stats.schema_entries += 1;
+                if load.writes() {
+                    // Schema is not MVCC-versioned — write directly.
+                    engine
+                        .put(Partition::Schema, &key, &value)
+                        .map_err(storage)?;
+                    load.stats.schema_entries += 1;
+                }
             }
         }
     }
-
-    // The rows went in directly, so the planner's counters never saw them.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Validate a binary dump manifest against the target engine.
@@ -171,13 +663,16 @@ pub fn restore_binary<R: Read>(
 ///    into a fresh database (fingerprint of an empty schema) always passes.
 fn validate_manifest(
     engine: &StorageEngine,
-    format_version: u32,
-    producer: &str,
-    dump_fingerprint: u64,
+    manifest: &Manifest,
     force: bool,
 ) -> Result<(), RestoreError> {
     use super::export::{BINARY_FORMAT_VERSION, schema_fingerprint};
 
+    let Manifest {
+        format_version,
+        ref producer,
+        schema_fingerprint: dump_fingerprint,
+    } = *manifest;
     if format_version > BINARY_FORMAT_VERSION && !force {
         return Err(RestoreError::IncompatibleVersion(format!(
             "dump format v{format_version} from {producer} is newer than supported v{BINARY_FORMAT_VERSION}; \
@@ -216,18 +711,22 @@ fn schema_fingerprint_of_empty() -> u64 {
 ///
 /// Property names are registered through `fields` before each record that
 /// uses them. Writes go straight to the engine; the oracle stamps each seqno.
-pub fn restore_json<R: BufRead>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    shard_id: u16,
+/// An edge instance of a `DISCRIMINATED BY` or temporal edge type carries its
+/// encoded discriminator in hex under `"discriminator"`.
+fn restore_json<R: BufRead>(
+    load: &mut Load<'_, '_>,
+    options: &RestoreOptions<'_>,
     reader: &mut R,
-    only_labels: Option<&std::collections::HashSet<String>>,
-) -> Result<RestoreStats, RestoreError> {
-    let mut stats = RestoreStats::default();
+) -> Result<(), RestoreError> {
+    let RestoreOptions {
+        shard_id,
+        only_labels,
+        ..
+    } = *options;
     // Selective restore: with `only_labels`, keep only nodes carrying a matching
     // label and drop edges whose endpoints were filtered out. Exports list nodes
     // before edges, so `kept` is complete by the time edges are read.
-    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut kept: HashSet<u64> = HashSet::new();
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -257,15 +756,18 @@ pub fn restore_json<R: BufRead>(
                     }
                     kept.insert(id);
                 }
-                write_node_record(
-                    engine,
-                    fields,
-                    shard_id,
-                    id,
-                    labels,
-                    obj.get("properties").and_then(|v| v.as_object()),
-                )?;
-                stats.nodes += 1;
+                let valid_from = match obj.get("valid_from") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(v.as_i64().ok_or_else(|| {
+                        RestoreError::InvalidFormat(format!(
+                            "node valid_from is not an integer: {v}"
+                        ))
+                    })?),
+                };
+                let props = obj.get("properties").and_then(|v| v.as_object());
+                load.node(shard_id, id, |t| {
+                    write_node(t, shard_id, id, valid_from, labels, json_props(props))
+                })?;
             }
             "edge" => {
                 let source = obj
@@ -282,18 +784,32 @@ pub fn restore_json<R: BufRead>(
                     .ok_or_else(|| {
                         RestoreError::InvalidFormat("edge missing 'edge_type'".into())
                     })?;
+                let discriminator = match obj.get("discriminator") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(hex)) => Some(decode_hex(hex)?),
+                    Some(other) => {
+                        return Err(RestoreError::InvalidFormat(format!(
+                            "edge discriminator is not a hex string: {other}"
+                        )));
+                    }
+                };
                 if only_labels.is_some() && (!kept.contains(&source) || !kept.contains(&target)) {
                     continue;
                 }
-                write_edge_record(
-                    engine,
-                    fields,
-                    source,
-                    target,
-                    edge_type,
-                    obj.get("properties").and_then(|v| v.as_object()),
-                )?;
-                stats.edges += 1;
+                let props = obj.get("properties").and_then(|v| v.as_object());
+                load.edge(|t| {
+                    write_edge_record(
+                        t,
+                        source,
+                        target,
+                        edge_type,
+                        discriminator.as_deref(),
+                        props,
+                    )
+                })?;
+            }
+            kind @ ("label_schema" | "edge_type_schema" | "index") => {
+                json_schema(load, kind, &obj, only_labels)?;
             }
             other => {
                 return Err(RestoreError::InvalidFormat(format!(
@@ -302,13 +818,122 @@ pub fn restore_json<R: BufRead>(
             }
         }
     }
+    Ok(())
+}
 
-    // The rows went in through the typed store, not the executor that
-    // stages the counters, so the planner's counts need rebuilding.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+/// One schema declaration of a `json` dump. A target that declares the same
+/// name otherwise is refused, in the survey, before anything is written; a
+/// target that lacks it gets it in the write pass, and one that declares it
+/// the same way is left as it is.
+fn json_schema(
+    load: &mut Load<'_, '_>,
+    kind: &str,
+    obj: &serde_json::Value,
+    only_labels: Option<&HashSet<String>>,
+) -> Result<(), RestoreError> {
+    use coordinode_core::schema::definition::{EdgeTypeSchema, LabelSchema};
+    use coordinode_modality::{
+        IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _,
+    };
+    use coordinode_query::index::IndexDefinition;
 
-    Ok(stats)
+    let engine = load.target.engine;
+    let storage = |e: coordinode_modality::StoreError| RestoreError::Storage(e.to_string());
+    let field = if kind == "index" {
+        "definition"
+    } else {
+        "schema"
+    };
+    let body = obj
+        .get(field)
+        .cloned()
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("{kind} line without '{field}'")))?;
+    let decode_error = |e: serde_json::Error| RestoreError::Deserialization(format!("{kind}: {e}"));
+    let differs = |what: &str, name: &str| {
+        RestoreError::SchemaMismatch(format!(
+            "{what} '{name}' is declared differently in the target"
+        ))
+    };
+    let kept = |label: &str| only_labels.is_none_or(|filter| filter.contains(label));
+    let schemas = LocalSchemaStore::new(engine);
+    let indexes = LocalIndexStore::new(engine);
+
+    let written = match kind {
+        "label_schema" => {
+            let schema: LabelSchema = serde_json::from_value(body).map_err(decode_error)?;
+            if !kept(&schema.name) {
+                return Ok(());
+            }
+            match schemas.load_label(&schema.name).map_err(storage)? {
+                Some(current) if current == schema => false,
+                Some(_) => return Err(differs("label", &schema.name)),
+                None if load.writes() => {
+                    schemas.save_label(&schema).map_err(storage)?;
+                    true
+                }
+                None => false,
+            }
+        }
+        "edge_type_schema" => {
+            let schema: EdgeTypeSchema = serde_json::from_value(body).map_err(decode_error)?;
+            match schemas.load_edge_type(&schema.name).map_err(storage)? {
+                Some(current) if current == schema => false,
+                Some(_) => return Err(differs("edge type", &schema.name)),
+                None if load.writes() => {
+                    schemas.save_edge_type(&schema).map_err(storage)?;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => {
+            let def: IndexDefinition = serde_json::from_value(body).map_err(decode_error)?;
+            if !kept(&def.label) {
+                return Ok(());
+            }
+            match indexes.load_definition(&def.name).map_err(storage)? {
+                Some(current) if same_index(&current, &def) => false,
+                Some(_) => return Err(differs("index", &def.name)),
+                None if load.writes() => {
+                    // An index resolves its label and properties through the
+                    // field dictionary, as its DDL registered them; the
+                    // entries are built from the loaded nodes once they are in.
+                    let mut names: Vec<&str> = vec![def.label.as_str()];
+                    names.extend(def.properties.iter().map(String::as_str));
+                    field_ids(load.target.fields, &names)?;
+                    indexes.put_definition(&def).map_err(storage)?;
+                    true
+                }
+                None => false,
+            }
+        }
+    };
+    if written {
+        load.stats.schema_entries += 1;
+    }
+    Ok(())
+}
+
+/// Whether two definitions of one index declare the same index: its build
+/// state, entry layout and the multikey flag its data set are not part of
+/// the declaration.
+fn same_index(
+    current: &coordinode_query::index::IndexDefinition,
+    dumped: &coordinode_query::index::IndexDefinition,
+) -> bool {
+    let mut dumped = dumped.clone();
+    dumped.state = current.state.clone();
+    dumped.layout = current.layout;
+    dumped.multikey = current.multikey;
+    dumped.maintenance.epoch = current.maintenance.epoch;
+    dumped.maintenance.source = current.maintenance.source;
+    *current == dumped
+}
+
+/// Decode a lowercase or uppercase hex string.
+fn decode_hex(text: &str) -> Result<Vec<u8>, RestoreError> {
+    super::export::hex::decode(text)
+        .ok_or_else(|| RestoreError::InvalidFormat(format!("not a hex string: {text}")))
 }
 
 /// Restore from a Neo4j APOC json-export dump (`apoc.export.json.all`).
@@ -321,17 +946,19 @@ pub fn restore_json<R: BufRead>(
 /// APOC; this reads its portable output and writes straight to storage, the
 /// same way [`restore_json`] does. Records of other types (graph metadata)
 /// are skipped.
-pub fn restore_apoc_json<R: BufRead>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    shard_id: u16,
+fn restore_apoc_json<R: BufRead>(
+    load: &mut Load<'_, '_>,
+    options: &RestoreOptions<'_>,
     reader: &mut R,
-    only_labels: Option<&std::collections::HashSet<String>>,
-) -> Result<RestoreStats, RestoreError> {
-    let mut stats = RestoreStats::default();
+) -> Result<(), RestoreError> {
+    let RestoreOptions {
+        shard_id,
+        only_labels,
+        ..
+    } = *options;
     // Selective restore: keep only label-matching nodes; drop edges to dropped
     // nodes (APOC lists nodes before relationships).
-    let mut kept: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut kept: HashSet<u64> = HashSet::new();
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -352,15 +979,10 @@ pub fn restore_apoc_json<R: BufRead>(
                     }
                     kept.insert(id);
                 }
-                write_node_record(
-                    engine,
-                    fields,
-                    shard_id,
-                    id,
-                    labels,
-                    obj.get("properties").and_then(|v| v.as_object()),
-                )?;
-                stats.nodes += 1;
+                let props = obj.get("properties").and_then(|v| v.as_object());
+                load.node(shard_id, id, |t| {
+                    write_node_record(t, shard_id, id, labels, props)
+                })?;
             }
             Some("relationship") => {
                 let source = apoc_id(
@@ -374,26 +996,13 @@ pub fn restore_apoc_json<R: BufRead>(
                 if only_labels.is_some() && (!kept.contains(&source) || !kept.contains(&target)) {
                     continue;
                 }
-                write_edge_record(
-                    engine,
-                    fields,
-                    source,
-                    target,
-                    edge_type,
-                    obj.get("properties").and_then(|v| v.as_object()),
-                )?;
-                stats.edges += 1;
+                let props = obj.get("properties").and_then(|v| v.as_object());
+                load.edge(|t| write_edge_record(t, source, target, edge_type, None, props))?;
             }
             _ => {}
         }
     }
-
-    // The rows went in through the typed store, not the executor that
-    // stages the counters, so the planner's counts need rebuilding.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Collect a JSON labels array into owned strings.
@@ -432,64 +1041,105 @@ fn field_ids(fields: &dyn FieldRegistrar, names: &[&str]) -> Result<Vec<u32>, Re
 /// (bulk restore is a stream of independent writes; per-record commit
 /// bounds buffer growth).
 fn write_node_record(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+    target: &RestoreTarget<'_>,
     shard_id: u16,
     id: u64,
     labels: Vec<String>,
     props: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(), RestoreError> {
-    use coordinode_core::graph::node::NodeRecord;
+    write_node(target, shard_id, id, None, labels, json_props(props))
+}
 
-    let mut record = NodeRecord::with_labels(labels);
-    if let Some(props) = props {
-        let names: Vec<&str> = props.keys().map(String::as_str).collect();
-        for (json_val, field_id) in props.values().zip(field_ids(fields, &names)?) {
-            record.set(field_id, json_to_value(json_val));
-        }
-    }
-    put_node_committed(engine, shard_id, NodeId::from_raw(id), &record)
+/// A json property map as `(name, value)` pairs.
+fn json_props(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Vec<(String, Value)> {
+    props
+        .map(|props| {
+            props
+                .iter()
+                .map(|(name, value)| (name.clone(), json_to_value(value)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Write a single fully-built node record straight to the engine (cheap
 /// direct-mode transaction: bulk restore is non-transactional, so it skips
 /// the MVCC buffer / OCC / snapshot / commit overhead — `put` lands
-/// immediately). Shared by the JSON/APOC/Cypher restore paths.
-fn put_node_committed(
-    engine: &StorageEngine,
+/// immediately). Shared by every text restore path. A `valid_from` makes it
+/// the version of a temporal node stored under that instant.
+fn write_node(
+    target: &RestoreTarget<'_>,
     shard_id: u16,
-    node_id: NodeId,
-    record: &coordinode_core::graph::node::NodeRecord,
+    id: u64,
+    valid_from: Option<i64>,
+    labels: Vec<String>,
+    props: Vec<(String, Value)>,
 ) -> Result<(), RestoreError> {
+    use coordinode_core::graph::node::NodeRecord;
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let mut txn = Transaction::new(engine, None, Timestamp::ZERO, None);
-    LocalNodeStore
-        .put(&mut txn, shard_id, node_id, record)
-        .map_err(|e| RestoreError::Storage(e.to_string()))
+
+    let mut record = NodeRecord::with_labels(labels);
+    let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
+    let ids = field_ids(target.fields, &names)?;
+    for ((_, value), field_id) in props.into_iter().zip(ids) {
+        record.set(field_id, value);
+    }
+    let mut txn = Transaction::new(target.engine, None, Timestamp::ZERO, None);
+    let node_id = NodeId::from_raw(id);
+    match valid_from {
+        None => LocalNodeStore.put(&mut txn, shard_id, node_id, &record),
+        Some(valid_from) => {
+            LocalNodeStore.put_temporal(&mut txn, shard_id, node_id, valid_from, &record)
+        }
+    }
+    .map_err(|e| RestoreError::Storage(e.to_string()))
+}
+
+/// Write one edge from a json property map.
+fn write_edge_record(
+    target: &RestoreTarget<'_>,
+    source: u64,
+    target_id: u64,
+    edge_type: &str,
+    discriminator: Option<&[u8]>,
+    props: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), RestoreError> {
+    write_edge(
+        target,
+        source,
+        target_id,
+        edge_type,
+        discriminator,
+        json_props(props),
+    )
 }
 
 /// Write one edge: both adjacency directions (merge operator, raw keys) plus
-/// optional edge properties in executor-native shape.
-fn write_edge_record(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+/// its property body in executor-native shape. An instance of a discriminated
+/// or temporal edge type is its body under the discriminator, so that body is
+/// written even when it holds no property; a plain edge without properties
+/// has none.
+fn write_edge(
+    target: &RestoreTarget<'_>,
     source: u64,
-    target: u64,
+    target_id: u64,
     edge_type: &str,
-    props: Option<&serde_json::Map<String, serde_json::Value>>,
+    discriminator: Option<&[u8]>,
+    props: Vec<(String, Value)>,
 ) -> Result<(), RestoreError> {
     use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
 
+    let engine = target.engine;
     let fwd_key = encode_adj_key_forward(edge_type, NodeId::from_raw(source));
     engine
         .merge(
             Partition::Adj,
             &fwd_key,
-            &coordinode_storage::engine::merge::encode_add(target),
+            &coordinode_storage::engine::merge::encode_add(target_id),
         )
         .map_err(|e| RestoreError::Storage(e.to_string()))?;
 
-    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target));
+    let rev_key = encode_adj_key_reverse(edge_type, NodeId::from_raw(target_id));
     engine
         .merge(
             Partition::Adj,
@@ -498,30 +1148,29 @@ fn write_edge_record(
         )
         .map_err(|e| RestoreError::Storage(e.to_string()))?;
 
-    if let Some(props) = props {
-        if !props.is_empty() {
-            // Write the edge property body through the typed EdgeStore
-            // direct-write helper so restore never hand-rolls the edge-prop key
-            // (encoder lockdown). The body uses the single canonical codec, so
-            // restored bytes match a put_edge write exactly and stay readable by
-            // queries (which expect the executor-native (field_id, Value) shape).
-            let mut edge_props = EdgeProperties::new();
-            let names: Vec<&str> = props.keys().map(String::as_str).collect();
-            for (json_val, field_id) in props.values().zip(field_ids(fields, &names)?) {
-                edge_props.set(field_id, json_to_value(json_val));
-            }
-            LocalEdgeStore
-                .put_props_direct(
-                    engine,
-                    edge_type,
-                    NodeId::from_raw(source),
-                    NodeId::from_raw(target),
-                    &edge_props,
-                )
-                .map_err(|e| RestoreError::Storage(e.to_string()))?;
-        }
+    if props.is_empty() && discriminator.is_none() {
+        return Ok(());
     }
-    Ok(())
+    // Write the edge property body through the typed EdgeStore direct-write
+    // helper so restore never hand-rolls the edge-prop key. The body uses the
+    // single canonical codec, so restored bytes match a transactional write
+    // exactly and stay readable by queries.
+    let mut edge_props = EdgeProperties::new();
+    let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
+    let ids = field_ids(target.fields, &names)?;
+    for ((_, value), field_id) in props.into_iter().zip(ids) {
+        edge_props.set(field_id, value);
+    }
+    LocalEdgeStore
+        .put_props_direct(
+            engine,
+            edge_type,
+            NodeId::from_raw(source),
+            NodeId::from_raw(target_id),
+            discriminator,
+            &edge_props,
+        )
+        .map_err(|e| RestoreError::Storage(e.to_string()))
 }
 
 /// Restore from a Cypher (OpenCypher `CREATE` statements) backup dump.
@@ -540,21 +1189,23 @@ fn write_edge_record(
 /// This is the round-trip path for CoordiNode's own cypher dumps. It is
 /// deliberately NOT a general OpenCypher importer: arbitrary external
 /// cypher (foreign schemas, computed expressions, multi-statement scope)
-/// must go through the query engine.
-pub fn restore_cypher<R: BufRead>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    shard_id: u16,
+/// must go through the query engine. An instance of a discriminated or
+/// temporal edge type ends its line with [`CYPHER_DISCRIMINATOR`] and the
+/// encoded discriminator in hex, a comment any other OpenCypher reader skips;
+/// a version of a temporal node ends its line with [`CYPHER_VALID_FROM`] and
+/// the instant it is stored under.
+fn restore_cypher<R: BufRead>(
+    load: &mut Load<'_, '_>,
+    options: &RestoreOptions<'_>,
     reader: &mut R,
-) -> Result<RestoreStats, RestoreError> {
-    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
-    use coordinode_core::graph::node::NodeRecord;
-    let mut stats = RestoreStats::default();
-
+) -> Result<(), RestoreError> {
+    let shard_id = options.shard_id;
     // One statement per line, each terminated by `;`. Export emits JSON
     // values, which escape newlines, so line-based splitting is safe.
     for line_result in reader.lines() {
         let line = line_result?;
+        let (line, discriminator) = split_cypher_discriminator(line.trim())?;
+        let (line, valid_from) = split_cypher_valid_from(line);
         let stmt = line.trim().trim_end_matches(';').trim();
         if stmt.is_empty() || stmt.starts_with("//") {
             continue;
@@ -568,63 +1219,79 @@ pub fn restore_cypher<R: BufRead>(
 
         if body.contains(")-[") {
             let (source, edge_type, target, props) = parse_cypher_edge(body)?;
-            let fwd = encode_adj_key_forward(&edge_type, NodeId::from_raw(source));
-            engine
-                .merge(
-                    Partition::Adj,
-                    &fwd,
-                    &coordinode_storage::engine::merge::encode_add(target),
+            load.edge(|t| {
+                write_edge(
+                    t,
+                    source,
+                    target,
+                    &edge_type,
+                    discriminator.as_deref(),
+                    props,
                 )
-                .map_err(|e| RestoreError::Storage(e.to_string()))?;
-            let rev = encode_adj_key_reverse(&edge_type, NodeId::from_raw(target));
-            engine
-                .merge(
-                    Partition::Adj,
-                    &rev,
-                    &coordinode_storage::engine::merge::encode_add(source),
-                )
-                .map_err(|e| RestoreError::Storage(e.to_string()))?;
-            if !props.is_empty() {
-                // Typed direct-write so the Cypher restore path never hand-rolls
-                // the edge-prop key (encoder lockdown); the canonical codec keeps
-                // restored bytes identical to a put_edge write and readable by
-                // queries (the executor-native (field_id, Value) shape).
-                let mut edge_props = EdgeProperties::new();
-                let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
-                let ids = field_ids(fields, &names)?;
-                for ((_, val), field_id) in props.into_iter().zip(ids) {
-                    edge_props.set(field_id, val);
-                }
-                LocalEdgeStore
-                    .put_props_direct(
-                        engine,
-                        &edge_type,
-                        NodeId::from_raw(source),
-                        NodeId::from_raw(target),
-                        &edge_props,
-                    )
-                    .map_err(|e| RestoreError::Storage(e.to_string()))?;
-            }
-            stats.edges += 1;
+            })?;
         } else {
             let (id, labels, props) = parse_cypher_node(body)?;
-            let mut record = NodeRecord::with_labels(labels);
-            let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
-            let ids = field_ids(fields, &names)?;
-            for ((_, val), field_id) in props.into_iter().zip(ids) {
-                record.set(field_id, val);
-            }
-            put_node_committed(engine, shard_id, NodeId::from_raw(id), &record)?;
-            stats.nodes += 1;
+            load.node(shard_id, id, |t| {
+                write_node(t, shard_id, id, valid_from, labels, props)
+            })?;
         }
     }
+    Ok(())
+}
 
-    // The rows went in through the typed store, not the executor that
-    // stages the counters, so the planner's counts need rebuilding.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
+/// The comment that carries an edge instance's discriminator on its line,
+/// followed by a space and the discriminator in hex (nothing at all for an
+/// empty one).
+pub(crate) const CYPHER_DISCRIMINATOR: &str = "; // discriminator";
 
-    Ok(stats)
+/// The comment that carries the valid_from a temporal node version is stored
+/// under on its line, followed by a space and the instant in milliseconds.
+pub(crate) const CYPHER_VALID_FROM: &str = "; // valid_from";
+
+/// Split a trailing `marker` comment off `line`, returning the statement
+/// with its `;` and the comment's value. The last occurrence counts, and only
+/// when it ends the line (an empty value, if `accept` takes one) or a space
+/// and an accepted value follow it to the end: a string value that happens to
+/// hold the text is followed by more of the statement.
+fn split_cypher_comment<'l>(
+    line: &'l str,
+    marker: &str,
+    accept: impl Fn(&str) -> bool,
+) -> (&'l str, Option<&'l str>) {
+    let Some(at) = line.rfind(marker) else {
+        return (line, None);
+    };
+    let rest = &line[at + marker.len()..];
+    let value = if rest.is_empty() {
+        ""
+    } else {
+        match rest.strip_prefix(' ') {
+            Some(value) if !value.is_empty() => value,
+            _ => return (line, None),
+        }
+    };
+    if !accept(value) {
+        return (line, None);
+    }
+    (&line[..=at], Some(value))
+}
+
+/// Split a trailing [`CYPHER_DISCRIMINATOR`] comment off `line`.
+fn split_cypher_discriminator(line: &str) -> Result<(&str, Option<Vec<u8>>), RestoreError> {
+    match split_cypher_comment(line, CYPHER_DISCRIMINATOR, |hex| {
+        hex.bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        (line, None) => Ok((line, None)),
+        (line, Some(hex)) => Ok((line, Some(decode_hex(hex)?))),
+    }
+}
+
+/// Split a trailing [`CYPHER_VALID_FROM`] comment off `line`.
+fn split_cypher_valid_from(line: &str) -> (&str, Option<i64>) {
+    match split_cypher_comment(line, CYPHER_VALID_FROM, |ms| ms.parse::<i64>().is_ok()) {
+        (line, Some(ms)) => (line, ms.parse().ok()),
+        (line, None) => (line, None),
+    }
 }
 
 /// Decoded `(node_id, labels, properties)` from a cypher node statement.
@@ -832,14 +1499,12 @@ fn find_top_level(s: &str, delim: char) -> Option<usize> {
 /// `UNIQUE IMPORT LABEL` cleanup pass are skipped: CoordiNode rebuilds those
 /// natively. Cypher functions / temporal literals in values are a hard error
 /// (we import data, not evaluate Cypher).
-pub fn restore_apoc_cypher<R: BufRead>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    shard_id: u16,
+fn restore_apoc_cypher<R: BufRead>(
+    load: &mut Load<'_, '_>,
+    options: &RestoreOptions<'_>,
     reader: &mut R,
-) -> Result<RestoreStats, RestoreError> {
-    let mut stats = RestoreStats::default();
-
+) -> Result<(), RestoreError> {
+    let shard_id = options.shard_id;
     let mut text = String::new();
     reader.read_to_string(&mut text)?;
 
@@ -861,24 +1526,16 @@ pub fn restore_apoc_cypher<R: BufRead>(
         if stmt.is_empty() {
             continue;
         }
-        apply_apoc_cypher_stmt(stmt, engine, fields, shard_id, &mut stats)?;
+        apply_apoc_cypher_stmt(stmt, load, shard_id)?;
     }
-
-    // The rows went in through the typed store, not the executor that
-    // stages the counters, so the planner's counts need rebuilding.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Classify and apply one APOC cypher statement.
 fn apply_apoc_cypher_stmt(
     stmt: &str,
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+    load: &mut Load<'_, '_>,
     shard_id: u16,
-    stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
     let upper = stmt.to_uppercase();
 
@@ -903,11 +1560,11 @@ fn apply_apoc_cypher_stmt(
     }
 
     if upper.starts_with("UNWIND") {
-        apply_apoc_unwind(stmt, engine, fields, shard_id, stats)
+        apply_apoc_unwind(stmt, load, shard_id)
     } else if upper.starts_with("CREATE (") || upper.starts_with("CREATE(") {
-        apply_apoc_plain_node(stmt, engine, fields, shard_id, stats)
+        apply_apoc_plain_node(stmt, load, shard_id)
     } else if upper.starts_with("MATCH") && stmt.contains("]->") {
-        apply_apoc_plain_rel(stmt, engine, fields, stats)
+        apply_apoc_plain_rel(stmt, load)
     } else {
         // Unknown maintenance statement (e.g. a vendor-specific clause):
         // skip rather than fail; only CREATE/UNWIND carry graph data.
@@ -918,10 +1575,8 @@ fn apply_apoc_cypher_stmt(
 /// Apply an `UNWIND [...] AS row CREATE/MATCH ...` batch (node or relationship).
 fn apply_apoc_unwind(
     stmt: &str,
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+    load: &mut Load<'_, '_>,
     shard_id: u16,
-    stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
     let lb = stmt
         .find('[')
@@ -939,8 +1594,7 @@ fn apply_apoc_unwind(
             let source = nested_id(row, "start")?;
             let target = nested_id(row, "end")?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            write_edge_record(engine, fields, source, target, &edge_type, props)?;
-            stats.edges += 1;
+            load.edge(|t| write_edge_record(t, source, target, &edge_type, None, props))?;
         }
     } else {
         let labels = extract_create_labels(&rest)?;
@@ -950,8 +1604,9 @@ fn apply_apoc_unwind(
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| RestoreError::InvalidFormat("UNWIND node row missing _id".into()))?;
             let props = row.get("properties").and_then(|v| v.as_object());
-            write_node_record(engine, fields, shard_id, id, labels.clone(), props)?;
-            stats.nodes += 1;
+            load.node(shard_id, id, |t| {
+                write_node_record(t, shard_id, id, labels.clone(), props)
+            })?;
         }
     }
     Ok(())
@@ -968,10 +1623,8 @@ fn nested_id(row: &serde_json::Value, side: &str) -> Result<u64, RestoreError> {
 /// Apply a plain `CREATE (:Labels {props, `UNIQUE IMPORT ID`: N});` node.
 fn apply_apoc_plain_node(
     stmt: &str,
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
+    load: &mut Load<'_, '_>,
     shard_id: u16,
-    stats: &mut RestoreStats,
 ) -> Result<(), RestoreError> {
     let body = stmt["CREATE".len()..].trim();
     let inner = body
@@ -996,18 +1649,13 @@ fn apply_apoc_plain_node(
                     .into(),
             )
         })?;
-    write_node_record(engine, fields, shard_id, id, labels, Some(&obj))?;
-    stats.nodes += 1;
-    Ok(())
+    load.node(shard_id, id, |t| {
+        write_node_record(t, shard_id, id, labels, Some(&obj))
+    })
 }
 
 /// Apply a plain `MATCH (a{id:X}), (b{id:Y}) CREATE (a)-[:T {props}]->(b);`.
-fn apply_apoc_plain_rel(
-    stmt: &str,
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    stats: &mut RestoreStats,
-) -> Result<(), RestoreError> {
+fn apply_apoc_plain_rel(stmt: &str, load: &mut Load<'_, '_>) -> Result<(), RestoreError> {
     let cpos = find_top_keyword(stmt, "CREATE")
         .ok_or_else(|| RestoreError::InvalidFormat(format!("rel without CREATE: {stmt}")))?;
     let (match_part, create_part) = stmt.split_at(cpos);
@@ -1020,9 +1668,8 @@ fn apply_apoc_plain_rel(
     }
     let edge_type = extract_reltype(create_part)?;
     let props = extract_rel_props(create_part)?;
-    write_edge_record(engine, fields, ids[0], ids[1], &edge_type, props.as_ref())?;
-    stats.edges += 1;
-    Ok(())
+    let (source, target) = (ids[0], ids[1]);
+    load.edge(|t| write_edge_record(t, source, target, &edge_type, None, props.as_ref()))
 }
 
 /// Pull the relationship type out of a `-[var:`TYPE` {props}]->` pattern.
@@ -1568,14 +2215,18 @@ fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
 /// type; `name` and `data` become properties. This mirrors what hetnetpy does
 /// when it writes the hetnet into Neo4j, so the dataset loads straight from the
 /// JSON with no Neo4j round trip.
-pub fn restore_hetio_json<R: BufRead>(
-    engine: &StorageEngine,
-    fields: &dyn FieldRegistrar,
-    shard_id: u16,
+fn restore_hetio_json<R: BufRead>(
+    load: &mut Load<'_, '_>,
+    options: &RestoreOptions<'_>,
     reader: &mut R,
-    only_labels: Option<&std::collections::HashSet<String>>,
-) -> Result<RestoreStats, RestoreError> {
+) -> Result<(), RestoreError> {
     use serde::Deserialize;
+
+    let RestoreOptions {
+        shard_id,
+        only_labels,
+        ..
+    } = *options;
 
     #[derive(Deserialize)]
     struct HetNode {
@@ -1603,7 +2254,6 @@ pub fn restore_hetio_json<R: BufRead>(
     let doc: HetnetDoc = serde_json::from_reader(reader)
         .map_err(|e| RestoreError::Deserialization(format!("hetnet json: {e}")))?;
 
-    let mut stats = RestoreStats::default();
     let mut id_map: std::collections::HashMap<(String, String), u64> =
         std::collections::HashMap::with_capacity(doc.nodes.len());
 
@@ -1622,15 +2272,9 @@ pub fn restore_hetio_json<R: BufRead>(
             props.insert("name".to_string(), name.clone());
         }
         props.insert("identifier".to_string(), n.identifier.clone());
-        write_node_record(
-            engine,
-            fields,
-            shard_id,
-            id,
-            vec![n.kind.clone()],
-            Some(&props),
-        )?;
-        stats.nodes += 1;
+        load.node(shard_id, id, |t| {
+            write_node_record(t, shard_id, id, vec![n.kind.clone()], Some(&props))
+        })?;
     }
 
     for e in &doc.edges {
@@ -1645,16 +2289,9 @@ pub fn restore_hetio_json<R: BufRead>(
         } else {
             Some(&e.data)
         };
-        write_edge_record(engine, fields, src, tgt, &e.kind, props)?;
-        stats.edges += 1;
+        load.edge(|t| write_edge_record(t, src, tgt, &e.kind, None, props))?;
     }
-
-    // The rows went in through the typed store, not the executor that
-    // stages the counters, so the planner's counts need rebuilding.
-    coordinode_storage::engine::stats::rebuild_node_counters(engine)
-        .map_err(|e| RestoreError::Storage(e.to_string()))?;
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Canonical string key for a hetnet identifier (string or integer) so a node

@@ -385,6 +385,82 @@ fn a_reopened_database_draws_above_every_granted_lease() {
     );
 }
 
+/// A restore takes its identifiers' sequences only from the ceiling its
+/// survey checked them against. A lease another allocator is granted in
+/// between may hold those very sequences; the restore then checks again,
+/// finds them issued and writes nothing, instead of raising the lease above
+/// the other allocator's range and loading nodes it will hand out again.
+#[test]
+fn a_lease_granted_during_a_restore_sends_it_back_to_the_check() {
+    use crate::backup::BackupFormat;
+    use crate::backup::restore::{self, RestoreError, RestoreOptions, RestoreTarget};
+    use coordinode_core::graph::node::IdLeaseReserver as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    let leases = || {
+        super::id_lease::LogLeaseReserver::new(
+            Arc::clone(&db.engine),
+            Arc::clone(&db.pipeline),
+            Arc::clone(&db.proposal_id_gen),
+            Arc::clone(&db.oracle),
+        )
+    };
+    let restorer = leases();
+    let other = leases();
+    let competed = std::cell::Cell::new(false);
+    let raise = |base: u64, target: u64, token| {
+        if !competed.replace(true) {
+            // Another allocator is granted (0, NODE_LEASE_SIZE] first.
+            other.reserve().map_err(|e| e.to_string())?;
+        }
+        restorer
+            .raise_from(base, target, token)
+            .map_err(|e| e.to_string())
+    };
+    let target = RestoreTarget {
+        engine: &db.engine,
+        fields: db.fields.as_ref(),
+        raise_lease: &raise,
+        build_indexes: &|| Ok(()),
+    };
+    let dump = concat!(
+        r#"{"type":"node","id":1,"labels":["User"],"properties":{"name":"a"}}"#,
+        "\n",
+        r#"{"type":"node","id":2,"labels":["User"],"properties":{"name":"b"}}"#,
+    );
+
+    let refused = restore::run(
+        &target,
+        BackupFormat::Json,
+        &dump.as_bytes(),
+        &RestoreOptions::default(),
+    )
+    .expect_err("the restore took sequences another allocator holds");
+    assert!(
+        matches!(&refused, RestoreError::IdentifiersIssued { count: 2, first } if first == &[1, 2]),
+        "got {refused:?}"
+    );
+    assert!(competed.get());
+    assert_eq!(
+        lease_ceiling(&db),
+        super::id_lease::NODE_LEASE_SIZE,
+        "only the other allocator's lease was granted"
+    );
+    assert!(
+        db.engine
+            .get(
+                coordinode_storage::engine::partition::Partition::Schema,
+                restore::LOAD_KEY
+            )
+            .expect("read")
+            .is_none(),
+        "a refused load leaves no record"
+    );
+    let rows = db.execute_cypher("MATCH (n:User) RETURN n").expect("match");
+    assert!(rows.is_empty(), "nothing was written: {rows:?}");
+}
+
 #[test]
 fn set_vector_consistency_session() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -1425,7 +1425,6 @@ impl Database {
         shard_id: u16,
         base_dir: &Path,
     ) -> coordinode_query::index::TextIndexRegistry {
-        use coordinode_core::graph::node::NodeRecord;
         use coordinode_query::index::IndexType;
 
         let registry = coordinode_query::index::TextIndexRegistry::new(base_dir);
@@ -1453,12 +1452,27 @@ impl Database {
             }
         }
 
+        Self::populate_text_indexes(&registry, engine, interner, shard_id, &text_defs);
+        registry
+    }
+
+    /// Register `text_defs` in `registry` and fill them from the nodes stored
+    /// on `shard_id`, one scan for all of them.
+    fn populate_text_indexes(
+        registry: &coordinode_query::index::TextIndexRegistry,
+        engine: &StorageEngine,
+        interner: &FieldInterner,
+        shard_id: u16,
+        text_defs: &[coordinode_query::index::IndexDefinition],
+    ) {
+        use coordinode_core::graph::node::NodeRecord;
+
         if text_defs.is_empty() {
-            return registry;
+            return;
         }
 
         // Step 2: Register all definitions (creates empty tantivy indexes).
-        for def in &text_defs {
+        for def in text_defs {
             if let Err(e) = registry.register(def.clone()) {
                 tracing::warn!("failed to register text index {}: {e}", def.name);
             }
@@ -1467,7 +1481,7 @@ impl Database {
         // Step 3: Scan node: partition once, populating all text indexes.
         let mut label_props: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for def in &text_defs {
+        for def in text_defs {
             let entry = label_props.entry(def.label.clone()).or_default();
             for prop in &def.properties {
                 if !entry.contains(prop) {
@@ -1488,7 +1502,7 @@ impl Database {
             Ok(it) => it,
             Err(e) => {
                 tracing::warn!("failed to scan nodes for text index rebuild: {e}");
-                return registry;
+                return;
             }
         };
 
@@ -1529,8 +1543,6 @@ impl Database {
                 text_defs.len()
             );
         }
-
-        registry
     }
 
     /// Snapshot the current session defaults into a [`QuerySession`].
@@ -3329,6 +3341,104 @@ impl Database {
     /// itself.
     pub fn field_registrar(&self) -> Arc<dyn FieldRegistrar> {
         Arc::clone(&self.fields) as Arc<dyn FieldRegistrar>
+    }
+
+    /// Restore a logical backup or import into this database, keeping every
+    /// node identifier of the input.
+    ///
+    /// The whole input is checked before anything is written: an identifier
+    /// this database already issued refuses it, since writing it would
+    /// replace a live node or hand the identifier out twice. The identifier
+    /// lease is then raised above the input's identifiers through the log, so
+    /// no node created later takes one. A crash midway leaves a record of the
+    /// load, and restoring the same input again finishes it.
+    ///
+    /// # Errors
+    ///
+    /// [`RestoreError::IdentifiersIssued`] when an identifier is already
+    /// issued here; [`RestoreError::UnfinishedLoad`] when an interrupted
+    /// restore of a different input holds part of this database;
+    /// [`RestoreError::Unsupported`] for a snapshot; otherwise a malformed or
+    /// incompatible input, or a storage or lease failure.
+    pub fn restore(
+        &self,
+        format: crate::backup::BackupFormat,
+        source: &dyn crate::backup::restore::RestoreSource,
+        options: &crate::backup::restore::RestoreOptions<'_>,
+    ) -> Result<crate::backup::restore::RestoreStats, crate::backup::restore::RestoreError> {
+        let leases = id_lease::LogLeaseReserver::new(
+            Arc::clone(&self.engine),
+            Arc::clone(&self.pipeline),
+            Arc::clone(&self.proposal_id_gen),
+            Arc::clone(&self.oracle),
+        );
+        let raise = |base: u64, target: u64, token| {
+            leases
+                .raise_from(base, target, token)
+                .map_err(|e| e.to_string())
+        };
+        let build_indexes = || self.build_indexes_over_stored_nodes();
+        let target = crate::backup::restore::RestoreTarget {
+            engine: &self.engine,
+            fields: self.fields.as_ref(),
+            raise_lease: &raise,
+            build_indexes: &build_indexes,
+        };
+        crate::backup::restore::run(&target, format, source, options)
+    }
+
+    /// Build every declared index again from the nodes in the store: the
+    /// records a restore writes reach no index on their way in. Index
+    /// definitions the load itself brought are taken up first.
+    fn build_indexes_over_stored_nodes(&self) -> Result<(), String> {
+        use coordinode_query::index::IndexType;
+
+        let defs = coordinode_query::index::ops::list_index_definitions(&self.engine)
+            .map_err(|e| format!("read the index definitions: {e}"))?;
+        self.refresh_btree_indexes().map_err(|e| e.to_string())?;
+        for def in defs.iter().filter(|d| d.index_type == IndexType::BTree) {
+            self.build_btree_index(def.clone(), FailedBuild::Keep)
+                .map_err(|e| format!("build index '{}': {e}", def.name))?;
+        }
+
+        let fields = self.fields.current().map_err(|e| e.to_string())?;
+        let hnsw: Vec<_> = defs
+            .iter()
+            .filter(|d| d.index_type == IndexType::Hnsw && d.vector_config.is_some())
+            .cloned()
+            .collect();
+        if !hnsw.is_empty() {
+            for def in &hnsw {
+                self.vector_index_registry
+                    .unregister(&def.label, def.property());
+            }
+            Self::register_and_populate_hnsw(
+                &self.vector_index_registry,
+                &fields,
+                &self.engine,
+                self.shard_id,
+                &hnsw,
+                PopulateMode::Blocking,
+            );
+        }
+
+        let text: Vec<_> = defs
+            .iter()
+            .filter(|d| d.index_type == IndexType::Text && d.text_config.is_some())
+            .cloned()
+            .collect();
+        for def in &text {
+            self.text_index_registry
+                .unregister(&def.label, def.property());
+        }
+        Self::populate_text_indexes(
+            &self.text_index_registry,
+            &self.engine,
+            &fields,
+            self.shard_id,
+            &text,
+        );
+        Ok(())
     }
 
     /// Get the query advisor registry for performance analysis.

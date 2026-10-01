@@ -59,9 +59,67 @@ impl LogLeaseReserver {
         }
     }
 
-    fn ceiling(&self) -> Result<u64, IdLeaseError> {
+    /// The highest sequence the log has granted so far.
+    pub(crate) fn ceiling(&self) -> Result<u64, IdLeaseError> {
         node_lease_ceiling(&self.engine)
             .map_err(|e| IdLeaseError::NotGranted(format!("read the lease records: {e}")))
+    }
+
+    /// Propose the grant `(base, target]` under `token` and report whether
+    /// this proposal is the one the log applied.
+    fn grant(
+        &self,
+        base: u64,
+        target: u64,
+        token: Option<[u8; NODE_LEASE_TOKEN_LEN]>,
+    ) -> Result<bool, IdLeaseError> {
+        let id = self.proposal_ids.next();
+        let commit_ts = self.oracle.next();
+        let token = token.unwrap_or_else(|| {
+            let mut token = [0u8; NODE_LEASE_TOKEN_LEN];
+            token[..8].copy_from_slice(&id.as_raw().to_be_bytes());
+            token[8..].copy_from_slice(&commit_ts.as_raw().to_be_bytes());
+            token
+        });
+
+        self.pipeline
+            .propose_and_wait(&RaftProposal {
+                id,
+                mutations: vec![Mutation::Command(MetadataCommand::GrantNodeLease {
+                    base,
+                    ceiling: target,
+                    token,
+                })],
+                commit_ts,
+                start_ts: Timestamp::from_raw(0),
+                bypass_rate_limiter: false,
+            })
+            .map_err(|e| IdLeaseError::NotGranted(e.to_string()))?;
+
+        let holder = node_lease_holder(&self.engine, target)
+            .map_err(|e| IdLeaseError::NotGranted(format!("read the lease record: {e}")))?;
+        Ok(holder == Some(token))
+    }
+
+    /// Take `(base, target]` under `token` while the granted ceiling is
+    /// still `base`, so no allocator of the group ever hands out a sequence
+    /// of it: a restore takes the sequences of the identifiers it writes this
+    /// way. `false` when another grant moved the ceiling first, since a range
+    /// taken in between may hold sequences the caller checked as free.
+    pub(crate) fn raise_from(
+        &self,
+        base: u64,
+        target: u64,
+        token: [u8; NODE_LEASE_TOKEN_LEN],
+    ) -> Result<bool, IdLeaseError> {
+        if target > NODE_ID_MAX_SEQUENCE {
+            return Err(IdLeaseError::Exhausted { shard_hint: 0 });
+        }
+        let _granting = self.granting.lock();
+        if self.ceiling()? != base {
+            return Ok(false);
+        }
+        self.grant(base, target, Some(token))
     }
 }
 
@@ -75,30 +133,7 @@ impl IdLeaseReserver for LogLeaseReserver {
             }
             // base < 2^44, so the sum cannot overflow a u64.
             let target = (base + NODE_LEASE_SIZE).min(NODE_ID_MAX_SEQUENCE);
-
-            let id = self.proposal_ids.next();
-            let commit_ts = self.oracle.next();
-            let mut token = [0u8; NODE_LEASE_TOKEN_LEN];
-            token[..8].copy_from_slice(&id.as_raw().to_be_bytes());
-            token[8..].copy_from_slice(&commit_ts.as_raw().to_be_bytes());
-
-            self.pipeline
-                .propose_and_wait(&RaftProposal {
-                    id,
-                    mutations: vec![Mutation::Command(MetadataCommand::GrantNodeLease {
-                        base,
-                        ceiling: target,
-                        token,
-                    })],
-                    commit_ts,
-                    start_ts: Timestamp::from_raw(0),
-                    bypass_rate_limiter: false,
-                })
-                .map_err(|e| IdLeaseError::NotGranted(e.to_string()))?;
-
-            let holder = node_lease_holder(&self.engine, target)
-                .map_err(|e| IdLeaseError::NotGranted(format!("read the lease record: {e}")))?;
-            if holder == Some(token) {
+            if self.grant(base, target, None)? {
                 return Ok(IdLease {
                     base,
                     ceiling: target,

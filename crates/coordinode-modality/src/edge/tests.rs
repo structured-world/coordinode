@@ -120,10 +120,10 @@ fn edge_without_props_returns_none_from_get_props() {
 }
 
 #[test]
-fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
+fn scan_props_snapshot_reads_body_and_nothing_via_mvcc_snapshot() {
     // Snapshot-aware read (backup export path): an edge written
     // with a property body is returned through a plain engine snapshot,
-    // and a property-less edge returns None (not "missing edge").
+    // and a property-less edge returns nothing (not "missing edge").
     let db = open();
     let a = NodeId::from_raw(11);
     let b = NodeId::from_raw(22);
@@ -135,18 +135,72 @@ fn get_props_snapshot_reads_body_and_none_via_mvcc_snapshot() {
     let store = LocalEdgeStore;
     let snap = db.engine.snapshot();
     let loaded = store
-        .get_props_snapshot(&db.engine, &snap, "OWNS", a, b)
-        .expect("ok")
-        .expect("Some");
+        .scan_props_snapshot(&db.engine, &snap, "OWNS", a, b)
+        .expect("ok");
     assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, None, "a plain edge has no discriminator");
+    assert_eq!(loaded[0].1.len(), 1);
 
     db.write(|s, t| s.put_edge(t, "LIKES", a, b, None).expect("put"));
     let snap2 = db.engine.snapshot();
     assert!(
         store
-            .get_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
+            .scan_props_snapshot(&db.engine, &snap2, "LIKES", a, b)
             .expect("ok")
-            .is_none()
+            .is_empty()
+    );
+}
+
+/// Each instance of a discriminated or temporal edge comes back with its own
+/// key suffix, and a direct write under that suffix lands on the same key: a
+/// backup carries every instance of a pair, not only the plain body.
+#[test]
+fn every_instance_of_a_pair_comes_back_with_its_discriminator() {
+    let db = open();
+    let a = NodeId::from_raw(41);
+    let b = NodeId::from_raw(42);
+    db.write(|s, t| {
+        s.put_edge_temporal(t, "WORKS_AT", a, b, 1_000, &props_with(7, 1))
+            .expect("first version");
+        s.put_edge_temporal(t, "WORKS_AT", a, b, 2_000, &props_with(7, 2))
+            .expect("second version");
+    });
+
+    let store = LocalEdgeStore;
+    let snap = db.engine.snapshot();
+    let instances = store
+        .scan_props_snapshot(&db.engine, &snap, "WORKS_AT", a, b)
+        .expect("ok");
+    assert_eq!(instances.len(), 2, "both versions, and no plain body");
+    for (suffix, props) in &instances {
+        let suffix = suffix
+            .as_deref()
+            .expect("an instance carries its discriminator");
+        let key = coordinode_core::graph::edge::temporal_edgeprop_pair_prefix("WORKS_AT", a, b)
+            .into_iter()
+            .chain(suffix.iter().copied())
+            .collect::<Vec<u8>>();
+        let (_, _, _, valid_from) =
+            coordinode_core::graph::edge::decode_temporal_edgeprop_key(&key).expect("decodes");
+        assert!(valid_from == 1_000 || valid_from == 2_000);
+        assert_eq!(props.len(), 1);
+    }
+
+    // Written back under their suffixes into another pair, the instances land
+    // on the keys the temporal store reads.
+    let c = NodeId::from_raw(43);
+    for (suffix, props) in &instances {
+        store
+            .put_props_direct(&db.engine, "WORKS_AT", a, c, suffix.as_deref(), props)
+            .expect("direct put");
+    }
+    let r = db.read();
+    let versions = store
+        .scan_edge_versions(&r, "WORKS_AT", a, c)
+        .expect("versions");
+    assert_eq!(
+        versions.iter().map(|(vf, _)| *vf).collect::<Vec<_>>(),
+        vec![1_000, 2_000]
     );
 }
 
@@ -160,15 +214,15 @@ fn put_props_direct_writes_canonical_body_readable_via_snapshot() {
     let b = NodeId::from_raw(32);
     let store = LocalEdgeStore;
     store
-        .put_props_direct(&db.engine, "OWNS", a, b, &props_with(7, 42))
+        .put_props_direct(&db.engine, "OWNS", a, b, None, &props_with(7, 42))
         .expect("direct put");
 
     let snap = db.engine.snapshot();
     let loaded = store
-        .get_props_snapshot(&db.engine, &snap, "OWNS", a, b)
-        .expect("ok")
-        .expect("Some");
+        .scan_props_snapshot(&db.engine, &snap, "OWNS", a, b)
+        .expect("ok");
     assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].1.len(), 1);
 
     // Same body via a transactional put_edge on a different edge reads back
     // to the same encoded bytes through get_props — proves wire identity.
@@ -182,7 +236,7 @@ fn put_props_direct_writes_canonical_body_readable_via_snapshot() {
         .get_props(&r, "OWNS", a, c)
         .expect("ok")
         .expect("Some");
-    assert_eq!(via_put_edge.len(), loaded.len());
+    assert_eq!(via_put_edge.len(), loaded[0].1.len());
 }
 
 #[test]

@@ -13,9 +13,8 @@
 //! 2. `export_binary` (or `_json`) into a `Vec<u8>` against a
 //!    consistent snapshot.
 //! 3. Open a fresh `db2` in a separate tempdir.
-//! 4. `restore_binary` into `db2.engine()` through `db2`'s field
-//!    registrar, which publishes the dump's bindings before the records
-//!    encoded with them are written.
+//! 4. `Database::restore` into `db2`, which publishes the dump's bindings
+//!    before the records encoded with them are written.
 //! 5. Run MATCH queries on `db2`, assert each property / label /
 //!    edge endpoint matches what `db1` had.
 
@@ -23,7 +22,8 @@
 
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
-use coordinode_embed::backup::{export, restore};
+use coordinode_embed::backup::restore::RestoreOptions;
+use coordinode_embed::backup::{BackupFormat, export};
 
 /// Build `(db2, _tempdir_keepalive)` from `db1`'s binary dump. The tempdir
 /// handle must stay alive (held by the caller) for the duration of the
@@ -42,20 +42,14 @@ fn dump_restore_binary(db1: &Database) -> (Database, tempfile::TempDir) {
 
     let dir2 = tempfile::tempdir().expect("tempdir for db2");
     let db2 = Database::open(dir2.path()).expect("open db2");
-    let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_binary(
-        db2.engine(),
-        db2.field_registrar().as_ref(),
-        &mut cursor,
-        false,
-    )
-    .expect("restore_binary");
+    db2.restore(BackupFormat::Binary, &buf, &RestoreOptions::default())
+        .expect("restore binary");
 
     (db2, dir2)
 }
 
 /// Round-trip through the cypher dump format: export to a cypher string,
-/// restore via `restore_cypher` into a fresh db. Mirrors the binary path
+/// restore it into a fresh db. Mirrors the binary path
 /// but exercises the text format's parser.
 fn dump_restore_cypher(db1: &Database) -> (Database, tempfile::TempDir) {
     let mut buf = Vec::new();
@@ -71,9 +65,8 @@ fn dump_restore_cypher(db1: &Database) -> (Database, tempfile::TempDir) {
 
     let dir2 = tempfile::tempdir().expect("tempdir for db2");
     let db2 = Database::open(dir2.path()).expect("open db2");
-    let mut cursor = std::io::Cursor::new(&buf);
-    restore::restore_cypher(db2.engine(), db2.field_registrar().as_ref(), 1, &mut cursor)
-        .expect("restore_cypher");
+    db2.restore(BackupFormat::Cypher, &buf, &RestoreOptions::default())
+        .expect("restore cypher");
     (db2, dir2)
 }
 
@@ -357,4 +350,401 @@ fn temporal_node_survives_binary_roundtrip() {
         "later valid_to must be null / absent, got {:?}",
         versions[1].1,
     );
+}
+
+/// Round-trip through the json dump format.
+fn dump_restore_json(db1: &Database) -> (Database, tempfile::TempDir) {
+    let mut buf = Vec::new();
+    let snapshot = db1.engine().snapshot();
+    export::export_json(
+        db1.engine(),
+        &db1.interner().expect("dictionary"),
+        1,
+        &snapshot,
+        &mut buf,
+    )
+    .expect("export_json");
+
+    let dir2 = tempfile::tempdir().expect("tempdir for db2");
+    let db2 = Database::open(dir2.path()).expect("open db2");
+    db2.restore(BackupFormat::Json, &buf, &RestoreOptions::default())
+        .expect("restore json");
+    (db2, dir2)
+}
+
+/// The ids of every `Person`, by name.
+fn person_ids(db: &mut Database) -> Vec<(String, i64)> {
+    let mut rows: Vec<(String, i64)> = db
+        .execute_cypher("MATCH (n:Person) RETURN n.name AS name, id(n) AS id")
+        .expect("MATCH people")
+        .into_iter()
+        .map(|r| match (r.get("name"), r.get("id")) {
+            (Some(Value::String(name)), Some(Value::Int(id))) => (name.clone(), *id),
+            other => panic!("unexpected row {other:?}"),
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A node created after a restore gets an identifier no restored node has,
+/// and no restored node is overwritten. A restore writes each node under its
+/// original identifier; a target that still allocates from the start of the
+/// sequence space would hand the first restored identifier out again, and the
+/// new node, a put by key, would replace the restored one.
+#[test]
+fn a_node_created_after_a_restore_takes_a_fresh_identifier() {
+    for (format, dump_restore) in [
+        ("json", dump_restore_json as fn(&Database) -> _),
+        ("binary", dump_restore_binary),
+        ("cypher", dump_restore_cypher),
+    ] {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        for name in ["Ada", "Bea", "Cal"] {
+            db1.execute_cypher(&format!("CREATE (:Person {{name: '{name}'}})"))
+                .unwrap();
+        }
+        let restored = person_ids(&mut db1);
+
+        let (mut db2, _keep) = dump_restore(&db1);
+        assert_eq!(person_ids(&mut db2), restored, "{format}: ids kept");
+
+        db2.execute_cypher("CREATE (:Person {name: 'Dan'})")
+            .unwrap();
+        let after = person_ids(&mut db2);
+        assert_eq!(after.len(), 4, "{format}: no restored node was replaced");
+        for kept in &restored {
+            assert!(after.contains(kept), "{format}: {kept:?} survived");
+        }
+        let dan = after.iter().find(|(n, _)| n == "Dan").expect("Dan").1;
+        assert!(
+            restored.iter().all(|(_, id)| *id != dan),
+            "{format}: the new node took a restored identifier {dan}"
+        );
+    }
+}
+
+/// Every format CoordiNode writes and reads back.
+const OWN_FORMATS: [BackupFormat; 3] = [
+    BackupFormat::Json,
+    BackupFormat::Cypher,
+    BackupFormat::Binary,
+];
+
+/// A dump of `db` in one of the formats CoordiNode writes.
+fn dump_of(db: &Database, format: BackupFormat) -> Vec<u8> {
+    let interner = db.interner().expect("dictionary");
+    let snapshot = db.engine().snapshot();
+    let mut buf = Vec::new();
+    match format {
+        BackupFormat::Json => export::export_json(db.engine(), &interner, 1, &snapshot, &mut buf),
+        BackupFormat::Cypher => {
+            export::export_cypher(db.engine(), &interner, 1, &snapshot, &mut buf)
+        }
+        _ => export::export_binary(db.engine(), &interner, 1, &snapshot, &mut buf),
+    }
+    .expect("export");
+    buf
+}
+
+/// Every instance of a temporal edge between one pair comes back with its own
+/// discriminator: the text formats used to key all instances of a pair alike,
+/// so the restore kept one and dropped the others.
+#[test]
+fn every_temporal_edge_instance_survives_every_format() {
+    const EDGE_TYPE: &str = "CREATE EDGE TYPE WORKS_AT TEMPORAL \
+                             WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)";
+    let instances = |db: &mut Database| {
+        let mut rows: Vec<(Option<Value>, Option<Value>)> = db
+            .execute_cypher(
+                "MATCH (:Person {name: 'B'})-[r:WORKS_AT]->(:Co {name: 'Acme'}) \
+                 RETURN r.role AS role, r.valid_from AS vf",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get("role").cloned(), r.get("vf").cloned()))
+            .collect();
+        rows.sort_by_key(|(role, _)| format!("{role:?}"));
+        rows
+    };
+
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher(EDGE_TYPE).unwrap();
+        db1.execute_cypher("CREATE (:Person {name: 'B'}), (:Co {name: 'Acme'})")
+            .unwrap();
+        for (from, to, role) in [(1000, 2000, "SWE"), (2000, 3000, "Staff")] {
+            db1.execute_cypher(&format!(
+                "MATCH (b:Person {{name: 'B'}}), (c:Co {{name: 'Acme'}}) \
+                 CREATE (b)-[:WORKS_AT {{valid_from: {from}, valid_to: {to}, role: '{role}'}}]->(c)"
+            ))
+            .unwrap();
+        }
+        let expected = instances(&mut db1);
+        assert_eq!(expected.len(), 2, "the source holds both instances");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        // A cypher dump carries data only; the others bring their schema.
+        if format == BackupFormat::Cypher {
+            db2.execute_cypher(EDGE_TYPE).unwrap();
+        }
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+        assert_eq!(instances(&mut db2), expected, "{format:?}");
+    }
+}
+
+/// Every version of a temporal node comes back in every format, under its
+/// own identifier and valid_from: the text formats used to skip versions.
+#[test]
+fn every_temporal_node_version_survives_every_format() {
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher(
+            "CREATE NODE TYPE Person TEMPORAL WITH \
+             (name: STRING NOT NULL, valid_from: INT NOT NULL, valid_to: INT)",
+        )
+        .unwrap();
+        db1.execute_cypher("CREATE (:Person {name: 'Alice', valid_from: 1000, valid_to: 2000})")
+            .unwrap();
+        db1.execute_cypher("CREATE (:Person {name: 'Alice', valid_from: 2000})")
+            .unwrap();
+        let versions = |db: &mut Database| {
+            let mut rows: Vec<(i64, Option<Value>)> = db
+                .execute_cypher(
+                    "MATCH (n:Person {name: 'Alice'}) \
+                     RETURN id(n) AS id, n.valid_from AS vf",
+                )
+                .unwrap()
+                .into_iter()
+                .map(|r| match r.get("id") {
+                    Some(Value::Int(id)) => (*id, r.get("vf").cloned()),
+                    other => panic!("no id: {other:?}"),
+                })
+                .collect();
+            rows.sort_by_key(|(id, vf)| (*id, format!("{vf:?}")));
+            rows
+        };
+        let expected = versions(&mut db1);
+        assert_eq!(expected.len(), 2);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+        assert_eq!(versions(&mut db2), expected, "{format:?}");
+    }
+}
+
+/// A restored database answers through its B-tree indexes and enforces their
+/// constraints for the restored nodes: the load writes node records directly,
+/// so the indexes are built from them before the restore returns, whether the
+/// dump brought the definition or the target declared it.
+#[test]
+fn indexes_cover_the_restored_nodes_in_every_format() {
+    const INDEX: &str = "CREATE UNIQUE INDEX u_email ON :U(email)";
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher(INDEX).unwrap();
+        db1.execute_cypher("CREATE (:U {email: 'a@x'}), (:U {email: 'b@x'})")
+            .unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        // A cypher dump carries data only; the others bring the index.
+        if format == BackupFormat::Cypher {
+            db2.execute_cypher(INDEX).unwrap();
+        }
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+
+        let found = db2
+            .execute_cypher("MATCH (u:U {email: 'a@x'}) RETURN u.email AS email")
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "{format:?}: the index finds a restored node"
+        );
+        let refused = db2.execute_cypher("CREATE (:U {email: 'b@x'})");
+        assert!(
+            refused.is_err(),
+            "{format:?}: a restored value is held by the unique index"
+        );
+        db2.execute_cypher("CREATE (:U {email: 'c@x'})")
+            .unwrap_or_else(|e| panic!("{format:?}: a new value is free: {e}"));
+    }
+}
+
+/// A `json` dump brings its schema, and a target that declares one of its
+/// types differently is refused before anything is written: reading the dump
+/// under the target's declaration would give its records another meaning.
+#[test]
+fn a_json_restore_refuses_a_target_that_declares_its_types_otherwise() {
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut db1 = Database::open(dir1.path()).unwrap();
+    db1.execute_cypher(
+        "CREATE EDGE TYPE WORKS_AT TEMPORAL \
+         WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)",
+    )
+    .unwrap();
+    db1.execute_cypher("CREATE (:Person {name: 'B'}), (:Co {name: 'Acme'})")
+        .unwrap();
+    let dump = dump_of(&db1, BackupFormat::Json);
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut db2 = Database::open(dir2.path()).unwrap();
+    db2.execute_cypher("CREATE EDGE TYPE WORKS_AT WITH (role: STRING)")
+        .unwrap();
+    let refused = db2
+        .restore(BackupFormat::Json, &dump, &RestoreOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            coordinode_embed::backup::restore::RestoreError::SchemaMismatch(_)
+        ),
+        "got {refused:?}"
+    );
+    let rows = db2.execute_cypher("MATCH (n) RETURN n").unwrap();
+    assert!(rows.is_empty(), "nothing written: {rows:?}");
+}
+
+/// A vector index holds every restored vector before any reopen, in every
+/// format: the restore builds it from the stored nodes, as an open does.
+#[test]
+fn a_vector_index_holds_the_restored_vectors_in_every_format() {
+    const INDEX: &str = "CREATE VECTOR INDEX item_emb ON :Item(emb) OPTIONS {metric: \"l2\"}";
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher(INDEX).unwrap();
+        db1.execute_cypher(
+            "CREATE (:Item {emb: [1.0, 0.0]}), (:Item {emb: [0.0, 1.0]}), (:Item {emb: [0.5, 0.5]})",
+        )
+        .unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        if format == BackupFormat::Cypher {
+            db2.execute_cypher(INDEX).unwrap();
+        }
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+        let held = db2
+            .vector_index_registry()
+            .get("Item", "emb")
+            .map(|hnsw| hnsw.read().expect("hnsw lock").len());
+        assert_eq!(held, Some(3), "{format:?}");
+    }
+}
+
+/// A text index answers for the restored nodes before any reopen, in every
+/// format: its documents come from the stored nodes, as on open.
+#[test]
+fn a_text_index_covers_the_restored_nodes_in_every_format() {
+    const INDEX: &str = "CREATE TEXT INDEX article_body ON :Article(body)";
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher(INDEX).unwrap();
+        db1.execute_cypher(
+            "CREATE (:Article {body: 'rust storage engines'}), (:Article {body: 'gardening'})",
+        )
+        .unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        if format == BackupFormat::Cypher {
+            db2.execute_cypher(INDEX).unwrap();
+        }
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+        let rows = db2
+            .execute_cypher(
+                "MATCH (a:Article) WHERE text_match(a.body, 'rust') RETURN a.body AS body",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{format:?}: {rows:?}");
+    }
+}
+
+/// Restored data that breaks a unique index the target declared is reported
+/// by the restore, and the index is set aside as failed rather than left to
+/// answer lookups it holds no entries for: a read still finds every
+/// restored node.
+#[test]
+fn restored_data_breaking_a_unique_index_is_reported() {
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut db1 = Database::open(dir1.path()).unwrap();
+    db1.execute_cypher("CREATE (:U {email: 'a@x'}), (:U {email: 'a@x'})")
+        .unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut db2 = Database::open(dir2.path()).unwrap();
+    db2.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .unwrap();
+    let refused = db2
+        .restore(
+            BackupFormat::Json,
+            &dump_of(&db1, BackupFormat::Json),
+            &RestoreOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            coordinode_embed::backup::restore::RestoreError::Indexes(_)
+        ),
+        "got {refused:?}"
+    );
+    let found = db2
+        .execute_cypher("MATCH (u:U {email: 'a@x'}) RETURN u")
+        .unwrap();
+    assert_eq!(found.len(), 2, "a read finds both restored nodes");
+}
+
+/// An export reads adjacency, edge bodies and nodes at one snapshot: an edge
+/// written after the snapshot is in none of them, so no dump holds half of it.
+#[test]
+fn an_edge_written_after_the_export_snapshot_is_not_exported() {
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        db1.execute_cypher("CREATE (:Person {name: 'A'}), (:Person {name: 'B'})")
+            .unwrap();
+        let snapshot = db1.engine().snapshot();
+        db1.execute_cypher(
+            "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) \
+             CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+        )
+        .unwrap();
+
+        let interner = db1.interner().unwrap();
+        let mut buf = Vec::new();
+        let stats = match format {
+            BackupFormat::Json => {
+                export::export_json(db1.engine(), &interner, 1, &snapshot, &mut buf)
+            }
+            BackupFormat::Cypher => {
+                export::export_cypher(db1.engine(), &interner, 1, &snapshot, &mut buf)
+            }
+            _ => export::export_binary(db1.engine(), &interner, 1, &snapshot, &mut buf),
+        }
+        .unwrap();
+        assert_eq!(stats.nodes, 2, "{format:?}");
+        assert_eq!(stats.edges, 0, "{format:?}: the later edge exported");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        db2.restore(format, &buf, &RestoreOptions::default())
+            .unwrap();
+        let rows = db2.execute_cypher("MATCH ()-[r]->() RETURN r").unwrap();
+        assert!(rows.is_empty(), "{format:?}: restored {rows:?}");
+    }
 }

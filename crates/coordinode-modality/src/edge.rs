@@ -78,33 +78,37 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Option<EdgeProperties>>;
 
-    /// Snapshot-aware read of edge properties for `(edge_type, src, tgt)`,
-    /// for callers that hold an MVCC [`StorageSnapshot`] rather than a
-    /// [`Transaction`] — backup export takes one consistent snapshot up front
-    /// and reads every edge through it. Same semantics as
-    /// [`Self::get_props`]: `None` when the edge carries no property body.
-    fn get_props_snapshot(
+    /// Every property body of `(edge_type, src, tgt)` visible at an MVCC
+    /// [`StorageSnapshot`], for backup export, which reads every edge through
+    /// one snapshot taken up front. The body of a plain edge comes with `None`;
+    /// each instance of a `DISCRIMINATED BY` or temporal edge type comes with
+    /// its key suffix, the encoded discriminator, so an export carries it byte
+    /// for byte. Empty when the edge has no property body.
+    fn scan_props_snapshot(
         &self,
         engine: &StorageEngine,
         snapshot: &StorageSnapshot,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
-    ) -> StoreResult<Option<EdgeProperties>>;
+    ) -> StoreResult<Vec<(Option<Vec<u8>>, EdgeProperties)>>;
 
-    /// Direct, non-transactional write of the edge property body for
-    /// `(edge_type, src, tgt)`, for the backup restore path that applies writes
-    /// straight to the engine (the oracle auto-stamps the seqno) rather
-    /// than through a [`Transaction`]. Writes ONLY the edgeprop body — adjacency
-    /// is restored separately — and encodes through the single canonical
-    /// edge-property codec, so restored bytes are identical to a put_edge write.
-    /// A typed helper so restore never hand-rolls the edge-prop key.
+    /// Direct, non-transactional write of one edge property body, for the
+    /// backup restore path that applies writes straight to the engine (the
+    /// oracle auto-stamps the seqno) rather than through a [`Transaction`].
+    /// `suffix` is the encoded discriminator of an instance, as
+    /// [`Self::scan_props_snapshot`] reports it, or `None` for a plain edge.
+    /// Writes ONLY the edgeprop body (adjacency is restored separately) through
+    /// the single canonical edge-property codec, so restored bytes are identical
+    /// to a transactional write. A typed helper so restore never hand-rolls the
+    /// edge-prop key.
     fn put_props_direct(
         &self,
         engine: &StorageEngine,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
+        suffix: Option<&[u8]>,
         props: &EdgeProperties,
     ) -> StoreResult<()>;
 
@@ -587,19 +591,27 @@ impl EdgeStore for LocalEdgeStore {
         }
     }
 
-    fn get_props_snapshot(
+    fn scan_props_snapshot(
         &self,
         engine: &StorageEngine,
         snapshot: &StorageSnapshot,
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
-    ) -> StoreResult<Option<EdgeProperties>> {
+    ) -> StoreResult<Vec<(Option<Vec<u8>>, EdgeProperties)>> {
+        let mut out = Vec::new();
         let key = encode_edgeprop_key(edge_type, src, tgt);
-        match engine.snapshot_get(snapshot, Partition::EdgeProp, &key)? {
-            Some(bytes) => Self::decode_props(&bytes).map(Some),
-            None => Ok(None),
+        if let Some(bytes) = engine.snapshot_get(snapshot, Partition::EdgeProp, &key)? {
+            out.push((None, Self::decode_props(&bytes)?));
         }
+        // Instances sit under the pair key plus ':'; the plain key above has
+        // no ':' after the target, so the scan does not meet it again.
+        let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+        for (key, bytes) in engine.snapshot_prefix_scan(snapshot, Partition::EdgeProp, &prefix)? {
+            let suffix = key[prefix.len()..].to_vec();
+            out.push((Some(suffix), Self::decode_props(&bytes)?));
+        }
+        Ok(out)
     }
 
     fn put_props_direct(
@@ -608,9 +620,17 @@ impl EdgeStore for LocalEdgeStore {
         edge_type: &str,
         src: NodeId,
         tgt: NodeId,
+        suffix: Option<&[u8]>,
         props: &EdgeProperties,
     ) -> StoreResult<()> {
-        let key = encode_edgeprop_key(edge_type, src, tgt);
+        let key = match suffix {
+            None => encode_edgeprop_key(edge_type, src, tgt),
+            Some(suffix) => {
+                let mut key = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
+                key.extend_from_slice(suffix);
+                key
+            }
+        };
         let value = Self::encode_props(props)?;
         engine.put(Partition::EdgeProp, &key, &value)?;
         Ok(())

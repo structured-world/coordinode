@@ -210,117 +210,17 @@ pub(crate) fn run_restore(
     let db = coordinode_embed::Database::open_with_config(storage_config)
         .map_err(|e| format!("failed to open database: {e}"))?;
 
-    let file = std::fs::File::open(&input)
-        .map_err(|e| format!("failed to open input file '{input}': {e}"))?;
-    // Transparently decompress a bzip2/gzip-compressed input (tool-side,
-    // pure-Rust). Uncompressed input passes through unchanged.
-    let mut reader = decompressing_reader(file)
-        .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
-
-    // Every restore path publishes the bindings its records need through the
-    // database's registrar before writing them.
-    let fields = db.field_registrar();
+    // A bzip2/gzip-compressed input is decompressed tool-side (pure Rust);
+    // an uncompressed one passes through unchanged. A logical restore reads
+    // it twice, so the file is opened once per pass.
+    let source = InputFile {
+        path: std::path::PathBuf::from(&input),
+    };
     match format {
-        coordinode_embed::backup::BackupFormat::Json => {
-            let shard_id = 1u16;
-            let stats = coordinode_embed::backup::restore::restore_json(
-                db.engine(),
-                fields.as_ref(),
-                shard_id,
-                &mut reader,
-                label_filter.as_ref(),
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (json)"
-            );
-        }
-        coordinode_embed::backup::BackupFormat::Binary => {
-            let stats = coordinode_embed::backup::restore::restore_binary(
-                db.engine(),
-                fields.as_ref(),
-                &mut reader,
-                force,
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (binary)"
-            );
-        }
-        coordinode_embed::backup::BackupFormat::Cypher => {
-            let shard_id = 1u16;
-            let stats = coordinode_embed::backup::restore::restore_cypher(
-                db.engine(),
-                fields.as_ref(),
-                shard_id,
-                &mut reader,
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (cypher)"
-            );
-        }
-        coordinode_embed::backup::BackupFormat::ApocJson => {
-            let shard_id = 1u16;
-            let stats = coordinode_embed::backup::restore::restore_apoc_json(
-                db.engine(),
-                fields.as_ref(),
-                shard_id,
-                &mut reader,
-                label_filter.as_ref(),
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (apoc-json)"
-            );
-        }
-        coordinode_embed::backup::BackupFormat::ApocCypher => {
-            let shard_id = 1u16;
-            let stats = coordinode_embed::backup::restore::restore_apoc_cypher(
-                db.engine(),
-                fields.as_ref(),
-                shard_id,
-                &mut reader,
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (apoc-cypher)"
-            );
-        }
-        coordinode_embed::backup::BackupFormat::HetioJson => {
-            let shard_id = 1u16;
-            let stats = coordinode_embed::backup::restore::restore_hetio_json(
-                db.engine(),
-                fields.as_ref(),
-                shard_id,
-                &mut reader,
-                label_filter.as_ref(),
-            )
-            .map_err(|e| format!("restore failed: {e}"))?;
-            info!(
-                nodes = stats.nodes,
-                edges = stats.edges,
-                schema = stats.schema_entries,
-                "restore complete (hetio-json)"
-            );
-        }
         coordinode_embed::backup::BackupFormat::RaftSnapshot => {
             use std::io::Read;
+            let mut reader = coordinode_embed::backup::restore::RestoreSource::open(&source)
+                .map_err(|e| format!("failed to read input file '{input}': {e}"))?;
             // Frame: [mode u8][u32 interner_len][interner][snapshot].
             // The snapshot is installed first, then the framed dictionary's
             // exact bindings are published: installing replaces the Schema
@@ -365,9 +265,43 @@ pub(crate) fn run_restore(
                 "restore complete (raft-snapshot)"
             );
         }
+        logical => {
+            let options = coordinode_embed::backup::restore::RestoreOptions {
+                only_labels: label_filter.as_ref(),
+                force,
+                ..Default::default()
+            };
+            let stats = db
+                .restore(logical, &source, &options)
+                .map_err(|e| format!("restore failed: {e}"))?;
+            info!(
+                nodes = stats.nodes,
+                edges = stats.edges,
+                schema = stats.schema_entries,
+                format = ?logical,
+                "restore complete"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// A restore input file, decompressed as it is read.
+struct InputFile {
+    path: std::path::PathBuf,
+}
+
+impl coordinode_embed::backup::restore::RestoreSource for InputFile {
+    fn open(&self) -> std::io::Result<Box<dyn std::io::BufRead + '_>> {
+        let file = std::fs::File::open(&self.path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("open input file '{}': {e}", self.path.display()),
+            )
+        })?;
+        decompressing_reader(file)
+    }
 }
 
 /// Wrap a restore input file so a bzip2- or gzip-compressed dump is

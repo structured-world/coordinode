@@ -97,10 +97,12 @@ pub enum ExportError {
 /// Output format (one JSON object per line):
 /// ```json
 /// {"type":"node","id":1,"labels":["User"],"properties":{"name":"Alice","age":30}}
-/// {"type":"edge","source":1,"target":2,"type":"FOLLOWS","properties":{}}
+/// {"type":"edge","source":1,"target":2,"edge_type":"FOLLOWS","properties":{}}
 /// ```
 ///
-/// Properties use resolved field names (not interned IDs).
+/// Properties use resolved field names (not interned IDs). A version of a
+/// temporal node adds `"valid_from"`, the instant it is stored under; an
+/// instance of a discriminated or temporal edge type adds `"discriminator"`.
 pub fn export_json<W: Write>(
     engine: &StorageEngine,
     interner: &FieldInterner,
@@ -109,6 +111,11 @@ pub fn export_json<W: Write>(
     writer: &mut W,
 ) -> Result<ExportStats, ExportError> {
     let mut stats = ExportStats::default();
+
+    // The schema first, so a restore declares it before the data it shapes.
+    for line in json_schema_lines(engine)? {
+        writeln!(writer, "{line}")?;
+    }
 
     // Export nodes (snapshot prefix_scan returns point-in-time consistent keys)
     let node_prefix = node_shard_prefix(shard_id);
@@ -120,7 +127,7 @@ pub fn export_json<W: Write>(
         .collect();
 
     for (key_bytes, value_bytes) in &entries {
-        let Some((_shard, node_id)) = node::decode_node_key(key_bytes) else {
+        let Some((node_id, valid_from)) = decode_node_version(key_bytes) else {
             continue;
         };
 
@@ -129,68 +136,161 @@ pub fn export_json<W: Write>(
 
         let props = resolve_properties(&record.props, interner)?;
 
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "type": "node",
             "id": node_id.as_raw(),
             "labels": record.labels,
             "properties": props,
         });
+        if let Some(valid_from) = valid_from {
+            json["valid_from"] = serde_json::Value::from(valid_from);
+        }
 
         writeln!(writer, "{json}")?;
         stats.nodes += 1;
     }
 
-    // Export edges (forward adjacency only — reverse is derived)
-    let adj_prefix = b"adj:";
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let iter = engine
-            .prefix_scan(Partition::Adj, adj_prefix)
-            .map_err(|e| ExportError::Storage(e.to_string()))?;
-        let mut result = Vec::new();
-        for guard in iter {
-            let (k, v) = guard
-                .into_inner()
-                .map_err(|e| ExportError::Storage(e.to_string()))?;
-            result.push((k.to_vec(), v.to_vec()));
+    // Export edges: one line per edge, or per instance of a discriminated or
+    // temporal edge type, which carries its encoded discriminator in hex.
+    for_each_edge(engine, snapshot, interner, |edge| {
+        let mut json = serde_json::json!({
+            "type": "edge",
+            "source": edge.source,
+            "target": edge.target,
+            "edge_type": edge.edge_type,
+            "properties": edge.properties,
+        });
+        if let Some(discriminator) = &edge.discriminator {
+            json["discriminator"] = serde_json::Value::String(hex::encode(discriminator));
         }
-        result
+        writeln!(writer, "{json}")?;
+        stats.edges += 1;
+        Ok(())
+    })?;
+
+    Ok(stats)
+}
+
+/// The schema of a `json` dump, one line per declaration in name order: node
+/// labels, edge types and indexes, in logical names. The schema is not
+/// versioned by snapshot, so it is read as it stands, as the binary dump does.
+fn json_schema_lines(engine: &StorageEngine) -> Result<Vec<serde_json::Value>, ExportError> {
+    use coordinode_modality::{
+        IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _,
     };
 
-    for (key_bytes, value_bytes) in &entries {
-        let key_str = match std::str::from_utf8(key_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    let storage = |e: coordinode_modality::StoreError| ExportError::Storage(e.to_string());
+    let encode = |kind: &str, field: &str, body: serde_json::Result<serde_json::Value>| {
+        body.map(|body| serde_json::json!({ "type": kind, field: body }))
+            .map_err(|e| ExportError::Serialization(format!("{kind}: {e}")))
+    };
+    let schemas = LocalSchemaStore::new(engine);
+    let mut labels = schemas.list_labels().map_err(storage)?;
+    labels.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut edge_types = schemas.list_edge_types().map_err(storage)?;
+    edge_types.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut indexes = LocalIndexStore::new(engine)
+        .list_definitions()
+        .map_err(storage)?;
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let mut lines = Vec::with_capacity(labels.len() + edge_types.len() + indexes.len());
+    for label in &labels {
+        lines.push(encode(
+            "label_schema",
+            "schema",
+            serde_json::to_value(label),
+        )?);
+    }
+    for edge_type in &edge_types {
+        lines.push(encode(
+            "edge_type_schema",
+            "schema",
+            serde_json::to_value(edge_type),
+        )?);
+    }
+    for index in &indexes {
+        lines.push(encode("index", "definition", serde_json::to_value(index))?);
+    }
+    Ok(lines)
+}
+
+/// The node a Node key stores, and the valid_from of the version when the
+/// key holds one version of a temporal node.
+fn decode_node_version(key: &[u8]) -> Option<(NodeId, Option<i64>)> {
+    node::decode_node_key(key)
+        .map(|(_, id)| (id, None))
+        .or_else(|| {
+            node::decode_temporal_node_key(key).map(|(_, id, valid_from)| (id, Some(valid_from)))
+        })
+}
+
+/// One edge, or one instance of a discriminated or temporal edge type, as a
+/// text export writes it.
+struct ExportedEdge<'a> {
+    edge_type: &'a str,
+    source: u64,
+    target: u64,
+    /// The encoded discriminator of an instance.
+    discriminator: Option<Vec<u8>>,
+    properties: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Visit every edge visible at `snapshot` through its forward adjacency (the
+/// reverse is derived), once per property instance, or once without
+/// properties for an edge that has none.
+fn for_each_edge(
+    engine: &StorageEngine,
+    snapshot: &StorageSnapshot,
+    interner: &FieldInterner,
+    mut visit: impl FnMut(ExportedEdge<'_>) -> Result<(), ExportError>,
+) -> Result<(), ExportError> {
+    let entries = engine
+        .snapshot_prefix_scan(snapshot, Partition::Adj, b"adj:")
+        .map_err(|e| ExportError::Storage(e.to_string()))?;
+    for (key_bytes, value_bytes) in &entries {
+        let Ok(key_str) = std::str::from_utf8(key_bytes) else {
+            continue;
+        };
         if !key_str.contains(":out:") {
             continue;
         }
-
-        let Some((edge_type, source_id)) = parse_adj_forward_key(key_str) else {
+        let Some((edge_type, source)) = parse_adj_forward_key(key_str) else {
             continue;
         };
-
         let posting_list = PostingList::from_bytes(value_bytes)
             .map_err(|e| ExportError::Serialization(e.to_string()))?;
-
-        for target_id in posting_list.iter() {
-            let edge_props =
-                load_edge_properties(engine, snapshot, &edge_type, source_id, target_id, interner)?;
-
-            let json = serde_json::json!({
-                "type": "edge",
-                "source": source_id,
-                "target": target_id,
-                "edge_type": edge_type,
-                "properties": edge_props,
-            });
-
-            writeln!(writer, "{json}")?;
-            stats.edges += 1;
+        for target in posting_list.iter() {
+            let instances = LocalEdgeStore
+                .scan_props_snapshot(
+                    engine,
+                    snapshot,
+                    &edge_type,
+                    NodeId::from_raw(source),
+                    NodeId::from_raw(target),
+                )
+                .map_err(|e| ExportError::Storage(e.to_string()))?;
+            if instances.is_empty() {
+                visit(ExportedEdge {
+                    edge_type: &edge_type,
+                    source,
+                    target,
+                    discriminator: None,
+                    properties: serde_json::Map::new(),
+                })?;
+            }
+            for (discriminator, props) in instances {
+                visit(ExportedEdge {
+                    edge_type: &edge_type,
+                    source,
+                    target,
+                    discriminator,
+                    properties: resolve_properties(&props.props, interner)?,
+                })?;
+            }
         }
     }
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Export all graph data as OpenCypher CREATE statements.
@@ -219,7 +319,7 @@ pub fn export_cypher<W: Write>(
         .collect();
 
     for (key_bytes, value_bytes) in &entries {
-        let Some((_shard, node_id)) = node::decode_node_key(key_bytes) else {
+        let Some((node_id, valid_from)) = decode_node_version(key_bytes) else {
             continue;
         };
 
@@ -231,66 +331,58 @@ pub fn export_cypher<W: Write>(
         let props_str = format_cypher_props(&props);
 
         let id = node_id.as_raw();
-        if props_str.is_empty() {
-            writeln!(writer, "CREATE (n{id}:{labels});")?;
+        let node = if props_str.is_empty() {
+            format!("CREATE (n{id}:{labels})")
         } else {
-            writeln!(writer, "CREATE (n{id}:{labels} {{{props_str}}});")?;
+            format!("CREATE (n{id}:{labels} {{{props_str}}})")
+        };
+        // A version of a temporal node ends its line with a comment carrying
+        // the valid_from it is stored under, as an edge instance carries its
+        // discriminator.
+        match valid_from {
+            None => writeln!(writer, "{node};")?,
+            Some(valid_from) => writeln!(
+                writer,
+                "{node}{} {valid_from}",
+                super::restore::CYPHER_VALID_FROM
+            )?,
         }
         stats.nodes += 1;
     }
 
-    // Export edges
-    let adj_prefix = b"adj:";
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let iter = engine
-            .prefix_scan(Partition::Adj, adj_prefix)
-            .map_err(|e| ExportError::Storage(e.to_string()))?;
-        let mut result = Vec::new();
-        for guard in iter {
-            let (k, v) = guard
-                .into_inner()
-                .map_err(|e| ExportError::Storage(e.to_string()))?;
-            result.push((k.to_vec(), v.to_vec()));
-        }
-        result
-    };
-
-    for (key_bytes, value_bytes) in &entries {
-        let key_str = match std::str::from_utf8(key_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
+    // Export edges. An instance of a discriminated or temporal edge type ends
+    // its line with a comment carrying the encoded discriminator; a CoordiNode
+    // restore reads it, any other OpenCypher reader skips it.
+    for_each_edge(engine, snapshot, interner, |edge| {
+        let ExportedEdge {
+            edge_type,
+            source,
+            target,
+            discriminator,
+            properties,
+        } = edge;
+        let rel = if properties.is_empty() {
+            format!(":{edge_type}")
+        } else {
+            format!(":{edge_type} {{{}}}", format_cypher_props(&properties))
         };
-
-        if !key_str.contains(":out:") {
-            continue;
+        match discriminator {
+            None => writeln!(writer, "CREATE (n{source})-[{rel}]->(n{target});")?,
+            Some(d) if d.is_empty() => writeln!(
+                writer,
+                "CREATE (n{source})-[{rel}]->(n{target}){}",
+                super::restore::CYPHER_DISCRIMINATOR
+            )?,
+            Some(d) => writeln!(
+                writer,
+                "CREATE (n{source})-[{rel}]->(n{target}){} {}",
+                super::restore::CYPHER_DISCRIMINATOR,
+                hex::encode(&d)
+            )?,
         }
-
-        let Some((edge_type, source_id)) = parse_adj_forward_key(key_str) else {
-            continue;
-        };
-
-        let posting_list = PostingList::from_bytes(value_bytes)
-            .map_err(|e| ExportError::Serialization(e.to_string()))?;
-
-        for target_id in posting_list.iter() {
-            let edge_props =
-                load_edge_properties(engine, snapshot, &edge_type, source_id, target_id, interner)?;
-
-            if edge_props.is_empty() {
-                writeln!(
-                    writer,
-                    "CREATE (n{source_id})-[:{edge_type}]->(n{target_id});"
-                )?;
-            } else {
-                let props_str = format_cypher_props(&edge_props);
-                writeln!(
-                    writer,
-                    "CREATE (n{source_id})-[:{edge_type} {{{props_str}}}]->(n{target_id});"
-                )?;
-            }
-            stats.edges += 1;
-        }
-    }
+        stats.edges += 1;
+        Ok(())
+    })?;
 
     Ok(stats)
 }
@@ -351,21 +443,14 @@ pub fn export_binary<W: Write>(
         stats.nodes += 1;
     }
 
-    // Export adjacency
-    let adj_prefix = b"adj:";
-    let entries: Vec<(Vec<u8>, Vec<u8>)> = {
-        let iter = engine
-            .prefix_scan(Partition::Adj, adj_prefix)
-            .map_err(|e| ExportError::Storage(e.to_string()))?;
-        let mut result = Vec::new();
-        for guard in iter {
-            let (k, v) = guard
-                .into_inner()
-                .map_err(|e| ExportError::Storage(e.to_string()))?;
-            result.push((k.to_vec(), v.to_vec()));
-        }
-        result
-    };
+    // Export adjacency at the same snapshot as the nodes and edge bodies: an
+    // edge written during the export is in all three or in none.
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = engine
+        .snapshot_prefix_scan(snapshot, Partition::Adj, b"adj:")
+        .map_err(|e| ExportError::Storage(e.to_string()))?
+        .into_iter()
+        .map(|(k, v)| (k, v.to_vec()))
+        .collect();
 
     for (key_bytes, value_bytes) in &entries {
         let entry = BackupEntry::Adj {
@@ -584,39 +669,30 @@ fn parse_adj_forward_key(key_str: &str) -> Option<(String, u64)> {
     Some((edge_type.to_string(), source_id))
 }
 
-/// Load edge properties for a specific (type, src, tgt) triple.
-fn load_edge_properties(
-    engine: &StorageEngine,
-    snapshot: &StorageSnapshot,
-    edge_type: &str,
-    source_id: u64,
-    target_id: u64,
-    interner: &FieldInterner,
-) -> Result<serde_json::Map<String, serde_json::Value>, ExportError> {
-    // Typed snapshot-aware read instead of hand-rolling the edge-prop key plus
-    // a raw snapshot_get plus a manual decode: the EdgeStore decodes through the
-    // single canonical edge-property codec and returns EdgeProperties, whose
-    // `props` map (`HashMap<u32, Value>`) is exactly the shape
-    // `resolve_properties` consumes.
-    let store = LocalEdgeStore;
-    match store
-        .get_props_snapshot(
-            engine,
-            snapshot,
-            edge_type,
-            NodeId::from_raw(source_id),
-            NodeId::from_raw(target_id),
-        )
-        .map_err(|e| ExportError::Storage(e.to_string()))?
-    {
-        Some(props) => resolve_properties(&props.props, interner),
-        None => Ok(serde_json::Map::new()),
-    }
-}
+/// Lowercase hex for blobs, binaries and discriminators in the text formats.
+pub(super) mod hex {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-// hex module for blob/binary encoding
-mod hex {
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            text.push(char::from(DIGITS[usize::from(b >> 4)]));
+            text.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+        }
+        text
+    }
+
+    /// The bytes of a lowercase or uppercase hex string, or `None` when it
+    /// has an odd length or a non-hex character.
+    pub fn decode(text: &str) -> Option<Vec<u8>> {
+        let digit = |c: u8| char::from(c).to_digit(16);
+        let (pairs, odd) = text.as_bytes().as_chunks::<2>();
+        if !odd.is_empty() {
+            return None;
+        }
+        pairs
+            .iter()
+            .map(|&[high, low]| Some((digit(high)? << 4 | digit(low)?) as u8))
+            .collect()
     }
 }
