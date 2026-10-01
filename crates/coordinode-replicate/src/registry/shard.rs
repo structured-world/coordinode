@@ -227,30 +227,29 @@ impl RegistryCore {
         Ok(out)
     }
 
-    /// Drain the buffered heartbeats into one coalesced proposal.
-    /// Consumers that vanished since buffering are silently skipped. A flush
-    /// that fails puts its heartbeats back: they are signs of life, and the
-    /// next sweep would otherwise evict a consumer that heartbeated in time.
+    /// Write the buffered heartbeats in one coalesced proposal.
+    /// Consumers that vanished since buffering are silently skipped. Each
+    /// heartbeat stays in the buffer until its write lands: while the write is
+    /// in flight the stored entry does not show it yet, and the buffer is then
+    /// the only sign of life a floor or a listing can see. A failed write
+    /// leaves all of them there for the next flush.
     fn flush_pending_heartbeats(&self) -> Result<(), RegistryError> {
-        let drained: Vec<(String, u64)> = {
-            let mut pending = self.pending_hb.lock();
+        let taken: Vec<(String, u64)> = {
+            let pending = self.pending_hb.lock();
             if pending.is_empty() {
                 return Ok(());
             }
-            pending.drain().collect()
+            pending.iter().map(|(id, ts)| (id.clone(), *ts)).collect()
         };
-        let written = self.write_heartbeats(&drained);
-        if written.is_err() {
-            let mut pending = self.pending_hb.lock();
-            for (consumer_id, ts) in drained {
-                // A heartbeat buffered meanwhile is newer or the same.
-                pending
-                    .entry(consumer_id)
-                    .and_modify(|t| *t = (*t).max(ts))
-                    .or_insert(ts);
+        self.write_heartbeats(&taken)?;
+        let mut pending = self.pending_hb.lock();
+        for (consumer_id, ts) in taken {
+            // A heartbeat buffered during the write is newer and stays.
+            if pending.get(&consumer_id) == Some(&ts) {
+                pending.remove(&consumer_id);
             }
         }
-        written
+        Ok(())
     }
 
     /// Persist `heartbeats` in one proposal.

@@ -538,6 +538,119 @@ async fn a_failed_flush_keeps_its_heartbeats_buffered() {
     );
 }
 
+/// A pipeline that, once closed, holds each proposal until the test lets it
+/// through, reporting that it holds one.
+struct GatedPipeline {
+    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    closed: std::sync::atomic::AtomicBool,
+    held: std::sync::mpsc::SyncSender<()>,
+    release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ProposalPipeline for GatedPipeline {
+    fn propose_and_wait(
+        &self,
+        proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        if self.closed.load(Ordering::Acquire) {
+            self.held
+                .send(())
+                .expect("the test waits for the held proposal");
+            self.release
+                .lock()
+                .recv()
+                .expect("the test releases the held proposal");
+        }
+        self.inner.propose_and_wait(proposal)
+    }
+}
+
+/// A heartbeat that is being written is still a sign of life: until the
+/// write lands, the consumer stays listed and its checkpoint keeps holding the
+/// retention floor, though neither the buffer nor the stored entry shows it.
+#[test]
+fn a_heartbeat_in_flight_keeps_its_consumer_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            oracle,
+        )
+        .expect("open engine"),
+    );
+    let (held_tx, held) = std::sync::mpsc::sync_channel(1);
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let pipeline = Arc::new(GatedPipeline {
+        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        held: held_tx,
+        release: parking_lot::Mutex::new(release_rx),
+    });
+    let clock = Arc::new(ManualClock::new(1_000));
+    let reg = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::clone(&pipeline) as Arc<dyn ProposalPipeline>,
+        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
+        clock.clone(),
+    );
+    let h = reg
+        .register(registration("reader", TopologyScope::Cluster, 2_000))
+        .expect("register");
+    let floor = reg.shard_floor();
+    assert_ne!(floor, u64::MAX, "the reader holds the floor");
+
+    reg.core.batching_on.store(true, Ordering::Release);
+    clock.set(2_500);
+    reg.heartbeat(&h).expect("buffer heartbeat");
+    pipeline.closed.store(true, Ordering::Release);
+    let flushing = {
+        let core = Arc::clone(&reg.core);
+        std::thread::spawn(move || core.flush_pending_heartbeats())
+    };
+    held.recv().expect("the flush proposes");
+
+    // Past the stored heartbeat's TTL (1000 + 2000), inside the one being
+    // written (2500 + 2000).
+    clock.set(4_000);
+    assert!(
+        reg.list_consumers()
+            .iter()
+            .any(|c| c.consumer_id == "reader"),
+        "a consumer whose heartbeat is being written was dropped from the list"
+    );
+    assert_eq!(
+        reg.core.recompute_floor().expect("floor"),
+        floor,
+        "a consumer whose heartbeat is being written stopped holding the floor"
+    );
+
+    pipeline.closed.store(false, Ordering::Release);
+    release.send(()).expect("release");
+    flushing.join().expect("flush thread").expect("flush");
+    assert!(
+        reg.core.pending_hb.lock().is_empty(),
+        "a written heartbeat leaves the buffer"
+    );
+    assert_eq!(
+        reg.list_consumers()
+            .iter()
+            .find(|c| c.consumer_id == "reader")
+            .map(|c| c.last_heartbeat_ts_ms),
+        Some(2_500),
+        "the heartbeat was written"
+    );
+}
+
 /// A pipeline whose every proposal takes `delay`, as a slow fsync does.
 struct SlowPipeline {
     inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
@@ -587,7 +700,12 @@ async fn a_slow_flush_does_not_starve_the_heartbeats_it_persists() {
         Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
         Arc::new(SystemClock),
     );
-    let ttl_ms = 400;
+    // Shorter than one write: the reader stays only by the heartbeats that
+    // reach the buffer while a write is in flight, which a service holding
+    // the runtime thread through the write never lets through. A heartbeat
+    // every 50 ms leaves several of them inside each 300 ms write, a margin
+    // that holds on a loaded machine.
+    let ttl_ms = 200;
     let h = reg
         .register(registration("reader", TopologyScope::Cluster, ttl_ms))
         .expect("register");
@@ -600,7 +718,7 @@ async fn a_slow_flush_does_not_starve_the_heartbeats_it_persists() {
     let beating = {
         let reg = reg.clone();
         tokio::spawn(async move {
-            let until = tokio::time::Instant::now() + Duration::from_millis(4 * ttl_ms);
+            let until = tokio::time::Instant::now() + Duration::from_millis(3 * ttl_ms);
             while tokio::time::Instant::now() < until {
                 reg.heartbeat(&h).expect("heartbeat");
                 tokio::time::sleep(Duration::from_millis(50)).await;
