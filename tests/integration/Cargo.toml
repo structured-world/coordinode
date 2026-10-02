@@ -38,7 +38,6 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 coordinode-client = { path = "../../crates/coordinode-client" }
 coordinode-test-fixtures = { path = "../../crates/coordinode-test-fixtures" }
-coordinode-workspace-hack = { version = "0.1", path = "../../crates/coordinode-workspace-hack" }
 
 # Asks a spawned server to stop with a console control event, the Windows
 # counterpart of SIGTERM.
