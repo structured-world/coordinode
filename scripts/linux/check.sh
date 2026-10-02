@@ -96,10 +96,15 @@ git checkout -q --detach FETCH_HEAD
 git submodule update --init -q
 echo checkout=\$? > ../status.txt
 export CARGO_TARGET_DIR='$remote_root/target' $bench_env
+# Build first and let the compilation cache finish writing before the timed
+# run: its background uploads otherwise share the CPU with the measurement.
+cargo bench $only_bench --no-run > ../bench-build.log 2>&1
+echo build=\$? >> ../status.txt
+if command -v sccache >/dev/null 2>&1; then sccache --stop-server >/dev/null 2>&1; fi
 cargo bench $only_bench > ../bench.log 2>&1
 echo bench=\$? >> ../status.txt
 echo done >> ../status.txt" || true
-  for f in status.txt bench.log; do
+  for f in status.txt bench-build.log bench.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
   cat "$out/status.txt"
