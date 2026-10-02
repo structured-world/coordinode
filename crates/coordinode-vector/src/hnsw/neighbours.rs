@@ -109,9 +109,10 @@ impl<const N: usize, T: Copy + PartialEq> AtomicNeighbourList<N, T> {
 
     /// Publish `edit` of the current list. `edit` receives the protected
     /// current ids and returns the complete new list, or `None` to leave the
-    /// list as it is. A lost CAS calls `edit` again with the list that won.
-    /// Returns whether a new list was published.
-    fn update(&self, mut edit: impl FnMut(&[T]) -> Option<Box<[T]>>) -> bool {
+    /// list as it is. A lost CAS calls `edit` again with the list that won,
+    /// so an edit computed from a list another writer replaced is never
+    /// published. Returns whether a new list was published.
+    pub(crate) fn update(&self, mut edit: impl FnMut(&[T]) -> Option<Box<[T]>>) -> bool {
         let guard = epoch::pin();
         let (mut expected, mut ids) = self.view(&guard);
         loop {

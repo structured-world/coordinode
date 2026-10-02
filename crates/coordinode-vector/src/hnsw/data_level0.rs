@@ -252,6 +252,23 @@ impl DataLevel0Block {
         out.extend(ids.iter().map(|&id| u64::from(id)));
     }
 
+    /// Publish `edit` of node `idx`'s layer-0 list: `edit` receives the
+    /// current ids and returns the complete new list (at most `m_max0` ids),
+    /// or `None` to keep it; a lost CAS reruns `edit` against the list that
+    /// won. Returns whether a new list was published.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity`.
+    pub(super) unsafe fn update_neighbours(
+        &self,
+        idx: usize,
+        edit: impl FnMut(&[u32]) -> Option<Box<[u32]>>,
+    ) -> bool {
+        // SAFETY: idx bound per contract.
+        unsafe { self.list(idx) }.update(edit)
+    }
+
     /// Append `id` to node `idx`'s layer-0 list under concurrent writers.
     /// Returns `false` when the list already holds `m_max0` ids; the caller
     /// runs its prune protocol.

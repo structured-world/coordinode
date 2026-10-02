@@ -2486,6 +2486,100 @@ fn apply_insert_plans_parallel_ingests_every_item() {
     );
 }
 
+/// A prune that races a back-edge append must keep the append: the prune
+/// recomputes against the list that won instead of overwriting it with a
+/// result computed from an older snapshot. `max_conn` here exceeds every
+/// list the test builds, so a prune never legitimately drops an id and any
+/// missing accepted append is a lost update.
+#[test]
+fn prune_racing_an_append_keeps_the_append() {
+    let mut cfg = make_config(VectorMetric::L2);
+    cfg.m = 32;
+    cfg.m_max0 = 64;
+    cfg.max_elements = 128;
+    let mut index = HnswIndex::new(cfg);
+    for i in 0..100u64 {
+        let v: Vec<f32> = (0..8).map(|d| ((i * 13 + d) as f32 * 0.07).sin()).collect();
+        index.insert(i, v);
+    }
+    for round in 0..200 {
+        index.set_outgoing(0, 0, &[]);
+        let appending = std::sync::atomic::AtomicBool::new(true);
+        let accepted = std::thread::scope(|s| {
+            s.spawn(|| {
+                while appending.load(std::sync::atomic::Ordering::Acquire) {
+                    index.prune_connections(0, 0, 64);
+                }
+            });
+            let mut accepted = Vec::new();
+            for id in 1..=60u64 {
+                if index.cas_add_neighbour_to(0, 0, id) {
+                    accepted.push(id);
+                }
+                std::thread::yield_now();
+            }
+            appending.store(false, std::sync::atomic::Ordering::Release);
+            accepted
+        });
+        let list = index.layer_snapshot(0, 0);
+        for id in accepted {
+            assert!(
+                list.contains(&id),
+                "round {round}: accepted append {id} lost by a racing prune; list {list:?}"
+            );
+        }
+    }
+}
+
+/// Removing edges while another writer appends keeps every accepted append
+/// and drops exactly the removed ids.
+#[test]
+fn removal_racing_an_append_keeps_the_append() {
+    let mut cfg = make_config(VectorMetric::L2);
+    cfg.m = 32;
+    cfg.m_max0 = 64;
+    cfg.max_elements = 128;
+    let mut index = HnswIndex::new(cfg);
+    for i in 0..100u64 {
+        let v: Vec<f32> = (0..8).map(|d| ((i * 13 + d) as f32 * 0.07).sin()).collect();
+        index.insert(i, v);
+    }
+    let doomed: Vec<u64> = (61..=90).collect();
+    for round in 0..200 {
+        index.set_outgoing(0, 0, &doomed);
+        let accepted = std::thread::scope(|s| {
+            s.spawn(|| {
+                for &id in &doomed {
+                    index.remove_neighbour_from(0, 0, id);
+                    std::thread::yield_now();
+                }
+            });
+            let mut accepted = Vec::new();
+            for id in 1..=34u64 {
+                if index.cas_add_neighbour_to(0, 0, id) {
+                    accepted.push(id);
+                }
+                std::thread::yield_now();
+            }
+            accepted
+        });
+        let list = index.layer_snapshot(0, 0);
+        for id in &accepted {
+            assert!(
+                list.contains(id),
+                "round {round}: accepted append {id} lost by a racing removal; list {list:?}"
+            );
+        }
+        for id in &doomed {
+            assert!(
+                !list.contains(id),
+                "round {round}: removed id {id} is back; list {list:?}"
+            );
+        }
+        assert_eq!(list.len(), accepted.len(), "round {round}: list {list:?}");
+    }
+}
+
 // Regression: HNSW search must return min(k, n) results regardless of
 // ef_search. Standard HNSW invariant — the layer-0 beam must be at
 // least `k` wide, otherwise low-ef configurations both truncate the

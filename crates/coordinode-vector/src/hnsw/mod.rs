@@ -3169,9 +3169,26 @@ impl HnswIndex {
         max_conn: usize,
         extras: &[u64],
     ) {
+        // Recomputed against the list that won when a concurrent writer
+        // replaced it between the read and the publish.
+        self.layer_update(node_idx, level, |neighbours| {
+            let kept = self.prune_selection(node_idx, neighbours, max_conn, extras);
+            (kept != neighbours).then_some(kept)
+        });
+    }
+
+    /// The pruned list for `node_idx` from its current `neighbours` and the
+    /// queued `extras`: the RobustPrune selection, backfilled by distance to
+    /// `max_conn`.
+    fn prune_selection(
+        &self,
+        node_idx: usize,
+        neighbours: &[u64],
+        max_conn: usize,
+        extras: &[u64],
+    ) -> Vec<u64> {
         // Stored u64s ARE neighbour indices now (not NodeIds) — no
         // id_to_idx hop. Dedupe via HashSet on those indices.
-        let neighbours = self.layer_snapshot(node_idx, level);
         let mut seen: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(neighbours.len() + extras.len());
         let mut candidates: Vec<Candidate> = Vec::with_capacity(neighbours.len() + extras.len());
@@ -3223,31 +3240,22 @@ impl HnswIndex {
                 kept.push(u64::from(c.idx));
             }
         }
-        self.set_outgoing(node_idx, level, &kept);
+        kept
     }
 
     // ── Atomic neighbour write helpers ─────────────────────────────────────
     //
-    // Single source of truth: `neighbours_l0` + `neighbours_upper`.
+    // Single source of truth: `data_level0` for layer 0, `neighbours_upper`
+    // for the layers above. Every list is published whole, and every write
+    // to a list another writer can reach goes through compare-and-swap:
     //
-    // Helpers that touch only the atomic neighbour storage take `&self`
-    // instead of `&mut self`. The new node's atomic layer Vec is
-    // append-only at slot-creation time (`apply_insert_plan` pushes once),
-    // and once the layers exist their internal state mutates through atomic
-    // APIs that need only `&self`. This unlocks parallel apply for distinct
-    // node indices in the concurrent insert path:
-    //
-    // * `set_outgoing(&self, idx, …)` is conflict-free across distinct
-    //   `idx` because the new-node's atomic list is freshly created by
-    //   the (single-writer) node-allocation phase.
-    // * `cas_add_neighbour_to(&self, neighbour_idx, …)` uses
-    //   `AtomicNeighbourList::cas_append` so multiple threads inserting
-    //   incoming edges into the same existing neighbour list never lose
-    //   each other's updates.
-    //
-    // The legacy `&mut self` `add_neighbour_to` / `remove_neighbour_from`
-    // / `clear_outgoing` paths serve the sequential callers
-    // (update_existing_node's rebuild, prune fallback).
+    // * `cas_add_neighbour_to` appends, retrying against the list that won.
+    // * `layer_update` (prune, full-list insert, removal) recomputes its
+    //   edit against the list that won, so it never overwrites an edge
+    //   another writer added after it read the list.
+    // * `set_outgoing` replaces a list blindly; it is for a node nobody else
+    //   can reach yet (the new node's own outgoing edges) or a caller that
+    //   holds `&mut self`.
 
     /// Resolve `(node, layer >= 1)` to the underlying [`AtomicNeighbourList`]
     /// in the SoA `neighbours_upper` store. **Layer 0 no longer lives here** —
@@ -3327,6 +3335,47 @@ impl HnswIndex {
         }
     }
 
+    /// Publish `edit` of the neighbour list at `(idx, level)` under
+    /// concurrent writers. `edit` receives the current ids and returns the
+    /// complete new list, or `None` to keep it; when another writer replaced
+    /// the list in between, `edit` runs again against the list that won, so a
+    /// concurrently accepted edge is never overwritten by a result computed
+    /// from an older list. The result is truncated to the layer's capacity.
+    /// Returns whether a new list was published.
+    fn layer_update(
+        &self,
+        idx: usize,
+        level: usize,
+        mut edit: impl FnMut(&[u64]) -> Option<Vec<u64>>,
+    ) -> bool {
+        if level > 0 {
+            return self.neighbours_upper[idx][level - 1].update(|current| {
+                edit(current).map(|mut next| {
+                    next.truncate(M_MAX0);
+                    next.into_boxed_slice()
+                })
+            });
+        }
+        let Some(block) = self.data_level0.as_ref() else {
+            return false;
+        };
+        if idx >= block.capacity() {
+            return false;
+        }
+        let cap = block.m_max0();
+        let mut wide: Vec<u64> = Vec::with_capacity(cap + 1);
+        // SAFETY: idx < capacity per the gate above.
+        unsafe {
+            block.update_neighbours(idx, |current| {
+                wide.clear();
+                wide.extend(current.iter().map(|&id| u64::from(id)));
+                // Graph indices fit u32: per-shard node count is well below
+                // `u32::MAX`, the same narrowing every layer-0 write makes.
+                edit(&wide).map(|next| next.iter().take(cap).map(|&id| id as u32).collect())
+            })
+        }
+    }
+
     /// Number of layers the node participates in (`top_level + 1`).
     /// Replaces the legacy `neighbours_atomic[idx].len()` idiom from
     /// before the layer-0 / upper-layer split.
@@ -3335,7 +3384,10 @@ impl HnswIndex {
         1 + self.neighbours_upper[idx].len()
     }
 
-    /// Replace the entire neighbour set at `(idx, level)` with `ids`.
+    /// Replace the entire neighbour set at `(idx, level)` with `ids`, without
+    /// looking at the current list. Only for a list no other writer can
+    /// reach (a node being inserted) or under `&mut self`; a list shared
+    /// with concurrent writers is edited through [`Self::layer_update`].
     /// Truncates to `M_MAX0` on overflow (logged at construction time).
     fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
         let n = ids.len().min(M_MAX0);
@@ -3356,18 +3408,13 @@ impl HnswIndex {
 
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
     /// exceeds `max_conn`, run `prune_connections` to shrink back to the
-    /// nearest `max_conn` neighbours.
-    ///
-    /// Single-writer path. The new node case uses `cas_append`
-    /// internally so cas-based callers can race with this safely on the
-    /// `len` counter, but the prune branch needs `&mut self` because
-    /// `prune_connections` reads vectors + reorders the list.
-    fn add_neighbour_to(&mut self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
+    /// nearest `max_conn` neighbours. Every step publishes by CAS, so it is
+    /// safe under concurrent writers to the same list.
+    fn add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64, max_conn: usize) {
         if self.layer_cas_append(neighbour_idx, level, id) {
             let len_now = self.layer_len(neighbour_idx, level);
             if len_now > max_conn {
                 self.prune_connections(neighbour_idx, level, max_conn);
-                // prune_connections funnels through set_outgoing. Done.
             }
             // Otherwise the append already landed in the sole neighbour store
             // for this layer; there is nothing else to mirror.
@@ -3383,31 +3430,36 @@ impl HnswIndex {
             // Fix: do the prune in-memory with the new id included, so it
             // competes fairly against existing neighbours. The kept set
             // has ≤ `max_conn` elements (`≤ M_MAX0`) so `set_outgoing` is
-            // guaranteed to fit without truncation.
-            let mut snap = self.layer_snapshot(neighbour_idx, level);
-            snap.push(id);
-            // Stored u64s ARE neighbour indices — direct cast, no map hop.
-            let mut scored: Vec<(f32, u64)> = Vec::with_capacity(snap.len());
-            for &nidx_u64 in &snap {
-                let nidx = nidx_u64 as usize;
-                if nidx < self.nodes.len() {
-                    let dist = self.distance_between_nodes(neighbour_idx, nidx);
-                    scored.push((dist, nidx_u64));
+            // guaranteed to fit without truncation. Recomputed against the
+            // winning list if another writer replaced it meanwhile.
+            self.layer_update(neighbour_idx, level, |current| {
+                if current.contains(&id) {
+                    return None;
                 }
-            }
-            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(max_conn);
-            let kept: Vec<u64> = scored.into_iter().map(|(_, nid)| nid).collect();
-            self.set_outgoing(neighbour_idx, level, &kept);
+                // Stored u64s ARE neighbour indices: direct cast, no map hop.
+                let mut scored: Vec<(f32, u64)> = Vec::with_capacity(current.len() + 1);
+                for &nidx_u64 in current.iter().chain(core::iter::once(&id)) {
+                    let nidx = nidx_u64 as usize;
+                    if nidx < self.nodes.len() {
+                        let dist = self.distance_between_nodes(neighbour_idx, nidx);
+                        scored.push((dist, nidx_u64));
+                    }
+                }
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(max_conn);
+                Some(scored.into_iter().map(|(_, nid)| nid).collect())
+            });
         }
     }
 
     /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
     /// is absent.
-    fn remove_neighbour_from(&mut self, idx: usize, level: usize, id: u64) {
-        let mut snap = self.layer_snapshot(idx, level);
-        snap.retain(|&nid| nid != id);
-        self.set_outgoing(idx, level, &snap);
+    fn remove_neighbour_from(&self, idx: usize, level: usize, id: u64) {
+        self.layer_update(idx, level, |current| {
+            current
+                .contains(&id)
+                .then(|| current.iter().copied().filter(|&nid| nid != id).collect())
+        });
     }
 
     /// Clear the entire neighbour set at `(idx, level)`.
