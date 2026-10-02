@@ -406,12 +406,16 @@ pub struct HnswIndex {
     /// search fast path so a neighbour visit touches one stride-addressed
     /// block instead of the per-node `Vec` behind the node's code in the
     /// store. Allocated on the first insert of a RaBitQ-configured index;
-    /// `None` for other codecs.
-    rabitq_block: Option<rabitq_block::RabitqBlock>,
-    /// The layer-0 store: the f32 vector of every node in one stride-
-    /// addressed block (hnswlib `data_level0_memory_`) and every node's
-    /// layer-0 neighbour list, published whole. The only place either lives.
-    data_level0: Option<data_level0::DataLevel0Block>,
+    /// empty for other codecs. A `OnceLock` so the first of concurrent
+    /// inserts creates it.
+    // no-std: once_cell::race::OnceBox
+    rabitq_block: std::sync::OnceLock<rabitq_block::RabitqBlock>,
+    /// The node store: every node's f32 vector in one stride-addressed block
+    /// per segment (hnswlib `data_level0_memory_`), its scalars, codes and
+    /// neighbour lists, published whole. Created by the first insert, which
+    /// fixes the dimension; a `OnceLock` so concurrent inserts create it once.
+    // no-std: once_cell::race::OnceBox
+    data_level0: std::sync::OnceLock<data_level0::DataLevel0Block>,
 }
 
 /// Read-only result of the planning phase of an insert.
@@ -695,8 +699,8 @@ impl HnswIndex {
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
-            rabitq_block: None,
-            data_level0: None,
+            rabitq_block: std::sync::OnceLock::new(),
+            data_level0: std::sync::OnceLock::new(),
         }
     }
 
@@ -787,7 +791,8 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.mirror_rabitq_to_block(i, enc.as_ref());
+            // SAFETY: `&mut self` excludes every other reader and writer.
+            unsafe { self.mirror_rabitq_to_block(i, enc.as_ref()) };
             if let Some(store) = self.nodes_mut() {
                 store.set_rabitq(i, enc);
             }
@@ -804,7 +809,7 @@ impl HnswIndex {
         // returned and `read_node_f32` reports None (rerank then loads f32
         // from disk).
         if self.config.offload_vectors {
-            if let Some(b) = self.data_level0.as_mut() {
+            if let Some(b) = self.data_level0.get_mut() {
                 b.drop_f32();
             }
         }
@@ -862,7 +867,7 @@ impl HnswIndex {
             // actually returned and `read_node_f32` reports None for these
             // nodes (rerank then loads f32 from disk via VectorLoader).
             if self.config.offload_vectors {
-                if let Some(b) = self.data_level0.as_mut() {
+                if let Some(b) = self.data_level0.get_mut() {
                     b.drop_f32();
                 }
             }
@@ -925,7 +930,8 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.mirror_rabitq_to_block(i, enc.as_ref());
+            // SAFETY: `&mut self` excludes every other reader and writer.
+            unsafe { self.mirror_rabitq_to_block(i, enc.as_ref()) };
             if let Some(store) = self.nodes_mut() {
                 store.set_rabitq(i, enc);
             }
@@ -980,7 +986,7 @@ impl HnswIndex {
                 dim = vector.len(),
                 index_dim = self
                     .data_level0
-                    .as_ref()
+                    .get()
                     .map(data_level0::DataLevel0Block::dim),
                 "HNSW insert rejected: vector dimension is zero or differs from the index"
             );
@@ -1267,37 +1273,43 @@ impl HnswIndex {
     /// the store on the first call once `dim` is known and growing it to fit
     /// `idx`. Neighbour lists are published separately through `layer_set` /
     /// `layer_cas_append`.
-    fn mirror_data_level0_vector(&mut self, idx: usize, vector: &[f32]) {
+    ///
+    /// Returns `false`, writing nothing, when the vector's dimension is zero
+    /// or differs from the store's; concurrent first inserts of different
+    /// dimensions race to create the store, and only the winner's fits.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the only writer of node `idx` and writes before the node
+    /// is reachable, or holds the index exclusively.
+    unsafe fn mirror_data_level0_vector(&self, idx: usize, vector: &[f32]) -> bool {
         let dim = vector.len();
-        if !self.accepts_dim(dim) {
-            return;
+        if dim == 0 {
+            return false;
         }
-        if self.data_level0.is_none() {
+        let block = self.data_level0.get_or_init(|| {
             let capacity = (self.config.max_elements as usize).max(idx + 1);
             // Size the lists to the effective per-node layer-0 degree
             // (`config.m_max0`, already capped to `M_MAX0`), not the
             // compile-time `M_MAX0` cap.
-            self.data_level0 = Some(data_level0::DataLevel0Block::new(
-                capacity,
-                self.config.m_max0,
-                dim,
-            ));
+            data_level0::DataLevel0Block::new(capacity, self.config.m_max0, dim)
+        });
+        if block.dim() != dim {
+            return false;
         }
-        let Some(block) = self.data_level0.as_ref() else {
-            return;
-        };
         // Grow rather than skip past capacity: this store holds every node's
         // lists and scalars, including those inserted beyond the initial
         // `max_elements` estimate, whether or not the vectors were offloaded.
         block.ensure_capacity(idx + 1);
         if block.has_f32() {
             // SAFETY: idx < capacity after `ensure_capacity`, vector.len() ==
-            // block.dim() per `accepts_dim`, and `&mut self` excludes every
-            // other reader and writer.
+            // block.dim() per the gate above, and the caller's exclusivity
+            // over node idx.
             unsafe {
                 block.set_vector(idx, vector);
             }
         }
+        true
     }
 
     /// Whether a vector of `dim` components can go into this index: non-zero
@@ -1307,7 +1319,7 @@ impl HnswIndex {
         dim > 0
             && self
                 .data_level0
-                .as_ref()
+                .get()
                 .is_none_or(|block| block.dim() == dim)
     }
 
@@ -1318,7 +1330,7 @@ impl HnswIndex {
     fn screen_dims(&self, items: &mut Vec<(u64, Vec<f32>)>) {
         let reference = self
             .data_level0
-            .as_ref()
+            .get()
             .map(data_level0::DataLevel0Block::dim)
             .or_else(|| items.iter().map(|(_, v)| v.len()).find(|&d| d > 0));
         items.retain(|(id, vec)| {
@@ -1339,8 +1351,8 @@ impl HnswIndex {
     /// once `dim` is known, with the code width of the configured codec so
     /// calibration fills it without a layout mismatch. Other codecs never
     /// produce RaBitQ codes and get no block.
-    fn ensure_rabitq_block(&mut self, idx: usize, dim: usize) {
-        if dim == 0 || self.rabitq_block.is_some() {
+    fn ensure_rabitq_block(&self, idx: usize, dim: usize) {
+        if dim == 0 || self.rabitq_block.get().is_some() {
             return;
         }
         let QuantizationCodec::RaBitQ { bits } = self.config.quantization else {
@@ -1350,16 +1362,15 @@ impl HnswIndex {
             return;
         }
         let capacity = (self.config.max_elements as usize).max(idx + 1);
-        self.rabitq_block = Some(rabitq_block::RabitqBlock::new_with_rabitq_bits(
-            capacity, dim, bits,
-        ));
+        self.rabitq_block
+            .get_or_init(|| rabitq_block::RabitqBlock::new_with_rabitq_bits(capacity, dim, bits));
     }
 
     /// Borrow the f32 vector of node `idx` from the layer-0 store. `None`
     /// before the first insert and once the vectors were offloaded to disk.
     #[inline]
     fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
-        self.data_level0.as_ref()?.vector(idx)
+        self.data_level0.get()?.vector(idx)
     }
 
     /// Read the layer-0 neighbour id snapshot into `out` from the
@@ -1386,7 +1397,7 @@ impl HnswIndex {
     ) {
         // `data_level0` holds every node's published layer-0 list (u32 ids);
         // read straight into `out`, widening u32 -> u64.
-        if let Some(block) = self.data_level0.as_ref() {
+        if let Some(block) = self.data_level0.get() {
             if block.read_list_u64(idx, out, guard) {
                 return;
             }
@@ -1423,16 +1434,22 @@ impl HnswIndex {
     /// nothing. When the code cannot go in (no code, a width or length that
     /// does not match the slot) the slot is cleared: a zero `norm` sends search
     /// to the node's code in the store, which costs speed, never a result.
-    fn mirror_rabitq_to_block(&mut self, idx: usize, enc: Option<&RabitqEncoded>) {
-        let Some(block) = self.rabitq_block.as_mut() else {
+    ///
+    /// # Safety
+    ///
+    /// The caller is the only writer of node `idx` and writes before the node
+    /// is reachable, or holds the index exclusively.
+    unsafe fn mirror_rabitq_to_block(&self, idx: usize, enc: Option<&RabitqEncoded>) {
+        let Some(block) = self.rabitq_block.get() else {
             return;
         };
         if idx >= block.capacity() {
             return;
         }
-        let installed = enc.is_some_and(|enc| Self::install_rabitq(block, idx, enc));
+        // SAFETY: forwarded caller exclusivity over node idx.
+        let installed = enc.is_some_and(|enc| unsafe { Self::install_rabitq(block, idx, enc) });
         if !installed {
-            // SAFETY: idx < capacity per the gate above.
+            // SAFETY: idx < capacity per the gate above; caller exclusivity.
             unsafe { block.set_rabitq_scalars(idx, rabitq_block::RaBitQScalars::default()) };
         }
     }
@@ -1440,9 +1457,13 @@ impl HnswIndex {
     /// Write `enc` into slot `idx` of `inline`; `false` when its width or
     /// length does not match the slot.
     ///
-    /// The caller guarantees `idx < inline.capacity()`.
-    fn install_rabitq(
-        inline: &mut rabitq_block::RabitqBlock,
+    /// # Safety
+    ///
+    /// `idx < inline.capacity()`, and the caller is the only writer of node
+    /// `idx` and writes before the node is reachable, or holds the block
+    /// exclusively.
+    unsafe fn install_rabitq(
+        inline: &rabitq_block::RabitqBlock,
         idx: usize,
         enc: &RabitqEncoded,
     ) -> bool {
@@ -1514,7 +1535,7 @@ impl HnswIndex {
     /// The RaBitQ code block, for tests.
     #[cfg(test)]
     pub(crate) fn rabitq_block(&self) -> Option<&rabitq_block::RabitqBlock> {
-        self.rabitq_block.as_ref()
+        self.rabitq_block.get()
     }
 
     /// Publish the full layer-0 neighbour list of `idx` in the layer-0
@@ -1522,7 +1543,7 @@ impl HnswIndex {
     /// indices to the store's u32 ids (per-shard node count is well below
     /// `u32::MAX`). No-op when the store is absent or does not cover `idx`.
     fn mirror_layer0_neighbours_to_data_level0(&self, idx: usize, ids: &[u64]) {
-        let Some(block) = self.data_level0.as_ref() else {
+        let Some(block) = self.data_level0.get() else {
             return;
         };
         if !block.contains(idx) {
@@ -1551,13 +1572,18 @@ impl HnswIndex {
                 dim = vector.len(),
                 index_dim = self
                     .data_level0
-                    .as_ref()
+                    .get()
                     .map(data_level0::DataLevel0Block::dim),
                 "HNSW insert rejected: vector dimension is zero or differs from the index"
             );
             return None;
         }
         let idx = self.node_len();
+        // SAFETY: node idx is not counted yet, so nothing reads or links it,
+        // and `&mut self` excludes every other writer.
+        if !unsafe { self.mirror_data_level0_vector(idx, vector) } {
+            return None;
+        }
 
         // Quantize if SQ8 is calibrated.
         let quantized = self.sq8_params.as_ref().map(|p| p.quantize(vector));
@@ -1584,11 +1610,11 @@ impl HnswIndex {
         }
 
         self.ensure_rabitq_block(idx, vector.len());
-        self.mirror_data_level0_vector(idx, vector);
         // SAFETY: `mirror_data_level0_vector` created the store and grew it
-        // to cover idx; `&mut self` excludes every other reader and writer.
-        self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
+        // to cover idx; node idx is not counted yet, so nothing reads or links
+        // it, and `&mut self` excludes every other writer.
         unsafe {
+            self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
             let store = self.nodes();
             store.init_node(idx, id, metrics::norm_l2(vector), new_level);
             store.set_codes(idx, quantized, rabitq_code);
@@ -2332,11 +2358,12 @@ impl HnswIndex {
         // Refresh the stores so a subsequent search reads the updated vector,
         // norms and codes, not the original insert's.
         self.ensure_rabitq_block(idx, vector.len());
-        self.mirror_data_level0_vector(idx, &vector);
-        self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
         // SAFETY: idx is an existing node; `&mut self` excludes every other
         // reader and writer while its vector, norms and codes change together.
+        // The dimension was checked on entry to `insert`.
         unsafe {
+            self.mirror_data_level0_vector(idx, &vector);
+            self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
             let store = self.nodes();
             store.set_norm(idx, metrics::norm_l2(&vector));
             store.set_codes(idx, quantized, rabitq_code);
@@ -2820,7 +2847,7 @@ impl HnswIndex {
             // predict (hnswlib issues the same hint on its candidate
             // top inside `searchBaseLayerST`).
             if level == 0 {
-                if let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.as_ref()) {
+                if let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.get()) {
                     block.prefetch_neighbours(next.idx as usize, guard);
                 }
             }
@@ -2971,7 +2998,7 @@ impl HnswIndex {
             if let (Some(params), Some(RabitqQuery::OneBit(q)), Some(inline)) = (
                 self.rabitq_params.as_ref(),
                 ctx.rabitq_query.as_ref(),
-                self.rabitq_block.as_ref(),
+                self.rabitq_block.get(),
             ) {
                 let slot_words = inline.rabitq_byte_len() / 8;
                 if inline.rabitq_bits() == 1
@@ -3069,7 +3096,7 @@ impl HnswIndex {
                 // same answer the division helpers' epsilon guard gives.
                 if let Some(b_inv) = self
                     .data_level0
-                    .as_ref()
+                    .get()
                     .and_then(|block| block.inv_norm(node_idx))
                 {
                     if b_inv.is_finite() {
@@ -3234,25 +3261,25 @@ impl HnswIndex {
     )]
     fn nodes(&self) -> &data_level0::DataLevel0Block {
         self.data_level0
-            .as_ref()
+            .get()
             .expect("a node exists only after the store was created")
     }
 
     /// Node `idx`'s SQ8 code, `None` before calibration.
     #[inline(always)]
     fn node_sq8(&self, idx: usize) -> Option<&[u8]> {
-        self.data_level0.as_ref()?.sq8(idx)
+        self.data_level0.get()?.sq8(idx)
     }
 
     /// Node `idx`'s RaBitQ code, `None` before calibration.
     #[inline(always)]
     fn node_rabitq(&self, idx: usize) -> Option<&RabitqEncoded> {
-        self.data_level0.as_ref()?.rabitq(idx)
+        self.data_level0.get()?.rabitq(idx)
     }
 
     /// The node store for a calibration that rewrites every node's codes.
     fn nodes_mut(&mut self) -> Option<&mut data_level0::DataLevel0Block> {
-        self.data_level0.as_mut()
+        self.data_level0.get_mut()
     }
 
     /// External id of node `idx`.
@@ -3298,7 +3325,7 @@ impl HnswIndex {
     /// `data_level0`'s atomic count.
     fn layer_len(&self, idx: usize, level: usize) -> usize {
         if level == 0 {
-            self.data_level0.as_ref().map_or(0, |block| {
+            self.data_level0.get().map_or(0, |block| {
                 if block.contains(idx) {
                     // SAFETY: idx < capacity per the gate.
                     unsafe { block.neighbour_count(idx) as usize }
@@ -3315,7 +3342,7 @@ impl HnswIndex {
     /// Layer 0 appends to `data_level0` (atomic CAS, multi-writer-safe).
     fn layer_cas_append(&self, idx: usize, level: usize, id: u64) -> bool {
         if level == 0 {
-            self.data_level0.as_ref().is_some_and(|block| {
+            self.data_level0.get().is_some_and(|block| {
                 if block.contains(idx) {
                     // SAFETY: idx < capacity per the gate.
                     unsafe { block.cas_append_neighbour(idx, id as u32) }
@@ -3360,7 +3387,7 @@ impl HnswIndex {
                 })
             });
         }
-        let Some(block) = self.data_level0.as_ref() else {
+        let Some(block) = self.data_level0.get() else {
             return false;
         };
         if !block.contains(idx) {
@@ -3550,7 +3577,7 @@ impl HnswIndex {
             if matches!(self.config.metric, VectorMetric::Cosine) {
                 let norms = self
                     .data_level0
-                    .as_ref()
+                    .get()
                     .map(|block| (block.norm(a_idx), block.norm(b_idx)));
                 if let Some((Some(na), Some(nb))) = norms {
                     if na.is_finite() && na > 0.0 && nb.is_finite() && nb > 0.0 {
@@ -3664,7 +3691,7 @@ impl HnswIndex {
         // target address is `base + idx * stride` — one ALU op, zero
         // SoA cache misses. Matches hnswlib's `_mm_prefetch(data_level0_memory_
         // + idx * size_data_per_element_)` shape.
-        if let Some(block) = self.data_level0.as_ref() {
+        if let Some(block) = self.data_level0.get() {
             if block.has_f32() {
                 block.prefetch(idx);
                 return;

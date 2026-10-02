@@ -21,8 +21,12 @@
 //!
 //! ## Concurrency model
 //!
-//! Codes are written under `&mut self` during calibration and insert, and read
-//! under `&self` by search once the writer released its exclusive borrow.
+//! A node's slot is written through `&self` by the writer that owns the node,
+//! before the node is reachable, or by a calibration that holds the index
+//! exclusively; search reads it after reaching the node through a
+//! release-published link or entry point.
+
+use core::cell::UnsafeCell;
 
 /// 24-byte scalar header that travels alongside the packed RaBitQ code.
 /// Covers every numeric field the HNSW search hot path reads on a neighbour
@@ -50,10 +54,10 @@ pub struct RaBitQScalars {
 const RABITQ_SCALARS_BYTES: usize = core::mem::size_of::<RaBitQScalars>();
 
 /// Stride-addressed store of every node's RaBitQ code and scalar header.
-#[derive(Debug)]
 pub struct RabitqBlock {
-    /// 8-byte-aligned backing of `stride_bytes * capacity` bytes.
-    backing: Box<[u64]>,
+    /// 8-byte-aligned backing of `stride_bytes * capacity` bytes. `UnsafeCell`
+    /// because a node's slot is written through `&self` by its owner.
+    backing: Box<[UnsafeCell<u64>]>,
     /// Bytes per per-node block, a multiple of 8.
     stride_bytes: usize,
     /// Number of nodes the allocation can hold.
@@ -65,6 +69,22 @@ pub struct RabitqBlock {
     rabitq_bits: u8,
     /// Offset of the `RaBitQScalars` header within a per-node block.
     rabitq_scalars_offset: usize,
+}
+
+// SAFETY: a node's slot is written only by the writer that owns the node
+// before the node is reachable, or under exclusive access, and read only after
+// the node was reached through a release-published link or entry point; see
+// the module doc.
+unsafe impl Sync for RabitqBlock {}
+
+impl core::fmt::Debug for RabitqBlock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RabitqBlock")
+            .field("capacity", &self.capacity)
+            .field("stride_bytes", &self.stride_bytes)
+            .field("rabitq_bits", &self.rabitq_bits)
+            .finish()
+    }
 }
 
 #[inline(always)]
@@ -114,7 +134,7 @@ impl RabitqBlock {
             .expect("backing total bytes overflows usize");
 
         Self {
-            backing: vec![0u64; total_bytes / 8].into_boxed_slice(),
+            backing: (0..total_bytes / 8).map(|_| UnsafeCell::new(0)).collect(),
             stride_bytes,
             capacity,
             rabitq_bytes,
@@ -155,23 +175,15 @@ impl RabitqBlock {
     ///
     /// `idx < self.capacity()`.
     #[inline(always)]
-    unsafe fn node_base_ptr(&self, idx: usize) -> *const u8 {
+    unsafe fn node_base_ptr(&self, idx: usize) -> *mut u8 {
         debug_assert!(idx < self.capacity, "idx out of capacity");
         // SAFETY: the backing holds stride_bytes * capacity bytes, so the
         // offset of an in-range idx is inside the allocation.
-        unsafe { (self.backing.as_ptr() as *const u8).add(idx * self.stride_bytes) }
-    }
-
-    /// Mutable base byte pointer for the per-node block at `idx`.
-    ///
-    /// # Safety
-    ///
-    /// `idx < self.capacity()`.
-    #[inline(always)]
-    unsafe fn node_base_ptr_mut(&mut self, idx: usize) -> *mut u8 {
-        debug_assert!(idx < self.capacity, "idx out of capacity");
-        // SAFETY: as in `node_base_ptr`.
-        unsafe { (self.backing.as_mut_ptr() as *mut u8).add(idx * self.stride_bytes) }
+        unsafe {
+            UnsafeCell::raw_get(self.backing.as_ptr())
+                .cast::<u8>()
+                .add(idx * self.stride_bytes)
+        }
     }
 
     /// The packed code bytes of node `idx`, 8-aligned.
@@ -204,13 +216,16 @@ impl RabitqBlock {
     ///
     /// # Safety
     ///
-    /// `idx < self.capacity()` and `code.len() == self.rabitq_byte_len()`.
+    /// `idx < self.capacity()`, `code.len() == self.rabitq_byte_len()`, and
+    /// the caller is the only writer of node `idx` and writes before the node
+    /// is reachable, or holds the block exclusively.
     #[inline]
-    pub unsafe fn set_rabitq(&mut self, idx: usize, code: &[u8]) {
+    pub unsafe fn set_rabitq(&self, idx: usize, code: &[u8]) {
         debug_assert_eq!(code.len(), self.rabitq_bytes, "rabitq len mismatch");
-        // SAFETY: caller bounds; the destination is the code slot.
+        // SAFETY: caller bounds and exclusivity; the destination is the code
+        // slot.
         unsafe {
-            let p = self.node_base_ptr_mut(idx);
+            let p = self.node_base_ptr(idx);
             core::ptr::copy_nonoverlapping(code.as_ptr(), p, self.rabitq_bytes);
         }
     }
@@ -219,13 +234,13 @@ impl RabitqBlock {
     ///
     /// # Safety
     ///
-    /// `idx < self.capacity()`.
+    /// As for [`Self::set_rabitq`].
     #[inline]
-    pub unsafe fn set_rabitq_scalars(&mut self, idx: usize, scalars: RaBitQScalars) {
-        // SAFETY: caller bounds; the destination is the header slot.
+    pub unsafe fn set_rabitq_scalars(&self, idx: usize, scalars: RaBitQScalars) {
+        // SAFETY: caller bounds and exclusivity; the destination is the
+        // header slot.
         unsafe {
-            let p =
-                self.node_base_ptr_mut(idx).add(self.rabitq_scalars_offset) as *mut RaBitQScalars;
+            let p = self.node_base_ptr(idx).add(self.rabitq_scalars_offset) as *mut RaBitQScalars;
             core::ptr::write_unaligned(p, scalars);
         }
     }

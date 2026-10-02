@@ -194,25 +194,26 @@ impl HnswIndex {
                     }
                 }
             }
-            self.data_level0 = Some(nb);
+            self.data_level0 = std::sync::OnceLock::from(nb);
         }
 
         // The code block is a copy of the nodes' RaBitQ codes laid out for
         // the search fast path: refill it from the codes moved above.
-        self.rabitq_block = None;
+        self.rabitq_block = std::sync::OnceLock::new();
         if let (Some(dim), Some(last)) = (
             self.data_level0
-                .as_ref()
+                .get()
                 .map(super::data_level0::DataLevel0Block::dim),
             n.checked_sub(1),
         ) {
             self.ensure_rabitq_block(last, dim);
         }
-        if let (Some(block), Some(store)) = (self.rabitq_block.as_mut(), self.data_level0.as_ref())
-        {
+        if let (Some(block), Some(store)) = (self.rabitq_block.get(), self.data_level0.get()) {
             for idx in 0..n.min(block.capacity()) {
                 if let Some(enc) = store.rabitq(idx) {
-                    Self::install_rabitq(block, idx, enc);
+                    // SAFETY: idx < block capacity; `&mut self` excludes
+                    // every other reader and writer.
+                    unsafe { Self::install_rabitq(block, idx, enc) };
                 }
             }
         }

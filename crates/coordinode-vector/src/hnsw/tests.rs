@@ -129,7 +129,7 @@ fn data_level0_neighbours_form_valid_layer0_graph() {
     }
     let block = index
         .data_level0
-        .as_ref()
+        .get()
         .expect("data_level0 present after inserts");
     let n = index.node_len();
     let mut with_neighbours = 0usize;
@@ -1791,8 +1791,8 @@ fn offload_memory_savings() {
     // drop_f32 re-lays it out without the f32 slot, actually freeing the
     // bytes. The offloaded index must hold no in-RAM f32 so rerank loads
     // from disk; the retained index keeps it.
-    let offloaded_has_f32 = offloaded.data_level0.as_ref().is_some_and(|b| b.has_f32());
-    let retained_has_f32 = retained.data_level0.as_ref().is_some_and(|b| b.has_f32());
+    let offloaded_has_f32 = offloaded.data_level0.get().is_some_and(|b| b.has_f32());
+    let retained_has_f32 = retained.data_level0.get().is_some_and(|b| b.has_f32());
     assert!(
         !offloaded_has_f32,
         "offloaded index must free contiguous-block f32"
@@ -1899,7 +1899,7 @@ fn atomic_neighbours_track_inserts_and_updates() {
     // every node.
     assert!(
         idx.data_level0
-            .as_ref()
+            .get()
             .is_some_and(|b| b.capacity() >= idx.node_len())
     );
     assert_eq!(idx.node_len(), 30, "the re-insert updated node 7 in place");
@@ -2037,7 +2037,7 @@ fn max_elements_preallocates_node_storage() {
 
     assert!(
         idx.data_level0
-            .as_ref()
+            .get()
             .is_some_and(|b| b.capacity() >= 50_000),
         "data_level0 capacity < max_elements 50_000"
     );

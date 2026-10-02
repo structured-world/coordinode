@@ -58,7 +58,7 @@ fn every_code_slot_is_eight_aligned() {
 
 #[test]
 fn rabitq_scalars_round_trip() {
-    let mut layer = RabitqBlock::new(4, 128);
+    let layer = RabitqBlock::new(4, 128);
     let scalars = RaBitQScalars {
         norm: 1.234_5,
         cross_term: -0.5,
@@ -83,7 +83,7 @@ fn rabitq_scalars_round_trip() {
 /// into the neighbouring nodes' blocks.
 #[test]
 fn code_and_scalars_do_not_overlap_neighbouring_nodes() {
-    let mut layer = RabitqBlock::new(4, 64);
+    let layer = RabitqBlock::new(4, 64);
     let scalars = RaBitQScalars {
         norm: 3.5,
         cross_term: 2.25,
@@ -110,7 +110,7 @@ fn code_and_scalars_do_not_overlap_neighbouring_nodes() {
 
 #[test]
 fn rabitq_round_trip() {
-    let mut layer = RabitqBlock::new(4, 128); // rabitq_bytes = 16
+    let layer = RabitqBlock::new(4, 128); // rabitq_bytes = 16
     let code_a: Vec<u8> = (0..16).collect();
     let code_b: Vec<u8> = (200..216).collect();
     // SAFETY: idx < 4, code lengths match rabitq_bytes (=16).
@@ -126,7 +126,7 @@ fn rabitq_round_trip() {
 
 #[test]
 fn large_dim_four_bit_round_trip() {
-    let mut layer = RabitqBlock::new_with_rabitq_bits(2, 1024, 4);
+    let layer = RabitqBlock::new_with_rabitq_bits(2, 1024, 4);
     let code: Vec<u8> = (0..512).map(|i| i as u8).collect(); // 1024 * 4 / 8
     // SAFETY: idx < 2, len matches.
     unsafe {
