@@ -161,6 +161,99 @@ async fn subscribe_refuses_a_token_it_cannot_resume() {
     );
 }
 
+/// A subscription resuming at a position the log no longer holds is refused
+/// with RETENTION_LOST and receives no event: reading on from the oldest
+/// retained entry would hand it a stream silently missing the purged ones.
+#[tokio::test]
+async fn resuming_below_the_retained_log_is_refused_with_retention_lost() {
+    let (engine, _engine_dir) = open_engine();
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
+        Arc::new(OwnedLocalProposalPipeline::new(&engine));
+    let (registry, _bg) = build_consumer_registry(engine, pipeline, RegistryTuning::default());
+
+    // Entries 0-4 and 5-9 in two sealed segments, the first one purged.
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut mgr = OplogManager::open(oplog_dir.path(), 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog");
+    for index in 0..10u64 {
+        mgr.append(&OplogEntry {
+            ts: 1000 + index,
+            term: 1,
+            index,
+            shard: 0,
+            ops: vec![OplogOp::Insert {
+                partition: 0,
+                key: format!("node:{index}").into_bytes(),
+                value: b"v".to_vec(),
+            }],
+            is_migration: false,
+            pre_images: None,
+        })
+        .expect("append");
+        if index == 4 {
+            mgr.rotate().expect("seal");
+        }
+    }
+    mgr.rotate().expect("seal");
+    assert_eq!(mgr.purge_before(5).expect("purge"), 1);
+
+    let service = ChangeEventServiceImpl::new(
+        0,
+        vec![oplog_dir.path().to_path_buf()],
+        registry,
+        super::DEFAULT_CONSUMER_TTL_MS,
+        Arc::new(|| 10),
+        None,
+    );
+    let mut stream = service
+        .subscribe(Request::new(SubscribeRequest {
+            resume_token: Some(ProtoResumeToken {
+                shard_id: 0,
+                segment_id: 0,
+                entry_offset: 2,
+            }),
+            filters: None,
+        }))
+        .await
+        .expect("subscribe")
+        .into_inner();
+
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream answers")
+        .expect("an item");
+    let status = match first {
+        Ok(event) => panic!("an event past a gap was sent: index {}", event.log_index),
+        Err(status) => status,
+    };
+    use tonic_types::StatusExt;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo");
+    assert_eq!(info.reason, "RETENTION_LOST");
+    assert_eq!(info.metadata.get("requested_index"), Some(&"2".to_string()));
+    assert_eq!(
+        info.metadata.get("first_retained_index"),
+        Some(&"5".to_string())
+    );
+
+    // From the start, the same log streams what it holds.
+    let mut fresh = service
+        .subscribe(Request::new(SubscribeRequest {
+            resume_token: None,
+            filters: None,
+        }))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    for expected in 5..10 {
+        assert_eq!(
+            next_index(&mut fresh, Duration::from_secs(5)).await,
+            Some(expected)
+        );
+    }
+}
+
 /// A waiting stream heartbeats at its interval, so an interval that reaches
 /// the consumer TTL would let a connected reader expire; the tuning refuses it.
 #[test]

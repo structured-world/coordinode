@@ -425,6 +425,107 @@ fn tailer_filter_edge_type() {
     assert_eq!(indexes(&batch), vec![0, 2], "only FOLLOWS entries");
 }
 
+/// Two sealed segments, entries 0-4 and 5-9, with the first one purged.
+fn purged_log(dir: &std::path::Path) -> OplogManager {
+    let mut mgr = open_manager(dir);
+    for i in 0..5u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    for i in 5..10u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    assert_eq!(
+        mgr.purge_before(5).expect("purge"),
+        1,
+        "the first segment goes"
+    );
+    mgr
+}
+
+/// A token naming an index the log no longer holds is refused. Reading on
+/// from the first retained segment would hand the reader a stream that
+/// silently lacks every entry in between.
+#[test]
+fn a_token_below_the_retained_log_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _mgr = purged_log(dir.path());
+
+    let mut resumed = tailer(
+        dir.path(),
+        ResumeToken {
+            shard_id: 0,
+            segment_id: 0,
+            entry_offset: 2,
+        },
+    );
+    let err = resumed
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect_err("index 2 is purged");
+    assert!(
+        matches!(
+            err,
+            StorageError::RetentionLost {
+                requested: 2,
+                first_retained: 5
+            }
+        ),
+        "expected retention lost at 2 with the log starting at 5, got {err:?}"
+    );
+}
+
+/// A stream started without a token begins at the oldest entry the log
+/// holds, whatever was purged before it.
+#[test]
+fn a_stream_from_the_start_begins_at_the_retained_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _mgr = purged_log(dir.path());
+
+    let mut fresh = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = fresh
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), (5..10).collect::<Vec<_>>());
+}
+
+/// A cursor that has read part of the log is refused once the entries after
+/// its position are purged, instead of jumping over them.
+#[test]
+fn a_live_cursor_overtaken_by_a_purge_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = open_manager(dir.path());
+    for i in 0..5u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+    for i in 5..10u64 {
+        mgr.append(&make_entry(i, 1000 + i, false)).expect("append");
+    }
+    seal_manager(&mut mgr);
+
+    let mut live = tailer(dir.path(), ResumeToken::from_start(0));
+    let batch = live
+        .read_next(2, &CdcFilters::default(), u64::MAX)
+        .expect("read");
+    assert_eq!(indexes(&batch), vec![0, 1]);
+
+    mgr.purge_before(5).expect("purge");
+    let err = live
+        .read_next(100, &CdcFilters::default(), u64::MAX)
+        .expect_err("indexes 2-4 are purged under the cursor");
+    assert!(
+        matches!(
+            err,
+            StorageError::RetentionLost {
+                requested: 2,
+                first_retained: 5
+            }
+        ),
+        "expected retention lost at 2 with the log starting at 5, got {err:?}"
+    );
+}
+
 #[test]
 fn tailer_reads_across_multiple_segments() {
     let dir = tempfile::tempdir().expect("tempdir");

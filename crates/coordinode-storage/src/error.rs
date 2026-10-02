@@ -114,6 +114,20 @@ pub enum StorageError {
     /// bound, or its bytes are not a frame this build accepts.
     #[error("unit frame: {0}")]
     Frame(#[from] coordinode_core::txn::frame::FrameError),
+
+    /// A log reader's position is below what the oplog still holds: the
+    /// entries from `requested` up to `first_retained` were purged, and a
+    /// reader resuming there cannot be given them. Never answered by reading
+    /// on from `first_retained`, which would hide the gap.
+    #[error(
+        "retention lost: oplog position {requested} was purged; the log now starts at {first_retained}"
+    )]
+    RetentionLost {
+        /// The next index the reader asked for.
+        requested: u64,
+        /// The first index the oplog still holds.
+        first_retained: u64,
+    },
 }
 
 impl From<lsm_tree::Error> for StorageError {

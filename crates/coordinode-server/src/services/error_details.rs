@@ -114,6 +114,12 @@ pub enum Reason {
     /// A statement tried to change a key column of an existing row. Metadata
     /// carries `table` and `column`. Terminal.
     KeyImmutable,
+    /// A change stream's position is no longer covered by the retained log:
+    /// the entries after it were purged, so the stream cannot continue from
+    /// there without a gap. Metadata carries `requested_index` and
+    /// `first_retained_index` when the position is known. Terminal for that
+    /// position: resubscribing from the same token is refused again.
+    RetentionLost,
 }
 
 impl Reason {
@@ -139,6 +145,7 @@ impl Reason {
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
             Reason::DuplicateKey => "DUPLICATE_KEY",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
+            Reason::RetentionLost => "RETENTION_LOST",
         }
     }
 

@@ -138,6 +138,10 @@ pub struct OplogTailer {
     shard_id: ShardId,
     /// The next log index to read.
     next: u64,
+    /// Whether `next` is a position the reader holds (a resume token, or an
+    /// entry already read) rather than "the oldest available". A held
+    /// position below the retained log is a gap, never a place to skip from.
+    held: bool,
 }
 
 impl OplogTailer {
@@ -155,6 +159,7 @@ impl OplogTailer {
             oplog_dirs: oplog_dirs.to_vec(),
             shard_id: token.shard_id,
             next: token.next_index()?,
+            held: !token.is_start(),
         })
     }
 
@@ -185,6 +190,18 @@ impl OplogTailer {
         until: u64,
     ) -> StorageResult<Vec<(OplogEntry, ResumeToken)>> {
         let segments = self.list_segments()?;
+        // Segments are purged as a prefix and named by their first index, so
+        // the oldest one says where the retained log begins. A reader holding
+        // a position below it would otherwise read on from there and never
+        // learn of the entries in between.
+        if let Some(&(first_retained, _)) = segments.first() {
+            if self.held && first_retained > self.next {
+                return Err(StorageError::RetentionLost {
+                    requested: self.next,
+                    first_retained,
+                });
+            }
+        }
         let mut result = Vec::new();
 
         for (position, (seg_first_index, seg_path)) in segments.iter().enumerate() {
@@ -239,6 +256,7 @@ impl OplogTailer {
                     return Ok(result);
                 }
                 self.next = entry.index + 1;
+                self.held = true;
                 // A reader sees the operations a unit frame encodes.
                 let ops = expand_units(&entry.ops)?;
                 if passes_filter(entry, &ops, filters) {

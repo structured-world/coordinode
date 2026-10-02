@@ -27,6 +27,7 @@ use coordinode_replicate::{
     TopologyScope,
 };
 use coordinode_storage::engine::core::StorageEngine;
+use coordinode_storage::error::StorageError;
 use coordinode_storage::oplog::entry::OplogOp;
 use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken};
 
@@ -246,9 +247,12 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 // gap (the consumer's checkpoint fell behind the GC floor).
                 if let Err(e) = registry.check_retention(&handle) {
                     let _ = tx
-                        .send(Err(Status::failed_precondition(format!(
-                            "change stream retention lost: {e}"
-                        ))))
+                        .send(Err(super::error_details::status_with_reason(
+                            tonic::Code::FailedPrecondition,
+                            format!("change stream retention lost: {e}"),
+                            super::error_details::Reason::RetentionLost,
+                            [],
+                        )))
                         .await;
                     break;
                 }
@@ -256,6 +260,26 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 let read_from = tailer.next_index();
                 let batch = match tailer.read_next(tuning.batch_size.get(), &filters, applied()) {
                     Ok(b) => b,
+                    Err(StorageError::RetentionLost {
+                        requested,
+                        first_retained,
+                    }) => {
+                        let _ = tx
+                            .send(Err(super::error_details::status_with_reason(
+                                tonic::Code::FailedPrecondition,
+                                format!(
+                                    "change stream retention lost: the log no longer holds index \
+                                     {requested}; it starts at {first_retained}"
+                                ),
+                                super::error_details::Reason::RetentionLost,
+                                [
+                                    ("requested_index", requested.to_string()),
+                                    ("first_retained_index", first_retained.to_string()),
+                                ],
+                            )))
+                            .await;
+                        break;
+                    }
                     Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                         break;
