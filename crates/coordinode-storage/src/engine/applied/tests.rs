@@ -27,7 +27,46 @@ fn put(partition: PartitionId, key: &[u8]) -> Mutation {
     }
 }
 
-const NO_WAIT: Duration = Duration::from_millis(0);
+const NO_WAIT: Option<Duration> = Some(Duration::from_millis(0));
+
+/// A subscriber waiting with no deadline sleeps until an entry applies, and
+/// takes that entry.
+#[test]
+fn a_waiting_subscriber_wakes_on_an_apply() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = std::sync::Arc::new(engine(&dir));
+    let sub = engine.subscribe_applied(Partition::Node, 16);
+
+    let waiter = std::thread::spawn(move || sub.next(None));
+    std::thread::sleep(Duration::from_millis(50));
+    engine
+        .apply_raft_proposal(&[put(PartitionId::Node, b"a")], 11, 1, 0, |_| false)
+        .expect("apply");
+
+    assert!(matches!(
+        waiter.join().expect("waiter"),
+        Some(AppliedEvent::Keys { index: 1, .. })
+    ));
+}
+
+/// A stop ends a wait that has no deadline, and every later wait returns at
+/// once: the consumer's shutdown never waits for an apply.
+#[test]
+fn a_stop_ends_a_wait_without_deadline() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let sub = engine.subscribe_applied(Partition::Node, 16);
+    let stop = sub.stopper();
+
+    let waiter = std::thread::spawn(move || {
+        let first = sub.next(None);
+        (first, sub.next(None))
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    stop.stop();
+
+    assert_eq!(waiter.join().expect("waiter"), (None, None));
+}
 
 /// An applied entry reaches the subscriber with its index, its commit
 /// timestamp and the keys it wrote in the subscribed partition, and nothing

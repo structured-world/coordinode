@@ -2,7 +2,7 @@ use super::*;
 // Tests plant fixtures directly (adjacency posting lists, edge-type
 // markers, node records) — raw partition + posting access is legitimate
 // setup the typed stores can't express.
-use coordinode_core::graph::edge::PostingList;
+use coordinode_core::graph::edge::{PostingList, encode_adj_key_forward, encode_adj_key_reverse};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::schema::definition::PropertyDef;
@@ -106,6 +106,195 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
+}
+
+// ── reap_computed_ttl_committed: the transactional pass ──────────
+
+/// Commit through the plain commit path, as the database's pipeline does on
+/// one member.
+fn commit_now(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
+    let wc = coordinode_core::txn::write_concern::WriteConcern::majority();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    txn.commit(&ctx).map(|_| ())
+}
+
+/// Commit `record` for `node` in a transaction of `oracle`.
+fn put_with(engine: &StorageEngine, oracle: &TimestampOracle, node: u64, record: &NodeRecord) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let mut txn = Transaction::begin(engine, Some(oracle), oracle.next());
+    LocalNodeStore
+        .put(&mut txn, 1, NodeId::from_raw(node), record)
+        .expect("put node");
+    commit_now(&mut txn).expect("commit node");
+}
+
+fn session(interner: &mut FieldInterner, created_at_us: i64) -> NodeRecord {
+    let mut record = NodeRecord::new("Session");
+    record.set(
+        interner.intern("created_at"),
+        Value::Timestamp(created_at_us),
+    );
+    record
+}
+
+/// The pass deletes what expired and keeps what did not, committing through
+/// the path it is given.
+#[test]
+fn a_committed_pass_deletes_what_expired() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let now = now_us();
+    put_with(
+        &engine,
+        &oracle,
+        1,
+        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+    );
+    put_with(&engine, &oracle, 2, &session(&mut interner, now));
+
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit_now);
+
+    assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
+    assert!(!node_exists(&engine, 1, 1), "the expired node is gone");
+    assert!(node_exists(&engine, 1, 2), "the fresh node stays");
+}
+
+/// A renewal committed after the pass read the record and before its page
+/// commits is a later version than the one the expiry was decided on: the
+/// page is refused, read again, and the renewed record is no longer expired.
+#[test]
+fn a_renewal_before_the_page_commits_keeps_the_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let now = now_us();
+    put_with(
+        &engine,
+        &oracle,
+        1,
+        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+    );
+    let renewed = session(&mut interner, now);
+
+    let mut renewed_once = false;
+    let mut commit = |txn: &mut Transaction<'_>| {
+        if !renewed_once {
+            renewed_once = true;
+            put_with(&engine, &oracle, 1, &renewed);
+        }
+        commit_now(txn)
+    };
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit);
+
+    assert_eq!(result.nodes_deleted, 0, "a renewed record was reaped");
+    assert!(node_exists(&engine, 1, 1), "the renewed node stays");
+}
+
+/// The same for a field-scoped TTL, where the removal is a merge operand
+/// that write-set validation does not compare: only the version condition
+/// keeps a renewed field from being removed.
+#[test]
+fn a_renewal_before_the_page_commits_keeps_the_field() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Field));
+    let now = now_us();
+    put_with(
+        &engine,
+        &oracle,
+        1,
+        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+    );
+    let renewed = session(&mut interner, now);
+
+    let mut renewed_once = false;
+    let mut commit = |txn: &mut Transaction<'_>| {
+        if !renewed_once {
+            renewed_once = true;
+            put_with(&engine, &oracle, 1, &renewed);
+        }
+        commit_now(txn)
+    };
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit);
+
+    assert_eq!(result.fields_removed, 0, "a renewed field was removed");
+    let field = interner.lookup("created_at").expect("interned");
+    let kept = read_node(&engine, 1, NodeId::from_raw(1)).expect("node");
+    assert_eq!(kept.props.get(&field), Some(&Value::Timestamp(now)));
+}
+
+/// An edge attached to an expired node after the pass read it is one the
+/// deletion never removed: the page is refused rather than leaving that edge
+/// pointing at a node that is gone, and the pass read again deletes the node
+/// with it.
+#[test]
+fn an_edge_attached_before_the_page_commits_is_removed_with_the_node() {
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let now = now_us();
+    put_with(
+        &engine,
+        &oracle,
+        1,
+        &session(&mut interner, now - 2 * 3600 * 1_000_000),
+    );
+    put_with(&engine, &oracle, 2, &NodeRecord::new("User"));
+
+    let mut attached = false;
+    let mut commit = |txn: &mut Transaction<'_>| {
+        if !attached {
+            attached = true;
+            // An edge of a type that did not exist when the pass began, so
+            // the pass cannot have known to look for it.
+            use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+            let mut link = Transaction::begin(&engine, Some(&oracle), oracle.next());
+            LocalSchemaStore::new(&engine)
+                .register_edge_type_marker(&mut link, "OWNS")
+                .expect("register the type");
+            LocalEdgeStore
+                .put_edge(
+                    &mut link,
+                    "OWNS",
+                    NodeId::from_raw(2),
+                    NodeId::from_raw(1),
+                    None,
+                )
+                .expect("attach");
+            commit_now(&mut link).expect("the attachment commits");
+        }
+        commit_now(txn)
+    };
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit);
+
+    assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
+    assert!(!node_exists(&engine, 1, 1));
+    let left = engine
+        .get(
+            Partition::Adj,
+            &encode_adj_key_forward("OWNS", NodeId::from_raw(2)),
+        )
+        .expect("read")
+        .map(|bytes| PostingList::from_bytes(&bytes).expect("posting").len())
+        .unwrap_or(0);
+    assert_eq!(left, 0, "an edge points at the reaped node");
 }
 
 // ── discover_ttl_targets ─────────────────────────────────────────

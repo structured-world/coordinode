@@ -315,6 +315,8 @@ impl StorageEngine {
                 coverage::write_fold(tree, Domain::Raft, from, next, payload, at);
             }
         }
+        // A fold can land in a memtable a rotation just emptied.
+        self.coordinator.flush_trigger().wrote_unmeasured();
     }
 
     /// Make `fence` the one that pauses this node's Raft applies, replacing

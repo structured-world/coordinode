@@ -8,10 +8,13 @@
 //!
 //! Heartbeats and eviction run through an optional background service
 //! ([`RegistryBackground`]): heartbeats buffer in-memory on the leader and
-//! flush as a single coalesced proposal every `heartbeat_window_ms`
-//! (≤ `1000 / window` proposals/sec regardless of consumer count); expired
-//! registrations are swept and removed by an eviction proposal on a timer.
-//! Without the background service, `heartbeat` writes eagerly (used by tests).
+//! flush as a single coalesced proposal per `heartbeat_window_ms` window the
+//! first buffered heartbeat opens (≤ `1000 / window` proposals/sec regardless
+//! of consumer count); expired registrations are swept and removed by an
+//! eviction proposal when the earliest one can expire, and the floor is
+//! refreshed whenever the registry keyspace changes. An idle registry runs
+//! nothing. Without the background service, `heartbeat` writes eagerly (used
+//! by tests).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +26,7 @@ use coordinode_core::txn::proposal::{
 };
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_storage::Guard;
+use coordinode_storage::engine::applied::AppliedStop;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use parking_lot::Mutex;
@@ -61,17 +65,20 @@ impl Clock for SystemClock {
 /// Tuning for the background heartbeat-flush + eviction-sweep service.
 #[derive(Debug, Clone, Copy)]
 pub struct BackgroundConfig {
-    /// Drain window for buffered heartbeats. One coalesced proposal per
-    /// window regardless of consumer count.
+    /// Drain window for buffered heartbeats: the first heartbeat buffered
+    /// opens a window, and the heartbeats of the window go in one proposal
+    /// regardless of consumer count. Nothing buffered, nothing runs.
     pub heartbeat_window_ms: u64,
-    /// How often to sweep and evict registrations past their TTL.
+    /// Shortest gap between two eviction sweeps. A sweep runs when the
+    /// earliest registration can expire and when the registry keyspace
+    /// changes, never on a timer of its own.
     pub eviction_interval_ms: u64,
 }
 
 impl Default for BackgroundConfig {
     fn default() -> Self {
         Self {
-            heartbeat_window_ms: 100,
+            heartbeat_window_ms: 1_000,
             eviction_interval_ms: 1_000,
         }
     }
@@ -102,6 +109,8 @@ struct RegistryCore {
     /// Buffered heartbeats awaiting the next coalesced flush:
     /// `consumer_id → latest heartbeat ts`.
     pending_hb: Mutex<HashMap<String, u64>>,
+    /// Notified when a heartbeat is buffered, opening a flush window.
+    hb_buffered: tokio::sync::Notify,
 }
 
 impl RegistryCore {
@@ -269,7 +278,7 @@ impl RegistryCore {
 
     /// Evict registrations past their TTL via one Delete proposal, then
     /// refresh the floor (a dead consumer must stop pinning retention).
-    fn sweep_evictions(&self) -> Result<usize, RegistryError> {
+    fn sweep_evictions(&self) -> Result<Sweep, RegistryError> {
         // A heartbeat still in the buffer is a sign of life the stored entry
         // does not show yet: persist it first, or a live consumer whose TTL is
         // close to the flush window is evicted between its heartbeat and the
@@ -277,6 +286,7 @@ impl RegistryCore {
         self.flush_pending_heartbeats()?;
         let now = self.clock.now_ms();
         let mut to_evict = Vec::new();
+        let mut next_expiry_ms: Option<u64> = None;
         let iter = self
             .engine
             .prefix_scan(Partition::Registry, REGISTRY_KEY_PREFIX)
@@ -285,28 +295,49 @@ impl RegistryCore {
             let (_, value) = guard
                 .into_inner()
                 .map_err(|e| RegistryError::Replication(e.to_string()))?;
-            let entry = RegistryEntry::decode(&value)
+            let mut entry = RegistryEntry::decode(&value)
                 .map_err(|e| RegistryError::Replication(format!("decode registry entry: {e}")))?;
             // The flush above can outlast a TTL; a heartbeat that arrived
             // meanwhile is only in the buffer, and it is a sign of life.
-            if entry.is_expired(now) && !self.pending_hb.lock().contains_key(&entry.consumer_id) {
+            let buffered = self.pending_hb.lock().get(&entry.consumer_id).copied();
+            if entry.is_expired(now) && buffered.is_none() {
                 to_evict.push(Mutation::Delete {
                     partition: PartitionId::Registry,
                     key: encode_registry_key(&entry.consumer_id),
                 });
+                continue;
+            }
+            if let Some(ts) = buffered {
+                entry.last_heartbeat_ts_ms = entry.last_heartbeat_ts_ms.max(ts);
+            }
+            if let Some(at) = entry.expires_at_ms() {
+                next_expiry_ms = Some(next_expiry_ms.map_or(at, |next| next.min(at)));
             }
         }
-        let count = to_evict.len();
-        if count > 0 {
+        let evicted = to_evict.len();
+        if evicted > 0 {
             self.propose(to_evict)?;
-            metrics::counter!("registry_evictions_total").increment(count as u64);
+            metrics::counter!("registry_evictions_total").increment(evicted as u64);
         }
         // Always refresh the floor: an expired registration that another
         // node evicted, or a checkpoint advanced through a different handle,
         // must reach the engine even when this sweep evicted nothing.
         self.recompute_floor()?;
-        Ok(count)
+        Ok(Sweep {
+            evicted,
+            next_expiry_ms,
+        })
     }
+}
+
+/// What one eviction sweep did and when the next one is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sweep {
+    /// Registrations removed.
+    evicted: usize,
+    /// When the earliest registration left can expire (clock ms), or `None`
+    /// when none can.
+    next_expiry_ms: Option<u64>,
 }
 
 /// Per-shard consumer-retention registry backed by `Partition::Registry`.
@@ -339,6 +370,7 @@ impl ShardConsumerRegistry {
             allow_topology_scopes: false,
             batching_on: AtomicBool::new(false),
             pending_hb: Mutex::new(HashMap::new()),
+            hb_buffered: tokio::sync::Notify::new(),
         });
         // Recover the floor + publish the engine watermark from any
         // registrations persisted in a prior life.
@@ -418,7 +450,8 @@ impl ShardConsumerRegistry {
         // the blocking pool, or the runtime thread they would hold is the one
         // the consumers' streams heartbeat from.
         let blocking =
-            |core: &Arc<RegistryCore>, work: fn(&RegistryCore) -> Result<usize, RegistryError>| {
+            |core: &Arc<RegistryCore>,
+             work: fn(&RegistryCore) -> Result<Option<u64>, RegistryError>| {
                 let core = Arc::clone(core);
                 async move {
                     tokio::task::spawn_blocking(move || work(&core))
@@ -428,28 +461,72 @@ impl ShardConsumerRegistry {
                         })
                 }
             };
-        let flush = |core: &RegistryCore| core.flush_pending_heartbeats().map(|()| 0);
+        let flush = |core: &RegistryCore| core.flush_pending_heartbeats().map(|()| None);
+        let sweep = |core: &RegistryCore| {
+            core.sweep_evictions().map(|sweep| {
+                if sweep.evicted > 0 {
+                    tracing::debug!(evicted = sweep.evicted, "registry TTL sweep");
+                }
+                sweep.next_expiry_ms
+            })
+        };
+
+        // A registration another member wrote changes the floor this member
+        // publishes, so a write applied to the registry keyspace asks for a
+        // sweep. The feed is a blocking subscription; one parked thread
+        // relays it.
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let applied = self.core.engine.subscribe_applied(Partition::Registry, 16);
+        let applied_stop = applied.stopper();
+        let relay = Arc::clone(&changed);
+        let relay_thread = std::thread::Builder::new()
+            .name("registry-applied".to_string())
+            .spawn(move || {
+                while applied.next(None).is_some() {
+                    relay.notify_one();
+                }
+            })
+            .map_err(|e| tracing::error!(error = %e, "registry apply relay did not start"))
+            .ok();
+
+        let window = Duration::from_millis(cfg.heartbeat_window_ms);
+        let gap = Duration::from_millis(cfg.eviction_interval_ms);
         let handle = tokio::spawn(async move {
-            let mut hb = tokio::time::interval(Duration::from_millis(cfg.heartbeat_window_ms));
-            let mut evict = tokio::time::interval(Duration::from_millis(cfg.eviction_interval_ms));
-            // A write slower than the window must not queue a burst of catch-up
-            // ticks behind it.
-            hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            evict.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut flush_at: Option<tokio::time::Instant> = None;
+            // The first sweep publishes the floor the stored registrations hold.
+            let mut sweep_at: Option<tokio::time::Instant> = Some(tokio::time::Instant::now());
+            let mut last_sweep: Option<tokio::time::Instant> = None;
             loop {
                 tokio::select! {
                     _ = stop.notified() => break,
-                    _ = hb.tick() => {
+                    _ = core.hb_buffered.notified(), if flush_at.is_none() => {
+                        flush_at = Some(tokio::time::Instant::now() + window);
+                    }
+                    _ = changed.notified() => {
+                        let soonest = last_sweep.map_or_else(tokio::time::Instant::now, |at| at + gap);
+                        sweep_at = Some(sweep_at.map_or(soonest, |due| due.min(soonest)));
+                    }
+                    _ = sleep_until(flush_at), if flush_at.is_some() => {
+                        flush_at = None;
                         if let Err(e) = blocking(&core, flush).await {
                             tracing::warn!(error = %e, "registry heartbeat flush failed");
+                            // The heartbeats stay buffered: try again a window on.
+                            flush_at = Some(tokio::time::Instant::now() + window);
                         }
                     }
-                    _ = evict.tick() => {
-                        match blocking(&core, RegistryCore::sweep_evictions).await {
-                            Ok(n) if n > 0 => tracing::debug!(evicted = n, "registry TTL sweep"),
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(error = %e, "registry eviction sweep failed"),
-                        }
+                    _ = sleep_until(sweep_at), if sweep_at.is_some() => {
+                        let swept_at = tokio::time::Instant::now();
+                        last_sweep = Some(swept_at);
+                        sweep_at = match blocking(&core, sweep).await {
+                            Ok(next) => next.map(|at_ms| {
+                                let wait = at_ms.saturating_sub(core.clock.now_ms());
+                                swept_at + Duration::from_millis(wait).max(gap)
+                            }),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "registry eviction sweep failed");
+                                Some(swept_at + gap)
+                            }
+                        };
                     }
                 }
             }
@@ -460,9 +537,19 @@ impl ShardConsumerRegistry {
         });
         RegistryBackground {
             shutdown,
-            handle,
+            handle: Some(handle),
+            applied_stop,
+            relay_thread,
             config: cfg,
         }
+    }
+}
+
+/// Sleep until `at`; never return when there is no `at`.
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -470,7 +557,10 @@ impl ShardConsumerRegistry {
 /// [`shutdown`](Self::shutdown) for a clean final flush.
 pub struct RegistryBackground {
     shutdown: Arc<tokio::sync::Notify>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// Ends the thread relaying registry applies.
+    applied_stop: AppliedStop,
+    relay_thread: Option<std::thread::JoinHandle<()>>,
     config: BackgroundConfig,
 }
 
@@ -481,9 +571,24 @@ impl RegistryBackground {
     }
 
     /// Stop the service after a final heartbeat flush, awaiting the task.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.shutdown.notify_one();
-        let _ = self.handle.await;
+        self.applied_stop.stop();
+        let relay = self.relay_thread.take();
+        if let Some(relay) = relay {
+            // The stop has ended its wait; the join is immediate.
+            let _ = tokio::task::spawn_blocking(move || relay.join()).await;
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for RegistryBackground {
+    fn drop(&mut self) {
+        // A parked relay thread would outlive the service otherwise.
+        self.applied_stop.stop();
     }
 }
 
@@ -534,6 +639,7 @@ impl SeqnoConsumerRegistry for ShardConsumerRegistry {
                 .entry(handle.consumer_id().to_string())
                 .and_modify(|t| *t = (*t).max(now))
                 .or_insert(now);
+            self.core.hb_buffered.notify_one();
             return Ok(());
         }
         // Eager path (no background service): validate + write immediately.

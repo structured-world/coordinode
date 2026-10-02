@@ -617,6 +617,55 @@ fn composing_the_deltas_preserves_the_claims_they_carried() {
     assert_eq!(plist.as_slice(), &[2, 3, 4, 5, 6, 7]);
 }
 
+/// Two attempts that began at one read timestamp are still two attempts.
+///
+/// Transactions opened with no commit between them share their read
+/// timestamp, which is the ordinary case. If the reservation were keyed by
+/// that timestamp, the second would replace the first's claims instead of
+/// being checked against them, and releasing either would drop both.
+#[test]
+fn attempts_sharing_a_read_timestamp_do_not_share_a_reservation() {
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, ClaimSet};
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    let generation = txn.schema_generation();
+    txn.merge_adj_add(b"adj:R:out:\x00\x00\x00\x00\x00\x00\x00\x02", 1);
+    txn.claim(Claim::new(
+        ClaimScope::Node(NodeId::from_raw(1)),
+        ClaimPredicate::EndpointAlive,
+        generation,
+    ));
+
+    // Another attempt that began at the same read timestamp is in flight,
+    // deleting the node this one attaches to.
+    let mut destroying = ClaimSet::new();
+    destroying.insert(Claim::new(
+        ClaimScope::Node(NodeId::from_raw(1)),
+        ClaimPredicate::EndpointDestroyed,
+        generation,
+    ));
+    let _in_flight = engine
+        .claim_registry()
+        .reserve_held(txn.read_ts().as_raw(), &destroying)
+        .expect("the other attempt holds its reservation");
+
+    assert!(
+        matches!(txn.commit(&ctx), Err(CommitError::InvariantRefused { .. })),
+        "an attachment committed beside a deletion of its endpoint"
+    );
+}
+
 /// A refusal is clean, which is what makes the retry it advises safe: nothing
 /// of the attempt is applied and the guard budget it held is returned. A
 /// refusal that left either behind would turn a retry into a second attempt
@@ -1001,22 +1050,18 @@ fn prefix_scan_paged_exact_limit_reports_exhausted() {
 /// commit passes untouched (there is nothing to admit).
 #[test]
 fn commit_rejects_writes_under_stop_pressure() {
-    // The compaction monitor overwrites the cached tier every poll cycle
-    // with the real (healthy) verdict, so the forced tier below must not
-    // race with it: give the monitor an hour-long poll interval and let its
-    // single startup tick land before forcing.
+    // The compaction monitor overwrites the cached tier whenever a flush or a
+    // compaction wakes it, with the real (healthy) verdict, so the forced tier
+    // below must not race with it: let its startup pass land before forcing;
+    // with no flush in this test nothing wakes it again.
     let dir = tempfile::tempdir().unwrap();
-    let config = {
-        let mut c = StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            dir.path().to_string_lossy().as_ref(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]);
-        c.compaction_poll_interval_ms = 3_600_000;
-        c
-    };
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path().to_string_lossy().as_ref(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
     let oracle = Arc::new(TimestampOracle::new());
     let engine = StorageEngine::open_with_oracle(&config, oracle.clone()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));

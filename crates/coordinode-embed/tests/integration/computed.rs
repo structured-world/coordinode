@@ -458,57 +458,6 @@ fn computed_ttl_node_deletion_survives_reopen() {
     }
 }
 
-/// Pipeline path: reaper submits mutations through ProposalPipeline
-/// (same path used by background thread in production).
-#[test]
-fn computed_ttl_reaper_via_pipeline() {
-    let (mut db, _dir) = open_db();
-    setup_memory_schema(&mut db);
-
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
-    let old_us = now_us - 31 * 86400 * 1_000_000;
-
-    // Create expired + fresh nodes.
-    db.execute_cypher(&format!(
-        "CREATE (m:Memory {{content: 'expired', created_at: {old_us}}})"
-    ))
-    .expect("create expired");
-    db.execute_cypher(&format!(
-        "CREATE (m:Memory {{content: 'fresh', created_at: {now_us}}})"
-    ))
-    .expect("create fresh");
-
-    // Create pipeline (same as Database uses internally).
-    let pipeline = std::sync::Arc::new(coordinode_raft::proposal::OwnedLocalProposalPipeline::new(
-        &db.engine_shared(),
-    ));
-    let id_gen = coordinode_core::txn::proposal::ProposalIdGenerator::new();
-    let interner = coordinode_core::graph::intern::FieldInterner::new();
-
-    let result = coordinode_query::index::ttl_reaper::reap_computed_ttl_via_pipeline(
-        &db.engine_shared(),
-        1,
-        1000,
-        &interner,
-        pipeline.as_ref(),
-        &id_gen,
-    );
-
-    assert_eq!(
-        result.nodes_deleted, 1,
-        "should delete 1 expired node via pipeline"
-    );
-
-    let rows = db
-        .execute_cypher("MATCH (m:Memory) RETURN m.content AS c")
-        .expect("query after pipeline reap");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("c"), Some(&Value::String("fresh".into())),);
-}
-
 // ── COMPUTED VECTOR_DECAY × vector_similarity ────────────────────
 
 /// Helper: create a schema with VECTOR_DECAY + embedding for decay-weighted vector tests.

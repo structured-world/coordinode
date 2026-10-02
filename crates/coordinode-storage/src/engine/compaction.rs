@@ -1,9 +1,12 @@
 //! CompactionScheduler: priority-based LSM compaction worker pool.
 //!
-//! Monitor thread polls all partition trees every `poll_interval_ms` and
-//! submits [`CompactionRequest`]s sorted by priority (Urgent → High →
-//! Normal → Low) via a flume channel to N worker threads.
-//! Workers call `tree.compact(Leveled::default(), gc_watermark)`.
+//! Monitor thread checks all partition trees when something changed what
+//! compaction has to do (a flush added a table, a compaction finished) and
+//! submits [`CompactionRequest`]s sorted by priority (Urgent → High → Normal
+//! → Low) via a flume channel to N worker threads. Workers call
+//! `tree.compact(Leveled::default(), gc_watermark)`. Between events nothing
+//! runs: an idle engine has nothing to compact, and asking every tree again
+//! on a timer only costs wakeups.
 //!
 //! Priority rules (per partition per poll cycle):
 //!   - **Urgent**: `l0_run_count > l0_urgent_threshold` — write stall imminent
@@ -26,6 +29,7 @@ use lsm_tree::AbstractTree;
 
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
+use coordinode_core::txn::wake::Wake;
 
 /// Compaction priority — lower numeric value = higher urgency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,6 +62,8 @@ pub(crate) struct CompactionScheduler {
     workers: Vec<std::thread::JoinHandle<()>>,
     monitor: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    /// The monitor's wakeup, notified on shutdown so the monitor sees the flag.
+    wake: Arc<Wake>,
     /// Sender clone held here so it can be dropped explicitly before joining workers.
     sender: Option<flume::Sender<CompactionRequest>>,
 }
@@ -65,7 +71,8 @@ pub(crate) struct CompactionScheduler {
 impl CompactionScheduler {
     /// Start the compaction scheduler.
     ///
-    /// Spawns one monitor thread and `num_workers` worker threads.
+    /// Spawns one monitor thread, woken through `wake` (which the flush
+    /// workers notify after each flush), and `num_workers` worker threads.
     ///
     /// # Errors
     ///
@@ -75,9 +82,9 @@ impl CompactionScheduler {
         gc_watermark: Arc<AtomicU64>,
         num_workers: usize,
         l0_urgent_threshold: usize,
-        poll_interval_ms: u64,
         debt_urgent_bytes: u64,
         write_pressure: Arc<std::sync::atomic::AtomicU8>,
+        wake: Arc<Wake>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -89,10 +96,10 @@ impl CompactionScheduler {
         let mut workers = Vec::with_capacity(num_workers);
         for i in 0..num_workers {
             let rx = receiver.clone();
-            let shutdown_w = Arc::clone(&shutdown);
+            let compacted = Arc::clone(&wake);
             let handle = std::thread::Builder::new()
                 .name(format!("coord-compact-worker-{i}"))
-                .spawn(move || compaction_worker_loop(rx, shutdown_w))
+                .spawn(move || compaction_worker_loop(rx, &compacted))
                 .map_err(|e| {
                     StorageError::InvalidConfig(format!("compaction worker spawn: {e}"))
                 })?;
@@ -105,6 +112,7 @@ impl CompactionScheduler {
 
         let tx = sender.clone();
         let shutdown_m = Arc::clone(&shutdown);
+        let wake_m = Arc::clone(&wake);
         let monitor = std::thread::Builder::new()
             .name("coord-compact-monitor".to_string())
             .spawn(move || {
@@ -113,10 +121,10 @@ impl CompactionScheduler {
                     tx,
                     gc_watermark,
                     l0_urgent_threshold,
-                    poll_interval_ms,
                     debt_urgent_bytes,
                     write_pressure,
                     shutdown_m,
+                    &wake_m,
                 );
             })
             .map_err(|e| StorageError::InvalidConfig(format!("compaction monitor spawn: {e}")))?;
@@ -125,6 +133,7 @@ impl CompactionScheduler {
             workers,
             monitor: Some(monitor),
             shutdown,
+            wake,
             sender: Some(sender),
         })
     }
@@ -133,6 +142,7 @@ impl CompactionScheduler {
 impl Drop for CompactionScheduler {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.wake.notify();
         if let Some(monitor) = self.monitor.take() {
             let _ = monitor.join();
         }
@@ -179,11 +189,12 @@ fn compaction_monitor_loop(
     sender: flume::Sender<CompactionRequest>,
     gc_watermark: Arc<AtomicU64>,
     l0_urgent_threshold: usize,
-    poll_interval_ms: u64,
     debt_urgent_bytes: u64,
     write_pressure: Arc<std::sync::atomic::AtomicU8>,
     shutdown: Arc<AtomicBool>,
+    wake: &Wake,
 ) {
+    wake.bind();
     let strategy = lsm_tree::compaction::Leveled::default();
     while !shutdown.load(Ordering::Relaxed) {
         let watermark = gc_watermark.load(Ordering::Relaxed);
@@ -243,64 +254,50 @@ fn compaction_monitor_loop(
         requests.sort_by_key(|r| r.priority);
 
         for req in requests {
-            // Non-blocking: if the channel is full, workers are busy.
-            // Skipped partitions will be retried on the next poll cycle.
+            // Non-blocking: if the channel is full, workers are busy. A
+            // partition skipped here is asked again when a running compaction
+            // finishes and wakes the monitor.
             let _ = sender.try_send(req);
         }
 
-        // Sleep in short ticks so engine shutdown (which joins this thread)
-        // stays responsive regardless of the configured poll interval.
-        let mut slept = 0u64;
-        while slept < poll_interval_ms && !shutdown.load(Ordering::Relaxed) {
-            let tick = (poll_interval_ms - slept).min(100);
-            std::thread::sleep(std::time::Duration::from_millis(tick));
-            slept += tick;
-        }
+        wake.wait(None);
     }
 }
 
 /// Worker loop: receives compaction requests and executes Leveled compaction.
-fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, shutdown: Arc<AtomicBool>) {
-    loop {
-        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(CompactionRequest {
-                tree,
-                partition,
-                priority,
-                gc_watermark,
-            }) => {
-                let strategy = Arc::new(lsm_tree::compaction::Leveled::default());
-                match tree.compact(strategy, gc_watermark) {
-                    Ok(result)
-                        if result.action != lsm_tree::compaction::CompactionAction::Nothing =>
-                    {
-                        tracing::debug!(
-                            partition = partition.name(),
-                            ?priority,
-                            tables_in = result.tables_in,
-                            tables_out = result.tables_out,
-                            "compaction completed"
-                        );
-                    }
-                    Ok(_) => {
-                        // Nothing to compact — Leveled strategy found no work.
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            partition = partition.name(),
-                            error = %e,
-                            "compaction failed"
-                        );
-                    }
-                }
+///
+/// Blocks on the channel with no timeout: the scheduler's drop closes the
+/// channel, which is what ends the loop. A compaction that did work wakes the
+/// monitor, because the result can make another level due.
+fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacted: &Wake) {
+    while let Ok(CompactionRequest {
+        tree,
+        partition,
+        priority,
+        gc_watermark,
+    }) = receiver.recv()
+    {
+        let strategy = Arc::new(lsm_tree::compaction::Leveled::default());
+        match tree.compact(strategy, gc_watermark) {
+            Ok(result) if result.action != lsm_tree::compaction::CompactionAction::Nothing => {
+                tracing::debug!(
+                    partition = partition.name(),
+                    ?priority,
+                    tables_in = result.tables_in,
+                    tables_out = result.tables_out,
+                    "compaction completed"
+                );
+                compacted.notify();
             }
-            Err(flume::RecvTimeoutError::Timeout) => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
+            Ok(_) => {
+                // Nothing to compact: the Leveled strategy found no work.
             }
-            Err(flume::RecvTimeoutError::Disconnected) => {
-                break;
+            Err(e) => {
+                tracing::error!(
+                    partition = partition.name(),
+                    error = %e,
+                    "compaction failed"
+                );
             }
         }
     }

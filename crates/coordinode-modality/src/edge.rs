@@ -326,6 +326,18 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<()>;
 
+    /// Tombstone every instance row of `(edge_type, src, tgt)`, whatever the
+    /// type's keying: the pair's own key and every version or discriminator
+    /// keyed beneath it. For deleting an endpoint, where the caller need not
+    /// know how the type keys its instances.
+    fn delete_pair_instances(
+        &self,
+        txn: &mut Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<()>;
+
     /// Move every temporal edge-property version from one endpoint pair to
     /// another, preserving each version's `valid_from` (edge-rewiring on a
     /// temporal edge type). A version already present at the new key is kept
@@ -476,6 +488,29 @@ impl LocalEdgeStore {
                 generation,
             ));
         }
+    }
+
+    /// State a change to the membership of one pair whose instances are
+    /// keyed per version or per discriminator. Such a pair can hold several
+    /// instances, so erasing the last one and writing another are the race the
+    /// claims exist for; a pair with one instance at most has no such race.
+    fn claim_pair(
+        txn: &mut Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+        predicate: ClaimPredicate,
+    ) {
+        let generation = txn.schema_generation();
+        txn.claim(Claim::new(
+            ClaimScope::Pair {
+                source: src,
+                target: tgt,
+                edge_type: edge_type.to_string(),
+            },
+            predicate,
+            generation,
+        ));
     }
 
     fn decode_err(e: impl core::fmt::Display) -> StoreError {
@@ -686,6 +721,13 @@ impl EdgeStore for LocalEdgeStore {
         let ep_key = encode_temporal_edgeprop_key(edge_type, src, tgt, valid_from_ms);
         let body = Self::encode_props(props)?;
         Self::claim_endpoints_alive(txn, src, tgt);
+        Self::claim_pair(
+            txn,
+            edge_type,
+            src,
+            tgt,
+            ClaimPredicate::PairInstanceWritten,
+        );
         txn.merge_adj_add(&fwd_key, tgt.as_raw());
         txn.merge_adj_add(&rev_key, src.as_raw());
         txn.put(Partition::EdgeProp, &ep_key, &body)?;
@@ -767,6 +809,13 @@ impl EdgeStore for LocalEdgeStore {
             })?;
         let body = Self::encode_props(props)?;
         Self::claim_endpoints_alive(txn, src, tgt);
+        Self::claim_pair(
+            txn,
+            edge_type,
+            src,
+            tgt,
+            ClaimPredicate::PairInstanceWritten,
+        );
         txn.merge_adj_add(&encode_adj_key_forward(edge_type, src), tgt.as_raw());
         txn.merge_adj_add(&encode_adj_key_reverse(edge_type, tgt), src.as_raw());
         txn.put(Partition::EdgeProp, &ep_key, &body)?;
@@ -842,6 +891,15 @@ impl EdgeStore for LocalEdgeStore {
             kind: "edge properties",
             message: format!("encode: {e}"),
         })?;
+        if valid_from_ms.is_some() {
+            Self::claim_pair(
+                txn,
+                edge_type,
+                src,
+                tgt,
+                ClaimPredicate::PairInstanceWritten,
+            );
+        }
         txn.put(Partition::EdgeProp, &key, &bytes)?;
         Ok(())
     }
@@ -923,8 +981,32 @@ impl EdgeStore for LocalEdgeStore {
         tgt: NodeId,
     ) -> StoreResult<()> {
         let versions = self.scan_versions_raw_tracked(txn, edge_type, src, tgt, None)?;
+        Self::claim_pair(
+            txn,
+            edge_type,
+            src,
+            tgt,
+            ClaimPredicate::PairInstancesComplete,
+        );
         for (vf, _) in versions {
             let key = encode_temporal_edgeprop_key(edge_type, src, tgt, vf);
+            txn.delete(Partition::EdgeProp, &key)?;
+        }
+        Ok(())
+    }
+
+    fn delete_pair_instances(
+        &self,
+        txn: &mut Transaction,
+        edge_type: &str,
+        src: NodeId,
+        tgt: NodeId,
+    ) -> StoreResult<()> {
+        // Every instance key starts with the pair's own key: a version or a
+        // discriminator is appended after a separator, and the endpoint ids
+        // are fixed-width, so the prefix reaches no other pair.
+        let pair = encode_edgeprop_key(edge_type, src, tgt);
+        for (key, _) in txn.prefix_scan(Partition::EdgeProp, &pair)? {
             txn.delete(Partition::EdgeProp, &key)?;
         }
         Ok(())
@@ -940,6 +1022,24 @@ impl EdgeStore for LocalEdgeStore {
         new_tgt: NodeId,
     ) -> StoreResult<()> {
         let versions = self.scan_versions_raw_tracked(txn, edge_type, old_src, old_tgt, None)?;
+        // Moving every version empties the old pair and writes into the new
+        // one, so both ends of the move state their membership change.
+        Self::claim_pair(
+            txn,
+            edge_type,
+            old_src,
+            old_tgt,
+            ClaimPredicate::PairInstancesComplete,
+        );
+        if !versions.is_empty() {
+            Self::claim_pair(
+                txn,
+                edge_type,
+                new_src,
+                new_tgt,
+                ClaimPredicate::PairInstanceWritten,
+            );
+        }
         for (vf, bytes) in versions {
             let new_key = encode_temporal_edgeprop_key(edge_type, new_src, new_tgt, vf);
             // Same-version duplicate at the new key collapses to the existing one.

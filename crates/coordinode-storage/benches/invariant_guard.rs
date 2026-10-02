@@ -180,6 +180,79 @@ fn skewed_node(claims: bool, peers_exist: bool) {
     report(label, samples, wall);
 }
 
+/// Every writer writes nodes of one label. With the schema read stated, each
+/// commit carries the label's schema as a condition and decides it at commit;
+/// the claims of the writers are compatible, so they must not serialise.
+fn one_label_writes(schema_read: bool) {
+    use coordinode_core::schema::definition::{
+        LabelSchema, encode_label_current_revision_key, encode_label_schema_key,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = open(&dir);
+    let schema = LabelSchema::new_node_id("Doc");
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_schema_key("Doc", schema.schema_revision),
+            &schema.to_msgpack().expect("encode"),
+        )
+        .expect("schema body");
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_current_revision_key("Doc"),
+            &schema.schema_revision.to_be_bytes(),
+        )
+        .expect("schema pointer");
+
+    let started = Instant::now();
+    let samples: Vec<Duration> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let engine = Arc::clone(&engine);
+                let oracle = Arc::clone(&oracle);
+                let revision = schema.schema_revision;
+                scope.spawn(move || {
+                    let wc = WriteConcern::default();
+                    let mut local = Vec::with_capacity(COMMITS / WRITERS);
+                    for i in 0..COMMITS / WRITERS {
+                        let snap = engine.snapshot();
+                        let mut txn = Transaction::new(
+                            engine.as_ref(),
+                            Some(oracle.as_ref()),
+                            coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+                            Some(snap),
+                        );
+                        if schema_read {
+                            txn.note_label_schema_read("Doc", revision);
+                        }
+                        let id = NodeId::from_raw((w * COMMITS + i + 2) as u64);
+                        let key =
+                            coordinode_core::graph::node::encode_node_key(engine.node_shard(), id);
+                        txn.put(Partition::Node, &key, b"doc").expect("put");
+                        let ctx = commit_ctx(&wc);
+                        let at = Instant::now();
+                        txn.commit(&ctx).expect("commit");
+                        local.push(at.elapsed());
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("writer"))
+            .collect()
+    });
+    let label = if schema_read {
+        "one label, schema read stated"
+    } else {
+        "one label, no schema condition"
+    };
+    report(label, samples, started.elapsed());
+}
+
 /// What one attempt's conditions occupy while the commit decides them, and
 /// what the table holds once it is done.
 fn guard_memory() {
@@ -281,6 +354,8 @@ fn main() {
     skewed_node(false, true);
     skewed_node(true, true);
     skewed_node(true, false);
+    one_label_writes(false);
+    one_label_writes(true);
     guard_memory();
     refusal_latency();
 }

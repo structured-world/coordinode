@@ -3,7 +3,8 @@
 //! Tails the Raft log's oplog segments and streams [`ChangeEvent`] messages
 //! to the client, only for entries this node has applied: the log also holds
 //! entries that are not committed yet, which a later leader may truncate and
-//! replace. Polls every 100ms when caught up.
+//! replace. A caught-up stream sleeps until this node applies another entry,
+//! waking only to heartbeat its registration.
 //!
 //! In embedded mode (no Raft) nothing is applied from a Raft log and the
 //! stream is empty — no error.
@@ -39,6 +40,10 @@ use crate::proto::replication::cdc::{
 /// the exclusive bound of what a change stream may send.
 pub type AppliedFrontier = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// Changes whenever the [`AppliedFrontier`] may have moved; `None` when it
+/// never moves (no Raft log).
+pub type AppliedSignal = Option<tokio::sync::watch::Receiver<u64>>;
+
 /// gRPC CDC service for one shard.
 ///
 /// Each subscription registers as an `oplog_events` consumer in the
@@ -57,19 +62,23 @@ pub struct ChangeEventServiceImpl {
     consumer_ttl_ms: u64,
     /// Bound of the entries a stream may send.
     applied: AppliedFrontier,
+    /// Wakes a caught-up stream when the bound moves.
+    applied_changes: AppliedSignal,
     /// Read pacing of every stream.
     tuning: CdcStreamTuning,
 }
 
 impl ChangeEventServiceImpl {
     /// A service streaming shard `shard_id`'s Raft log from `oplog_dirs`
-    /// (see `coordinode_raft::storage::raft_oplog_dirs`).
+    /// (see `coordinode_raft::storage::raft_oplog_dirs`), up to `applied`,
+    /// which `applied_changes` signals moving.
     pub fn new(
         shard_id: u32,
         oplog_dirs: Vec<PathBuf>,
         registry: ShardConsumerRegistry,
         consumer_ttl_ms: u64,
         applied: AppliedFrontier,
+        applied_changes: AppliedSignal,
     ) -> Self {
         Self {
             shard_id,
@@ -78,6 +87,7 @@ impl ChangeEventServiceImpl {
             next_consumer: Arc::new(AtomicU64::new(0)),
             consumer_ttl_ms,
             applied,
+            applied_changes,
             tuning: CdcStreamTuning::default(),
         }
     }
@@ -101,29 +111,32 @@ impl ChangeEventServiceImpl {
         consumer_ttl_ms: u64,
     ) -> std::io::Result<Self> {
         let dirs = raft_oplog_dirs(engine, 0)?.all;
+        let changes = node.subscribe_applied();
         Ok(Self::new(
             0,
             dirs,
             registry,
             consumer_ttl_ms,
             Arc::new(move || node.applied_through()),
+            Some(changes),
         ))
     }
 }
 
 /// Default TTL for a CDC consumer registration (`cdc_consumer_ttl_secs`,
-/// 30s). The stream heartbeats every poll ([`CdcStreamTuning::poll_interval`]),
-/// so a connected-but-idle reader is never evicted; a reader that vanishes
-/// without unregistering (crash) is reclaimed after this.
+/// 30s). The stream heartbeats every [`CdcStreamTuning::heartbeat_interval`]
+/// while it waits, so a connected-but-idle reader is never evicted; a reader
+/// that vanishes without unregistering (crash) is reclaimed after this.
 pub const DEFAULT_CONSUMER_TTL_MS: u64 = 30_000;
 
-/// How a change stream paces its reads (`cdc_poll_interval_ms`,
+/// How a change stream paces its reads (`cdc_heartbeat_interval_ms`,
 /// `cdc_batch_size`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdcStreamTuning {
-    /// Wait between polls once caught up to the last applied entry: the
-    /// delivery latency of an idle stream, and its heartbeat period.
-    pub poll_interval: Duration,
+    /// How often a stream waiting (caught up, or on a slow reader) heartbeats
+    /// its registration. Delivery does not wait on it: a caught-up stream
+    /// wakes as soon as another entry applies.
+    pub heartbeat_interval: Duration,
     /// Most entries read and sent per poll (back-pressure).
     pub batch_size: NonZeroUsize,
 }
@@ -131,7 +144,7 @@ pub struct CdcStreamTuning {
 impl Default for CdcStreamTuning {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(10),
             batch_size: const {
                 match NonZeroUsize::new(256) {
                     Some(n) => n,
@@ -147,15 +160,15 @@ impl CdcStreamTuning {
     ///
     /// # Errors
     ///
-    /// The poll interval is not shorter than `consumer_ttl_ms`: an idle stream
-    /// heartbeats once per poll, so its registration would expire and release
-    /// the oplog it still reads.
+    /// The heartbeat interval is not shorter than `consumer_ttl_ms`: an idle
+    /// stream's registration would expire and release the oplog it still
+    /// reads.
     pub fn check(&self, consumer_ttl_ms: u64) -> Result<(), String> {
-        if self.poll_interval >= Duration::from_millis(consumer_ttl_ms) {
+        if self.heartbeat_interval >= Duration::from_millis(consumer_ttl_ms) {
             return Err(format!(
-                "cdc_poll_interval_ms ({} ms) must be shorter than cdc_consumer_ttl_secs \
-                 ({consumer_ttl_ms} ms): an idle change stream heartbeats once per poll",
-                self.poll_interval.as_millis()
+                "cdc_heartbeat_interval_ms ({} ms) must be shorter than cdc_consumer_ttl_secs \
+                 ({consumer_ttl_ms} ms): an idle change stream heartbeats at that interval",
+                self.heartbeat_interval.as_millis()
             ));
         }
         Ok(())
@@ -215,12 +228,18 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
         let registry = self.registry.clone();
         let applied = Arc::clone(&self.applied);
+        let mut applied_changes = self.applied_changes.clone();
         let tuning = self.tuning;
         tokio::spawn(async move {
             'stream: loop {
                 // Client cancelled (channel closed).
                 if tx.is_closed() {
                     break;
+                }
+                // Marked seen before the read: an entry applied after it
+                // wakes the wait below.
+                if let Some(changes) = applied_changes.as_mut() {
+                    changes.borrow_and_update();
                 }
 
                 // Surface retention loss as a clean error rather than a silent
@@ -248,7 +267,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                     // A slow reader leaves no room in the channel; keep its
                     // registration alive while waiting, as an idle poll does.
                     let permit = loop {
-                        match tokio::time::timeout(tuning.poll_interval, tx.reserve()).await {
+                        match tokio::time::timeout(tuning.heartbeat_interval, tx.reserve()).await {
                             Ok(Ok(permit)) => break permit,
                             // Client disconnected mid-batch.
                             Ok(Err(_)) => break 'stream,
@@ -273,11 +292,28 @@ impl ChangeStreamService for ChangeEventServiceImpl {
 
                 if caught_up {
                     // Heartbeat so an idle-but-connected reader is not
-                    // TTL-evicted, then wait for new applied entries.
+                    // TTL-evicted, then sleep until an entry applies, the
+                    // client leaves, or the next heartbeat is due.
                     if let Err(e) = registry.heartbeat(&handle) {
                         tracing::warn!(error = %e, "change stream heartbeat failed");
                     }
-                    tokio::time::sleep(tuning.poll_interval).await;
+                    let heartbeat = tokio::time::sleep(tuning.heartbeat_interval);
+                    match applied_changes.as_mut() {
+                        Some(changes) => tokio::select! {
+                            changed = changes.changed() => {
+                                if changed.is_err() {
+                                    // The node is gone; nothing more applies.
+                                    applied_changes = None;
+                                }
+                            }
+                            () = tx.closed() => break,
+                            () = heartbeat => {}
+                        },
+                        None => tokio::select! {
+                            () = tx.closed() => break,
+                            () = heartbeat => {}
+                        },
+                    }
                 }
             }
 

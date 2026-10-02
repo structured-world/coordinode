@@ -261,7 +261,7 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
     let hot = TempDir::new().expect("hot tempdir");
     let cold = TempDir::new().expect("cold tempdir");
 
-    let config = StorageConfig::with_endpoints(vec![
+    let mut config = StorageConfig::with_endpoints(vec![
         EndpointConfig::new(
             "ep-hot",
             hot.path(),
@@ -277,6 +277,10 @@ fn cascade_eviction_moves_data_to_cooler_endpoint() {
             Tier::Cold,
         ),
     ]);
+    // The eviction is what must move the data. A background compaction that
+    // gets there first, as it does on a loaded host, leaves the eviction
+    // nothing to move and the count below unchanged.
+    config.compaction_workers = 0;
 
     let engine = StorageEngine::open(&config).expect("open");
     for i in 0..1500u32 {

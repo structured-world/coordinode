@@ -14,7 +14,6 @@
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::encoding::{Unindexable, encode_element};
-use coordinode_core::txn::proposal::{Mutation, PartitionId};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
@@ -71,15 +70,6 @@ pub trait TableKeyStore {
     ///
     /// A storage failure.
     fn release_all(&self, txn: &mut Transaction, table: &str) -> StoreResult<()>;
-
-    /// The mutation that frees `key` in `table`, for a writer that deletes
-    /// rows by submitting mutations directly rather than through a
-    /// transaction (the TTL reaper).
-    ///
-    /// # Errors
-    ///
-    /// A key value of a type that cannot be a key.
-    fn release_mutation(&self, table: &str, key: &[Value]) -> StoreResult<Mutation>;
 
     /// The row holding `key` in `table` in the latest committed state, outside
     /// any transaction. Tells a transaction that lost a race for a key which
@@ -158,13 +148,6 @@ impl TableKeyStore for LocalTableKeyStore {
             txn.delete(Partition::Idx, &key)?;
         }
         Ok(())
-    }
-
-    fn release_mutation(&self, table: &str, key: &[Value]) -> StoreResult<Mutation> {
-        Ok(Mutation::Delete {
-            partition: PartitionId::Idx,
-            key: entry_key(table, key)?,
-        })
     }
 
     fn committed_holder(

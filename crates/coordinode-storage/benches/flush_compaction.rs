@@ -31,8 +31,6 @@ fn flush_config(dir: &std::path::Path) -> StorageConfig {
     )]);
     cfg.max_write_buffer_bytes = 1;
     cfg.max_sealed_memtables = 0;
-    cfg.flush_poll_interval_ms = 5;
-    cfg.compaction_poll_interval_ms = 10;
     cfg.compaction_l0_urgent_threshold = 2;
     cfg
 }

@@ -208,10 +208,17 @@ async fn batched_heartbeats_flush_and_refresh_liveness() {
         reg.heartbeat(&h).expect("buffer heartbeat");
     }
 
-    // Wait for at least one flush window.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-
-    let listed = reg.list_consumers();
+    // The first buffered heartbeat opens a 30 ms window; the flush after it
+    // is a proposal, whose fsync can take longer than the window on a slow
+    // disk, so wait for the write rather than for a fixed time.
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut listed = reg.list_consumers();
+    while listed.first().map(|c| c.last_heartbeat_ts_ms) != Some(4_000)
+        && tokio::time::Instant::now() < until
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        listed = reg.list_consumers();
+    }
     assert_eq!(listed.len(), 1);
     assert_eq!(
         listed[0].last_heartbeat_ts_ms, 4_000,
@@ -432,15 +439,15 @@ async fn floors_are_split_by_consumer_space() {
 }
 
 /// The eviction sweep removes a registration past its TTL via a Raft
-/// proposal and lifts the floor it was pinning.
+/// proposal and lifts the floor it was pinning. Nothing but the TTL running
+/// out schedules that sweep: no write and no heartbeat arrive meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn eviction_sweep_removes_expired_and_lifts_floor() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
+    let (reg, _engine, node, _dir) = registry_with_clock(Arc::new(SystemClock)).await;
 
     reg.register(ConsumerRegistration {
         initial_seqno: InitialSeqno::At(10),
-        ..registration("doomed", TopologyScope::Cluster, 2_000)
+        ..registration("doomed", TopologyScope::Cluster, 300)
     })
     .expect("register doomed");
     reg.register(ConsumerRegistration {
@@ -455,9 +462,8 @@ async fn eviction_sweep_removes_expired_and_lifts_floor() {
         eviction_interval_ms: 30,
     });
 
-    // Advance past the doomed consumer's TTL (last hb 1000 + 2000).
-    clock.set(4_000);
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // Past the doomed consumer's TTL, with a margin for a loaded machine.
+    tokio::time::sleep(Duration::from_millis(900)).await;
 
     let listed = reg.list_consumers();
     assert_eq!(listed.len(), 1, "expired consumer was evicted");
@@ -472,31 +478,76 @@ async fn eviction_sweep_removes_expired_and_lifts_floor() {
     node.shutdown().await.expect("shutdown");
 }
 
+/// A registration written through another member's registry reaches this
+/// member's floor as it applies: the background service has no timer that
+/// would pick it up otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_applied_from_elsewhere_moves_the_floor() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let (reg, engine, node, _dir) = registry_with_clock(clock.clone()).await;
+    let bg = reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
+        eviction_interval_ms: 30,
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(reg.shard_floor(), u64::MAX);
+
+    // Another member's registry: same replicated keyspace, its own handle.
+    let elsewhere = ShardConsumerRegistry::new(
+        Arc::clone(&engine),
+        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft()))),
+        Arc::new(ProposalIdGenerator::with_base(3u64 << 48)),
+        clock,
+    );
+    elsewhere
+        .register(ConsumerRegistration {
+            initial_seqno: InitialSeqno::At(77),
+            ..registration("remote", TopologyScope::Cluster, 0)
+        })
+        .expect("register elsewhere");
+
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while reg.shard_floor() != 77 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        reg.shard_floor(),
+        77,
+        "a registration applied from elsewhere did not reach the floor"
+    );
+
+    bg.shutdown().await;
+    node.shutdown().await.expect("shutdown");
+}
+
 /// A heartbeat that has not been flushed yet still counts: the sweep may run
 /// before the flush that would persist it, and a consumer that just proved it
 /// is alive must not be evicted for the flush's timing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_buffered_heartbeat_keeps_its_consumer_from_eviction() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
+    let clock = SystemClock;
+    let (reg, _engine, node, _dir) = registry_with_clock(Arc::new(clock)).await;
+    let ttl_ms = 400;
     let h = reg
-        .register(registration("reader", TopologyScope::Cluster, 2_000))
+        .register(registration("reader", TopologyScope::Cluster, ttl_ms))
         .expect("register");
+    let registered_at = reg.list_consumers()[0].last_heartbeat_ts_ms;
 
     let bg = reg.start_background(BackgroundConfig {
         heartbeat_window_ms: 100_000, // the heartbeat stays buffered
         eviction_interval_ms: 30,
     });
-    // Let the service take its first, immediate ticks, so the next flush is
-    // a window away.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    clock.set(2_500);
+    // Halfway through the TTL the reader heartbeats; the sweep due when the
+    // stored heartbeat runs out finds the buffered one.
+    tokio::time::sleep(Duration::from_millis(ttl_ms / 2)).await;
+    let beat_at = clock.now_ms();
     reg.heartbeat(&h).expect("buffer heartbeat");
-    // Past the persisted heartbeat's TTL (1000 + 2000), inside the
-    // buffered one's (2500 + 2000).
-    clock.set(4_000);
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    // Past the stored heartbeat's TTL, inside the buffered one's.
+    let until_ms = registered_at + ttl_ms + 100;
+    // Already past the point on a slow machine: wait for nothing.
+    let left = until_ms.saturating_sub(clock.now_ms());
+    tokio::time::sleep(Duration::from_millis(left)).await;
 
     let listed = reg.list_consumers();
     assert_eq!(
@@ -504,7 +555,10 @@ async fn a_buffered_heartbeat_keeps_its_consumer_from_eviction() {
         1,
         "a consumer with a fresh buffered heartbeat was evicted"
     );
-    assert_eq!(listed[0].last_heartbeat_ts_ms, 2_500);
+    assert!(
+        listed[0].last_heartbeat_ts_ms >= beat_at,
+        "the sweep persisted the buffered heartbeat"
+    );
 
     bg.shutdown().await;
     node.shutdown().await.expect("shutdown");
@@ -806,9 +860,17 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
             reg.heartbeat(&h).expect("heartbeat during the flush");
         }
     }));
-    let evicted = reg.core.sweep_evictions().expect("sweep");
+    let swept = reg.core.sweep_evictions().expect("sweep");
 
-    assert_eq!(evicted, 0, "a reader with a buffered heartbeat was evicted");
+    assert_eq!(
+        swept.evicted, 0,
+        "a reader with a buffered heartbeat was evicted"
+    );
+    assert_eq!(
+        swept.next_expiry_ms,
+        Some(2_000 + 400 + 1),
+        "the next sweep is due when the buffered heartbeat runs out"
+    );
     assert!(
         reg.core.read_entry("reader").expect("read").is_some(),
         "the reader's registration is gone"

@@ -338,6 +338,8 @@ fn dir_size(root: &Path) -> u64 {
 /// so all the policy lives in one place.
 pub struct CapacityScanner {
     shutdown: Arc<AtomicBool>,
+    /// The scanner sleeps a whole interval on this; a stop interrupts it.
+    wake: Arc<coordinode_core::txn::wake::Wake>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -357,19 +359,23 @@ impl CapacityScanner {
         F: Fn() + Send + 'static,
     {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(coordinode_core::txn::wake::Wake::default());
         let shutdown_w = Arc::clone(&shutdown);
+        let wake_w = Arc::clone(&wake);
         let handle = std::thread::Builder::new()
             .name("coord-capacity-scanner".to_string())
-            .spawn(move || capacity_scanner_loop(interval, shutdown_w, refresh_fn))?;
+            .spawn(move || capacity_scanner_loop(interval, &shutdown_w, &wake_w, refresh_fn))?;
         Ok(Self {
             shutdown,
+            wake,
             handle: Some(handle),
         })
     }
 
-    /// Signal the scanner to stop after its current iteration. Idempotent.
+    /// Signal the scanner to stop, waking it from its sleep. Idempotent.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        self.wake.interrupt();
     }
 }
 
@@ -393,15 +399,20 @@ impl Drop for CapacityScanner {
 /// The actual loop body — pulled out as a free function so unit tests
 /// can drive the loop synchronously by injecting a controlled
 /// shutdown flag.
-fn capacity_scanner_loop<F>(interval: Duration, shutdown: Arc<AtomicBool>, refresh_fn: F)
-where
+///
+/// The scan reads the disk, which changes under the engine's feet (file
+/// deletion after a compaction runs asynchronously), so it is periodic by
+/// nature; what it does not do is wake between scans. It sleeps the whole
+/// interval and a stop interrupts the sleep.
+fn capacity_scanner_loop<F>(
+    interval: Duration,
+    shutdown: &AtomicBool,
+    wake: &coordinode_core::txn::wake::Wake,
+    refresh_fn: F,
+) where
     F: Fn(),
 {
-    // Sleep granularity: the scanner wakes every `tick_granularity` to
-    // check the shutdown flag promptly even when `interval` is large.
-    // This keeps engine close latency bounded (~100 ms) regardless of
-    // the scan cadence.
-    let tick_granularity = Duration::from_millis(100);
+    wake.bind();
     loop {
         // Sleep BEFORE the first refresh so engine open completes
         // without a concurrent scan competing with the user thread's
@@ -410,16 +421,16 @@ where
         // persisted Schema state; the first poll-based refresh is
         // only useful after some wall-clock has passed, at which
         // point on-disk state may have changed.
-        //
-        // Sleep up to `interval`, checking the shutdown flag every
-        // `tick_granularity`. Burns nothing if shutdown is already set.
-        let mut elapsed = Duration::ZERO;
-        while elapsed < interval {
+        let deadline = std::time::Instant::now() + interval;
+        loop {
             if shutdown.load(Ordering::Acquire) {
                 return;
             }
-            std::thread::sleep(tick_granularity);
-            elapsed += tick_granularity;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            wake.wait(Some(deadline - now));
         }
         // Now run the refresh — at the end of each interval, never at t=0.
         refresh_fn();

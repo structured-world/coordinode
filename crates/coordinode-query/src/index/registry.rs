@@ -10,7 +10,6 @@ use std::sync::RwLock;
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::txn::proposal::Mutation;
 use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
@@ -409,26 +408,6 @@ impl IndexRegistry {
             }
         }
         Ok(())
-    }
-
-    /// The mutations removing the entries of a node that a writer deletes by
-    /// submitting mutations directly (the TTL reaper).
-    pub fn delete_mutations(
-        &self,
-        engine: &StorageEngine,
-        node: &NodeState<'_>,
-        field_of: FieldOf<'_>,
-    ) -> Vec<Mutation> {
-        let store = LocalIndexStore::new(engine);
-        self.btree_for_label(node.label)
-            .iter()
-            .filter_map(|r| {
-                entry_values(&r.def, node.value_of).map(|values| {
-                    store.entry_delete_mutations(&r.def, field_of, &values, node.node_id)
-                })
-            })
-            .flatten()
-            .collect()
     }
 }
 

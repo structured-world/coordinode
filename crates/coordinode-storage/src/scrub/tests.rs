@@ -43,7 +43,8 @@ fn largest_file(root: &std::path::Path) -> PathBuf {
 #[test]
 fn scrub_config_defaults() {
     let config = ScrubConfig::default();
-    assert!(config.enabled);
+    // A pass reads every block, so a scrub runs only where it is enabled.
+    assert!(!config.enabled);
     assert_eq!(config.interval, Duration::from_secs(7 * 24 * 3600));
     assert_eq!(config.throttle, None);
     assert_eq!(config.parallelism, 1);

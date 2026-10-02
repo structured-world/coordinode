@@ -365,6 +365,7 @@ impl RaftNode {
             Arc::clone(&engine),
             &engine_work,
             snap_config,
+            applied_rx.clone(),
         );
 
         Ok(Self {
@@ -533,6 +534,7 @@ impl RaftNode {
             Arc::clone(&engine),
             &engine_work,
             snap_config,
+            applied_rx.clone(),
         );
 
         Ok(Self {
@@ -673,6 +675,7 @@ impl RaftNode {
             Arc::clone(&engine),
             &engine_work,
             snap_config,
+            applied_rx.clone(),
         );
 
         let node = Self {
@@ -770,6 +773,7 @@ impl RaftNode {
             Arc::clone(&engine),
             &engine_work,
             snap_config,
+            applied_rx.clone(),
         );
 
         tracing::info!(
@@ -897,6 +901,7 @@ impl RaftNode {
             Arc::clone(&engine),
             &engine_work,
             snap_config,
+            applied_rx.clone(),
         );
 
         Ok(Self {
@@ -2198,8 +2203,9 @@ impl RaftNode {
     /// lacks at most [`Self::join_readiness_lag`] entries, then calls
     /// [`Self::change_membership`] to promote the node to a Voter.
     ///
-    /// Broadcasts [`JoinProgressEvent`] at each phase transition and every lag
-    /// poll iteration so callers can stream progress to operators.
+    /// Broadcasts [`JoinProgressEvent`] at each phase transition and as the
+    /// replication metrics move, at most once a second, so callers can stream
+    /// progress to operators.
     ///
     /// # Errors
     ///
@@ -2216,13 +2222,20 @@ impl RaftNode {
         node_id: u64,
         progress_tx: tokio::sync::broadcast::Sender<JoinProgressEvent>,
     ) -> Result<(), RaftNodeError> {
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        // Shortest gap between two looks at the replication metrics, so a
+        // fast catch-up reports progress at a readable rate.
+        const REPORT_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+        use openraft::rt::watch::WatchReceiver;
 
         let timeout = self.join_timeout();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut initial_lag: Option<u64> = None;
+        let mut metrics = self.raft.metrics();
+        let mut looked_at = tokio::time::Instant::now();
 
-        // Step 1: poll until the node has answered and lags little enough.
+        // Step 1: wait until the node has answered and lags little enough.
+        // Replication progress moves the metrics; nothing else can change
+        // the answer, so the loop sleeps until they move.
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let _ = progress_tx.send(JoinProgressEvent {
@@ -2241,7 +2254,18 @@ impl RaftNode {
                 )));
             }
 
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::select! {
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        return Err(RaftNodeError::Membership(
+                            "join aborted: the raft instance shut down".into(),
+                        ));
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => continue,
+            }
+            tokio::time::sleep_until((looked_at + REPORT_GAP).min(deadline)).await;
+            looked_at = tokio::time::Instant::now();
 
             let lag = match self.lag_for_node(node_id) {
                 Some(l) => l,
@@ -2356,8 +2380,9 @@ impl RaftNode {
 ///
 /// Complements openraft's own entry-count trigger with the other two of
 /// [`SnapshotTriggerConfig`]: the bytes the log grew by since the last
-/// snapshot, probed every second, and the periodic timer. Neither fires
-/// while nothing was applied since the last snapshot.
+/// snapshot, probed after an apply at most once a second, and the periodic
+/// timer. Neither fires while nothing was applied since the last snapshot,
+/// and the task sleeps until `applied_rx` moves.
 ///
 /// The task runs until the Raft instance is shut down (detected via `trigger()` error).
 fn spawn_snapshot_trigger(
@@ -2365,6 +2390,7 @@ fn spawn_snapshot_trigger(
     engine: Arc<StorageEngine>,
     work: &crate::storage::EngineWork,
     config: SnapshotTriggerConfig,
+    mut applied_rx: tokio::sync::watch::Receiver<u64>,
 ) -> tokio::task::JoinHandle<()> {
     // The task holds the engine until it is dropped, which an abort does
     // later, on the runtime; the shutdown waits for the work guard to go, and
@@ -2379,32 +2405,38 @@ fn spawn_snapshot_trigger(
         let engine = &held.engine;
 
         let probe = config.check_interval.min(SNAPSHOT_SIZE_PROBE);
-        let mut interval = tokio::time::interval(probe);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Don't fire immediately on startup
-        interval.tick().await;
         let metrics_rx = raft.metrics();
         let mut last = tokio::time::Instant::now();
+        // Don't probe immediately on startup.
+        let mut last_probe = last;
         // The log's size when the last snapshot was asked for; growth is
         // measured from it. A purge that shrinks the log lowers it.
         let mut base = crate::storage::raft_log_bytes(engine).unwrap_or(0);
 
         loop {
-            interval.tick().await;
-
+            // The log grows only as entries arrive, so it is looked at after
+            // an apply, at most once per probe period: a build in progress is
+            // not asked for again before the period ends.
+            tokio::time::sleep_until(last_probe + probe).await;
+            // Marked seen before the state is read: an entry applied after
+            // it wakes the waits below. Read after the pause, so a build that
+            // finished during it counts.
+            let applied = *applied_rx.borrow_and_update();
+            let snapped = metrics_rx
+                .borrow_watched()
+                .snapshot
+                .map(|id| id.index)
+                .unwrap_or(0);
             // A snapshot captures every partition, so asking for one when
-            // nothing was applied since the last is pure waste.
-            let (applied, snapped) = {
-                let m = metrics_rx.borrow_watched();
-                (
-                    m.last_applied.map(|id| id.index).unwrap_or(0),
-                    m.snapshot.map(|id| id.index).unwrap_or(0),
-                )
-            };
+            // nothing was applied since the last is pure waste: sleep until
+            // an entry applies.
             if applied <= snapped {
+                if applied_rx.changed().await.is_err() {
+                    break;
+                }
                 continue;
             }
-
+            last_probe = tokio::time::Instant::now();
             let size = match crate::storage::raft_log_bytes(engine) {
                 Ok(size) => size,
                 Err(e) => {
@@ -2414,6 +2446,15 @@ fn spawn_snapshot_trigger(
             };
             base = base.min(size);
             let Some(reason) = snapshot_due(size - base, last.elapsed(), &config) else {
+                // Not due yet: the next apply or the interval decides.
+                tokio::select! {
+                    changed = applied_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep_until(last + config.check_interval) => {}
+                }
                 continue;
             };
 
@@ -2543,8 +2584,6 @@ async fn publish_existing_state_as_group_base(
     raft: &RaftInstance,
     engine: &StorageEngine,
 ) -> Result<(), RaftNodeError> {
-    use openraft::rt::watch::WatchReceiver;
-
     if !engine
         .holds_user_data()
         .map_err(|e| RaftNodeError::Init(e.to_string()))?
@@ -2555,15 +2594,12 @@ async fn publish_existing_state_as_group_base(
     // The snapshot is taken at the applied index, so wait for the membership
     // entry this open just proposed to apply; snapshotting before it would
     // publish a base the group cannot place in its own history.
-    let metrics = raft.metrics();
-    let mut applied = None;
-    for _ in 0..100 {
-        applied = metrics.borrow_watched().last_applied;
-        if applied.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    let applied = raft
+        .wait(Some(std::time::Duration::from_secs(5)))
+        .metrics(|m| m.last_applied.is_some(), "the membership entry applies")
+        .await
+        .ok()
+        .and_then(|m| m.last_applied);
     let Some(applied) = applied else {
         return Err(RaftNodeError::Init(
             "a group formed around existing data never applied its own membership entry, so \
@@ -2577,14 +2613,15 @@ async fn publish_existing_state_as_group_base(
         .await
         .map_err(|e| RaftNodeError::Init(format!("snapshot of the existing state: {e}")))?;
 
-    let mut snapshot = None;
-    for _ in 0..200 {
-        snapshot = metrics.borrow_watched().snapshot;
-        if snapshot.is_some_and(|s| s.index >= applied.index) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    let snapshot = raft
+        .wait(Some(std::time::Duration::from_secs(10)))
+        .metrics(
+            |m| m.snapshot.is_some_and(|s| s.index >= applied.index),
+            "the snapshot of the existing state completes",
+        )
+        .await
+        .ok()
+        .and_then(|m| m.snapshot);
     let Some(snapshot) = snapshot.filter(|s| s.index >= applied.index) else {
         return Err(RaftNodeError::Init(
             "the snapshot carrying this store's existing data never completed, so the data \

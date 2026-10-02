@@ -678,6 +678,18 @@ pub fn encode_edge_type_schema_key(name: &str, revision: u64) -> Vec<u8> {
     key
 }
 
+/// Key prefix of every edge type schema record and marker.
+pub const EDGE_TYPE_SCHEMA_KEY_PREFIX: &[u8] = b"schema:edge_type:";
+
+/// The edge type name of a key written by [`encode_edge_type_schema_key`].
+/// Names cannot contain ':' (DDL grammar), so the rightmost ':' splits the
+/// name from the revision.
+pub fn decode_edge_type_schema_key_name(key: &[u8]) -> Option<&str> {
+    let suffix = key.strip_prefix(EDGE_TYPE_SCHEMA_KEY_PREFIX)?;
+    let (name, _revision) = core::str::from_utf8(suffix).ok()?.rsplit_once(':')?;
+    Some(name)
+}
+
 /// Encode the current-revision pointer for an edge type:
 /// `schema:current_revision:edge_type:<name>`. Value: u64 BE.
 pub fn encode_edge_type_current_revision_key(name: &str) -> Vec<u8> {

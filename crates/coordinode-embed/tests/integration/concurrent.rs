@@ -357,6 +357,90 @@ fn two_writers_on_one_key_cannot_both_commit_from_the_same_base() {
     }
 }
 
+/// A reader never sees part of a commit: batches of a thousand writes each are
+/// observed whole or not at all, however the reads interleave with them.
+#[test]
+fn a_reader_sees_a_thousand_write_commit_whole_or_not_at_all() {
+    use coordinode_core::txn::proposal::ProposalIdGenerator;
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_raft::proposal::OwnedLocalProposalPipeline;
+    use coordinode_storage::engine::partition::Partition;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    use std::sync::atomic::AtomicBool;
+
+    const WRITES: usize = 1000;
+    const BATCHES: usize = 20;
+    const PREFIX: &[u8] = b"node:\0\x01:batch:";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine =
+        Arc::new(StorageEngine::open_embedded(&config, Arc::clone(&oracle)).expect("open"));
+    let pipeline = OwnedLocalProposalPipeline::new(&engine);
+    let ids = ProposalIdGenerator::new();
+    let concern = WriteConcern::majority();
+    let done = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut reads = 0u64;
+            while !done.load(Ordering::Acquire) {
+                let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+                let seen = txn
+                    .prefix_scan(Partition::Node, PREFIX)
+                    .expect("scan")
+                    .len();
+                assert_eq!(
+                    seen % WRITES,
+                    0,
+                    "a reader saw {seen} keys, part of a {WRITES}-write commit"
+                );
+                reads += 1;
+            }
+            reads
+        });
+
+        let ctx = CommitContext {
+            pipeline: Some(&pipeline),
+            id_gen: Some(&ids),
+            write_concern: &concern,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        for batch in 0..BATCHES {
+            let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+            for i in 0..WRITES {
+                let mut key = PREFIX.to_vec();
+                key.extend_from_slice(&((batch * WRITES + i) as u64).to_be_bytes());
+                txn.put(Partition::Node, &key, b"x").expect("stage");
+            }
+            txn.commit(&ctx).expect("the batch commits");
+        }
+        done.store(true, Ordering::Release);
+        let reads = reader.join().expect("the reader saw only whole commits");
+        assert!(
+            reads > 0,
+            "the reader never read while the batches committed"
+        );
+    });
+
+    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        txn.prefix_scan(Partition::Node, PREFIX)
+            .expect("scan")
+            .len(),
+        WRITES * BATCHES
+    );
+}
+
 /// Two threads doing UPSERTs with different ON MATCH SET values.
 /// Verifies the final value is set by the last successful writer (serializable).
 #[test]

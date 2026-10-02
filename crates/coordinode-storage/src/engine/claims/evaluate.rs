@@ -66,101 +66,205 @@ pub fn evaluate(
     staged_points: StagedPoints<'_>,
     read_ts: u64,
 ) -> StorageResult<Verdict> {
-    match (&claim.scope, &claim.predicate) {
-        (
-            ClaimScope::Incident {
-                node,
-                edge_type,
-                direction,
-            },
-            ClaimPredicate::CardinalityBound {
-                measure,
-                at_most,
-                at_least,
-            },
-        ) => {
-            let count = match measure {
-                CardinalityMeasure::DistinctNeighbours => {
-                    distinct_neighbours(engine, *node, edge_type, *direction, staged)?
+    Evaluation::new(engine, staged, staged_points, read_ts).decide(claim)
+}
+
+/// One attempt's claims decided together, against one authoritative state.
+///
+/// What every claim of the attempt reads the same way is read once: the edge
+/// types a destroyed node is probed under do not change between two deletions
+/// of one commit, and a bulk delete would otherwise list them per node.
+pub struct Evaluation<'a> {
+    engine: &'a StorageEngine,
+    staged: StagedAdj<'a>,
+    staged_points: StagedPoints<'a>,
+    read_ts: u64,
+    edge_types: core::cell::OnceCell<Vec<String>>,
+}
+
+impl<'a> Evaluation<'a> {
+    /// The context of one attempt viewing the store at `read_ts`.
+    pub fn new(
+        engine: &'a StorageEngine,
+        staged: StagedAdj<'a>,
+        staged_points: StagedPoints<'a>,
+        read_ts: u64,
+    ) -> Self {
+        Self {
+            engine,
+            staged,
+            staged_points,
+            read_ts,
+            edge_types: core::cell::OnceCell::new(),
+        }
+    }
+
+    /// Every edge type the store has recorded, listed on first use.
+    fn edge_types(&self) -> StorageResult<&[String]> {
+        use coordinode_core::schema::definition::{
+            EDGE_TYPE_SCHEMA_KEY_PREFIX, decode_edge_type_schema_key_name,
+        };
+
+        if let Some(types) = self.edge_types.get() {
+            return Ok(types);
+        }
+        let mut types: Vec<String> = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)?
+        {
+            let (key, _) = guard.into_inner()?;
+            if let Some(name) = decode_edge_type_schema_key_name(&key) {
+                if !types.iter().any(|t| t == name) {
+                    types.push(name.to_string());
                 }
-                CardinalityMeasure::EdgeInstances => {
-                    match edge_instances(engine, *node, edge_type, *direction, staged_points)? {
-                        Some(n) => n,
-                        // Instances are counted from the edge-property
-                        // entries of each pair, which an incoming scope
-                        // cannot enumerate without the neighbour set it is
-                        // being asked about.
-                        None => return Ok(Verdict::Undecidable),
+            }
+        }
+        Ok(self.edge_types.get_or_init(|| types))
+    }
+
+    /// Decide `claim` in this context.
+    pub fn decide(&self, claim: &Claim) -> StorageResult<Verdict> {
+        let Self {
+            engine,
+            staged,
+            staged_points,
+            read_ts,
+            ..
+        } = *self;
+        match (&claim.scope, &claim.predicate) {
+            (
+                ClaimScope::Incident {
+                    node,
+                    edge_type,
+                    direction,
+                },
+                ClaimPredicate::CardinalityBound {
+                    measure,
+                    at_most,
+                    at_least,
+                },
+            ) => {
+                let count = match measure {
+                    CardinalityMeasure::DistinctNeighbours => {
+                        distinct_neighbours(engine, *node, edge_type, *direction, staged)?
+                    }
+                    CardinalityMeasure::EdgeInstances => {
+                        match edge_instances(engine, *node, edge_type, *direction, staged_points)? {
+                            Some(n) => n,
+                            // Instances are counted from the edge-property
+                            // entries of each pair, which an incoming scope
+                            // cannot enumerate without the neighbour set it is
+                            // being asked about.
+                            None => return Ok(Verdict::Undecidable),
+                        }
+                    }
+                };
+                let within_upper = at_most.is_none_or(|limit| count <= limit as usize);
+                let within_lower = at_least.is_none_or(|limit| count >= limit as usize);
+                Ok(if within_upper && within_lower {
+                    Verdict::Holds
+                } else {
+                    Verdict::Broken
+                })
+            }
+
+            (
+                ClaimScope::Pair {
+                    source,
+                    target,
+                    edge_type,
+                },
+                ClaimPredicate::PairAdjacency { observed },
+            ) => pair_observation_survived(engine, *source, *target, edge_type, *observed, read_ts),
+
+            // A footprint, not a condition: it exists so the registry keeps an
+            // erase of the pair out while this write is in flight, and there is
+            // nothing about the pair this write's result depends on.
+            (ClaimScope::Pair { .. }, ClaimPredicate::PairInstanceWritten) => Ok(Verdict::Holds),
+
+            // The erase enumerated the pair's instances at its view; an
+            // instance committed since is one it never removed.
+            (
+                ClaimScope::Pair {
+                    source,
+                    target,
+                    edge_type,
+                },
+                ClaimPredicate::PairInstancesComplete,
+            ) => pair_instances_unchanged(engine, *source, *target, edge_type, read_ts),
+
+            (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
+                endpoint_alive(engine, *node, staged_points, read_ts)
+            }
+
+            // The registry excludes the reference rights still in flight; this
+            // answers for the ones that already committed. A reference committed
+            // after the attempt's view is one its decision to delete never saw.
+            (ClaimScope::Node(node), ClaimPredicate::EndpointDestroyed) => {
+                endpoint_unreferenced(engine, self.edge_types()?, *node, staged, read_ts)
+            }
+
+            // An enumeration is proved by what it enumerated over: the attempt
+            // read the whole incident set at its view, and the claim is that
+            // nothing joined or left it since. A member added after the scan is
+            // exactly the one the scan could not have found.
+            (
+                ClaimScope::Incident {
+                    node,
+                    edge_type,
+                    direction,
+                },
+                ClaimPredicate::IncidentSetComplete,
+            ) => incident_set_unchanged(engine, *node, edge_type, *direction, read_ts),
+
+            // The whole node: every edge type the store knows at the commit,
+            // which includes one created after the attempt read, in both
+            // directions.
+            (ClaimScope::Node(node), ClaimPredicate::IncidentSetComplete) => {
+                for edge_type in self.edge_types()? {
+                    for direction in [Direction::Outgoing, Direction::Incoming] {
+                        if incident_set_unchanged(engine, *node, edge_type, direction, read_ts)?
+                            == Verdict::Broken
+                        {
+                            return Ok(Verdict::Broken);
+                        }
                     }
                 }
-            };
-            let within_upper = at_most.is_none_or(|limit| count <= limit as usize);
-            let within_lower = at_least.is_none_or(|limit| count >= limit as usize);
-            Ok(if within_upper && within_lower {
-                Verdict::Holds
-            } else {
-                Verdict::Broken
-            })
+                Ok(Verdict::Holds)
+            }
+
+            // The condition was evaluated against one version of the record, so
+            // any later write to it is a renewal that invalidates the condition,
+            // whatever it wrote.
+            (ClaimScope::Record(key), ClaimPredicate::CleanupCondition { observed_version }) => Ok(
+                if engine.written_since_snapshot(Partition::Node, key, *observed_version)? {
+                    Verdict::Broken
+                } else {
+                    Verdict::Holds
+                },
+            ),
+
+            // The writes were validated under the schema the attempt read. Any
+            // write to its pointer or to the revision it named since then is a
+            // different schema, including a property edited in place at the
+            // same revision.
+            (ClaimScope::LabelSchema(label), ClaimPredicate::SchemaRead { revision }) => {
+                label_schema_unchanged(engine, label, *revision, read_ts)
+            }
+
+            // The new schema governs the nodes already stored, so every one of
+            // them must satisfy it. The registry keeps writers validated under
+            // the old schema out while this runs, and those that committed
+            // before are in the state read here.
+            (ClaimScope::LabelSchema(label), ClaimPredicate::SchemaActivated { revision }) => {
+                label_schema_admits_stored_nodes(engine, label, *revision, staged_points)
+            }
+
+            // An overlap this evaluator has no evidence for stays undecided, and
+            // a caller treats that as a refusal rather than a pass.
+            _ => Ok(Verdict::Undecidable),
         }
-
-        (
-            ClaimScope::Pair {
-                source,
-                target,
-                edge_type,
-            },
-            ClaimPredicate::PairAdjacency { observed },
-        ) => pair_observation_survived(engine, *source, *target, edge_type, *observed, read_ts),
-
-        (ClaimScope::Node(node), ClaimPredicate::EndpointAlive) => {
-            endpoint_alive(engine, *node, staged_points, read_ts)
-        }
-
-        // The destruction is the attempt's own intent, not a condition on the
-        // state it reads: there is nothing to re-check, and what the claim
-        // buys is stated entirely in the registry, where it excludes every
-        // reference right held on the same node. Answering `Undecidable` here
-        // would refuse every deletion.
-        (ClaimScope::Node(_), ClaimPredicate::EndpointDestroyed) => Ok(Verdict::Holds),
-
-        // An enumeration is proved by what it enumerated over: the attempt
-        // read the whole incident set at its view, and the claim is that
-        // nothing joined or left it since. A member added after the scan is
-        // exactly the one the scan could not have found.
-        (
-            ClaimScope::Incident {
-                node,
-                edge_type,
-                direction,
-            },
-            ClaimPredicate::IncidentSetComplete,
-        ) => incident_set_unchanged(engine, *node, edge_type, *direction, read_ts),
-
-        // The condition was evaluated against one version of the record, so
-        // any later write to it is a renewal that invalidates the condition,
-        // whatever it wrote.
-        (ClaimScope::Record(key), ClaimPredicate::CleanupCondition { observed_version }) => Ok(
-            if engine.written_since_snapshot(Partition::Node, key, *observed_version)? {
-                Verdict::Broken
-            } else {
-                Verdict::Holds
-            },
-        ),
-
-        // A predicate evaluated under one schema generation says nothing
-        // about the graph under another, and the generation the attempt
-        // stamped on the claim is what it read when it evaluated.
-        (ClaimScope::SchemaElement(_), ClaimPredicate::SchemaApplicability) => {
-            Ok(if claim.schema_revision == engine.schema_generation() {
-                Verdict::Holds
-            } else {
-                Verdict::Broken
-            })
-        }
-
-        // An overlap this evaluator has no evidence for stays undecided, and
-        // a caller treats that as a refusal rather than a pass.
-        _ => Ok(Verdict::Undecidable),
     }
 }
 
@@ -186,25 +290,273 @@ fn incident_set_unchanged(
         Direction::Outgoing => encode_adj_key_forward(edge_type, node),
         Direction::Incoming => encode_adj_key_reverse(edge_type, node),
     };
-    let members = |bytes: Option<Vec<u8>>| -> Vec<u64> {
-        bytes
-            .and_then(|b| PostingList::from_bytes(&b).ok())
-            .map(|p| p.as_slice().to_vec())
-            .unwrap_or_default()
-    };
-
-    let at_view = members(
+    let at_view = posting(
         engine
             .snapshot_get(&read_ts, Partition::Adj, &key)?
-            .map(|b| b.to_vec()),
-    );
-    let now = members(engine.get(Partition::Adj, &key)?.map(|b| b.to_vec()));
+            .as_deref(),
+    )?;
+    let now = posting(engine.get(Partition::Adj, &key)?.as_deref())?;
 
     Ok(if at_view == now {
         Verdict::Holds
     } else {
         Verdict::Broken
     })
+}
+
+/// Whether `label`'s schema is still the one an attempt viewing the store at
+/// `read_ts` read at `revision`.
+fn label_schema_unchanged(
+    engine: &StorageEngine,
+    label: &str,
+    revision: u64,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, encode_label_schema_key,
+    };
+
+    let pointer = encode_label_current_revision_key(label);
+    if engine.written_since_snapshot(Partition::Schema, &pointer, read_ts)? {
+        return Ok(Verdict::Broken);
+    }
+    // A label with no schema has no body to have changed.
+    if revision != 0 {
+        let body = encode_label_schema_key(label, revision);
+        if engine.written_since_snapshot(Partition::Schema, &body, read_ts)? {
+            return Ok(Verdict::Broken);
+        }
+    }
+    Ok(Verdict::Holds)
+}
+
+/// Whether every stored node whose primary label is `label` satisfies the
+/// schema the attempt activates at `revision`.
+///
+/// The primary label is the one a write validates against, so it is the one
+/// the activation answers for. The attempt's own staged node writes are part
+/// of the post-state and replace what is stored under the same key.
+fn label_schema_admits_stored_nodes(
+    engine: &StorageEngine,
+    label: &str,
+    revision: u64,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Verdict> {
+    use coordinode_core::schema::definition::{LabelSchema, encode_label_schema_key};
+
+    // Removing the schema admits everything.
+    if revision == 0 {
+        return Ok(Verdict::Holds);
+    }
+    let body_key = encode_label_schema_key(label, revision);
+    let body = match staged_points.get(&(Partition::Schema, body_key.clone())) {
+        Some(Some(bytes)) => Some(bytes.clone()),
+        Some(None) => None,
+        None => engine
+            .get(Partition::Schema, &body_key)?
+            .map(|b| b.to_vec()),
+    };
+    let Some(body) = body else {
+        // An activation of a revision that is nowhere describes nothing the
+        // nodes could be checked against.
+        return Ok(Verdict::Undecidable);
+    };
+    let schema = LabelSchema::from_msgpack(&body).map_err(|e| {
+        crate::error::StorageError::Serialization(format!("label schema '{label}': {e}"))
+    })?;
+    Ok(
+        match first_label_schema_violation(engine, &schema, staged_points)? {
+            None => Verdict::Holds,
+            Some(_) => Verdict::Broken,
+        },
+    )
+}
+
+/// A stored node that breaks a label schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelSchemaViolation {
+    /// The node.
+    pub node: NodeId,
+    /// What it breaks, as the write path would report it.
+    pub reason: String,
+}
+
+/// The first stored node whose primary label is `schema`'s label and that
+/// breaks `schema`, or `None` when every one satisfies it.
+///
+/// The primary label is the one a write validates against, so it is the one
+/// a schema answers for. `staged_points` are writes of the attempt asking:
+/// they are part of the state checked and replace what is stored under the
+/// same key. Overflow properties count under the names they were stored by.
+///
+/// # Errors
+///
+/// A stored record or the field dictionary does not decode.
+pub fn first_label_schema_violation(
+    engine: &StorageEngine,
+    schema: &coordinode_core::schema::definition::LabelSchema,
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Option<LabelSchemaViolation>> {
+    use coordinode_core::graph::node::NodeRecord;
+
+    // A flexible schema checks only NOT NULL; without one there is nothing
+    // a stored node can break, and the scan is skipped.
+    if !schema.mode.validates_declared()
+        && !schema.mode.rejects_unknown()
+        && !schema
+            .properties
+            .values()
+            .any(|p| p.not_null && p.default.is_none())
+    {
+        return Ok(None);
+    }
+
+    let dictionary = crate::engine::metadata::load_field_dictionary(engine)?;
+    let names: std::collections::HashMap<u32, String> = dictionary
+        .iter()
+        .map(|(name, id)| (id, name.to_string()))
+        .collect();
+    let check = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<LabelSchemaViolation>> {
+        let record = NodeRecord::from_msgpack(bytes)
+            .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        if record.labels.first() != Some(&schema.name) {
+            return Ok(None);
+        }
+        Ok(
+            record_violation(schema, record, &names, dictionary.frontier()).map(|reason| {
+                LabelSchemaViolation {
+                    node: node_of_record_key(key),
+                    reason,
+                }
+            }),
+        )
+    };
+
+    for guard in engine.prefix_scan(Partition::Node, NODE_KEY_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        if !is_node_record_key(&key) || staged_points.contains_key(&(Partition::Node, key.to_vec()))
+        {
+            continue;
+        }
+        if let Some(violation) = check(&key, &value)? {
+            return Ok(Some(violation));
+        }
+    }
+    for ((part, key), value) in staged_points.iter() {
+        if *part != Partition::Node || !is_node_record_key(key) {
+            continue;
+        }
+        if let Some(bytes) = value {
+            if let Some(violation) = check(key, bytes)? {
+                return Ok(Some(violation));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The node a record key addresses: the id follows `node:<shard:2>:`.
+fn node_of_record_key(key: &[u8]) -> NodeId {
+    let mut id = [0u8; 8];
+    // `is_node_record_key` admitted only keys at least 16 bytes long.
+    id.copy_from_slice(&key[8..16]);
+    NodeId::from_raw(u64::from_be_bytes(id))
+}
+
+/// The prefix every node record key starts with.
+const NODE_KEY_PREFIX: &[u8] = b"node:";
+
+/// Whether `key` addresses a node record: the current record of a node, or
+/// one valid-time version of a temporal one.
+fn is_node_record_key(key: &[u8]) -> bool {
+    key.starts_with(NODE_KEY_PREFIX) && (key.len() == 16 || key.len() == 25)
+}
+
+/// What `record` breaks in `schema`, its overflow properties included (they
+/// are properties of the node under the names they were stored by), or
+/// `None` when it satisfies it.
+fn record_violation(
+    schema: &coordinode_core::schema::definition::LabelSchema,
+    record: coordinode_core::graph::node::NodeRecord,
+    names: &std::collections::HashMap<u32, String>,
+    frontier: u32,
+) -> Option<String> {
+    use coordinode_core::schema::validation::validate_properties;
+
+    let first = |errors: Vec<coordinode_core::schema::validation::ValidationError>| {
+        errors
+            .into_iter()
+            .next()
+            .map_or_else(|| "invalid".to_string(), |e| e.to_string())
+    };
+    let mut props = record.props;
+    let Some(extra) = record.extra.filter(|e| !e.is_empty()) else {
+        return validate_properties(schema, &props, names).err().map(first);
+    };
+    // The overflow names take ids past every bound one, so they can neither
+    // collide with a stored property nor resolve to another name.
+    let mut names = names.clone();
+    for (offset, (name, value)) in extra.into_iter().enumerate() {
+        let Some(id) = u32::try_from(offset)
+            .ok()
+            .and_then(|o| frontier.checked_add(o))
+        else {
+            return Some(format!(
+                "more overflow properties than field ids, at '{name}'"
+            ));
+        };
+        names.insert(id, name);
+        props.insert(id, value);
+    }
+    validate_properties(schema, &props, &names).err().map(first)
+}
+
+/// Decode an adjacency posting, refusing bytes that do not decode.
+///
+/// A claim decided on a posting it could not read would be decided on an
+/// empty set, which can pass an absence or an unchanged-set check that the
+/// real data fails. Corruption is an error here, never an answer.
+fn decode_posting(bytes: &[u8]) -> StorageResult<PostingList> {
+    PostingList::from_bytes(bytes)
+        .map_err(|e| crate::error::StorageError::Serialization(format!("adjacency posting: {e}")))
+}
+
+/// The members of an adjacency posting, or none when the key is absent.
+fn posting(bytes: Option<&[u8]>) -> StorageResult<Vec<u64>> {
+    Ok(match bytes {
+        Some(b) => decode_posting(b)?.as_slice().to_vec(),
+        None => Vec::new(),
+    })
+}
+
+/// Whether the pair's instances are the ones the erase enumerated.
+///
+/// Every instance of a pair lives under the pair's own edge-property key or
+/// directly beneath it (one key per version or discriminator), so one prefix
+/// covers them all. Only the keys are compared: an instance rewritten in place
+/// is the same key, and the erase deletes that key, which first-committer-wins
+/// already decides.
+fn pair_instances_unchanged(
+    engine: &StorageEngine,
+    source: NodeId,
+    target: NodeId,
+    edge_type: &str,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    let prefix = coordinode_core::graph::edge::encode_edgeprop_key(edge_type, source, target);
+    let mut at_view = engine.snapshot_prefix_iter(&read_ts, Partition::EdgeProp, &prefix)?;
+    let mut now = engine.prefix_scan(Partition::EdgeProp, &prefix)?;
+    loop {
+        match (at_view.next(), now.next()) {
+            (None, None) => return Ok(Verdict::Holds),
+            (Some(seen), Some(current)) => {
+                if seen.key()? != current.key()? {
+                    return Ok(Verdict::Broken);
+                }
+            }
+            _ => return Ok(Verdict::Broken),
+        }
+    }
 }
 
 /// Whether the observation an attempt built its result on still stands.
@@ -231,18 +583,13 @@ fn pair_observation_survived(
 ) -> StorageResult<Verdict> {
     let key = encode_adj_key_forward(edge_type, source);
 
-    let at_view = match engine.snapshot_get(&read_ts, Partition::Adj, &key)? {
-        Some(bytes) => PostingList::from_bytes(&bytes)
-            .map(|p| p.as_slice().contains(&target.as_raw()))
-            .unwrap_or(false),
-        None => false,
-    };
-    let now = match engine.get(Partition::Adj, &key)? {
-        Some(bytes) => PostingList::from_bytes(&bytes)
-            .map(|p| p.as_slice().contains(&target.as_raw()))
-            .unwrap_or(false),
-        None => false,
-    };
+    let at_view = posting(
+        engine
+            .snapshot_get(&read_ts, Partition::Adj, &key)?
+            .as_deref(),
+    )?
+    .contains(&target.as_raw());
+    let now = posting(engine.get(Partition::Adj, &key)?.as_deref())?.contains(&target.as_raw());
 
     // The view has to agree with what the attempt says it saw; a claim whose
     // own observation was already stale when it was made is no evidence.
@@ -330,6 +677,39 @@ fn endpoint_alive(
     Ok(Verdict::Broken)
 }
 
+/// Whether a node being destroyed gained no edge the attempt did not see.
+///
+/// A deletion decides on the incident set at its view: a plain DELETE that
+/// found none, a DETACH that removes the ones it found. An edge committed to
+/// the node afterwards, of any type and in either direction, is a member that
+/// decision never accounted for, and admitting the deletion would leave it
+/// pointing at a node that is gone. The probe is key-only per edge type; the
+/// adjacency is read only for a key that moved, and then with the attempt's
+/// own removals applied, so a DETACH that removed what it saw is not refused
+/// for its own work.
+fn endpoint_unreferenced(
+    engine: &StorageEngine,
+    edge_types: &[String],
+    node: NodeId,
+    staged: StagedAdj<'_>,
+    read_ts: u64,
+) -> StorageResult<Verdict> {
+    for edge_type in edge_types {
+        for direction in [Direction::Outgoing, Direction::Incoming] {
+            let adj_key = match direction {
+                Direction::Outgoing => encode_adj_key_forward(edge_type, node),
+                Direction::Incoming => encode_adj_key_reverse(edge_type, node),
+            };
+            if engine.written_since_snapshot(Partition::Adj, &adj_key, read_ts)?
+                && !adjacency(engine, node, edge_type, direction, staged)?.is_empty()
+            {
+                return Ok(Verdict::Broken);
+            }
+        }
+    }
+    Ok(Verdict::Holds)
+}
+
 /// The neighbour set of one incident scope, with the attempt's staged writes
 /// applied in the order they were staged.
 fn adjacency(
@@ -345,7 +725,7 @@ fn adjacency(
     };
 
     let mut plist = match engine.get(Partition::Adj, &key)? {
-        Some(bytes) => PostingList::from_bytes(&bytes).unwrap_or_else(|_| PostingList::new()),
+        Some(bytes) => decode_posting(&bytes)?,
         None => PostingList::new(),
     };
 
@@ -408,9 +788,9 @@ fn edge_instances(
 
     let mut count: usize = 0;
     for guard in engine.prefix_scan(Partition::EdgeProp, &prefix)? {
-        let Ok(key) = guard.key() else {
-            continue;
-        };
+        // A row that cannot be read is not a row that is absent: skipping it
+        // would undercount and admit the instance that breaks the bound.
+        let key = guard.key()?;
         // A row this attempt tombstones is already gone as far as the bound
         // is concerned; one it rewrites is still the same identity.
         match staged_points.get(&(Partition::EdgeProp, key.to_vec())) {

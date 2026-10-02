@@ -101,15 +101,15 @@ the key is unset.
 | `planner_stats_ttl_secs` | `60` | restart (`Database::set_stats_ttl` in embedded mode) | How long the query planner reuses its storage statistics (node counts per label, edge fan-out) before reading them again. Shorter keeps estimates closer to fresh writes at the cost of a counter read and a bounded adjacency sample on each refresh. The statistics steer the choice of plan, never its result. When they cannot be read because a counter or an adjacency list is damaged, the failure is logged as an error naming the key and remembered for the same time, and queries plan with defaults until the next refresh. |
 | `vector_build_wait_ms` | `30000` | restart (`Database::set_vector_build_wait` or `SET vector_build_wait` in embedded mode) | How long a query waits for a vector index still being built, under the `block` online-during-build policy, before it is refused. It is the default for queries that name no bound: a query's own `/*+ vector_build_wait('5s') */` hint overrides it, so a query that can wait longer, or should not wait at all, says so itself. `0` refuses a building index at once. |
 | `node_shard` | `0` | restart | The shard whose node rows this engine holds. Node keys carry the shard ahead of the id, and the invariant guard is the one place inside the engine that resolves a node from its id alone, so it needs this to find the row. It must match the shard the statements above run against; the embedded database sets it from its own handle. |
-| `registry_heartbeat_ms` | `100` | restart | Consumer-registry heartbeat coalescing window, in ms. Buffered consumer heartbeats flush as one Raft proposal per window; a larger window trades freshness for fewer proposals on busy shards. |
-| `registry_eviction_ms` | `1000` | restart | Consumer-registry TTL-eviction sweep interval, in ms. How often expired registrations are swept and the retention floor is refreshed against the wall clock. |
-| `cdc_consumer_ttl_secs` | `30` | restart | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every poll, and while a slow reader leaves no room for more events, so they are never evicted. |
-| `cdc_poll_interval_ms` | `100` | restart | How often an idle CDC change stream polls for newly applied Raft log entries, in ms: its delivery latency once caught up, and its heartbeat period. Must be shorter than `cdc_consumer_ttl_secs`, otherwise the server refuses to start. `0` is refused. |
+| `registry_heartbeat_ms` | `1000` | restart | Consumer-registry heartbeat coalescing window, in ms. The first heartbeat buffered opens a window, and the window's heartbeats flush as one Raft proposal; a larger window trades freshness for fewer proposals on busy shards. Nothing buffered, nothing runs. |
+| `registry_eviction_ms` | `1000` | restart | Shortest gap between two consumer-registry TTL-eviction sweeps, in ms. A sweep runs when the earliest registration can expire and when a registration changes (on this member or replicated from another), refreshing the retention floor; it never runs on a timer of its own. |
+| `cdc_consumer_ttl_secs` | `30` | restart | CDC change-stream consumer TTL, in seconds. How long a disconnected/crashed change-stream reader's registration holds the oplog retention floor before it is reclaimed. Connected readers heartbeat every `cdc_heartbeat_interval_ms` while they wait, for new entries or for a slow reader to make room, so they are never evicted. |
+| `cdc_heartbeat_interval_ms` | `10000` | restart | How often a CDC change stream that is waiting (caught up, or on a slow reader) heartbeats its registration, in ms. Delivery does not wait on it: a caught-up stream wakes as soon as this node applies another entry. Must be shorter than `cdc_consumer_ttl_secs`, otherwise the server refuses to start. `0` is refused. |
 | `cdc_batch_size` | `256` | restart | Most entries a CDC change stream reads and sends per poll. Larger batches cut per-poll overhead for a reader far behind; smaller ones keep each poll short. `0` is refused. |
 | `interactive_txn_idle_timeout_secs` | `30` | restart | Idle timeout for an interactive transaction (a `BeginTransaction` left open without commit/rollback), in seconds. An open transaction pins an MVCC snapshot and buffers writes; one idle this long is auto-rolled-back. |
 | `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
 | `wire_compression_level` | `3` | restart | Inter-node gRPC transport zstd compression level (C-zstd `1`..=`22`). Default `3` is zstd's standard default (~9x reduction on Raft batches); raise on a bandwidth-constrained link. Independent of the on-disk codec. |
-| `scrub_enabled` | `true` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). |
+| `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
 | `scrub_throttle_ms` | `50` | restart | Pause between SST scans during a scrub so it yields I/O to production; `0` runs at full speed. |
 | `checkpoint_enabled` | `true` | restart | Whether periodic local checkpoints are taken (the base for WAL-replay repair when no healthy replica is available). |
@@ -119,7 +119,7 @@ the key is unset.
 | `trigger_max_cascade_depth` | `10` | live (setParameter) | Async AFTER COMMIT cascade-depth cap. A self- or mutually-triggering chain deeper than this is dead-lettered as a cascade overflow rather than looping. Per-trigger `CASCADE_LIMIT n` overrides it. |
 | `trigger_default_retry_attempts` | `3` | live (setParameter) | Default total execution attempts for an AFTER COMMIT trigger that declares no `ON ERROR` clause, before its event is dead-lettered into `trigger_failures`. Per-trigger `ON ERROR RETRY n` overrides it. |
 | `trigger_default_backoff_ms` | `1000` | live (setParameter) | Default base retry backoff in ms for AFTER COMMIT triggers with no `ON ERROR` clause; per-attempt wait is `backoff * 2^attempt`. Per-trigger `WITH BACKOFF ms` overrides it. |
-| `trigger_dispatch_interval_ms` | `500` | restart | How often the leader's AFTER COMMIT dispatch worker wakes to fire due retries (it also wakes immediately on each replicated write). |
+| `trigger_dispatch_interval_ms` | `1000` | restart | Shortest gap between two passes of the leader's AFTER COMMIT dispatch worker, in ms. The worker wakes on each replicated write and at the earliest scheduled retry; with nothing queued it does not wake at all. |
 | `extensions` | empty | restart | Settings belonging to a distribution built on top of this server; see below. |
 
 The three `live` knobs are runtime-tunable on a running database by an owner via
@@ -286,7 +286,7 @@ wire_compression_level: 3
 # tls_require_client_auth: false
 
 # Background integrity scrub (per-node, verifies on-disk block checksums).
-scrub_enabled: true
+scrub_enabled: false
 # scrub_interval_secs: 604800
 # scrub_throttle_ms: 50
 
@@ -576,9 +576,12 @@ horizon for both time-travel reads and lagging-consumer recovery.
   install and drains to zero by itself; a figure that stays high is worth
   investigating. Both refresh on the capacity-scan cadence.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
-  consumer-retention registry's background service: how often buffered consumer
-  heartbeats are flushed as a coalesced proposal, and how often expired
-  registrations are swept. The defaults (100 ms / 1000 ms) suit most
+  consumer-retention registry's background service: the window over which
+  buffered consumer heartbeats are coalesced into one proposal (opened by the
+  first heartbeat buffered), and the shortest gap between two sweeps of expired
+  registrations (a sweep runs when the earliest registration can expire and
+  when a registration changes). With no heartbeat buffered and nothing about to
+  expire the service does not wake. The defaults (1000 ms / 1000 ms) suit most
   deployments; raise the heartbeat window on shards with many consumers to cut
   proposal volume.
 

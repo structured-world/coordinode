@@ -199,19 +199,20 @@ pub struct ServerConfig {
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
-    /// Consumer-registry heartbeat coalescing window in ms (`None` = 100).
+    /// Consumer-registry heartbeat coalescing window in ms (`None` = 1000).
     pub registry_heartbeat_ms: Option<u64>,
-    /// Consumer-registry TTL-eviction sweep interval in ms (`None` = 1000).
+    /// Shortest gap between consumer-registry TTL-eviction sweeps in ms
+    /// (`None` = 1000).
     pub registry_eviction_ms: Option<u64>,
     /// CDC change-stream consumer TTL in seconds (`None` = 30). How long a
     /// disconnected/crashed CDC reader's registration holds the oplog retention
-    /// floor before it is TTL-reclaimed; connected readers heartbeat each poll
-    /// and are never evicted.
+    /// floor before it is TTL-reclaimed; connected readers heartbeat while
+    /// they wait and are never evicted.
     pub cdc_consumer_ttl_secs: Option<u64>,
-    /// How often an idle CDC change stream polls for newly applied entries,
-    /// in ms (`None` = 100): the delivery latency of an idle stream and its
-    /// heartbeat period, so it must stay below `cdc_consumer_ttl_secs`.
-    pub cdc_poll_interval_ms: Option<NonZeroU64>,
+    /// How often a waiting CDC change stream heartbeats its registration, in
+    /// ms (`None` = 10000). Must stay below `cdc_consumer_ttl_secs`. Delivery
+    /// does not wait on it: a caught-up stream wakes when an entry applies.
+    pub cdc_heartbeat_interval_ms: Option<NonZeroU64>,
     /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
     /// Interactive-transaction idle timeout in seconds.
@@ -238,7 +239,8 @@ pub struct ServerConfig {
     /// connections. Needs `tls_ca`. Default false.
     pub tls_require_client_auth: bool,
     /// Whether the background integrity scrub runs. Each node scrubs its own
-    /// local storage independently (no leader election). Default true.
+    /// local storage independently (no leader election). Default false: a
+    /// full pass reads every block, which an operator schedules deliberately.
     pub scrub_enabled: bool,
     /// Interval between background scrub cycles, in seconds. Default 7 days.
     pub scrub_interval_secs: u64,
@@ -274,9 +276,10 @@ pub struct ServerConfig {
     /// `ON ERROR` policy (per-attempt wait = `backoff * 2^attempt`). Per-trigger
     /// `WITH BACKOFF ms` overrides it. `None` = 1000.
     pub trigger_default_backoff_ms: Option<u64>,
-    /// How often the leader-gated AFTER COMMIT dispatch worker wakes to fire due
-    /// retries, in ms (it also wakes immediately on each applied entry). Restart
-    /// to change. `None` = 500.
+    /// Shortest gap between two passes of the leader-gated AFTER COMMIT
+    /// dispatch worker, in ms. The worker wakes on each applied entry and at
+    /// the earliest scheduled retry, never on a timer of its own. Restart to
+    /// change. `None` = 1000.
     pub trigger_dispatch_interval_ms: Option<u64>,
     /// Keys belonging to whatever was registered on the [`crate::ServerBuilder`].
     ///
@@ -326,7 +329,7 @@ impl Default for ServerConfig {
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
             cdc_consumer_ttl_secs: None,
-            cdc_poll_interval_ms: None,
+            cdc_heartbeat_interval_ms: None,
             cdc_batch_size: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
@@ -335,7 +338,7 @@ impl Default for ServerConfig {
             tls_key: None,
             tls_ca: None,
             tls_require_client_auth: false,
-            scrub_enabled: true,
+            scrub_enabled: false,
             scrub_interval_secs: 7 * 24 * 3600,
             scrub_throttle_ms: Some(50),
             checkpoint_enabled: true,
@@ -516,10 +519,10 @@ impl ServerConfig {
         }
     }
 
-    /// Leader-gated AFTER COMMIT dispatch worker poll interval (default 500ms).
+    /// Shortest gap between AFTER COMMIT dispatch passes (default 1s).
     #[must_use]
     pub fn trigger_dispatch_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(500))
+        std::time::Duration::from_millis(self.trigger_dispatch_interval_ms.unwrap_or(1000))
     }
 
     /// Resolve the storage endpoints for this node.

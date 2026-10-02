@@ -31,8 +31,6 @@ fn aggressive_flush_config(dir: &std::path::Path) -> StorageConfig {
     )]);
     cfg.max_write_buffer_bytes = 1; // always flush
     cfg.max_sealed_memtables = 0; // always flush sealed
-    cfg.flush_poll_interval_ms = 10; // fast poll for tests
-    cfg.compaction_poll_interval_ms = 20;
     cfg.compaction_l0_urgent_threshold = 2; // compact aggressively
     cfg
 }

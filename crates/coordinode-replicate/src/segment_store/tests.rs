@@ -666,6 +666,64 @@ async fn a_copy_behind_the_local_applies_is_refused() {
     );
 }
 
+/// Two peers at one position whose partitions differ build segments with
+/// different bytes: the installed partition is exactly one peer's copy,
+/// never a splice of both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repair_from_peers_with_different_copies_installs_one_of_them_whole() {
+    let a_dir = tempfile::tempdir().expect("tempdir");
+    let (a, _) = raft_engine(a_dir.path(), 20);
+    let b_dir = tempfile::tempdir().expect("tempdir");
+    let (b, _) = raft_engine(b_dir.path(), 20);
+    for i in 0..200u32 {
+        let key = format!("node:0:{i:08}");
+        a.put(
+            Partition::Node,
+            key.as_bytes(),
+            format!("a-{i:04}").as_bytes(),
+        )
+        .expect("put");
+        b.put(
+            Partition::Node,
+            key.as_bytes(),
+            format!("b-{i:04}").as_bytes(),
+        )
+        .expect("put");
+    }
+    let uri_a = serve(&a).await;
+    let uri_b = serve(&b).await;
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let (local, _) = raft_engine(local_dir.path(), 10);
+    let installer = Arc::new(SegmentInstaller::new(Arc::clone(&local)));
+    installer
+        .repair_partition(&[uri_a, uri_b], Partition::Node, 256, PieceEncoding::None)
+        .await
+        .expect("repair");
+
+    let first = local
+        .get(Partition::Node, b"node:0:00000000")
+        .expect("get")
+        .expect("present");
+    let prefix = if first.as_ref().starts_with(b"a-") {
+        "a"
+    } else {
+        "b"
+    };
+    for i in 0..200u32 {
+        let key = format!("node:0:{i:08}");
+        let v = local
+            .get(Partition::Node, key.as_bytes())
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            v.as_ref(),
+            format!("{prefix}-{i:04}").as_bytes(),
+            "key {i} comes from the other peer"
+        );
+    }
+}
+
 /// Schema carries this node's own records (per-node routing, the state
 /// machine's membership and snapshot metadata): they neither travel nor
 /// get replaced by a peer's copy.

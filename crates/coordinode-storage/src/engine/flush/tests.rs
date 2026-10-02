@@ -21,26 +21,44 @@ fn make_test_trees() -> (HashMap<Partition, lsm_tree::AnyTree>, tempfile::TempDi
     (trees, dir)
 }
 
+/// Start a manager with fresh wakes; returns the monitor's wake so a test can
+/// act as the write path.
+fn start(
+    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    gc_watermark: &Arc<AtomicU64>,
+    threshold: u64,
+    max_sealed: usize,
+    workers: usize,
+    max_age_secs: u64,
+) -> (FlushManager, Arc<Wake>) {
+    let wake = Arc::new(Wake::default());
+    let mgr = FlushManager::start(
+        trees,
+        Arc::clone(gc_watermark),
+        threshold,
+        max_sealed,
+        workers,
+        max_age_secs,
+        Arc::clone(&wake),
+        Arc::new(Wake::default()),
+    )
+    .expect("start FlushManager");
+    (mgr, wake)
+}
+
 #[test]
 fn flush_manager_starts_and_stops() {
     let (trees, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        64 * 1024 * 1024, // 64MB threshold (won't trigger in this test)
-        4,
-        1,  // 1 worker
-        50, // poll interval
-        0,  // age trigger disabled
-    )
-    .expect("start FlushManager");
+    // 64MB threshold (won't trigger in this test), age trigger disabled.
+    let (mgr, _wake) = start(&trees, &gc_watermark, 64 * 1024 * 1024, 4, 1, 0);
 
     // Brief sleep to let threads spin up.
     std::thread::sleep(Duration::from_millis(120));
 
-    // Drop manager: should join all threads cleanly without hanging.
+    // Drop manager: should join all threads cleanly without hanging, though
+    // the monitor is parked with no deadline.
     drop(mgr);
 }
 
@@ -60,17 +78,9 @@ fn flush_manager_flushes_when_sealed_count_exceeded() {
     tree.rotate_memtable();
     assert_eq!(tree.sealed_memtable_count(), 1, "one sealed before start");
 
-    // FlushManager with max_sealed=0 so ANY sealed count triggers flush.
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        u64::MAX, // size threshold: never triggers
-        0,        // max_sealed=0: flush immediately when any sealed memtable exists
-        1,
-        20, // fast poll for test
-        0,  // age trigger disabled — isolating the sealed-count gate
-    )
-    .expect("start FlushManager");
+    // max_sealed=0 so ANY sealed count triggers flush; size never triggers,
+    // age trigger disabled, isolating the sealed-count gate.
+    let (mgr, _wake) = start(&trees, &gc_watermark, u64::MAX, 0, 1, 0);
 
     // Wait up to 500ms for the flush to complete.
     let mut flushed = false;
@@ -101,17 +111,9 @@ fn flush_manager_flushes_when_size_threshold_exceeded() {
     // Write enough data to exceed a tiny threshold (1 byte).
     tree.insert(b"key1", b"value1_some_data", seqno.next());
 
-    // FlushManager with threshold=1 byte so the active memtable exceeds it.
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        1,   // 1 byte threshold — will always trigger
-        100, // high sealed count so only size trigger fires
-        1,
-        20,
-        0, // age trigger disabled — isolating the size gate
-    )
-    .expect("start FlushManager");
+    // 1 byte threshold, so it always triggers; high sealed count so only the
+    // size trigger fires; age trigger disabled.
+    let (mgr, _wake) = start(&trees, &gc_watermark, 1, 100, 1, 0);
 
     // Wait up to 500ms for rotate + flush to complete.
     let mut flushed = false;
@@ -131,22 +133,44 @@ fn flush_manager_flushes_when_size_threshold_exceeded() {
     );
 }
 
+/// A write that crosses the threshold after the monitor went to sleep wakes
+/// it through the trigger: the monitor has no timer that would find the
+/// write otherwise.
+#[test]
+fn a_write_through_the_trigger_wakes_the_sleeping_monitor() {
+    let (trees, _dir) = make_test_trees();
+    let gc_watermark = Arc::new(AtomicU64::new(0));
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    let tree = trees.get(&Partition::Node).expect("node tree").clone();
+
+    let (mgr, wake) = start(&trees, &gc_watermark, 8, 100, 1, 0);
+    let trigger = FlushTrigger::new(wake, 8);
+    // Let the monitor find nothing and park with no deadline.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (added, memtable) = tree.insert(b"key1", b"a value longer than eight bytes", seqno.next());
+    trigger.wrote(added, memtable);
+
+    let mut flushed = false;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        if tree.sealed_memtable_count() == 0 && tree.active_memtable().size() == 0 {
+            flushed = true;
+            break;
+        }
+    }
+    drop(mgr);
+    assert!(flushed, "the triggered write was not flushed");
+}
+
 #[test]
 fn flush_manager_multiple_workers_no_panic() {
     let (trees, _dir) = make_test_trees();
     let gc_watermark = Arc::new(AtomicU64::new(0));
 
-    // Start with 4 workers, rapid flush to exercise concurrency.
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        1,  // 1 byte: always trigger
-        0,  // max_sealed=0: always trigger
-        4,  // 4 workers
-        10, // fast poll
-        0,  // age trigger disabled — concurrency comes from size+sealed
-    )
-    .expect("start FlushManager");
+    // 4 workers, every trigger on, to exercise concurrency.
+    let (mgr, _wake) = start(&trees, &gc_watermark, 1, 0, 4, 0);
 
     std::thread::sleep(Duration::from_millis(150));
     drop(mgr); // must not panic or deadlock
@@ -166,27 +190,17 @@ fn flush_manager_age_trigger_rotates_idle_memtable() {
         Arc::new(lsm_tree::SequenceNumberCounter::default());
     let tree = trees.get(&Partition::Node).expect("node tree").clone();
 
-    // One tiny write — nowhere near the 64MB size threshold.
+    // One tiny write, nowhere near the size threshold.
     tree.insert(b"k", b"v", seqno.next());
     assert!(
         tree.active_memtable().size() > 0,
         "precondition: data lives in the active memtable"
     );
 
-    // age trigger = 1 second, size & sealed thresholds effectively off.
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        u64::MAX, // size: never triggers
-        usize::MAX,
-        1,
-        20, // poll every 20ms
-        1,  // age trigger after 1s
-    )
-    .expect("start FlushManager");
+    // age trigger = 1 second, size & sealed thresholds effectively off. The
+    // monitor sleeps until the age deadline, with no other wakeup.
+    let (mgr, _wake) = start(&trees, &gc_watermark, u64::MAX, usize::MAX, 1, 1);
 
-    // The age trigger needs both wall time AND a poll tick to fire. Give
-    // it 2× the age budget; flush worker then handles the sealed memtable.
     let mut flushed = false;
     for _ in 0..150 {
         std::thread::sleep(Duration::from_millis(20));
@@ -216,19 +230,10 @@ fn flush_manager_age_zero_disables_time_based_trigger() {
 
     tree.insert(b"k", b"v", seqno.next());
 
-    let mgr = FlushManager::start(
-        &trees,
-        Arc::clone(&gc_watermark),
-        u64::MAX, // size: never triggers
-        usize::MAX,
-        1,
-        20,
-        0, // age trigger DISABLED
-    )
-    .expect("start FlushManager");
+    let (mgr, _wake) = start(&trees, &gc_watermark, u64::MAX, usize::MAX, 1, 0);
 
-    // Even after several poll cycles the active memtable must still hold
-    // its byte — nothing else has been touched to push it out.
+    // The active memtable must still hold its byte: nothing else has been
+    // touched to push it out.
     std::thread::sleep(Duration::from_millis(400));
     let stayed = tree.active_memtable().size() > 0 && tree.sealed_memtable_count() == 0;
     drop(mgr);

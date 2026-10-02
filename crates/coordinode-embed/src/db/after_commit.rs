@@ -99,6 +99,10 @@ pub struct AfterCommitDispatchReport {
     /// Non-fatal dispatcher errors (queue bookkeeping failures). Body errors are
     /// not here — they drive the retry / dead-letter path instead.
     pub errors: Vec<String>,
+    /// When the earliest event left for a later retry becomes due (Unix
+    /// microseconds), or `None` when nothing waits on a time: a caller that
+    /// drives the queue sleeps until then, or until the next write.
+    pub next_due_us: Option<u64>,
 }
 
 impl AfterCommitDispatchReport {
@@ -146,15 +150,20 @@ impl Database {
         // not be re-collected and spun on within the same drive.
         let mut seen: HashSet<u64> = HashSet::new();
         let mut budget = MAX_EXECUTIONS_PER_PASS;
+        let pass_start = now_us();
 
         loop {
-            let due = match self.collect_due_pending(&seen) {
+            let due = match self.collect_due_pending(&seen, pass_start, &mut report.next_due_us) {
                 Ok(d) => d,
                 Err(e) => {
                     report.errors.push(format!("scan pending: {e}"));
                     break;
                 }
             };
+            if budget == 0 && !due.is_empty() {
+                // Work left over: due again at once.
+                report.next_due_us = Some(now_us());
+            }
             if due.is_empty() || budget == 0 {
                 break;
             }
@@ -199,12 +208,16 @@ impl Database {
     }
 
     /// Scan the pending queue and return events that are due now (`next_attempt_us
-    /// <= now`) and not already handled this pass, oldest-key first.
+    /// <= now`) and not already handled this pass, oldest-key first. Sets
+    /// `next_due` to the earliest time an event not yet due becomes due.
     fn collect_due_pending(
         &self,
         seen: &HashSet<u64>,
+        pass_start: u64,
+        next_due: &mut Option<u64>,
     ) -> Result<Vec<(u64, PendingTriggerEvent)>, String> {
         let now = now_us();
+        *next_due = None;
         let iter = self
             .engine
             .prefix_scan(Partition::Schema, trigger_pending_scan_prefix())
@@ -217,17 +230,25 @@ impl Database {
             let Some(seq) = decode_trigger_event_seq(&key) else {
                 continue;
             };
-            if seen.contains(&seq) {
-                continue;
-            }
             let event: PendingTriggerEvent = match rmp_serde::from_slice(&value) {
                 Ok(ev) => ev,
                 // A corrupt queue entry cannot be executed; skip it (it stays
                 // in the queue for an operator to inspect rather than vanishing).
                 Err(_) => continue,
             };
+            if seen.contains(&seq) {
+                // Handled this pass. One rescheduled by it waits on its retry
+                // time; one left as it was (a disabled trigger) waits on the
+                // write that enables it, not on a time.
+                if event.next_attempt_us > pass_start {
+                    note_due(next_due, event.next_attempt_us);
+                }
+                continue;
+            }
             if event.next_attempt_us <= now {
                 out.push((seq, event));
+            } else {
+                note_due(next_due, event.next_attempt_us);
             }
         }
         Ok(out)
@@ -481,6 +502,11 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// Keep the earlier of `next_due` and `at`.
+fn note_due(next_due: &mut Option<u64>, at: u64) {
+    *next_due = Some(next_due.map_or(at, |due| due.min(at)));
 }
 
 /// RAII reset for the reentrancy flag.

@@ -106,6 +106,9 @@ pub struct DrainBuffer {
     entries: Mutex<Vec<DrainEntry>>,
     used_bytes: AtomicU64,
     capacity_bytes: u64,
+    /// The drain thread sleeps on this while the buffer is empty; an append
+    /// wakes it.
+    wake: super::wake::Wake,
 }
 
 impl DrainBuffer {
@@ -115,6 +118,7 @@ impl DrainBuffer {
             entries: Mutex::new(Vec::new()),
             used_bytes: AtomicU64::new(0),
             capacity_bytes,
+            wake: super::wake::Wake::default(),
         }
     }
 
@@ -147,6 +151,8 @@ impl DrainBuffer {
 
         self.used_bytes.fetch_add(entry_bytes, Ordering::Relaxed);
         entries.push(entry);
+        drop(entries);
+        self.wake.notify();
         Ok(())
     }
 
@@ -281,6 +287,7 @@ impl DrainHandle {
     /// are drained before the thread exits.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.buffer.wake.interrupt();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -313,9 +320,24 @@ fn drain_loop(
     write_buffer: Option<&dyn WriteBufferHook>,
 ) {
     let interval = std::time::Duration::from_millis(config.interval_ms);
+    buffer.wake.bind();
 
     loop {
-        std::thread::sleep(interval);
+        // Asleep while nothing is buffered; an append or the stop wakes it.
+        if !shutdown.load(Ordering::Acquire) {
+            buffer.wake.wait(None);
+        }
+        // Once there is something to drain, keep the batching window the
+        // interval sets, so writes arriving together go in one proposal. The
+        // stop cuts the window short.
+        let deadline = std::time::Instant::now() + interval;
+        while !shutdown.load(Ordering::Acquire) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::park_timeout(deadline - now);
+        }
 
         drain_once(buffer, pipeline, id_gen, config.batch_max, write_buffer);
 

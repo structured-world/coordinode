@@ -4,12 +4,19 @@
 //!   - active memtable size exceeds `flush_threshold_bytes`
 //!   - sealed memtable count exceeds `max_sealed`
 //!
-//! Architecture: one monitor thread polls all trees at a configurable interval
-//! and submits [`FlushRequest`]s via a flume channel to N worker threads.
-//! Workers call `get_flush_lock()` + `flush()` on the received tree clone.
+//! Architecture: one monitor thread checks the trees when something may have
+//! made one due, and submits [`FlushRequest`]s via a flume channel to N worker
+//! threads. Workers call `get_flush_lock()` + `flush()` on the received tree
+//! clone.
 //!
-//! Shutdown is automatic via [`Drop`] — the monitor exits when the shutdown
-//! flag is set, then workers exit when all senders are dropped.
+//! Nothing here runs on a timer while the database is idle. The write path
+//! tells the monitor when a memtable crossed its size threshold or received
+//! its first entry ([`FlushTrigger`]); a finished flush tells it the sealed
+//! backlog moved; the only deadline the monitor keeps is the age of a
+//! memtable that holds data.
+//!
+//! Shutdown is automatic via [`Drop`]: the monitor exits when woken with the
+//! shutdown flag set, then workers exit when all senders are dropped.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -22,6 +29,43 @@ use lsm_tree::AbstractTree;
 
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
+use coordinode_core::txn::wake::Wake;
+
+/// How the write path tells the flush monitor that a memtable may be due.
+///
+/// Held by every writer of a partition tree. A write that leaves its memtable
+/// above the size threshold, or that is the memtable's first entry (which
+/// starts its age), wakes the monitor; any other write does nothing beyond one
+/// comparison.
+#[derive(Debug)]
+pub(crate) struct FlushTrigger {
+    wake: Arc<Wake>,
+    threshold_bytes: u64,
+}
+
+impl FlushTrigger {
+    /// A trigger waking `wake` for memtables above `threshold_bytes`.
+    pub(crate) fn new(wake: Arc<Wake>, threshold_bytes: u64) -> Self {
+        Self {
+            wake,
+            threshold_bytes,
+        }
+    }
+
+    /// A write of `added` bytes left its memtable at `memtable_bytes`.
+    #[inline]
+    pub(crate) fn wrote(&self, added: u64, memtable_bytes: u64) {
+        if memtable_bytes > self.threshold_bytes || memtable_bytes == added {
+            self.wake.notify();
+        }
+    }
+
+    /// A write whose effect on the memtable's size is not reported (a range
+    /// tombstone): wake the monitor rather than guess.
+    pub(crate) fn wrote_unmeasured(&self) {
+        self.wake.notify();
+    }
+}
 
 /// Request to flush sealed memtables for a single partition tree.
 struct FlushRequest {
@@ -44,6 +88,8 @@ pub(crate) struct FlushManager {
     monitor: Option<std::thread::JoinHandle<()>>,
     /// Shutdown flag: set to `true` to stop all threads.
     shutdown: Arc<AtomicBool>,
+    /// The monitor's wakeup, notified on shutdown so the monitor sees the flag.
+    wake: Arc<Wake>,
     /// Sender clone held here so we can drop it explicitly before joining workers.
     sender: Option<flume::Sender<FlushRequest>>,
 }
@@ -51,19 +97,24 @@ pub(crate) struct FlushManager {
 impl FlushManager {
     /// Start the flush manager.
     ///
-    /// Spawns one monitor thread and `num_workers` worker threads.
+    /// Spawns one monitor thread, woken through `wake` (the wake the write
+    /// path's [`FlushTrigger`] notifies), and `num_workers` worker threads,
+    /// which notify `compaction_wake` after every flush: a flush adds a table
+    /// compaction may have to act on.
     ///
     /// # Errors
     ///
     /// Returns `Err` if any background thread fails to spawn (OS resource limit).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
         gc_watermark: Arc<AtomicU64>,
         flush_threshold_bytes: u64,
         max_sealed: usize,
         num_workers: usize,
-        poll_interval_ms: u64,
         max_memtable_age_secs: u64,
+        wake: Arc<Wake>,
+        compaction_wake: Arc<Wake>,
     ) -> StorageResult<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -75,10 +126,11 @@ impl FlushManager {
         let mut workers = Vec::with_capacity(num_workers);
         for i in 0..num_workers {
             let rx = receiver.clone();
-            let shutdown_w = Arc::clone(&shutdown);
+            let flushed = Arc::clone(&wake);
+            let compaction = Arc::clone(&compaction_wake);
             let handle = std::thread::Builder::new()
                 .name(format!("coord-flush-worker-{i}"))
-                .spawn(move || flush_worker_loop(rx, shutdown_w))
+                .spawn(move || flush_worker_loop(rx, &flushed, &compaction))
                 .map_err(|e| StorageError::InvalidConfig(format!("flush worker spawn: {e}")))?;
             workers.push(handle);
         }
@@ -90,6 +142,7 @@ impl FlushManager {
         // Spawn monitor thread.
         let tx = sender.clone();
         let shutdown_m = Arc::clone(&shutdown);
+        let wake_m = Arc::clone(&wake);
         let monitor = std::thread::Builder::new()
             .name("coord-flush-monitor".to_string())
             .spawn(move || {
@@ -100,9 +153,9 @@ impl FlushManager {
                         gc_watermark,
                         flush_threshold_bytes,
                         max_sealed,
-                        poll_interval_ms,
                         max_memtable_age_secs,
                         shutdown: shutdown_m,
+                        wake: wake_m,
                     },
                 );
             })
@@ -112,6 +165,7 @@ impl FlushManager {
             workers,
             monitor: Some(monitor),
             shutdown,
+            wake,
             sender: Some(sender),
         })
     }
@@ -119,10 +173,10 @@ impl FlushManager {
 
 impl Drop for FlushManager {
     fn drop(&mut self) {
-        // Signal all threads to stop.
+        // Signal all threads to stop, and wake the monitor so it sees it.
         self.shutdown.store(true, Ordering::Relaxed);
+        self.wake.notify();
 
-        // Wait for monitor — it sleeps at most `poll_interval_ms` before checking shutdown.
         // The monitor's sender clone is dropped when the monitor exits.
         if let Some(monitor) = self.monitor.take() {
             let _ = monitor.join();
@@ -146,12 +200,14 @@ struct FlushMonitorConfig {
     gc_watermark: Arc<AtomicU64>,
     flush_threshold_bytes: u64,
     max_sealed: usize,
-    poll_interval_ms: u64,
     max_memtable_age_secs: u64,
     shutdown: Arc<AtomicBool>,
+    wake: Arc<Wake>,
 }
 
-/// Monitor loop: polls all partition trees and submits flush requests when needed.
+/// Monitor loop: checks all partition trees when woken and submits flush
+/// requests where needed, then sleeps until the next event or the earliest
+/// age deadline of a memtable holding data.
 ///
 /// Three independent triggers can rotate a partition's active memtable:
 ///
@@ -167,6 +223,7 @@ struct FlushMonitorConfig {
 ///    The clock starts at startup and resets on every rotation; an empty
 ///    active memtable is never rotated (no data to lose).
 fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMonitorConfig) {
+    cfg.wake.bind();
     let max_age = Duration::from_secs(cfg.max_memtable_age_secs);
     let start = Instant::now();
     let mut last_rotate: HashMap<Partition, Instant> =
@@ -175,6 +232,10 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
     while !cfg.shutdown.load(Ordering::Relaxed) {
         let watermark = cfg.gc_watermark.load(Ordering::Relaxed);
         let now = Instant::now();
+        // The soonest a memtable that holds data and stays below the other
+        // triggers becomes due by age. None while every memtable is empty: an
+        // idle engine sleeps until a write wakes it.
+        let mut next_due: Option<Duration> = None;
 
         for (partition, tree) in &trees {
             let active_bytes = tree.active_memtable().size();
@@ -201,55 +262,53 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                 // Non-blocking: if channel is full, workers are busy.
                 // The sealed memtable stays in the sealed list until the next flush call.
                 let _ = cfg.sender.try_send(req);
+            } else if cfg.max_memtable_age_secs > 0 && active_bytes > 0 {
+                let remaining = max_age.saturating_sub(age);
+                next_due = Some(next_due.map_or(remaining, |due| due.min(remaining)));
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(cfg.poll_interval_ms));
+        cfg.wake.wait(next_due);
     }
 }
 
 /// Worker loop: receives flush requests and flushes sealed memtables to SST.
-fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, shutdown: Arc<AtomicBool>) {
-    loop {
-        // Use a timeout so the shutdown flag is checked periodically even when idle.
-        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(FlushRequest {
-                tree,
-                partition,
-                gc_watermark,
-            }) => {
-                // get_flush_lock() is not Send — must be acquired and used in this thread.
-                let flush_lock = tree.get_flush_lock();
-                match tree.flush(&flush_lock, gc_watermark) {
-                    Ok(Some(bytes)) => {
-                        tracing::debug!(
-                            partition = partition.name(),
-                            flushed_bytes = bytes,
-                            "memtable flushed to SST"
-                        );
-                    }
-                    Ok(None) => {
-                        // Nothing to flush — another worker or the monitor already did it.
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            partition = partition.name(),
-                            error = %e,
-                            "memtable flush failed"
-                        );
-                    }
-                }
+///
+/// Blocks on the channel with no timeout: the manager's drop closes the
+/// channel, which is what ends the loop.
+fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, flushed: &Wake, compaction: &Wake) {
+    while let Ok(FlushRequest {
+        tree,
+        partition,
+        gc_watermark,
+    }) = receiver.recv()
+    {
+        // get_flush_lock() is not Send: it is acquired and used in this thread.
+        let flush_lock = tree.get_flush_lock();
+        match tree.flush(&flush_lock, gc_watermark) {
+            Ok(Some(bytes)) => {
+                tracing::debug!(
+                    partition = partition.name(),
+                    flushed_bytes = bytes,
+                    "memtable flushed to SST"
+                );
+                // A new table may need compacting.
+                compaction.notify();
             }
-            Err(flume::RecvTimeoutError::Timeout) => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
+            Ok(None) => {
+                // Nothing to flush: another worker or the monitor already did it.
             }
-            Err(flume::RecvTimeoutError::Disconnected) => {
-                // All senders dropped — channel closed, exit gracefully.
-                break;
+            Err(e) => {
+                tracing::error!(
+                    partition = partition.name(),
+                    error = %e,
+                    "memtable flush failed"
+                );
             }
         }
+        // The sealed backlog moved; a request the monitor could not queue
+        // while workers were busy can go now.
+        flushed.notify();
     }
 }
 

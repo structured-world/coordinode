@@ -45,12 +45,12 @@ rustc-hash = { workspace = true }
 lsm-tree = { workspace = true }
 
 # Storage internals dependencies (carried over from fjall)
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 flume = { version = "0.12.0", default-features = false }
 byteorder = { package = "byteorder-lite", version = "0.1.0" }
-byteview = "~0.10.1"
-log = "0.4.27"
-tempfile = "3.20.0"
+byteview = "~0.10.2"
+log = "0.4.34"
+tempfile = "3.27.0"
 lz4_flex = { version = "0.14.0", optional = true }
 # NOTE: zstd compression is provided by lsm-tree's `zstd` feature, which uses
 # pure-Rust `structured-zstd` (no C FFI / zstd-sys). CoordiNode never links C zstd.
@@ -81,7 +81,7 @@ criterion = { workspace = true }
 serde_json = { workspace = true }
 # Storage internal test dependencies (carried over from fjall)
 nanoid = "0.5"
-test-log = "0.2.18"
+test-log = "0.2.21"
 rand = "0.10"
 
 [[bench]]

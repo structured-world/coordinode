@@ -18,9 +18,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coordinode_core::txn::proposal::Mutation;
+use coordinode_core::txn::wake::Wake;
 use parking_lot::RwLock;
 
 use crate::engine::partition::Partition;
@@ -59,6 +60,11 @@ struct Subscriber {
     tx: SyncSender<AppliedEvent>,
     /// Set when an event could not be queued; cleared by the subscriber.
     lost: AtomicBool,
+    /// Notified on every event queued or lost, so a waiting subscriber sleeps
+    /// until there is something to take.
+    wake: Wake,
+    /// Set by [`AppliedStop::stop`]; a waiting subscriber returns `None`.
+    stopped: AtomicBool,
 }
 
 /// An open subscription. Closes when dropped.
@@ -69,16 +75,56 @@ pub struct AppliedSubscription {
     feed: Weak<AppliedFeed>,
 }
 
+/// Ends the waits of one subscription from another thread.
+#[derive(Debug, Clone)]
+pub struct AppliedStop(Arc<Subscriber>);
+
+impl AppliedStop {
+    /// Make every current and later [`AppliedSubscription::next`] that would
+    /// wait return `None` instead.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, Ordering::Release);
+        self.0.wake.interrupt();
+    }
+}
+
 impl AppliedSubscription {
-    /// The next event, waiting at most `wait`. `None` when none arrived.
-    /// An event the queue could not hold comes back as
+    /// The next event, waiting at most `wait`, or until one arrives or the
+    /// subscription is stopped when `wait` is `None`. `None` when none
+    /// arrived. An event the queue could not hold comes back as
     /// [`AppliedEvent::Replaced`], once, before the events queued after it.
-    pub fn next(&self, wait: Duration) -> Option<AppliedEvent> {
-        if self.subscriber.lost.swap(false, Ordering::AcqRel) {
-            return Some(AppliedEvent::Replaced);
+    ///
+    /// The thread that waits is the one the events wake, so one thread
+    /// consumes a subscription.
+    pub fn next(&self, wait: Option<Duration>) -> Option<AppliedEvent> {
+        let deadline = wait.map(|wait| Instant::now() + wait);
+        loop {
+            if let Some(event) = self.try_next() {
+                return Some(event);
+            }
+            if self.subscriber.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            let timeout = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return None;
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
+            // An event queued between the take above and this wait has
+            // already notified, so the wait returns at once.
+            self.subscriber.wake.bind();
+            self.subscriber.wake.wait(timeout);
         }
-        // A timeout or a closed feed both mean nothing arrived.
-        self.rx.recv_timeout(wait).ok()
+    }
+
+    /// A handle that stops this subscription's waits.
+    pub fn stopper(&self) -> AppliedStop {
+        AppliedStop(Arc::clone(&self.subscriber))
     }
 
     /// An event already queued, without waiting.
@@ -124,6 +170,8 @@ impl AppliedFeed {
             partition,
             tx,
             lost: AtomicBool::new(false),
+            wake: Wake::default(),
+            stopped: AtomicBool::new(false),
         });
         {
             let mut subscribers = self.subscribers.write();
@@ -215,8 +263,12 @@ impl AppliedFeed {
 /// Queue `event` without waiting; a full queue marks the subscription lost.
 fn send(subscriber: &Subscriber, event: AppliedEvent) {
     match subscriber.tx.try_send(event) {
-        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-        Err(TrySendError::Full(_)) => subscriber.lost.store(true, Ordering::Release),
+        Ok(()) => subscriber.wake.notify(),
+        Err(TrySendError::Disconnected(_)) => {}
+        Err(TrySendError::Full(_)) => {
+            subscriber.lost.store(true, Ordering::Release);
+            subscriber.wake.notify();
+        }
     }
 }
 

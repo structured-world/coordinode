@@ -266,6 +266,11 @@ pub struct Transaction<'a> {
     /// go. Checked and reserved at commit: the write set alone cannot tell
     /// two attempts apart that each validated a condition the other breaks.
     claims: ClaimSet,
+    /// The label schemas this attempt read, as the claims they become if it
+    /// writes. Held apart from `claims` because a read alone depends on
+    /// nothing a schema change can break: an attempt that only read commits
+    /// whatever the schema did meanwhile.
+    schema_reads: ClaimSet,
     /// Records this attempt will only write if their version is still what it
     /// read. `None` as the expected version means the record must not exist.
     ///
@@ -321,6 +326,9 @@ pub struct TransactionState {
     /// because an interactive transaction is one attempt across statements
     /// and a condition stated by the first still binds the last.
     claims: ClaimSet,
+    /// Parked with the claims: a schema read by the first statement governs
+    /// a write staged by a later one.
+    schema_reads: ClaimSet,
     /// Parked for the same reason as the claims: a condition stated by one
     /// statement of an interactive transaction binds the commit of the last.
     expected_versions: Vec<(Partition, Vec<u8>, Option<u64>)>,
@@ -477,6 +485,7 @@ impl<'a> Transaction<'a> {
             merge_counter_deltas: HashMap::new(),
             counter_overflow: None,
             claims: ClaimSet::new(),
+            schema_reads: ClaimSet::new(),
             expected_versions: Vec::new(),
             schema_generation: engine.schema_generation(),
             schema_changed: false,
@@ -525,6 +534,7 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope,
             merge_adj_ops: self.merge_adj_ops,
             claims: self.claims,
+            schema_reads: self.schema_reads,
             expected_versions: self.expected_versions,
             schema_generation: self.schema_generation,
             schema_changed: self.schema_changed,
@@ -553,6 +563,7 @@ impl<'a> Transaction<'a> {
             occ_scope: self.occ_scope.take(),
             merge_adj_ops: std::mem::take(&mut self.merge_adj_ops),
             claims: std::mem::take(&mut self.claims),
+            schema_reads: std::mem::take(&mut self.schema_reads),
             expected_versions: std::mem::take(&mut self.expected_versions),
             schema_generation: self.schema_generation,
             schema_changed: std::mem::take(&mut self.schema_changed),
@@ -586,6 +597,7 @@ impl<'a> Transaction<'a> {
             merge_adj_ops: state.merge_adj_ops,
             counter_overflow: None,
             claims: state.claims,
+            schema_reads: state.schema_reads,
             expected_versions: state.expected_versions,
             schema_generation: state.schema_generation,
             schema_changed: state.schema_changed,
@@ -908,24 +920,23 @@ impl<'a> Transaction<'a> {
     /// passing it: an undecidable claim is not a satisfied one, and admitting
     /// it would mean the protection is absent exactly where the evidence is.
     fn evaluate_claims(&self) -> Result<(), CommitError> {
-        use crate::engine::claims::evaluate::{Verdict, evaluate};
+        use crate::engine::claims::evaluate::{Evaluation, Verdict};
 
+        if self.claims.is_empty() {
+            return Ok(());
+        }
+        // The attempt's view as a sequence number, which is what "written
+        // since" is asked in. The pinned snapshot is that number by
+        // construction; `read_ts` only coincides with it where the oracle and
+        // the engine share one space, and reading it here would make the
+        // check silently pass wherever they do not. A transaction without a
+        // snapshot is the legacy direct path, which has no view to protect and
+        // applies as it goes.
+        let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
+        let evaluation =
+            Evaluation::new(self.engine, &self.merge_adj_ops, &self.write_buffer, view);
         for claim in self.claims.claims() {
-            // The attempt's view as a sequence number, which is what "written
-            // since" is asked in. The pinned snapshot is that number by
-            // construction; `read_ts` only coincides with it where the oracle
-            // and the engine share one space, and reading it here would make
-            // the check silently pass wherever they do not. A transaction
-            // without a snapshot is the legacy direct path, which has no view
-            // to protect and applies as it goes.
-            let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
-            match evaluate(
-                self.engine,
-                claim,
-                &self.merge_adj_ops,
-                &self.write_buffer,
-                view,
-            )? {
+            match evaluation.decide(claim)? {
                 Verdict::Holds => {}
                 Verdict::Broken => {
                     return Err(CommitError::InvariantRefused {
@@ -955,6 +966,25 @@ impl<'a> Transaction<'a> {
     /// which graph predicate a mutation was constructed against.
     pub fn claim(&mut self, claim: Claim) {
         self.claims.insert(claim);
+    }
+
+    /// Record that this attempt read `label`'s schema at `revision` (`0` when
+    /// the label has none). If the attempt writes, its commit depends on that
+    /// schema still being the one in force; if it only reads, on nothing.
+    pub fn note_label_schema_read(&mut self, label: &str, revision: u64) {
+        self.schema_reads.insert(Claim::new(
+            coordinode_core::txn::invariant::ClaimScope::LabelSchema(label.to_string()),
+            coordinode_core::txn::invariant::ClaimPredicate::SchemaRead { revision },
+            self.schema_generation,
+        ));
+    }
+
+    /// Whether this attempt stages anything the commit would write.
+    fn stages_writes(&self) -> bool {
+        !self.write_buffer.is_empty()
+            || !self.merge_adj_ops.is_empty()
+            || !self.merge_node_deltas.is_empty()
+            || !self.merge_counter_deltas.is_empty()
     }
 
     /// Write this record only while its version is still `expected`.
@@ -1298,15 +1328,21 @@ impl<'a> Transaction<'a> {
         // since the apply follows both either way, but an attempt that failed
         // in between held a reservation it had no use for, and a reader of
         // this function had to reconstruct that the two belonged together.
+        // The schemas the attempt read become conditions only now that it is
+        // known to write: a write was validated under them, a read was not.
+        if self.stages_writes() {
+            for read in std::mem::take(&mut self.schema_reads).claims() {
+                self.claims.insert(read.clone());
+            }
+        }
         let _reservation = if self.claims.is_empty() {
             None
         } else {
-            let attempt = self.read_ts.as_raw();
             let engine: &'a StorageEngine = self.engine;
             Some(
                 engine
                     .claim_registry()
-                    .reserve_held(attempt, &self.claims)
+                    .reserve_attempt(&self.claims)
                     .map_err(|refusal| CommitError::InvariantRefused {
                         reason: format!("{refusal:?}"),
                     })?,

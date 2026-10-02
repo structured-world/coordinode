@@ -465,13 +465,16 @@ fn edge_removal_survives_a_compaction_that_does_not_see_the_list() {
     use lsm_tree::compaction::{CompactionAction, Leveled};
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
     )]);
+    // The test places every table by hand; a background compaction between
+    // two of its steps would move them and void the scenario.
+    config.compaction_workers = 0;
     let engine = StorageEngine::open(&config).expect("open");
     let key = b"adj:FOLLOWS:out:hub";
     let neighbours = |engine: &StorageEngine| {
@@ -561,13 +564,16 @@ fn nested_set_survives_a_compaction_that_does_not_see_the_record() {
     use lsm_tree::compaction::{CompactionAction, Leveled};
 
     let dir = TempDir::new().expect("tempdir");
-    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         dir.path(),
         Media::Hdd,
         Durability::Durable,
         Tier::Warm,
     )]);
+    // The test places every table by hand; a background compaction between
+    // two of its steps would move them and void the scenario.
+    config.compaction_workers = 0;
     let engine = StorageEngine::open(&config).expect("open");
     let key = b"node:\x00\x01\x00\x00\x00\x00\x00\x00\x00\x05";
 

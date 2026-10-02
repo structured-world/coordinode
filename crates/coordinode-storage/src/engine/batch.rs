@@ -323,6 +323,7 @@ fn apply_group(
                 let start = coverage::clamp_user_start(start);
                 if start < end.as_slice() {
                     tree.remove_range(start.to_vec(), end.clone(), seqno);
+                    engine.coordinator().flush_trigger().wrote_unmeasured();
                 }
             }
         }
@@ -330,7 +331,8 @@ fn apply_group(
     if let Some(mark) = cover {
         batch.insert(mark.key().as_slice(), &[][..]);
     }
-    tree.apply_batch(batch, seqno)?;
+    let (added, memtable) = tree.apply_batch(batch, seqno)?;
+    engine.coordinator().flush_trigger().wrote(added, memtable);
     engine.write_taps().applied(part, group);
     Ok(())
 }

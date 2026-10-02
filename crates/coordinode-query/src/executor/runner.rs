@@ -2503,6 +2503,19 @@ impl<'a> ExecutionContext<'a> {
         ));
     }
 
+    /// State that this statement enumerated every incident edge of `node`,
+    /// of every type and in both directions, including types it did not know
+    /// of when it read. Used where no type filter bounds what was promised.
+    pub fn claim_all_incident_sets_complete(&mut self, node: NodeId) {
+        use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
+        let generation = self.txn.schema_generation();
+        self.txn.claim(Claim::new(
+            ClaimScope::Node(node),
+            ClaimPredicate::IncidentSetComplete,
+            generation,
+        ));
+    }
+
     /// Buffer a reverse-adjacency add (`tgt` gains in-neighbour `uid`).
     pub fn adj_merge_add_rev(&mut self, edge_type: &str, tgt: NodeId, uid: u64) {
         use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
@@ -12828,6 +12841,23 @@ fn execute_redirect_edges(
             continue;
         }
 
+        // The redirect moves every edge of `a` it finds; an edge attached to
+        // `a` after this read is one it never moved, and the two write
+        // different keys. Without a type filter the promise covers types not
+        // known yet as well, so the claim covers the whole node.
+        if edge_types.is_some() {
+            for et in &types {
+                if do_out {
+                    ctx.claim_incident_set_complete(et, a_id, true);
+                }
+                if do_in {
+                    ctx.claim_incident_set_complete(et, a_id, false);
+                }
+            }
+        } else {
+            ctx.claim_all_incident_sets_complete(a_id);
+        }
+
         // Snapshot every selected type's neighbours BEFORE mutating, so a later
         // remove never perturbs a list still being read.
         let mut snaps: Vec<RedirectSnap> = Vec::with_capacity(types.len());
@@ -15144,6 +15174,22 @@ fn execute_alter_label(
 
     schema.set_mode(mode);
     schema.schema_revision += 1;
+
+    // The new mode governs the nodes already stored. The commit decides this
+    // authoritatively with no write under the old mode beside it; checking
+    // here as well names the node that refuses it.
+    let staged = std::collections::HashMap::new();
+    if let Some(violation) =
+        coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
+            ctx.engine, &schema, &staged,
+        )?
+    {
+        return Err(ExecutionError::SchemaViolation(format!(
+            "label '{label}' cannot be set to {mode}: node {} breaks it ({})",
+            violation.node.as_raw(),
+            violation.reason
+        )));
+    }
 
     // Persist new version + pointer atomically via save helper.
     ctx.save_current_label_schema(&schema)?;

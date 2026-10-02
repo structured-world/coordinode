@@ -55,6 +55,10 @@ pub enum ClaimRefusal {
 pub struct ClaimRegistry {
     inner: Mutex<Registry>,
     max_claims: usize,
+    /// Source of attempt identities for [`Self::reserve_attempt`]. Starts in
+    /// the upper half of the range so it never meets an identity a caller
+    /// names itself through [`Self::reserve_held`].
+    next_attempt: core::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -69,7 +73,22 @@ impl ClaimRegistry {
         Self {
             inner: Mutex::new(Registry::default()),
             max_claims,
+            next_attempt: core::sync::atomic::AtomicU64::new(1 << 63),
         }
+    }
+
+    /// Reserve `claims` under an attempt identity of the registry's own,
+    /// held until the returned guard is dropped.
+    ///
+    /// The commit path uses this rather than naming the attempt by its read
+    /// timestamp: transactions that began with no commit between them share
+    /// that timestamp, and two attempts under one identity would replace each
+    /// other's claims instead of being checked against them.
+    pub fn reserve_attempt(&self, claims: &ClaimSet) -> Result<Reservation<'_>, Box<ClaimRefusal>> {
+        let attempt = self
+            .next_attempt
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.reserve_held(attempt, claims)
     }
 
     /// Reserve `claims` for `attempt`, or say what refused it.

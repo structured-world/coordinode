@@ -15,24 +15,39 @@ leak-timeout = "1s"
 [profile.default.slow-timeout]
 period = "30s"
 
-# Raft cluster tests: bounded concurrency.
-# Each test spawns 3 tokio runtimes with gRPC servers — election-timing-
-# sensitive (300-600ms). Earlier full-parallel runs were flaky from CPU
-# oversubscription. Pattern: each test claims 3 threads (one per node);
-# group caps at 6 → at most 2 raft tests concurrent on a ≥8-core host.
-# Verified stable across 3 consecutive runs (25/25 each, ~104s).
+# Raft cluster tests: one at a time.
+# Each test spawns 3 tokio runtimes with gRPC servers, election-timing-
+# sensitive (300-600ms), and every member fsyncs its log. Each test claims 3
+# threads (one per node) and the group caps at 3, so one cluster runs at a
+# time. Two at once beside the rest of the package still pushed members past
+# their 30 s bounds on a macOS host, where a durable fsync is expensive; one
+# at a time ran the whole raft package green (249/249).
 #
-# The integration crate's cluster binary joins the same group: it spawns
-# multi-node clusters with the same election timing, so leaving it outside
-# let it oversubscribe the CPU alongside the tests that are inside, and the
-# failures landed on whichever test was waiting on an election at the time.
+# Every binary that spawns multi-node clusters joins the same group: they
+# share the election timing, so one left outside oversubscribes the CPU
+# alongside the tests that are inside, and the failures land on whichever
+# test was waiting on an election at the time.
+#
+# On macOS a cluster test runs alone. Every durable sync there is a full
+# device flush (F_FULLFSYNC), and a member's shutdown checkpoint flushes and
+# checkpoints each partition; beside the storage and embed tests, which flush
+# just as hard, that step grew from 0.5 s to 5 s per member and the tests ran
+# past their 30 s bounds, while the same tests alone pass every time. Linux
+# and Windows sync per file without a device flush and keep the shared
+# schedule. First matching override wins, so this one precedes the general one.
 [[profile.default.overrides]]
-filter = "binary(raft_cluster) + binary(cluster)"
+platform = 'cfg(target_os = "macos")'
+filter = "binary(raft_cluster) + binary(cluster) + binary(follower_reads) + binary(shutdown_without_quorum) + binary(derived_index) + binary(jepsen) + binary(standalone_growth) + binary(tls_cluster) + binary(cluster_vector_replication) + binary(restore_in_a_group) + binary(write_forwarding)"
+threads-required = "num-test-threads"
+test-group = "raft-cluster"
+
+[[profile.default.overrides]]
+filter = "binary(raft_cluster) + binary(cluster) + binary(follower_reads) + binary(shutdown_without_quorum) + binary(derived_index) + binary(jepsen) + binary(standalone_growth) + binary(tls_cluster) + binary(cluster_vector_replication) + binary(restore_in_a_group) + binary(write_forwarding)"
 threads-required = 3
 test-group = "raft-cluster"
 
 [test-groups.raft-cluster]
-max-threads = 6
+max-threads = 3
 
 # Heavy property-based tests: bounded concurrency to prevent oversubscription
 # when they coincide with raft tests. Each proptest claims 2 threads; group
@@ -59,7 +74,7 @@ period = "60s"
 path = "junit.xml"
 
 [[profile.ci.overrides]]
-filter = "binary(raft_cluster) + binary(cluster)"
+filter = "binary(raft_cluster) + binary(cluster) + binary(follower_reads) + binary(shutdown_without_quorum) + binary(derived_index) + binary(jepsen) + binary(standalone_growth) + binary(tls_cluster) + binary(cluster_vector_replication) + binary(restore_in_a_group) + binary(write_forwarding)"
 threads-required = 3
 test-group = "raft-cluster"
 

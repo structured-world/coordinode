@@ -47,10 +47,10 @@ publish = false
 # written), not the major: a consumer with its own lockfile otherwise keeps an
 # older 5.x that satisfies "5" and fails to build, to reopen a store, or to
 # keep a flushed tree across a power cut.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.10", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.13", default-features = false }
 
 # Consensus
-openraft = { version = "0.10.0-alpha.25", features = ["serde"] }
+openraft = { version = "0.10.0-alpha.36", features = ["serde"] }
 
 # Full-text search.
 # default-features = false to drop `columnar-zstd-compression`, the only tantivy
@@ -117,7 +117,7 @@ rand = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Parallelism
-rayon = "1.10"
+rayon = "1.12"
 crossbeam-epoch = "0.9"
 
 # Fast non-DoS hasher for internal-id keyed maps/sets on hot paths.

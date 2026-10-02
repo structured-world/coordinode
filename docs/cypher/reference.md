@@ -485,6 +485,19 @@ ALTER LABEL Event  SET SCHEMA VALIDATED
 | `VALIDATED` | Declared properties interned; unknown properties stored in overflow map |
 | `FLEXIBLE` | All properties accepted, all interned. No schema enforcement |
 
+The new mode governs the nodes already stored, not only later writes. Every
+node whose primary (first) label is the altered one is checked against the new
+mode when the statement commits; if one breaks it, the statement fails, names
+the node and the property, and the label keeps its previous mode. Fix or move
+the offending nodes, then alter again. The same check applies to a schema
+published through the typed schema API (for example a property declared
+`NOT NULL` that a stored node lacks).
+
+A write is validated against the schema it read. A transaction that wrote
+nodes of a label under one mode and commits after the label's schema changed
+is refused and can be retried under the new mode; a transaction that only
+read the label is unaffected.
+
 ---
 
 ### Time-Travel Clause

@@ -721,6 +721,9 @@ pub struct LocalMultiModalCoordinator {
     /// filter folds operands / collects versions instead of seeing a frozen
     /// `0` threshold.
     gc_controller: Arc<GcWatermarkController>,
+    /// Tells the flush monitor when a write may have made a memtable due, so
+    /// the monitor can sleep while nothing is written.
+    flush_trigger: Arc<crate::engine::flush::FlushTrigger>,
 }
 
 impl LocalMultiModalCoordinator {
@@ -753,6 +756,7 @@ impl LocalMultiModalCoordinator {
         cache: Arc<lsm_tree::Cache>,
         gc_watermark: Arc<AtomicU64>,
         gc_controller: Arc<GcWatermarkController>,
+        flush_trigger: Arc<crate::engine::flush::FlushTrigger>,
     ) -> Self {
         Self {
             trees,
@@ -760,7 +764,14 @@ impl LocalMultiModalCoordinator {
             cache,
             gc_watermark,
             gc_controller,
+            flush_trigger,
         }
+    }
+
+    /// The flush monitor's trigger, for writers of a tree outside the
+    /// single-key methods below (batches, coverage markers, schema records).
+    pub(crate) fn flush_trigger(&self) -> &crate::engine::flush::FlushTrigger {
+        &self.flush_trigger
     }
 
     /// Pin a read snapshot at the current seqno. While the returned guard is
@@ -875,7 +886,8 @@ impl LocalMultiModalCoordinator {
     ) -> StorageResult<lsm_tree::SeqNo> {
         let tree = self.tree(part)?;
         let seqno = self.seqno.next();
-        tree.insert(key, value, seqno);
+        let (added, memtable) = tree.insert(key, value, seqno);
+        self.flush_trigger.wrote(added, memtable);
         Ok(seqno)
     }
 
@@ -883,7 +895,8 @@ impl LocalMultiModalCoordinator {
     pub(crate) fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<lsm_tree::SeqNo> {
         let tree = self.tree(part)?;
         let seqno = self.seqno.next();
-        tree.remove(key, seqno);
+        let (added, memtable) = tree.remove(key, seqno);
+        self.flush_trigger.wrote(added, memtable);
         Ok(seqno)
     }
 
@@ -902,6 +915,7 @@ impl LocalMultiModalCoordinator {
         let start = coverage::clamp_user_start(start);
         if start < end {
             tree.remove_range(start.to_vec(), end.to_vec(), seqno);
+            self.flush_trigger.wrote_unmeasured();
         }
         Ok(seqno)
     }
@@ -916,7 +930,8 @@ impl LocalMultiModalCoordinator {
     ) -> StorageResult<lsm_tree::SeqNo> {
         let tree = self.tree(part)?;
         let seqno = self.seqno.next();
-        tree.merge(key, operand, seqno);
+        let (added, memtable) = tree.merge(key, operand, seqno);
+        self.flush_trigger.wrote(added, memtable);
         Ok(seqno)
     }
 }

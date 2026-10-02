@@ -110,6 +110,102 @@ fn alter_label_invalid_mode_parse_error() {
     assert!(result.is_err(), "invalid mode should fail");
 }
 
+// ── Activation validates the data it governs ────────────────────────
+
+/// A mode that a stored node already breaks is refused, and the label keeps
+/// the mode it had: activating it would declare a rule the data does not
+/// follow.
+#[test]
+fn alter_label_refuses_a_mode_existing_nodes_break() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Doc {x: 1})").expect("create");
+
+    let refused = db.execute_cypher("ALTER LABEL Doc SET SCHEMA STRICT");
+    let message = match refused {
+        Ok(rows) => panic!("STRICT with an undeclared stored property was accepted: {rows:?}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        message.contains("breaks it") && message.contains("'x'"),
+        "the refusal names the node and the property it breaks: {message}"
+    );
+
+    // Still accepts what the old mode accepts.
+    db.execute_cypher("CREATE (:Doc {y: 2})")
+        .expect("the label kept its previous mode");
+}
+
+/// A mode the stored nodes satisfy is accepted.
+#[test]
+fn alter_label_accepts_a_mode_existing_nodes_satisfy() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Doc)").expect("create");
+    db.execute_cypher("ALTER LABEL Doc SET SCHEMA STRICT")
+        .expect("no stored node breaks STRICT");
+    assert!(
+        db.execute_cypher("CREATE (:Doc {x: 1})").is_err(),
+        "STRICT is in force for new writes"
+    );
+}
+
+/// A writer that validated under the old mode and commits after the new one
+/// landed is refused: its node was admitted by a rule no longer in force,
+/// and the activation never saw it.
+#[test]
+fn a_write_validated_under_a_replaced_mode_is_refused() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Doc)").expect("label exists");
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "CREATE (:Doc {x: 1})", None)
+        .expect("FLEXIBLE accepts the property");
+
+    db.execute_cypher("ALTER LABEL Doc SET SCHEMA STRICT")
+        .expect("no committed node breaks STRICT");
+
+    assert!(
+        db.commit_transaction(tx).is_err(),
+        "a node validated under FLEXIBLE committed under STRICT"
+    );
+    let rows = db
+        .execute_cypher("MATCH (n:Doc) WHERE n.x IS NOT NULL RETURN count(n) AS n")
+        .expect("count");
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(0)));
+}
+
+/// A transaction that only read under the old mode commits: reading is not a
+/// write the new rule could be broken by.
+#[test]
+fn a_read_under_a_replaced_mode_still_commits() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Doc)").expect("label exists");
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(tx, "MATCH (n:Doc) RETURN n", None)
+        .expect("read");
+    db.execute_cypher("ALTER LABEL Doc SET SCHEMA STRICT")
+        .expect("alter");
+    db.commit_transaction(tx)
+        .expect("a read-only transaction is not refused by a schema change");
+}
+
+/// A declared property made NOT NULL through the typed API is refused while
+/// a stored node lacks it, the same as through DDL.
+#[test]
+fn a_typed_schema_change_is_validated_against_stored_nodes() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:Doc {x: 1})").expect("create");
+
+    let mut schema = LabelSchema::new_node_id("Doc");
+    schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
+    assert!(
+        db.create_label_schema(schema).is_err(),
+        "a NOT NULL property a stored node lacks was declared"
+    );
+}
+
 // ── Regression: revision-bump semantics ─────────────────────────────
 
 /// ALTER LABEL ... SET SCHEMA <mode> must bump `schema_revision` (mode change is

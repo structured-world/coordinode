@@ -764,15 +764,24 @@ impl StorageEngine {
             None
         };
 
-        // Start background flush manager.
+        // Start background flush manager. Its monitor sleeps until the write
+        // path's trigger, a finished flush or a memtable's age wakes it; the
+        // compaction monitor sleeps until a flush or a compaction wakes it.
+        let flush_wake = Arc::new(coordinode_core::txn::wake::Wake::default());
+        let compaction_wake = Arc::new(coordinode_core::txn::wake::Wake::default());
+        let flush_trigger = Arc::new(crate::engine::flush::FlushTrigger::new(
+            Arc::clone(&flush_wake),
+            config.max_write_buffer_bytes,
+        ));
         let flush_manager = FlushManager::start(
             &trees,
             Arc::clone(&gc_watermark),
             config.max_write_buffer_bytes,
             config.max_sealed_memtables,
             config.flush_workers,
-            config.flush_poll_interval_ms,
             config.max_memtable_age_secs,
+            flush_wake,
+            Arc::clone(&compaction_wake),
         )?;
 
         // Feed the backpressure thresholds to every partition tree so the
@@ -796,9 +805,9 @@ impl StorageEngine {
             Arc::clone(&gc_watermark),
             config.compaction_workers,
             config.compaction_l0_urgent_threshold,
-            config.compaction_poll_interval_ms,
             config.backpressure.bytes_slowdown,
             Arc::clone(&write_pressure),
+            compaction_wake,
         )?;
 
         info!(
@@ -965,6 +974,7 @@ impl StorageEngine {
             cache,
             gc_watermark,
             gc_controller,
+            flush_trigger,
         );
         coordinator.set_retention_window_us(retention_window_to_us(
             std::time::Duration::from_secs(config.retention_window_secs),
@@ -1549,6 +1559,7 @@ impl StorageEngine {
         for index in above {
             tree.insert(domain.marker_key(index, 0).as_slice(), &[][..], at);
         }
+        self.coordinator.flush_trigger().wrote_unmeasured();
         Ok(())
     }
 
@@ -2513,6 +2524,8 @@ impl StorageEngine {
         for tree in self.coordinator.trees().values() {
             coverage::write_fold(tree, Domain::Journal, from, next, &[], at);
         }
+        // A fold can land in a memtable a rotation just emptied.
+        self.coordinator.flush_trigger().wrote_unmeasured();
         #[cfg(feature = "columnar")]
         for (table_id, markers) in coverage.take_table_markers_below(next) {
             // A dropped table took its markers with it.
@@ -3584,14 +3597,19 @@ fn run_capacity_refresh<F>(
     }
 
     // Persist used_bytes snapshots to Schema for warm-load on the
-    // next engine open. Each snapshot is a tiny u64 (MessagePack
-    // ≈ 9 bytes including header); writing one per endpoint per
-    // refresh tick is negligible overhead.
+    // next engine open, only when the value moved: an unchanged
+    // snapshot rewritten every scan keeps the Schema memtable from
+    // ever emptying, which on an idle engine means a flush, a table and
+    // a compaction per memtable age for nothing.
     if let Some(schema_tree) = trees.get(&Partition::Schema) {
         use lsm_tree::AbstractTree;
         for (_id, usage) in capacity.iter() {
             let key = capacity_key_for(&usage.id);
-            if let Ok(encoded) = rmp_serde::to_vec(&usage.used()) {
+            let Ok(encoded) = rmp_serde::to_vec(&usage.used()) else {
+                continue;
+            };
+            let stored = schema_tree.get(&key, lsm_tree::SeqNo::MAX).ok().flatten();
+            if stored.as_deref() != Some(encoded.as_slice()) {
                 schema_tree.insert(&key, &encoded, seqno.next());
             }
         }

@@ -164,7 +164,7 @@ pub(crate) async fn serve(
         registry_heartbeat_ms,
         registry_eviction_ms,
         cdc_consumer_ttl_secs,
-        cdc_poll_interval_ms,
+        cdc_heartbeat_interval_ms,
         cdc_batch_size,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
@@ -227,9 +227,10 @@ pub(crate) async fn serve(
     let cdc_tuning = {
         let default = services::cdc::CdcStreamTuning::default();
         services::cdc::CdcStreamTuning {
-            poll_interval: cdc_poll_interval_ms.map_or(default.poll_interval, |ms| {
-                std::time::Duration::from_millis(ms.get())
-            }),
+            heartbeat_interval: cdc_heartbeat_interval_ms
+                .map_or(default.heartbeat_interval, |ms| {
+                    std::time::Duration::from_millis(ms.get())
+                }),
             batch_size: cdc_batch_size.unwrap_or(default.batch_size),
         }
     };
@@ -693,11 +694,14 @@ pub(crate) async fn serve(
     // Interactive-transaction tunables. Always resolved (the
     // config gate carries the built-in defaults: 30s idle timeout,
     // 256 MiB buffered-write ceiling per open transaction).
+    let interactive_begun = Arc::new(tokio::sync::Notify::new());
     {
         let mut db = database.write();
         db.set_interactive_idle_timeout(std::time::Duration::from_secs(
             interactive_txn_idle_timeout_secs,
         ));
+        let begun = Arc::clone(&interactive_begun);
+        db.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
         // AFTER COMMIT trigger dispatch knobs from the config file.
         // The same setter is the runtime `setParameters` seam.
@@ -718,13 +722,14 @@ pub(crate) async fn serve(
         }
     }
 
-    // Idle reaper: periodically roll back interactive transactions left
-    // untouched past the idle timeout, so an abandoned client cannot pin
-    // a transaction (and its snapshot) forever.
+    // Idle reaper: roll back interactive transactions left untouched past
+    // the idle timeout, so an abandoned client cannot pin a transaction (and
+    // its snapshot) forever. Asleep while none is open.
     crate::txn_reaper::spawn(
         Arc::clone(&database),
         Arc::clone(&session_registry),
         std::time::Duration::from_secs(interactive_txn_idle_timeout_secs),
+        interactive_begun,
         std::time::Duration::from_secs(1),
     );
 
@@ -736,8 +741,8 @@ pub(crate) async fn serve(
     // standalone and cluster modes drive it through the same Raft
     // pipeline. Held for the process lifetime.
     // Operator overrides for the background cadences arrive from the
-    // config file; `None` keeps the built-in defaults (100 ms heartbeat,
-    // 1 s eviction).
+    // config file; `None` keeps the built-in defaults (1 s heartbeat
+    // window, 1 s between sweeps).
     let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
         Arc::clone(&engine),
         Arc::clone(&pipeline),
@@ -747,17 +752,14 @@ pub(crate) async fn serve(
         },
     );
 
-    // Vector index observability: publish per-index
-    // serving state + freshness lag as Prometheus gauges. Scrape-style
-    // periodic collector — the lag needs the engine's current
-    // committed HLC, which is only meaningful at sample time.
-    {
+    // Vector index observability: per-index serving state + freshness lag as
+    // Prometheus gauges. The lag needs the engine's current committed HLC,
+    // which is only meaningful at sample time, so a scrape samples them.
+    let sample_gauges: ops::SampleGauges = {
         let db_metrics = Arc::clone(&database);
         let engine_metrics = Arc::clone(&engine);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
-            loop {
-                tick.tick().await;
+        Arc::new(move || {
+            {
                 let committed = engine_metrics.snapshot();
                 let health = db_metrics.read().vector_index_registry().all_health();
                 for (label, property, state) in health {
@@ -786,8 +788,8 @@ pub(crate) async fn serve(
                     .set(lag as f64);
                 }
             }
-        });
-    }
+        })
+    };
 
     let raft_node_shared: Option<Arc<coordinode_raft::cluster::RaftNode>> =
         Some(Arc::clone(&raft_node));
@@ -832,17 +834,18 @@ pub(crate) async fn serve(
     // node runs the backlog at a time (the body's writes have to go through
     // the leader's pipeline anyway). A leader change before an event is
     // acknowledged runs it again on the new leader, so bodies run at least
-    // once. Woken by
-    // each applied entry (covers fresh enqueues) and a periodic tick
-    // (covers retry backoff timers). The blocking dispatch runs off the
-    // async runtime so a long body never stalls consensus.
+    // once. Woken by each applied entry (covers fresh enqueues, a trigger
+    // enabled, and the entry a new leader appends) and by the earliest
+    // retry the last pass left scheduled; with nothing queued it sleeps.
+    // Passes are at least `trigger_dispatch_interval` apart. The blocking
+    // dispatch runs off the async runtime so a long body never stalls
+    // consensus.
     if peers.is_some() {
         let db = Arc::clone(&database);
         let rn = Arc::clone(&raft_node);
         let mut applied_rx = rn.subscribe_applied();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(trigger_dispatch_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut due: Option<tokio::time::Instant> = None;
             loop {
                 tokio::select! {
                     changed = applied_rx.changed() => {
@@ -850,11 +853,13 @@ pub(crate) async fn serve(
                             break; // RaftNode dropped — shut the worker down.
                         }
                     }
-                    _ = tick.tick() => {}
+                    _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {}
                 }
+                due = None;
                 if rn.current_leader() != Some(rn.node_id()) {
                     continue;
                 }
+                let passed_at = tokio::time::Instant::now();
                 let db2 = Arc::clone(&db);
                 match tokio::task::spawn_blocking(move || {
                     db2.read().dispatch_after_commit_triggers()
@@ -865,9 +870,20 @@ pub(crate) async fn serve(
                         for e in &report.errors {
                             tracing::warn!("after-commit trigger dispatch: {e}");
                         }
+                        // A bookkeeping failure leaves its event due: try again.
+                        let retry_in = if report.errors.is_empty() {
+                            report.next_due_us.map(|at| {
+                                // A retry already due waits for nothing.
+                                std::time::Duration::from_micros(at.saturating_sub(unix_now_us()))
+                            })
+                        } else {
+                            Some(std::time::Duration::ZERO)
+                        };
+                        due = retry_in.map(|wait| passed_at + wait.max(trigger_dispatch_interval));
                     }
                     Err(e) => {
-                        tracing::warn!(%e, "after-commit dispatch task join error")
+                        tracing::warn!(%e, "after-commit dispatch task join error");
+                        due = Some(passed_at + trigger_dispatch_interval);
                     }
                 }
             }
@@ -876,16 +892,21 @@ pub(crate) async fn serve(
 
     // Rebuild the B-tree indexes a store kept in the entry layout that
     // preceded transactional entries. The rebuild is written through the log,
-    // so the leader runs it; a member that is not leading keeps looking until
-    // it leads or another member's rebuild reaches it through apply.
+    // so the leader runs it; a member that is not leading looks again at each
+    // applied entry (a new leader's first entry among them) until it leads or
+    // another member's rebuild reaches it through apply.
     {
         let db = Arc::clone(&database);
         let rn = Arc::clone(&raft_node);
+        let mut applied_rx = rn.subscribe_applied();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // A failed rebuild is tried again after this, not at the next apply.
+            const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+            let mut first = true;
             loop {
-                tick.tick().await;
+                if !std::mem::take(&mut first) && applied_rx.changed().await.is_err() {
+                    break; // RaftNode dropped.
+                }
                 if rn.current_leader() != Some(rn.node_id()) {
                     continue;
                 }
@@ -902,6 +923,8 @@ pub(crate) async fn serve(
                     Ok(Err(e)) => tracing::warn!(%e, "B-tree index rebuild failed; retrying"),
                     Err(e) => tracing::warn!(%e, "B-tree index rebuild task join error"),
                 }
+                tokio::time::sleep(RETRY).await;
+                first = true;
             }
         });
     }
@@ -941,6 +964,7 @@ pub(crate) async fn serve(
             consumer_registry,
             cdc_ttl_ms,
             Arc::new(|| 0),
+            None,
         ),
     }
     .with_tuning(cdc_tuning);
@@ -960,7 +984,7 @@ pub(crate) async fn serve(
     let readiness = ops::Readiness::default();
     let ops_readiness = readiness.clone();
     tokio::spawn(async move {
-        if let Err(e) = ops::start_ops_server(ops_listener, ops_readiness).await {
+        if let Err(e) = ops::start_ops_server(ops_listener, ops_readiness, sample_gauges).await {
             tracing::error!("ops server error: {e}");
         }
     });
@@ -986,46 +1010,28 @@ pub(crate) async fn serve(
         proxy_health.enabled = false;
         let mut proxy_metrics = MetricsConfig::default();
         proxy_metrics.enabled = false;
-        // structured-proxy 2.0.1 makes the embedded-constructed config structs
-        // hand-buildable again (no longer #[non_exhaustive]), so the config is built
-        // programmatically. serve() is gone in 2.x; the proxy exposes an axum Router
-        // that we bind and serve here.
+        // The wiring structs are hand-buildable for embedders; everything not
+        // named here keeps the proxy's own default, including the forwarded
+        // headers (authorization, dpop, request id, forwarding and client
+        // headers, idempotency key). The proxy exposes an axum Router that is
+        // bound and served here.
         let config = ProxyConfig {
-            upstream: UpstreamConfig {
+            upstream: Some(UpstreamConfig {
                 default: grpc_upstream,
-            },
+            }),
             descriptors: vec![DescriptorSource::Embedded {
                 bytes: DESCRIPTOR_BYTES,
             }],
             listen: ListenConfig {
                 http: rest_addr.clone(),
+                ..ListenConfig::default()
             },
             service: ServiceConfig {
                 name: "coordinode".into(),
             },
             health: proxy_health,
             metrics: proxy_metrics,
-            aliases: vec![],
-            openapi: None,
-            auth: None,
-            shield: None,
-            oidc_discovery: None,
-            maintenance: Default::default(),
-            cors: Default::default(),
-            logging: Default::default(),
-            streaming: Default::default(),
-            metrics_classes: vec![],
-            forwarded_headers: vec![
-                "authorization".into(),
-                "dpop".into(),
-                "x-request-id".into(),
-                "x-forwarded-for".into(),
-                "x-forwarded-proto".into(),
-                "x-real-ip".into(),
-                "user-agent".into(),
-                "accept-language".into(),
-                "idempotency-key".into(),
-            ],
+            ..ProxyConfig::default()
         };
         let proxy = structured_proxy::ProxyServer::from_config(config);
         tokio::spawn(async move {
@@ -1346,4 +1352,12 @@ pub(crate) async fn serve(
         .await?;
 
     Ok(())
+}
+
+/// Wall-clock microseconds since the Unix epoch, the clock the AFTER COMMIT
+/// queue schedules retries on.
+fn unix_now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
 }

@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use coordinode_core::txn::wake::Wake;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::error::{StorageError, StorageResult};
@@ -250,6 +251,7 @@ impl Default for CheckpointSchedulerConfig {
 /// simply never start it.
 pub struct CheckpointScheduler {
     shutdown: Arc<AtomicBool>,
+    wake: Arc<Wake>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -261,17 +263,23 @@ impl CheckpointScheduler {
         cfg: CheckpointSchedulerConfig,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Wake::default());
         let stop = Arc::clone(&shutdown);
+        let stopped = Arc::clone(&wake);
         let root = checkpoint_root(&data_dir);
-        // Sleep in short ticks so shutdown is responsive regardless of interval.
-        let tick = Duration::from_millis(200);
         let handle = std::thread::Builder::new()
             .name("coordinode-checkpoint".into())
             .spawn(move || {
-                let mut since_last = Duration::ZERO;
+                stopped.bind();
+                let mut next = Instant::now() + cfg.interval;
                 while !stop.load(Ordering::Relaxed) {
-                    if since_last >= cfg.interval {
-                        since_last = Duration::ZERO;
+                    // Asleep for the whole interval; the drop interrupts it.
+                    let now = Instant::now();
+                    if now < next {
+                        stopped.wait(Some(next - now));
+                        continue;
+                    }
+                    next = now + cfg.interval;
                         if let Err(e) = create_checkpoint(&engine, &root) {
                             tracing::error!(error = %e, "scheduled checkpoint failed");
                         }
@@ -298,9 +306,6 @@ impl CheckpointScheduler {
                         if let Err(e) = engine.oplog_purge_expired(now, keep_from) {
                             tracing::warn!(error = %e, "oplog purge failed");
                         }
-                    }
-                    std::thread::sleep(tick);
-                    since_last += tick;
                 }
             });
         let handle = match handle {
@@ -310,13 +315,18 @@ impl CheckpointScheduler {
                 None
             }
         };
-        Self { shutdown, handle }
+        Self {
+            shutdown,
+            wake,
+            handle,
+        }
     }
 }
 
 impl Drop for CheckpointScheduler {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.wake.interrupt();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

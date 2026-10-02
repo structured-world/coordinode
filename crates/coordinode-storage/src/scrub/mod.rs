@@ -30,7 +30,7 @@ use crate::error::StorageResult;
 /// Configuration for background scrub.
 #[derive(Debug, Clone)]
 pub struct ScrubConfig {
-    /// Whether background scrubbing is enabled. Default: `true`.
+    /// Whether background scrubbing is enabled. Default: `false`.
     pub enabled: bool,
 
     /// Interval between full scrub cycles. Default: 7 days.
@@ -49,7 +49,7 @@ pub struct ScrubConfig {
 impl Default for ScrubConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             interval: Duration::from_secs(7 * 24 * 3600),
             throttle: None,
             parallelism: 1,

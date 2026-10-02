@@ -794,3 +794,254 @@ fn a_version_condition_refuses_what_it_cannot_be_stated_on() {
         "the node exists now, so requiring its absence must refuse"
     );
 }
+
+/// The holder of a fence node, read back in one transaction.
+fn fence_holder(db: &mut Database) -> String {
+    let rows = db
+        .execute_cypher("MATCH (f:Fence {k: 1}) RETURN f.holder AS holder")
+        .expect("read the fence");
+    match rows[0].get("holder") {
+        Some(coordinode_core::graph::types::Value::String(holder)) => holder.clone(),
+        other => panic!("no holder: {other:?}"),
+    }
+}
+
+/// Two transactions that both take one fence node never both commit,
+/// whichever commits first: the second wrote from a version the first one
+/// replaced, so letting it through would hand the fence to two holders.
+#[test]
+fn two_transactions_taking_one_fence_never_both_commit() {
+    for a_commits_first in [true, false] {
+        let mut db = open_db();
+        db.execute_cypher("CREATE (:Fence {k: 1, holder: 'none'})")
+            .expect("seed the fence");
+        let a = db.begin_transaction();
+        let b = db.begin_transaction();
+        db.execute_in_transaction(a, "MATCH (f:Fence {k: 1}) SET f.holder = 'a'", None)
+            .expect("a takes the fence");
+        db.execute_in_transaction(b, "MATCH (f:Fence {k: 1}) SET f.holder = 'b'", None)
+            .expect("b takes the fence");
+
+        let (first, second, winner) = if a_commits_first {
+            (a, b, "a")
+        } else {
+            (b, a, "b")
+        };
+        db.commit_transaction(first).expect("the first commits");
+        assert!(
+            db.commit_transaction(second).is_err(),
+            "both transactions committed a fence they took from one version"
+        );
+        assert_eq!(fence_holder(&mut db), winner);
+    }
+}
+
+/// A node deleted while another transaction links an edge to it: exactly one
+/// of the two commits, in either order, and no edge is left pointing at a
+/// node that is gone.
+#[test]
+fn deleting_a_node_and_linking_to_it_never_both_commit() {
+    for delete_commits_first in [true, false] {
+        let mut db = open_db();
+        db.execute_cypher("CREATE (:P {name: 'a'}), (:P {name: 'b'})")
+            .expect("seed");
+        let delete = db.begin_transaction();
+        let link = db.begin_transaction();
+        db.execute_in_transaction(delete, "MATCH (n:P {name: 'a'}) DELETE n", None)
+            .expect("delete a, which has no edge yet");
+        db.execute_in_transaction(
+            link,
+            "MATCH (a:P {name: 'a'}), (b:P {name: 'b'}) CREATE (b)-[:R]->(a)",
+            None,
+        )
+        .expect("link b to a, which still exists");
+
+        let (first, second) = if delete_commits_first {
+            (delete, link)
+        } else {
+            (link, delete)
+        };
+        db.commit_transaction(first).expect("the first commits");
+        assert!(
+            db.commit_transaction(second).is_err(),
+            "the delete and the link both committed (delete first: {delete_commits_first})"
+        );
+
+        let a_left = db
+            .execute_cypher("MATCH (n:P {name: 'a'}) RETURN n")
+            .expect("read a")
+            .len();
+        let edges = db
+            .execute_cypher("MATCH (:P)-[r:R]->(:P) RETURN r")
+            .expect("read edges")
+            .len();
+        let dangling = db
+            .execute_cypher("MATCH ()-[r:R]->() RETURN r")
+            .expect("read any edge")
+            .len();
+        if delete_commits_first {
+            assert_eq!((a_left, edges), (0, 0), "a is gone and nothing links to it");
+        } else {
+            assert_eq!((a_left, edges), (1, 1), "a stays and the link holds");
+        }
+        assert_eq!(dangling, edges, "an edge points at a node that is gone");
+    }
+}
+
+/// Deleting a temporal edge removes every version of the pair it found and,
+/// with the last one, the pair's adjacency. A version inserted into the pair
+/// by a transaction that committed after the delete read it is one the delete
+/// never found: letting both commit would leave that acknowledged version with
+/// no adjacency to reach it. Committed the other way round, the insert lands
+/// on a pair the delete emptied, and both are admissible.
+#[test]
+fn erasing_a_pair_and_inserting_into_it_never_lose_the_insert() {
+    for insert_commits_first in [true, false] {
+        let mut db = open_db();
+        db.execute_cypher(
+            "CREATE EDGE TYPE WORKS_AT TEMPORAL \
+             WITH (valid_from: TIMESTAMP, valid_to: TIMESTAMP, role: STRING)",
+        )
+        .expect("declare the temporal type");
+        db.execute_cypher(
+            "CREATE (b:Person {name: 'B'})-[:WORKS_AT {valid_from: 1000, valid_to: 2000, role: 'SWE'}]->(:Co {name: 'Acme'})",
+        )
+        .expect("seed one version");
+
+        let erase = db.begin_transaction();
+        let insert = db.begin_transaction();
+        db.execute_in_transaction(
+            erase,
+            "MATCH (:Person {name: 'B'})-[r:WORKS_AT]->(:Co {name: 'Acme'}) DELETE r",
+            None,
+        )
+        .expect("erase every version the delete sees");
+        db.execute_in_transaction(
+            insert,
+            "MATCH (b:Person {name: 'B'}), (c:Co {name: 'Acme'}) \
+             CREATE (b)-[:WORKS_AT {valid_from: 3000, valid_to: 4000, role: 'Staff'}]->(c)",
+            None,
+        )
+        .expect("insert a later version into the same pair");
+
+        let versions = |db: &mut Database| {
+            db.execute_cypher(
+                "MATCH (:Person {name: 'B'})-[r:WORKS_AT]->(:Co {name: 'Acme'}) RETURN r.role AS role",
+            )
+            .expect("read the pair")
+            .len()
+        };
+
+        if insert_commits_first {
+            db.commit_transaction(insert).expect("the insert commits");
+            assert!(
+                db.commit_transaction(erase).is_err(),
+                "the erase committed over a version it never saw"
+            );
+            assert_eq!(versions(&mut db), 2, "both versions stay reachable");
+        } else {
+            db.commit_transaction(erase).expect("the erase commits");
+            db.commit_transaction(insert)
+                .expect("an insert into an emptied pair is admissible");
+            assert_eq!(versions(&mut db), 1, "only the inserted version is left");
+        }
+    }
+}
+
+/// REDIRECT EDGES moves every edge of its source it found. An edge attached to
+/// the source by a transaction that committed after the redirect read it is
+/// one the redirect never moved: committing the redirect after it would leave
+/// an edge on the source that a redirect committed later promised to move.
+#[test]
+fn a_redirect_is_refused_for_an_edge_it_never_saw() {
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE (a:U {tag: 'a'})-[:R]->(:U {tag: 'x'}), (:U {tag: 'b'}), (:U {tag: 'c'})",
+    )
+    .expect("seed");
+    let redirect = db.begin_transaction();
+    db.execute_in_transaction(
+        redirect,
+        "MATCH (a:U {tag: 'a'}), (b:U {tag: 'b'}) REDIRECT EDGES FROM a TO b",
+        None,
+    )
+    .expect("move a's one edge to b");
+    db.execute_cypher("MATCH (a:U {tag: 'a'}), (c:U {tag: 'c'}) CREATE (c)-[:R]->(a)")
+        .expect("an edge reaches a after the redirect read it");
+    assert!(
+        db.commit_transaction(redirect).is_err(),
+        "the redirect committed without the edge it never saw"
+    );
+    let on_a = db
+        .execute_cypher("MATCH (:U {tag: 'a'})-[r]-() RETURN r")
+        .expect("read a's edges")
+        .len();
+    assert_eq!(on_a, 2, "a keeps both its edges");
+}
+
+/// A redirect bounded to one edge type promises only that type: a newcomer of
+/// that type refuses it, a newcomer of another type does not.
+#[test]
+fn a_type_filtered_redirect_answers_only_for_its_types() {
+    for (newcomer, refused) in [("R", true), ("S", false)] {
+        let mut db = open_db();
+        db.execute_cypher(
+            "CREATE (a:U {tag: 'a'})-[:R]->(:U {tag: 'x'}), (:U {tag: 'b'}), \
+             (c:U {tag: 'c'})-[:S]->(:U {tag: 'y'})",
+        )
+        .expect("seed both types");
+        let redirect = db.begin_transaction();
+        db.execute_in_transaction(
+            redirect,
+            "MATCH (a:U {tag: 'a'}), (b:U {tag: 'b'}) \
+             REDIRECT EDGES FROM a TO b WHERE type(r) IN ['R']",
+            None,
+        )
+        .expect("move a's R edges to b");
+        db.execute_cypher(&format!(
+            "MATCH (a:U {{tag: 'a'}}), (c:U {{tag: 'c'}}) CREATE (c)-[:{newcomer}]->(a)"
+        ))
+        .expect("an edge reaches a after the redirect read it");
+        assert_eq!(
+            db.commit_transaction(redirect).is_err(),
+            refused,
+            "a {newcomer} newcomer"
+        );
+    }
+}
+
+/// A DETACH DELETE removes the edges it found; an edge of a type that did not
+/// exist yet, committed to the node after the delete read it, is one it never
+/// found. The delete is refused rather than leaving that edge dangling, and a
+/// DETACH with no such newcomer still commits its own removals.
+#[test]
+fn a_detach_delete_is_refused_for_an_edge_it_never_saw() {
+    let mut db = open_db();
+    db.execute_cypher("CREATE (a:P {name: 'a'})-[:R]->(b:P {name: 'b'}), (:P {name: 'c'})")
+        .expect("seed");
+    let delete = db.begin_transaction();
+    db.execute_in_transaction(delete, "MATCH (n:P {name: 'a'}) DETACH DELETE n", None)
+        .expect("detach a and its one edge");
+    db.execute_cypher("MATCH (a:P {name: 'a'}), (c:P {name: 'c'}) CREATE (c)-[:S]->(a)")
+        .expect("an edge of a new type reaches a");
+    assert!(
+        db.commit_transaction(delete).is_err(),
+        "the detach committed without the edge it never saw"
+    );
+    let a_edges = db
+        .execute_cypher("MATCH (n:P {name: 'a'})-[r]-() RETURN r")
+        .expect("read a's edges")
+        .len();
+    assert_eq!(a_edges, 2, "a and both its edges stay");
+
+    let again = db.begin_transaction();
+    db.execute_in_transaction(again, "MATCH (n:P {name: 'a'}) DETACH DELETE n", None)
+        .expect("detach a with every edge it now has");
+    db.commit_transaction(again)
+        .expect("a detach that saw every edge commits");
+    let left = db
+        .execute_cypher("MATCH ()-[r]->() RETURN r")
+        .expect("read edges")
+        .len();
+    assert_eq!(left, 0, "no edge is left pointing at a");
+}

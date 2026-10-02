@@ -35,6 +35,18 @@ impl RegistryEntry {
         self.ttl_ms != 0 && now_ms.saturating_sub(self.last_heartbeat_ts_ms) > self.ttl_ms
     }
 
+    /// The first instant (ms) at which [`Self::is_expired`] holds, or `None`
+    /// for a registration that never expires.
+    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
+        if self.ttl_ms == 0 {
+            return None;
+        }
+        // An instant past the clock's range is never reached.
+        self.last_heartbeat_ts_ms
+            .checked_add(self.ttl_ms)?
+            .checked_add(1)
+    }
+
     /// Serialize to the replicated msgpack wire form.
     pub(crate) fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         rmp_serde::to_vec(self)

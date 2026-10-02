@@ -627,9 +627,6 @@ pub struct StorageConfig {
     /// Default: 4.
     pub max_sealed_memtables: usize,
 
-    /// Flush monitor polling interval in milliseconds. Default: 50ms.
-    pub flush_poll_interval_ms: u64,
-
     /// Maximum age (in seconds) of a non-empty active memtable before it is
     /// rotated regardless of size. Bounds the worst-case window during which
     /// committed mutations may live in volatile memory only — critical at low
@@ -648,9 +645,6 @@ pub struct StorageConfig {
     /// L0 run count above which a partition is assigned Urgent compaction priority.
     /// When L0 exceeds this threshold, a write stall is imminent. Default: 8.
     pub compaction_l0_urgent_threshold: usize,
-
-    /// Compaction monitor polling interval in milliseconds. Default: 200ms.
-    pub compaction_poll_interval_ms: u64,
 
     /// Write-backpressure thresholds fed to every partition tree. The
     /// engine never sleeps on the resulting verdict: the slowdown tier
@@ -919,11 +913,9 @@ impl StorageConfig {
             cache: TieredCacheConfig::default(),
             flush_workers: 2,
             max_sealed_memtables: 4,
-            flush_poll_interval_ms: 50,
             max_memtable_age_secs: 30,
             compaction_workers: 2,
             compaction_l0_urgent_threshold: 8,
-            compaction_poll_interval_ms: 200,
             backpressure: BackpressureLimits::default(),
             oplog_segment_max_bytes: 64 * 1024 * 1024,
             oplog_segment_max_entries: 50_000,

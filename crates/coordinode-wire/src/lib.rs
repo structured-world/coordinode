@@ -40,8 +40,11 @@ pub mod tls;
 static WIRE_CLIENT_TLS: OnceLock<ClientTlsConfig> = OnceLock::new();
 
 /// Install the outbound inter-node client TLS config. Call once at startup,
-/// before any peer connection is opened; later calls are ignored.
+/// before any peer connection is opened; later calls are ignored. tonic builds
+/// the rustls config from the process default provider, so the selected one
+/// is installed here when no default exists yet.
 pub fn set_wire_client_tls(config: ClientTlsConfig) {
+    tls::ensure_default_provider();
     let _ = WIRE_CLIENT_TLS.set(config);
 }
 

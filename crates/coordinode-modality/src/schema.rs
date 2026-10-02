@@ -16,8 +16,9 @@
 //! valid revision number, …).
 
 use coordinode_core::schema::definition::{
-    EdgeTypeSchema, LabelSchema, encode_edge_type_current_revision_key,
-    encode_edge_type_schema_key, encode_label_current_revision_key, encode_label_schema_key,
+    EDGE_TYPE_SCHEMA_KEY_PREFIX, EdgeTypeSchema, LabelSchema, decode_edge_type_schema_key_name,
+    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    encode_label_current_revision_key, encode_label_schema_key,
 };
 use coordinode_storage::Guard;
 use coordinode_storage::engine::batch::WriteBatch;
@@ -203,17 +204,6 @@ pub trait SchemaStore {
     fn list_edge_type_names_engine(&self) -> StoreResult<Vec<String>>;
 }
 
-/// Extract the edge-type name from a `schema:edge_type:<name>:<version>` key.
-/// Names cannot contain ':' (DDL grammar), so the rightmost ':' splits name
-/// from version.
-fn edge_type_name_from_key(key: &[u8]) -> Option<String> {
-    const PREFIX: &[u8] = b"schema:edge_type:";
-    let suffix = key.get(PREFIX.len()..)?;
-    let suffix_str = std::str::from_utf8(suffix).ok()?;
-    let (name, _version) = suffix_str.rsplit_once(':')?;
-    Some(name.to_string())
-}
-
 /// CE single-shard implementation of [`SchemaStore`]. Operates
 /// directly on a [`StorageEngine`]. Reads use point gets; writes use
 /// a two-op [`WriteBatch`] for revision-body + pointer atomicity.
@@ -273,6 +263,17 @@ impl<'a> LocalSchemaStore<'a> {
             })?;
         Ok(Some(u64::from_be_bytes(array)))
     }
+}
+
+/// State that `txn` makes `revision` the schema of `label` (`0` removes it).
+fn claim_activation(txn: &mut Transaction, label: &str, revision: u64) {
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
+    let generation = txn.schema_generation();
+    txn.claim(Claim::new(
+        ClaimScope::LabelSchema(label.to_string()),
+        ClaimPredicate::SchemaActivated { revision },
+        generation,
+    ));
 }
 
 impl SchemaStore for LocalSchemaStore<'_> {
@@ -428,10 +429,20 @@ impl SchemaStore for LocalSchemaStore<'_> {
         name: &str,
     ) -> StoreResult<Option<LabelSchema>> {
         let pointer_key = encode_label_current_revision_key(name);
+        // A schema this attempt staged itself is covered by its own
+        // activation; one it read from the store is what its writes are
+        // validated under, and has to still be there when they land.
+        let own_pointer = txn.buffered(Partition::Schema, &pointer_key).is_some();
         let Some(revision) = Self::load_revision_pointer_txn(txn, &pointer_key, "label")? else {
+            if !own_pointer {
+                txn.note_label_schema_read(name, 0);
+            }
             return Ok(None);
         };
         let schema_key = encode_label_schema_key(name, revision);
+        if !own_pointer && txn.buffered(Partition::Schema, &schema_key).is_none() {
+            txn.note_label_schema_read(name, revision);
+        }
         let Some(schema_bytes) = txn.get(Partition::Schema, &schema_key)? else {
             return Err(StoreError::Decode {
                 kind: "label schema",
@@ -491,6 +502,9 @@ impl SchemaStore for LocalSchemaStore<'_> {
         // A definition changed, so predicates other attempts evaluated under
         // the old one stop counting as evidence once this lands.
         txn.note_schema_change();
+        // The new schema governs the nodes already stored, and the commit
+        // checks them against it with no write under the old one beside it.
+        claim_activation(txn, &schema.name, schema.schema_revision);
         Ok(())
     }
 
@@ -498,6 +512,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         let pointer_key = encode_label_current_revision_key(name);
         txn.delete(Partition::Schema, &pointer_key)?;
         txn.note_schema_change();
+        claim_activation(txn, name, 0);
         Ok(())
     }
 
@@ -546,12 +561,11 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn list_edge_type_names(&self, txn: &mut Transaction) -> StoreResult<Vec<String>> {
-        const PREFIX: &[u8] = b"schema:edge_type:";
         let mut types: Vec<String> = Vec::new();
-        for (k, _) in txn.prefix_scan(Partition::Schema, PREFIX)? {
-            if let Some(name) = edge_type_name_from_key(&k) {
-                if !types.contains(&name) {
-                    types.push(name);
+        for (k, _) in txn.prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)? {
+            if let Some(name) = decode_edge_type_schema_key_name(&k) {
+                if !types.iter().any(|t| t == name) {
+                    types.push(name.to_string());
                 }
             }
         }
@@ -559,13 +573,15 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn list_edge_type_names_engine(&self) -> StoreResult<Vec<String>> {
-        const PREFIX: &[u8] = b"schema:edge_type:";
         let mut types: Vec<String> = Vec::new();
-        for guard in self.engine.prefix_scan(Partition::Schema, PREFIX)? {
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, EDGE_TYPE_SCHEMA_KEY_PREFIX)?
+        {
             let (k, _) = guard.into_inner()?;
-            if let Some(name) = edge_type_name_from_key(&k) {
-                if !types.contains(&name) {
-                    types.push(name);
+            if let Some(name) = decode_edge_type_schema_key_name(&k) {
+                if !types.iter().any(|t| t == name) {
+                    types.push(name.to_string());
                 }
             }
         }

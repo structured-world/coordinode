@@ -25,10 +25,10 @@ use coordinode_storage::engine::core::StorageEngine;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RegistryTuning {
     /// Heartbeat coalescing window in milliseconds (`registry_heartbeat_ms`).
-    /// `None` keeps the default 100 ms.
-    pub heartbeat_window_ms: Option<u64>,
-    /// TTL-eviction sweep interval in milliseconds (`registry_eviction_ms`).
     /// `None` keeps the default 1000 ms.
+    pub heartbeat_window_ms: Option<u64>,
+    /// Shortest gap between TTL-eviction sweeps in milliseconds
+    /// (`registry_eviction_ms`). `None` keeps the default 1000 ms.
     pub eviction_interval_ms: Option<u64>,
 }
 

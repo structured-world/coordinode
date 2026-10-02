@@ -30,7 +30,7 @@ use coordinode_core::index::encoding::{
     decode_node_id, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
     legacy_index_prefix, unique_index_prefix,
 };
-use coordinode_core::txn::proposal::{DerivedIndexWork, DerivedSource, Mutation, PartitionId};
+use coordinode_core::txn::proposal::{Mutation, PartitionId};
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -119,18 +119,6 @@ pub trait IndexStore {
         txn: &mut Transaction,
         index: &IndexDefinition,
     ) -> StoreResult<Vec<NodeId>>;
-
-    /// The mutations removing the entries of `node_id` holding `values`, for
-    /// a writer that deletes nodes by submitting mutations directly (the TTL
-    /// reaper). The node is being deleted, so its entries go unconditionally:
-    /// as deletes for a RESOLVED index, as sealed work for a DERIVED one.
-    fn entry_delete_mutations(
-        &self,
-        index: &IndexDefinition,
-        field_of: &dyn Fn(&str) -> Option<u32>,
-        values: &[Value],
-        node_id: NodeId,
-    ) -> Vec<Mutation>;
 
     /// The mutations removing every entry of the index `name`, of both
     /// shapes: one range tombstone each.
@@ -456,36 +444,6 @@ impl IndexStore for LocalIndexStore<'_> {
             }
         }
         Ok(out)
-    }
-
-    fn entry_delete_mutations(
-        &self,
-        index: &IndexDefinition,
-        field_of: &dyn Fn(&str) -> Option<u32>,
-        values: &[Value],
-        node_id: NodeId,
-    ) -> Vec<Mutation> {
-        match index.maintenance.profile {
-            IndexProfile::Resolved => membership_effects(
-                &index.name,
-                index.unique,
-                node_id.as_raw(),
-                Some(values),
-                None,
-            )
-            .into_iter()
-            .map(|effect| Mutation::Delete {
-                partition: PartitionId::Idx,
-                key: effect.key,
-            })
-            .collect(),
-            IndexProfile::Derived => vec![Mutation::Derive(DerivedIndexWork {
-                binding: index.binding(field_of),
-                node_id: node_id.as_raw(),
-                old: Some(values.to_vec()),
-                new: DerivedSource::Values(None),
-            })],
-        }
     }
 
     fn clear_mutations(&self, name: &str) -> Vec<Mutation> {

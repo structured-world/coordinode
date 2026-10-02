@@ -16,21 +16,16 @@
 //! rebuild of every index from the store.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_query::index::{BuildTarget, BuildToken, VectorBuild, VectorIndexRegistry};
-use coordinode_storage::engine::applied::{AppliedEvent, AppliedSubscription};
+use coordinode_storage::engine::applied::{AppliedEvent, AppliedStop, AppliedSubscription};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashSet;
-
-/// How long the worker waits for an entry before checking whether it should
-/// stop.
-const IDLE_POLL: Duration = Duration::from_millis(50);
 
 /// Most applied entries folded together, bounding how long one fold keeps
 /// the indexes' write locks busy.
@@ -40,6 +35,8 @@ const BATCH: usize = 256;
 /// the Raft entries applied on this node.
 pub struct VectorIndexWorker {
     stop: BuildToken,
+    /// Ends the worker's wait for the next applied entry.
+    applied_stop: AppliedStop,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -56,6 +53,7 @@ impl VectorIndexWorker {
         shard_id: u16,
     ) -> Self {
         let stop = registry.new_build_token();
+        let applied_stop = applied.stopper();
         let worker = Worker {
             engine,
             applied,
@@ -69,7 +67,11 @@ impl VectorIndexWorker {
             .spawn(move || worker.run())
             .map_err(|e| tracing::error!(error = %e, "could not start the vector index worker"))
             .ok();
-        Self { stop, handle }
+        Self {
+            stop,
+            applied_stop,
+            handle,
+        }
     }
 
     /// Signal the worker to stop and wait for it to exit. A rebuild in
@@ -80,6 +82,7 @@ impl VectorIndexWorker {
 
     fn stop_and_join(&mut self) {
         self.stop.cancel();
+        self.applied_stop.stop();
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
                 tracing::error!("the vector index worker panicked");
@@ -110,7 +113,8 @@ impl Worker {
     fn run(self) {
         tracing::info!("vector index worker started");
         while !self.stop.is_cancelled() {
-            let Some(first) = self.applied.next(IDLE_POLL) else {
+            // Asleep until an entry applies or the worker is stopped.
+            let Some(first) = self.applied.next(None) else {
                 continue;
             };
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();

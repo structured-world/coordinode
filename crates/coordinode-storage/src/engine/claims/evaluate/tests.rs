@@ -48,6 +48,50 @@ fn bound(node_id: u64, at_most: Option<u32>, at_least: Option<u32>) -> Claim {
     )
 }
 
+/// An adjacency posting that does not decode is an error, never an empty
+/// set: read as empty it would confirm an observed absence and an unchanged
+/// incident set that the stored data may well contradict.
+#[test]
+fn a_posting_that_does_not_decode_decides_nothing() {
+    let (engine, _d) = engine();
+    let key = encode_adj_key_forward("AT", node(1));
+    engine
+        .put(Partition::Adj, &key, &[0xFF, 0xFE, 0xFD])
+        .expect("store bytes that are not a posting");
+    let no_points = HashMap::new();
+    let view = engine.snapshot();
+
+    let absent = Claim::new(
+        ClaimScope::Pair {
+            source: node(1),
+            target: node(2),
+            edge_type: "AT".to_string(),
+        },
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        GEN,
+    );
+    assert!(
+        evaluate(&engine, &absent, &[], &no_points, view).is_err(),
+        "an unreadable posting confirmed an absence"
+    );
+
+    let scan = Claim::new(
+        ClaimScope::Incident {
+            node: node(1),
+            edge_type: "AT".to_string(),
+            direction: Direction::Outgoing,
+        },
+        ClaimPredicate::IncidentSetComplete,
+        GEN,
+    );
+    assert!(
+        evaluate(&engine, &scan, &[], &no_points, view).is_err(),
+        "an unreadable posting confirmed an unchanged set"
+    );
+}
+
 /// An upper bound is decided against the neighbours actually stored.
 #[test]
 fn an_upper_bound_is_decided_against_stored_adjacency() {
@@ -498,25 +542,160 @@ fn a_cleanup_condition_is_broken_by_a_renewal_of_the_record() {
     );
 }
 
-/// A predicate evaluated under one schema generation is no evidence about the
-/// graph under another: activating a constraint between the evaluation and
-/// the commit changes what the same shape means.
-#[test]
-fn schema_applicability_is_broken_by_a_definition_change() {
-    let (engine, _d) = engine();
-    let claim = Claim::new(
-        ClaimScope::SchemaElement("OWNS".to_string()),
-        ClaimPredicate::SchemaApplicability,
-        engine.schema_generation(),
-    );
-    assert_eq!(decide(&engine, &claim, &[]), Verdict::Holds);
+/// Store `schema` as `label`'s current schema, the way DDL publishes it.
+fn store_label_schema(
+    engine: &StorageEngine,
+    schema: &coordinode_core::schema::definition::LabelSchema,
+) {
+    use coordinode_core::schema::definition::{
+        encode_label_current_revision_key, encode_label_schema_key,
+    };
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_schema_key(&schema.name, schema.schema_revision),
+            &schema.to_msgpack().expect("encode schema"),
+        )
+        .expect("schema body");
+    engine
+        .put(
+            Partition::Schema,
+            &encode_label_current_revision_key(&schema.name),
+            &schema.schema_revision.to_be_bytes(),
+        )
+        .expect("schema pointer");
+}
 
-    engine.note_schema_change();
-    assert_eq!(
-        decide(&engine, &claim, &[]),
-        Verdict::Broken,
-        "a background scan alone would not close this activation race"
+fn schema_claim(label: &str, predicate: ClaimPredicate) -> Claim {
+    Claim::new(ClaimScope::LabelSchema(label.to_string()), predicate, GEN)
+}
+
+/// A write validated under the schema it read stays admissible only while
+/// that schema is in force: a new revision breaks it, and so does a property
+/// edited in place at the same revision.
+#[test]
+fn a_schema_read_is_broken_by_any_change_of_the_schema() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+
+    let (engine, _d) = engine();
+    let mut schema = LabelSchema::new_node_id("Doc");
+    store_label_schema(&engine, &schema);
+    let read = schema_claim(
+        "Doc",
+        ClaimPredicate::SchemaRead {
+            revision: schema.schema_revision,
+        },
     );
+    let no_points = HashMap::new();
+    let view = engine.snapshot();
+    let at_view =
+        |engine: &StorageEngine| evaluate(engine, &read, &[], &no_points, view).expect("evaluate");
+    assert_eq!(at_view(&engine), Verdict::Holds);
+
+    schema.add_property(PropertyDef::new("title", PropertyType::String).not_null());
+    engine
+        .put(
+            Partition::Schema,
+            &coordinode_core::schema::definition::encode_label_schema_key(
+                "Doc",
+                schema.schema_revision,
+            ),
+            &schema.to_msgpack().expect("encode"),
+        )
+        .expect("edit in place");
+    assert_eq!(
+        at_view(&engine),
+        Verdict::Broken,
+        "a property edited at the same revision changed what the write was validated against"
+    );
+}
+
+/// A label that had no schema when the write read it gains one: the write
+/// was validated against nothing the new schema promises.
+#[test]
+fn a_schema_read_of_an_undeclared_label_is_broken_by_its_declaration() {
+    use coordinode_core::schema::definition::LabelSchema;
+
+    let (engine, _d) = engine();
+    let read = schema_claim("Doc", ClaimPredicate::SchemaRead { revision: 0 });
+    let no_points = HashMap::new();
+    let view = engine.snapshot();
+    assert_eq!(
+        evaluate(&engine, &read, &[], &no_points, view).expect("evaluate"),
+        Verdict::Holds
+    );
+    store_label_schema(&engine, &LabelSchema::new_node_id("Doc"));
+    assert_eq!(
+        evaluate(&engine, &read, &[], &no_points, view).expect("evaluate"),
+        Verdict::Broken
+    );
+}
+
+/// An activation answers for every stored node of its primary label: one that
+/// breaks the new schema refuses it, nodes of other labels do not count, and
+/// the schema it checks against is the one the attempt stages.
+#[test]
+fn an_activation_is_decided_by_the_stored_nodes_of_its_label() {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::schema::definition::{LabelSchema, SchemaMode, encode_label_schema_key};
+
+    let (engine, _d) = engine();
+    let mut staged_schema = LabelSchema::new_node_id("Doc");
+    staged_schema.set_mode(SchemaMode::Strict);
+    staged_schema.schema_revision = 2;
+    let mut points = HashMap::new();
+    points.insert(
+        (
+            Partition::Schema,
+            encode_label_schema_key("Doc", staged_schema.schema_revision),
+        ),
+        Some(staged_schema.to_msgpack().expect("encode")),
+    );
+    let activation = schema_claim("Doc", ClaimPredicate::SchemaActivated { revision: 2 });
+    let decide_with = |engine: &StorageEngine, points: &HashMap<_, _>| {
+        evaluate(engine, &activation, &[], points, engine.snapshot()).expect("evaluate")
+    };
+
+    // A node with no properties satisfies STRICT; one of another label with
+    // an undeclared property is not this label's concern.
+    let bare = NodeRecord::with_labels(vec!["Doc".to_string()]);
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(0, node(1)),
+            &bare.to_msgpack().expect("encode"),
+        )
+        .expect("bare node");
+    let mut other = NodeRecord::with_labels(vec!["User".to_string(), "Doc".to_string()]);
+    other.set_extra("x", coordinode_core::graph::types::Value::Int(1));
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(0, node(2)),
+            &other.to_msgpack().expect("encode"),
+        )
+        .expect("node of another primary label");
+    assert_eq!(decide_with(&engine, &points), Verdict::Holds);
+
+    // An undeclared property on a node of the label breaks STRICT.
+    let mut loose = NodeRecord::with_labels(vec!["Doc".to_string()]);
+    loose.set_extra("x", coordinode_core::graph::types::Value::Int(1));
+    engine
+        .put(
+            Partition::Node,
+            &encode_node_key(0, node(3)),
+            &loose.to_msgpack().expect("encode"),
+        )
+        .expect("loose node");
+    assert_eq!(decide_with(&engine, &points), Verdict::Broken);
+}
+
+/// Removing a label's schema admits every node, whatever they hold.
+#[test]
+fn removing_a_schema_admits_every_node() {
+    let (engine, _d) = engine();
+    let removal = schema_claim("Doc", ClaimPredicate::SchemaActivated { revision: 0 });
+    assert_eq!(decide(&engine, &removal, &[]), Verdict::Holds);
 }
 
 /// What this evaluator is not given evidence for, it refuses to decide, and

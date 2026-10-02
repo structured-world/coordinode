@@ -67,14 +67,20 @@ fn respond(
     }
 }
 
+/// Sets the gauges whose value is only meaningful when sampled, right before
+/// `/metrics` renders them: a scrape samples them, and nothing samples them
+/// between scrapes.
+pub(crate) type SampleGauges = Arc<dyn Fn() + Send + Sync>;
+
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
-/// Handles /health, /ready, /metrics; `/ready` follows `readiness`. Runs
-/// until the process exits.
+/// Handles /health, /ready, /metrics; `/ready` follows `readiness`, and
+/// `/metrics` runs `sample` first. Runs until the process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
+    sample: SampleGauges,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install Prometheus metrics recorder
     let prometheus_handle = PrometheusBuilder::new()
@@ -98,6 +104,7 @@ pub(crate) async fn start_ops_server(
         };
 
         let handle = prometheus_handle.clone();
+        let sample = Arc::clone(&sample);
         let ready = readiness.get();
 
         tokio::spawn(async move {
@@ -116,7 +123,10 @@ pub(crate) async fn start_ops_server(
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/");
 
-            let (status, content_type, body) = respond(path, ready, || handle.render());
+            let (status, content_type, body) = respond(path, ready, || {
+                sample();
+                handle.render()
+            });
 
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

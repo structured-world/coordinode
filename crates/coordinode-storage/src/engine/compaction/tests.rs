@@ -30,9 +30,9 @@ fn compaction_scheduler_starts_and_stops() {
         Arc::clone(&gc_watermark),
         1,                       // 1 worker
         8,                       // l0_urgent_threshold
-        50,                      // poll interval ms
         64 * 1024 * 1024 * 1024, // debt_urgent_bytes
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        Arc::new(Wake::default()),
     )
     .expect("start CompactionScheduler");
 
@@ -129,9 +129,9 @@ fn compaction_scheduler_no_panic_with_l0_data() {
         Arc::clone(&gc_watermark),
         1,
         8,
-        20, // fast poll for test
         64 * 1024 * 1024 * 1024,
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        Arc::new(Wake::default()),
     )
     .expect("start CompactionScheduler");
 
@@ -149,9 +149,9 @@ fn compaction_scheduler_multiple_workers_no_panic() {
         Arc::clone(&gc_watermark),
         4, // 4 workers
         8,
-        10, // fast poll
         64 * 1024 * 1024 * 1024,
         Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        Arc::new(Wake::default()),
     )
     .expect("start CompactionScheduler");
 

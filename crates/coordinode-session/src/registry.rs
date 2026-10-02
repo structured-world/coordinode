@@ -143,6 +143,17 @@ impl SessionRegistry {
         }
         reaped
     }
+
+    /// When the earliest open transaction becomes eligible for
+    /// [`Self::reap_idle`], or `None` when no transaction is open.
+    pub fn next_idle_deadline(&self) -> Option<Instant> {
+        self.sessions
+            .read()
+            .values()
+            .flat_map(|entry| entry.transactions.values())
+            .map(|t| t.last_activity + self.idle_timeout)
+            .min()
+    }
 }
 
 impl OperationsView for SessionRegistry {

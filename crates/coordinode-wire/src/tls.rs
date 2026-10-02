@@ -4,10 +4,16 @@
 //! certificate material, with optional mutual TLS. The crypto provider is
 //! chosen once at startup: the stock server picks the pure-Rust
 //! [`rustls_rustcrypto`] one (no C FFI), and a downstream distribution
-//! may select another, `aws-lc-rs` being the reason the seam exists. Every
-//! builder here pins the selected provider explicitly via `*_with_provider`
-//! rather than reading rustls' process default, so a stray `install_default`
-//! elsewhere in the process cannot change what the wire negotiates.
+//! may select another, `aws-lc-rs` being the reason the seam exists.
+//!
+//! The wire itself runs tonic's own TLS, which builds its rustls configs
+//! from rustls' process default provider: [`install_crypto_provider`] makes
+//! the selection that default, and [`crate::set_wire_client_tls`] installs
+//! the selected provider (the pure-Rust one unless something was selected)
+//! when no default exists yet, so a process that dials peers without having
+//! run the server's startup still negotiates with the selected provider
+//! rather than with whichever backend a dependency's features enabled. The
+//! builders here pin the selected provider explicitly via `*_with_provider`.
 //!
 //! Encryption is server-cert TLS on the shared `:7080` listener (covers
 //! client-to-server and intra-cluster TLS); mutual TLS is opt-in — pass a client
@@ -77,6 +83,15 @@ pub fn install_crypto_provider(provider: Arc<CryptoProvider>) -> bool {
 /// selected nothing (a unit test building a config directly, say).
 fn provider() -> Arc<CryptoProvider> {
     SELECTED.get_or_init(rustcrypto_provider).clone()
+}
+
+/// Make the selected provider rustls' process default unless one is already
+/// installed, so a TLS config built from the default (tonic's) uses it.
+pub(crate) fn ensure_default_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // A concurrent installer may win the race; either way a default exists.
+        let _ = provider().as_ref().clone().install_default();
+    }
 }
 
 /// Parse one or more PEM certificates into DER.

@@ -57,6 +57,127 @@ fn at_least_one() -> ClaimPredicate {
     }
 }
 
+/// Erasing every instance of a pair, and with the last one its adjacency,
+/// against writing a new instance into it: the erase enumerated the instances
+/// without the new one, so admitting both leaves an instance no adjacency
+/// reaches.
+#[test]
+fn erasing_a_pair_and_writing_an_instance_into_it_cannot_both_be_admitted() {
+    let erase = set(vec![Claim::new(
+        pair(1, 2, "AT"),
+        ClaimPredicate::PairInstancesComplete,
+        GEN,
+    )]);
+    let write = set(vec![Claim::new(
+        pair(1, 2, "AT"),
+        ClaimPredicate::PairInstanceWritten,
+        GEN,
+    )]);
+    assert!(!erase.compatible_with(&write));
+    assert!(!write.compatible_with(&erase));
+}
+
+/// Two writers of instances into one pair do not depend on each other, and
+/// two erasers of it agree on what they leave, so neither pair queues.
+#[test]
+fn writers_of_one_pair_and_erasers_of_one_pair_coexist() {
+    let written = Claim::new(pair(1, 2, "AT"), ClaimPredicate::PairInstanceWritten, GEN);
+    assert!(set(vec![written.clone()]).compatible_with(&set(vec![written])));
+    let erased = Claim::new(pair(1, 2, "AT"), ClaimPredicate::PairInstancesComplete, GEN);
+    assert!(set(vec![erased.clone()]).compatible_with(&set(vec![erased])));
+}
+
+/// A writer of an instance breaks the absence a MERGE built its creation on;
+/// it does not break an observation of presence.
+#[test]
+fn an_instance_write_breaks_an_observed_absence_only() {
+    let write = set(vec![Claim::new(
+        pair(1, 2, "AT"),
+        ClaimPredicate::PairInstanceWritten,
+        GEN,
+    )]);
+    let absent = set(vec![Claim::new(
+        pair(1, 2, "AT"),
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+        GEN,
+    )]);
+    let present = set(vec![Claim::new(
+        pair(1, 2, "AT"),
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Present,
+        },
+        GEN,
+    )]);
+    assert!(!write.compatible_with(&absent));
+    assert!(write.compatible_with(&present));
+}
+
+/// Referencing a node and changing the membership of one of its pairs are
+/// separate conditions. If they were not, every edge written to a popular
+/// node would queue behind every other pair change on it.
+#[test]
+fn an_endpoint_reference_does_not_conflict_with_pair_membership_on_it() {
+    let alive = set(vec![Claim::new(
+        ClaimScope::Node(node(1)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    )]);
+    for predicate in [
+        ClaimPredicate::PairInstanceWritten,
+        ClaimPredicate::PairInstancesComplete,
+        ClaimPredicate::PairAdjacency {
+            observed: Adjacency::Absent,
+        },
+    ] {
+        let membership = set(vec![Claim::new(pair(1, 3, "AT"), predicate, GEN)]);
+        assert!(alive.compatible_with(&membership));
+        assert!(membership.compatible_with(&alive));
+    }
+}
+
+/// Destroying a node still excludes every pair change on it: the pair's
+/// endpoint is what is going away.
+#[test]
+fn destroying_a_node_excludes_writing_an_instance_of_its_pair() {
+    let destroyed = set(vec![Claim::new(
+        ClaimScope::Node(node(1)),
+        ClaimPredicate::EndpointDestroyed,
+        GEN,
+    )]);
+    let write = set(vec![Claim::new(
+        pair(3, 1, "AT"),
+        ClaimPredicate::PairInstanceWritten,
+        GEN,
+    )]);
+    assert!(!destroyed.compatible_with(&write));
+}
+
+/// An enumeration of the incident set and a bound over it are both changed by
+/// erasing a pair inside it, as they are by writing an instance into one.
+#[test]
+fn pair_changes_reach_the_incident_claims_of_both_ends() {
+    for predicate in [
+        ClaimPredicate::PairInstanceWritten,
+        ClaimPredicate::PairInstancesComplete,
+    ] {
+        let change = set(vec![Claim::new(pair(1, 2, "AT"), predicate, GEN)]);
+        let scan = set(vec![Claim::new(
+            incident(2, "AT", Direction::Incoming),
+            ClaimPredicate::IncidentSetComplete,
+            GEN,
+        )]);
+        let bound = set(vec![Claim::new(
+            incident(1, "AT", Direction::Outgoing),
+            at_most_one(),
+            GEN,
+        )]);
+        assert!(!change.compatible_with(&scan));
+        assert!(!change.compatible_with(&bound));
+    }
+}
+
 /// Two additions under an at-most-one bound. Each sees zero edges and each is
 /// admissible alone; together they are two.
 #[test]
@@ -420,6 +541,53 @@ fn an_attempt_with_no_claims_blocks_nothing() {
     assert!(empty.compatible_with(&busy));
     assert!(busy.compatible_with(&empty));
     assert!(empty.first_conflict(&busy).is_none());
+}
+
+fn label_schema(name: &str, predicate: ClaimPredicate) -> ClaimSet {
+    set(vec![Claim::new(
+        ClaimScope::LabelSchema(name.to_string()),
+        predicate,
+        GEN,
+    )])
+}
+
+/// Writers of one label do not queue behind each other, whichever revision
+/// each of them read.
+#[test]
+fn writers_under_one_label_schema_coexist() {
+    let a = label_schema("Doc", ClaimPredicate::SchemaRead { revision: 3 });
+    let b = label_schema("Doc", ClaimPredicate::SchemaRead { revision: 3 });
+    let stale = label_schema("Doc", ClaimPredicate::SchemaRead { revision: 2 });
+    assert!(a.compatible_with(&b));
+    assert!(a.compatible_with(&stale));
+}
+
+/// An activation and a write validated under the schema it replaces cannot
+/// both land: the activation's check of the stored nodes would miss the
+/// write, and the write was admitted by a rule no longer in force. Stated
+/// both ways, since either can arrive first.
+#[test]
+fn an_activation_excludes_writers_of_its_label() {
+    let ddl = label_schema("Doc", ClaimPredicate::SchemaActivated { revision: 4 });
+    let writer = label_schema("Doc", ClaimPredicate::SchemaRead { revision: 3 });
+    assert!(!ddl.compatible_with(&writer));
+    assert!(!writer.compatible_with(&ddl));
+}
+
+/// Two activations of one label cannot both become its schema.
+#[test]
+fn two_activations_of_one_label_conflict() {
+    let a = label_schema("Doc", ClaimPredicate::SchemaActivated { revision: 4 });
+    let b = label_schema("Doc", ClaimPredicate::SchemaActivated { revision: 4 });
+    assert!(!a.compatible_with(&b));
+}
+
+/// A schema change of one label leaves writers of every other label alone.
+#[test]
+fn an_activation_leaves_other_labels_alone() {
+    let ddl = label_schema("Doc", ClaimPredicate::SchemaActivated { revision: 4 });
+    let other = label_schema("User", ClaimPredicate::SchemaRead { revision: 1 });
+    assert!(ddl.compatible_with(&other));
 }
 
 /// The same condition stated twice by two statements of one attempt is one

@@ -13,7 +13,7 @@ coordinode-storage = { workspace = true }
 crossbeam-epoch = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
-smallvec = { version = "1.13", features = ["serde", "union"] }
+smallvec = { version = "1.16", features = ["serde", "union"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }

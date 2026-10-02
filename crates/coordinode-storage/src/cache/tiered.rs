@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use coordinode_core::txn::wake::Wake;
 use tracing::{debug, info, warn};
 
 use crate::engine::partition::Partition;
@@ -562,6 +563,9 @@ pub struct TieredCache {
     layers: Arc<Vec<CacheLayer>>,
     /// Shutdown flag for background compaction thread.
     shutdown: Arc<AtomicBool>,
+    /// The compaction thread sleeps on this between passes; the drop
+    /// interrupts it.
+    wake: Arc<Wake>,
     /// Background compaction thread handle.
     compaction_thread: Option<std::thread::JoinHandle<()>>,
     /// Per-label eviction priority weights. Used by `resolve_weight()`.
@@ -571,6 +575,7 @@ pub struct TieredCache {
 impl Drop for TieredCache {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.wake.interrupt();
         if let Some(handle) = self.compaction_thread.take() {
             let _ = handle.join();
         }
@@ -590,17 +595,19 @@ impl TieredCache {
         let layer_count = layers.len();
         let layers = Arc::new(layers);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Wake::default());
 
         let compaction_thread = if config.compaction_interval_secs > 0 && !layers.is_empty() {
             let layers_ref = Arc::clone(&layers);
             let shutdown_ref = Arc::clone(&shutdown);
+            let wake_ref = Arc::clone(&wake);
             let interval = Duration::from_secs(config.compaction_interval_secs);
 
             Some(
                 std::thread::Builder::new()
                     .name("cache-compaction".to_string())
                     .spawn(move || {
-                        Self::compaction_loop(&layers_ref, &shutdown_ref, interval);
+                        Self::compaction_loop(&layers_ref, &shutdown_ref, &wake_ref, interval);
                     })
                     .map_err(std::io::Error::other)?,
             )
@@ -617,6 +624,7 @@ impl TieredCache {
         Ok(Self {
             layers,
             shutdown,
+            wake,
             compaction_thread,
             label_weights,
         })
@@ -724,22 +732,30 @@ impl TieredCache {
     }
 
     /// Background compaction loop. Runs on a dedicated thread.
-    fn compaction_loop(layers: &[CacheLayer], shutdown: &AtomicBool, interval: Duration) {
+    fn compaction_loop(
+        layers: &[CacheLayer],
+        shutdown: &AtomicBool,
+        wake: &Wake,
+        interval: Duration,
+    ) {
         debug!(
             interval_secs = interval.as_secs(),
             "background cache compaction started"
         );
+        wake.bind();
 
         while !shutdown.load(Ordering::Relaxed) {
-            // Sleep in small increments to respond to shutdown quickly
-            let mut elapsed = Duration::ZERO;
-            let tick = Duration::from_millis(500);
-            while elapsed < interval {
+            // Asleep for the whole interval; the drop interrupts it.
+            let deadline = std::time::Instant::now() + interval;
+            loop {
                 if shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                std::thread::sleep(tick.min(interval - elapsed));
-                elapsed += tick;
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                wake.wait(Some(deadline - now));
             }
 
             if shutdown.load(Ordering::Relaxed) {

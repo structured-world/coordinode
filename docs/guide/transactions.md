@@ -148,6 +148,8 @@ So every mutation states the conditions its result depends on, and the server ch
 
 Conditions that agree do not exclude each other. Any number of transactions may attach edges to one node at the same time: they all state that the node keeps its identity, which is compatible with itself, so a popular node does not serialise the writes that reference it. Only a mutation that destroys the identity excludes them.
 
+The exclusion holds in both orders. An edge attached to a node another transaction is deleting is refused when the deletion committed first, and the deletion is refused when the edge committed first: the deleting transaction decided on the edges it saw, and an edge that reached the node after it read them is one it never accounted for. This applies to `DETACH DELETE` too, for an edge of any type, including a type that did not exist when it read the node, so no edge is ever left pointing at a node that is gone.
+
 ## Durability
 
 A write concern is two independent parameters, as in MongoDB. `w` says how many members of the replica group must hold the write before the caller is answered; `journal` says what state each of those members holds it in.

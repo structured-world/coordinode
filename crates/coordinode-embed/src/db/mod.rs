@@ -449,6 +449,9 @@ pub struct Database {
     /// Set by the server from the `--interactive-txn-max-bytes` flag (passed
     /// via `COORDINODE_EXTRA_ARGS` in `/etc/coordinode/coordinode.conf`).
     max_interactive_txn_bytes: usize,
+    /// Called after an interactive transaction opens, so an idle reaper with
+    /// nothing to reap can sleep until there is something.
+    interactive_begun: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A query whose parse + analyze + logical-plan-build succeeded, kept
@@ -1053,6 +1056,7 @@ impl Database {
                 1, // shard_id
                 ttl_reaper_config,
                 Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
+                Arc::clone(&oracle),
                 Arc::clone(&pipeline),
                 Arc::clone(&proposal_id_gen),
             ))
@@ -1110,6 +1114,7 @@ impl Database {
             next_txn_id: AtomicU64::new(0),
             interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
+            interactive_begun: None,
         };
         // A store that owns its log rebuilds its legacy-layout indexes now; a
         // cluster member does it once it leads, since the rebuild is written
@@ -1806,7 +1811,16 @@ impl Database {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, (state, Instant::now()));
+        if let Some(begun) = &self.interactive_begun {
+            begun();
+        }
         id
+    }
+
+    /// Call `begun` after every interactive transaction opens. The server's
+    /// idle reaper uses it to sleep while no transaction is open.
+    pub fn set_interactive_begun_hook(&mut self, begun: Arc<dyn Fn() + Send + Sync>) {
+        self.interactive_begun = Some(begun);
     }
 
     /// Run one statement of an interactive transaction.
@@ -2038,14 +2052,19 @@ impl Database {
     /// Drop interactive transactions idle longer than `timeout`. An open
     /// transaction pins an MVCC snapshot and buffers writes in memory, so an
     /// abandoned one would leak retention and leader memory. Called
-    /// opportunistically on `begin`; the server also runs it on a timer, so
-    /// reaping does not wait for the next `begin`.
-    pub fn reap_idle_transactions(&self, timeout: Duration) {
+    /// opportunistically on `begin`; the server's reaper also runs it at the
+    /// returned instant, so reaping does not wait for the next `begin`.
+    ///
+    /// Returns when the earliest transaction still open becomes idle for
+    /// `timeout`, or `None` when none is open.
+    pub fn reap_idle_transactions(&self, timeout: Duration) -> Option<Instant> {
         let now = Instant::now();
-        self.interactive_txns
+        let mut txns = self
+            .interactive_txns
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|_, (_, touched)| now.duration_since(*touched) < timeout);
+            .unwrap_or_else(|p| p.into_inner());
+        txns.retain(|_, (_, touched)| now.duration_since(*touched) < timeout);
+        txns.values().map(|(_, touched)| *touched + timeout).min()
     }
 
     /// Default idle timeout for an open interactive transaction.
@@ -3019,10 +3038,6 @@ impl Database {
         &mut self,
         schema: coordinode_core::schema::definition::LabelSchema,
     ) -> Result<u64, DatabaseError> {
-        use coordinode_core::schema::definition::{
-            encode_label_current_revision_key, encode_label_schema_key,
-        };
-
         // 1. The unique indexes first: a schema that declares a property
         //    unique is published only once the index enforcing it exists.
         let label_name = schema.name.clone();
@@ -3044,20 +3059,34 @@ impl Database {
             )?;
         }
 
-        // 2. Publish the schema. Version-prefixed key carries the immutable
-        //    snapshot; the current_revision pointer names the active one.
-        //    Both travel in one proposal, so no member ever holds a pointer
-        //    to a revision it does not have, and a crash keeps both or
-        //    neither.
-        let key = encode_label_schema_key(&schema.name, schema.schema_revision);
-        let bytes = schema
-            .to_msgpack()
-            .map_err(|e| DatabaseError::Other(format!("serialize label schema: {e}")))?;
-        let pointer_key = encode_label_current_revision_key(&schema.name);
-        self.publish_schema(vec![
-            Self::schema_put(key, bytes),
-            Self::schema_put(pointer_key, schema.schema_revision.to_be_bytes().to_vec()),
-        ])?;
+        // 2. Publish the schema in one transaction: the version-prefixed body
+        //    and the current_revision pointer land together, and the commit
+        //    checks every stored node of the label against the schema with
+        //    no write validated under the previous one beside it. A schema
+        //    the stored nodes break is refused, not published.
+        let wc = self.write_concern;
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
+            write_concern: &wc,
+            pipeline: Some(self.pipeline.as_ref()),
+            id_gen: Some(&self.proposal_id_gen),
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        let mut txn = coordinode_storage::engine::transaction::Transaction::begin(
+            &self.engine,
+            Some(&self.oracle),
+            self.oracle.next(),
+        );
+        {
+            use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+            LocalSchemaStore::new(&self.engine).save_label_txn(&mut txn, &schema)?;
+        }
+        txn.commit(&commit_ctx).map_err(|e| {
+            DatabaseError::Semantic(format!(
+                "schema for label '{}' not published: {e}",
+                schema.name
+            ))
+        })?;
 
         Ok(schema.schema_revision)
     }

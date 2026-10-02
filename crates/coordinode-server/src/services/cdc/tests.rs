@@ -58,6 +58,7 @@ async fn subscribe_registers_then_unregisters_cdc_consumer() {
         registry.clone(),
         super::DEFAULT_CONSUMER_TTL_MS,
         Arc::new(|| 0),
+        None,
     );
 
     // No oplog exists, so the stream is empty (caught up immediately)
@@ -81,12 +82,10 @@ async fn subscribe_registers_then_unregisters_cdc_consumer() {
         "subscribe must register exactly one cdc oplog_events consumer, got {consumers:?}"
     );
 
-    // Dropping the response drops the receiver stream; the tailing task notices
-    // the closed channel on its next poll and unregisters.
+    // Dropping the response drops the receiver stream; the waiting task sees
+    // the channel close and unregisters, without waiting for a heartbeat.
     drop(response);
 
-    // Poll interval is 100ms; give the task several cycles to observe the
-    // disconnect and release the registration.
     let mut released = false;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -120,6 +119,7 @@ async fn subscribe_refuses_a_token_it_cannot_resume() {
         registry.clone(),
         super::DEFAULT_CONSUMER_TTL_MS,
         Arc::new(|| 0),
+        None,
     );
 
     for (token, what) in [
@@ -161,12 +161,12 @@ async fn subscribe_refuses_a_token_it_cannot_resume() {
     );
 }
 
-/// An idle stream heartbeats once per poll, so a poll interval that reaches
+/// A waiting stream heartbeats at its interval, so an interval that reaches
 /// the consumer TTL would let a connected reader expire; the tuning refuses it.
 #[test]
-fn a_poll_interval_must_be_shorter_than_the_consumer_ttl() {
+fn a_heartbeat_interval_must_be_shorter_than_the_consumer_ttl() {
     let at = |ms| super::CdcStreamTuning {
-        poll_interval: Duration::from_millis(ms),
+        heartbeat_interval: Duration::from_millis(ms),
         ..super::CdcStreamTuning::default()
     };
     assert!(at(100).check(30_000).is_ok());
@@ -206,9 +206,10 @@ async fn a_slow_reader_is_not_evicted() {
         registry.clone(),
         ttl_ms,
         Arc::new(|| 300),
+        None,
     )
     .with_tuning(super::CdcStreamTuning {
-        poll_interval: Duration::from_millis(50),
+        heartbeat_interval: Duration::from_millis(50),
         batch_size: std::num::NonZeroUsize::new(256).expect("nonzero"),
     });
     let mut stream = service
@@ -287,12 +288,14 @@ async fn stream_sends_only_applied_entries() {
 
     let applied = Arc::new(AtomicU64::new(3));
     let frontier = Arc::clone(&applied);
+    let (applies, changes) = tokio::sync::watch::channel(0u64);
     let service = ChangeEventServiceImpl::new(
         0,
         vec![oplog_dir.path().to_path_buf()],
         registry,
         super::DEFAULT_CONSUMER_TTL_MS,
         Arc::new(move || frontier.load(Ordering::Acquire)),
+        Some(changes),
     );
     let mut stream = service
         .subscribe(Request::new(SubscribeRequest {
@@ -315,7 +318,10 @@ async fn stream_sends_only_applied_entries() {
         "entries 3 and 4 are not applied yet"
     );
 
+    // The stream sleeps until an apply is signalled; the default heartbeat
+    // (10 s) is far beyond the wait below, so only the signal can wake it.
     applied.store(5, Ordering::Release);
+    applies.send(5).expect("stream listens");
     assert_eq!(
         next_index(&mut stream, Duration::from_secs(5)).await,
         Some(3)
@@ -343,6 +349,7 @@ async fn filtered_stream_advances_its_checkpoint() {
         registry.clone(),
         super::DEFAULT_CONSUMER_TTL_MS,
         Arc::new(|| 5),
+        None,
     );
     let mut stream = service
         .subscribe(Request::new(SubscribeRequest {

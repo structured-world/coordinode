@@ -76,8 +76,9 @@ pub enum ClaimScope {
     /// One record addressed by its storage key, for a condition that names a
     /// particular row rather than a graph shape.
     Record(Vec<u8>),
-    /// One schema element, named by the label or edge type it defines.
-    SchemaElement(String),
+    /// The schema of one node label: what a node whose primary label it is
+    /// must satisfy.
+    LabelSchema(String),
 }
 
 /// What a claim asserts about its scope.
@@ -107,6 +108,14 @@ pub enum ClaimPredicate {
         /// The state the attempt observed and needs to still hold.
         observed: Adjacency,
     },
+    /// The attempt writes an instance of the pair. It depends on nothing
+    /// about the pair; it is stated so that an erase which enumerated the
+    /// pair's instances without this one is not admitted beside it.
+    PairInstanceWritten,
+    /// The attempt removed every instance of the pair it enumerated, and
+    /// with the last one the pair's adjacency. Its result depends on no
+    /// instance having joined the pair since.
+    PairInstancesComplete,
     /// The attempt enumerated the complete incident set of its scope and its
     /// result depends on nothing having been added to it since. This is what
     /// protects a scan against a member it never saw.
@@ -118,9 +127,22 @@ pub enum ClaimPredicate {
         /// The version the condition was evaluated against.
         observed_version: u64,
     },
-    /// The predicate was evaluated under this schema element as it stood, and
-    /// a change of the element changes what is admissible.
-    SchemaApplicability,
+    /// The attempt validated its writes under the label's schema as it stood
+    /// at this revision (`0` when the label had none). Writers do not depend
+    /// on each other; a schema that changed since the read admits different
+    /// writes.
+    SchemaRead {
+        /// The revision the attempt read.
+        revision: u64,
+    },
+    /// The attempt makes this revision the label's schema (`0` removes it).
+    /// Its result depends on every stored node of the label satisfying the
+    /// new schema, so no write validated under the old one may land beside
+    /// it.
+    SchemaActivated {
+        /// The revision being activated.
+        revision: u64,
+    },
 }
 
 /// Whether a pair was seen as adjacent.
@@ -180,8 +202,8 @@ impl Claim {
     }
 
     /// One direction of the compatibility question. Called both ways by
-    /// [`Self::compatible_with`], so each arm only has to state the cases it
-    /// knows about from its own side.
+    /// [`Self::compatible_with`], so a refusing arm only has to state its own
+    /// side, while an admitting arm has to hold from both.
     fn predicates_compatible(a: &ClaimPredicate, b: &ClaimPredicate) -> bool {
         use ClaimPredicate::*;
         match (a, b) {
@@ -194,6 +216,16 @@ impl Claim {
             // it, including one taken a moment ago.
             (EndpointDestroyed, EndpointAlive | EndpointDestroyed) => false,
 
+            // That a node keeps its identity and what the membership of one
+            // of its pairs is are separate conditions; tying them would queue
+            // every edge written to a popular node behind every pair change on
+            // it. Destroying the node is what excludes pair changes, above.
+            // Stated from both sides because both directions must agree.
+            (EndpointAlive, PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete)
+            | (PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete, EndpointAlive) => {
+                true
+            }
+
             // Two attempts that both change what a bound counts decide the
             // same predicate, and only one of them can be right about the
             // post-state it validated against.
@@ -202,7 +234,27 @@ impl Claim {
             // A bound counts the adjacency a pair claim is about, and an
             // enumeration of the incident set is what a bound is computed
             // from, so neither can be decided without the other.
-            (CardinalityBound { .. }, PairAdjacency { .. } | IncidentSetComplete) => false,
+            (
+                CardinalityBound { .. },
+                PairAdjacency { .. }
+                | PairInstanceWritten
+                | PairInstancesComplete
+                | IncidentSetComplete,
+            ) => false,
+
+            // Writers of instances into one pair do not depend on each other,
+            // and erasers of one pair agree on what they leave.
+            (PairInstanceWritten, PairInstanceWritten) => true,
+            (PairInstancesComplete, PairInstancesComplete) => true,
+
+            // An erase enumerated the instances without the one being
+            // written, so the written one would be left with no adjacency.
+            (PairInstancesComplete, PairInstanceWritten) => false,
+
+            // A written instance makes the pair adjacent: it breaks an
+            // observed absence and agrees with an observed presence.
+            (PairInstanceWritten, PairAdjacency { observed })
+            | (PairAdjacency { observed }, PairInstanceWritten) => *observed == Adjacency::Present,
 
             // Two attempts that observed the pair the same way agree about
             // it, and agreeing is not a conflict: two insertions of one edge
@@ -214,15 +266,28 @@ impl Claim {
 
             // A scan that enumerated the set is invalidated by anything that
             // changes membership, including a member it never saw.
-            (IncidentSetComplete, IncidentSetComplete | PairAdjacency { .. }) => false,
+            (
+                IncidentSetComplete,
+                IncidentSetComplete
+                | PairAdjacency { .. }
+                | PairInstanceWritten
+                | PairInstancesComplete,
+            ) => false,
 
             // The condition was evaluated against one version of the record;
             // any other claim on that record can have moved it.
             (CleanupCondition { .. }, _) | (_, CleanupCondition { .. }) => false,
 
-            // Changing the element changes what every predicate evaluated
-            // under it means.
-            (SchemaApplicability, _) | (_, SchemaApplicability) => false,
+            // Writes validated under one schema do not depend on each other,
+            // whichever revision each read: a stale read is refused by its
+            // own evaluation, not by its neighbours.
+            (SchemaRead { .. }, SchemaRead { .. }) => true,
+
+            // An activation validates the stored nodes under the new schema;
+            // a write validated under the old one in flight beside it would
+            // land unseen by that validation and unbound by the new rule.
+            // Two activations of one label cannot both be the current one.
+            (SchemaActivated { .. }, SchemaRead { .. } | SchemaActivated { .. }) => false,
 
             // An overlap this function does not recognise is not permission
             // to proceed.
@@ -267,7 +332,7 @@ impl ClaimScope {
                 },
             ) => s1 == s2 && g1 == g2 && t1 == t2,
             (Record(a), Record(b)) => a == b,
-            (SchemaElement(a), SchemaElement(b)) => a == b,
+            (LabelSchema(a), LabelSchema(b)) => a == b,
 
             // A pair's edge is incident to both its endpoints, so it is
             // inside the incident scope of either one under the same type
@@ -310,8 +375,8 @@ impl ClaimScope {
                 n == source || n == target
             }
 
-            // A schema element reaches the shapes it defines only through the
-            // generation carried on each claim, which is compared separately.
+            // A label's schema governs the nodes of the label, and the
+            // writes to them state that through their own schema claim.
             _ => false,
         }
     }
