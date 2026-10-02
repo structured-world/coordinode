@@ -73,3 +73,29 @@ fn an_unlabelled_temporal_target_is_found() {
 fn an_unlabelled_temporal_target_is_found_over_a_temporal_edge() {
     assert_every_form_finds_the_edge(true);
 }
+
+/// A fan-out large enough for the parallel target path finds unlabelled
+/// temporal targets too: the parallel reader hands the targets it finds no
+/// plain record for to the sequential one, which reads their versions.
+#[test]
+fn an_unlabelled_temporal_target_is_found_on_the_parallel_path() {
+    let mut db = Database::open_in_memory().expect("open");
+    for statement in [
+        "CREATE NODE TYPE T TEMPORAL",
+        "ALTER LABEL T SET SCHEMA FLEXIBLE",
+        "CREATE (:Src {k: 1})",
+        "UNWIND range(1, 40) AS i CREATE (:T {i: i, valid_from: 1})",
+        "UNWIND range(1, 40) AS i CREATE (:P {i: i})",
+        "MATCH (s:Src), (t:T) CREATE (s)-[:E]->(t)",
+        "MATCH (s:Src), (p:P) CREATE (s)-[:E]->(p)",
+    ] {
+        db.execute_cypher(statement).expect(statement);
+    }
+    db.set_adaptive_parallel_threshold(8);
+    assert_eq!(
+        rows(&mut db, "MATCH (s:Src)-[:E]->(t) RETURN t"),
+        80,
+        "the 40 temporal and the 40 plain targets"
+    );
+    assert_eq!(rows(&mut db, "MATCH (s:Src)-[:E*1..1]->(t) RETURN t"), 80);
+}

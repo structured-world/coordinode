@@ -530,14 +530,17 @@ pub(crate) fn dispatch_scalar_function(
             }
         }
         "labels" => {
-            // labels(n) → list of label strings for a node.
-            // The executor stores primary label as `n.__label__` in the row.
-            // CoordiNode nodes currently have exactly one label.
+            // labels(n) → every label of the node. The executor binds a
+            // multi-label node's labels as `n.__labels__` and every node's
+            // primary label as `n.__label__`.
             if let Some(var) = first_arg_var {
-                let key = format!("{var}.__label__");
-                match row.get(&key) {
-                    Some(Value::String(l)) => Value::Array(vec![Value::String(l.clone())]),
-                    _ => Value::Array(vec![]),
+                if let Some(all @ Value::Array(_)) = row.get(&format!("{var}.__labels__")) {
+                    all.clone()
+                } else {
+                    match row.get(&format!("{var}.__label__")) {
+                        Some(Value::String(l)) => Value::Array(vec![Value::String(l.clone())]),
+                        _ => Value::Array(vec![]),
+                    }
                 }
             } else {
                 Value::Array(vec![])

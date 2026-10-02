@@ -4149,8 +4149,37 @@ fn execute_node_scan(
     Ok(results)
 }
 
-/// The row a node scan produces for `record`, or `None` when the record has
-/// none of `labels` or fails one of the inline `property_filters`.
+/// Bind `var`'s label columns for `record` and return its primary label:
+/// `var.__label__` always, and `var.__labels__` with every label when the
+/// node has more than one (what `labels()` reads; a single-label node pays
+/// no extra column).
+fn insert_label_columns(row: &mut Row, var: &str, record: &NodeRecord) -> String {
+    let primary = record.primary_label().to_string();
+    row.insert(format!("{var}.__label__"), Value::String(primary.clone()));
+    if record.labels.len() > 1 {
+        row.insert(
+            format!("{var}.__labels__"),
+            Value::Array(record.labels.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    primary
+}
+
+/// [`insert_label_columns`] for a row that already binds `var` to a node
+/// whose labels just changed: a list left from before is dropped first.
+fn refresh_label_columns(row: &mut Row, var: &str, record: &NodeRecord) {
+    row.remove(&format!("{var}.__labels__"));
+    insert_label_columns(row, var, record);
+}
+
+/// Whether `record` carries every label of a pattern: `(n:A:B)` is a node
+/// labelled both A and B. An empty pattern list matches any node.
+fn has_all_labels(record: &NodeRecord, labels: &[String]) -> bool {
+    labels.iter().all(|l| record.has_label(l))
+}
+
+/// The row a node scan produces for `record`, or `None` when the record
+/// lacks one of `labels` or fails one of the inline `property_filters`.
 fn node_row_if_matching(
     variable: &str,
     labels: &[String],
@@ -4159,7 +4188,7 @@ fn node_row_if_matching(
     property_filters: &[(String, crate::plan::expr::Expr)],
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Option<Row>, ExecutionError> {
-    if !labels.is_empty() && !labels.iter().any(|l| record.has_label(l)) {
+    if !has_all_labels(record, labels) {
         return Ok(None);
     }
 
@@ -4176,11 +4205,7 @@ fn node_row_if_matching(
             row.insert(format!("{variable}.{name}"), value.clone());
         }
     }
-    let primary_label = record.primary_label().to_string();
-    row.insert(
-        format!("{variable}.__label__"),
-        Value::String(primary_label.clone()),
-    );
+    let primary_label = insert_label_columns(&mut row, variable, record);
     inject_computed_properties(&mut row, variable, &primary_label, ctx);
 
     // Inline property filters. Inside a correlated join (e.g. `UNWIND ... AS
@@ -4537,11 +4562,7 @@ fn execute_btree_index_scan(
             }
         }
 
-        let primary_label = record.primary_label().to_string();
-        row.insert(
-            format!("{variable}.__label__"),
-            Value::String(primary_label.clone()),
-        );
+        let primary_label = insert_label_columns(&mut row, variable, &record);
 
         inject_computed_properties(&mut row, variable, &primary_label, ctx);
 
@@ -4672,11 +4693,7 @@ fn execute_hnsw_scan(
                 row.insert(format!("{binding}.{name}"), value.clone());
             }
         }
-        let primary_label = record.primary_label().to_string();
-        row.insert(
-            format!("{binding}.__label__"),
-            Value::String(primary_label.clone()),
-        );
+        let primary_label = insert_label_columns(&mut row, binding, &record);
         inject_computed_properties(&mut row, binding, &primary_label, ctx);
 
         if let Some(alias) = distance_alias {
@@ -4915,8 +4932,7 @@ fn build_target_rows(
     // then apply the edge-property fan-out + filter pipeline below.
     let mut materialised_rows: Vec<Row> = Vec::with_capacity(target_records.len());
     for (target_record, valid_from_opt) in target_records {
-        // Label filter
-        if !target_labels.is_empty() && !target_labels.iter().any(|l| target_record.has_label(l)) {
+        if !has_all_labels(&target_record, target_labels) {
             continue;
         }
 
@@ -4936,11 +4952,7 @@ fn build_target_rows(
             }
         }
 
-        let target_label = target_record.primary_label().to_string();
-        out_row.insert(
-            format!("{target_variable}.__label__"),
-            Value::String(target_label.clone()),
-        );
+        let target_label = insert_label_columns(&mut out_row, target_variable, &target_record);
 
         // Re-surface valid_from from the key suffix so callers
         // always see a non-null binding even if the stored property map
@@ -5127,11 +5139,16 @@ struct ParallelCtx<'a> {
 /// keys are collected into the `Mutex<Vec>` for the caller to merge into
 /// `ExecutionContext::occ_scope` via `OccScope::extend` after the
 /// parallel block completes.
+///
+/// A target with no plain record is pushed to `unresolved` rather than
+/// dropped: it may be a temporal node the pattern does not label, whose
+/// versions only the sequential path reads.
 fn process_targets_parallel(
     neighbors: &[(u64, u64, usize)],
     input_row: &Row,
     params: &TraverseParams<'_>,
     pctx: &ParallelCtx<'_>,
+    unresolved: &Mutex<Vec<(u64, u64, usize)>>,
 ) -> Result<Vec<Row>, EvalError> {
     let target_variable = params.target_variable;
     let target_labels = params.target_labels;
@@ -5154,7 +5171,12 @@ fn process_targets_parallel(
                 let (target_key, bytes) = LocalNodeStore
                     .read_at_snapshot(pctx.engine, pctx.mvcc_snapshot, pctx.shard_id, target_id)
                     .ok()?;
-                let bytes = bytes?;
+                let Some(bytes) = bytes else {
+                    if let Ok(mut guard) = unresolved.lock() {
+                        guard.push((*src_uid, *tgt_uid, *et_idx));
+                    }
+                    return None;
+                };
 
                 // Track the node key in the OCC read-set: each worker records
                 // into the shared accumulator; merged into the statement's
@@ -5167,10 +5189,7 @@ fn process_targets_parallel(
 
                 let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
 
-                // Label filter
-                if !target_labels.is_empty()
-                    && !target_labels.iter().any(|l| target_record.has_label(l))
-                {
+                if !has_all_labels(&target_record, target_labels) {
                     return None;
                 }
 
@@ -5194,11 +5213,8 @@ fn process_targets_parallel(
                     }
                 }
 
-                let target_label = target_record.primary_label().to_string();
-                out_row.insert(
-                    format!("{target_variable}.__label__"),
-                    Value::String(target_label.clone()),
-                );
+                let target_label =
+                    insert_label_columns(&mut out_row, target_variable, &target_record);
 
                 // Inject COMPUTED property values in parallel path
                 inject_computed_from_engine(
@@ -5371,7 +5387,9 @@ fn execute_single_hop_traverse(
                 .iter()
                 .map(|&(tgt, et_idx)| (src_raw, tgt, et_idx))
                 .collect();
-            let parallel_rows = process_targets_parallel(&with_src, row, params, &pctx)?;
+            let unresolved = Mutex::new(Vec::new());
+            let parallel_rows =
+                process_targets_parallel(&with_src, row, params, &pctx, &unresolved)?;
             // Merge OCC read keys from parallel workers into the Layer-3 scope
             // via the typed per-partition extends.
             if let Some(ref keys) = pctx.occ_read_keys {
@@ -5385,6 +5403,18 @@ fn execute_single_hop_traverse(
                 }
             }
             results.extend(parallel_rows);
+            // Targets with no plain record (temporal nodes the pattern does
+            // not label, or dangling edges) take the sequential path, which
+            // reads their versions.
+            for (_, target_uid, et_idx) in unresolved.into_inner().unwrap_or_default() {
+                let trp = TargetRowParams {
+                    input_row: row,
+                    target_uid,
+                    edge_type: params.edge_types.get(et_idx).map(|s| s.as_str()),
+                    edge_is_temporal: params.edge_temporal.get(et_idx).copied().unwrap_or(false),
+                };
+                results.extend(build_target_rows(&trp, params, ctx)?);
+            }
         } else {
             // Sequential path for normal fan-out
             for (target_uid, et_idx) in neighbors {
@@ -5685,7 +5715,9 @@ fn execute_varlen_traverse(
                     // at the default level, so nothing collects here either.
                     occ_read_keys: None,
                 };
-                let parallel_rows = process_targets_parallel(&depth_neighbors, row, params, &pctx)?;
+                let unresolved = Mutex::new(Vec::new());
+                let parallel_rows =
+                    process_targets_parallel(&depth_neighbors, row, params, &pctx, &unresolved)?;
                 // Merge OCC read keys from parallel workers into the Layer-3
                 // scope via the typed per-partition extends.
                 if let Some(ref keys) = pctx.occ_read_keys {
@@ -5699,6 +5731,24 @@ fn execute_varlen_traverse(
                     }
                 }
                 results.extend(parallel_rows);
+                // As at the single-hop site: targets with no plain record are
+                // read sequentially, versions included. The parallel path runs
+                // only without a path variable, so no route is bound here.
+                for (src_uid, tgt_uid, et_idx) in unresolved.into_inner().unwrap_or_default() {
+                    let mut hop_row = row.clone();
+                    hop_row.insert(params.source.to_string(), Value::Int(src_uid as i64));
+                    let trp = TargetRowParams {
+                        input_row: &hop_row,
+                        target_uid: tgt_uid,
+                        edge_type: params.edge_types.get(et_idx).map(|s| s.as_str()),
+                        edge_is_temporal: params
+                            .edge_temporal
+                            .get(et_idx)
+                            .copied()
+                            .unwrap_or(false),
+                    };
+                    results.extend(build_target_rows(&trp, params, ctx)?);
+                }
             } else {
                 for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
                     // For depth > 1 the source becomes an intermediate node, so
@@ -8746,10 +8796,7 @@ fn bind_path_element(
         Value::Int(raw) => {
             let node_id = NodeId::from_raw(*raw as u64);
             if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                scratch.insert(
-                    format!("{var}.__label__"),
-                    Value::String(record.primary_label().to_string()),
-                );
+                insert_label_columns(scratch, var, &record);
                 for (field_id, value) in &record.props {
                     if let Some(name) = ctx.interner.resolve(*field_id) {
                         scratch.insert(format!("{var}.{name}"), value.clone());
@@ -9216,54 +9263,18 @@ fn execute_upsert(
                 let mut current_row = row.clone();
                 for element in elements {
                     if let PatternElement::Node(np) = element {
-                        let node_id = ctx.id_allocator.next()?;
-                        let label = np.labels.first().cloned().unwrap_or_default();
-
-                        let mut record = NodeRecord::new(&label);
-                        let names: Vec<&str> =
-                            np.properties.iter().map(|(n, _)| n.as_str()).collect();
-                        let field_ids = ctx.field_ids(&names)?;
-                        for ((_, expr), field_id) in np.properties.iter().zip(field_ids) {
-                            let val = eval_neutral(expr, &current_row)?;
-                            record.set(field_id, val);
-                        }
-
-                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
-                        ctx.write_stats.nodes_created += 1;
-                        ctx.stat_node_created(&record);
-
-                        // Fire BEFORE COMMIT CREATE triggers on the new
-                        // node's label. UPSERT's ON CREATE branch is
-                        // logically `CREATE (n:Label {…})`; users expect
-                        // the same trigger semantics as a hand-written
-                        // CREATE.
-                        if !label.is_empty() {
-                            let mut props_map: std::collections::HashMap<String, Value> =
-                                std::collections::HashMap::with_capacity(np.properties.len());
-                            for (name, expr) in np.properties.iter() {
-                                let val = eval_neutral(expr, row)?.map_to_document();
-                                props_map.insert(name.clone(), val);
-                            }
-                            let trigger_params =
-                                trigger_params_for_node_create(node_id, &props_map);
-                            let target_segment =
-                                coordinode_core::schema::triggers::TriggerTargetSchema::label(
-                                    label.clone(),
-                                )
-                                .index_key_segment();
-                            let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
-                            if !matched.is_empty() {
-                                fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
-                            }
-                        }
-
-                        let var_name = np.variable.as_deref().unwrap_or("_");
-                        current_row
-                            .insert(var_name.to_string(), Value::Int(node_id.as_raw() as i64));
-                        current_row.insert(format!("{var_name}.__label__"), Value::String(label));
-                        for (prop_name, expr) in &np.properties {
-                            let val = eval_neutral(expr, row)?;
-                            current_row.insert(format!("{var_name}.{prop_name}"), val);
+                        // UPSERT's ON CREATE branch is a CREATE of the
+                        // pattern node: every label, the schema checks, the
+                        // index entries and the CREATE triggers of each label.
+                        let created = execute_create_node(
+                            std::slice::from_ref(&current_row),
+                            Some(np.variable.as_deref().unwrap_or("_")),
+                            &np.labels,
+                            &np.properties,
+                            ctx,
+                        )?;
+                        if let Some(created_row) = created.into_iter().next() {
+                            current_row = created_row;
                         }
                     }
                 }
@@ -9392,60 +9403,10 @@ fn execute_create_from_pattern(
                 }
             }
 
-            let node_id = ctx.id_allocator.next()?;
-            let label = labels.first().cloned().unwrap_or_default();
-
-            let mut record = NodeRecord::new(&label);
-            let empty_row = Row::new();
-            let names: Vec<&str> = property_filters.iter().map(|(n, _)| n.as_str()).collect();
-            let field_ids = ctx.field_ids(&names)?;
-            for ((_, expr), field_id) in property_filters.iter().zip(field_ids) {
-                let val = eval_neutral(expr, &empty_row)?;
-                record.set(field_id, val);
-            }
-
-            // Index entries, in the statement transaction; a unique value
-            // another node holds refuses the write.
-            ctx.index_node_created(node_id, &record)?;
-
-            ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
-            // MERGE-created nodes count like CREATE-created ones: the write
-            // stats callers surface and the statistics counters both see the
-            // new row (previously this creation went unreported).
-            ctx.write_stats.nodes_created += 1;
-            ctx.stat_node_created(&record);
-
-            // Fire BEFORE COMMIT CREATE triggers registered on the new
-            // node's label. This path is reached from MERGE (create branch)
-            // and from standalone MERGE relationship create when the
-            // endpoint node has to be invented; both must fire the same
-            // CREATE trigger as `execute_create_node`.
-            if !label.is_empty() {
-                let mut props_map: std::collections::HashMap<String, Value> =
-                    std::collections::HashMap::with_capacity(property_filters.len());
-                for (name, expr) in property_filters.iter() {
-                    let val = eval_neutral(expr, &empty_row)?.map_to_document();
-                    props_map.insert(name.clone(), val);
-                }
-                let trigger_params = trigger_params_for_node_create(node_id, &props_map);
-                let target_segment =
-                    coordinode_core::schema::triggers::TriggerTargetSchema::label(label.clone())
-                        .index_key_segment();
-                let matched = ctx.lookup_matching_triggers(&target_segment, "c")?;
-                if !matched.is_empty() {
-                    fire_before_commit_triggers(&matched, &trigger_params, ctx)?;
-                }
-            }
-
-            let mut row = Row::new();
-            row.insert(variable.to_string(), Value::Int(node_id.as_raw() as i64));
-            row.insert(format!("{variable}.__label__"), Value::String(label));
-            for (prop_name, expr) in property_filters {
-                let val = eval_neutral(expr, &Row::new())?;
-                row.insert(format!("{variable}.{prop_name}"), val);
-            }
-
-            Ok(vec![row])
+            // The node MERGE invents is a CREATE of its pattern node: every
+            // label, the schema checks, the index entries, the vector and
+            // text index writes, and the CREATE triggers of each label.
+            execute_create_node(&[Row::new()], Some(variable), labels, property_filters, ctx)
         }
         LogicalOp::Filter { input, .. } => {
             // If there's a filter wrapping a scan, use the inner scan for creation
@@ -9935,11 +9896,7 @@ fn execute_create_node(
         let mut row = input_row.clone();
         let var_name = variable.unwrap_or("_");
         row.insert(var_name.to_string(), Value::Int(node_id.as_raw() as i64));
-        let primary_label = record.primary_label().to_string();
-        row.insert(
-            format!("{var_name}.__label__"),
-            Value::String(primary_label),
-        );
+        insert_label_columns(&mut row, var_name, &record);
         for (prop_name, expr) in properties {
             let val = eval_neutral(expr, input_row)?;
             row.insert(format!("{var_name}.{prop_name}"), val);
@@ -11353,10 +11310,7 @@ fn execute_update(
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
-                        out_row.insert(
-                            format!("{variable}.__label__"),
-                            Value::String(record.primary_label().to_string()),
-                        );
+                        refresh_label_columns(&mut out_row, variable, &record);
                     }
                 }
             }
@@ -11651,11 +11605,8 @@ fn execute_remove(
                 // downstream RETURN sees the latest version, symmetric with
                 // the temporal SET path.
                 out_row.insert(format!("{var}.valid_from"), Value::Int(new_valid_from));
-                if new_record.primary_label() != closing_record.primary_label() {
-                    out_row.insert(
-                        format!("{var}.__label__"),
-                        Value::String(new_record.primary_label().to_string()),
-                    );
+                if new_record.labels != closing_record.labels {
+                    refresh_label_columns(&mut out_row, var, &new_record);
                 }
             }
         }
@@ -11774,10 +11725,7 @@ fn execute_remove(
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
-                        out_row.insert(
-                            format!("{variable}.__label__"),
-                            Value::String(record.primary_label().to_string()),
-                        );
+                        refresh_label_columns(&mut out_row, variable, &record);
                     }
                 }
             }
@@ -12507,10 +12455,8 @@ fn execute_merge_nodes(
                 row_with_refresh.insert(format!("{target_var}.{name}"), value.clone());
             }
         }
-        row_with_refresh.insert(
-            format!("{target_var}.__label__"),
-            Value::String(target_label.clone()),
-        );
+        // Stale columns were all dropped above, so the plain insert suffices.
+        insert_label_columns(&mut row_with_refresh, target_var, &target_rec);
 
         // The non-surviving variable's columns refer to a deleted node — drop
         // them so RETURN/WITH/WHERE never resolve them to stale values.

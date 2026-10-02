@@ -31,6 +31,7 @@ mod integration {
     mod interactive_txn;
     mod merge_stress;
     mod multi_endpoint;
+    mod multi_label;
     mod mvcc;
     mod mvcc_snapshots;
     mod oplog_placement;
