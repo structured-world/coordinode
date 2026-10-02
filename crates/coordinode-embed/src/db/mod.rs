@@ -3384,10 +3384,12 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// [`RestoreError::IdentifiersIssued`] when an identifier is already
-    /// issued here; [`RestoreError::UnfinishedLoad`] when an interrupted
-    /// restore of a different input holds part of this database;
-    /// [`RestoreError::Unsupported`] for a snapshot; otherwise a malformed or
+    /// [`RestoreError::IdentifiersIssued`](crate::backup::restore::RestoreError::IdentifiersIssued)
+    /// when an identifier is already issued here;
+    /// [`RestoreError::UnfinishedLoad`](crate::backup::restore::RestoreError::UnfinishedLoad)
+    /// when an interrupted restore of a different input holds part of this
+    /// database; [`RestoreError::Unsupported`](crate::backup::restore::RestoreError::Unsupported)
+    /// for a snapshot; otherwise a malformed or
     /// incompatible input, or a storage or lease failure.
     pub fn restore(
         &self,
