@@ -48,6 +48,10 @@ name = "hnsw_search"
 harness = false
 
 [[bench]]
+name = "hnsw_publication"
+harness = false
+
+[[bench]]
 name = "hnsw_parallel_search"
 harness = false
 

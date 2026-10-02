@@ -2270,6 +2270,70 @@ fn insert_batch_chunked_preserves_recall_vs_brute_force() {
     );
 }
 
+/// One large `insert_batch` must build a usable graph, not only chunked ones.
+/// Every plan of a batch is computed against the graph as it stood before
+/// the batch; when the batch dwarfs that graph (5k items over a 64-node
+/// seed), each new node links only to the seed and the graph degenerates
+/// into a star with near-zero recall. The batch must reach the same floor
+/// as the chunked build of the test above, on the same data.
+#[test]
+fn a_single_large_insert_batch_keeps_recall() {
+    let dim = 16usize;
+    let n_train = 5_000usize;
+    let n_query = 50usize;
+    let k = 10usize;
+    let cfg = HnswConfig {
+        m: 8,
+        m_max0: 16,
+        ef_construction: 100,
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        max_dimensions: dim as u32,
+        quantization: QuantizationCodec::None,
+        rerank_candidates: 64,
+        calibration_threshold: 100_000,
+        offload_vectors: false,
+        property_name: String::new(),
+        rerank_mode: RerankMode::Inline,
+        rerank_oversample_factor: 1.0,
+        alpha_pruning: 1.0,
+        max_elements: n_train as u32,
+    };
+    fn make_vec(i: u64, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|d| ((i * 31 + d as u64) as f32 * 0.13).sin())
+            .collect()
+    }
+
+    let mut idx = HnswIndex::new(cfg);
+    idx.insert_batch((0..n_train as u64).map(|i| (i, make_vec(i, dim))).collect());
+    assert_eq!(idx.len(), n_train);
+
+    let mut hits = 0u64;
+    let mut total = 0u64;
+    for q in (0..n_query).map(|i| (i * 73) as u64) {
+        let query = make_vec(q, dim);
+        let mut bf: Vec<(f32, u64)> = (0..n_train as u64)
+            .map(|i| {
+                (
+                    metrics::euclidean_distance_squared(&query, &make_vec(i, dim)),
+                    i,
+                )
+            })
+            .collect();
+        bf.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let gt: HashSet<u64> = bf.iter().take(k).map(|&(_, id)| id).collect();
+        let got: HashSet<u64> = idx.search(&query, k).into_iter().map(|r| r.id).collect();
+        hits += gt.intersection(&got).count() as u64;
+        total += k as u64;
+    }
+    let recall = hits as f64 / total as f64;
+    assert!(
+        recall >= 0.5,
+        "single-batch insert_batch recall {recall:.3} below floor 0.5"
+    );
+}
+
 #[test]
 fn insert_batch_below_threshold_runs_sequentially() {
     // Small batches (< 16 items) bypass rayon; the result must still

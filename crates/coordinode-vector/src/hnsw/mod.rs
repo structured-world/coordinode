@@ -1135,37 +1135,49 @@ impl HnswIndex {
                 None => break,
             }
         }
-        let remaining: Vec<(u64, Vec<f32>)> = iter.collect();
+        // Rounds of parallel planning and serial apply. Every plan sees the
+        // graph as it stood before its round, so a round larger than that
+        // graph links most of its items only to what came before: one 5k
+        // batch over the 64-node seed turned the graph into a star around
+        // the seed. A round therefore holds at most as many items as the
+        // graph already has (doubling from the seed), up to the batch size
+        // the staleness trade-off is measured at.
+        const MAX_ROUND: usize = 1024;
+        loop {
+            let round_len = self.nodes.len().clamp(BATCH_PARALLEL_THRESHOLD, MAX_ROUND);
+            let round: Vec<(u64, Vec<f32>)> = iter.by_ref().take(round_len).collect();
+            if round.is_empty() {
+                break;
+            }
+            let plans: Vec<(InsertPlan, Vec<f32>)> = if round.len() >= BATCH_PARALLEL_THRESHOLD {
+                use rayon::prelude::*;
+                round
+                    .into_par_iter()
+                    .map(|(id, vec)| {
+                        let plan = self.compute_insert_plan(id, &vec);
+                        (plan, vec)
+                    })
+                    .collect()
+            } else {
+                round
+                    .into_iter()
+                    .map(|(id, vec)| {
+                        let plan = self.compute_insert_plan(id, &vec);
+                        (plan, vec)
+                    })
+                    .collect()
+            };
 
-        // Parallel-plan, serial-apply for the remainder.
-        let plans: Vec<(InsertPlan, Vec<f32>)> = if remaining.len() >= BATCH_PARALLEL_THRESHOLD {
-            use rayon::prelude::*;
-            remaining
-                .into_par_iter()
-                .map(|(id, vec)| {
-                    let plan = self.compute_insert_plan(id, &vec);
-                    (plan, vec)
-                })
-                .collect()
-        } else {
-            remaining
-                .into_iter()
-                .map(|(id, vec)| {
-                    let plan = self.compute_insert_plan(id, &vec);
-                    (plan, vec)
-                })
-                .collect()
-        };
-
-        // The parallel apply path runs a post-batch prune-pass that
-        // backfills any back-edges dropped on capacity, so its resulting
-        // graph holds the batch recall contract (≥ 0.7 vs serial).
-        // Dispatch to it for large batches; sequential apply for small.
-        if plans.len() >= BATCH_PARALLEL_THRESHOLD {
-            self.apply_insert_plans_parallel(plans);
-        } else {
-            for (plan, vec) in plans {
-                self.apply_insert_plan(plan, vec);
+            // The parallel apply path runs a post-batch prune-pass that
+            // backfills any back-edges dropped on capacity, so its resulting
+            // graph holds the batch recall contract (≥ 0.7 vs serial).
+            // Dispatch to it for large rounds; sequential apply for small.
+            if plans.len() >= BATCH_PARALLEL_THRESHOLD {
+                self.apply_insert_plans_parallel(plans);
+            } else {
+                for (plan, vec) in plans {
+                    self.apply_insert_plan(plan, vec);
+                }
             }
         }
 
