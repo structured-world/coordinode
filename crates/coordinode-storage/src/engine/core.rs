@@ -2435,7 +2435,11 @@ impl StorageEngine {
     /// canonicalises each key to one final operation, so this marks an
     /// upstream bug rather than silently ordering the pair.
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
-        self.apply_proposal_covered(mutations, commit_ts, None)
+        self.apply_proposal_covered(mutations, commit_ts, None)?;
+        // A local commit has no log position; its subscribers follow it by
+        // commit timestamp.
+        self.applied_feed.applied(0, commit_ts, mutations);
+        Ok(())
     }
 
     /// Journal one committed proposal, then apply it at `commit_ts` together
@@ -2495,6 +2499,9 @@ impl StorageEngine {
             coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
         self.apply_effects_covered(&resolved, commit_ts, Some(mark))?;
         self.note_applied(coverage, index);
+        // Subscribers of an embedded engine follow its commits the way a
+        // cluster member's follow its applied log entries.
+        self.applied_feed.applied(index, commit_ts, mutations);
         Ok(())
     }
 
@@ -3188,12 +3195,14 @@ impl StorageEngine {
         Ok((tap, at))
     }
 
-    /// Follow the Raft entries applied to `partition` from now on, queueing
-    /// at most `capacity` events; see [`crate::engine::applied`].
+    /// Follow the commits applied to `partition` from now on, queueing at
+    /// most `capacity` events; see [`crate::engine::applied`].
     ///
-    /// Only entries the Raft state machine applies through
-    /// [`Self::apply_raft_proposal`] are reported, after they are in the
-    /// store; an engine without Raft reports nothing.
+    /// Reported, after they are in the store: the entries the Raft state
+    /// machine applies through [`Self::apply_raft_proposal`] (with their log
+    /// index), and the local commits of an engine without Raft through
+    /// [`Self::commit_journaled`] (with their journal index) or
+    /// [`Self::apply_proposal_at`] (with index 0).
     pub fn subscribe_applied(
         &self,
         partition: Partition,

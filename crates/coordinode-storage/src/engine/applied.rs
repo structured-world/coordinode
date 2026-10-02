@@ -1,4 +1,4 @@
-//! A feed of the Raft entries this node has applied.
+//! A feed of the commits this node has applied.
 //!
 //! State derived from the replicated data but kept outside it (a vector
 //! index's graph) has to follow the entries in the order they apply, and only
@@ -6,7 +6,9 @@
 //! committed is not in the store until it applies. The Raft state machine
 //! applies through the engine, so the engine is where an entry becomes part
 //! of the store; a subscriber receives each applied entry's keys there, with
-//! the entry's log index and commit timestamp.
+//! the entry's log index and commit timestamp. An engine without Raft reports
+//! its local commits the same way, with their journal index (or 0 when it
+//! keeps no journal).
 //!
 //! The feed never slows the applies down. Each subscriber has a bounded
 //! queue; when it is full the event is dropped and the subscription marked
@@ -29,10 +31,11 @@ use crate::engine::partition::Partition;
 /// What happened to a subscribed partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppliedEvent {
-    /// Raft entry `index` applied at `commit_ts`, writing `keys` (each once
-    /// per mutation, in the entry's order) in the subscribed partition.
+    /// Entry `index` applied at `commit_ts`, writing `keys` (each once per
+    /// mutation, in the entry's order) in the subscribed partition.
     Keys {
-        /// The entry's position in the Raft log.
+        /// The entry's position in the Raft log, or in the journal of an
+        /// engine without Raft; 0 for a local commit with no journal.
         index: u64,
         /// The commit timestamp the entry applied at.
         commit_ts: u64,
@@ -185,8 +188,8 @@ impl AppliedFeed {
         }
     }
 
-    /// Report that Raft entry `index` applied `mutations` at `commit_ts`.
-    /// Call after they are in the store.
+    /// Report that entry `index` applied `mutations` at `commit_ts`. Call
+    /// after they are in the store.
     #[inline]
     pub(crate) fn applied(&self, index: u64, commit_ts: u64, mutations: &[Mutation]) {
         if self.open.load(Ordering::Acquire) == 0 {
