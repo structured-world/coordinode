@@ -5,7 +5,7 @@
 //! maintained incrementally on node create/update/delete.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use coordinode_cluster::VectorShardRouter;
@@ -13,7 +13,9 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_vector::VectorLoader;
 use coordinode_vector::health::{HealthSignal, IndexHealthState};
-use coordinode_vector::hnsw::{HnswConfig, HnswIndex, SearchResult};
+use coordinode_vector::hnsw::{
+    DEFAULT_RETIRED_BYTES_BUDGET, HnswConfig, HnswIndex, PublicationSnapshot, SearchResult,
+};
 use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 
@@ -22,9 +24,41 @@ use super::definition::IndexDefinition;
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
 
-/// Thread-safe handle to an HNSW index. Readers can search concurrently;
-/// writers (insert/delete) acquire exclusive access.
+/// Thread-safe handle to an HNSW index. Searches and inserts share the lock;
+/// the exclusive side is for the transitions that rewrite every node at once
+/// (codec calibration, reorder, wholesale replacement).
 pub type HnswHandle = Arc<RwLock<HnswIndex>>;
+
+/// Insert one vector under the shared lock, concurrently with searches and
+/// other inserts. The exclusive lock is taken only for the calibration the
+/// insert reports due.
+pub(crate) fn insert_one(handle: &RwLock<HnswIndex>, id: u64, vector: &[f32]) {
+    let due = match handle.read() {
+        Ok(graph) => graph.insert_shared(id, vector),
+        Err(_) => return,
+    };
+    if due {
+        calibrate(handle);
+    }
+}
+
+/// [`insert_one`] for a batch, through [`HnswIndex::insert_batch_shared`].
+pub(crate) fn insert_many(handle: &RwLock<HnswIndex>, items: Vec<(u64, Vec<f32>)>) {
+    let due = match handle.read() {
+        Ok(graph) => graph.insert_batch_shared(items),
+        Err(_) => return,
+    };
+    if due {
+        calibrate(handle);
+    }
+}
+
+#[cold]
+fn calibrate(handle: &RwLock<HnswIndex>) {
+    if let Ok(mut graph) = handle.write() {
+        graph.calibrate_if_due();
+    }
+}
 
 /// A similarity-partitioned (sharded) vector index: N per-partition HNSW
 /// handles plus the router that maps a vector to its partitions.
@@ -88,6 +122,9 @@ pub struct VectorIndexRegistry {
     /// before touching the index. Without that ownership the build outlives
     /// the index it belongs to and keeps writing under whatever comes next.
     builds: Mutex<HashMap<String, BuildHandle>>,
+    /// Retired-memory budget each graph gets (see
+    /// [`Self::set_retired_bytes_budget`]).
+    retired_bytes_budget: AtomicUsize,
 }
 
 /// A running backfill: the flag that stops it and the thread to join.
@@ -136,6 +173,7 @@ impl VectorIndexRegistry {
             health: RwLock::new(HashMap::new()),
             tier_backend: None,
             builds: Mutex::new(HashMap::new()),
+            retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
         }
     }
 
@@ -157,7 +195,93 @@ impl VectorIndexRegistry {
             health: RwLock::new(HashMap::new()),
             tier_backend: Some(backend),
             builds: Mutex::new(HashMap::new()),
+            retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
         }
+    }
+
+    /// Set the retired-memory budget of every vector index, those registered
+    /// later included: the bytes of replaced neighbour lists an index lets
+    /// wait for reclamation before its writers hold off (see
+    /// [`HnswConfig::retired_bytes_budget`]). Takes effect on the next write.
+    pub fn set_retired_bytes_budget(&self, bytes: usize) {
+        self.retired_bytes_budget.store(bytes, Ordering::Relaxed);
+        for handle in self.all_graphs() {
+            if let Ok(graph) = handle.read() {
+                graph.set_retired_bytes_budget(bytes);
+            }
+        }
+    }
+
+    /// The retired-memory budget new indexes get.
+    pub fn retired_bytes_budget(&self) -> usize {
+        self.retired_bytes_budget.load(Ordering::Relaxed)
+    }
+
+    /// Every graph the registry holds: each plain index and each partition
+    /// of a partitioned one.
+    fn all_graphs(&self) -> Vec<HnswHandle> {
+        let mut graphs: Vec<HnswHandle> = self
+            .indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for layout in self
+            .sharded
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            graphs.extend(layout.shards.iter().cloned());
+        }
+        graphs
+    }
+
+    /// Publication and reclamation figures per `(label, property)`, summed
+    /// over the partitions of a partitioned index (the oldest operation is
+    /// the oldest of any partition). For the metrics a scrape samples.
+    pub fn all_publication_stats(&self) -> Vec<(String, String, PublicationSnapshot)> {
+        let sum = |graphs: &[HnswHandle]| {
+            graphs
+                .iter()
+                .filter_map(|g| g.read().ok().map(|g| g.publication_stats()))
+                .fold(PublicationSnapshot::default(), |acc, s| {
+                    PublicationSnapshot {
+                        retired_bytes: acc.retired_bytes + s.retired_bytes,
+                        retired_lists: acc.retired_lists + s.retired_lists,
+                        lost_cas: acc.lost_cas + s.lost_cas,
+                        admission_waits: acc.admission_waits + s.admission_waits,
+                        admission_wait: acc.admission_wait + s.admission_wait,
+                        oldest_operation: acc.oldest_operation.max(s.oldest_operation),
+                        retired_nodes: acc.retired_nodes + s.retired_nodes,
+                        free_slots: acc.free_slots + s.free_slots,
+                    }
+                })
+        };
+        let mut out: Vec<(String, String, PublicationSnapshot)> = self
+            .indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|((label, property), handle)| {
+                (
+                    label.clone(),
+                    property.clone(),
+                    sum(std::slice::from_ref(handle)),
+                )
+            })
+            .collect();
+        out.extend(
+            self.sharded
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|((label, property), layout)| {
+                    (label.clone(), property.clone(), sum(&layout.shards))
+                }),
+        );
+        out
     }
 
     /// Build a [`VectorTierHandle`] from pre-resolved
@@ -216,7 +340,7 @@ impl VectorIndexRegistry {
             return;
         };
 
-        let mut hnsw = HnswIndex::new(Self::hnsw_config_from(config, def.property()));
+        let mut hnsw = HnswIndex::new(self.hnsw_config_from(config, def.property()));
         // Bind the caller-resolved tier handle BEFORE the index is
         // moved into the registry so subsequent inserts persist f32
         // to disk. `None` keeps the index pure in-RAM
@@ -242,7 +366,11 @@ impl VectorIndexRegistry {
     /// name. Shared by the Unsharded ([`Self::register_with_tier`]) and sharded
     /// ([`Self::register_sharded`]) registration paths so every per-partition
     /// graph uses identical parameters.
-    fn hnsw_config_from(config: &crate::index::VectorIndexConfig, property: &str) -> HnswConfig {
+    fn hnsw_config_from(
+        &self,
+        config: &crate::index::VectorIndexConfig,
+        property: &str,
+    ) -> HnswConfig {
         HnswConfig {
             m: config.m,
             m_max0: config.m * 2,
@@ -256,6 +384,7 @@ impl VectorIndexRegistry {
             offload_vectors: config.offload_vectors,
             property_name: property.to_string(),
             max_elements: 1_000_000,
+            retired_bytes_budget: self.retired_bytes_budget(),
             ..HnswConfig::default()
         }
     }
@@ -285,10 +414,9 @@ impl VectorIndexRegistry {
         let n = router.n_partitions().max(1);
         let shards: Vec<HnswHandle> = (0..n)
             .map(|_| {
-                Arc::new(RwLock::new(HnswIndex::new(Self::hnsw_config_from(
-                    config,
-                    def.property(),
-                ))))
+                Arc::new(RwLock::new(HnswIndex::new(
+                    self.hnsw_config_from(config, def.property()),
+                )))
             })
             .collect();
 
@@ -438,9 +566,7 @@ impl VectorIndexRegistry {
             if batch.is_empty() {
                 continue;
             }
-            if let Ok(mut hnsw) = layout.shards[p].write() {
-                hnsw.insert_batch(batch);
-            }
+            insert_many(&layout.shards[p], batch);
         }
         count
     }
@@ -449,6 +575,7 @@ impl VectorIndexRegistry {
     ///
     /// Uses interior mutability — safe to call via `&self`.
     pub fn register_with_index(&self, def: IndexDefinition, hnsw: HnswIndex) {
+        hnsw.set_retired_bytes_budget(self.retired_bytes_budget());
         let key = (def.label.clone(), def.property().to_string());
         self.indexes
             .write()
@@ -852,9 +979,8 @@ impl VectorIndexRegistry {
     /// Insert a vector into all applicable HNSW indexes for a node.
     ///
     /// Called on node creation or vector property update. For bulk
-    /// loads use [`Self::on_vectors_written`] to amortise the HNSW
-    /// write-lock across the whole batch instead of paying it per
-    /// inserted vector.
+    /// loads use [`Self::on_vectors_written`], which spreads one batch
+    /// across the rayon pool.
     pub fn on_vector_written(&self, label: &str, node_id: NodeId, property: &str, vector: &[f32]) {
         if self.build_owns_writes(label, property) {
             return;
@@ -867,21 +993,17 @@ impl VectorIndexRegistry {
             }
         }
         if let Some(handle) = self.get(label, property) {
-            if let Ok(mut hnsw) = handle.write() {
-                hnsw.insert(node_id.as_raw(), vector.to_vec());
-            }
+            insert_one(&handle, node_id.as_raw(), vector);
         }
     }
 
     /// Batched variant: insert N vectors into the same (label,
-    /// property) HNSW index under a single write-lock acquisition,
-    /// then dispatch to [`HnswIndex::insert_batch`] which seeds
-    /// sequentially up to `SEED_DENSITY` and parallelises the rest
-    /// via rayon.
+    /// property) HNSW index through [`HnswIndex::insert_batch_shared`],
+    /// which seeds sequentially up to `SEED_DENSITY` and parallelises
+    /// the rest via rayon, concurrently with searches.
     ///
-    /// Caller is responsible for grouping by (label, property) — a
-    /// mixed batch would otherwise need one write-lock per group,
-    /// negating the win for the cross-group case.
+    /// Caller is responsible for grouping by (label, property): one call
+    /// per index keeps the rayon fan-out per batch rather than per row.
     ///
     /// `items` is consumed: each `(NodeId, Vec<f32>)` is forwarded
     /// to the HNSW insert path without further copies.
@@ -899,25 +1021,60 @@ impl VectorIndexRegistry {
             }
         }
         if let Some(handle) = self.get(label, property) {
-            if let Ok(mut hnsw) = handle.write() {
-                let batch: Vec<(u64, Vec<f32>)> =
-                    items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect();
-                hnsw.insert_batch(batch);
+            insert_many(
+                &handle,
+                items.into_iter().map(|(id, v)| (id.as_raw(), v)).collect(),
+            );
+        }
+    }
+
+    /// A statement deleted a node or its vector property, ahead of its
+    /// commit. The graph keeps the node: removing it now would lose the
+    /// vector of a deletion that then aborts. The MVCC visibility filter
+    /// hides it from results until the committed deletion reaches
+    /// [`Self::on_vector_removed`] through the applied-commit feed.
+    pub fn on_vector_deleted(&self, _label: &str, _node_id: NodeId, _property: &str) {}
+
+    /// Take `node_id` out of the index of `(label, property)`, every
+    /// partition of a partitioned one, for a deletion that is committed.
+    /// Runs beside searches and inserts; an absent node is a no-op. While a
+    /// build owns the index, the build's own fold reconciles the node.
+    pub fn on_vector_removed(&self, label: &str, property: &str, node_id: NodeId) {
+        if self.build_owns_writes(label, property) {
+            return;
+        }
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                for shard in &layout.shards {
+                    if let Ok(graph) = shard.read() {
+                        graph.remove(node_id.as_raw());
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(handle) = self.get(label, property) {
+            if let Ok(graph) = handle.read() {
+                graph.remove(node_id.as_raw());
             }
         }
     }
 
-    /// Remove a vector from all applicable HNSW indexes for a node.
-    ///
-    /// Called on node deletion or vector property removal.
-    /// HNSW does not support true deletion — we rely on the MVCC
-    /// visibility filter to exclude deleted nodes from search results.
-    /// The vector remains in the graph to avoid fragmentation.
-    /// Periodic rebuild (>50% tombstones) is tracked separately.
-    pub fn on_vector_deleted(&self, _label: &str, _node_id: NodeId, _property: &str) {
-        // HNSW graph deletion is handled via MVCC post-filter visibility.
-        // Physical removal would fragment the graph. Tracked as future
-        // optimization: rebuild when tombstone ratio exceeds threshold.
+    /// Whether the index of `(label, property)`, any partition of a
+    /// partitioned one, holds `node_id`.
+    pub fn holds(&self, label: &str, property: &str, node_id: NodeId) -> bool {
+        {
+            let sharded = self.sharded.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(layout) = sharded.get(&(label.to_string(), property.to_string())) {
+                return layout
+                    .shards
+                    .iter()
+                    .any(|shard| shard.read().is_ok_and(|g| g.contains(node_id.as_raw())));
+            }
+        }
+        self.get(label, property)
+            .is_some_and(|handle| handle.read().is_ok_and(|g| g.contains(node_id.as_raw())))
     }
 
     /// Search the HNSW index for a (label, property) pair.
@@ -1040,13 +1197,9 @@ impl VectorIndexRegistry {
             None => return 0,
         };
 
-        let mut count = 0;
-        if let Ok(mut hnsw) = handle.write() {
-            for (id, vec) in vectors {
-                hnsw.insert(id, vec);
-                count += 1;
-            }
-        }
+        let items: Vec<(u64, Vec<f32>)> = vectors.collect();
+        let count = items.len();
+        insert_many(&handle, items);
         count
     }
 }

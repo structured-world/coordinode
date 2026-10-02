@@ -128,6 +128,76 @@ fn concurrent_cas_append_no_lost_writes() {
     });
 }
 
+/// The edit that drops a removed node from a neighbour's list races an
+/// append to the same list: the removal is recomputed against the list that
+/// won, so the accepted append survives and the removed id is gone, in every
+/// order.
+#[test]
+fn removal_edit_racing_an_append_keeps_the_append() {
+    loom::model(|| {
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+        list.set(&[1, 2]);
+
+        let append = {
+            let list = list.clone();
+            thread::spawn(move || assert!(list.cas_append(5)))
+        };
+        let remove = {
+            let list = list.clone();
+            thread::spawn(move || {
+                list.update(|current| {
+                    current
+                        .contains(&2)
+                        .then(|| current.iter().copied().filter(|&id| id != 2).collect())
+                });
+            })
+        };
+
+        append.join().unwrap();
+        remove.join().unwrap();
+        let mut seen = list.snapshot();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 5], "lost the append or kept the removed id");
+    });
+}
+
+/// A prune computed from a list another writer replaced is never published:
+/// it reruns against the winner. Pruning `[1, 2, 3]` to the two largest ids
+/// while 4 is appended ends as `[3, 4]` (append first) or `[2, 3, 4]` (prune
+/// first), never `[2, 3]`, which would drop the accepted append.
+#[test]
+fn stale_prune_never_overwrites_an_append() {
+    loom::model(|| {
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+        list.set(&[1, 2, 3]);
+
+        let append = {
+            let list = list.clone();
+            thread::spawn(move || assert!(list.cas_append(4)))
+        };
+        let prune = {
+            let list = list.clone();
+            thread::spawn(move || {
+                list.update(|current| {
+                    let mut kept = current.to_vec();
+                    kept.sort_unstable();
+                    let drop = kept.len().checked_sub(2).filter(|&d| d > 0)?;
+                    Some(kept[drop..].into())
+                });
+            })
+        };
+
+        append.join().unwrap();
+        prune.join().unwrap();
+        let mut seen = list.snapshot();
+        seen.sort_unstable();
+        assert!(
+            seen == vec![3, 4] || seen == vec![2, 3, 4],
+            "a stale prune overwrote the append: {seen:?}"
+        );
+    });
+}
+
 /// Capacity boundary under concurrent writers: with room for one id, exactly
 /// one of two racing appends succeeds and the other is told the list is full,
 /// including when it lost the CAS to the winner and re-read a full list.

@@ -356,12 +356,12 @@ fn every_node_written_after_the_handover_is_a_member() {
 }
 
 /// A node that stops being a member while the build runs (deleted,
-/// relabelled, or stripped of its vector) is counted as a stale entry for the
-/// read path to re-validate, never re-inserted from what the tap delivered.
+/// relabelled, or stripped of its vector) is taken out of the graph, never
+/// re-inserted from what the tap delivered; a node that stays a member stays.
 #[test]
-fn a_node_leaving_the_index_during_the_build_is_counted_stale() {
+fn a_node_leaving_the_index_during_the_build_is_removed() {
     let fx = fixture();
-    for id in 1..=3 {
+    for id in 1..=4 {
         fx.apply_doc_at(id, [0.0, 1.0, id as f32], fx.oracle.next().as_raw());
     }
     let older = fx.open_transaction();
@@ -374,12 +374,14 @@ fn a_node_leaving_the_index_during_the_build_is_counted_stale() {
         drop(older);
     });
 
-    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 3 }));
-    assert_eq!(
-        fx.health().tombstones(),
-        3,
-        "the deleted, the relabelled and the stripped node"
-    );
+    assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 4 }));
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    let graph = hnsw.read().expect("graph");
+    for (id, why) in [(1, "deleted"), (2, "relabelled"), (3, "stripped")] {
+        assert!(!graph.contains(id), "the {why} node {id} is still indexed");
+    }
+    assert!(graph.contains(4), "the untouched node left the index");
+    assert_eq!(graph.len(), 1);
 }
 
 /// A vector rewritten while the build runs ends up in the index at its new
@@ -399,7 +401,8 @@ fn a_vector_rewritten_during_the_build_is_indexed_at_its_new_value() {
 
     assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
     assert!(fx.indexed([1.0, 0.0, 0.0], 1), "found at its new value");
-    assert_eq!(fx.health().tombstones(), 0, "still a member");
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+    assert_eq!(hnsw.read().expect("graph").len(), 2, "still a member, once");
 }
 
 /// The build indexes one shard: a node another shard owns, landing while it

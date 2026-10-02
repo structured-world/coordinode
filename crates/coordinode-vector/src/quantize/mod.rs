@@ -69,12 +69,10 @@ impl Sq8Params {
     }
 
     /// Calibrate SQ8 parameters from vectors in an existing HNSW index.
-    /// Collects all in-memory f32 vectors and delegates to `calibrate()`.
-    pub fn calibrate_from_index(index: &crate::hnsw::HnswIndex) -> Option<Self> {
-        let refs: Vec<&[f32]> = (0..index.len())
-            .filter_map(|i| index.get_vector(i))
-            .collect();
-        Self::calibrate(&refs)
+    /// Collects the in-memory f32 vectors of its nodes and delegates to
+    /// `calibrate()`.
+    pub fn calibrate_from_index(index: &mut crate::hnsw::HnswIndex) -> Option<Self> {
+        Self::calibrate(&index.calibration_vectors())
     }
 
     /// Number of dimensions.

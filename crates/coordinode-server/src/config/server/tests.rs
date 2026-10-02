@@ -184,6 +184,22 @@ fn vector_build_wait_parses_from_the_config_file() {
     assert_eq!(c.vector_build_wait_ms, Some(1500));
 }
 
+/// The vector indexes' retired-memory budget is a config-file setting: unset
+/// it leaves the index default, set it carries the bytes given.
+#[test]
+fn vector_retired_bytes_budget_parses_from_the_config_file() {
+    assert!(
+        ServerConfig::default()
+            .vector_retired_bytes_budget
+            .is_none()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "vector_retired_bytes_budget: 67108864\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.vector_retired_bytes_budget, Some(64 << 20));
+}
+
 /// The change-stream pacing is a config-file setting; zero is refused at
 /// parse, since a zero batch never reads and a zero heartbeat interval spins.
 #[test]

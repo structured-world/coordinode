@@ -1482,11 +1482,30 @@ fn hnsw_search_after_auto_inserts() {
 }
 
 /// DELETE node calls on_vector_deleted (wiring correctness).
-/// Since on_vector_deleted is intentionally a no-op (MVCC post-filter),
-/// we verify the deletion doesn't crash and the vector remains in the
-/// HNSW graph (by design — MVCC visibility handles exclusion).
+/// Wait, up to a bound, for `held` to report that the index of
+/// `(label, property)` no longer holds the node whose vector is nearest
+/// `query`: the committed deletion reaches the graph through the background
+/// follower of the applied commits, not on the statement's own thread.
+fn await_removed(db: &Database, label: &str, property: &str, query: &[f32]) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let empty = db
+            .vector_index_registry()
+            .search(label, property, query, 5)
+            .is_some_and(|hits| hits.is_empty());
+        if empty {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// A committed DETACH DELETE takes the node out of the HNSW graph: the
+/// statement leaves it in place (it could still abort), and once the commit
+/// has applied, the follower of the applied commits removes it.
 #[test]
-fn delete_node_calls_on_vector_deleted() {
+fn delete_node_removes_it_from_the_graph_once_committed() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1519,23 +1538,18 @@ fn delete_node_calls_on_vector_deleted() {
     db.execute_cypher("MATCH (a:Item {name: 'Ephemeral'}) DETACH DELETE a")
         .expect("delete");
 
-    // Vector remains in HNSW (by design — on_vector_deleted is no-op,
-    // MVCC post-filter handles visibility). The HNSW graph is NOT
-    // compacted on delete — this is intentional to avoid fragmentation.
-    let reg = db.vector_index_registry();
-    let post_delete = reg
-        .search("Item", "v", &[1.0, 2.0, 3.0], 5)
-        .expect("post-delete search");
-    assert_eq!(
-        post_delete.len(),
-        1,
-        "vector should remain in HNSW graph after delete (MVCC post-filter handles visibility)"
+    assert!(
+        await_removed(&db, "Item", "v", &[1.0, 2.0, 3.0]),
+        "the deleted node is still in the HNSW graph"
     );
+    let handle = db.vector_index_registry().get("Item", "v").expect("index");
+    assert_eq!(handle.read().expect("graph").len(), 0);
 }
 
-/// REMOVE vector property calls on_vector_deleted wiring.
+/// A committed REMOVE of the vector property takes the node out of the
+/// graph, while the node itself lives on.
 #[test]
-fn remove_vector_property_wiring() {
+fn remove_vector_property_takes_the_node_out_of_the_graph() {
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1557,20 +1571,17 @@ fn remove_vector_property_wiring() {
     db.execute_cypher("CREATE (a:Item {name: 'A', v: [1.0, 0.0, 0.0]})")
         .expect("create");
 
-    // REMOVE the vector property — should call on_vector_deleted (no-op) without crash
     db.execute_cypher("MATCH (a:Item {name: 'A'}) REMOVE a.v")
         .expect("remove vector property");
 
-    // Vector remains in HNSW (on_vector_deleted is no-op, by design)
-    let reg = db.vector_index_registry();
-    let results = reg
-        .search("Item", "v", &[1.0, 0.0, 0.0], 5)
-        .expect("search");
-    assert_eq!(
-        results.len(),
-        1,
-        "vector stays in HNSW after REMOVE (MVCC visibility handles exclusion)"
+    assert!(
+        await_removed(&db, "Item", "v", &[1.0, 0.0, 0.0]),
+        "the node stripped of its vector is still in the HNSW graph"
     );
+    let rows = db
+        .execute_cypher("MATCH (a:Item {name: 'A'}) RETURN a.name")
+        .expect("read");
+    assert_eq!(rows.len(), 1, "the node itself lives on");
 }
 
 // ── HNSW index persistence and rebuild on startup ───────────────────
@@ -1969,7 +1980,7 @@ fn forced_offload_search_through_registry() {
         );
 
         // Manually calibrate from existing vectors
-        let params = coordinode_vector::quantize::Sq8Params::calibrate_from_index(&hnsw)
+        let params = coordinode_vector::quantize::Sq8Params::calibrate_from_index(&mut hnsw)
             .expect("calibrate from 20 vectors");
         hnsw.set_sq8_params(params);
 
@@ -2079,8 +2090,8 @@ fn forced_offload_cypher_e2e() {
         let reg = db.vector_index_registry();
         let handle = reg.get("Part", "emb").expect("index");
         let mut hnsw = handle.write().expect("lock");
-        let params =
-            coordinode_vector::quantize::Sq8Params::calibrate_from_index(&hnsw).expect("calibrate");
+        let params = coordinode_vector::quantize::Sq8Params::calibrate_from_index(&mut hnsw)
+            .expect("calibrate");
         hnsw.set_sq8_params(params);
         assert!(
             hnsw.is_offloaded(),

@@ -28,6 +28,7 @@ fn config() -> HnswConfig {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 20_000,
+        retired_bytes_budget: coordinode_vector::hnsw::DEFAULT_RETIRED_BYTES_BUDGET,
     }
 }
 

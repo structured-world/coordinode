@@ -58,6 +58,11 @@ impl IdMap {
         self.shard(id).write().insert(id, idx)
     }
 
+    /// Drop `id`, returning the index it pointed at.
+    pub(super) fn remove(&self, id: u64) -> Option<usize> {
+        self.shard(id).write().remove(&id)
+    }
+
     /// Number of ids.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {

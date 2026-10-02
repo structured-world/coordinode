@@ -374,11 +374,10 @@ pub struct Database {
     index_registry: coordinode_query::index::IndexRegistry,
     /// Vector index registry — holds live HNSW indexes for accelerated vector search.
     vector_index_registry: Arc<coordinode_query::index::VectorIndexRegistry>,
-    /// Background oplog tailer keeping HNSW indexes current with
-    /// replicated writes (see [`crate::vector_worker`]). `None` when
-    /// the process has no oplog (pure embedded mode without Raft).
+    /// Background follower of the applied commits keeping HNSW indexes
+    /// current with them, removals included (see [`crate::vector_worker`]).
     /// Held for its Drop (stops the thread when the Database closes).
-    _vector_worker: Option<crate::vector_worker::VectorIndexWorker>,
+    _vector_worker: crate::vector_worker::VectorIndexWorker,
     /// Text index registry — holds live tantivy indexes for full-text search.
     text_index_registry: coordinode_query::index::TextIndexRegistry,
     /// Extension-op handler registry threaded into every ExecutionContext.
@@ -951,12 +950,13 @@ impl Database {
             tracing::warn!("failed to load index registry: {e}, starting fresh");
         }
 
-        // Follow the applied Raft entries from before the rebuild below, so
-        // no entry falls between what the rebuild reads and what the worker
-        // receives. Entries arriving during the rebuild are the rebuild's to
-        // fold; the worker's copy of them is a harmless upsert.
-        let applied = follow_raft_applies
-            .then(|| engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY));
+        // Follow the applied commits (Raft entries, or the local commits of a
+        // store without Raft) from before the rebuild below, so no commit
+        // falls between what the rebuild reads and what the worker receives.
+        // Commits arriving during the rebuild are the rebuild's to fold; the
+        // worker's copy of them is a harmless upsert. The worker is also what
+        // takes a committed deletion out of the graph.
+        let applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
 
         // Load vector index definitions from schema: partition and rebuild
         // HNSW graphs from stored vectors (eager rebuild). The registry is
@@ -971,15 +971,13 @@ impl Database {
 
         // The rebuild above covered what the store held; the worker keeps the
         // indexes current with every entry applied from here on.
-        let vector_worker = applied.map(|applied| {
-            crate::vector_worker::VectorIndexWorker::spawn(
-                Arc::clone(&engine),
-                applied,
-                Arc::clone(&vector_index_registry),
-                Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
-                1, /* shard_id */
-            )
-        });
+        let vector_worker = crate::vector_worker::VectorIndexWorker::spawn(
+            Arc::clone(&engine),
+            applied,
+            Arc::clone(&vector_index_registry),
+            Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
+            1, /* shard_id */
+        );
 
         // Load text index definitions and rebuild tantivy indexes from stored nodes.
         let text_index_base = path.join("text_indexes");
@@ -2178,6 +2176,22 @@ impl Database {
     /// names no bound of its own.
     pub fn vector_build_wait(&self) -> Duration {
         self.vector_build_wait
+    }
+
+    /// Set the retired-memory budget of every vector index: the bytes of
+    /// replaced neighbour lists an index lets wait for reclamation before
+    /// its inserts and removals hold off until the searches that may still
+    /// read them finish. Bounds that memory under a stalled search by
+    /// slowing writers, never by dropping a write. Takes effect on the next
+    /// write, for the indexes created later too. Default
+    /// [`coordinode_vector::hnsw::DEFAULT_RETIRED_BYTES_BUDGET`].
+    pub fn set_vector_retired_bytes_budget(&self, bytes: usize) {
+        self.vector_index_registry.set_retired_bytes_budget(bytes);
+    }
+
+    /// The retired-memory budget of the vector indexes.
+    pub fn vector_retired_bytes_budget(&self) -> usize {
+        self.vector_index_registry.retired_bytes_budget()
     }
 
     /// Set session-level read concern.

@@ -40,6 +40,7 @@ fn make_config(m: usize, max_dim: u32, max_elements: u32) -> HnswConfig {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements,
+        retired_bytes_budget: coordinode_vector::hnsw::DEFAULT_RETIRED_BYTES_BUDGET,
     }
 }
 

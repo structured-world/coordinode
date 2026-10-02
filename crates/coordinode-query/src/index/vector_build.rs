@@ -234,9 +234,11 @@ impl VectorBuild<'_> {
                     scanned += 1;
                     for target in self.targets {
                         if let Some(vec_data) = target.member(record) {
-                            if let Ok(mut graph) = target.hnsw.write() {
-                                graph.insert(node_id.as_raw(), vec_data);
-                            }
+                            super::vector_registry::insert_one(
+                                target.hnsw,
+                                node_id.as_raw(),
+                                &vec_data,
+                            );
                             written += 1;
                         }
                     }
@@ -276,10 +278,8 @@ impl VectorBuild<'_> {
     /// membership can be LOST while the node lives (its vector property
     /// removed, its label changed), and that is decidable from the current
     /// record alone. A node that is still a member is upserted; one that is
-    /// not is counted as a tombstone and left in the graph, which is what
-    /// every engine in this space does: physical removal from an HNSW is a
-    /// rebuild, not an operation, and correctness at read comes from
-    /// re-validating the candidate.
+    /// not is removed from the graph, which repairs the links around it and
+    /// later reuses its slot.
     ///
     /// The read and the insert happen under the graphs' write locks. A writer
     /// that inserts its own vector after its record landed is ordered by the
@@ -316,12 +316,11 @@ impl VectorBuild<'_> {
                 for ((target, graph), batch) in self.targets.iter().zip(&graphs).zip(&mut batches) {
                     match record.as_ref().and_then(|r| target.member(r)) {
                         Some(vec_data) => batch.push((node_id.as_raw(), vec_data)),
-                        // Deleted, relabelled or stripped of its vector: a
-                        // stale entry only if the graph holds one.
-                        None if graph.contains(node_id.as_raw()) => {
-                            target.health.record_tombstone();
+                        // Deleted, relabelled or stripped of its vector: out of
+                        // the graph, if the graph holds it.
+                        None => {
+                            graph.remove(node_id.as_raw());
                         }
-                        None => {}
                     }
                 }
             }

@@ -42,12 +42,18 @@ fn bulk_insert_counts() {
     assert_eq!(store.len().unwrap(), 10);
 }
 
+/// A removed node leaves the index: it is no longer counted or returned,
+/// the other nodes still are, and removing it again changes nothing.
 #[test]
-fn remove_is_noop_for_index() {
+fn remove_takes_the_node_out_of_the_index() {
     let store = LocalVectorStore::new(mk_config(2));
     store.insert(42, vec![1.0, 2.0]).unwrap();
+    store.insert(43, vec![2.0, 1.0]).unwrap();
     store.remove(42).unwrap();
-    // HNSW retains the vector — query layer filters via MVCC.
+    assert_eq!(store.len().unwrap(), 1);
+    let hits = store.knn_search(&[1.0, 2.0], 2).unwrap();
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![43]);
+    store.remove(42).unwrap();
     assert_eq!(store.len().unwrap(), 1);
 }
 

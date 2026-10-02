@@ -33,9 +33,13 @@ mod entry_point;
 mod id_map;
 mod neighbours;
 mod rabitq_block;
+mod reclaim;
 mod reorder;
 mod search_scratch;
+mod stats;
 mod visited;
+
+pub use stats::PublicationSnapshot;
 
 pub use neighbours::AtomicNeighbourList;
 
@@ -307,7 +311,21 @@ pub struct HnswConfig {
     /// pauses inserts briefly; size this generously when ingestion volume
     /// is known. Default: 1_000_000.
     pub max_elements: u32,
+    /// Bytes of replaced neighbour lists the index lets wait for reclamation
+    /// before an insert or removal holds off until running searches release
+    /// them. A search that stalls keeps every list replaced after it began;
+    /// the budget bounds that memory by slowing writers, never by dropping
+    /// a write. `usize::MAX` disables the bound. Live-settable with
+    /// [`HnswIndex::set_retired_bytes_budget`]. Default:
+    /// [`DEFAULT_RETIRED_BYTES_BUDGET`].
+    pub retired_bytes_budget: usize,
 }
+
+/// Fewest retired slots a sweep waits for (see `retire_node`).
+const SWEEP_MIN_SLOTS: usize = 64;
+
+/// Default [`HnswConfig::retired_bytes_budget`]: 256 MiB.
+pub const DEFAULT_RETIRED_BYTES_BUDGET: usize = 256 << 20;
 
 impl Default for HnswConfig {
     fn default() -> Self {
@@ -327,6 +345,7 @@ impl Default for HnswConfig {
             rerank_oversample_factor: 1.0,
             alpha_pruning: 0.0,
             max_elements: 1_000_000,
+            retired_bytes_budget: DEFAULT_RETIRED_BYTES_BUDGET,
         }
     }
 }
@@ -420,6 +439,20 @@ pub struct HnswIndex {
     /// fixes the dimension; a `OnceLock` so concurrent inserts create it once.
     // no-std: once_cell::race::OnceBox
     data_level0: std::sync::OnceLock<data_level0::DataLevel0Block>,
+    /// Retired lists, lost CAS, admission waits and running operations.
+    stats: std::sync::Arc<stats::PublicationStats>,
+    /// The slots of removed and replaced nodes on their way to reuse.
+    reclaim: std::sync::Arc<reclaim::SlotReclaim>,
+    /// [`HnswConfig::retired_bytes_budget`], settable while the index serves.
+    retired_bytes_budget: core::sync::atomic::AtomicUsize,
+}
+
+/// One search, insert or removal: the epoch pin that keeps every list and
+/// slot it reads in place until it ends, and its entry in the running
+/// operations.
+struct Operation<'a> {
+    guard: crossbeam_epoch::Guard,
+    _tracked: stats::OperationGuard<'a>,
 }
 
 /// Per-layer outcome of planning an insert: which existing nodes the new node
@@ -663,7 +696,12 @@ impl HnswIndex {
         // is supported, the first overflow simply triggers Vec growth.
         let capacity = config.max_elements as usize;
         let id_to_idx = id_map::IdMap::with_capacity(capacity);
+        let retired_bytes_budget =
+            core::sync::atomic::AtomicUsize::new(config.retired_bytes_budget);
         Self {
+            stats: std::sync::Arc::new(stats::PublicationStats::new()),
+            reclaim: std::sync::Arc::new(reclaim::SlotReclaim::default()),
+            retired_bytes_budget,
             config,
             node_count: core::sync::atomic::AtomicUsize::new(0),
             live_count: core::sync::atomic::AtomicUsize::new(0),
@@ -817,9 +855,23 @@ impl HnswIndex {
 
     /// Get a reference to the f32 vector at node index `idx`, if present.
     ///
-    /// Reads from the layer-0 store.
-    pub fn get_vector(&self, idx: usize) -> Option<&[f32]> {
+    /// Takes `&mut self`: through a shared borrow an insert could reuse the
+    /// slot of a removed node and rewrite the vector under the reference.
+    pub fn get_vector(&mut self, idx: usize) -> Option<&[f32]> {
         self.read_node_f32(idx)
+    }
+
+    /// The in-memory f32 vectors of the nodes that are results (removed and
+    /// replaced nodes left out), for a calibration that holds the index
+    /// exclusively.
+    pub fn calibration_vectors(&mut self) -> Vec<&[f32]> {
+        let Some(store) = self.data_level0.get() else {
+            return Vec::new();
+        };
+        (0..self.node_len())
+            .filter(|&idx| store.state(idx) == data_level0::NodeState::Live)
+            .filter_map(|idx| store.vector(idx))
+            .collect()
     }
 
     /// Auto-calibrate SQ8 from all currently stored vectors.
@@ -839,9 +891,7 @@ impl HnswIndex {
                 SQ8_MIN_VECTORS,
             );
         }
-        let refs: Vec<&[f32]> = (0..self.node_len())
-            .filter_map(|idx| self.read_node_f32(idx))
-            .collect();
+        let refs = self.calibration_vectors();
         if let Some(params) = Sq8Params::calibrate(&refs) {
             self.quantize_all(&params);
             // Offload: free the f32 from the layer-0 store so the RAM is
@@ -891,8 +941,10 @@ impl HnswIndex {
         // upper bound of 12 iterations caps calibration latency well
         // under one second even at calibration_threshold = 100k.
         const N_CLUSTERS: u32 = 16;
-        let training: Vec<Vec<f32>> = (0..self.node_len())
-            .filter_map(|idx| self.read_node_f32(idx).map(<[f32]>::to_vec))
+        let training: Vec<Vec<f32>> = self
+            .calibration_vectors()
+            .into_iter()
+            .map(<[f32]>::to_vec)
             .collect();
         let params = if training.is_empty() {
             RaBitQParams::calibrate(dims as u32, seed)
@@ -972,7 +1024,20 @@ impl HnswIndex {
     /// concurrent inserts into a near-empty graph would mostly see each other
     /// still unlinked and connect poorly. Repeated ids keep their last
     /// vector, as if inserted in order.
-    pub fn insert_batch(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
+    ///
+    /// Through [`Self::insert_batch_shared`], then the calibration it reports
+    /// due.
+    pub fn insert_batch(&mut self, items: Vec<(u64, Vec<f32>)>) {
+        if self.insert_batch_shared(items) {
+            self.calibrate_if_due();
+        }
+    }
+
+    /// [`Self::insert_batch`] through a shared borrow, concurrently with
+    /// searches and other inserts. Returns whether a calibration is now due;
+    /// the caller runs [`Self::calibrate_if_due`] once it holds the index
+    /// exclusively.
+    pub fn insert_batch_shared(&self, mut items: Vec<(u64, Vec<f32>)>) -> bool {
         use rayon::prelude::*;
         const SEED_DENSITY: usize = 64;
 
@@ -997,11 +1062,10 @@ impl HnswIndex {
         for (id, vector) in items {
             self.insert_shared(id, &vector);
         }
-        let this = &*self;
         rest.par_iter().for_each(|(id, vector)| {
-            this.insert_shared(*id, vector);
+            self.insert_shared(*id, vector);
         });
-        self.calibrate_if_due();
+        self.calibration_due()
     }
 
     /// Bulk-build path for static corpora where every vector is known
@@ -1398,12 +1462,29 @@ impl HnswIndex {
             return None;
         };
         // The slot is this insert's alone: no link or entry point names it
-        // until the caller links the node.
-        let idx = self
-            .node_count
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        // until the caller links the node. A reused slot is reachable from
+        // nothing either: it became free only after every operation that
+        // could still hold it had ended.
+        let idx = match self.reclaim.take_free() {
+            Some(idx) => {
+                block.set_state(idx, data_level0::NodeState::Reserved);
+                // SAFETY: idx < capacity (the slot was in use); its old
+                // layer-0 list names nodes the new one has no edge to.
+                unsafe {
+                    block.update_neighbours(
+                        idx,
+                        |ids| (!ids.is_empty()).then(Box::default),
+                        &self.stats,
+                    )
+                };
+                idx
+            }
+            None => self
+                .node_count
+                .fetch_add(1, core::sync::atomic::Ordering::AcqRel),
+        };
         // SAFETY: the dimension matches the store per `store_for`, and the
-        // fresh slot is unreachable and written by this insert only.
+        // slot is unreachable and written by this insert only.
         unsafe { Self::place_vector(block, idx, vector) };
 
         // Quantize if SQ8 is calibrated.
@@ -1457,6 +1538,8 @@ impl HnswIndex {
     /// the index exclusively, so the caller runs it with
     /// [`Self::calibrate_if_due`].
     pub fn insert_shared(&self, id: u64, vector: &[f32]) -> bool {
+        self.admit();
+        let op = self.begin_operation();
         if let Some(current) = self.id_to_idx.get(id) {
             if self.read_node_f32(current) == Some(vector) {
                 return false;
@@ -1470,11 +1553,11 @@ impl HnswIndex {
         self.nodes().set_state(idx, data_level0::NodeState::Live);
         match self.id_to_idx.insert(id, idx) {
             Some(old) => {
-                self.retire_node(old);
                 // The descent must not start from a node that is never a
                 // result: with a single node it is the only way in.
                 self.entry_point
                     .try_replace(old as u64, new_level as u8, idx as u64);
+                self.retire_node(old, &op.guard);
             }
             None => {
                 self.live_count
@@ -1485,6 +1568,132 @@ impl HnswIndex {
         // layer.
         let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
         self.calibration_due()
+    }
+
+    /// Remove `id` through a shared borrow, concurrently with searches and
+    /// inserts. Its node stops being a result at once; its slot is reused by
+    /// a later insert once no list names it and no operation that could
+    /// reach it is still running. Returns whether `id` was in the index.
+    pub fn remove(&self, id: u64) -> bool {
+        self.admit();
+        let op = self.begin_operation();
+        let Some(idx) = self.id_to_idx.remove(id) else {
+            return false;
+        };
+        self.live_count
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        self.hand_over_entry_point(idx);
+        self.retire_node(idx, &op.guard);
+        true
+    }
+
+    /// Move the entry point off node `old`, which is being removed: to its
+    /// nearest linkable neighbour on the highest layer that has one, else to
+    /// any node that can be a result, else nowhere (the index is empty).
+    fn hand_over_entry_point(&self, old: usize) {
+        if self.entry_point.for_search().map(|(idx, _)| idx) != Some(old) {
+            return;
+        }
+        let store = self.nodes();
+        let n = self.node_len();
+        for level in (0..self.node_levels(old)).rev() {
+            for nb in self.layer_snapshot(old, level) {
+                let nb = nb as usize;
+                if nb < n && nb != old && store.state(nb) == data_level0::NodeState::Live {
+                    let top = self.node_levels(nb) - 1;
+                    if self
+                        .entry_point
+                        .try_replace(old as u64, top as u8, nb as u64)
+                    {
+                        return;
+                    }
+                    // Someone else moved it already.
+                    return;
+                }
+            }
+        }
+        // No neighbour left: the rare isolated node. A linear pass finds any
+        // node still serving; the entry point must not stay on a node whose
+        // slot is about to be reused.
+        if let Some(nb) =
+            (0..n).find(|&i| i != old && store.state(i) == data_level0::NodeState::Live)
+        {
+            let top = self.node_levels(nb) - 1;
+            self.entry_point
+                .try_replace(old as u64, top as u8, nb as u64);
+        } else {
+            self.entry_point.try_clear(old as u64);
+        }
+    }
+
+    /// Pin the epoch and track the operation: every list and slot read until
+    /// the returned value drops stays in place.
+    #[inline]
+    fn begin_operation(&self) -> Operation<'_> {
+        Operation {
+            _tracked: self.stats.begin(),
+            guard: crossbeam_epoch::pin(),
+        }
+    }
+
+    /// Hold an insert or removal off while the replaced lists awaiting
+    /// reclamation exceed the budget. Never called under a pin: a writer
+    /// waiting here must not itself hold back the reclamation it waits for.
+    #[inline]
+    fn admit(&self) {
+        let budget = self
+            .retired_bytes_budget
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if self.stats.retired_bytes() <= budget {
+            return;
+        }
+        self.wait_for_reclamation(budget);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_reclamation(&self, budget: usize) {
+        let started = std::time::Instant::now();
+        let mut last = usize::MAX;
+        loop {
+            // Running the deferred frees of this thread and advancing the
+            // epoch is the part of reclamation a writer can do itself; the
+            // rest waits for the operations still pinned to finish.
+            crossbeam_epoch::pin().flush();
+            let now = self.stats.retired_bytes();
+            if now <= budget {
+                break;
+            }
+            // With no operation running nothing protects what is left: it
+            // sits in the bounded per-thread queues of threads that have not
+            // pinned since, and waiting would not free it.
+            if !self.stats.any_running() && now >= last {
+                break;
+            }
+            last = now;
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        self.stats
+            .admission_waited(started.elapsed().as_nanos() as u64);
+    }
+
+    /// Set [`HnswConfig::retired_bytes_budget`] while the index serves; the
+    /// next insert or removal sees it.
+    pub fn set_retired_bytes_budget(&self, bytes: usize) {
+        self.retired_bytes_budget
+            .store(bytes, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Publication and reclamation figures: replaced lists not yet freed,
+    /// lost compare-and-swaps, admission waits, the oldest running operation
+    /// and the slots on their way to reuse.
+    pub fn publication_stats(&self) -> PublicationSnapshot {
+        let (retired_nodes, free_slots) = self.reclaim.counts();
+        PublicationSnapshot {
+            retired_nodes,
+            free_slots,
+            ..self.stats.snapshot()
+        }
     }
 
     /// Link the freshly allocated node `idx` into the graph: plan against
@@ -1512,12 +1721,12 @@ impl HnswIndex {
                  }| {
                     // An older node of the same id is about to be retired, and a
                     // retired node is never a result: neither is worth a slot.
+                    // Never linking a retired node is also what lets its slot
+                    // be reused once the writers that saw it live are done.
                     let selected = selected_idxs
                         .into_iter()
                         .filter(|&n| {
-                            n != idx
-                                && store.state(n) != data_level0::NodeState::Retired
-                                && self.node_id(n) != id
+                            n != idx && store.state(n).is_linkable() && self.node_id(n) != id
                         })
                         .map(|n| n as u64)
                         .collect();
@@ -1541,21 +1750,134 @@ impl HnswIndex {
         }
     }
 
-    /// Retire node `old`, replaced by a newer node of the same id: it stops
-    /// being a result, and its neighbours drop their edges to it. Edges that
-    /// other nodes keep to it still lead somewhere valid: the slot and its
-    /// lists stay in place for readers that reach it.
-    fn retire_node(&self, old: usize) {
-        self.nodes().set_state(old, data_level0::NodeState::Retired);
+    /// Retire node `old`, removed or replaced by a newer node of the same id:
+    /// it stops being a result and a link target, and its neighbours drop
+    /// their edges to it. Edges that other nodes keep to it still lead
+    /// somewhere valid: the slot and its lists stay in place for readers that
+    /// reach it until the sweep and the epoch have made it free.
+    fn retire_node(&self, old: usize, guard: &crossbeam_epoch::Guard) {
+        let store = self.nodes();
+        store.set_state(old, data_level0::NodeState::Retired);
         let n = self.node_len();
+        let dead = |id: u64| id == old as u64;
         for level in 0..self.node_levels(old) {
-            for nb in self.layer_snapshot(old, level) {
+            let bridge = self.layer_snapshot(old, level);
+            for &nb in &bridge {
                 let nb = nb as usize;
-                if nb < n && level < self.node_levels(nb) {
-                    self.remove_neighbour_from(nb, level, old as u64);
+                if nb < n && store.state(nb).is_linkable() && level < self.node_levels(nb) {
+                    self.layer_update(nb, level, |current| {
+                        self.repaired_list(nb, level, current, &dead, &bridge)
+                    });
                 }
             }
         }
+        self.reclaim.retired(old, guard);
+        // A sweep reads every list once, so it waits for enough slots to be
+        // worth it: a sixteenth of the index, and never fewer than
+        // `SWEEP_MIN_SLOTS`.
+        if self.reclaim.unlinkable_len() >= (n / 16).max(SWEEP_MIN_SLOTS) {
+            self.sweep_unlinkable(guard);
+        }
+    }
+
+    /// `current`, the list of `idx` at `level`, without the slots `dead`
+    /// accepts, refilled from `bridge` (the dead slots' own neighbours at that
+    /// level) by the prune rule, so the gap they leave is bridged rather than
+    /// cut (FreshDiskANN's delete consolidation). `None` when `current` names
+    /// no dead slot.
+    fn repaired_list(
+        &self,
+        idx: usize,
+        level: usize,
+        current: &[u64],
+        dead: &impl Fn(u64) -> bool,
+        bridge: &[u64],
+    ) -> Option<Vec<u64>> {
+        if !current.iter().any(|&nb| dead(nb)) {
+            return None;
+        }
+        let store = self.nodes();
+        let n = self.node_len();
+        let kept: Vec<u64> = current.iter().copied().filter(|&nb| !dead(nb)).collect();
+        let extras: Vec<u64> = bridge
+            .iter()
+            .copied()
+            .filter(|&e| {
+                let e_idx = e as usize;
+                e_idx != idx
+                    && !dead(e)
+                    && e_idx < n
+                    && store.state(e_idx).is_linkable()
+                    && level < self.node_levels(e_idx)
+                    && !kept.contains(&e)
+            })
+            .collect();
+        let max_conn = if level == 0 {
+            self.config.m_max0
+        } else {
+            self.config.m
+        };
+        Some(self.prune_selection(idx, &kept, max_conn, &extras))
+    }
+
+    /// Republish every list that names a slot no writer can link any more
+    /// without it, then queue those slots for reuse. The entry point's slot
+    /// stays queued until the entry point has moved off it.
+    fn sweep_unlinkable(&self, guard: &crossbeam_epoch::Guard) {
+        let store = self.nodes();
+        self.reclaim.sweep_with(guard, |queued| {
+            let entry = self.entry_point.for_search().map(|(idx, _)| idx);
+            let (swept, kept): (Vec<usize>, Vec<usize>) =
+                queued.into_iter().partition(|&idx| Some(idx) != entry);
+            if swept.is_empty() {
+                return (swept, kept);
+            }
+            let dead: rustc_hash::FxHashSet<u64> = swept.iter().map(|&idx| idx as u64).collect();
+            let is_dead = |id: u64| dead.contains(&id);
+            // The swept slots' own lists, per layer: what a list that loses
+            // one of them is refilled from. Still readable, since nothing
+            // reuses a slot before this sweep's pin has ended.
+            let max_level = swept
+                .iter()
+                .map(|&d| self.node_levels(d))
+                .max()
+                .unwrap_or(0);
+            let bridges: Vec<Vec<u64>> = (0..max_level)
+                .map(|level| {
+                    let mut bridge: Vec<u64> = swept
+                        .iter()
+                        .filter(|&&d| level < self.node_levels(d))
+                        .flat_map(|&d| self.layer_snapshot(d, level))
+                        .collect();
+                    bridge.sort_unstable();
+                    bridge.dedup();
+                    bridge
+                })
+                .collect();
+            let n = self.node_len();
+            for idx in 0..n {
+                // A reserved slot is still being written by its insert, which
+                // started after these slots were retired and so never linked
+                // them; a free one is unreachable.
+                if !matches!(
+                    store.state(idx),
+                    data_level0::NodeState::Live | data_level0::NodeState::Retired
+                ) || dead.contains(&(idx as u64))
+                {
+                    continue;
+                }
+                for level in 0..self.node_levels(idx) {
+                    let bridge = bridges.get(level).map_or(&[][..], Vec::as_slice);
+                    self.layer_update(idx, level, |current| {
+                        self.repaired_list(idx, level, current, &is_dead, bridge)
+                    });
+                }
+            }
+            for &idx in &swept {
+                store.set_state(idx, data_level0::NodeState::Free);
+            }
+            (swept, kept)
+        });
     }
 
     /// Whether the configured codec has reached its calibration threshold
@@ -1608,6 +1930,7 @@ impl HnswIndex {
     /// (dequantized) distances for candidate generation. The final top-K
     /// results are reranked using exact f32 distances.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let _op = self.begin_operation();
         // Cache query-side state once per search — for Cosine the query norm
         // would otherwise be recomputed on every distance call (hundreds of
         // times per level). Other metrics ignore the cached norm.
@@ -1701,6 +2024,7 @@ impl HnswIndex {
     /// HNSW overhead exceeds a straight scan, or when recall=1.0 is a hard
     /// requirement (regulatory queries, ground-truth validation).
     fn search_exact(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        let _op = self.begin_operation();
         let n = self.node_len();
         if n == 0 || k == 0 {
             return Vec::new();
@@ -1782,6 +2106,7 @@ impl HnswIndex {
     where
         F: Fn(u64) -> bool,
     {
+        let _op = self.begin_operation();
         let mut stats = coordinode_core::graph::types::VectorMvccStats {
             overfetch_factor,
             ..Default::default()
@@ -1886,6 +2211,7 @@ impl HnswIndex {
         if !self.is_offloaded() {
             return self.search(query, k);
         }
+        let _op = self.begin_operation();
 
         let qctx = QueryCtx::new(
             query,
@@ -1975,6 +2301,7 @@ impl HnswIndex {
                 );
             }
         };
+        let _op = self.begin_operation();
 
         let mut stats = coordinode_core::graph::types::VectorMvccStats {
             overfetch_factor,
@@ -2881,11 +3208,12 @@ impl HnswIndex {
         self.data_level0.get_mut()
     }
 
-    /// `candidates` without the retired nodes: a node replaced by a newer
-    /// one of the same id still guides the descent but is never a result.
+    /// `candidates` without the retired and free nodes: a node removed or
+    /// replaced by a newer one of the same id still guides the descent but is
+    /// never a result.
     fn results_only(&self, mut candidates: Vec<Candidate>) -> Vec<Candidate> {
         if let Some(store) = self.data_level0.get() {
-            candidates.retain(|c| store.state(c.idx as usize) != data_level0::NodeState::Retired);
+            candidates.retain(|c| store.state(c.idx as usize).is_linkable());
         }
         candidates
     }
@@ -2953,13 +3281,14 @@ impl HnswIndex {
             self.data_level0.get().is_some_and(|block| {
                 if block.contains(idx) {
                     // SAFETY: idx < capacity per the gate.
-                    unsafe { block.cas_append_neighbour(idx, id as u32) }
+                    unsafe { block.cas_append_neighbour(idx, id as u32, &self.stats) }
                 } else {
                     false
                 }
             })
         } else {
-            self.neighbours_at(idx, level).cas_append(id)
+            self.neighbours_at(idx, level)
+                .cas_append_up_to_with(id, M_MAX0, Some(&self.stats))
         }
     }
 
@@ -2977,12 +3306,15 @@ impl HnswIndex {
         mut edit: impl FnMut(&[u64]) -> Option<Vec<u64>>,
     ) -> bool {
         if level > 0 {
-            return self.neighbours_at(idx, level).update(|current| {
-                edit(current).map(|mut next| {
-                    next.truncate(M_MAX0);
-                    next.into_boxed_slice()
-                })
-            });
+            return self.neighbours_at(idx, level).update_with(
+                |current| {
+                    edit(current).map(|mut next| {
+                        next.truncate(M_MAX0);
+                        next.into_boxed_slice()
+                    })
+                },
+                Some(&self.stats),
+            );
         }
         let Some(block) = self.data_level0.get() else {
             return false;
@@ -2994,13 +3326,18 @@ impl HnswIndex {
         let mut wide: Vec<u64> = Vec::with_capacity(cap + 1);
         // SAFETY: idx < capacity per the gate above.
         unsafe {
-            block.update_neighbours(idx, |current| {
-                wide.clear();
-                wide.extend(current.iter().map(|&id| u64::from(id)));
-                // Graph indices fit u32: per-shard node count is well below
-                // `u32::MAX`, the same narrowing every layer-0 write makes.
-                edit(&wide).map(|next| next.iter().take(cap).map(|&id| id as u32).collect())
-            })
+            block.update_neighbours(
+                idx,
+                |current| {
+                    wide.clear();
+                    wide.extend(current.iter().map(|&id| u64::from(id)));
+                    // Graph indices fit u32: per-shard node count is well
+                    // below `u32::MAX`, the same narrowing every layer-0
+                    // write makes.
+                    edit(&wide).map(|next| next.iter().take(cap).map(|&id| id as u32).collect())
+                },
+                &self.stats,
+            )
         }
     }
 
@@ -3056,16 +3393,6 @@ impl HnswIndex {
                 Some(scored.into_iter().map(|(_, nid)| nid).collect())
             });
         }
-    }
-
-    /// Remove every occurrence of `id` from `(idx, level)`. No-op if `id`
-    /// is absent.
-    fn remove_neighbour_from(&self, idx: usize, level: usize, id: u64) {
-        self.layer_update(idx, level, |current| {
-            current
-                .contains(&id)
-                .then(|| current.iter().copied().filter(|&nid| nid != id).collect())
-        });
     }
 
     /// Compute distance between two nodes in the graph.

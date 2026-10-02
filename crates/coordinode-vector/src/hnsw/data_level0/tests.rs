@@ -1,5 +1,10 @@
 use super::*;
 
+/// Fresh counters for the list writes a test makes.
+fn stats() -> Arc<PublicationStats> {
+    Arc::new(PublicationStats::new())
+}
+
 /// The block holds only the vectors: a node's stride is its f32 vector
 /// rounded up to 8 bytes, whatever `m_max0` is, because the neighbours live
 /// in their published lists.
@@ -250,11 +255,12 @@ fn rejects_zero_capacity() {
 #[test]
 fn cas_append_grows_in_order() {
     let block = DataLevel0Block::new(2, M_MAX0, 8);
+    let stats = stats();
     // SAFETY: idx 0 < capacity.
     unsafe {
-        assert!(block.cas_append_neighbour(0, 5));
-        assert!(block.cas_append_neighbour(0, 7));
-        assert!(block.cas_append_neighbour(0, 9));
+        assert!(block.cas_append_neighbour(0, 5, &stats));
+        assert!(block.cas_append_neighbour(0, 7, &stats));
+        assert!(block.cas_append_neighbour(0, 9, &stats));
         assert_eq!(block.neighbour_count(0), 3);
     }
     let mut out = Vec::new();
@@ -269,13 +275,17 @@ fn cas_append_grows_in_order() {
 fn cas_append_returns_false_when_full() {
     // m_max0 = 4 so the list fills quickly.
     let block = DataLevel0Block::new(1, 4, 8);
+    let stats = stats();
     // SAFETY: idx 0 < capacity.
     unsafe {
         for i in 0..4 {
-            assert!(block.cas_append_neighbour(0, i), "append {i} should fit");
+            assert!(
+                block.cas_append_neighbour(0, i, &stats),
+                "append {i} should fit"
+            );
         }
         assert!(
-            !block.cas_append_neighbour(0, 99),
+            !block.cas_append_neighbour(0, 99, &stats),
             "append past m_max0 must fail"
         );
     }
@@ -293,7 +303,7 @@ fn set_neighbours_then_cas_append_extends() {
     // SAFETY: idx 0 < capacity, ids fit m_max0.
     unsafe {
         block.set_neighbours(0, &[1, 2, 3]);
-        assert!(block.cas_append_neighbour(0, 4));
+        assert!(block.cas_append_neighbour(0, 4, &stats()));
     }
     let mut out = Vec::new();
     // SAFETY: idx 0 < capacity.
@@ -307,6 +317,8 @@ fn set_neighbours_then_cas_append_extends() {
 fn cas_append_concurrent_writers_keep_count_consistent() {
     let block = DataLevel0Block::new(1, M_MAX0, 8);
     let block_ref = &block;
+    let stats = stats();
+    let stats_ref = &stats;
     let n_writers: u32 = 32;
     std::thread::scope(|s| {
         for w in 0..n_writers {
@@ -314,7 +326,7 @@ fn cas_append_concurrent_writers_keep_count_consistent() {
                 // SAFETY: idx 0 < capacity; concurrent cas_append is the
                 // documented contract.
                 unsafe {
-                    assert!(block_ref.cas_append_neighbour(0, w));
+                    assert!(block_ref.cas_append_neighbour(0, w, stats_ref));
                 }
             });
         }
@@ -370,13 +382,15 @@ fn replace_is_observed_whole_on_layer0() {
 fn cas_append_concurrent_append_and_snapshot_no_torn_state() {
     let block = DataLevel0Block::new(1, M_MAX0, 8);
     let block_ref = &block;
+    let stats = stats();
+    let stats_ref = &stats;
     std::thread::scope(|s| {
         // Appender fills the list one id at a time.
         s.spawn(move || {
             for i in 0..M_MAX0 as u32 {
                 // SAFETY: idx 0 < capacity.
                 unsafe {
-                    block_ref.cas_append_neighbour(0, i);
+                    block_ref.cas_append_neighbour(0, i, stats_ref);
                 }
             }
         });

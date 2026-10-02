@@ -16,20 +16,28 @@ use std::collections::VecDeque;
 
 use super::HnswIndex;
 
+/// `new_of_old` entry of a slot the reorder compacts away.
+pub(super) const DROPPED: usize = usize::MAX;
+
 impl HnswIndex {
-    /// Compute a BFS visit-order permutation of node indices.
+    /// Compute a BFS visit-order numbering of the live nodes.
     ///
     /// Returns `new_of_old`, where `new_of_old[old_idx]` is the node's position
     /// in a breadth-first traversal of the layer-0 graph starting at the entry
-    /// point. Nodes unreachable from the entry point retain their relative order
-    /// and are appended after every reachable node. The result is always a
-    /// bijection of `0..self.nodes.len()`.
+    /// point, or [`DROPPED`] for a slot whose node is removed, replaced or
+    /// free: those are compacted away. Live nodes unreachable from the entry
+    /// point retain their relative order and follow every reachable one. The
+    /// live nodes are numbered `0..live` without gaps.
     pub(super) fn compute_bfs_permutation(&self) -> Vec<usize> {
         let n = self.node_len();
-        let mut new_of_old = vec![usize::MAX; n];
+        let mut new_of_old = vec![DROPPED; n];
         if n == 0 {
             return new_of_old;
         }
+        let store = self.nodes();
+        let live = |idx: usize| store.state(idx) == super::data_level0::NodeState::Live;
+        // Every slot is visited once; only the live ones are numbered.
+        let mut seen = vec![false; n];
 
         let mut queue: VecDeque<usize> = VecDeque::with_capacity(n);
         let mut next_new = 0usize;
@@ -46,35 +54,39 @@ impl HnswIndex {
             .map(|(idx, _top_level)| idx)
             .unwrap_or(0);
         if start < n {
-            new_of_old[start] = next_new;
-            next_new += 1;
+            seen[start] = true;
+            if live(start) {
+                new_of_old[start] = next_new;
+                next_new += 1;
+            }
             queue.push_back(start);
         }
 
+        // A retired node still bridges parts of the graph, so the walk goes
+        // through it; it only takes no number.
         while let Some(old) = queue.pop_front() {
             self.read_layer0_neighbours_into(old, &mut buf);
             for &nb in &buf {
                 let nb = nb as usize;
-                if nb < n && new_of_old[nb] == usize::MAX {
-                    new_of_old[nb] = next_new;
-                    next_new += 1;
+                if nb < n && !seen[nb] {
+                    seen[nb] = true;
+                    if live(nb) {
+                        new_of_old[nb] = next_new;
+                        next_new += 1;
+                    }
                     queue.push_back(nb);
                 }
             }
         }
 
-        // Nodes unreachable from the entry point keep their relative order and
-        // follow the reachable set, so the permutation stays a full bijection.
-        for slot in new_of_old.iter_mut() {
-            if *slot == usize::MAX {
+        // Live nodes unreachable from the entry point keep their relative
+        // order and follow the reachable set.
+        for (old, slot) in new_of_old.iter_mut().enumerate() {
+            if *slot == DROPPED && live(old) {
                 *slot = next_new;
                 next_new += 1;
             }
         }
-        debug_assert_eq!(
-            next_new, n,
-            "permutation must cover every node exactly once"
-        );
         new_of_old
     }
 
@@ -82,11 +94,12 @@ impl HnswIndex {
     ///
     /// Renumbers every node by [`compute_bfs_permutation`](Self::compute_bfs_permutation)
     /// so graph-adjacent nodes become memory-adjacent across the SoA arrays and
-    /// the contiguous layer-0 blocks. The graph is unchanged — only node indices
-    /// are permuted and every stored neighbour index is remapped — so search
-    /// results are identical before and after. A post-build, single-writer
-    /// operation (`&mut self`); not safe to run concurrently with inserts or
-    /// searches.
+    /// the contiguous layer-0 blocks. The slots of removed and replaced nodes
+    /// are compacted away and every edge to them dropped; the live graph is
+    /// otherwise unchanged (indices permuted, every stored neighbour index
+    /// remapped), so search results are identical before and after. A
+    /// post-build, single-writer operation (`&mut self`); not safe to run
+    /// concurrently with inserts or searches.
     pub(crate) fn reorder_for_cache_locality(&mut self) {
         let n = self.node_len();
         if n < 2 {
@@ -96,29 +109,43 @@ impl HnswIndex {
         self.apply_permutation(&new_of_old);
     }
 
-    /// Apply a `new_of_old` index permutation to every per-node store.
+    /// Apply a `new_of_old` numbering to every per-node store, dropping the
+    /// slots it maps to [`DROPPED`].
     ///
     /// Two-phase to avoid read-while-write aliasing in the byte blocks: phase A
-    /// snapshots all per-node payload (under `&self`) with neighbour indices
-    /// already remapped into the new index space; phase B rebuilds each store in
-    /// the new order from those snapshots. `new_of_old` must be a bijection of
-    /// `0..self.nodes.len()`.
+    /// snapshots the payload of every kept node (under `&self`) with neighbour
+    /// indices already remapped into the new index space and edges to dropped
+    /// slots removed; phase B rebuilds each store in the new order from those
+    /// snapshots. The kept nodes must be numbered `0..kept` without gaps.
     fn apply_permutation(&mut self, new_of_old: &[usize]) {
-        let n = self.node_len();
-        debug_assert_eq!(new_of_old.len(), n);
+        debug_assert_eq!(new_of_old.len(), self.node_len());
+        let remap = |id: u64| {
+            let new = new_of_old[id as usize];
+            (new != DROPPED).then_some(new)
+        };
 
         // Inverse: old_of_new[new] = old. Drives the rebuild order.
+        let kept: Vec<(usize, usize)> = new_of_old
+            .iter()
+            .enumerate()
+            .filter(|&(_, &new)| new != DROPPED)
+            .map(|(old, &new)| (old, new))
+            .collect();
+        let n = kept.len();
         let mut old_of_new = vec![0usize; n];
-        for (old, &new) in new_of_old.iter().enumerate() {
+        for &(old, new) in &kept {
             old_of_new[new] = old;
         }
 
-        // --- Step A: snapshot per-old payload (neighbours remapped) ---
-        // Layer-0 f32 + neighbours, indexed by OLD idx.
+        // --- Step A: snapshot every kept node's payload, by NEW idx ---
+        // Layer-0 f32 + neighbours, upper-layer neighbours (outer = node,
+        // mid = layer, inner = remapped ids), and the node's id and norm.
         let mut l0_vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut l0_nbrs: Vec<Vec<u32>> = Vec::with_capacity(n);
+        let mut upper: Vec<Vec<Vec<u64>>> = Vec::with_capacity(n);
+        let mut meta: Vec<(u64, f32)> = Vec::with_capacity(n);
         let mut nb_buf: Vec<u64> = Vec::new();
-        for old in 0..n {
+        for &old in &old_of_new {
             l0_vecs.push(
                 self.read_node_f32(old)
                     .map(<[f32]>::to_vec)
@@ -128,76 +155,85 @@ impl HnswIndex {
             l0_nbrs.push(
                 nb_buf
                     .iter()
-                    .map(|&id| new_of_old[id as usize] as u32)
+                    .filter_map(|&id| remap(id))
+                    .map(|new| new as u32)
                     .collect(),
             );
-        }
-
-        // Upper-layer neighbours per OLD idx: outer = node, mid = layer, inner =
-        // remapped neighbour ids. The node's id and norm travel with it.
-        let mut upper: Vec<Vec<Vec<u64>>> = Vec::with_capacity(n);
-        let mut meta: Vec<(u64, f32, super::data_level0::NodeState)> = Vec::with_capacity(n);
-        for old in 0..n {
             let levels = self.node_levels(old);
-            let mut per_layer = Vec::with_capacity(levels - 1);
-            for level in 1..levels {
-                let mut snap = self.neighbours_at(old, level).snapshot();
-                for id in snap.iter_mut() {
-                    *id = new_of_old[*id as usize] as u64;
-                }
-                per_layer.push(snap);
-            }
+            let per_layer = (1..levels)
+                .map(|level| {
+                    self.neighbours_at(old, level)
+                        .snapshot()
+                        .into_iter()
+                        .filter_map(remap)
+                        .map(|new| new as u64)
+                        .collect()
+                })
+                .collect();
             upper.push(per_layer);
             meta.push((
                 self.node_id(old),
                 self.nodes().norm(old).unwrap_or_default(),
-                self.nodes().state(old),
             ));
         }
 
         // Reconstruct the entry from `load` (the canonical packed representation
         // `try_promote` round-trips), remapping its idx. Using `for_search`'s
         // derived level here would mis-encode the entry and change search starts.
-        let entry = self
-            .entry_point
-            .load()
-            .map(|(level, idx)| (level, new_of_old[idx as usize] as u64));
+        // Should the entry name a dropped slot, it moves to the first kept
+        // node at that node's own top layer: the entry point never names a
+        // slot that no longer exists.
+        let entry = match self.entry_point.load() {
+            Some((level, idx)) => match remap(idx) {
+                Some(new) => Some((level, new as u64)),
+                None => (n > 0).then(|| ((upper[0].len()) as u8, 0)),
+            },
+            None => None,
+        };
 
         // --- Step B: rebuild every store in new order ---
 
-        // Node store: every node rebuilt at its new index with its id, norm,
-        // f32 vector, codes and remapped lists on every layer.
+        // Node store: every kept node rebuilt at its new index with its id,
+        // norm, f32 vector, codes and remapped lists on every layer.
         if let Some(mut old_block) = self.data_level0.take() {
-            let mut codes: Vec<_> = (0..n).map(|old| old_block.take_codes(old)).collect();
+            let mut codes: Vec<_> = old_of_new
+                .iter()
+                .map(|&old| old_block.take_codes(old))
+                .collect();
             let dim = old_block.dim();
             let m = old_block.m_max0();
-            let cap = old_block.capacity().max(n);
+            let cap = old_block.capacity().max(n.max(1));
             let has_f32 = old_block.has_f32();
             let mut nb = super::data_level0::DataLevel0Block::new(cap, m, dim);
             if !has_f32 {
                 nb.drop_f32();
             }
-            for (new, &old) in old_of_new.iter().enumerate() {
-                let (id, norm, state) = meta[old];
-                let per_layer = std::mem::take(&mut upper[old]);
-                let (sq8, rabitq) = std::mem::take(&mut codes[old]);
+            for new in 0..n {
+                let (id, norm) = meta[new];
+                let per_layer = std::mem::take(&mut upper[new]);
+                let (sq8, rabitq) = std::mem::take(&mut codes[new]);
                 // SAFETY: new < n <= cap; `nb` is owned here, so nothing else
                 // reads or writes it.
                 unsafe {
                     nb.init_node(new, id, norm, per_layer.len());
                     nb.set_codes(new, sq8, rabitq);
-                    if has_f32 && !l0_vecs[old].is_empty() {
-                        nb.set_vector(new, &l0_vecs[old]);
+                    if has_f32 && !l0_vecs[new].is_empty() {
+                        nb.set_vector(new, &l0_vecs[new]);
                     }
-                    nb.set_neighbours(new, &l0_nbrs[old]);
+                    nb.set_neighbours(new, &l0_nbrs[new]);
                     for (layer, ids) in per_layer.iter().enumerate() {
                         nb.upper(new, layer + 1).set(ids);
                     }
                 }
-                nb.set_state(new, state);
+                nb.set_state(new, super::data_level0::NodeState::Live);
             }
             self.data_level0 = std::sync::OnceLock::from(nb);
         }
+        self.node_count = core::sync::atomic::AtomicUsize::new(n);
+        self.live_count = core::sync::atomic::AtomicUsize::new(n);
+        // Every retired slot is gone and the numbering changed: the slots
+        // queued for reuse mean nothing any more.
+        self.reclaim.reset();
 
         // The code block is a copy of the nodes' RaBitQ codes laid out for
         // the search fast path: refill it from the codes moved above.
@@ -222,8 +258,8 @@ impl HnswIndex {
 
         // id -> idx map and entry point follow the new numbering.
         self.id_to_idx.clear();
-        for (new, &old) in old_of_new.iter().enumerate() {
-            self.id_to_idx.insert(meta[old].0, new);
+        for (new, &(id, _)) in meta.iter().enumerate() {
+            self.id_to_idx.insert(id, new);
         }
         self.entry_point = super::entry_point::EntryPoint::new();
         if let Some((level, idx)) = entry {

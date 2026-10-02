@@ -104,6 +104,29 @@ The CREATE response row includes a `state` field (`"building" | "ready" |
 "failed"`) so clients can poll for completion or surface the status in a
 control plane.
 
+#### Searching while writing
+
+A ready index keeps serving searches while vectors are inserted, updated and
+removed: writes do not wait for searches, and searches do not wait for
+writes. Each node's neighbour list is replaced whole, so a search always
+walks a complete list, old or new. Two steps still take the index for a
+moment: the one-time calibration of a quantized index, which re-encodes
+every vector when the index first reaches its calibration size, and, while a
+backfill runs, each batch it folds in from the writes that landed meanwhile.
+
+When a node is deleted, or loses its vector property or the indexed label,
+it leaves the index once that change is committed; until then the query
+reads the committed data and never returns it. The links around a removed
+node are repaired from its own neighbours, and its slot is reused by a later
+insert, so an index under steady deletes and inserts does not grow without
+bound. An update builds the node anew and retires the old one the same way.
+
+A search keeps the lists replaced after it began until it finishes. The
+server's `vector_retired_bytes_budget` (default 256 MiB, see
+[Configuration](../guide/configuration.md)) bounds that memory per index:
+past it, writes hold off until running searches finish. They are slowed,
+never dropped.
+
 #### Graph predicate pushdown
 
 When a query combines a vector top-K sort with a sibling label or simple

@@ -55,12 +55,14 @@ pub trait VectorStore: Send + Sync {
     /// ```
     fn insert(&self, node_id: u64, vector: Vec<f32>) -> StoreResult<()>;
 
-    /// Mark a node's vector as deleted.
+    /// Remove a node's vector: it stops being a result at once, the graph
+    /// around it is repaired, and its slot is reused by a later insert.
+    /// Concurrent with searches and inserts. Removing an absent node is a
+    /// no-op.
     ///
-    /// HNSW graph deletion is unsupported by design; physical removal
-    /// fragments the graph. This call is a no-op — callers MUST apply
-    /// an MVCC visibility filter to search results to suppress
-    /// tombstoned IDs.
+    /// Call it once the deletion is committed: a removal made ahead of the
+    /// commit would lose the vector of a deletion that then aborts. Readers
+    /// still apply the MVCC visibility filter for deletions not yet removed.
     ///
     /// # Examples
     ///
@@ -68,7 +70,9 @@ pub trait VectorStore: Send + Sync {
     /// # use coordinode_modality::{LocalVectorStore, VectorStore};
     /// # use coordinode_vector::hnsw::HnswConfig;
     /// let store = LocalVectorStore::new(HnswConfig::default());
-    /// store.remove(42)?; // no-op at the index level
+    /// store.insert(42, vec![1.0, 0.0])?;
+    /// store.remove(42)?;
+    /// assert!(store.knn_search(&[1.0, 0.0], 1)?.is_empty());
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     fn remove(&self, node_id: u64) -> StoreResult<()>;
@@ -255,9 +259,9 @@ impl VectorStore for LocalVectorStore {
         Ok(())
     }
 
-    fn remove(&self, _node_id: u64) -> StoreResult<()> {
-        // Intentional no-op. See trait doc — MVCC visibility filter
-        // handles tombstoning at the query layer.
+    fn remove(&self, node_id: u64) -> StoreResult<()> {
+        // Shared, like an insert: the removal runs beside searches.
+        self.read()?.remove(node_id);
         Ok(())
     }
 

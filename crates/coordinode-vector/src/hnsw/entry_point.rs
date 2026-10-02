@@ -160,6 +160,18 @@ impl EntryPoint {
         }
     }
 
+    /// Empty the entry point if it still names node `old`: the last node of
+    /// the index was removed. Returns whether it was emptied.
+    pub fn try_clear(&self, old: u64) -> bool {
+        let cur = self.inner.load(Ordering::SeqCst);
+        cur != SENTINEL
+            && unpack(cur).1 == old
+            && self
+                .inner
+                .compare_exchange(cur, SENTINEL, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
     /// Outcome of [`try_promote`] — communicates whether the caller's
     /// insert actually owns the entry-point now, or another insert
     /// already had a higher (or equal) level.

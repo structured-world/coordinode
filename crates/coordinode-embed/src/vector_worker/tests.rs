@@ -176,6 +176,43 @@ fn applied_entries_reach_the_index() {
     assert_eq!(nearest.first().map(|r| r.id), Some(5));
 }
 
+/// An applied deletion takes the node out of the index, and an applied write
+/// that strips the vector does too; the other nodes stay.
+#[test]
+fn applied_deletions_leave_the_index() {
+    let fx = fixture();
+    let worker = fx.spawn(1024);
+    for id in 1..=5u64 {
+        fx.apply(id, &[fx.put_item(id, id as f32)]);
+    }
+    assert_eq!(fx.await_indexed(5), 5);
+
+    fx.apply(
+        6,
+        &[Mutation::Delete {
+            partition: PartitionId::Node,
+            key: encode_node_key(SHARD, NodeId::from_raw(3)),
+        }],
+    );
+    fx.apply(
+        7,
+        &[Mutation::Put {
+            partition: PartitionId::Node,
+            key: encode_node_key(SHARD, NodeId::from_raw(4)),
+            value: NodeRecord::new("Item").to_msgpack().unwrap(),
+        }],
+    );
+
+    let indexed = fx.await_indexed(3);
+    worker.shutdown();
+    assert_eq!(indexed, 3, "the deleted and the stripped node left");
+    let handle = fx.registry.get("Item", "embedding").unwrap();
+    let graph = handle.read().unwrap();
+    for id in [1u64, 2, 5] {
+        assert!(graph.contains(id), "node {id} left the index");
+    }
+}
+
 /// A store replaced by a snapshot is read afresh: the nodes it holds reach
 /// the index though no entry carried them.
 #[test]
@@ -183,11 +220,12 @@ fn a_snapshot_installed_is_rebuilt_from_the_store() {
     let fx = fixture();
     let worker = fx.spawn(1024);
 
-    // Written into the store outside the applies, as an installed snapshot
-    // writes it; then the install is recorded.
+    // Written into the store outside the applies and the commits, as an
+    // installed snapshot writes it, with no event per key; then the install
+    // is recorded.
     for id in 1..=5u64 {
         fx.engine
-            .apply_proposal_at(&[fx.put_item(id, id as f32)], id)
+            .apply_mutation(&fx.put_item(id, id as f32))
             .unwrap();
     }
     fx.engine.reset_raft_coverage(6, &[]).unwrap();

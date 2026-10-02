@@ -26,15 +26,20 @@
 //! ## Concurrency
 //!
 //! Neighbour reads and writes and growth take `&self` and are safe under any
-//! mix of readers and writers. A node's f32 vector is written once by the
-//! writer that owns the node, before the node becomes reachable through a
-//! link or the entry point ([`DataLevel0Block::set_vector`]); dropping the
-//! vectors takes `&mut self`.
+//! mix of readers and writers. A node's f32 vector, scalars and codes are
+//! written by the writer that owns the slot, before the node becomes
+//! reachable through a link or the entry point
+//! ([`DataLevel0Block::set_vector`]). A slot is rewritten for a new node only
+//! once it is [`Free`](NodeState::Free) and no operation that could still
+//! reach the old node is running; dropping the vectors takes `&mut self`.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use std::sync::Arc;
+
 use super::neighbours::AtomicNeighbourList;
+use super::stats::PublicationStats;
 use super::{M_MAX0, RabitqEncoded};
 
 /// Per-node vector alignment: keeps every node's f32 vector f32-aligned and
@@ -67,8 +72,8 @@ impl NodeMeta {
     }
 }
 
-/// Where a node is in its life. A slot is never reused, so the state only
-/// moves forward.
+/// Where a slot is in its life: `Reserved`, `Live`, `Retired`, `Free`, and
+/// from `Free` back to `Reserved` when an insert reuses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(super) enum NodeState {
@@ -76,9 +81,21 @@ pub(super) enum NodeState {
     Reserved = 0,
     /// Linked and answering queries.
     Live = 1,
-    /// Replaced by a newer node of the same id: still navigable for readers
-    /// that reach it through a remaining link, never a result.
+    /// Removed, or replaced by a newer node of the same id: still navigable
+    /// for readers that reach it through a remaining link, never a result,
+    /// never a new link.
     Retired = 2,
+    /// No list names the slot any more; it is reused once no operation that
+    /// read a list naming it is still running.
+    Free = 3,
+}
+
+impl NodeState {
+    /// Whether the slot may be a result or a new neighbour.
+    #[inline]
+    pub(super) fn is_linkable(self) -> bool {
+        matches!(self, Self::Reserved | Self::Live)
+    }
 }
 
 /// The neighbour lists of one node above layer 0, one per layer.
@@ -143,10 +160,11 @@ impl Segment {
 }
 
 // SAFETY: the lists and scalars are `Sync`. The vector bytes, the upper lists'
-// box and the codes are written only by the writer that owns a node, before
+// box and the codes are written only by the writer that owns a slot, before
 // the node is reachable, and read only after it was reached through a
-// release-published link or entry point; every other write goes through
-// `&mut self` or an exclusive calibration.
+// release-published link or entry point; a reused slot is written only after
+// every operation that could reach its previous node has ended. Every other
+// write goes through `&mut self` or an exclusive calibration.
 unsafe impl Sync for Segment {}
 
 /// The layer-0 store. See the module doc for layout and concurrency.
@@ -475,6 +493,7 @@ impl DataLevel0Block {
         {
             1 => NodeState::Live,
             2 => NodeState::Retired,
+            3 => NodeState::Free,
             _ => NodeState::Reserved,
         }
     }
@@ -718,9 +737,10 @@ impl DataLevel0Block {
         &self,
         idx: usize,
         edit: impl FnMut(&[u32]) -> Option<Box<[u32]>>,
+        stats: &Arc<PublicationStats>,
     ) -> bool {
         // SAFETY: idx bound per contract.
-        unsafe { self.list(idx) }.update(edit)
+        unsafe { self.list(idx) }.update_with(edit, Some(stats))
     }
 
     /// Append `id` to node `idx`'s layer-0 list under concurrent writers.
@@ -730,9 +750,14 @@ impl DataLevel0Block {
     /// # Safety
     ///
     /// `idx < self.capacity()`.
-    pub(super) unsafe fn cas_append_neighbour(&self, idx: usize, id: u32) -> bool {
+    pub(super) unsafe fn cas_append_neighbour(
+        &self,
+        idx: usize,
+        id: u32,
+        stats: &Arc<PublicationStats>,
+    ) -> bool {
         // SAFETY: idx bound per contract.
-        unsafe { self.list(idx) }.cas_append_up_to(id, self.m_max0)
+        unsafe { self.list(idx) }.cas_append_up_to_with(id, self.m_max0, Some(stats))
     }
 
     /// Install the f32 vector for node `idx`.

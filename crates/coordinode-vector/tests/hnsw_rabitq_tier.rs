@@ -77,6 +77,7 @@ fn rabitq_inserts_persist_originals_through_tier() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: N as u32,
+        retired_bytes_budget: coordinode_vector::hnsw::DEFAULT_RETIRED_BYTES_BUDGET,
     });
     index.set_vector_tier(Some(tier_handle));
 

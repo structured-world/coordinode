@@ -1,8 +1,9 @@
-//! Incremental HNSW maintenance from the applied Raft entries.
+//! Incremental HNSW maintenance from the applied commits.
 //!
 //! [`VectorIndexWorker`] follows the entries this node's Raft state machine
-//! applies and keeps every registered vector index current with the node
-//! records they wrote. It works from what has applied, never from the log:
+//! applies (on an embedded store without Raft, its local commits) and keeps
+//! every registered vector index current with the node records they wrote,
+//! removals included. It works from what has applied, never from the log:
 //! an entry appended to the log may never commit, and one committed is not in
 //! the store until it applies, so reading the log ahead of the applies would
 //! insert vectors that never become data and pass over writes that land after
@@ -158,6 +159,11 @@ impl Worker {
 
     /// Bring the nodes behind `keys` into every index that covers them.
     fn fold(&self, keys: FxHashSet<Vec<u8>>) {
+        // A store without vector indexes pays no read for its commits.
+        let definitions = self.registry.all_definitions();
+        if definitions.is_empty() {
+            return;
+        }
         let ids: Vec<NodeId> = keys
             .iter()
             .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
@@ -187,24 +193,30 @@ impl Worker {
             }
         };
         for (node_id, record) in ids.into_iter().zip(records) {
-            // A deleted node stays in the graph as a stale entry the read path
-            // re-validates, the same as a write-path delete leaves it.
-            let Some(record) = record else {
-                continue;
-            };
-            let label = record.primary_label();
-            for property in self.registry.indexed_properties(label) {
-                let Some(field_id) = interner.lookup(&property) else {
-                    continue;
-                };
-                let Some(value) = record.props.get(&field_id) else {
-                    continue;
-                };
-                let Some(vector) = crate::db::try_extract_vector(value) else {
-                    continue;
-                };
-                self.registry
-                    .on_vector_written(label, node_id, &property, &vector);
+            // Every index is reconciled against the record as it stands: a
+            // member is upserted, and a node that left an index (deleted,
+            // relabelled, stripped of its vector) is removed from it. Node
+            // ids are never reused, and every later commit that touches the
+            // node is folded again, so acting on the committed record never
+            // leaves an index behind the data.
+            for def in &definitions {
+                let property = def.property();
+                let vector = record
+                    .as_ref()
+                    .filter(|r| r.primary_label() == def.label)
+                    .and_then(|r| r.props.get(&interner.lookup(property)?))
+                    .and_then(crate::db::try_extract_vector);
+                match vector {
+                    Some(vector) => {
+                        self.registry
+                            .on_vector_written(&def.label, node_id, property, &vector);
+                    }
+                    None if self.registry.holds(&def.label, property, node_id) => {
+                        self.registry
+                            .on_vector_removed(&def.label, property, node_id);
+                    }
+                    None => {}
+                }
             }
         }
     }

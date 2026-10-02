@@ -722,6 +722,7 @@ fn make_sq8_config(metric: VectorMetric) -> HnswConfig {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     }
 }
 
@@ -817,6 +818,7 @@ fn sq8_reranking_improves_accuracy() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     let dim = 16;
@@ -903,6 +905,7 @@ fn sq8_recall_vs_non_quantized() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     for (i, v) in vectors.iter().enumerate() {
@@ -988,6 +991,7 @@ fn rabitq_recall_sanity_cosine() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: n as u32,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     for (i, v) in vectors.iter().enumerate() {
@@ -1088,6 +1092,7 @@ fn rabitq_recall_cosine_dim_100_with_padding() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: n as u32,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     for (i, v) in vectors.iter().enumerate() {
@@ -1189,6 +1194,7 @@ fn extended_rabitq_recall_sanity_cosine_2bit() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: n as u32,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     for (i, v) in vectors.iter().enumerate() {
@@ -1635,6 +1641,7 @@ fn make_offload_config(metric: VectorMetric) -> HnswConfig {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     }
 }
 
@@ -1852,14 +1859,21 @@ fn insert_updates_existing_node_vector_and_graph_position() {
         ids_right
     );
 
-    // Query "up" → node 1 must NO LONGER be the top result (its vector changed).
-    // Node 2 or 3 should win for "up" now.
-    let after_up = index.search(&[0.0, 1.0], 1);
-    assert_ne!(
-        after_up.first().map(|r| r.id),
-        Some(1),
-        "after update: 'up' query must NOT return node 1 (its vector is now 'right'). Got: {:?}",
-        after_up
+    // Query "up" → nothing points up any more: node 1 answers with its new
+    // vector's distance, never the 0.0 of its old one. Nodes 1 and 2 now both
+    // point right and tie at cosine distance 1.0, so either may come first.
+    let after_up = index.search(&[0.0, 1.0], 3);
+    let node1 = after_up
+        .iter()
+        .find(|r| r.id == 1)
+        .expect("node 1 is still in the index");
+    assert!(
+        (node1.score - 1.0).abs() < 1e-6,
+        "after update: node 1 must score its new 'right' vector against 'up'. Got: {after_up:?}"
+    );
+    assert!(
+        after_up.iter().all(|r| r.score > 0.5),
+        "after update: no node points up any more. Got: {after_up:?}"
     );
 }
 
@@ -1886,6 +1900,7 @@ fn atomic_neighbours_track_inserts_and_updates() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     });
 
     for i in 0..30u64 {
@@ -2109,6 +2124,7 @@ fn insert_batch_matches_serial_insert_topology() {
             rerank_oversample_factor: 1.0,
             alpha_pruning: 1.0,
             max_elements: 1_000,
+            retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
         }
     }
     fn make_vec(i: u64) -> Vec<f32> {
@@ -2220,6 +2236,7 @@ fn insert_batch_chunked_preserves_recall_vs_brute_force() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: n_train as u32,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     };
     fn make_vec(i: u64, dim: usize) -> Vec<f32> {
         (0..dim)
@@ -2301,6 +2318,7 @@ fn a_single_large_insert_batch_keeps_recall() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: n_train as u32,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     };
     fn make_vec(i: u64, dim: usize) -> Vec<f32> {
         (0..dim)
@@ -2357,6 +2375,7 @@ fn insert_batch_below_threshold_runs_sequentially() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 100,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     };
     let mut idx = HnswIndex::new(cfg);
     let items: Vec<(u64, Vec<f32>)> = (0..8u64)
@@ -2393,6 +2412,7 @@ fn insert_batch_handles_mixed_new_and_existing_ids() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 100,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     };
     let mut idx = HnswIndex::new(cfg);
     for i in 0..10u64 {
@@ -2437,6 +2457,7 @@ fn concurrent_inserts_under_live_search_land_every_node() {
         rerank_oversample_factor: 1.0,
         alpha_pruning: 1.0,
         max_elements: 1_000,
+        retired_bytes_budget: super::DEFAULT_RETIRED_BYTES_BUDGET,
     };
     let idx = HnswIndex::new(cfg);
     // Vectors with no locality along the id, so the comparison with a
@@ -2571,6 +2592,339 @@ fn update_moves_the_id_and_retires_the_old_node() {
         exact.iter().filter(|r| r.id == 7).count(),
         1,
         "id counted once"
+    );
+}
+
+/// Let the epoch run what it deferred. Each test runs in a process of its
+/// own, so once this thread stops pinning, flushes move the epoch past every
+/// pin the test took; each flush runs only a few queued batches, so it takes
+/// many to run them all.
+fn drain_epoch() {
+    for _ in 0..4_096 {
+        crossbeam_epoch::pin().flush();
+    }
+}
+
+/// Take every removed slot of `index` to free now, whatever the sweep
+/// threshold: the epoch, the sweep, the epoch again.
+fn reclaim_now(index: &HnswIndex) {
+    drain_epoch();
+    let guard = crossbeam_epoch::pin();
+    index.sweep_unlinkable(&guard);
+    drop(guard);
+    drain_epoch();
+}
+
+/// No list of a node that can be reached names a free slot: a free slot is
+/// about to hold another node, and an edge to it would lead there.
+fn assert_no_edge_to_a_free_slot(index: &HnswIndex) {
+    let store = index.nodes();
+    for idx in 0..index.node_len() {
+        if !store.state(idx).is_linkable() {
+            continue;
+        }
+        for level in 0..index.node_levels(idx) {
+            for nb in index.layer_snapshot(idx, level) {
+                assert_ne!(
+                    store.state(nb as usize),
+                    data_level0::NodeState::Free,
+                    "node {idx} layer {level} names free slot {nb}"
+                );
+            }
+        }
+    }
+}
+
+/// A graph dense enough that every node is found by its own vector before
+/// any removal, so a miss after one is the removal's doing.
+fn removal_config() -> HnswConfig {
+    HnswConfig {
+        m: 16,
+        m_max0: 32,
+        ef_construction: 100,
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        ..Default::default()
+    }
+}
+
+/// A removed id is never a result again, by approximate or exact search, and
+/// is counted out; every other id stays findable, through the repair of the
+/// removed nodes' neighbours. Removing it twice, or removing an id never
+/// inserted, is a no-op that says so.
+#[test]
+fn removed_ids_are_never_results() {
+    let index = HnswIndex::new(removal_config());
+    for i in 0..200u64 {
+        index.insert_shared(i, &scattered_vector(i, 8));
+    }
+    for i in 0..200u64 {
+        assert_eq!(
+            index.search(&scattered_vector(i, 8), 1)[0].id,
+            i,
+            "baseline {i}"
+        );
+    }
+    for i in (0..200u64).step_by(3) {
+        assert!(index.remove(i), "id {i} was present");
+    }
+    assert!(!index.remove(0), "a second removal finds nothing");
+    assert!(!index.remove(9_999), "an id never inserted is not removed");
+    assert_eq!(index.len(), 200 - 67);
+    for i in 0..200u64 {
+        let removed = i % 3 == 0;
+        assert_eq!(index.contains(i), !removed, "id {i}");
+        let hits = index.search(&scattered_vector(i, 8), 5);
+        if removed {
+            assert!(hits.iter().all(|h| h.id != i), "removed id {i} returned");
+        } else {
+            assert_eq!(hits[0].id, i, "live id {i} lost");
+        }
+        let exact = index.search_with_mode(&scattered_vector(i, 8), 3, SearchMode::Exact);
+        assert_eq!(exact[0].id == i, !removed, "exact search on id {i}");
+    }
+}
+
+/// Removing the entry point hands it to a node that serves, so every other
+/// id stays reachable; removing every node empties the index, which then
+/// takes inserts again.
+#[test]
+fn removing_the_entry_point_hands_it_over() {
+    let index = HnswIndex::new(removal_config());
+    for i in 0..50u64 {
+        index.insert_shared(i, &scattered_vector(i, 6));
+    }
+    let ep = index.entry_point_idx_for_test().expect("non-empty");
+    let ep_id = index.node_id(ep);
+    assert!(index.remove(ep_id));
+    let new_ep = index.entry_point_idx_for_test().expect("still non-empty");
+    assert_ne!(new_ep, ep);
+    assert_eq!(index.nodes().state(new_ep), data_level0::NodeState::Live);
+    for i in (0..50u64).filter(|&i| i != ep_id) {
+        assert_eq!(
+            index.search(&scattered_vector(i, 6), 1)[0].id,
+            i,
+            "id {i} lost"
+        );
+    }
+    for i in 0..50u64 {
+        index.remove(i);
+    }
+    assert_eq!(index.len(), 0);
+    assert!(
+        index.entry_point_idx_for_test().is_none(),
+        "an empty index has no entry"
+    );
+    assert!(index.search(&scattered_vector(1, 6), 3).is_empty());
+    index.insert_shared(77, &scattered_vector(77, 6));
+    assert_eq!(index.search(&scattered_vector(77, 6), 1)[0].id, 77);
+}
+
+/// The slots of removed nodes come back: once the epoch has passed the
+/// removal and the sweep, no list names them and new inserts take them
+/// instead of growing the store.
+#[test]
+fn removed_slots_are_reused_after_reclamation() {
+    let index = HnswIndex::new(removal_config());
+    for i in 0..300u64 {
+        index.insert_shared(i, &scattered_vector(i, 8));
+    }
+    for i in 0..100u64 {
+        index.remove(i * 3);
+    }
+    reclaim_now(&index);
+    let stats = index.publication_stats();
+    assert_eq!(stats.free_slots, 100, "{stats:?}");
+    assert_eq!(stats.retired_nodes, 0, "{stats:?}");
+    assert_no_edge_to_a_free_slot(&index);
+    for i in 1_000..1_100u64 {
+        index.insert_shared(i, &scattered_vector(i, 8));
+    }
+    assert_eq!(index.node_len(), 300, "the inserts took the free slots");
+    assert_eq!(index.publication_stats().free_slots, 0);
+    assert_eq!(index.len(), 300);
+    for i in (0..300u64).chain(1_000..1_100) {
+        let removed = i < 300 && i % 3 == 0;
+        let exact = index.search_with_mode(&scattered_vector(i, 8), 1, SearchMode::Exact);
+        assert_eq!(exact[0].id == i, !removed, "id {i}");
+        if !removed {
+            assert_eq!(exact[0].score, 0.0, "id {i} reads its own vector");
+        }
+    }
+}
+
+/// A reorder compacts the slots of removed and replaced nodes away: the
+/// store holds the live nodes only, each id maps to its own node, and the
+/// queued slots are forgotten rather than reused under the new numbering.
+#[test]
+fn reorder_compacts_removed_and_replaced_slots() {
+    let mut index = HnswIndex::new(removal_config());
+    for i in 0..200u64 {
+        index.insert(i, scattered_vector(i, 8));
+    }
+    for i in 0..50u64 {
+        index.insert(i, scattered_vector(i + 10_000, 8));
+    }
+    for i in 150..180u64 {
+        assert!(index.remove(i));
+    }
+    index.reorder_for_cache_locality();
+    assert_eq!(index.node_len(), 170);
+    assert_eq!(index.len(), 170);
+    assert_eq!(index.publication_stats().retired_nodes, 0);
+    assert_eq!(index.publication_stats().free_slots, 0);
+    for idx in 0..170 {
+        assert_eq!(index.nodes().state(idx), data_level0::NodeState::Live);
+        let id = index.node_id(idx);
+        assert_eq!(index.idx_for_id_for_test(id), Some(idx), "id {id}");
+    }
+    for i in (0..150u64).chain(180..200) {
+        let at = if i < 50 {
+            scattered_vector(i + 10_000, 8)
+        } else {
+            scattered_vector(i, 8)
+        };
+        assert_eq!(index.search(&at, 1)[0].id, i, "id {i}");
+    }
+    drain_epoch();
+    index.insert_shared(5_000, &scattered_vector(5_000, 8));
+    assert_eq!(index.node_len(), 171, "no stale free slot was reused");
+}
+
+/// Removals, re-inserts and searches run together on one index: searches
+/// return only ids that exist, no slot is reused while it is reachable (a
+/// reused slot would answer for the wrong id, which the final exact pass
+/// catches), and the slots of removed nodes are reused.
+#[test]
+fn concurrent_removals_reinserts_and_searches_stay_consistent() {
+    let index = HnswIndex::new(removal_config());
+    const IDS: u64 = 400;
+    const ROUNDS: u64 = 6;
+    for i in 0..IDS {
+        index.insert_shared(i, &scattered_vector(i, 8));
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let writers: Vec<_> = (0..2u64)
+            .map(|w| {
+                let index = &index;
+                s.spawn(move || {
+                    for round in 1..=ROUNDS {
+                        for i in (w..IDS).step_by(2) {
+                            assert!(index.remove(i), "id {i} round {round}");
+                            index.insert_shared(i, &scattered_vector(i + round * IDS, 8));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..2 {
+            let (index, stop) = (&index, &stop);
+            s.spawn(move || {
+                let mut q = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let hits = index.search(&scattered_vector(q % (IDS * ROUNDS), 8), 10);
+                    let mut seen = HashSet::new();
+                    for h in &hits {
+                        assert!(h.id < IDS, "a search returned unknown id {}", h.id);
+                        assert!(seen.insert(h.id), "id {} returned twice", h.id);
+                    }
+                    q += 1;
+                }
+            });
+        }
+        // The searchers run until the writers are done.
+        for writer in writers {
+            writer.join().expect("writer panicked");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    assert_eq!(index.len(), IDS as usize);
+    for i in 0..IDS {
+        let at = scattered_vector(i + ROUNDS * IDS, 8);
+        let exact = index.search_with_mode(&at, 1, SearchMode::Exact);
+        assert_eq!(exact[0].id, i, "id {i} answers for its final vector");
+        assert_eq!(exact[0].score, 0.0, "id {i} reads its own final vector");
+    }
+    let total_inserts = (IDS * (ROUNDS + 1)) as usize;
+    assert!(
+        index.node_len() < total_inserts,
+        "no slot was reused: {} slots for {total_inserts} inserts",
+        index.node_len()
+    );
+    assert_no_edge_to_a_free_slot(&index);
+}
+
+/// While an operation that protects memory runs, a writer whose index holds
+/// more replaced lists than the budget waits for it to end instead of
+/// growing the retired memory further, and goes ahead once it has.
+#[test]
+fn a_writer_over_the_retired_budget_waits_for_running_operations() {
+    let index = HnswIndex::new(make_config(VectorMetric::L2));
+    for i in 0..50u64 {
+        index.insert_shared(i, &scattered_vector(i, 4));
+    }
+    drain_epoch();
+    index.set_retired_bytes_budget(1);
+    let started = std::sync::Barrier::new(2);
+    let hold = std::time::Duration::from_millis(300);
+    std::thread::scope(|s| {
+        let (index, started) = (&index, &started);
+        s.spawn(move || {
+            let _op = index.begin_operation();
+            started.wait();
+            std::thread::sleep(hold);
+        });
+        started.wait();
+        let began = std::time::Instant::now();
+        // The first update retires lists the running operation may read; the
+        // next ones find the budget exceeded and wait.
+        for round in 0..3u64 {
+            index.insert_shared(7, &scattered_vector(100 + round, 4));
+        }
+        assert!(
+            began.elapsed() >= hold / 2,
+            "the writer did not wait: {:?}",
+            began.elapsed()
+        );
+    });
+    let stats = index.publication_stats();
+    assert!(stats.admission_waits >= 1, "{stats:?}");
+    assert!(stats.admission_wait >= hold / 2, "{stats:?}");
+    assert_eq!(index.search(&scattered_vector(102, 4), 1)[0].id, 7);
+}
+
+/// Replaced lists are counted while a pin can still read them and freed
+/// once none can; a running operation shows as the oldest protection.
+#[test]
+fn publication_stats_follow_retired_lists_and_running_operations() {
+    let index = HnswIndex::new(make_config(VectorMetric::L2));
+    for i in 0..50u64 {
+        index.insert_shared(i, &scattered_vector(i, 4));
+    }
+    drain_epoch();
+    assert_eq!(index.publication_stats().retired_bytes, 0);
+    let op = index.begin_operation();
+    for i in 0..10u64 {
+        index.insert_shared(i, &scattered_vector(i + 500, 4));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let held = index.publication_stats();
+    assert!(held.retired_bytes > 0, "{held:?}");
+    assert!(held.retired_lists > 0, "{held:?}");
+    assert!(
+        held.oldest_operation >= std::time::Duration::from_millis(20),
+        "{held:?}"
+    );
+    drop(op);
+    drain_epoch();
+    let freed = index.publication_stats();
+    assert_eq!(freed.retired_bytes, 0, "{freed:?}");
+    assert_eq!(freed.retired_lists, 0, "{freed:?}");
+    assert_eq!(
+        freed.oldest_operation,
+        std::time::Duration::ZERO,
+        "{freed:?}"
     );
 }
 
@@ -2712,7 +3066,8 @@ fn prune_racing_an_append_keeps_the_append() {
 }
 
 /// Removing edges while another writer appends keeps every accepted append
-/// and drops exactly the removed ids.
+/// and drops exactly the removed ids. The removal is the repair a retired
+/// node's neighbours run, with nothing to refill from.
 #[test]
 fn removal_racing_an_append_keeps_the_append() {
     let mut cfg = make_config(VectorMetric::L2);
@@ -2730,7 +3085,9 @@ fn removal_racing_an_append_keeps_the_append() {
         let accepted = std::thread::scope(|s| {
             s.spawn(|| {
                 for &id in &doomed {
-                    index.remove_neighbour_from(0, 0, id);
+                    index.layer_update(0, 0, |current| {
+                        index.repaired_list(0, 0, current, &|nb| nb == id, &[])
+                    });
                     std::thread::yield_now();
                 }
             });

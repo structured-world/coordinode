@@ -177,6 +177,7 @@ pub(crate) async fn serve(
         raft_snapshot_interval_secs,
         planner_stats_ttl_secs,
         vector_build_wait_ms,
+        vector_retired_bytes_budget,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -678,6 +679,11 @@ pub(crate) async fn serve(
     if let Some(ms) = vector_build_wait_ms {
         database.set_vector_build_wait(std::time::Duration::from_millis(ms));
     }
+    if let Some(bytes) = vector_retired_bytes_budget {
+        // A budget past the address space is no bound at all, which is what
+        // `usize::MAX` means.
+        database.set_vector_retired_bytes_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
     // no-std: spin::RwLock (drop-in).
     let database = Arc::new(parking_lot::RwLock::new(database));
 
@@ -786,6 +792,62 @@ pub(crate) async fn serve(
                         "property" => property,
                     )
                     .set(lag as f64);
+                }
+                // Neighbour-list publication: memory replaced lists still
+                // hold for running searches, the age of the oldest of those,
+                // contention, and writers held off by the budget.
+                let publication = db_metrics
+                    .read()
+                    .vector_index_registry()
+                    .all_publication_stats();
+                for (label, property, s) in publication {
+                    let gauges: [(&'static str, f64); 5] = [
+                        (
+                            "coordinode_vector_index_retired_bytes",
+                            s.retired_bytes as f64,
+                        ),
+                        (
+                            "coordinode_vector_index_retired_lists",
+                            s.retired_lists as f64,
+                        ),
+                        (
+                            "coordinode_vector_index_oldest_operation_seconds",
+                            s.oldest_operation.as_secs_f64(),
+                        ),
+                        (
+                            "coordinode_vector_index_retired_nodes",
+                            s.retired_nodes as f64,
+                        ),
+                        ("coordinode_vector_index_free_slots", s.free_slots as f64),
+                    ];
+                    for (name, value) in gauges {
+                        metrics::gauge!(
+                            name,
+                            "label" => label.clone(),
+                            "property" => property.clone(),
+                        )
+                        .set(value);
+                    }
+                    // Monotonic since the index was created.
+                    let counters: [(&'static str, u64); 3] = [
+                        ("coordinode_vector_index_lost_cas_total", s.lost_cas),
+                        (
+                            "coordinode_vector_index_admission_waits_total",
+                            s.admission_waits,
+                        ),
+                        (
+                            "coordinode_vector_index_admission_wait_microseconds_total",
+                            s.admission_wait.as_micros() as u64,
+                        ),
+                    ];
+                    for (name, value) in counters {
+                        metrics::counter!(
+                            name,
+                            "label" => label.clone(),
+                            "property" => property.clone(),
+                        )
+                        .absolute(value);
+                    }
                 }
             }
         })
