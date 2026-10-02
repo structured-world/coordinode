@@ -92,6 +92,13 @@ fn folder_file_bytes(fs: &dyn Fs, folder: &Path) -> StorageResult<u64> {
             // Deleted between the listing and the stat: a table the version
             // history just released, which is exactly not retained.
             Err(e) if e.kind() == lsm_tree::io::ErrorKind::NotFound => continue,
+            // The same release seen on Windows: a file deleted while a
+            // handle is still open stays listed in a delete-pending state,
+            // and opening it fails with ERROR_ACCESS_DENIED until the last
+            // handle closes (Win32 DeleteFileW, Remarks).
+            Err(e) if cfg!(windows) && e.kind() == lsm_tree::io::ErrorKind::PermissionDenied => {
+                continue;
+            }
             Err(e) => return Err(lsm_tree::Error::from(e).into()),
         };
         if meta.is_file {
