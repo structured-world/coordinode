@@ -11653,7 +11653,12 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
 
     let wm = MaxAssignedWatermark::new(coordinode_core::txn::timestamp::Timestamp::ZERO);
     let wm_advancer = std::sync::Arc::clone(&wm);
+    // The advancer's 30ms start once the clock below runs: counted from the
+    // spawn, a slow parse on a loaded host would use them up and the read
+    // would find the watermark already advanced.
+    let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
     let advancer = std::thread::spawn(move || {
+        start_rx.recv().expect("the reader starts");
         std::thread::sleep(std::time::Duration::from_millis(30));
         wm_advancer.advance(coordinode_core::txn::timestamp::Timestamp::from_raw(500));
     });
@@ -11667,6 +11672,7 @@ fn read_consistency_snapshot_unblocks_on_watermark_advance() {
     ctx.read_timeout = std::time::Duration::from_millis(500);
 
     let before = std::time::Instant::now();
+    start_tx.send(()).expect("the advancer waits");
     let rows = execute(&plan, &mut ctx).expect("must unblock on advance");
     let elapsed = before.elapsed();
     advancer.join().unwrap();

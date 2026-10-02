@@ -250,6 +250,14 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         // Graceful shutdown (simulates "crash" after which we reopen cleanly).
         // In real crash, Drop wouldn't run and oplog entries are safe (fsynced).
         node.shutdown().await.expect("shutdown");
+        // Once shutdown returns nothing but the node and this test holds
+        // the engine, or the reopen below finds the directory locked.
+        drop(node);
+        assert_eq!(
+            Arc::strong_count(&engine_read),
+            2,
+            "something still holds the engine after shutdown"
+        );
     }
 
     // ── Step 2: Reopen and verify crash recovery ─────────────────────────────
