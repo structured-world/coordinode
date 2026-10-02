@@ -353,9 +353,12 @@ fn replace_is_observed_whole_on_layer0() {
     unsafe { block.set_neighbours(0, &a) };
     let stop = std::sync::atomic::AtomicBool::new(false);
     let (block_ref, a_ref, b_ref, stop_ref) = (&block, &a, &b, &stop);
+    // Miri interprets every access: a few hundred replacements still race
+    // the readers on each one, where the native count would never finish.
+    let replaces = if cfg!(miri) { 200 } else { 200_000 };
     std::thread::scope(|s| {
         s.spawn(move || {
-            for i in 0..200_000 {
+            for i in 0..replaces {
                 let next = if i % 2 == 0 { b_ref } else { a_ref };
                 // SAFETY: idx 0 < capacity, 16 <= m_max0.
                 unsafe { block_ref.set_neighbours(0, next) };
