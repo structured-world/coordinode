@@ -1500,6 +1500,28 @@ fn await_removed(db: &Database, label: &str, property: &str, query: &[f32]) -> b
     false
 }
 
+/// Wait, up to a bound, for the index of `(label, property)` to hold `count`
+/// nodes near `query`: while the index's build owns its writes, a node
+/// written meanwhile reaches the graph when the build folds it in, not on the
+/// statement's own thread.
+fn await_present(db: &Database, label: &str, property: &str, query: &[f32], count: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let found = db
+            .vector_index_registry()
+            .search(label, property, query, 5)
+            .map_or(0, |hits| hits.len());
+        if found == count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index holds {found} nodes near the query, expected {count}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// A committed DETACH DELETE takes the node out of the HNSW graph: the
 /// statement leaves it in place (it could still abort), and once the commit
 /// has applied, the follower of the applied commits removes it.
@@ -1526,12 +1548,7 @@ fn delete_node_removes_it_from_the_graph_once_committed() {
     db.execute_cypher("CREATE (a:Item {name: 'Ephemeral', v: [1.0, 2.0, 3.0]})")
         .expect("create");
 
-    // Verify it's in HNSW
-    let reg = db.vector_index_registry();
-    let pre_delete = reg
-        .search("Item", "v", &[1.0, 2.0, 3.0], 5)
-        .expect("pre-delete search");
-    assert_eq!(pre_delete.len(), 1, "should find vector before delete");
+    await_present(&db, "Item", "v", &[1.0, 2.0, 3.0], 1);
 
     // DETACH DELETE the node
     db.execute_cypher("MATCH (a:Item {name: 'Ephemeral'}) DETACH DELETE a")
@@ -1569,6 +1586,9 @@ fn remove_vector_property_takes_the_node_out_of_the_graph() {
     // Create node with vector, then REMOVE the vector property
     db.execute_cypher("CREATE (a:Item {name: 'A', v: [1.0, 0.0, 0.0]})")
         .expect("create");
+    // Present first, or the removal below would be checked against a node
+    // that never reached the graph.
+    await_present(&db, "Item", "v", &[1.0, 0.0, 0.0], 1);
 
     db.execute_cypher("MATCH (a:Item {name: 'A'}) REMOVE a.v")
         .expect("remove vector property");
@@ -1633,6 +1653,7 @@ fn ttl_expiry_takes_the_node_out_of_the_graph() {
     ))
     .expect("create fresh");
 
+    await_present(&db, "Item", "v", &[1.0, 0.0, 0.0], 2);
     let reaped = db.reap_expired().expect("reap");
     assert_eq!(reaped.nodes_deleted, 1, "only the expired node is reaped");
 
