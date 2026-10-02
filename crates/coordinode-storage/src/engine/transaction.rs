@@ -987,6 +987,21 @@ impl<'a> Transaction<'a> {
             || !self.merge_counter_deltas.is_empty()
     }
 
+    /// Refuse the commit when a record stated with [`Self::expect_version`]
+    /// is no longer at the version named, carrying the version that is there.
+    fn check_expected_versions(&self) -> Result<(), CommitError> {
+        for (part, key, expected) in &self.expected_versions {
+            let current = self.engine.record_version(*part, key)?;
+            if current != *expected {
+                return Err(CommitError::RevisionMismatch {
+                    expected: *expected,
+                    current,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Write this record only while its version is still `expected`.
     ///
     /// `None` means the record must not exist: the create-if-absent form,
@@ -1281,6 +1296,9 @@ impl<'a> Transaction<'a> {
         // Flush adj merge buffers even in legacy (no MVCC) mode.
         // Legacy puts write directly to engine, but merge adds are buffered.
         if self.oracle.is_none() {
+            // No admission without a clock: the conditions are checked
+            // against the state as it stands, as the writes are applied to it.
+            self.check_expected_versions()?;
             let staged = std::mem::take(&mut self.merge_adj_ops);
             for (key, operand) in encode_staged_adj(&staged) {
                 self.engine.merge(Partition::Adj, key, &operand)?;
@@ -1312,7 +1330,11 @@ impl<'a> Transaction<'a> {
 
         let has_merge_ops = self.has_pending_merges();
         if self.write_buffer.is_empty() && !has_merge_ops {
-            // Read-only — no commit needed.
+            // Read-only: nothing to admit or apply, but a condition the
+            // caller stated is still the answer it asked for. Checked against
+            // committed state now, which is where a commit with no writes
+            // takes effect.
+            self.check_expected_versions()?;
             return Ok(CommitOutcome {
                 commit_ts: Some(self.read_ts),
                 applied_index: None,
@@ -1370,10 +1392,20 @@ impl<'a> Transaction<'a> {
             .filter(|(part, _)| !part.is_commutative())
             .map(|(part, key)| (*part, key.clone()))
             .collect();
+        // The records this commit is conditioned on but does not write. The
+        // condition is checked against committed state below; registered
+        // here, a commit in flight that writes one of them is refused, or
+        // refuses this one, instead of moving it after the check.
+        let guards: Vec<(Partition, Vec<u8>)> = self
+            .expected_versions
+            .iter()
+            .filter(|(part, key, _)| !scope.iter().any(|(p, k)| p == part && k == key))
+            .map(|(part, key, _)| (*part, key.clone()))
+            .collect();
         let (commit_ts_raw, admission) = self
             .engine
             .pending_commits()
-            .admit_allocated(|| oracle.next().as_raw(), scope)
+            .admit_allocated(|| oracle.next().as_raw(), scope, guards)
             .map_err(|refusal| match refusal {
                 crate::engine::pending::Refusal::Overlap {
                     partition,
@@ -1410,17 +1442,10 @@ impl<'a> Transaction<'a> {
 
         // Records written on the condition of their version. Checked here,
         // under the same admission as the write set, because this is where
-        // the answer is still true when the writes land: the scope is
-        // registered, so nobody else can move these records in between.
-        for (part, key, expected) in &self.expected_versions {
-            let current = self.engine.record_version(*part, key)?;
-            if current != *expected {
-                return Err(CommitError::RevisionMismatch {
-                    expected: *expected,
-                    current,
-                });
-            }
-        }
+        // the answer is still true when the writes land: the written keys
+        // and the guarded ones are registered, so nobody else can move these
+        // records in between.
+        self.check_expected_versions()?;
 
         // First-committer-wins over the WRITE set (seqno probing, write
         // keys only). Every mainstream engine conflicts on concurrent writes

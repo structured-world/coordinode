@@ -40,6 +40,11 @@ struct Admitted {
     /// The keys this commit will write, excluding the commutative partitions
     /// whose concurrency story is the merge operator rather than exclusion.
     scope: Vec<(Partition, Vec<u8>)>,
+    /// The keys this commit's writes are conditioned on without writing them.
+    /// A writer of one of them in flight beside this commit would move it
+    /// after the condition was checked; two commits that only condition on
+    /// the same key leave it where both found it, so they do not collide.
+    guards: Vec<(Partition, Vec<u8>)>,
 }
 
 /// The commits this leader has admitted but not yet applied.
@@ -62,9 +67,10 @@ pub struct PendingCommits {
 /// Why an admission was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// Another commit in flight writes a key this one writes.
+    /// Another commit in flight writes a key this one writes or conditions
+    /// on, or conditions on a key this one writes.
     Overlap {
-        /// The key both commits write.
+        /// The key both commits touch.
         partition: Partition,
         /// The key itself, for the message the caller has to produce.
         key: Vec<u8>,
@@ -122,14 +128,16 @@ impl PendingCommits {
         }
     }
 
-    /// Admit `commit_ts` with `scope`, or name the commit that already holds
-    /// one of its keys.
+    /// Admit a commit writing `scope` and conditioned on `guards`, or name
+    /// the commit that already holds one of its keys.
     ///
-    /// Any overlap refuses, whichever of the two has the lower timestamp. The
-    /// commit already in flight read its inputs at a snapshot that cannot
+    /// Any overlap of a written key with a key the other commit writes or
+    /// conditions on refuses, whichever of the two has the lower timestamp.
+    /// The commit already in flight read its inputs at a snapshot that cannot
     /// contain this one, so whether it lands before or after, one of the two
-    /// writes is computed from a state the other replaced.
-    /// Allocate a commit timestamp and register its scope without a gap
+    /// is computed from a state the other replaced.
+    ///
+    /// The timestamp is allocated and the keys registered without a gap
     /// between the two.
     ///
     /// Two separate steps leave an interval in which the clock has already
@@ -142,6 +150,7 @@ impl PendingCommits {
         &'p self,
         allocate: impl FnOnce() -> u64,
         scope: Vec<(Partition, Vec<u8>)>,
+        guards: Vec<(Partition, Vec<u8>)>,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let mut table = self.inner.lock();
 
@@ -155,9 +164,21 @@ impl PendingCommits {
 
         let commit_ts = allocate();
 
+        let holds = |keys: &[(Partition, Vec<u8>)], partition: &Partition, key: &[u8]| {
+            keys.iter().any(|(p, k)| p == partition && k == key)
+        };
         for other in table.values() {
             for (partition, key) in &scope {
-                if other.scope.iter().any(|(p, k)| p == partition && k == key) {
+                if holds(&other.scope, partition, key) || holds(&other.guards, partition, key) {
+                    return Err(Refusal::Overlap {
+                        partition: *partition,
+                        key: key.clone(),
+                        holder_ts: other.commit_ts,
+                    });
+                }
+            }
+            for (partition, key) in &guards {
+                if holds(&other.scope, partition, key) {
                     return Err(Refusal::Overlap {
                         partition: *partition,
                         key: key.clone(),
@@ -170,7 +191,14 @@ impl PendingCommits {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        table.insert(id, Admitted { commit_ts, scope });
+        table.insert(
+            id,
+            Admitted {
+                commit_ts,
+                scope,
+                guards,
+            },
+        );
         Ok((commit_ts, Admission { pending: self, id }))
     }
 

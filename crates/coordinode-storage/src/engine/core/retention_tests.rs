@@ -1232,6 +1232,7 @@ fn commit_in_flight<'e>(
         .admit_allocated(
             || oracle.next().as_raw(),
             vec![(Partition::Node, key.to_vec())],
+            Vec::new(),
         )
         .expect("admit")
 }

@@ -19,7 +19,21 @@ fn admit_at(
     ts: u64,
     scope: Vec<(Partition, Vec<u8>)>,
 ) -> Result<Admission<'_>, Refusal> {
-    pending.admit_allocated(|| ts, scope).map(|(_, a)| a)
+    pending
+        .admit_allocated(|| ts, scope, Vec::new())
+        .map(|(_, a)| a)
+}
+
+/// Admit a commit that writes `scope` and only conditions on `guards`.
+fn admit_guarded(
+    pending: &PendingCommits,
+    ts: u64,
+    scope: Vec<(Partition, Vec<u8>)>,
+    guards: Vec<(Partition, Vec<u8>)>,
+) -> Result<Admission<'_>, Refusal> {
+    pending
+        .admit_allocated(|| ts, scope, guards)
+        .map(|(_, a)| a)
 }
 
 fn holder_of(refusal: &Refusal) -> u64 {
@@ -78,6 +92,52 @@ fn an_overlap_refuses_even_when_the_arrival_lands_first() {
         .expect_err("the key is spoken for whichever lands first");
     assert_eq!(holder_of(&refusal), 20);
     assert_eq!(pending.in_flight(), 1);
+}
+
+/// A key one commit conditions on and another writes refuses whichever
+/// arrives second: the writer would move the key after the condition on it
+/// was checked.
+#[test]
+fn a_condition_and_a_write_on_one_key_refuse_each_other() {
+    let pending = table();
+    {
+        let _guard = admit_guarded(&pending, 10, Vec::new(), key(Partition::Node, b"g"))
+            .expect("the guard first");
+        let refusal = admit_at(&pending, 11, key(Partition::Node, b"g"))
+            .expect_err("a writer of a guarded key");
+        assert_eq!(holder_of(&refusal), 10);
+    }
+    let _writer = admit_at(&pending, 12, key(Partition::Node, b"g")).expect("the writer first");
+    let refusal = admit_guarded(
+        &pending,
+        13,
+        key(Partition::Node, b"w"),
+        key(Partition::Node, b"g"),
+    )
+    .expect_err("a condition on a key being written");
+    assert_eq!(holder_of(&refusal), 12);
+}
+
+/// Two commits that only condition on one key leave it as both found it,
+/// so neither holds the other up.
+#[test]
+fn two_conditions_on_one_key_are_both_admitted() {
+    let pending = table();
+    let _first = admit_guarded(
+        &pending,
+        10,
+        key(Partition::Node, b"a"),
+        key(Partition::Node, b"g"),
+    )
+    .expect("first");
+    let _second = admit_guarded(
+        &pending,
+        11,
+        key(Partition::Node, b"b"),
+        key(Partition::Node, b"g"),
+    )
+    .expect("a shared condition is not a conflict");
+    assert_eq!(pending.in_flight(), 2);
 }
 
 /// A registration lives exactly as long as the commit it belongs to.
@@ -196,7 +256,7 @@ fn a_named_timestamp_waits_for_the_commits_it_covers() {
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let admitted = holder
-            .admit_allocated(|| 50, key(Partition::Node, b"a"))
+            .admit_allocated(|| 50, key(Partition::Node, b"a"), Vec::new())
             .map(|(_, a)| a)
             .expect("admit");
         started_tx.send(()).expect("signal");
@@ -262,6 +322,7 @@ fn the_table_refuses_rather_than_growing_without_bound() {
                 12
             },
             key(Partition::Node, b"c"),
+            Vec::new(),
         )
         .map(|(_, a)| a)
         .expect_err("the table is full");

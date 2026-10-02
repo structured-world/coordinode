@@ -400,11 +400,11 @@ fn a_read_waits_for_pending_work_below_it_and_not_above_it() {
     let pending = PendingCommits::new(16);
 
     let _at_100 = pending
-        .admit_allocated(|| 100, vec![(Partition::Node, b"a".to_vec())])
+        .admit_allocated(|| 100, vec![(Partition::Node, b"a".to_vec())], Vec::new())
         .expect("admit")
         .1;
     let _at_200 = pending
-        .admit_allocated(|| 200, vec![(Partition::Node, b"b".to_vec())])
+        .admit_allocated(|| 200, vec![(Partition::Node, b"b".to_vec())], Vec::new())
         .expect("admit")
         .1;
 
@@ -540,6 +540,106 @@ fn two_claimers_of_one_record_produce_one_winner() {
         Some(&b"first"[..]),
         "the loser overwrote nothing"
     );
+}
+
+/// A condition stated by a transaction that writes nothing is still decided.
+/// A caller uses such a commit to confirm a record has not moved; answering
+/// it with success without looking tells it the record is where it named.
+#[test]
+fn a_condition_without_a_write_is_still_checked() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    const KEY: &[u8] = b"node:checked";
+
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut create = mvcc_txn(&engine, &oracle);
+    create.put(Partition::Node, KEY, b"there").expect("stage");
+    create.commit(&ctx()).expect("create");
+    let version = engine
+        .record_version(Partition::Node, KEY)
+        .expect("version")
+        .expect("the record is there");
+
+    let mut absent = mvcc_txn(&engine, &oracle);
+    absent
+        .expect_version(Partition::Node, KEY, None)
+        .expect("state the condition");
+    match absent.commit(&ctx()) {
+        Err(CommitError::RevisionMismatch { expected, current }) => {
+            assert_eq!(expected, None);
+            assert_eq!(current, Some(version));
+        }
+        other => panic!("expected a version mismatch, got {other:?}"),
+    }
+
+    let mut matching = mvcc_txn(&engine, &oracle);
+    matching
+        .expect_version(Partition::Node, KEY, Some(version))
+        .expect("state the condition");
+    matching
+        .commit(&ctx())
+        .expect("the record is at that version");
+}
+
+/// A record a transaction conditions on but does not write is protected
+/// from a commit in flight that writes it. Without that, the condition is
+/// checked against committed state, the other commit lands after, and this
+/// transaction's writes stand on a version that no longer exists.
+#[test]
+fn a_condition_on_a_record_being_written_by_another_commit_is_refused() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    const GUARD: &[u8] = b"node:guard";
+    const WRITTEN: &[u8] = b"node:written";
+
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+
+    let mut create = mvcc_txn(&engine, &oracle);
+    create.put(Partition::Node, GUARD, b"v1").expect("stage");
+    create.commit(&ctx()).expect("create");
+    let version = engine
+        .record_version(Partition::Node, GUARD)
+        .expect("version")
+        .expect("the guard is there");
+
+    // Another commit has validated and is about to write the guard.
+    let in_flight = engine
+        .pending_commits()
+        .admit_allocated(
+            || oracle.next().as_raw(),
+            vec![(Partition::Node, GUARD.to_vec())],
+            Vec::new(),
+        )
+        .expect("admit the other commit");
+
+    let mut guarded = mvcc_txn(&engine, &oracle);
+    guarded
+        .expect_version(Partition::Node, GUARD, Some(version))
+        .expect("state the condition");
+    guarded.put(Partition::Node, WRITTEN, b"x").expect("stage");
+    match guarded.commit(&ctx()) {
+        Err(CommitError::Conflict(_)) => {}
+        other => panic!("expected a conflict with the commit in flight, got {other:?}"),
+    }
+    assert_eq!(
+        engine.get(Partition::Node, WRITTEN).unwrap(),
+        None,
+        "a refused commit applied nothing"
+    );
+    drop(in_flight);
 }
 
 /// A merge-composed record has no version, and asking for one is refused
