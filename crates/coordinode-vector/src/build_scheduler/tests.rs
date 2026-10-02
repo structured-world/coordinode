@@ -157,13 +157,16 @@ fn queue_depth_is_read_by_planner_path() {
             let _p = s.acquire(Priority::Normal);
             thread::sleep(Duration::from_millis(5));
         }));
-        thread::sleep(Duration::from_millis(5));
     }
-    // Best-effort observation — three waiters should have queued.
-    // Allow some slack for thread scheduling.
-    let depth = s.queue_depth();
-    assert!(depth >= 1, "expected ≥1 queued waiter, got {depth}");
-    assert!(depth <= 3, "expected ≤3 queued waiters, got {depth}");
+    // The slot is held, so all three wait; the planner reads exactly that.
+    // Waited for rather than slept on: a loaded machine starts the threads
+    // later than any fixed pause.
+    wait_for_queue_depth(&s, 3);
+    assert_eq!(
+        s.queue_depth(),
+        3,
+        "three waiters queue behind the held slot"
+    );
 
     drop(hog);
     for w in waiters {
