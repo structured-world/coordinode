@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 
-use super::{HnswIndex, M_MAX0};
+use super::HnswIndex;
 
 /// Permute an owned `Vec<T>` into BFS order: `out[new] = old[old_of_new[new]]`.
 /// Pure index shuffle (no clone), so it works for non-`Clone` payloads like the
@@ -40,7 +40,7 @@ impl HnswIndex {
     /// and are appended after every reachable node. The result is always a
     /// bijection of `0..self.nodes.len()`.
     pub(super) fn compute_bfs_permutation(&self) -> Vec<usize> {
-        let n = self.nodes.len();
+        let n = self.node_len();
         let mut new_of_old = vec![usize::MAX; n];
         if n == 0 {
             return new_of_old;
@@ -103,7 +103,7 @@ impl HnswIndex {
     /// operation (`&mut self`); not safe to run concurrently with inserts or
     /// searches.
     pub(crate) fn reorder_for_cache_locality(&mut self) {
-        let n = self.nodes.len();
+        let n = self.node_len();
         if n < 2 {
             return;
         }
@@ -119,7 +119,7 @@ impl HnswIndex {
     /// the new order from those snapshots. `new_of_old` must be a bijection of
     /// `0..self.nodes.len()`.
     fn apply_permutation(&mut self, new_of_old: &[usize]) {
-        let n = self.nodes.len();
+        let n = self.node_len();
         debug_assert_eq!(new_of_old.len(), n);
 
         // Inverse: old_of_new[new] = old. Drives the rebuild order.
@@ -149,19 +149,24 @@ impl HnswIndex {
         }
 
         // Upper-layer neighbours per OLD idx: outer = node, mid = layer, inner =
-        // remapped neighbour ids.
+        // remapped neighbour ids. The node's id and norm travel with it.
         let mut upper: Vec<Vec<Vec<u64>>> = Vec::with_capacity(n);
+        let mut meta: Vec<(u64, f32)> = Vec::with_capacity(n);
         for old in 0..n {
-            let layers = self.neighbours_upper[old].len();
-            let mut per_layer = Vec::with_capacity(layers);
-            for layer in 0..layers {
-                let mut snap = self.neighbours_upper[old][layer].snapshot();
+            let levels = self.node_levels(old);
+            let mut per_layer = Vec::with_capacity(levels - 1);
+            for level in 1..levels {
+                let mut snap = self.neighbours_at(old, level).snapshot();
                 for id in snap.iter_mut() {
                     *id = new_of_old[*id as usize] as u64;
                 }
                 per_layer.push(snap);
             }
             upper.push(per_layer);
+            meta.push((
+                self.node_id(old),
+                self.nodes().norm(old).unwrap_or_default(),
+            ));
         }
 
         // Reconstruct the entry from `load` (the canonical packed representation
@@ -174,36 +179,14 @@ impl HnswIndex {
 
         // --- Step B: rebuild every store in new order ---
 
-        // SoA arrays: pure index shuffle (payload is per-node, no remap).
-        let nodes = std::mem::take(&mut self.nodes);
-        self.nodes = permute_vec(nodes, &old_of_new);
-        let norms = std::mem::take(&mut self.node_norms);
-        self.node_norms = permute_vec(norms, &old_of_new);
-        let inv = std::mem::take(&mut self.node_inv_norms);
-        self.node_inv_norms = permute_vec(inv, &old_of_new);
+        // Per-node codes: pure index shuffle (payload is per-node, no remap).
         let quant = std::mem::take(&mut self.node_quantized);
         self.node_quantized = permute_vec(quant, &old_of_new);
         let rabitq = std::mem::take(&mut self.node_rabitq_codes);
         self.node_rabitq_codes = permute_vec(rabitq, &old_of_new);
 
-        // Upper-layer lists: fresh lists in new order, remapped contents.
-        let mut new_upper: Vec<Vec<super::neighbours::AtomicNeighbourList<M_MAX0>>> =
-            Vec::with_capacity(n);
-        for &old in &old_of_new {
-            let per_layer = std::mem::take(&mut upper[old]);
-            let lists: Vec<_> = per_layer
-                .into_iter()
-                .map(|ids| {
-                    let list = super::neighbours::AtomicNeighbourList::<M_MAX0>::new();
-                    list.set(&ids);
-                    list
-                })
-                .collect();
-            new_upper.push(lists);
-        }
-        self.neighbours_upper = new_upper;
-
-        // Layer-0 block (primary read path): rebuild f32 + remapped neighbours.
+        // Node store: every node rebuilt at its new index with its id, norm,
+        // f32 vector and remapped lists on every layer.
         if let Some(old_block) = self.data_level0.take() {
             let dim = old_block.dim();
             let m = old_block.m_max0();
@@ -214,12 +197,20 @@ impl HnswIndex {
                 nb.drop_f32();
             }
             for (new, &old) in old_of_new.iter().enumerate() {
-                if has_f32 && !l0_vecs[old].is_empty() {
-                    // SAFETY: new < n <= cap; vector len == dim.
-                    unsafe { nb.set_vector(new, &l0_vecs[old]) };
+                let (id, norm) = meta[old];
+                let per_layer = std::mem::take(&mut upper[old]);
+                // SAFETY: new < n <= cap; `nb` is owned here, so nothing else
+                // reads or writes it.
+                unsafe {
+                    nb.init_node(new, id, norm, per_layer.len());
+                    if has_f32 && !l0_vecs[old].is_empty() {
+                        nb.set_vector(new, &l0_vecs[old]);
+                    }
+                    nb.set_neighbours(new, &l0_nbrs[old]);
+                    for (layer, ids) in per_layer.iter().enumerate() {
+                        nb.upper(new, layer + 1).set(ids);
+                    }
                 }
-                // SAFETY: new < cap; ids already bounded to the new index space.
-                unsafe { nb.set_neighbours(new, &l0_nbrs[old]) };
             }
             self.data_level0 = Some(nb);
         }
@@ -246,8 +237,8 @@ impl HnswIndex {
 
         // id -> idx map and entry point follow the new numbering.
         self.id_to_idx.clear();
-        for (new, node) in self.nodes.iter().enumerate() {
-            self.id_to_idx.insert(node.id, new);
+        for (new, &old) in old_of_new.iter().enumerate() {
+            self.id_to_idx.insert(meta[old].0, new);
         }
         self.entry_point = super::entry_point::EntryPoint::new();
         if let Some((level, idx)) = entry {

@@ -32,7 +32,7 @@
 //! vectors takes `&mut self`.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::M_MAX0;
 use super::neighbours::AtomicNeighbourList;
@@ -45,6 +45,28 @@ const NODE_ALIGN: usize = 8;
 /// `first_cap << 40` nodes, beyond any addressable store.
 const MAX_EXTRA_SEGMENTS: usize = 40;
 
+/// Scalars of one node read off the visit path, written once by the writer
+/// that owns the node before the node is reachable. Atomics so that write and
+/// later reads never race, at the cost of plain loads and stores.
+struct NodeMeta {
+    /// External node id.
+    id: AtomicU64,
+    /// L2 norm of the vector, as f32 bits.
+    norm: AtomicU32,
+}
+
+impl NodeMeta {
+    fn new() -> Self {
+        Self {
+            id: AtomicU64::new(0),
+            norm: AtomicU32::new(0),
+        }
+    }
+}
+
+/// The neighbour lists of one node above layer 0, one per layer.
+type UpperLists = Box<[AtomicNeighbourList<M_MAX0>]>;
+
 /// One run of nodes with stable addresses.
 struct Segment {
     /// f32 vectors, `cap * stride` bytes as 8-byte words; empty once the
@@ -53,6 +75,15 @@ struct Segment {
     vectors: Box<[UnsafeCell<u64>]>,
     /// The layer-0 neighbour list of every node in the segment.
     lists: Box<[AtomicNeighbourList<M_MAX0, u32>]>,
+    /// Per-node scalars.
+    meta: Box<[NodeMeta]>,
+    /// `1 / norm` per node (0.0 for a zero vector), as f32 bits; the
+    /// per-visit cosine multiplies by it instead of dividing. Kept apart from
+    /// `meta` so a visit reads 4 bytes per node from a dense array.
+    inv_norms: Box<[AtomicU32]>,
+    /// Per-node lists above layer 0; their count is the node's top layer.
+    /// Written once with the node's scalars, before the node is reachable.
+    upper: Box<[UnsafeCell<UpperLists>]>,
 }
 
 impl Segment {
@@ -65,6 +96,9 @@ impl Segment {
         Self {
             vectors: (0..words).map(|_| UnsafeCell::new(0)).collect(),
             lists: (0..cap).map(|_| AtomicNeighbourList::new()).collect(),
+            meta: (0..cap).map(|_| NodeMeta::new()).collect(),
+            inv_norms: (0..cap).map(|_| AtomicU32::new(0)).collect(),
+            upper: (0..cap).map(|_| UnsafeCell::new(Box::default())).collect(),
         }
     }
 
@@ -84,10 +118,10 @@ impl Segment {
     }
 }
 
-// SAFETY: the lists are `Sync`. The vector bytes are written only by the
-// writer that owns a node, before the node is reachable, and read only after
-// it was reached through a release-published link or entry point; every
-// other access goes through `&mut self`.
+// SAFETY: the lists and scalars are `Sync`. The vector bytes and the upper
+// lists' box are written only by the writer that owns a node, before the node
+// is reachable, and read only after it was reached through a release-published
+// link or entry point; every other access goes through `&mut self`.
 unsafe impl Sync for Segment {}
 
 /// The layer-0 store. See the module doc for layout and concurrency.
@@ -123,6 +157,29 @@ impl core::fmt::Debug for DataLevel0Block {
             .field("dim", &self.dim)
             .field("has_f32", &self.has_f32)
             .finish()
+    }
+}
+
+/// Store `norm` and its inverse for the node at `off` in `segment`; a norm
+/// below `f32::EPSILON` stores inverse 0.0, which collapses the cosine product
+/// to 0 like the division helpers' epsilon guard.
+///
+/// # Safety
+///
+/// `off` lies inside the segment.
+unsafe fn store_norms(segment: &Segment, off: usize, norm: f32) {
+    let inv = if norm < f32::EPSILON { 0.0 } else { 1.0 / norm };
+    // SAFETY: off bound per contract.
+    unsafe {
+        segment
+            .meta
+            .get_unchecked(off)
+            .norm
+            .store(norm.to_bits(), Ordering::Relaxed);
+        segment
+            .inv_norms
+            .get_unchecked(off)
+            .store(inv.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -342,6 +399,113 @@ impl DataLevel0Block {
         let ids = unsafe { segment.lists.get_unchecked(off) }.read(guard);
         out.extend(ids.iter().map(|&id| u64::from(id)));
         true
+    }
+
+    /// Initialize node `idx`: its external id, its norms and `upper_layers`
+    /// empty lists above layer 0.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`, and the caller is the only writer of node
+    /// `idx` and writes before the node is reachable by any reader (no link
+    /// or entry point names it yet), or holds the store exclusively.
+    pub(super) unsafe fn init_node(&self, idx: usize, id: u64, norm: f32, upper_layers: usize) {
+        // SAFETY: caller bounds and exclusivity.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            segment
+                .meta
+                .get_unchecked(off)
+                .id
+                .store(id, Ordering::Relaxed);
+            store_norms(segment, off, norm);
+            *segment.upper.get_unchecked(off).get() = (0..upper_layers)
+                .map(|_| AtomicNeighbourList::new())
+                .collect();
+        }
+    }
+
+    /// Replace the norms of node `idx` (its vector changed).
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`, under the same exclusivity as the vector
+    /// write that changed them.
+    pub(super) unsafe fn set_norm(&self, idx: usize, norm: f32) {
+        // SAFETY: caller bounds.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            store_norms(segment, off, norm);
+        }
+    }
+
+    /// External id of node `idx`.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()` and the node was initialized.
+    #[inline]
+    pub(super) unsafe fn id(&self, idx: usize) -> u64 {
+        // SAFETY: caller bounds.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            segment.meta.get_unchecked(off).id.load(Ordering::Relaxed)
+        }
+    }
+
+    /// L2 norm of node `idx`'s vector, `None` when `idx` has no slot.
+    #[inline]
+    pub(super) fn norm(&self, idx: usize) -> Option<f32> {
+        let (segment, off) = self.try_locate(idx)?;
+        // SAFETY: off lies inside the segment per try_locate.
+        let bits = unsafe { segment.meta.get_unchecked(off) }
+            .norm
+            .load(Ordering::Relaxed);
+        Some(f32::from_bits(bits))
+    }
+
+    /// `1 / norm` of node `idx`'s vector (0.0 for a zero vector), `None`
+    /// when `idx` has no slot. Read on every cosine visit.
+    #[inline(always)]
+    pub(super) fn inv_norm(&self, idx: usize) -> Option<f32> {
+        let (segment, off) = self.try_locate(idx)?;
+        // SAFETY: off lies inside the segment per try_locate.
+        let bits = unsafe { segment.inv_norms.get_unchecked(off) }.load(Ordering::Relaxed);
+        Some(f32::from_bits(bits))
+    }
+
+    /// Layers node `idx` takes part in: its top layer plus one.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()` and the node was initialized.
+    #[inline(always)]
+    pub(super) unsafe fn levels(&self, idx: usize) -> usize {
+        // SAFETY: caller bounds; the box was written before the node became
+        // reachable and never changes afterwards.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            let lists: &UpperLists = &*segment.upper.get_unchecked(off).get();
+            1 + lists.len()
+        }
+    }
+
+    /// Node `idx`'s list at `level >= 1`.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`, the node was initialized, and
+    /// `1 <= level < self.levels(idx)`.
+    #[inline]
+    pub(super) unsafe fn upper(&self, idx: usize, level: usize) -> &AtomicNeighbourList<M_MAX0> {
+        debug_assert!(level >= 1, "layer 0 lists are read with read_list_u64");
+        // SAFETY: caller bounds; the box is never replaced after the node
+        // became reachable, so the borrow lives as long as `&self`.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            let lists: &UpperLists = &*segment.upper.get_unchecked(off).get();
+            lists.get_unchecked(level - 1)
+        }
     }
 
     /// [`Self::locate`] for nodes past the first segment.

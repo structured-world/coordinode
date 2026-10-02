@@ -348,54 +348,12 @@ impl HnswConfig {
     }
 }
 
-/// A single element in the HNSW graph.
-///
-/// Per-layer neighbour lists are stored separately: layer 0 in the contiguous
-/// `data_level0` block (hot path, co-located with the f32 vector) and
-/// [`HnswIndex::neighbours_upper`] (cold path, layers ≥1) using lock-free
-/// [`AtomicNeighbourList`]s — never inside this struct. The node's layer
-/// count equals `HnswIndex::node_levels(node_idx)`; the node's max layer
-/// is also captured in [`HnswNode::max_layer`] for cheap access from the
-/// update / rebuild paths.
-struct HnswNode {
-    /// Node ID (maps to graph node ID).
-    id: u64,
-    /// Highest layer this element exists on. Same value as
-    /// `node_levels(node_idx) - 1`; cached here so the rebuild path
-    /// doesn't have to indirect through the mirror on every read.
-    max_layer: usize,
-}
-
 /// HNSW index: in-memory approximate nearest neighbor graph.
 pub struct HnswIndex {
     config: HnswConfig,
-    /// All nodes' light metadata (id + max_layer). The hot per-node payload
-    /// (f32 vector, SQ8 quantized, RaBitQ code) lives in the parallel
-    /// `node_vectors` / `node_quantized` / `node_rabitq_codes` arrays so a
-    /// search visit reads only the payload it actually needs. Before this
-    /// SoA split the whole `HnswNode` struct (id + 3× `Option<Vec>` + usize
-    /// = ~80 B) was loaded per visit; for a 1.18 M-node glove index that
-    /// pulled ~90 MiB of mostly-unused metadata into L1/L2 during search.
-    /// hnswlib's contiguous `data_level0_memory_` chose the opposite layout
-    /// for the same reason — one allocation, one prefetch covers everything
-    /// the inner loop needs. SoA is the Rust-friendly version of that
-    /// invariant: parallel arrays sized to `nodes.len()`, lock-step on
-    /// every push.
-    nodes: Vec<HnswNode>,
-    /// Pre-computed L2 norm per node, parallel to `nodes`. Cosine search
-    /// uses this to skip a per-visit pass over the neighbour vector
-    /// (`norm_l2(b)` inside `cosine_similarity_with_query_norm`), so the
-    /// hot loop reads each node's data ONCE per visit instead of twice.
-    /// Hnswlib achieves the same by normalising input vectors at insert
-    /// time; we store the norm separately so the f32 vector stays in
-    /// its original scale for the rerank + SQ8 paths.
-    node_norms: Vec<f32>,
-    /// 1 / ‖vector‖₂ per node (0.0 for zero vectors), parallel to
-    /// `node_norms`. The per-visit cosine reads this instead of the
-    /// norm so the score is one multiply (`dot * inv_a * inv_b`)
-    /// rather than a divide — `divss` has ~3x the latency of `mulss`
-    /// and sits on the accept/reject critical path of every visit.
-    node_inv_norms: Vec<f32>,
+    /// Number of nodes. Every node's id, norms, f32 vector and neighbour
+    /// lists live in `data_level0` at stable addresses, indexed `0..len`.
+    node_count: core::sync::atomic::AtomicUsize,
     /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
     /// calibration completes (or always None when SQ8 is disabled).
     node_quantized: Vec<Option<Vec<u8>>>,
@@ -405,16 +363,7 @@ pub struct HnswIndex {
     /// index. This is the array the cosine-RaBitQ hot path hits on every
     /// neighbour visit.
     node_rabitq_codes: Vec<Option<RabitqEncoded>>,
-    /// Lock-free upper-layer neighbour lists. `neighbours_upper[idx]`
-    /// holds layers 1..=top_level for node `idx` (length =
-    /// `nodes[idx].max_layer`). Cold path — only walked during the
-    /// top-down greedy descent in `search_layer_greedy`, never on the
-    /// per-visit `search_layer` candidate expansion that dominates QPS.
-    /// Keeping upper layers in `Vec<Vec<…>>` avoids paying the
-    /// O(total_layers) hot-path penalty across nodes whose `max_layer ==
-    /// 0` (the overwhelming majority on default `level_mult = 1/ln(M)`).
-    neighbours_upper: Vec<Vec<AtomicNeighbourList<M_MAX0>>>,
-    /// Map from node ID to index in `nodes` vec.
+    /// Map from node ID to its index in the node store.
     id_to_idx: std::collections::HashMap<u64, usize>,
     /// Lock-free entry point: packed `(level, idx)` in a single
     /// `AtomicU64` with `u64::MAX` as the "empty index" sentinel.
@@ -739,12 +688,9 @@ impl HnswIndex {
         let id_to_idx = std::collections::HashMap::with_capacity(capacity);
         Self {
             config,
-            nodes: Vec::with_capacity(capacity),
-            node_norms: Vec::with_capacity(capacity),
-            node_inv_norms: Vec::with_capacity(capacity),
+            node_count: core::sync::atomic::AtomicUsize::new(0),
             node_quantized: Vec::with_capacity(capacity),
             node_rabitq_codes: Vec::with_capacity(capacity),
-            neighbours_upper: Vec::with_capacity(capacity),
             id_to_idx,
             entry_point: EntryPoint::new(),
             // max_level is derived from entry_point.load() at every
@@ -841,7 +787,7 @@ impl HnswIndex {
         // assign back via `&mut self`. The encoded vector is `Option<_>` —
         // mismatched dims / disabled codec yield None and the slot stays
         // empty (consistent with prior behaviour).
-        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.nodes.len())
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.node_len())
             .map(|i| {
                 let enc = self
                     .read_node_f32(i)
@@ -860,7 +806,7 @@ impl HnswIndex {
     /// Quantizes all existing nodes that don't have quantized vectors yet.
     /// If `offload_vectors` is enabled, drops f32 after quantizing.
     pub fn set_sq8_params(&mut self, params: Sq8Params) {
-        for idx in 0..self.nodes.len() {
+        for idx in 0..self.node_len() {
             if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
                 self.node_quantized[idx] = Some(code);
             }
@@ -896,9 +842,9 @@ impl HnswIndex {
     /// Logs a warning if the index has fewer than [`SQ8_MIN_VECTORS`] (1000)
     /// vectors — quantization overhead is not justified for small indexes.
     fn auto_calibrate(&mut self) {
-        if self.nodes.len() < SQ8_MIN_VECTORS {
+        if self.node_len() < SQ8_MIN_VECTORS {
             warn!(
-                vectors = self.nodes.len(),
+                vectors = self.node_len(),
                 min_recommended = SQ8_MIN_VECTORS,
                 "SQ8 quantization on small index (<{} vectors): \
                  calibration storage overhead may exceed memory savings. \
@@ -906,11 +852,11 @@ impl HnswIndex {
                 SQ8_MIN_VECTORS,
             );
         }
-        let refs: Vec<&[f32]> = (0..self.nodes.len())
+        let refs: Vec<&[f32]> = (0..self.node_len())
             .filter_map(|idx| self.read_node_f32(idx))
             .collect();
         if let Some(params) = Sq8Params::calibrate(&refs) {
-            for idx in 0..self.nodes.len() {
+            for idx in 0..self.node_len() {
                 if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
                     self.node_quantized[idx] = Some(code);
                 }
@@ -936,7 +882,7 @@ impl HnswIndex {
     /// one.
     fn auto_calibrate_rabitq(&mut self) {
         // Need at least one vector to infer D.
-        let dims = match (0..self.nodes.len()).find_map(|idx| self.read_node_f32(idx)) {
+        let dims = match (0..self.node_len()).find_map(|idx| self.read_node_f32(idx)) {
             Some(v) => v.len(),
             None => return,
         };
@@ -962,7 +908,7 @@ impl HnswIndex {
         // upper bound of 12 iterations caps calibration latency well
         // under one second even at calibration_threshold = 100k.
         const N_CLUSTERS: u32 = 16;
-        let training: Vec<Vec<f32>> = (0..self.nodes.len())
+        let training: Vec<Vec<f32>> = (0..self.node_len())
             .filter_map(|idx| self.read_node_f32(idx).map(<[f32]>::to_vec))
             .collect();
         let params = if training.is_empty() {
@@ -973,7 +919,7 @@ impl HnswIndex {
 
         // Two-pass borrow split — encode_rabitq needs `&self.config`
         // while encoding, then we mutate node.rabitq_code separately.
-        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.nodes.len())
+        let encoded: Vec<(usize, Option<RabitqEncoded>)> = (0..self.node_len())
             .map(|i| {
                 let enc = self
                     .read_node_f32(i)
@@ -1005,7 +951,7 @@ impl HnswIndex {
 
     /// Number of indexed vectors.
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.node_len()
     }
 
     /// Whether a vector for `id` is in the graph.
@@ -1015,7 +961,7 @@ impl HnswIndex {
 
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.node_len() == 0
     }
 
     /// Insert a vector into the index.
@@ -1029,6 +975,18 @@ impl HnswIndex {
     /// neighbours for each layer, then a single-threaded mutation that
     /// publishes the new node and its neighbour edges.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
+        if !self.accepts_dim(vector.len()) {
+            warn!(
+                node_id = id,
+                dim = vector.len(),
+                index_dim = self
+                    .data_level0
+                    .as_ref()
+                    .map(data_level0::DataLevel0Block::dim),
+                "HNSW insert rejected: vector dimension is zero or differs from the index"
+            );
+            return;
+        }
         if let Some(&idx) = self.id_to_idx.get(&id) {
             // The same vector again (a write maintained by more than one
             // path, or re-delivered): the node already sits where it
@@ -1063,7 +1021,8 @@ impl HnswIndex {
     ///
     /// Expected throughput: 5-8× over per-item `insert` on multi-core
     /// hardware (planning dominates ~80% of insert cost).
-    pub fn insert_batch(&mut self, items: Vec<(u64, Vec<f32>)>) {
+    pub fn insert_batch(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
+        self.screen_dims(&mut items);
         // Threshold below which rayon overhead exceeds the parallelism win.
         // Tuned empirically; values from 4-32 perform equivalently on the
         // current bench host. 16 keeps small admin-style batches sequential.
@@ -1106,7 +1065,7 @@ impl HnswIndex {
 
         // Seed phase: bring graph up to SEED_DENSITY before batching.
         let mut iter = inserts.into_iter();
-        while self.nodes.len() < SEED_DENSITY {
+        while self.node_len() < SEED_DENSITY {
             match iter.next() {
                 Some((id, vec)) => self.insert(id, vec),
                 None => break,
@@ -1121,7 +1080,7 @@ impl HnswIndex {
         // the staleness trade-off is measured at.
         const MAX_ROUND: usize = 1024;
         loop {
-            let round_len = self.nodes.len().clamp(BATCH_PARALLEL_THRESHOLD, MAX_ROUND);
+            let round_len = self.node_len().clamp(BATCH_PARALLEL_THRESHOLD, MAX_ROUND);
             let round: Vec<(u64, Vec<f32>)> = iter.by_ref().take(round_len).collect();
             if round.is_empty() {
                 break;
@@ -1195,7 +1154,8 @@ impl HnswIndex {
     /// ParlayANN topology); that work requires threading an
     /// allowed-node bitmap through the search-internals and is
     /// deliberately not part of this entry point.
-    pub fn bulk_build(&mut self, items: Vec<(u64, Vec<f32>)>) {
+    pub fn bulk_build(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
+        self.screen_dims(&mut items);
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
             self.insert_batch(items);
             return;
@@ -1208,7 +1168,8 @@ impl HnswIndex {
     /// one-off post-build pass for better search cache locality. Prefer this for
     /// read-heavy indexes built once and queried many times; use
     /// [`bulk_build`](Self::bulk_build) when the index keeps mutating.
-    pub fn bulk_build_cache_optimized(&mut self, items: Vec<(u64, Vec<f32>)>) {
+    pub fn bulk_build_cache_optimized(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
+        self.screen_dims(&mut items);
         if items.len() < bulk_build::BULK_BUILD_THRESHOLD {
             self.insert_batch(items);
             self.reorder_for_cache_locality();
@@ -1309,38 +1270,70 @@ impl HnswIndex {
     /// `layer_cas_append`.
     fn mirror_data_level0_vector(&mut self, idx: usize, vector: &[f32]) {
         let dim = vector.len();
-        if dim == 0 {
+        if !self.accepts_dim(dim) {
             return;
         }
         if self.data_level0.is_none() {
             let capacity = (self.config.max_elements as usize).max(idx + 1);
-            // Size the block to the effective per-node layer-0 degree
+            // Size the lists to the effective per-node layer-0 degree
             // (`config.m_max0`, already capped to `M_MAX0`), not the
-            // compile-time `M_MAX0` cap: for M=16 (m_max0=32) this halves the
-            // neighbour-id region, shrinking the stride and the cache lines
-            // touched per visit, which closes the small-M scaling regression.
+            // compile-time `M_MAX0` cap.
             self.data_level0 = Some(data_level0::DataLevel0Block::new(
                 capacity,
                 self.config.m_max0,
                 dim,
             ));
         }
-        let Some(block) = self.data_level0.as_mut() else {
+        let Some(block) = self.data_level0.as_ref() else {
             return;
         };
-        if !block.has_f32() || vector.len() != block.dim() {
-            return;
-        }
-        // Grow rather than skip past capacity: this store is the only f32
-        // source, so it must hold every node, including those inserted beyond
-        // the initial `max_elements` estimate.
+        // Grow rather than skip past capacity: this store holds every node's
+        // lists and scalars, including those inserted beyond the initial
+        // `max_elements` estimate, whether or not the vectors were offloaded.
         block.ensure_capacity(idx + 1);
-        // SAFETY: idx < capacity after `ensure_capacity` and vector.len()
-        // == block.dim() per the gate above; block was allocated with the
-        // same dim.
-        unsafe {
-            block.set_vector(idx, vector);
+        if block.has_f32() {
+            // SAFETY: idx < capacity after `ensure_capacity`, vector.len() ==
+            // block.dim() per `accepts_dim`, and `&mut self` excludes every
+            // other reader and writer.
+            unsafe {
+                block.set_vector(idx, vector);
+            }
         }
+    }
+
+    /// Whether a vector of `dim` components can go into this index: non-zero
+    /// and equal to the dimension of the first vector, which sized the store.
+    #[inline]
+    fn accepts_dim(&self, dim: usize) -> bool {
+        dim > 0
+            && self
+                .data_level0
+                .as_ref()
+                .is_none_or(|block| block.dim() == dim)
+    }
+
+    /// Drop, with a warning, the batch items whose dimension is zero or
+    /// differs from the index's (or, before the first insert, from the first
+    /// non-empty item's). Batch planning and cluster assignment compare items
+    /// with each other, and the distance kernels assume equal lengths.
+    fn screen_dims(&self, items: &mut Vec<(u64, Vec<f32>)>) {
+        let reference = self
+            .data_level0
+            .as_ref()
+            .map(data_level0::DataLevel0Block::dim)
+            .or_else(|| items.iter().map(|(_, v)| v.len()).find(|&d| d > 0));
+        items.retain(|(id, vec)| {
+            let accepted = !vec.is_empty() && Some(vec.len()) == reference;
+            if !accepted {
+                warn!(
+                    node_id = *id,
+                    dim = vec.len(),
+                    index_dim = reference,
+                    "HNSW insert rejected: vector dimension is zero or differs from the index"
+                );
+            }
+            accepted
+        });
     }
 
     /// Allocate the RaBitQ code block on the first insert of a RaBitQ index,
@@ -1548,17 +1541,27 @@ impl HnswIndex {
         }
     }
 
-    pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
-        let InsertPlan {
-            id,
-            new_level,
-            per_layer,
-            is_first_node,
-        } = plan;
-        let idx = self.nodes.len();
+    /// Add node `id` with no links yet: its vector, norms, codes and
+    /// `new_level` empty lists above layer 0, then count it. `None` when the
+    /// vector's dimension is zero or differs from the index's; the index is
+    /// left unchanged.
+    fn allocate_node(&mut self, id: u64, new_level: usize, vector: &[f32]) -> Option<usize> {
+        if !self.accepts_dim(vector.len()) {
+            warn!(
+                node_id = id,
+                dim = vector.len(),
+                index_dim = self
+                    .data_level0
+                    .as_ref()
+                    .map(data_level0::DataLevel0Block::dim),
+                "HNSW insert rejected: vector dimension is zero or differs from the index"
+            );
+            return None;
+        }
+        let idx = self.node_len();
 
         // Quantize if SQ8 is calibrated.
-        let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
+        let quantized = self.sq8_params.as_ref().map(|p| p.quantize(vector));
         // Encode if RaBitQ is calibrated. Encoded against the rotation matrix
         // already chosen at calibration time — codes from before vs after
         // calibration are not interchangeable, so this branch only fires
@@ -1568,7 +1571,7 @@ impl HnswIndex {
         let rabitq_code = self
             .rabitq_params
             .as_ref()
-            .and_then(|p| self.encode_rabitq(p, &vector));
+            .and_then(|p| self.encode_rabitq(p, vector));
 
         // Persist the f32 truth tier. Quantized codes (SQ8 / RaBitQ /
         // PolarQuant / PQ) stay in RAM only; cross-shard rerank reads
@@ -1576,37 +1579,38 @@ impl HnswIndex {
         // the in-RAM insert: the in-RAM graph is authoritative, and the
         // truth tier regenerates from data on recovery.
         if let Some(tier) = self.vector_tier.as_ref() {
-            if let Err(e) = tier.put_f32(id, &vector) {
+            if let Err(e) = tier.put_f32(id, vector) {
                 warn!(node_id = id, error = %e, "vector_tier put_f32 failed");
             }
         }
 
-        self.nodes.push(HnswNode {
-            id,
-            max_layer: new_level,
-        });
         self.ensure_rabitq_block(idx, vector.len());
-        self.mirror_data_level0_vector(idx, &vector);
-        // SoA payload pushes in lockstep — same idx, no extra clone.
-        let norm = metrics::norm_l2(&vector);
-        self.node_norms.push(norm);
-        self.node_inv_norms.push(inv_or_zero(norm));
+        self.mirror_data_level0_vector(idx, vector);
+        // SAFETY: `mirror_data_level0_vector` created the store and grew it
+        // to cover idx; `&mut self` excludes every other reader and writer.
+        unsafe {
+            self.nodes()
+                .init_node(idx, id, metrics::norm_l2(vector), new_level);
+        }
         self.node_quantized.push(quantized);
-        let code_idx = self.node_rabitq_codes.len();
-        self.mirror_rabitq_to_block(code_idx, rabitq_code.as_ref());
+        self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
         self.node_rabitq_codes.push(rabitq_code);
         self.id_to_idx.insert(id, idx);
+        self.node_count
+            .store(idx + 1, core::sync::atomic::Ordering::Release);
+        Some(idx)
+    }
 
-        // Allocate atomic neighbour storage in lockstep — write helpers
-        // index by (node, layer) and would panic on a missing entry.
-        // Layer 0 lives in the contiguous data_level0 block (populated by the
-        // f32 mirror + neighbour write-through); upper layers in the cold
-        // per-node Vec.
-        let mut upper = Vec::with_capacity(new_level);
-        for _ in 0..new_level {
-            upper.push(AtomicNeighbourList::new());
-        }
-        self.neighbours_upper.push(upper);
+    pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
+        let InsertPlan {
+            id,
+            new_level,
+            per_layer,
+            is_first_node,
+        } = plan;
+        let Some(idx) = self.allocate_node(id, new_level, &vector) else {
+            return;
+        };
 
         if is_first_node {
             // First insert seeds the entry-point. try_promote on a
@@ -1680,41 +1684,10 @@ impl HnswIndex {
         // Step 1 — serial allocation phase.
         let mut allocated: Vec<(InsertPlan, usize)> = Vec::with_capacity(plans.len());
         for (plan, vec) in plans {
-            let idx = self.nodes.len();
-            let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vec));
-            let rabitq_code = self
-                .rabitq_params
-                .as_ref()
-                .and_then(|p| self.encode_rabitq(p, &vec));
             let new_level = plan.new_level;
-
-            // Persist the f32 truth tier (mirrors apply_insert_plan).
-            if let Some(tier) = self.vector_tier.as_ref() {
-                if let Err(e) = tier.put_f32(plan.id, &vec) {
-                    warn!(node_id = plan.id, error = %e, "vector_tier put_f32 failed");
-                }
-            }
-
-            self.nodes.push(HnswNode {
-                id: plan.id,
-                max_layer: new_level,
-            });
-            self.ensure_rabitq_block(idx, vec.len());
-            self.mirror_data_level0_vector(idx, &vec);
-            let norm = metrics::norm_l2(&vec);
-            self.node_norms.push(norm);
-            self.node_inv_norms.push(inv_or_zero(norm));
-            self.node_quantized.push(quantized);
-            let code_idx = self.node_rabitq_codes.len();
-            self.mirror_rabitq_to_block(code_idx, rabitq_code.as_ref());
-            self.node_rabitq_codes.push(rabitq_code);
-            self.id_to_idx.insert(plan.id, idx);
-
-            let mut upper = Vec::with_capacity(new_level);
-            for _ in 0..new_level {
-                upper.push(AtomicNeighbourList::new());
-            }
-            self.neighbours_upper.push(upper);
+            let Some(idx) = self.allocate_node(plan.id, new_level, &vec) else {
+                continue;
+            };
 
             // Entry-point promotion through the lock-free CAS-loop.
             // The first insert (`nodes.len() == 1`) hits an empty
@@ -1831,7 +1804,7 @@ impl HnswIndex {
     /// node's f32 if offloading is active. Called at the end of `insert()`.
     fn maybe_calibrate_and_offload(&mut self, _just_inserted_idx: usize) {
         // Step 1: Auto-calibrate the configured codec when threshold reached.
-        let threshold_reached = self.nodes.len() >= self.config.calibration_threshold;
+        let threshold_reached = self.node_len() >= self.config.calibration_threshold;
         match self.config.quantization {
             QuantizationCodec::Sq8 if self.sq8_params.is_none() && threshold_reached => {
                 self.auto_calibrate();
@@ -1903,7 +1876,7 @@ impl HnswIndex {
                 .map(|c| {
                     let exact_dist = self.compute_exact_distance(&qctx, c.idx as usize);
                     SearchResult {
-                        id: self.nodes[c.idx as usize].id,
+                        id: self.node_id(c.idx as usize),
                         score: exact_dist,
                     }
                 })
@@ -1921,7 +1894,7 @@ impl HnswIndex {
                 .into_iter()
                 .take(k)
                 .map(|c| SearchResult {
-                    id: self.nodes[c.idx as usize].id,
+                    id: self.node_id(c.idx as usize),
                     score: c.distance,
                 })
                 .collect()
@@ -1950,7 +1923,7 @@ impl HnswIndex {
     /// HNSW overhead exceeds a straight scan, or when recall=1.0 is a hard
     /// requirement (regulatory queries, ground-truth validation).
     fn search_exact(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
-        let n = self.nodes.len();
+        let n = self.node_len();
         if n == 0 || k == 0 {
             return Vec::new();
         }
@@ -1984,7 +1957,7 @@ impl HnswIndex {
         let mut out: Vec<SearchResult> = heap
             .into_iter()
             .map(|c| SearchResult {
-                id: self.nodes[c.idx as usize].id,
+                id: self.node_id(c.idx as usize),
                 score: c.distance,
             })
             .collect();
@@ -2069,7 +2042,7 @@ impl HnswIndex {
                 let mut reranked: Vec<SearchResult> = candidates
                     .into_iter()
                     .map(|c| SearchResult {
-                        id: self.nodes[c.idx as usize].id,
+                        id: self.node_id(c.idx as usize),
                         score: self.compute_exact_distance(&qctx, c.idx as usize),
                     })
                     .collect();
@@ -2083,7 +2056,7 @@ impl HnswIndex {
                 candidates
                     .into_iter()
                     .map(|c| SearchResult {
-                        id: self.nodes[c.idx as usize].id,
+                        id: self.node_id(c.idx as usize),
                         score: c.distance,
                     })
                     .collect()
@@ -2158,14 +2131,14 @@ impl HnswIndex {
         // Batch-load f32 vectors from storage for reranking
         let candidate_ids: Vec<u64> = candidates
             .iter()
-            .map(|c| self.nodes[c.idx as usize].id)
+            .map(|c| self.node_id(c.idx as usize))
             .collect();
         let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
 
         let mut reranked: Vec<SearchResult> = candidates
             .into_iter()
             .filter_map(|c| {
-                let node_id = self.nodes[c.idx as usize].id;
+                let node_id = self.node_id(c.idx as usize);
                 let f32_vec = loaded.get(&node_id)?;
                 let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                 Some(SearchResult {
@@ -2252,14 +2225,14 @@ impl HnswIndex {
             // Batch-load f32 for reranking
             let candidate_ids: Vec<u64> = candidates
                 .iter()
-                .map(|c| self.nodes[c.idx as usize].id)
+                .map(|c| self.node_id(c.idx as usize))
                 .collect();
             let loaded = loader.load_vectors(&candidate_ids, &self.config.property_name);
 
             let mut results: Vec<SearchResult> = candidates
                 .into_iter()
                 .filter_map(|c| {
-                    let node_id = self.nodes[c.idx as usize].id;
+                    let node_id = self.node_id(c.idx as usize);
                     let f32_vec = loaded.get(&node_id)?;
                     let exact_dist = self.distance_for_metric(&qctx, f32_vec);
                     Some(SearchResult {
@@ -2323,7 +2296,7 @@ impl HnswIndex {
     /// 4. Re-run the HNSW insertion neighbourhood search from a valid entry point.
     /// 5. Re-connect bidirectionally at each layer.
     fn update_existing_node(&mut self, idx: usize, vector: Vec<f32>) {
-        let id = self.nodes[idx].id;
+        let id = self.node_id(idx);
         let n_levels = self.node_levels(idx);
 
         // Step 1: Remove this node from every neighbour's connection list.
@@ -2332,7 +2305,7 @@ impl HnswIndex {
             let neighbours = self.layer_snapshot(idx, level);
             for neighbour_idx_u64 in neighbours {
                 let neighbour_idx = neighbour_idx_u64 as usize;
-                if neighbour_idx < self.nodes.len() && level < self.node_levels(neighbour_idx) {
+                if neighbour_idx < self.node_len() && level < self.node_levels(neighbour_idx) {
                     self.remove_neighbour_from(neighbour_idx, level, idx as u64);
                 }
             }
@@ -2362,13 +2335,18 @@ impl HnswIndex {
         // reads the updated vector and code, not the original insert's.
         self.ensure_rabitq_block(idx, vector.len());
         self.mirror_data_level0_vector(idx, &vector);
+        // SAFETY: idx is an existing node; `&mut self` excludes every other
+        // reader and writer while its vector and norms change together.
+        unsafe {
+            self.nodes().set_norm(idx, metrics::norm_l2(&vector));
+        }
         self.node_quantized[idx] = quantized;
         self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
         self.node_rabitq_codes[idx] = rabitq_code;
 
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
-        if self.nodes.len() == 1 {
+        if self.node_len() == 1 {
             return;
         }
 
@@ -2393,7 +2371,7 @@ impl HnswIndex {
             None => (0, 0),
         };
 
-        let node_level = self.nodes[idx].max_layer;
+        let node_level = n_levels - 1;
         let mut current_ep = ep_idx;
 
         // Step 4a: Greedy descent from top layer down to node_level+1.
@@ -2502,7 +2480,7 @@ impl HnswIndex {
                     // Stored u64s ARE internal indices now (HNSW search hot
                     // path: no id_to_idx HashMap hop per neighbour).
                     let neighbor_idx = neighbor_idx_u64 as usize;
-                    if neighbor_idx < self.nodes.len() {
+                    if neighbor_idx < self.node_len() {
                         let dist = self.compute_distance(ctx, neighbor_idx);
                         if dist < current_dist {
                             current = neighbor_idx;
@@ -2600,11 +2578,10 @@ impl HnswIndex {
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
         let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
-        // Lifted out of the `while let Some(...)` loop body — `nodes.len()`
-        // is invariant for the duration of a search call (insert is
-        // exclusive on `&mut self`, search holds `&self`). Saves one
-        // field load per inner iteration.
-        let n_nodes = self.nodes.len();
+        // One snapshot of the node count per search: nodes inserted after it
+        // are skipped by this search, and the visited list covers every index
+        // below it. Saves one atomic load per inner iteration.
+        let n_nodes = self.node_len();
         let mut visited = self.visited_pool.get(n_nodes);
 
         let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
@@ -2633,7 +2610,8 @@ impl HnswIndex {
             if closest.distance > farthest_dist && results.len() >= ef {
                 break;
             }
-            if level >= self.node_levels(closest.idx as usize) {
+            // Every node takes part in layer 0, so only upper layers ask.
+            if level > 0 && level >= self.node_levels(closest.idx as usize) {
                 continue;
             }
             if level == 0 {
@@ -2805,11 +2783,10 @@ impl HnswIndex {
         let heap_cap = ef + 16;
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::with_capacity(heap_cap);
         let mut results: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(heap_cap);
-        // Lifted out of the `while let Some(...)` loop body — `nodes.len()`
-        // is invariant for the duration of a search call (insert is
-        // exclusive on `&mut self`, search holds `&self`). Saves one
-        // field load per inner iteration.
-        let n_nodes = self.nodes.len();
+        // One snapshot of the node count per search: nodes inserted after it
+        // are skipped by this search, and the visited list covers every index
+        // below it. Saves one atomic load per inner iteration.
+        let n_nodes = self.node_len();
         let mut visited = self.visited_pool.get(n_nodes);
 
         let mut connections: Vec<u64> = Vec::with_capacity(M_MAX0);
@@ -2850,7 +2827,8 @@ impl HnswIndex {
                 }
             }
 
-            if level < self.node_levels(closest.idx as usize) {
+            // Every node takes part in layer 0, so only upper layers ask.
+            if level == 0 || level < self.node_levels(closest.idx as usize) {
                 unvisited_neighbors.clear();
                 // Read this node's neighbour row: layer 0 from the contiguous
                 // data_level0 block (co-located with the f32 vector, ids u32),
@@ -3091,10 +3069,11 @@ impl HnswIndex {
                 // is `1 - dot * inv_a * inv_b`. Zero-vector inverses are
                 // stored as 0.0, which collapses the product to 0.0 — the
                 // same answer the division helpers' epsilon guard gives.
-                // Falls through to the legacy single-norm helper when the
-                // cache slot is missing (node inserted before the field
-                // landed).
-                if let Some(&b_inv) = self.node_inv_norms.get(node_idx) {
+                if let Some(b_inv) = self
+                    .data_level0
+                    .as_ref()
+                    .and_then(|block| block.inv_norm(node_idx))
+                {
                     if b_inv.is_finite() {
                         let dot = metrics::dot_product(ctx.vec, node_vec);
                         return 1.0 - dot * ctx.inv_norm_l2 * b_inv;
@@ -3182,7 +3161,7 @@ impl HnswIndex {
                 continue;
             }
             let neighbor_idx = neighbor_idx_u64 as usize;
-            if neighbor_idx < self.nodes.len() {
+            if neighbor_idx < self.node_len() {
                 let dist = self.distance_between_nodes(node_idx, neighbor_idx);
                 candidates.push(Candidate {
                     distance: dist,
@@ -3242,28 +3221,54 @@ impl HnswIndex {
     //   can reach yet (the new node's own outgoing edges) or a caller that
     //   holds `&mut self`.
 
-    /// Resolve `(node, layer >= 1)` to the underlying [`AtomicNeighbourList`]
-    /// in the SoA `neighbours_upper` store. **Layer 0 no longer lives here** —
-    /// it is the contiguous `data_level0` block; layer-0 callers go through the
-    /// `layer_*` helpers below. Calling this with `level == 0` is a bug.
+    /// Number of nodes in the index.
+    #[inline(always)]
+    fn node_len(&self) -> usize {
+        self.node_count.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The node store. Present from the first insert on, so every `idx <
+    /// node_len()` finds it.
+    #[inline(always)]
+    #[allow(
+        clippy::expect_used,
+        reason = "only called for an existing node; a node exists only in the store"
+    )]
+    fn nodes(&self) -> &data_level0::DataLevel0Block {
+        self.data_level0
+            .as_ref()
+            .expect("a node exists only after the store was created")
+    }
+
+    /// External id of node `idx`.
+    #[inline]
+    fn node_id(&self, idx: usize) -> u64 {
+        debug_assert!(idx < self.node_len(), "node {idx} does not exist");
+        // SAFETY: idx < node_len, and every counted node was initialized.
+        unsafe { self.nodes().id(idx) }
+    }
+
+    /// Resolve `(node, layer >= 1)` to its [`AtomicNeighbourList`]. Layer 0
+    /// lists are compact and go through the `layer_*` helpers below; calling
+    /// this with `level == 0` is a bug.
     #[inline]
     fn neighbours_at(&self, idx: usize, level: usize) -> &AtomicNeighbourList<M_MAX0> {
         debug_assert!(
-            level >= 1,
-            "layer 0 neighbours live in data_level0; use the layer_* helpers"
+            level >= 1 && level < self.node_levels(idx),
+            "node {idx} has no list at layer {level}"
         );
-        &self.neighbours_upper[idx][level - 1]
+        // SAFETY: idx is an existing node and 1 <= level < its layer count.
+        unsafe { self.nodes().upper(idx, level) }
     }
 
     /// Snapshot node `idx`'s neighbours at `level` into `out` (cleared first).
-    /// Layer 0 reads the contiguous `data_level0` block (the sole layer-0
-    /// store, ids widened u32 -> u64); layers >= 1 read `neighbours_upper`.
+    /// Layer 0 lists widen their u32 ids to u64.
     fn layer_snapshot_into(&self, idx: usize, level: usize, out: &mut Vec<u64>) {
         if level == 0 {
             self.read_layer0_neighbours_into(idx, out);
         } else {
             out.clear();
-            self.neighbours_upper[idx][level - 1].snapshot_into(out);
+            self.neighbours_at(idx, level).snapshot_into(out);
         }
     }
 
@@ -3287,7 +3292,7 @@ impl HnswIndex {
                 }
             })
         } else {
-            self.neighbours_upper[idx][level - 1].len()
+            self.neighbours_at(idx, level).len()
         }
     }
 
@@ -3304,19 +3309,18 @@ impl HnswIndex {
                 }
             })
         } else {
-            self.neighbours_upper[idx][level - 1].cas_append(id)
+            self.neighbours_at(idx, level).cas_append(id)
         }
     }
 
-    /// Bulk-replace the neighbour set at `(idx, level)`. Layer 0 writes the
-    /// contiguous block (single-writer-per-node, same contract as the SoA
-    /// `set`); layers >= 1 write `neighbours_upper`.
+    /// Bulk-replace the neighbour set at `(idx, level)`. Layer 0 narrows the
+    /// ids to the compact layer-0 list.
     fn layer_set(&self, idx: usize, level: usize, ids: &[u64]) {
         if level == 0 {
             self.mirror_layer0_neighbours_to_data_level0(idx, ids);
         } else {
             let n = ids.len().min(M_MAX0);
-            self.neighbours_upper[idx][level - 1].set(&ids[..n]);
+            self.neighbours_at(idx, level).set(&ids[..n]);
         }
     }
 
@@ -3334,7 +3338,7 @@ impl HnswIndex {
         mut edit: impl FnMut(&[u64]) -> Option<Vec<u64>>,
     ) -> bool {
         if level > 0 {
-            return self.neighbours_upper[idx][level - 1].update(|current| {
+            return self.neighbours_at(idx, level).update(|current| {
                 edit(current).map(|mut next| {
                     next.truncate(M_MAX0);
                     next.into_boxed_slice()
@@ -3362,11 +3366,11 @@ impl HnswIndex {
     }
 
     /// Number of layers the node participates in (`top_level + 1`).
-    /// Replaces the legacy `neighbours_atomic[idx].len()` idiom from
-    /// before the layer-0 / upper-layer split.
     #[inline]
     fn node_levels(&self, idx: usize) -> usize {
-        1 + self.neighbours_upper[idx].len()
+        debug_assert!(idx < self.node_len(), "node {idx} does not exist");
+        // SAFETY: idx < node_len, and every counted node was initialized.
+        unsafe { self.nodes().levels(idx) }
     }
 
     /// Replace the entire neighbour set at `(idx, level)` with `ids`, without
@@ -3425,7 +3429,7 @@ impl HnswIndex {
                 let mut scored: Vec<(f32, u64)> = Vec::with_capacity(current.len() + 1);
                 for &nidx_u64 in current.iter().chain(core::iter::once(&id)) {
                     let nidx = nidx_u64 as usize;
-                    if nidx < self.nodes.len() {
+                    if nidx < self.node_len() {
                         let dist = self.distance_between_nodes(neighbour_idx, nidx);
                         scored.push((dist, nidx_u64));
                     }
@@ -3529,9 +3533,11 @@ impl HnswIndex {
             // O(max_conn x candidates) times per insert; on glove-100
             // angular the redundant norm passes dominated build cycles.
             if matches!(self.config.metric, VectorMetric::Cosine) {
-                if let (Some(&na), Some(&nb)) =
-                    (self.node_norms.get(a_idx), self.node_norms.get(b_idx))
-                {
+                let norms = self
+                    .data_level0
+                    .as_ref()
+                    .map(|block| (block.norm(a_idx), block.norm(b_idx)));
+                if let Some((Some(na), Some(nb))) = norms {
                     if na.is_finite() && na > 0.0 && nb.is_finite() && nb > 0.0 {
                         return 1.0 - metrics::cosine_similarity_with_both_norms(va, vb, na, nb);
                     }

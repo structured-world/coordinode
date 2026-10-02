@@ -51,7 +51,7 @@ fn assert_rabitq_block_matches_codes(index: &HnswIndex) {
     let block = index
         .rabitq_block()
         .expect("a RaBitQ index has a code block after inserts");
-    for idx in 0..index.nodes.len() {
+    for idx in 0..index.node_len() {
         let soa = index.node_rabitq_codes[idx].as_ref();
         assert!(
             matches!(soa, Some(RabitqEncoded::OneBit(_))),
@@ -131,7 +131,7 @@ fn data_level0_neighbours_form_valid_layer0_graph() {
         .data_level0
         .as_ref()
         .expect("data_level0 present after inserts");
-    let n = index.nodes.len();
+    let n = index.node_len();
     let mut with_neighbours = 0usize;
     for idx in 0..n {
         let mut blk = Vec::new();
@@ -588,7 +588,7 @@ fn random_level_distribution() {
 
     // Count nodes per max layer
     let mut layer_counts = [0usize; 10];
-    for idx in 0..index.nodes.len() {
+    for idx in 0..index.node_len() {
         let max_layer = index.node_levels(idx).saturating_sub(1);
         if max_layer < layer_counts.len() {
             layer_counts[max_layer] += 1;
@@ -1373,7 +1373,7 @@ fn set_rabitq_params_re_encodes_existing_nodes() {
     assert!(index.is_rabitq_active());
     // Every node must now carry an encoded code, and that code must
     // match the persisted rotation's encoding of its f32 vector.
-    for i in 0..index.nodes.len() {
+    for i in 0..index.node_len() {
         let code_opt = &index.node_rabitq_codes[i];
         assert!(
             code_opt.is_some(),
@@ -1399,7 +1399,7 @@ fn sq8_memory_savings() {
 
     assert!(index.is_quantized());
 
-    for i in 0..index.nodes.len() {
+    for i in 0..index.node_len() {
         let v = index
             .read_node_f32(i)
             .expect("f32 should be retained (offload_vectors=false)");
@@ -1689,16 +1689,16 @@ fn offload_drops_f32_after_calibration() {
     assert!(index.is_offloaded(), "should be in offload mode");
 
     // Verify f32 vectors are dropped from in-memory nodes
-    for (i, node) in index.nodes.iter().enumerate() {
+    for i in 0..index.node_len() {
         assert!(
             index.read_node_f32(i).is_none(),
             "f32 should be None when offloaded (node {})",
-            node.id
+            index.node_id(i)
         );
         assert!(
             index.node_quantized[i].is_some(),
             "quantized should be present (node {})",
-            node.id
+            index.node_id(i)
         );
     }
 }
@@ -1909,18 +1909,12 @@ fn atomic_neighbours_track_inserts_and_updates() {
     assert!(
         idx.data_level0
             .as_ref()
-            .is_some_and(|b| b.capacity() >= idx.nodes.len())
+            .is_some_and(|b| b.capacity() >= idx.node_len())
     );
-    assert_eq!(idx.neighbours_upper.len(), idx.nodes.len());
+    assert_eq!(idx.node_len(), 30, "the re-insert updated node 7 in place");
 
     let mut scratch = Vec::with_capacity(M_MAX0);
-    for node_idx in 0..idx.nodes.len() {
-        // Node layer count tracks the node's max_layer + 1.
-        assert_eq!(
-            idx.node_levels(node_idx),
-            idx.nodes[node_idx].max_layer + 1,
-            "node {node_idx} layer count diverged from max_layer + 1",
-        );
+    for node_idx in 0..idx.node_len() {
         for level in 0..idx.node_levels(node_idx) {
             idx.layer_snapshot_into(node_idx, level, &mut scratch);
             assert!(
@@ -2040,23 +2034,16 @@ fn search_exact_handles_empty_index_and_zero_k() {
 
 #[test]
 fn max_elements_preallocates_node_storage() {
-    // HnswConfig::max_elements drives Vec::with_capacity for nodes +
-    // neighbours_upper, and sizes the contiguous data_level0 block, so
-    // steady-state inserts don't pay reallocation cost on the hot path.
+    // HnswConfig::max_elements sizes the node store's first segment, so
+    // steady-state inserts don't pay growth on the hot path.
     let cfg = HnswConfig {
         max_elements: 50_000,
         ..HnswConfig::default()
     };
     let mut idx = HnswIndex::new(cfg);
-    // data_level0 (layer-0 neighbours + f32) allocates lazily on the first
-    // insert, sized to max_elements.
+    // The store allocates lazily on the first insert, sized to max_elements.
     idx.insert(0, vec![0.1; 16]);
 
-    assert!(
-        idx.nodes.capacity() >= 50_000,
-        "nodes Vec capacity {} < max_elements 50_000",
-        idx.nodes.capacity()
-    );
     assert!(
         idx.data_level0
             .as_ref()
@@ -2068,9 +2055,10 @@ fn max_elements_preallocates_node_storage() {
 }
 
 #[test]
-fn insert_within_max_elements_does_not_reallocate_node_vec() {
-    // The whole point of pre-allocation: stable Vec capacity through
-    // the full max_elements range of inserts.
+fn inserts_past_max_elements_keep_node_addresses() {
+    // A node's vector keeps its address while the index grows, inside the
+    // max_elements estimate and past it: readers hold such pointers across
+    // concurrent inserts, so growth must never move a node.
     let cfg = HnswConfig {
         m: 4,
         m_max0: 8,
@@ -2079,16 +2067,22 @@ fn insert_within_max_elements_does_not_reallocate_node_vec() {
         ..HnswConfig::default()
     };
     let mut idx = HnswIndex::new(cfg);
-    let cap_before = idx.nodes.capacity();
-    for i in 0..200u64 {
-        let v: Vec<f32> = (0..4).map(|d| ((i * 7 + d) as f32).sin()).collect();
-        idx.insert(i, v);
+    let vector = |i: u64| -> Vec<f32> { (0..4).map(|d| ((i * 7 + d) as f32).sin()).collect() };
+    idx.insert(0, vector(0));
+    let first = idx.get_vector(0).map(<[f32]>::as_ptr);
+    for i in 1..700u64 {
+        idx.insert(i, vector(i));
     }
+    assert_eq!(idx.len(), 700);
     assert_eq!(
-        idx.nodes.capacity(),
-        cap_before,
-        "nodes Vec reallocated within max_elements window",
+        idx.get_vector(0).map(<[f32]>::as_ptr),
+        first,
+        "node 0 moved"
     );
+    for i in [0u64, 199, 200, 399, 400, 699] {
+        let at = idx.idx_for_id_for_test(i).expect("inserted");
+        assert_eq!(idx.get_vector(at), Some(vector(i).as_slice()), "node {i}");
+    }
 }
 
 #[test]
@@ -2483,6 +2477,72 @@ fn apply_insert_plans_parallel_ingests_every_item() {
     assert!(
         ratio >= 0.85,
         "self-recover ratio {ratio:.2} after parallel apply (expected ≥ 0.85)",
+    );
+}
+
+/// A vector whose dimension is zero or differs from the index's is rejected
+/// on every insert path and leaves the index as it was; the distance kernels
+/// assume equal lengths, so it must never reach planning or the store.
+#[test]
+fn inserts_with_the_wrong_dimension_are_rejected() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
+    index.insert(1, vec![]);
+    assert!(index.is_empty(), "a zero-length vector sized the index");
+    for i in 0..10u64 {
+        index.insert(i, vec![i as f32, 1.0, 2.0]);
+    }
+    index.insert(100, vec![1.0, 2.0]);
+    index.insert(3, vec![1.0, 2.0, 3.0, 4.0]);
+    let batch: Vec<(u64, Vec<f32>)> = (200..300u64)
+        .map(|i| {
+            let dim = if i % 3 == 0 { 5 } else { 3 };
+            (i, vec![i as f32; dim])
+        })
+        .collect();
+    index.insert_batch(batch);
+    assert!(!index.contains(100));
+    assert_eq!(
+        index.get_vector(index.idx_for_id_for_test(3).expect("kept")),
+        Some([3.0, 1.0, 2.0].as_slice()),
+        "a wrong-dimension update replaced node 3"
+    );
+    assert!(
+        (200..300u64)
+            .filter(|i| i % 3 == 0)
+            .all(|i| !index.contains(i))
+    );
+    assert!(
+        (200..300u64)
+            .filter(|i| i % 3 != 0)
+            .all(|i| index.contains(i))
+    );
+    let accepted = (200..300u64).filter(|i| i % 3 != 0).count();
+    assert_eq!(index.len(), 10 + accepted);
+}
+
+/// Updating a node's vector refreshes the norms the cosine kernels read: a
+/// query along the new vector scores it at distance 0, not at a value
+/// computed from the old vector's norm.
+#[test]
+fn update_refreshes_the_cosine_norms() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::Cosine));
+    for i in 0..20u64 {
+        let v: Vec<f32> = (0..4).map(|d| ((i * 5 + d) as f32 * 0.3).sin()).collect();
+        index.insert(i, v);
+    }
+    index.insert(3, vec![1.0, 0.0, 0.0, 0.0]);
+    // Same id, a longer vector in a new direction.
+    index.insert(3, vec![5.0, 5.0, 0.0, 0.0]);
+    let hit = index
+        .search(&[1.0, 1.0, 0.0, 0.0], 1)
+        .into_iter()
+        .next()
+        .expect("a result");
+    assert_eq!(hit.id, 3);
+    assert!(
+        hit.score.abs() < 1e-5,
+        "cosine distance to an identical direction is {}, expected 0",
+        hit.score
     );
 }
 
