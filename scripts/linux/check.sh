@@ -9,6 +9,11 @@
 # added (a filter and a stress count to chase a flaky test, for example:
 # COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
 #
+# With COORDINODE_CHECK_BENCH set, only that `cargo bench` runs, with those
+# arguments (a task's bounded measurement, for example:
+# COORDINODE_CHECK_BENCH='-p coordinode-vector --bench hnsw_publication');
+# its output lands in bench.log.
+#
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
 # anything when one is missing. Logs and the status file land in
@@ -17,11 +22,17 @@
 set -euo pipefail
 
 host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of the Linux machine}"
-# A directory of this run's own, so concurrent runs and other users of a
-# shared machine never meet in it.
-remote_root="/var/tmp/cn-check-$(date +%Y%m%d%H%M%S)-$$"
+# One fixed directory per host, created atomically as the run's lock: the
+# compilation cache keys on absolute paths, so a path that differs per run
+# would never hit and every run would rebuild the workspace from nothing. A
+# second run on the same host waits for no one; it stops and says why.
+remote_root="/var/tmp/cn-check"
+locked=0
 ref='refs/check/linux'
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
+only_bench="${COORDINODE_CHECK_BENCH:-}"
+# Extra NAME=value assignments exported for the bench run only.
+bench_env="${COORDINODE_CHECK_BENCH_ENV:-}"
 
 repo="$(git rev-parse --show-toplevel)"
 
@@ -54,18 +65,46 @@ index="$(mktemp)"
 cleanup() {
   rm -f "$index"
   git -C "$repo" update-ref -d "$ref" 2>/dev/null || true
-  ssh "$host" "rm -rf '$remote_root'" || true
+  # Only the run that took the lock removes the directory.
+  if [ "$locked" = 1 ]; then
+    ssh "$host" "rm -rf '$remote_root'" || true
+  fi
 }
 trap cleanup EXIT
-cp "$repo/.git/index" "$index"
+# The git dir, not `$repo/.git`: in a worktree `.git` is a file.
+cp "$(git -C "$repo" rev-parse --absolute-git-dir)/index" "$index"
 GIT_INDEX_FILE="$index" git -C "$repo" add -A
 tree="$(GIT_INDEX_FILE="$index" git -C "$repo" write-tree)"
 commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'linux check snapshot')"
 git -C "$repo" update-ref "$ref" "$commit"
 git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
 
-ssh "$host" "mkdir -p '$remote_root'"
+if ! ssh "$host" "mkdir '$remote_root'"; then
+  echo "another check holds $remote_root on $host; if no run is in progress, remove it with: ssh $host rm -rf $remote_root" >&2
+  exit 1
+fi
+locked=1
 ssh "$host" "cat > '$remote_root/tree.bundle'" < "$bundle"
+
+if [ -n "$only_bench" ]; then
+  ssh "$host" "set -u
+cd '$remote_root'
+git clone -q --no-checkout tree.bundle src
+cd src
+git fetch -q ../tree.bundle '$ref'
+git checkout -q --detach FETCH_HEAD
+git submodule update --init -q
+echo checkout=\$? > ../status.txt
+export CARGO_TARGET_DIR='$remote_root/target' $bench_env
+cargo bench $only_bench > ../bench.log 2>&1
+echo bench=\$? >> ../status.txt
+echo done >> ../status.txt" || true
+  for f in status.txt bench.log; do
+    ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
+  done
+  cat "$out/status.txt"
+  exit 0
+fi
 
 if [ -n "$only_nextest" ]; then
   ssh "$host" "set -u
