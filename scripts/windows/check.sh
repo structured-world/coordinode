@@ -31,7 +31,8 @@ bundle="$out/tree.bundle"
 # index so the real one is left as it is.
 index="$(mktemp)"
 trap 'rm -f "$index"; git -C "$repo" update-ref -d "$ref" 2>/dev/null || true' EXIT
-cp "$repo/.git/index" "$index"
+# The git dir, not `$repo/.git`: in a worktree `.git` is a file.
+cp "$(git -C "$repo" rev-parse --absolute-git-dir)/index" "$index"
 GIT_INDEX_FILE="$index" git -C "$repo" add -A
 tree="$(GIT_INDEX_FILE="$index" git -C "$repo" write-tree)"
 commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'windows check snapshot')"
