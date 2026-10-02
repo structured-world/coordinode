@@ -20,11 +20,14 @@ cd coordinode
 cargo build
 
 # Run tests (the same selection CI runs, so local builds reuse its artefacts).
-# The cluster tests time Raft elections; on a machine busy running the whole
-# suite in parallel, the generous timeouts CI uses keep them from electing
-# spuriously and timing out.
-COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run --workspace --all-features
+# The multi-node cluster schemes are left out of this run.
+cargo nextest run --workspace --all-features
 cargo test --doc --all-features
+
+# Run the multi-node cluster schemes, when a change touches clustering. They
+# time Raft elections; the generous timeouts keep them from electing
+# spuriously on a busy machine.
+COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run -P cluster --workspace --all-features
 
 # Run with Clippy (must pass with zero warnings)
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -87,7 +90,7 @@ cargo nextest run --cargo-profile debugger -E 'test(name)'
 4. Ensure all checks pass:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings` (zero warnings)
-   - `COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run --workspace --all-features` and `cargo test --doc --all-features` (all tests pass)
+   - `cargo nextest run --workspace --all-features` and `cargo test --doc --all-features` (all tests pass); for a change to clustering, also `COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 cargo nextest run -P cluster --workspace --all-features`
    - `cargo hakari generate --diff` and `cargo hakari manage-deps --dry-run` (workspace-hack up to date)
 5. Write a clear commit message following [Conventional Commits](https://www.conventionalcommits.org/)
 6. Open a pull request with a description of what changed and why

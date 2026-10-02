@@ -8,6 +8,8 @@
 # With COORDINODE_CHECK_NEXTEST set, only nextest runs, with those arguments
 # added (a filter and a stress count to chase a flaky test, for example:
 # COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
+# The multi-node cluster schemes are left out of the default run; they run
+# with COORDINODE_CHECK_NEXTEST='-P cluster'.
 #
 # With COORDINODE_CHECK_BENCH set, only that `cargo bench` runs, with those
 # arguments (a task's bounded measurement, for example:

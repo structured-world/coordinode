@@ -8,6 +8,8 @@
 # With COORDINODE_CHECK_NEXTEST set, only nextest runs, with those arguments
 # added; they are split at whitespace on the host, so a filter holds none
 # (for example: COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
+# The multi-node cluster schemes are left out of the default run; they run
+# with COORDINODE_CHECK_NEXTEST='-P cluster'.
 #
 # The host needs git, a Rust toolchain, cargo-nextest and protoc, and an
 # OpenSSH server whose default shell is PowerShell. Logs and the status file
