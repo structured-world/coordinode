@@ -136,7 +136,7 @@ impl HnswIndex {
         // Upper-layer neighbours per OLD idx: outer = node, mid = layer, inner =
         // remapped neighbour ids. The node's id and norm travel with it.
         let mut upper: Vec<Vec<Vec<u64>>> = Vec::with_capacity(n);
-        let mut meta: Vec<(u64, f32)> = Vec::with_capacity(n);
+        let mut meta: Vec<(u64, f32, super::data_level0::NodeState)> = Vec::with_capacity(n);
         for old in 0..n {
             let levels = self.node_levels(old);
             let mut per_layer = Vec::with_capacity(levels - 1);
@@ -151,6 +151,7 @@ impl HnswIndex {
             meta.push((
                 self.node_id(old),
                 self.nodes().norm(old).unwrap_or_default(),
+                self.nodes().state(old),
             ));
         }
 
@@ -177,7 +178,7 @@ impl HnswIndex {
                 nb.drop_f32();
             }
             for (new, &old) in old_of_new.iter().enumerate() {
-                let (id, norm) = meta[old];
+                let (id, norm, state) = meta[old];
                 let per_layer = std::mem::take(&mut upper[old]);
                 let (sq8, rabitq) = std::mem::take(&mut codes[old]);
                 // SAFETY: new < n <= cap; `nb` is owned here, so nothing else
@@ -193,6 +194,7 @@ impl HnswIndex {
                         nb.upper(new, layer + 1).set(ids);
                     }
                 }
+                nb.set_state(new, state);
             }
             self.data_level0 = std::sync::OnceLock::from(nb);
         }

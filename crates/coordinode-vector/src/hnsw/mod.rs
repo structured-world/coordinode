@@ -1638,6 +1638,7 @@ impl HnswIndex {
         };
 
         if is_first_node {
+            self.nodes().set_state(idx, data_level0::NodeState::Live);
             // First insert seeds the entry-point. try_promote on a
             // fresh EntryPoint always succeeds — no other writer
             // has touched it yet, and we're holding &mut self.
@@ -1667,6 +1668,7 @@ impl HnswIndex {
                 }
             }
         }
+        self.nodes().set_state(idx, data_level0::NodeState::Live);
 
         // Promote the new node to entry-point if it pierced a new top
         // layer. CAS-loop returns `NotNeeded` when another insert has
@@ -1817,6 +1819,11 @@ impl HnswIndex {
                 self.prune_connections_with_extras(*neighbour_idx, *level, *max_conn, &extras);
             });
 
+        // Every allocated node is linked now.
+        for (_, idx) in &allocated {
+            self.nodes().set_state(*idx, data_level0::NodeState::Live);
+        }
+
         // Step 4 — serial post-phase. SQ8 calibration sees the final
         // population. We call once with the last allocated idx; the
         // calibration path itself looks at `self.nodes` as a whole.
@@ -1964,7 +1971,13 @@ impl HnswIndex {
         // max-heap over distance — exactly the shape we want for a
         // k-smallest selector.
         let mut heap: BinaryHeap<FarCandidate> = BinaryHeap::with_capacity(k + 1);
+        let store = self.nodes();
         for idx in 0..n {
+            // A scan reaches every slot, not only linked nodes: one still
+            // being initialized or already replaced is not a result.
+            if store.state(idx) != data_level0::NodeState::Live {
+                continue;
+            }
             let distance = self.compute_exact_distance(&qctx, idx);
             let cand = FarCandidate {
                 distance,

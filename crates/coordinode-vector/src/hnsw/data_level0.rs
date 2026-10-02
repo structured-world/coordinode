@@ -32,7 +32,7 @@
 //! vectors takes `&mut self`.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::neighbours::AtomicNeighbourList;
 use super::{M_MAX0, RabitqEncoded};
@@ -53,6 +53,8 @@ struct NodeMeta {
     id: AtomicU64,
     /// L2 norm of the vector, as f32 bits.
     norm: AtomicU32,
+    /// [`NodeState`] as its discriminant.
+    state: AtomicU8,
 }
 
 impl NodeMeta {
@@ -60,8 +62,23 @@ impl NodeMeta {
         Self {
             id: AtomicU64::new(0),
             norm: AtomicU32::new(0),
+            state: AtomicU8::new(NodeState::Reserved as u8),
         }
     }
+}
+
+/// Where a node is in its life. A slot is never reused, so the state only
+/// moves forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum NodeState {
+    /// Allocated and being initialized or linked; not yet a result.
+    Reserved = 0,
+    /// Linked and answering queries.
+    Live = 1,
+    /// Replaced by a newer node of the same id: still navigable for readers
+    /// that reach it through a remaining link, never a result.
+    Retired = 2,
 }
 
 /// The neighbour lists of one node above layer 0, one per layer.
@@ -444,6 +461,35 @@ impl DataLevel0Block {
         unsafe {
             let (segment, off) = self.locate(idx);
             store_norms(segment, off, norm);
+        }
+    }
+
+    /// Move node `idx` to `state`. Release, so a reader that observes the
+    /// state also observes everything written to the node before it.
+    pub(super) fn set_state(&self, idx: usize, state: NodeState) {
+        if let Some((segment, off)) = self.try_locate(idx) {
+            // SAFETY: off lies inside the segment per try_locate.
+            unsafe { segment.meta.get_unchecked(off) }
+                .state
+                .store(state as u8, Ordering::Release);
+        }
+    }
+
+    /// The state of node `idx`; `Reserved` when `idx` has no slot. Acquire,
+    /// pairing with [`Self::set_state`].
+    #[inline]
+    pub(super) fn state(&self, idx: usize) -> NodeState {
+        let Some((segment, off)) = self.try_locate(idx) else {
+            return NodeState::Reserved;
+        };
+        // SAFETY: off lies inside the segment per try_locate.
+        match unsafe { segment.meta.get_unchecked(off) }
+            .state
+            .load(Ordering::Acquire)
+        {
+            1 => NodeState::Live,
+            2 => NodeState::Retired,
+            _ => NodeState::Reserved,
         }
     }
 

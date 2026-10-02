@@ -2471,6 +2471,32 @@ fn apply_insert_plans_parallel_ingests_every_item() {
     );
 }
 
+/// Every inserted node ends live, through the single, batched and parallel
+/// paths, and a reorder keeps that state with the node.
+#[test]
+fn inserted_nodes_are_live_and_reorder_keeps_them_live() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
+    for i in 0..10u64 {
+        index.insert(i, vec![i as f32, 1.0, 0.5]);
+    }
+    let batch: Vec<(u64, Vec<f32>)> = (10..200u64)
+        .map(|i| (i, vec![(i as f32).sin(), (i as f32).cos(), 0.5]))
+        .collect();
+    index.insert_batch(batch);
+    let all_live = |index: &HnswIndex| {
+        (0..index.node_len()).all(|i| index.nodes().state(i) == data_level0::NodeState::Live)
+    };
+    assert!(all_live(&index));
+    index.reorder_for_cache_locality();
+    assert!(all_live(&index));
+    assert_eq!(
+        index
+            .search_with_mode(&[0.0, 1.0, 0.5], 5, SearchMode::Exact)
+            .len(),
+        5
+    );
+}
+
 /// A vector whose dimension is zero or differs from the index's is rejected
 /// on every insert path and leaves the index as it was; the distance kernels
 /// assume equal lengths, so it must never reach planning or the store.
