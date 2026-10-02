@@ -2065,6 +2065,30 @@ impl Database {
         txns.values().map(|(_, touched)| *touched + timeout).min()
     }
 
+    /// Run one pass of the COMPUTED TTL reaper now, as the background reaper
+    /// runs it: expired records are deleted by committed transactions, which
+    /// replicate and reach every follower of the applied commits (the vector
+    /// indexes among them). For a host that wants expiry applied without
+    /// waiting for the reaper's next interval.
+    ///
+    /// # Errors
+    ///
+    /// The field dictionary could not be read; nothing was reaped.
+    pub fn reap_expired(
+        &self,
+    ) -> Result<coordinode_query::index::ttl_reaper::ComputedTtlReapResult, DatabaseError> {
+        coordinode_query::index::ttl_reaper::reap_pass(
+            &self.engine,
+            self.shard_id,
+            coordinode_query::index::ttl_reaper::TtlReaperConfig::default().batch_size,
+            self.fields.as_ref(),
+            &self.oracle,
+            self.pipeline.as_ref(),
+            &self.proposal_id_gen,
+        )
+        .map_err(|e| DatabaseError::Other(format!("field dictionary: {e}")))
+    }
+
     /// Default idle timeout for an open interactive transaction.
     pub const DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 

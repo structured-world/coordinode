@@ -1481,7 +1481,6 @@ fn hnsw_search_after_auto_inserts() {
     );
 }
 
-/// DELETE node calls on_vector_deleted (wiring correctness).
 /// Wait, up to a bound, for `held` to report that the index of
 /// `(label, property)` no longer holds the node whose vector is nearest
 /// `query`: the committed deletion reaches the graph through the background
@@ -1582,6 +1581,76 @@ fn remove_vector_property_takes_the_node_out_of_the_graph() {
         .execute_cypher("MATCH (a:Item {name: 'A'}) RETURN a.name")
         .expect("read");
     assert_eq!(rows.len(), 1, "the node itself lives on");
+}
+
+/// A node the TTL reaper deletes leaves the graph as one deleted by a
+/// statement does, while an unexpired node stays searchable.
+#[test]
+fn ttl_expiry_takes_the_node_out_of_the_graph() {
+    use coordinode_core::schema::computed::{ComputedSpec, TtlScope};
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+    use coordinode_query::index::VectorIndexConfig;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+
+    let mut schema = LabelSchema::new_node_id("Item");
+    schema.set_mode(SchemaMode::Flexible);
+    schema.add_property(PropertyDef::new("created_at", PropertyType::Timestamp));
+    schema.add_property(PropertyDef::computed(
+        "_ttl",
+        ComputedSpec::Ttl {
+            duration_secs: 3600,
+            anchor_field: "created_at".into(),
+            scope: TtlScope::Node,
+            target_field: None,
+        },
+    ));
+    db.create_label_schema(schema).expect("schema with a TTL");
+    db.create_vector_index(
+        "item_vec",
+        "Item",
+        "v",
+        VectorIndexConfig {
+            dimensions: 3,
+            metric: VectorMetric::L2,
+            ..VectorIndexConfig::default()
+        },
+    )
+    .expect("create vector index");
+
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64;
+    let expired_us = now_us - 2 * 3600 * 1_000_000;
+    db.execute_cypher(&format!(
+        "CREATE (:Item {{name: 'old', created_at: {expired_us}, v: [1.0, 0.0, 0.0]}})"
+    ))
+    .expect("create expired");
+    db.execute_cypher(&format!(
+        "CREATE (:Item {{name: 'new', created_at: {now_us}, v: [0.0, 0.0, 100.0]}})"
+    ))
+    .expect("create fresh");
+
+    let reaped = db.reap_expired().expect("reap");
+    assert_eq!(reaped.nodes_deleted, 1, "only the expired node is reaped");
+
+    let handle = db.vector_index_registry().get("Item", "v").expect("index");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while handle.read().expect("graph").len() != 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        handle.read().expect("graph").len(),
+        1,
+        "the reaped node is still in the HNSW graph"
+    );
+    let hits = db
+        .vector_index_registry()
+        .search("Item", "v", &[1.0, 0.0, 0.0], 5)
+        .expect("search");
+    assert_eq!(hits.len(), 1, "only the unexpired node is found");
 }
 
 // ── HNSW index persistence and rebuild on startup ───────────────────

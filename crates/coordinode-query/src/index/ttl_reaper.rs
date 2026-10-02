@@ -239,6 +239,47 @@ pub fn reap_computed_ttl_committed<'a>(
     )
 }
 
+/// Run one COMPUTED TTL reap pass the way the background reaper does: each
+/// page is a transaction of `oracle` committed through `pipeline`, so the
+/// deletions replicate and reach every follower of the applied commits.
+///
+/// # Errors
+///
+/// The field dictionary could not be read; nothing was reaped.
+#[allow(clippy::too_many_arguments)]
+pub fn reap_pass(
+    engine: &StorageEngine,
+    shard_id: u16,
+    batch_size: usize,
+    fields: &dyn coordinode_core::graph::intern::FieldRegistrar,
+    oracle: &TimestampOracle,
+    pipeline: &dyn ProposalPipeline,
+    id_gen: &ProposalIdGenerator,
+) -> Result<ComputedTtlReapResult, coordinode_core::graph::intern::DictionaryError> {
+    // Each pass reads the dictionary as it stands, so a TTL property
+    // registered since the last pass is reaped too.
+    let interner = fields.view()?;
+    // Majority, as every replicated write is by default: a cleanup a
+    // failover could forget would be redone, but one acknowledged and then
+    // lost would hand a renewed record back to a reaper that already decided.
+    let write_concern = coordinode_core::txn::write_concern::WriteConcern::default();
+    let commit_ctx = CommitContext {
+        write_concern: &write_concern,
+        pipeline: Some(pipeline),
+        id_gen: Some(id_gen),
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    Ok(reap_computed_ttl_committed(
+        engine,
+        shard_id,
+        batch_size,
+        &interner,
+        oracle,
+        &mut |txn| txn.commit(&commit_ctx).map(|_| ()),
+    ))
+}
+
 /// The commit of a direct-mode transaction: its writes were applied as they
 /// were staged, and this flushes what it buffered.
 fn direct_commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
@@ -978,17 +1019,6 @@ fn reaper_loop(
     pipeline: &dyn ProposalPipeline,
     id_gen: &ProposalIdGenerator,
 ) {
-    // Majority, as every replicated write is by default: a cleanup a
-    // failover could forget would be redone, but one acknowledged and then
-    // lost would hand a renewed record back to a reaper that already decided.
-    let write_concern = coordinode_core::txn::write_concern::WriteConcern::default();
-    let commit_ctx = CommitContext {
-        write_concern: &write_concern,
-        pipeline: Some(pipeline),
-        id_gen: Some(id_gen),
-        drain_buffer: None,
-        nvme_write_buffer: None,
-    };
     let interval = Duration::from_secs(config.interval_secs);
     tracing::info!(
         "ttl_reaper: started (interval={}s, batch_size={})",
@@ -1017,23 +1047,21 @@ fn reaper_loop(
             return;
         }
 
-        // Each pass reads the dictionary as it stands, so a TTL property
-        // registered since the last pass is reaped too.
-        let interner = match fields.view() {
-            Ok(view) => view,
+        let result = match reap_pass(
+            engine,
+            shard_id,
+            config.batch_size,
+            fields,
+            oracle,
+            pipeline,
+            id_gen,
+        ) {
+            Ok(result) => result,
             Err(e) => {
                 tracing::error!("ttl_reaper: field dictionary unavailable, pass skipped: {e}");
                 continue;
             }
         };
-        let result = reap_computed_ttl_committed(
-            engine,
-            shard_id,
-            config.batch_size,
-            &interner,
-            oracle,
-            &mut |txn| txn.commit(&commit_ctx).map(|_| ()),
-        );
 
         if result.total_deletions() > 0 || !result.errors.is_empty() {
             tracing::info!(
