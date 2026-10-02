@@ -60,6 +60,24 @@ workspace-members = ["coordinode-core"]
 # the cost is one extra copy of each between a default and an --all-features
 # build, which is a different binary anyway.
 [traversal-excludes]
+# Members outside the embedded library's dependency graph. A consumer that
+# depends on `coordinode-embed` from git gets the workspace-hack with it, so
+# whatever the hack unifies reaches that consumer's build: the server's
+# features and crates (the proxy, JWT, the S3 gateway) must not be in it.
+# These members resolve their own extra features per build instead.
+workspace-members = [
+    "coordinode-server",
+    "coordinode-s3",
+    "coordinode-client",
+    "coordinode-auth",
+    "coordinode-session",
+    "coordinode-swarm",
+    "coordinode-replicate",
+    "coordinode-timeseries",
+    "coordinode-bench",
+    "coordinode-test-fixtures",
+    "coordinode-integration",
+]
 third-party = [
     { name = "coordinode-lsm-tree" },
     { name = "lindera" },
