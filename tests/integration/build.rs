@@ -23,29 +23,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Proto files are in the `proto/` submodule at the workspace root.
     // From this crate (tests/integration/) that's ../../proto.
     let proto_root_path = std::path::Path::new(&manifest_dir).join("../../proto");
-
-    // Guard against un-initialised proto submodule (release-plz temp worktrees,
-    // shallow clones without --recurse-submodules, CI without submodule init, etc.).
-    let out_dir = std::env::var("OUT_DIR")?;
-    let fallback_dir = std::path::Path::new(&manifest_dir).join("proto_gen");
-    // Declaring any rerun trigger replaces cargo's default, so every input
-    // is named: the proto tree (scanned recursively), the committed fallback,
-    // and the refresh switch.
-    println!("cargo:rerun-if-env-changed={UPDATE_PROTO_GEN}");
+    // Regenerate whenever anything under the proto tree changes.
     println!("cargo:rerun-if-changed={}", proto_root_path.display());
-    println!("cargo:rerun-if-changed={}", fallback_dir.display());
 
+    // The bindings are a build artifact, generated from the proto submodule
+    // into OUT_DIR on every build and never committed. A checkout without the
+    // submodule fails here, loudly, rather than compiling stale bindings.
     let sentinel = proto_root_path.join("coordinode/v1/query/cypher.proto");
     if !sentinel.exists() {
-        // Copy pre-generated files (committed in proto_gen/) to OUT_DIR so that
-        // the `include!()` macros in proto.rs compile without a live proto submodule.
-        // The `proto_gen_matches_the_proto_submodule` test keeps them current.
-        for entry in std::fs::read_dir(&fallback_dir)? {
-            let entry = entry?;
-            let dest = std::path::Path::new(&out_dir).join(entry.file_name());
-            std::fs::copy(entry.path(), dest)?;
-        }
-        return Ok(());
+        return Err(format!(
+            "proto submodule is not checked out (missing {}). \
+             Run `git submodule update --init --recursive`.",
+            sentinel.display()
+        )
+        .into());
     }
 
     let proto_root = canonicalize_for_protoc(&proto_root_path);
@@ -78,22 +69,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &includes,
         )?;
 
-    // Refresh the committed fallback copy on request, so a proto change is
-    // carried into proto_gen/ by the build itself rather than by hand.
-    if std::env::var_os(UPDATE_PROTO_GEN).is_some() {
-        for entry in std::fs::read_dir(&fallback_dir)? {
-            std::fs::remove_file(entry?.path())?;
-        }
-        for entry in std::fs::read_dir(&out_dir)? {
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|e| e == "rs") {
-                std::fs::copy(entry.path(), fallback_dir.join(entry.file_name()))?;
-            }
-        }
-    }
-
     Ok(())
 }
-
-/// Set to any value to copy the freshly generated bindings into `proto_gen/`.
-const UPDATE_PROTO_GEN: &str = "COORDINODE_UPDATE_PROTO_GEN";

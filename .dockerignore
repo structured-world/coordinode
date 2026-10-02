@@ -5,7 +5,7 @@ arch/
 benches/
 docs/
 examples/
-# Exclude test sources but keep Cargo.toml + proto_gen/ for workspace resolution.
+# Exclude test sources but keep Cargo.toml for workspace resolution.
 tests/integration/src/
 data/
 deploy/grafana/

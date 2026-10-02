@@ -64,9 +64,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load-bearing one, used to forward a write to whichever node leads, so a
     // client never has to know which that is. Unused clients cost compile
     // time and nothing else.
+    //
+    // The same call writes the descriptor set of these protos and their
+    // imports (the google.api.http annotations included), which the embedded
+    // REST proxy transcodes by. It is generated with the stubs on every build,
+    // so the REST surface always matches the gRPC one.
+    let descriptor_set =
+        std::path::Path::new(&std::env::var("OUT_DIR")?).join("coordinode.descriptor.bin");
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .file_descriptor_set_path(&descriptor_set)
         .compile_protos(
             &[
                 format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),

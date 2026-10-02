@@ -43,9 +43,6 @@ COPY crates/ /build/crates/
 # for workspace resolution even when building only the server binary.
 # The test code itself is not compiled during Docker build.
 COPY tests/ /build/tests/
-# Proto file descriptor set — embedded into the coordinode binary at compile time
-# via include_bytes! for the REST/JSON proxy (structured-proxy, rest-proxy feature).
-COPY coordinode.descriptor.bin /build/coordinode.descriptor.bin
 
 # Build the coordinode binary (static musl link, release profile with LTO).
 # REST/JSON proxy (port 7081) is embedded via the rest-proxy feature (default).

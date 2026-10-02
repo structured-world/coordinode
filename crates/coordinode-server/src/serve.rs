@@ -1061,7 +1061,8 @@ pub(crate) async fn serve(
             DescriptorSource, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
             ServiceConfig, UpstreamConfig,
         };
-        static DESCRIPTOR_BYTES: &[u8] = include_bytes!("../../../coordinode.descriptor.bin");
+        static DESCRIPTOR_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/coordinode.descriptor.bin"));
         let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
         // The proxy would otherwise mount its own /health and /metrics on the
         // REST port, reporting proxy state. CoordiNode publishes those for the
