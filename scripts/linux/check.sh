@@ -9,9 +9,11 @@
 # added (a filter and a stress count to chase a flaky test, for example:
 # COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
 #
-# The host needs git, a Rust toolchain, cargo-nextest and protoc. Logs and the
-# status file land in target/linux-check/ locally; the run's directory on the
-# host, build output included, is removed afterwards.
+# The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
+# (scripts/linux/provision.sh installs them); the run stops before uploading
+# anything when one is missing. Logs and the status file land in
+# target/linux-check/ locally; the run's directory on the host, build output
+# included, is removed afterwards.
 set -euo pipefail
 
 host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of the Linux machine}"
@@ -22,6 +24,26 @@ ref='refs/check/linux'
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 
 repo="$(git rev-parse --show-toplevel)"
+
+# A missing tool would otherwise surface as a failed step after the upload
+# and a full checkout, with the cause buried in its log.
+channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$repo/rust-toolchain.toml")"
+if ! ssh "$host" "missing=''
+for tool in git protoc rustup; do
+  command -v \$tool >/dev/null 2>&1 || missing=\"\$missing \$tool\"
+done
+if command -v rustup >/dev/null 2>&1; then
+  rustup run '$channel' rustc --version >/dev/null 2>&1 || missing=\"\$missing rust-$channel\"
+  rustup run '$channel' cargo nextest --version >/dev/null 2>&1 || missing=\"\$missing cargo-nextest\"
+fi
+if [ -n \"\$missing\" ]; then
+  echo \"missing on the host:\$missing\" >&2
+  exit 1
+fi"; then
+  echo "prepare the host with: COORDINODE_LINUX_HOST=$host scripts/linux/provision.sh" >&2
+  exit 1
+fi
+
 out="$repo/target/linux-check"
 mkdir -p "$out"
 bundle="$out/tree.bundle"
