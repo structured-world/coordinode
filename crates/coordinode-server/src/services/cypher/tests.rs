@@ -238,6 +238,152 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     .expect("the version matches now");
 }
 
+/// A transaction that only reads still has its condition decided at commit.
+/// A caller confirming that a record has not moved gets a refusal once it
+/// has, not an empty success.
+#[tokio::test]
+async fn grpc_a_read_only_commit_still_checks_its_condition() {
+    let (svc, _dir) = test_service();
+
+    svc.execute_cypher(cypher_request("CREATE (n:Guard {revision: 1})"))
+        .await
+        .expect("create");
+    let guard = coordinode_core::graph::node::NodeId::from_raw(1);
+    let read_version = svc
+        .database
+        .read()
+        .node_version(guard)
+        .expect("read version")
+        .expect("the guard exists");
+
+    svc.execute_cypher(cypher_request("MATCH (n:Guard) SET n.revision = 2"))
+        .await
+        .expect("concurrent write");
+
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn(
+        "MATCH (n:Guard) RETURN n.revision",
+        tx,
+    ))
+    .await
+    .expect("a read");
+    let status = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![query::ExpectedNodeVersion {
+                node_id: guard.as_raw(),
+                version: Some(read_version),
+            }],
+        }))
+        .await
+        .expect_err("the guard moved since it was read");
+
+    use tonic_types::StatusExt;
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("a refusal carries ErrorInfo");
+    assert_eq!(info.reason, "REVISION_MISMATCH");
+
+    // At the version that is there, the same read-only commit succeeds.
+    let current = svc
+        .database
+        .read()
+        .node_version(guard)
+        .expect("read version")
+        .expect("still there");
+    let again = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.commit_transaction(Request::new(query::CommitTransactionRequest {
+        transaction_id: again,
+        expect: vec![query::ExpectedNodeVersion {
+            node_id: guard.as_raw(),
+            version: Some(current),
+        }],
+    }))
+    .await
+    .expect("the guard is at that version");
+}
+
+/// A commit that conditions on a guard node and writes another node is
+/// refused while a commit writing the guard is in flight: checked against
+/// committed state alone, the condition would pass and the guard would move
+/// right after, under writes that relied on it.
+#[tokio::test]
+async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight() {
+    let (svc, _dir) = test_service();
+
+    svc.execute_cypher(cypher_request("CREATE (n:Guard {revision: 1})"))
+        .await
+        .expect("create the guard");
+    let guard = coordinode_core::graph::node::NodeId::from_raw(1);
+    let version = svc
+        .database
+        .read()
+        .node_version(guard)
+        .expect("read version")
+        .expect("the guard exists");
+
+    let tx = svc
+        .begin_transaction(Request::new(query::BeginTransactionRequest {}))
+        .await
+        .expect("begin")
+        .into_inner()
+        .transaction_id;
+    svc.execute_cypher(cypher_request_in_txn("CREATE (e:Event {seq: 1})", tx))
+        .await
+        .expect("a write beside the guard");
+
+    // Another commit has validated and is about to write the guard. Its
+    // timestamp is above every clock reading here, so no reader waits on it.
+    let engine = svc.database.read().engine_shared();
+    let guard_key = coordinode_core::graph::node::encode_node_key(1, guard);
+    let in_flight = engine
+        .pending_commits()
+        .admit_allocated(
+            || u64::MAX >> 1,
+            vec![(
+                coordinode_storage::engine::partition::Partition::Node,
+                guard_key,
+            )],
+            Vec::new(),
+        )
+        .expect("admit the other commit");
+
+    let status = svc
+        .commit_transaction(Request::new(query::CommitTransactionRequest {
+            transaction_id: tx,
+            expect: vec![query::ExpectedNodeVersion {
+                node_id: guard.as_raw(),
+                version: Some(version),
+            }],
+        }))
+        .await
+        .expect_err("the guard is being written");
+    drop(in_flight);
+
+    use tonic_types::StatusExt;
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("a refusal carries ErrorInfo");
+    assert_eq!(info.reason, "TRANSACTION_CONFLICT");
+
+    let events = svc
+        .execute_cypher(cypher_request("MATCH (e:Event) RETURN e.seq"))
+        .await
+        .expect("read")
+        .into_inner();
+    assert!(events.rows.is_empty(), "the refused commit applied nothing");
+}
+
 /// A self-committing statement reports the version it wrote, so the next
 /// conditional write needs no read in between.
 #[tokio::test]
