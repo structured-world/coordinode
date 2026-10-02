@@ -36,8 +36,12 @@ tempfile = { workspace = true }
 # code is gated by `#[cfg(loom)]`, so regular builds compile none of it.
 # The dep is small (~30 KB) and only impacts dependency resolution, not
 # compilation output, when --cfg loom is not set.
+# crossbeam-epoch's `loom` feature, built with `--cfg crossbeam_loom` too,
+# runs the epoch machinery on loom's atomics, so the model checks the real
+# neighbour-list publication and reclamation path.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
+crossbeam-epoch = { workspace = true, features = ["loom"] }
 
 [[bench]]
 name = "hnsw_search"

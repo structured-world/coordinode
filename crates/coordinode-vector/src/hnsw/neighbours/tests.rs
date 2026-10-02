@@ -81,10 +81,12 @@ fn concurrent_readers_safe_under_single_writer() {
             let mut buf = Vec::with_capacity(16);
             while !stop.load(Ordering::Relaxed) {
                 list.snapshot_into(&mut buf);
-                // Every value seen must be a valid neighbour id (never the
-                // sentinel) — the Release/Acquire pair guarantees this.
-                for &v in &buf {
-                    assert_ne!(v, EMPTY);
+                // Each published list is `i*100 + 0..i%16` for one `i`: a
+                // snapshot must be exactly one of them, never a mix of two.
+                if let Some(&first) = buf.first() {
+                    let i = first / 100;
+                    let whole: Vec<u64> = (0..(i % 16)).map(|k| i * 100 + k).collect();
+                    assert_eq!(buf, whole, "snapshot mixes two published lists");
                 }
             }
         }));
@@ -244,20 +246,21 @@ fn concurrent_cas_append_and_snapshot_no_torn_state() {
         let list = list.clone();
         let stop = stop.clone();
         let input_set = input_set.clone();
+        // Each reader thread owns its copy of the expected sequence.
+        let inputs = inputs.clone();
         reader_handles.push(thread::spawn(move || {
             let mut buf = Vec::with_capacity(CAP);
             while !stop.load(Ordering::Relaxed) {
                 list.snapshot_into(&mut buf);
                 for &v in &buf {
-                    // Sentinel must not surface (snapshot filters it).
-                    assert_ne!(v, EMPTY);
-                    // Every observed id must be one of the writer's
-                    // inputs — no torn read of a half-stored slot.
+                    // Every observed id must be one of the writer's inputs.
                     assert!(
                         input_set.contains(&v),
                         "garbage id {v} observed in snapshot",
                     );
                 }
+                // A single appender publishes prefixes of its input, in order.
+                assert_eq!(buf, inputs[..buf.len()], "snapshot is not a prefix");
             }
         }));
     }

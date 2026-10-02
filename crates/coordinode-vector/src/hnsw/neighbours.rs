@@ -1,91 +1,50 @@
-//! Lock-free atomic neighbour list — the storage unit of the lock-free HNSW
-//! read path. One [`AtomicNeighbourList<N>`] holds the out-edges of a single
-//! node at a single layer; the whole graph is a `Vec<Vec<AtomicNeighbourList>>`
-//! (outer `Vec` indexed by node, inner `Vec` indexed by layer).
+//! One node's neighbour list at one layer, published whole.
 //!
-//! # Memory model
+//! The list is an immutable allocation behind one atomic descriptor. A writer
+//! builds the complete new list privately from the protected current one plus
+//! its edit and publishes it with one compare-and-swap of the descriptor; a
+//! writer that loses the CAS rebuilds against the list that won, so a
+//! concurrent accepted edit is never overwritten. A reader acquire-loads the
+//! descriptor and walks that one list: it sees the list before or after a
+//! replace, never one assembled from both, and never retries because a writer
+//! is working. A replaced list is retired through epoch-based reclamation and
+//! freed only once no pinned reader or writer can still hold it.
 //!
-//! * Each slot is an [`AtomicU64`] node-id. The sentinel [`EMPTY`] marks an
-//!   unused slot — node ids ≠ `u64::MAX` are required (the index already uses
-//!   monotonic, dense ids starting from 0, so the sentinel is safe).
-//! * `len` is an [`AtomicU32`] published with `Release` after every slot store
-//!   is `Relaxed`. Readers load `len` with `Acquire`, then read exactly that
-//!   many slots `Relaxed` — the `Acquire`/`Release` pair guarantees the slot
-//!   stores happen-before the `len` load.
-//! * The slot array is allocated inline (`[AtomicU64; N]`) so a snapshot is a
-//!   cache-line-friendly memcpy on the read path. `N` is chosen to match
-//!   `m_max0` (e.g. `64` for the default `M = 32`).
-//!
-//! # Writers
-//!
-//! * Single-writer `set` — the bulk-replace primitive. The caller holds
-//!   exclusive write access to the list; concurrent search reads via
-//!   [`snapshot`] without locking.
-//! * Multi-writer [`cas_append`] — incoming-edge add under concurrent
-//!   inserters.
-//!
-//! The `loom` model-check campaign in `tests/loom_neighbours.rs` covers
-//! both.
+//! Under `--cfg loom --cfg crossbeam_loom` the epoch machinery itself runs on
+//! loom's atomics, so `tests/loom_neighbours.rs` checks this exact publication
+//! path.
 
-// Atomics are routed through `loom` when the `--cfg loom` build flag is set,
-// so the model-checker can permute every observable interleaving. Under a
-// regular build we use `std::sync::atomic` and the cost is zero.
+use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned, Shared};
+
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use loom::sync::atomic::Ordering;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-/// Sentinel value for an unused slot. Node IDs are dense `u64` starting from
-/// `0`, so `u64::MAX` is safe to reserve.
-pub(crate) const EMPTY: u64 = u64::MAX;
+/// One published neighbour list. Immutable once its descriptor points at it.
+struct List {
+    ids: Box<[u64]>,
+}
 
-/// Fixed-capacity, lock-free list of neighbour node-IDs for one HNSW node at
-/// one layer.
-///
-/// Capacity `N` is a compile-time constant — pick it to match `m_max0` (the
-/// per-node connection cap at layer 0, typically `2 * M`). Storing the slots
-/// inline (no heap indirection) lets the read path do a single cache-line
-/// fetch for nodes with the common-case small degree, and at most a couple
-/// of cache lines for the dense layer-0 case.
+/// Neighbour list of one HNSW node at one layer, holding at most `N` ids.
 ///
 /// # Concurrency contract
 ///
-/// * Multiple concurrent readers are safe (`snapshot` is wait-free).
-/// * [`set`](Self::set) needs exclusive write access to the list;
-///   [`cas_append`](Self::cas_append) is safe under concurrent writers.
-/// * No `Drop` side-effects — the type is a plain POD over atomics.
+/// * Readers are wait-free and see one whole published list.
+/// * [`set`](Self::set) and [`cas_append`](Self::cas_append) are both safe
+///   under concurrent writers: each publishes one complete list by CAS and
+///   retries against the current list when another writer won.
 #[doc(hidden)]
 pub struct AtomicNeighbourList<const N: usize> {
-    /// Published length. Reads use `Acquire`; writes use `Release`.
-    len: AtomicU32,
-    /// Inline slots. All `EMPTY` at construction. Slot stores use `Relaxed`
-    /// and are made visible to readers by the subsequent `Release` store on
-    /// `len`.
-    slots: [AtomicU64; N],
+    /// The published list; null is the empty list.
+    current: Atomic<List>,
 }
 
 impl<const N: usize> AtomicNeighbourList<N> {
-    /// Construct an empty neighbour list. All slots are `EMPTY`.
-    ///
-    /// Const-constructible under regular builds (slot array literal). Under
-    /// `--cfg loom` the constructor is non-const because `loom::sync::
-    /// atomic::AtomicU64::new` is non-const (the model-checker needs to
-    /// register every atomic with its scheduler at runtime).
-    #[cfg(not(loom))]
-    pub(crate) const fn new() -> Self {
-        Self {
-            len: AtomicU32::new(0),
-            slots: [const { AtomicU64::new(EMPTY) }; N],
-        }
-    }
-
-    /// Loom-flavoured constructor (non-const, registers each atomic with
-    /// the model-checker scheduler).
-    #[cfg(loom)]
+    /// An empty neighbour list.
     pub fn new() -> Self {
         Self {
-            len: AtomicU32::new(0),
-            slots: std::array::from_fn(|_| AtomicU64::new(EMPTY)),
+            current: Atomic::null(),
         }
     }
 
@@ -95,144 +54,132 @@ impl<const N: usize> AtomicNeighbourList<N> {
         N
     }
 
-    /// Current published length. Acquire-ordered so that any slots in
-    /// `0..len` are visible to subsequent reads.
+    /// The ids of the list published when `guard` loaded it. The slice lives
+    /// as long as the guard keeps the list from being reclaimed.
     #[inline]
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire) as usize
+    fn view<'g>(&self, guard: &'g Guard) -> (Shared<'g, List>, &'g [u64]) {
+        let shared = self.current.load(Ordering::Acquire, guard);
+        // SAFETY: a non-null descriptor points at a list that was fully
+        // initialized before its Release CAS made it reachable, and the guard
+        // keeps it alive until the guard is dropped: a replaced list is only
+        // retired through `defer_destroy`, which waits for every pin taken
+        // before the retirement.
+        let ids = unsafe { shared.as_ref() }.map_or(&[][..], |list| &list.ids);
+        (shared, ids)
     }
 
-    /// Whether the list currently holds zero neighbours.
+    /// Current number of neighbours.
+    #[inline]
+    pub fn len(&self) -> usize {
+        let guard = epoch::pin();
+        self.view(&guard).1.len()
+    }
+
+    /// Whether the list holds no neighbours.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Snapshot the live neighbours into `out`, clearing it first.
-    ///
-    /// Wait-free, O(len). Returns the number of neighbours written.
-    ///
-    /// The snapshot is *consistent for the read epoch* — under concurrent
-    /// writers, the returned set is a valid intermediate state of the list
-    /// at some point during the call; with a single writer it is the
-    /// committed state.
+    /// Copy the published list into `out`, clearing it first.
     pub fn snapshot_into(&self, out: &mut Vec<u64>) {
         out.clear();
-        let len = self.len.load(Ordering::Acquire) as usize;
-        let len = len.min(N);
-        for slot in self.slots.iter().take(len) {
-            let v = slot.load(Ordering::Relaxed);
-            if v != EMPTY {
-                out.push(v);
-            }
-        }
+        let guard = epoch::pin();
+        out.extend_from_slice(self.view(&guard).1);
     }
 
-    /// Allocate-and-return variant of [`snapshot_into`]. Prefer the in-place
-    /// variant on hot search paths to recycle the output buffer.
+    /// Allocating variant of [`snapshot_into`](Self::snapshot_into).
     pub fn snapshot(&self) -> Vec<u64> {
-        let mut out = Vec::with_capacity(self.len());
+        let mut out = Vec::new();
         self.snapshot_into(&mut out);
         out
     }
 
-    /// Single-writer publish.
-    ///
-    /// Overwrites the current neighbour set with `new` and publishes the new
-    /// length. `new.len()` must be ≤ `N`; longer slices are truncated with a
-    /// debug-only assertion (release builds silently truncate to `N`).
-    ///
-    /// Callers MUST hold exclusive write access to this list: concurrent
-    /// calls to `set` race. [`AtomicNeighbourList::cas_append`] is the
-    /// multi-writer primitive.
+    /// Publish `edit` of the current list. `edit` receives the protected
+    /// current ids and returns the complete new list, or `None` to leave the
+    /// list as it is. A lost CAS calls `edit` again with the list that won.
+    /// Returns whether a new list was published.
+    fn update(&self, mut edit: impl FnMut(&[u64]) -> Option<Box<[u64]>>) -> bool {
+        let guard = epoch::pin();
+        let (mut expected, mut ids) = self.view(&guard);
+        loop {
+            let Some(next) = edit(ids) else {
+                return false;
+            };
+            debug_assert!(next.len() <= N, "a neighbour list holds at most {N} ids");
+            match self.current.compare_exchange(
+                expected,
+                Owned::new(List { ids: next }),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard,
+            ) {
+                Ok(_) => {
+                    if !expected.is_null() {
+                        // SAFETY: the CAS unlinked `expected`, so no new
+                        // reader can reach it; readers that loaded it before
+                        // are pinned, and `defer_destroy` waits for them.
+                        unsafe { guard.defer_destroy(expected) };
+                    }
+                    return true;
+                }
+                Err(lost) => {
+                    // The unpublished candidate is dropped with `lost.new`;
+                    // rebuild against the list that won.
+                    expected = lost.current;
+                    // SAFETY: as in `view`: the winner was initialized before
+                    // its publishing CAS and the guard protects it.
+                    ids = unsafe { expected.as_ref() }.map_or(&[][..], |list| &list.ids);
+                }
+            }
+        }
+    }
+
+    /// Replace the whole list with `new`, truncated to `N` ids.
     pub fn set(&self, new: &[u64]) {
         debug_assert!(
             new.len() <= N,
-            "AtomicNeighbourList<{}>::set received {} neighbours — would truncate",
-            N,
+            "AtomicNeighbourList<{N}>::set received {} neighbours, would truncate",
             new.len()
         );
         let n = new.len().min(N);
-
-        // Step 1: write slots (Relaxed — the Release on `len` orders them).
-        for (slot, &id) in self.slots.iter().zip(new.iter()).take(n) {
-            slot.store(id, Ordering::Relaxed);
-        }
-        // Wipe the tail so a later snapshot doesn't see stale ids past `len`.
-        // Belt-and-braces: snapshot already truncates by `len`, but a slot
-        // `cas_append` reserved and has not yet written must read `EMPTY`.
-        for slot in self.slots.iter().skip(n) {
-            slot.store(EMPTY, Ordering::Relaxed);
-        }
-        // Step 2: publish length. Release ensures the slot stores are visible
-        // before any reader observing this length sees them.
-        self.len.store(n as u32, Ordering::Release);
+        self.update(|current| (current != &new[..n]).then(|| new[..n].into()));
     }
 
-    // ─── Lock-free write primitives ───────────────────────────────────────
-
-    /// Append `id` to the list under concurrent writers. Returns `true` on
-    /// success, `false` if the list is full (caller must run a shrink/prune
-    /// protocol — see `HnswIndex::prune_connections`, which today runs
-    /// single-writer under `&mut self`).
-    ///
-    /// # Algorithm
-    ///
-    /// 1. CAS-loop on `len` to reserve a slot index — read current `len`,
-    ///    abort with `false` if at capacity, else `compare_exchange` to
-    ///    `len + 1`. Only the winning thread reaches step 2.
-    /// 2. The winner writes `id` to its reserved slot with `Release`
-    ///    ordering, making the new neighbour visible to subsequent
-    ///    snapshots.
-    ///
-    /// # Concurrent-reader semantics
-    ///
-    /// A snapshot taken between step 1 (reserve) and step 2 (write) sees
-    /// `len = new_len` but slot `current` is still `EMPTY`. The reader path
-    /// ([`snapshot_into`]) filters `EMPTY` out, so the transient state is
-    /// equivalent to the new entry "not yet visible" — readers either see
-    /// the old state (snapshot before reserve) or the new state (snapshot
-    /// after write). No torn read of a partially-populated entry can
-    /// happen because slot stores are atomic `u64`.
-    ///
-    /// # Why not `fetch_add`
-    ///
-    /// `fetch_add` would also work and is one instruction cheaper, but it
-    /// makes the over-capacity case messy: the bumped `len` is observable
-    /// before we know we can't actually store there. The CAS-loop keeps
-    /// `len` monotonic AND never above `N`.
+    /// Append `id` under concurrent writers. Returns `false` when the list is
+    /// already full; the caller then runs its prune protocol.
     pub fn cas_append(&self, id: u64) -> bool {
-        loop {
-            let current = self.len.load(Ordering::Acquire) as usize;
-            if current >= N {
-                return false;
-            }
-            let new_len = (current as u32) + 1;
-            match self.len.compare_exchange(
-                current as u32,
-                new_len,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // We own slot `current`. Publish the id.
-                    self.slots[current].store(id, Ordering::Release);
-                    return true;
-                }
-                Err(_) => {
-                    // Another writer raced ahead; retry with the fresh len.
-                    std::hint::spin_loop();
-                }
-            }
-        }
+        let mut full = false;
+        self.update(|current| {
+            full = current.len() >= N;
+            (!full).then(|| {
+                let mut next = Vec::with_capacity(current.len() + 1);
+                next.extend_from_slice(current);
+                next.push(id);
+                next.into_boxed_slice()
+            })
+        });
+        !full
     }
 
-    /// Replace the entire list contents: [`set`](Self::set) under a
-    /// single-writer gate. Concurrent readers observe either the
-    /// pre-replace or post-replace contents, with no torn intermediate.
+    /// Replace the entire list contents: [`set`](Self::set).
     #[cfg(test)]
     pub fn replace(&self, new: &[u64]) {
         self.set(new);
+    }
+}
+
+impl<const N: usize> Drop for AtomicNeighbourList<N> {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` means no reader or writer of this list exists
+        // any more; lists replaced earlier were handed to the epoch already.
+        unsafe {
+            let guard = epoch::unprotected();
+            let current = self.current.load(Ordering::Relaxed, guard);
+            if !current.is_null() {
+                drop(current.into_owned());
+            }
+        }
     }
 }
 

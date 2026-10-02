@@ -115,9 +115,13 @@ jobs:
         # Loom permutes every observable order of atomic operations on the
         # lock-free HNSW primitives — exhaustive verification that:
         #
-        # * AtomicNeighbourList — Acquire/Release pairing on `len`
-        #   correctly publishes slot writes to any subsequent reader,
-        #   and `cas_append` never loses writes under concurrent senders.
+        # * AtomicNeighbourList: a reader sees one whole published list
+        #   (never a mix of the list before and after a replace), and a
+        #   writer that loses the descriptor CAS rebuilds against the
+        #   winner, so `cas_append` never loses writes. `crossbeam_loom`
+        #   runs the epoch reclamation on loom's atomics too, so the model
+        #   covers the real publication and retirement path; two
+        #   preemptions keep that larger state space tractable.
         # * EntryPoint — packed `(level, idx)` CAS-loop honours the
         #   layer-promotion linearisability invariant: after every legal
         #   interleaving of two
@@ -129,9 +133,9 @@ jobs:
         # nondeterministic-fail when binaries share global state across
         # `loom::model` runs in the same process.
         env:
-          RUSTFLAGS: --cfg loom
+          RUSTFLAGS: --cfg loom --cfg crossbeam_loom
         run: |
-          cargo nextest run \
+          LOOM_MAX_PREEMPTIONS=2 cargo nextest run \
             --test loom_neighbours \
             --release \
             -p coordinode-vector \

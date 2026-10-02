@@ -71,6 +71,33 @@ fn cas_append_writer_vs_snapshot_reader() {
     });
 }
 
+/// A reader during a whole-list replace sees the old list or the new one,
+/// never a list assembled from both: a prune that replaces `[1, 2]` with
+/// `[3, 4]` must not be observed as `[3, 2]` or `[1, 4]`.
+#[test]
+fn replace_is_observed_whole() {
+    loom::model(|| {
+        let list: Arc<AtomicNeighbourList<CAP>> = Arc::new(AtomicNeighbourList::new());
+        list.set(&[1, 2]);
+
+        let writer = {
+            let list = list.clone();
+            thread::spawn(move || list.set(&[3, 4]))
+        };
+        let reader = {
+            let list = list.clone();
+            thread::spawn(move || list.snapshot())
+        };
+
+        writer.join().unwrap();
+        let seen = reader.join().unwrap();
+        assert!(
+            seen == vec![1, 2] || seen == vec![3, 4],
+            "reader observed a mixed list: {seen:?}"
+        );
+    });
+}
+
 /// Two concurrent writers each calling `cas_append` once. The final list
 /// must contain exactly both ids, never duplicates, never missing one.
 /// This is the core multi-writer correctness property.
@@ -101,15 +128,15 @@ fn concurrent_cas_append_no_lost_writes() {
     });
 }
 
-/// Capacity boundary under concurrent writers — exactly CAP appends
-/// succeed, the rest return false. Tests the CAS-loop bail-out branch.
+/// Capacity boundary under concurrent writers: with room for one id, exactly
+/// one of two racing appends succeeds and the other is told the list is full,
+/// including when it lost the CAS to the winner and re-read a full list.
+/// Two threads keep the model tractable with the epoch machinery under loom.
 #[test]
 fn cas_append_capacity_boundary_under_race() {
     loom::model(|| {
-        // CAP = 2 for this test (override the module-level CAP via a
-        // local type alias so loom enumerates fewer interleavings).
-        const SMALL: usize = 2;
-        let list: Arc<AtomicNeighbourList<SMALL>> = Arc::new(AtomicNeighbourList::new());
+        const ONE: usize = 1;
+        let list: Arc<AtomicNeighbourList<ONE>> = Arc::new(AtomicNeighbourList::new());
 
         let a = {
             let list = list.clone();
@@ -119,27 +146,12 @@ fn cas_append_capacity_boundary_under_race() {
             let list = list.clone();
             thread::spawn(move || list.cas_append(2))
         };
-        let c = {
-            let list = list.clone();
-            thread::spawn(move || list.cas_append(3))
-        };
 
         let r_a = a.join().unwrap();
         let r_b = b.join().unwrap();
-        let r_c = c.join().unwrap();
 
-        // Exactly two threads succeed; one returns false (capacity reached).
-        let success_count = [r_a, r_b, r_c].iter().filter(|x| **x).count();
-        assert_eq!(
-            success_count, 2,
-            "expected exactly 2 successes, got {success_count}"
-        );
-
-        // The list contains exactly two of {1, 2, 3} and no garbage.
-        let snap = list.snapshot();
-        assert_eq!(snap.len(), 2);
-        for &v in &snap {
-            assert!(v == 1 || v == 2 || v == 3, "garbage id {v}");
-        }
+        assert!(r_a != r_b, "exactly one append fits: a={r_a}, b={r_b}");
+        let winner = if r_a { 1 } else { 2 };
+        assert_eq!(list.snapshot(), vec![winner]);
     });
 }
