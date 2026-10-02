@@ -224,21 +224,25 @@ impl HnswIndex {
             self.data_level0 = Some(nb);
         }
 
-        // Inline layer-0 is a write-through MIRROR, not a source of truth:
-        // `data_level0` is the primary read for f32 + layer-0 neighbours and
-        // `node_rabitq_codes` holds the RaBitQ source. Rather than hand-roll a
-        // second unsafe block remap, drop the mirror on reorder — the f32 read
-        // falls back to the (just-rebuilt, f32-bearing) `data_level0`. Repopu-
-        // lating the inline mirror is a perf refinement, not a correctness need.
-        debug_assert!(
-            self.inline_layer0.is_none()
-                || self
-                    .data_level0
-                    .as_ref()
-                    .is_some_and(super::data_level0::DataLevel0Block::has_f32),
-            "dropping inline mirror requires data_level0 to retain f32"
-        );
-        self.inline_layer0 = None;
+        // The code block is a copy of `node_rabitq_codes` laid out for the
+        // search fast path: refill it from the codes remapped above.
+        self.rabitq_block = None;
+        if let (Some(dim), Some(last)) = (
+            self.data_level0
+                .as_ref()
+                .map(super::data_level0::DataLevel0Block::dim),
+            n.checked_sub(1),
+        ) {
+            self.ensure_rabitq_block(last, dim);
+        }
+        if let Some(block) = self.rabitq_block.as_mut() {
+            let cap = block.capacity();
+            for (idx, enc) in self.node_rabitq_codes.iter().enumerate().take(cap) {
+                if let Some(enc) = enc {
+                    Self::install_rabitq(block, idx, enc);
+                }
+            }
+        }
 
         // id -> idx map and entry point follow the new numbering.
         self.id_to_idx.clear();

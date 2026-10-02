@@ -30,13 +30,85 @@ fn effective_alpha_resolves_auto_and_explicit() {
     assert_eq!(l2.effective_alpha(), 1.0);
 }
 
+fn rabitq_cosine_config() -> HnswConfig {
+    let mut cfg = make_config(VectorMetric::Cosine);
+    cfg.quantization = QuantizationCodec::RaBitQ { bits: 1 };
+    cfg.calibration_threshold = 16;
+    cfg.max_elements = 64;
+    cfg
+}
+
+/// dim 64 makes the 1-bit code exactly one u64 word, the shape the search
+/// fast path reads from the code block.
+fn rabitq_vector(i: u64, phase: f32) -> Vec<f32> {
+    (0..64)
+        .map(|d| ((i as f32 * 0.37) + d as f32 * 0.11 + phase).sin())
+        .collect()
+}
+
+/// Every node's slot in the code block holds exactly its current SoA code.
+fn assert_rabitq_block_matches_codes(index: &HnswIndex) {
+    let block = index
+        .rabitq_block()
+        .expect("a RaBitQ index has a code block after inserts");
+    for idx in 0..index.nodes.len() {
+        let soa = index.node_rabitq_codes[idx].as_ref();
+        assert!(
+            matches!(soa, Some(RabitqEncoded::OneBit(_))),
+            "node {idx} has no 1-bit code after calibration"
+        );
+        let Some(RabitqEncoded::OneBit(code)) = soa else {
+            continue;
+        };
+        let words: &[u64] = code.code.as_slice();
+        // SAFETY: idx < nodes.len() <= max_elements == block capacity.
+        let (bytes, scalars) = unsafe { (block.rabitq(idx).to_vec(), block.rabitq_scalars(idx)) };
+        let expected: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert_eq!(bytes, expected[..bytes.len()], "code bytes of node {idx}");
+        assert_eq!(scalars.norm, code.norm, "norm of node {idx}");
+        assert_eq!(
+            scalars.signed_sum, code.signed_sum,
+            "signed_sum of node {idx}"
+        );
+    }
+}
+
 #[test]
-fn inline_layer0_is_lazy_until_first_insert() {
-    let index = HnswIndex::new(make_config(VectorMetric::L2));
+fn rabitq_block_is_lazy_and_only_for_rabitq() {
+    let index = HnswIndex::new(rabitq_cosine_config());
     assert!(
-        index.inline_layer0().is_none(),
-        "inline_layer0 must not allocate until the first insert observes a vector dim"
+        index.rabitq_block().is_none(),
+        "the code block must not allocate before the first insert observes a dim"
     );
+    // Other codecs never produce RaBitQ codes, so they get no block.
+    let mut plain = HnswIndex::new(make_config(VectorMetric::Cosine));
+    plain.insert(1, rabitq_vector(1, 0.0));
+    assert!(plain.rabitq_block().is_none());
+}
+
+/// The block is filled at calibration and on every later insert, and an
+/// update replaces a node's slot with its new code.
+#[test]
+fn rabitq_block_tracks_codes_through_calibration_insert_and_update() {
+    let mut index = HnswIndex::new(rabitq_cosine_config());
+    for i in 0..32u64 {
+        index.insert(i, rabitq_vector(i, 0.0));
+    }
+    assert_rabitq_block_matches_codes(&index);
+    // Re-inserting an existing id moves the node to its new vector.
+    index.insert(3, rabitq_vector(3, 1.7));
+    assert_rabitq_block_matches_codes(&index);
+}
+
+/// Reordering renumbers the nodes; the block is refilled in the new order.
+#[test]
+fn rabitq_block_follows_reorder() {
+    let mut index = HnswIndex::new(rabitq_cosine_config());
+    for i in 0..40u64 {
+        index.insert(i, rabitq_vector(i, 0.0));
+    }
+    index.reorder_for_cache_locality();
+    assert_rabitq_block_matches_codes(&index);
 }
 
 #[test]
@@ -88,71 +160,12 @@ fn data_level0_neighbours_form_valid_layer0_graph() {
 }
 
 #[test]
-fn inline_layer0_mirrors_soa_on_per_item_insert() {
-    let mut cfg = make_config(VectorMetric::L2);
-    // Cap small so the test does not allocate 100s of MB for the
-    // contiguous store; idx values stay below this.
-    cfg.max_elements = 32;
-    let mut index = HnswIndex::new(cfg);
-    let payload = |i: u64| -> Vec<f32> {
-        (0..8)
-            .map(|d| (i as f32) * 0.5 + (d as f32) * 0.01)
-            .collect()
-    };
-    for i in 0..8u64 {
-        index.insert(i, payload(i));
-    }
-    let inline = index
-        .inline_layer0()
-        .expect("inline store must be populated after the first insert");
-    for idx in 0..8 {
-        // SAFETY: idx < 8 < inline.capacity() (32).
-        unsafe {
-            let label = inline.label(idx).load(std::sync::atomic::Ordering::Relaxed);
-            let expected_id = index.nodes[idx].id;
-            assert_eq!(label, expected_id, "label mismatch at idx={idx}");
-            let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
-            let block_vec = index.read_node_f32(idx).expect("f32 present");
-            assert_eq!(
-                inline_vec.as_slice(),
-                block_vec,
-                "vector mismatch at idx={idx}"
-            );
-        }
-    }
-}
-
-#[test]
-fn inline_layer0_mirrors_soa_on_batch_insert() {
-    let mut cfg = make_config(VectorMetric::L2);
-    cfg.max_elements = 64;
-    let mut index = HnswIndex::new(cfg);
+fn rabitq_block_tracks_codes_on_batch_insert() {
+    let mut index = HnswIndex::new(rabitq_cosine_config());
     // Above BATCH_PARALLEL_THRESHOLD so the rayon-planned path fires.
-    let items: Vec<(u64, Vec<f32>)> = (0..32u64)
-        .map(|i| {
-            let v: Vec<f32> = (0..8).map(|d| -(i as f32) + (d as f32) * 0.1).collect();
-            (i, v)
-        })
-        .collect();
+    let items: Vec<(u64, Vec<f32>)> = (0..48u64).map(|i| (i, rabitq_vector(i, 0.0))).collect();
     index.insert_batch(items);
-    let inline = index
-        .inline_layer0()
-        .expect("inline store must be populated after a batch insert");
-    for idx in 0..index.nodes.len() {
-        // SAFETY: idx < nodes.len() < inline.capacity() (64).
-        unsafe {
-            let label = inline.label(idx).load(std::sync::atomic::Ordering::Relaxed);
-            let expected_id = index.nodes[idx].id;
-            assert_eq!(label, expected_id, "label mismatch at idx={idx}");
-            let inline_vec: Vec<f32> = inline.vector_f32(idx).to_vec();
-            let block_vec = index.read_node_f32(idx).expect("f32 present");
-            assert_eq!(
-                inline_vec.as_slice(),
-                block_vec,
-                "vector mismatch at idx={idx}"
-            );
-        }
-    }
+    assert_rabitq_block_matches_codes(&index);
 }
 
 #[test]

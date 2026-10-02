@@ -30,8 +30,8 @@
 mod bulk_build;
 mod data_level0;
 mod entry_point;
-mod inline_layer0;
 mod neighbours;
+mod rabitq_block;
 mod reorder;
 mod search_scratch;
 mod visited;
@@ -459,29 +459,16 @@ pub struct HnswIndex {
     /// and quantized bytes on (re)calibration; reads through it power
     /// cross-shard rerank and application-side custom rerank.
     vector_tier: Option<crate::storage::VectorTierHandle>,
-    /// Contiguous per-node store covering layer-0 neighbours, f32 vector,
-    /// RaBitQ code and external label in a single stride-addressable
-    /// allocation. Mirrors the hnswlib `data_level0_memory_` layout that
-    /// shows super-linear MT4 scaling on sift-128 f32 search (worker
-    /// threads share L3 fills on common neighbour visits, whereas the
-    /// SoA fields above keep cache lines uncorrelated). Allocated on
-    /// the first insert once the vector dim is known. Populated as
-    /// write-through alongside the SoA fields; the search side reads
-    /// remain on SoA today, the follow-up commit on the same plan
-    /// switches the layer-0 neighbour read to this store.
-    inline_layer0: Option<inline_layer0::InlineLayer0>,
-    /// f32-only contiguous layer-0 block (hnswlib `data_level0_memory_`
-    /// parity). When present, holds the f32 vector of every node in one
-    /// `Box<[u8]>` indexed by `base + idx * stride`. The search hot
-    /// path's `prefetch_node_vector` and the rerank `read_node_f32`
-    /// prefer this store, avoiding the SoA double-indirection that
-    /// makes the prefetch helper itself do two cache misses to decide
-    /// what to prefetch.
-    ///
-    /// Mirrors the f32 vector ONLY. Neighbour ids stay in
-    /// `neighbours_l0` (`AtomicNeighbourList`) so multi-writer
-    /// back-edge appends keep working without atomic neighbours in
-    /// this block.
+    /// Contiguous per-node RaBitQ code + scalar header, read by the cosine
+    /// search fast path so a neighbour visit touches one stride-addressed
+    /// block instead of the per-node `Vec` behind `node_rabitq_codes`.
+    /// Allocated on the first insert of a RaBitQ-configured index; `None`
+    /// for other codecs and after a reorder (search then reads the SoA
+    /// codes).
+    rabitq_block: Option<rabitq_block::RabitqBlock>,
+    /// The layer-0 store: the f32 vector of every node in one stride-
+    /// addressed block (hnswlib `data_level0_memory_`) and every node's
+    /// layer-0 neighbour list, published whole. The only place either lives.
     data_level0: Option<data_level0::DataLevel0Block>,
 }
 
@@ -771,7 +758,7 @@ impl HnswIndex {
             // Seed from address of self (varies per instance). Non-deterministic but fast.
             rng_state: std::sync::atomic::AtomicU64::new(0xdeadbeef_cafebabe),
             vector_tier: None,
-            inline_layer0: None,
+            rabitq_block: None,
             data_level0: None,
         }
     }
@@ -863,7 +850,7 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.mirror_rabitq_to_inline(i, enc.as_ref());
+            self.mirror_rabitq_to_block(i, enc.as_ref());
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -878,32 +865,26 @@ impl HnswIndex {
                 self.node_quantized[idx] = Some(code);
             }
         }
-        // Offload: free the f32 from the contiguous blocks too so the RAM is
-        // actually returned and `read_node_f32` reports None (rerank then
-        // loads f32 from disk).
+        // Offload: free the f32 from the layer-0 store so the RAM is actually
+        // returned and `read_node_f32` reports None (rerank then loads f32
+        // from disk).
         if self.config.offload_vectors {
             if let Some(b) = self.data_level0.as_mut() {
-                b.drop_f32();
-            }
-            if let Some(b) = self.inline_layer0.as_mut() {
                 b.drop_f32();
             }
         }
         self.sq8_params = Some(params);
     }
 
-    /// Check if the node at `idx` has an in-memory f32 vector.
-    ///
-    /// The answer reflects every f32 store (the contiguous `data_level0` /
-    /// `inline_layer0` blocks as well as the SoA copy). Offloaded nodes (f32 on disk)
-    /// correctly report `false`.
+    /// Check if the node at `idx` has an in-memory f32 vector. Offloaded
+    /// nodes (f32 on disk) report `false`.
     pub fn has_f32_vector(&self, idx: usize) -> bool {
         self.read_node_f32(idx).is_some()
     }
 
     /// Get a reference to the f32 vector at node index `idx`, if present.
     ///
-    /// Reads from the contiguous f32 block first, falling back to the SoA copy.
+    /// Reads from the layer-0 store.
     pub fn get_vector(&self, idx: usize) -> Option<&[f32]> {
         self.read_node_f32(idx)
     }
@@ -934,15 +915,11 @@ impl HnswIndex {
                     self.node_quantized[idx] = Some(code);
                 }
             }
-            // Offload: free the f32 from the contiguous blocks too (not only
-            // the SoA copy), re-laying them out without the f32 slot so the
-            // RAM is actually returned and `read_node_f32` reports None for
-            // these nodes (rerank then loads f32 from disk via VectorLoader).
+            // Offload: free the f32 from the layer-0 store so the RAM is
+            // actually returned and `read_node_f32` reports None for these
+            // nodes (rerank then loads f32 from disk via VectorLoader).
             if self.config.offload_vectors {
                 if let Some(b) = self.data_level0.as_mut() {
-                    b.drop_f32();
-                }
-                if let Some(b) = self.inline_layer0.as_mut() {
                     b.drop_f32();
                 }
             }
@@ -1005,7 +982,7 @@ impl HnswIndex {
             })
             .collect();
         for (i, enc) in encoded {
-            self.mirror_rabitq_to_inline(i, enc.as_ref());
+            self.mirror_rabitq_to_block(i, enc.as_ref());
             self.node_rabitq_codes[i] = enc;
         }
         self.rabitq_params = Some(params);
@@ -1326,28 +1303,10 @@ impl HnswIndex {
         }
     }
 
-    /// Mutation phase of an insert. Pushes the new node, allocates atomic
-    /// neighbour storage, then publishes outgoing + bidirectional edges
-    /// from the plan via the write helpers (`set_outgoing` /
-    /// `add_neighbour_to`). Single-writer — caller holds `&mut self`.
-    /// Mirror `(id, vector)` for node `idx` into the contiguous layer-0
-    /// store. Lazy-allocates the store on the first call once `dim` is
-    /// known; subsequent calls reuse it. No-op when the store is already
-    /// allocated for a different dim (programmer error elsewhere) or when
-    /// `idx` overruns the pre-allocated capacity; this keeps the SoA path
-    /// authoritative until the search-side switch lands.
-    ///
-    /// Neighbour ids and RaBitQ codes are NOT written here; they hook in
-    /// from the dedicated CAS neighbour-write path and from
-    /// `auto_calibrate_rabitq` respectively, in follow-up commits on the
-    /// same plan. Writing them now without the matching reads would just
-    /// double the build-time cost.
-    /// Mirror the f32 vector for node `idx` into the dedicated
-    /// `data_level0` contiguous block. Lazy-allocates on first call once
-    /// `dim` is known. Writes ONLY the f32 vector; neighbour ids stay
-    /// in `neighbours_l0` (`AtomicNeighbourList`) because multi-writer
-    /// back-edge appends need atomics that the f32-only block does not
-    /// carry.
+    /// Store the f32 vector of node `idx` in the layer-0 store, allocating
+    /// the store on the first call once `dim` is known and growing it to fit
+    /// `idx`. Neighbour lists are published separately through `layer_set` /
+    /// `layer_cas_append`.
     fn mirror_data_level0_vector(&mut self, idx: usize, vector: &[f32]) {
         let dim = vector.len();
         if dim == 0 {
@@ -1372,11 +1331,9 @@ impl HnswIndex {
         if !block.has_f32() || vector.len() != block.dim() {
             return;
         }
-        // Grow the contiguous block to fit `idx` rather than skipping past
-        // capacity — the contiguous store is now the authoritative f32 source
-        // (the SoA `node_vectors` copy is being removed), so it must hold
-        // every node, including those inserted beyond the initial
-        // `max_elements` estimate.
+        // Grow rather than skip past capacity: this store is the only f32
+        // source, so it must hold every node, including those inserted beyond
+        // the initial `max_elements` estimate.
         block.ensure_capacity(idx + 1);
         // SAFETY: idx < capacity after `ensure_capacity` and vector.len()
         // == block.dim() per the gate above; block was allocated with the
@@ -1386,83 +1343,42 @@ impl HnswIndex {
         }
     }
 
-    fn mirror_inline_layer0(&mut self, idx: usize, id: u64, vector: &[f32]) {
-        let dim = vector.len();
-        if dim == 0 {
+    /// Allocate the RaBitQ code block on the first insert of a RaBitQ index,
+    /// once `dim` is known, with the code width of the configured codec so
+    /// calibration fills it without a layout mismatch. Other codecs never
+    /// produce RaBitQ codes and get no block.
+    fn ensure_rabitq_block(&mut self, idx: usize, dim: usize) {
+        if dim == 0 || self.rabitq_block.is_some() {
             return;
         }
-        if self.inline_layer0.is_none() {
-            let capacity = (self.config.max_elements as usize).max(idx + 1);
-            // Pick the RaBitQ packed-code width from the configured codec
-            // so a later calibration can mirror into the contiguous store
-            // without a layout mismatch. Non-RaBitQ configs use 1 bit (the
-            // minimum legal value) since the code slot stays unused.
-            let rabitq_bits = match self.config.quantization {
-                QuantizationCodec::RaBitQ { bits } => bits,
-                _ => 1,
-            };
-            self.inline_layer0 = Some(inline_layer0::InlineLayer0::new_with_rabitq_bits(
-                capacity,
-                M_MAX0,
-                dim,
-                rabitq_bits,
-            ));
-        }
-        let Some(inline) = self.inline_layer0.as_mut() else {
+        let QuantizationCodec::RaBitQ { bits } = self.config.quantization else {
             return;
         };
-        if inline.dim() != dim || idx >= inline.capacity() {
+        if !(1..=4).contains(&bits) {
             return;
         }
-        // SAFETY: idx < capacity (checked above), vector.len() == dim
-        // (checked above), and we hold &mut self so no other reader
-        // observes the partial write.
-        unsafe {
-            inline.set_label(idx, id);
-            inline.set_vector_f32(idx, vector);
-        }
+        let capacity = (self.config.max_elements as usize).max(idx + 1);
+        self.rabitq_block = Some(rabitq_block::RabitqBlock::new_with_rabitq_bits(
+            capacity, dim, bits,
+        ));
     }
 
-    /// Borrow the per-node f32 vector for `idx`. Prefers the SoA
-    /// `node_vectors` slot because measurements on real cosine and
-    /// euclidean workloads (sift-128, glove-100, M=16) showed the
-    /// contiguous per-node block layout regresses f32 search QPS
-    /// 13-16% under both ST and MT4 versus reading from SoA. The
-    /// contiguous store still owns the f32 mirror for the RaBitQ
-    /// search path (which benefits from co-locating code + scalars)
-    /// and as a fallback for nodes whose SoA slot is unavailable.
-    /// Returns `None` when neither path holds an f32 payload
-    /// (offloaded SQ8 or pre-insert states); callers that need a
-    /// non-`None` value already handle the `None` arm.
+    /// Borrow the f32 vector of node `idx` from the layer-0 store. `None`
+    /// before the first insert and once the vectors were offloaded to disk.
     #[inline]
     fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
-        // Prefer the dedicated f32-only contiguous block when present:
-        // single ALU op for the address, no SoA double-indirection.
-        // Matches hnswlib's `getDataByInternalId` shape and is the
-        // companion read for the prefetch issued in
-        // `prefetch_node_vector`.
-        if let Some(block) = self.data_level0.as_ref() {
-            if block.has_f32() && idx < block.capacity() {
-                // SAFETY: idx < capacity per the gate above; the block
-                // was sized for `dim` f32 values at construction; the
-                // borrow lifetime is tied to `&self`.
-                unsafe {
-                    let ptr = block.vector_ptr(idx);
-                    return Some(core::slice::from_raw_parts(ptr, block.dim()));
-                }
-            }
+        let block = self.data_level0.as_ref()?;
+        if !block.has_f32() || idx >= block.capacity() {
+            return None;
         }
-        if let Some(inline) = self.inline_layer0.as_ref() {
-            if inline.has_f32() && idx < inline.capacity() {
-                // SAFETY: idx < capacity per the gate above; payload
-                // bytes were installed under &mut self and we only ever
-                // take &self after that.
-                unsafe {
-                    return Some(inline.vector_f32(idx));
-                }
-            }
+        // SAFETY: idx < capacity per the gate above; the block was sized for
+        // `dim` f32 values per node; the borrow is tied to `&self`.
+        unsafe {
+            Some(core::slice::from_raw_parts(
+                block.vector_ptr(idx),
+                block.dim(),
+            ))
         }
-        None
     }
 
     /// Read the layer-0 neighbour id snapshot into `out` from the
@@ -1525,28 +1441,39 @@ impl HnswIndex {
         self.id_to_idx.get(&id).copied()
     }
 
-    /// Mirror the RaBitQ code (packed bytes) and scalar header for node
-    /// `idx` into the contiguous store. Skips silently when:
-    /// - the contiguous store is not allocated yet,
-    /// - the store's `rabitq_bits` does not match the active codec
-    ///   (e.g. lazy alloc happened before calibration set bits),
-    /// - `idx` exceeds the pre-allocated capacity, or
-    /// - the encoded variant is `None`.
-    ///
-    /// SoA remains authoritative for search reads, so a missed mirror is
-    /// a perf miss, not a correctness bug.
-    fn mirror_rabitq_to_inline(&mut self, idx: usize, enc: Option<&RabitqEncoded>) {
-        let Some(enc) = enc else { return };
-        let Some(inline) = self.inline_layer0.as_mut() else {
+    /// Copy the RaBitQ code (packed bytes) and scalar header of node `idx`
+    /// into the code block, so the slot holds the node's current code or
+    /// nothing. When the code cannot go in (no code, a width or length that
+    /// does not match the slot) the slot is cleared: a zero `norm` sends search
+    /// to `node_rabitq_codes`, which costs speed, never a result.
+    fn mirror_rabitq_to_block(&mut self, idx: usize, enc: Option<&RabitqEncoded>) {
+        let Some(block) = self.rabitq_block.as_mut() else {
             return;
         };
-        if idx >= inline.capacity() {
+        if idx >= block.capacity() {
             return;
         }
+        let installed = enc.is_some_and(|enc| Self::install_rabitq(block, idx, enc));
+        if !installed {
+            // SAFETY: idx < capacity per the gate above.
+            unsafe { block.set_rabitq_scalars(idx, rabitq_block::RaBitQScalars::default()) };
+        }
+    }
+
+    /// Write `enc` into slot `idx` of `inline`; `false` when its width or
+    /// length does not match the slot.
+    ///
+    /// The caller guarantees `idx < inline.capacity()`.
+    fn install_rabitq(
+        inline: &mut rabitq_block::RabitqBlock,
+        idx: usize,
+        enc: &RabitqEncoded,
+    ) -> bool {
+        debug_assert!(idx < inline.capacity(), "idx out of the code block");
         match enc {
             RabitqEncoded::OneBit(code) => {
                 if inline.rabitq_bits() != 1 {
-                    return;
+                    return false;
                 }
                 // `CodeWords` derefs to `&[u64]`; reinterpret as bytes for
                 // the packed-code slot.
@@ -1556,7 +1483,15 @@ impl HnswIndex {
                 // an aligned `&[u64]` as `&[u8]` is sound.
                 let byte_slice =
                     unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) };
-                let scalars = inline_layer0::RaBitQScalars {
+                // The words round the code up to whole u64s; the slot holds
+                // the exact byte length. A code shorter than the slot was
+                // encoded for another dimension: skip it rather than install
+                // a partial code under valid scalars.
+                let dst_len = inline.rabitq_byte_len();
+                if byte_slice.len() < dst_len {
+                    return false;
+                }
+                let scalars = rabitq_block::RaBitQScalars {
                     norm: code.norm,
                     cross_term: code.cross_term,
                     signed_sum: code.signed_sum,
@@ -1565,24 +1500,21 @@ impl HnswIndex {
                     cluster_id: code.cluster_id,
                     _pad: 0,
                 };
-                // SAFETY: idx < capacity per the gate above; the byte
-                // count is capped at the inline rabitq slot length.
+                // SAFETY: idx < capacity per the caller; the slice is exactly
+                // the slot length.
                 unsafe {
-                    let dst_len = inline.rabitq(idx).len();
-                    let take = byte_slice.len().min(dst_len);
-                    if take > 0 {
-                        let mut tmp = vec![0u8; dst_len];
-                        tmp[..take].copy_from_slice(&byte_slice[..take]);
-                        inline.set_rabitq(idx, &tmp);
-                    }
+                    inline.set_rabitq(idx, &byte_slice[..dst_len]);
                     inline.set_rabitq_scalars(idx, scalars);
                 }
+                true
             }
             RabitqEncoded::Multi(code) => {
-                if inline.rabitq_bits() != code.bits {
-                    return;
+                if inline.rabitq_bits() != code.bits
+                    || code.packed.len() != inline.rabitq_byte_len()
+                {
+                    return false;
                 }
-                let scalars = inline_layer0::RaBitQScalars {
+                let scalars = rabitq_block::RaBitQScalars {
                     norm: code.norm,
                     cross_term: code.cross_term,
                     signed_sum: 0,
@@ -1591,41 +1523,27 @@ impl HnswIndex {
                     cluster_id: 0,
                     _pad: 0,
                 };
-                // SAFETY: idx < capacity; `code.packed` is the canonical
-                // byte layout for the configured (dim, bits) pair.
+                // SAFETY: idx < capacity per the caller; the packed code is
+                // exactly the slot length per the gate above.
                 unsafe {
-                    let dst_len = inline.rabitq(idx).len();
-                    if code.packed.len() == dst_len {
-                        inline.set_rabitq(idx, &code.packed);
-                    }
+                    inline.set_rabitq(idx, &code.packed);
                     inline.set_rabitq_scalars(idx, scalars);
                 }
+                true
             }
         }
     }
 
-    /// Read-only view of the contiguous layer-0 store, for parity tests
-    /// and the follow-up search-side switch.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "consumer of this accessor lands with the search-side switch on the same plan"
-        )
-    )]
-    pub(crate) fn inline_layer0(&self) -> Option<&inline_layer0::InlineLayer0> {
-        self.inline_layer0.as_ref()
+    /// The RaBitQ code block, for tests.
+    #[cfg(test)]
+    pub(crate) fn rabitq_block(&self) -> Option<&rabitq_block::RabitqBlock> {
+        self.rabitq_block.as_ref()
     }
 
-    /// Write-through the full layer-0 neighbour set for `idx` into the
-    /// contiguous `data_level0` block (bulk replace, single-writer-per-node —
-    /// same contract as `set_outgoing`'s SoA `set`). Bridges the u64 graph
-    /// indices to the block's u32 slots (per-shard node count is well below
-    /// `u32::MAX`). No-op when the block is absent or does not yet cover `idx`.
-    ///
-    /// This is the write-through twin of [`Self::mirror_layer0_neighbours_to_inline`]
-    /// for the contiguous-block neighbour collapse: the block becomes the
-    /// single search source for both neighbours and the f32 vector.
+    /// Publish the full layer-0 neighbour list of `idx` in the layer-0
+    /// store, replacing the previous list whole. Narrows the u64 graph
+    /// indices to the store's u32 ids (per-shard node count is well below
+    /// `u32::MAX`). No-op when the store is absent or does not cover `idx`.
     fn mirror_layer0_neighbours_to_data_level0(&self, idx: usize, ids: &[u64]) {
         let Some(block) = self.data_level0.as_ref() else {
             return;
@@ -1682,20 +1600,16 @@ impl HnswIndex {
             id,
             max_layer: new_level,
         });
-        // Mirror into the contiguous layer-0 store before moving `vector`.
-        // No-op until the field has been allocated AND we are inside
-        // capacity; the SoA path below remains authoritative either way.
-        self.mirror_inline_layer0(idx, id, &vector);
+        self.ensure_rabitq_block(idx, vector.len());
         self.mirror_data_level0_vector(idx, &vector);
         // SoA payload pushes in lockstep — same idx, no extra clone.
         let norm = metrics::norm_l2(&vector);
         self.node_norms.push(norm);
         self.node_inv_norms.push(inv_or_zero(norm));
         self.node_quantized.push(quantized);
-        let rabitq_for_mirror = rabitq_code.clone();
+        let code_idx = self.node_rabitq_codes.len();
+        self.mirror_rabitq_to_block(code_idx, rabitq_code.as_ref());
         self.node_rabitq_codes.push(rabitq_code);
-        let mirror_idx = self.node_rabitq_codes.len() - 1;
-        self.mirror_rabitq_to_inline(mirror_idx, rabitq_for_mirror.as_ref());
         self.id_to_idx.insert(id, idx);
 
         // Allocate atomic neighbour storage in lockstep — write helpers
@@ -1800,17 +1714,15 @@ impl HnswIndex {
                 id: plan.id,
                 max_layer: new_level,
             });
-            // Mirror into the contiguous layer-0 stores before moving `vec`.
-            self.mirror_inline_layer0(idx, plan.id, &vec);
+            self.ensure_rabitq_block(idx, vec.len());
             self.mirror_data_level0_vector(idx, &vec);
             let norm = metrics::norm_l2(&vec);
             self.node_norms.push(norm);
             self.node_inv_norms.push(inv_or_zero(norm));
             self.node_quantized.push(quantized);
-            let rabitq_for_mirror = rabitq_code.clone();
+            let code_idx = self.node_rabitq_codes.len();
+            self.mirror_rabitq_to_block(code_idx, rabitq_code.as_ref());
             self.node_rabitq_codes.push(rabitq_code);
-            let mirror_idx = self.node_rabitq_codes.len() - 1;
-            self.mirror_rabitq_to_inline(mirror_idx, rabitq_for_mirror.as_ref());
             self.id_to_idx.insert(plan.id, idx);
 
             let mut upper = Vec::with_capacity(new_level);
@@ -2461,15 +2373,13 @@ impl HnswIndex {
             }
         }
 
-        // Refresh the contiguous-store payload alongside the SoA write so
-        // a subsequent search reads the updated vector and not a stale
-        // mirror left over from the original insert.
-        self.mirror_inline_layer0(idx, id, &vector);
+        // Refresh the stores alongside the SoA write so a subsequent search
+        // reads the updated vector and code, not the original insert's.
+        self.ensure_rabitq_block(idx, vector.len());
         self.mirror_data_level0_vector(idx, &vector);
         self.node_quantized[idx] = quantized;
-        let rabitq_for_mirror = rabitq_code.clone();
+        self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
         self.node_rabitq_codes[idx] = rabitq_code;
-        self.mirror_rabitq_to_inline(idx, rabitq_for_mirror.as_ref());
 
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
@@ -3091,16 +3001,16 @@ impl HnswIndex {
         // Mismatched variants fall through to f32 — keeps a partially
         // recalibrated index queryable rather than panicking.
         if matches!(self.config.metric, VectorMetric::Cosine) {
-            // Contiguous-store fast path: read packed code + scalars from
-            // the per-node block instead of dereferencing the SoA
+            // Code-block fast path: read packed code + scalars from the
+            // per-node block instead of dereferencing the SoA
             // `node_rabitq_codes[idx]`. Gated on byte-length match between
-            // the inline slot and the query bit-planes so dims whose
-            // effective code width differs from `dim/8` (e.g. dim=100
-            // padded to 128) cleanly fall through to the SoA path.
+            // the slot and the query bit-planes so dims whose effective code
+            // width differs from `dim/8` (e.g. dim=100 padded to 128) cleanly
+            // fall through to the SoA path.
             if let (Some(params), Some(RabitqQuery::OneBit(q)), Some(inline)) = (
                 self.rabitq_params.as_ref(),
                 ctx.rabitq_query.as_ref(),
-                self.inline_layer0.as_ref(),
+                self.rabitq_block.as_ref(),
             ) {
                 let slot_words = inline.rabitq_byte_len() / 8;
                 if inline.rabitq_bits() == 1
@@ -3108,11 +3018,11 @@ impl HnswIndex {
                     && slot_words == q.planes[0].len()
                     && node_idx < inline.capacity()
                 {
-                    // SAFETY: node_idx < capacity; the rabitq slot is
-                    // 8-byte aligned by construction (rabitq_offset
-                    // aligned in `new_with_rabitq_bits`) and we verified
-                    // the byte length is a multiple of 8 above. The
-                    // slice borrow lives for the duration of the call.
+                    // SAFETY: node_idx < capacity; the code starts each
+                    // per-node block, whose stride is a multiple of 8 over a
+                    // u64 backing, so it is 8-aligned, and we verified the
+                    // byte length is a multiple of 8 above. The slice borrow
+                    // lives for the duration of the call.
                     let scalars = unsafe { inline.rabitq_scalars(node_idx) };
                     if scalars.norm > 0.0 {
                         let bytes = unsafe { inline.rabitq(node_idx) };
