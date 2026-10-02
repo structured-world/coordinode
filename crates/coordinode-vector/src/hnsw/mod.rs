@@ -1367,18 +1367,7 @@ impl HnswIndex {
     /// before the first insert and once the vectors were offloaded to disk.
     #[inline]
     fn read_node_f32(&self, idx: usize) -> Option<&[f32]> {
-        let block = self.data_level0.as_ref()?;
-        if !block.has_f32() || idx >= block.capacity() {
-            return None;
-        }
-        // SAFETY: idx < capacity per the gate above; the block was sized for
-        // `dim` f32 values per node; the borrow is tied to `&self`.
-        unsafe {
-            Some(core::slice::from_raw_parts(
-                block.vector_ptr(idx),
-                block.dim(),
-            ))
-        }
+        self.data_level0.as_ref()?.vector(idx)
     }
 
     /// Read the layer-0 neighbour id snapshot into `out` from the
@@ -1406,11 +1395,7 @@ impl HnswIndex {
         // `data_level0` holds every node's published layer-0 list (u32 ids);
         // read straight into `out`, widening u32 -> u64.
         if let Some(block) = self.data_level0.as_ref() {
-            if idx < block.capacity() {
-                // SAFETY: idx < capacity per the gate.
-                unsafe {
-                    block.read_neighbours_into_u64(idx, out, guard);
-                }
+            if block.read_list_u64(idx, out, guard) {
                 return;
             }
         }
@@ -1548,7 +1533,7 @@ impl HnswIndex {
         let Some(block) = self.data_level0.as_ref() else {
             return;
         };
-        if idx >= block.capacity() {
+        if !block.contains(idx) {
             return;
         }
         let n = ids.len().min(block.m_max0());
@@ -3294,7 +3279,7 @@ impl HnswIndex {
     fn layer_len(&self, idx: usize, level: usize) -> usize {
         if level == 0 {
             self.data_level0.as_ref().map_or(0, |block| {
-                if idx < block.capacity() {
+                if block.contains(idx) {
                     // SAFETY: idx < capacity per the gate.
                     unsafe { block.neighbour_count(idx) as usize }
                 } else {
@@ -3311,7 +3296,7 @@ impl HnswIndex {
     fn layer_cas_append(&self, idx: usize, level: usize, id: u64) -> bool {
         if level == 0 {
             self.data_level0.as_ref().is_some_and(|block| {
-                if idx < block.capacity() {
+                if block.contains(idx) {
                     // SAFETY: idx < capacity per the gate.
                     unsafe { block.cas_append_neighbour(idx, id as u32) }
                 } else {
@@ -3359,7 +3344,7 @@ impl HnswIndex {
         let Some(block) = self.data_level0.as_ref() else {
             return false;
         };
-        if idx >= block.capacity() {
+        if !block.contains(idx) {
             return false;
         }
         let cap = block.m_max0();
@@ -3659,7 +3644,7 @@ impl HnswIndex {
         // SoA cache misses. Matches hnswlib's `_mm_prefetch(data_level0_memory_
         // + idx * size_data_per_element_)` shape.
         if let Some(block) = self.data_level0.as_ref() {
-            if block.has_f32() && idx < block.capacity() {
+            if block.has_f32() {
                 block.prefetch(idx);
                 return;
             }

@@ -41,7 +41,7 @@ fn neighbours_round_trip() {
 #[test]
 fn vector_round_trip_and_alignment() {
     let dim = 64;
-    let mut block = DataLevel0Block::new(8, M_MAX0, dim);
+    let block = DataLevel0Block::new(8, M_MAX0, dim);
     let v: Vec<f32> = (0..dim).map(|i| i as f32 * 0.25).collect();
 
     // SAFETY: idx < capacity, v.len() == dim.
@@ -59,45 +59,100 @@ fn vector_round_trip_and_alignment() {
     assert_eq!(slice, v.as_slice());
 }
 
+/// Growth adds segments and moves nothing: a vector and a list a reader holds
+/// keep their address, and nodes in every segment round-trip.
 #[test]
-fn ensure_capacity_grows_and_preserves_existing_vectors() {
+fn growth_keeps_addresses_and_fills_every_segment() {
     let dim = 8;
-    let mut block = DataLevel0Block::new(2, M_MAX0, dim);
-    let v0: Vec<f32> = (0..dim).map(|i| i as f32).collect();
-    let v1: Vec<f32> = (0..dim).map(|i| i as f32 + 100.0).collect();
-    // SAFETY: idx < capacity, len == dim.
+    let block = DataLevel0Block::new(3, M_MAX0, dim);
+    let vector = |i: usize| -> Vec<f32> { (0..dim).map(|d| (i * 100 + d) as f32).collect() };
+    // SAFETY: idx < capacity, len == dim, single writer, nothing reachable.
     unsafe {
-        block.set_vector(0, &v0);
-        block.set_vector(1, &v1);
+        block.set_vector(0, &vector(0));
+        block.set_vector(2, &vector(2));
+        block.set_neighbours(2, &[7, 8]);
     }
-    assert_eq!(block.capacity(), 2);
+    assert_eq!(block.capacity(), 3);
+    // SAFETY: idx < capacity.
+    let (v0, v2) = unsafe { (block.vector_ptr(0), block.vector_ptr(2)) };
 
-    // Grow to fit idx 5 (beyond the initial capacity).
+    // Segments of 3, 6, 12: capacity 3 -> 6 -> 12 -> 24.
+    block.ensure_capacity(20);
+    assert_eq!(block.capacity(), 24);
+    // SAFETY: idx < capacity.
+    unsafe {
+        assert_eq!(block.vector_ptr(0), v0, "node 0 moved on growth");
+        assert_eq!(block.vector_ptr(2), v2, "node 2 moved on growth");
+    }
+
+    for i in 3..24 {
+        // SAFETY: idx < capacity, len == dim, single writer.
+        unsafe {
+            block.set_vector(i, &vector(i));
+            block.set_neighbours(i, &[i as u32]);
+        }
+    }
+    let mut out = Vec::new();
+    for i in [0usize, 2, 3, 5, 6, 11, 12, 23] {
+        // SAFETY: idx < capacity; the vector is f32-aligned for `dim` values.
+        unsafe {
+            let got = core::slice::from_raw_parts(block.vector_ptr(i), dim);
+            assert_eq!(got, vector(i).as_slice(), "vector of node {i}");
+            assert_eq!(block.vector_ptr(i).align_offset(4), 0);
+            block.read_neighbours_into(i, &mut out);
+        }
+        let expected: Vec<u32> = match i {
+            0 => vec![],
+            2 => vec![7, 8],
+            _ => vec![i as u32],
+        };
+        assert_eq!(out, expected, "list of node {i}");
+    }
+
+    // Already large enough: a no-op.
+    block.ensure_capacity(5);
+    assert_eq!(block.capacity(), 24);
+}
+
+/// Concurrent growth installs each segment once and covers the request.
+#[test]
+fn concurrent_growth_installs_each_segment_once() {
+    let block = DataLevel0Block::new(4, M_MAX0, 8);
+    std::thread::scope(|s| {
+        for t in 0..8 {
+            let block = &block;
+            s.spawn(move || block.ensure_capacity(40 + t));
+        }
+    });
+    // 4 -> 8 -> 16 -> 32 -> 64.
+    assert_eq!(block.capacity(), 64);
+    // SAFETY: idx < capacity, single writer, nothing reachable.
+    unsafe {
+        block.set_neighbours(63, &[1]);
+        assert_eq!(block.neighbour_count(63), 1);
+    }
+}
+
+/// Dropping the vectors after growth frees them in every segment and keeps
+/// every list; a segment installed afterwards carries no vectors.
+#[test]
+fn drop_f32_after_growth_keeps_lists() {
+    let mut block = DataLevel0Block::new(2, M_MAX0, 8);
     block.ensure_capacity(6);
-    assert!(block.capacity() >= 6, "capacity must grow to fit");
-
-    // Existing vectors survive the reallocate-and-copy.
-    // SAFETY: idx < capacity, ptr is f32-aligned for `dim` values.
+    // SAFETY: idx < capacity.
     unsafe {
-        let s0 = core::slice::from_raw_parts(block.vector_ptr(0), dim);
-        let s1 = core::slice::from_raw_parts(block.vector_ptr(1), dim);
-        assert_eq!(s0, v0.as_slice());
-        assert_eq!(s1, v1.as_slice());
+        block.set_neighbours(1, &[3]);
+        block.set_neighbours(5, &[4, 5]);
     }
-
-    // The newly available slot is usable.
-    let v5: Vec<f32> = (0..dim).map(|i| i as f32 + 200.0).collect();
-    // SAFETY: idx 5 < capacity after growth, len == dim.
+    block.drop_f32();
+    block.ensure_capacity(10);
+    assert!(!block.has_f32());
+    // SAFETY: idx < capacity.
     unsafe {
-        block.set_vector(5, &v5);
-        let s5 = core::slice::from_raw_parts(block.vector_ptr(5), dim);
-        assert_eq!(s5, v5.as_slice());
+        assert_eq!(block.neighbour_count(1), 1);
+        assert_eq!(block.neighbour_count(5), 2);
+        assert_eq!(block.neighbour_count(9), 0);
     }
-
-    // No-op when already large enough — no shrink, no realloc.
-    let cap = block.capacity();
-    block.ensure_capacity(3);
-    assert_eq!(block.capacity(), cap);
 }
 
 #[test]
@@ -135,7 +190,7 @@ fn drop_f32_shrinks_stride_and_preserves_neighbours() {
 #[test]
 fn payloads_do_not_alias_across_nodes() {
     let dim = 16;
-    let mut block = DataLevel0Block::new(4, M_MAX0, dim);
+    let block = DataLevel0Block::new(4, M_MAX0, dim);
     let v0: Vec<f32> = (0..dim).map(|i| i as f32).collect();
     let v1: Vec<f32> = (0..dim).map(|i| -(i as f32)).collect();
 
