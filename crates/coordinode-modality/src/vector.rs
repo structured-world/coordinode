@@ -235,11 +235,23 @@ impl LocalVectorStore {
             .read()
             .map_err(|_| StoreError::Invariant("HNSW read lock poisoned".to_owned()))
     }
+
+    /// Run the calibration an insert reported due. Calibration rewrites
+    /// every node's code, so it is the one write that takes the index
+    /// exclusively; inserts and searches share it otherwise.
+    fn calibrate(&self) -> StoreResult<()> {
+        self.write()?.calibrate_if_due();
+        Ok(())
+    }
 }
 
 impl VectorStore for LocalVectorStore {
     fn insert(&self, node_id: u64, vector: Vec<f32>) -> StoreResult<()> {
-        self.write()?.insert(node_id, vector);
+        // Shared: concurrent inserts and searches proceed together.
+        let due = self.read()?.insert_shared(node_id, &vector);
+        if due {
+            self.calibrate()?;
+        }
         Ok(())
     }
 
@@ -280,11 +292,17 @@ impl VectorStore for LocalVectorStore {
         &self,
         vectors: &mut dyn Iterator<Item = (u64, Vec<f32>)>,
     ) -> StoreResult<usize> {
-        let mut guard = self.write()?;
         let mut count = 0;
-        for (id, vec) in vectors {
-            guard.insert(id, vec);
-            count += 1;
+        let mut due = false;
+        {
+            let guard = self.read()?;
+            for (id, vec) in vectors {
+                due |= guard.insert_shared(id, &vec);
+                count += 1;
+            }
+        }
+        if due {
+            self.calibrate()?;
         }
         Ok(count)
     }
