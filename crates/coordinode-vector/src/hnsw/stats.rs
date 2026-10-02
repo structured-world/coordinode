@@ -8,6 +8,7 @@
 //! tolerates a stale value by construction (it re-reads before giving up).
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crossbeam_utils::CachePadded;
 use std::time::Instant;
 
 /// Operations tracked at once for [`PublicationSnapshot::oldest_operation`];
@@ -19,10 +20,10 @@ const TRACKED_OPERATIONS: usize = 64;
 /// may run after the index itself is gone.
 #[derive(Debug)]
 pub(crate) struct PublicationStats {
-    /// Bytes of replaced lists waiting for reclamation.
-    retired_bytes: AtomicUsize,
-    /// Replaced lists waiting for reclamation.
-    retired_lists: AtomicUsize,
+    /// Written by every list replacement and reclamation, so kept on a cache
+    /// line of its own: the rarely written counters and the operation slots
+    /// do not bounce with it.
+    retired: CachePadded<Retired>,
     /// Publications that lost the descriptor CAS and recomputed.
     lost_cas: AtomicU64,
     /// Inserts that waited for reclamation to bring the retired bytes under
@@ -30,20 +31,28 @@ pub(crate) struct PublicationStats {
     admission_waits: AtomicU64,
     admission_wait_nanos: AtomicU64,
     /// Start of every tracked operation, as nanoseconds after `origin` plus
-    /// one; 0 marks a free slot.
-    operations: [AtomicU64; TRACKED_OPERATIONS],
+    /// one; 0 marks a free slot. One cache line per slot: concurrent
+    /// searches claim and release neighbouring slots, and sharing a line
+    /// would make every begin and end a cross-core transfer.
+    operations: [CachePadded<AtomicU64>; TRACKED_OPERATIONS],
     origin: Instant,
+}
+
+/// Replaced lists waiting for reclamation, and their bytes.
+#[derive(Debug, Default)]
+struct Retired {
+    bytes: AtomicUsize,
+    lists: AtomicUsize,
 }
 
 impl PublicationStats {
     pub(crate) fn new() -> Self {
         Self {
-            retired_bytes: AtomicUsize::new(0),
-            retired_lists: AtomicUsize::new(0),
+            retired: CachePadded::new(Retired::default()),
             lost_cas: AtomicU64::new(0),
             admission_waits: AtomicU64::new(0),
             admission_wait_nanos: AtomicU64::new(0),
-            operations: core::array::from_fn(|_| AtomicU64::new(0)),
+            operations: core::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             origin: Instant::now(),
         }
     }
@@ -51,15 +60,15 @@ impl PublicationStats {
     /// A replaced list of `bytes` was handed to the epoch.
     #[inline]
     pub(crate) fn list_retired(&self, bytes: usize) {
-        self.retired_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.retired_lists.fetch_add(1, Ordering::Relaxed);
+        self.retired.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.retired.lists.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A replaced list of `bytes` was freed.
     #[inline]
     pub(crate) fn list_reclaimed(&self, bytes: usize) {
-        self.retired_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        self.retired_lists.fetch_sub(1, Ordering::Relaxed);
+        self.retired.bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.retired.lists.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// A publication lost its CAS and is recomputing.
@@ -71,7 +80,7 @@ impl PublicationStats {
     /// Bytes of replaced lists not yet reclaimed.
     #[inline]
     pub(crate) fn retired_bytes(&self) -> usize {
-        self.retired_bytes.load(Ordering::Relaxed)
+        self.retired.bytes.load(Ordering::Relaxed)
     }
 
     /// An insert waited `nanos` for the retired bytes to fall under budget.
@@ -90,7 +99,7 @@ impl PublicationStats {
         // slots without a shared counter to contend on.
         let probe = (&stamp as *const u64 as usize >> 12) % TRACKED_OPERATIONS;
         for step in 0..TRACKED_OPERATIONS {
-            let slot = &self.operations[(probe + step) % TRACKED_OPERATIONS];
+            let slot: &AtomicU64 = &self.operations[(probe + step) % TRACKED_OPERATIONS];
             if slot
                 .compare_exchange(0, stamp, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
@@ -122,7 +131,7 @@ impl PublicationStats {
             .map_or(0, |start| now.saturating_sub(start));
         PublicationSnapshot {
             retired_bytes: self.retired_bytes(),
-            retired_lists: self.retired_lists.load(Ordering::Relaxed),
+            retired_lists: self.retired.lists.load(Ordering::Relaxed),
             lost_cas: self.lost_cas.load(Ordering::Relaxed),
             admission_waits: self.admission_waits.load(Ordering::Relaxed),
             admission_wait: std::time::Duration::from_nanos(

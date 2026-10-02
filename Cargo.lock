@@ -1288,6 +1288,7 @@ dependencies = [
  "coordinode-workspace-hack",
  "criterion",
  "crossbeam-epoch",
+ "crossbeam-utils",
  "loom",
  "parking_lot",
  "proptest",

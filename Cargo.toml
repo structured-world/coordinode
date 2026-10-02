@@ -119,6 +119,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Parallelism
 rayon = "1.12"
 crossbeam-epoch = "0.9"
+crossbeam-utils = { version = "0.8", default-features = false }
 
 # Fast non-DoS hasher for internal-id keyed maps/sets on hot paths.
 rustc-hash = "2.1"
