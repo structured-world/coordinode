@@ -64,13 +64,6 @@ impl IdMap {
         self.shards.iter().map(|shard| shard.read().len()).sum()
     }
 
-    /// Some present index other than `except`, if any.
-    pub(super) fn any_other(&self, except: usize) -> Option<usize> {
-        self.shards
-            .iter()
-            .find_map(|shard| shard.read().values().copied().find(|&idx| idx != except))
-    }
-
     /// Remove every id.
     pub(super) fn clear(&mut self) {
         for shard in self.shards.iter_mut() {

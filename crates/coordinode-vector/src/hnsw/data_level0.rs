@@ -450,20 +450,6 @@ impl DataLevel0Block {
         }
     }
 
-    /// Replace the norms of node `idx` (its vector changed).
-    ///
-    /// # Safety
-    ///
-    /// `idx < self.capacity()`, under the same exclusivity as the vector
-    /// write that changed them.
-    pub(super) unsafe fn set_norm(&self, idx: usize, norm: f32) {
-        // SAFETY: caller bounds.
-        unsafe {
-            let (segment, off) = self.locate(idx);
-            store_norms(segment, off, norm);
-        }
-    }
-
     /// Move node `idx` to `state`. Release, so a reader that observes the
     /// state also observes everything written to the node before it.
     pub(super) fn set_state(&self, idx: usize, state: NodeState) {

@@ -1902,7 +1902,12 @@ fn atomic_neighbours_track_inserts_and_updates() {
             .get()
             .is_some_and(|b| b.capacity() >= idx.node_len())
     );
-    assert_eq!(idx.node_len(), 30, "the re-insert updated node 7 in place");
+    assert_eq!(idx.len(), 30, "the re-insert keeps 30 ids");
+    assert_eq!(
+        idx.node_len(),
+        31,
+        "the re-insert built node 7 in a new slot"
+    );
 
     let mut scratch = Vec::with_capacity(M_MAX0);
     for node_idx in 0..idx.node_len() {
@@ -2410,20 +2415,19 @@ fn insert_batch_handles_mixed_new_and_existing_ids() {
     assert_eq!(idx.len(), 20, "expected 20 unique ids after batch");
 }
 
+/// Inserts through a shared borrow from many threads, while other threads
+/// search the same index, land every node: each one is found again by its
+/// own vector, and no search observes a result outside the inserted ids or a
+/// panic from a half-built node.
 #[test]
-fn apply_insert_plans_parallel_ingests_every_item() {
-    // Explicit parallel-apply variant without the prune-pass that
-    // backfills dropped back-edges, so recall agreement vs serial is
-    // not asserted; the property checked is weaker: every plan must
-    // result in a present, self-recoverable node (search for own
-    // vector returns it as top-1).
+fn concurrent_inserts_under_live_search_land_every_node() {
     let cfg = HnswConfig {
         m: 8,
         m_max0: 16,
         ef_construction: 50,
         ef_search: 50,
         metric: VectorMetric::L2,
-        max_dimensions: 4,
+        max_dimensions: 8,
         quantization: QuantizationCodec::None,
         rerank_candidates: 50,
         calibration_threshold: 10_000,
@@ -2434,40 +2438,103 @@ fn apply_insert_plans_parallel_ingests_every_item() {
         alpha_pruning: 1.0,
         max_elements: 1_000,
     };
-    let mut idx = HnswIndex::new(cfg);
-
-    // Seed 64 nodes so the parallel apply's plans have a real graph.
-    for i in 0..64u64 {
-        let v: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
-        idx.insert(i, v);
-    }
-    // Pre-compute plans against the seeded graph, then apply in
-    // parallel.
-    let plans: Vec<(InsertPlan, Vec<f32>)> = (64..200u64)
-        .map(|i| {
-            let v: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
-            let plan = idx.compute_insert_plan(i, &v);
-            (plan, v)
-        })
-        .collect();
-    idx.apply_insert_plans_parallel(plans);
-
-    assert_eq!(idx.len(), 200);
-    // Every node must search-recover to itself as the closest result.
-    // This is a much looser invariant than recall agreement: it says
-    // "the node landed in the index and its outgoing edges are
-    // sufficient to reach itself from any nearby entry".
-    let mut self_recovered = 0;
-    for i in 64..200u64 {
-        let q: Vec<f32> = (0..4).map(|d| ((i * 31 + d) as f32 * 0.1).sin()).collect();
-        if idx.search(&q, 1)[0].id == i {
-            self_recovered += 1;
+    let idx = HnswIndex::new(cfg);
+    // Vectors with no locality along the id, so the comparison with a
+    // sequential build below measures concurrency, not insert order (vectors
+    // on a smooth curve favour inserting along it).
+    let vector = |i: u64| -> Vec<f32> { scattered_vector(i, 8) };
+    let inserting = std::sync::atomic::AtomicUsize::new(4);
+    std::thread::scope(|s| {
+        for t in 0..4u64 {
+            let (idx, inserting) = (&idx, &inserting);
+            s.spawn(move || {
+                for i in (t * 200)..(t * 200 + 200) {
+                    idx.insert_shared(i, &vector(i));
+                }
+                inserting.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            });
         }
+        for _ in 0..2 {
+            let (idx, inserting) = (&idx, &inserting);
+            s.spawn(move || {
+                let mut q = 0u64;
+                while inserting.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                    for hit in idx.search(&vector(q % 800), 5) {
+                        assert!(
+                            hit.id < 800,
+                            "search returned an id never inserted: {}",
+                            hit.id
+                        );
+                    }
+                    q += 7;
+                }
+            });
+        }
+    });
+
+    assert_eq!(idx.len(), 800);
+    let recovered = |index: &HnswIndex| {
+        (0..800u64)
+            .filter(|&i| index.search(&vector(i), 1).first().map(|r| r.id) == Some(i))
+            .count()
+    };
+    // The same items inserted one by one into a twin index set the bar:
+    // concurrency may cost a little, never a collapse.
+    let mut serial = HnswIndex::new(idx.config().clone());
+    for i in 0..800u64 {
+        serial.insert(i, vector(i));
     }
-    let ratio = self_recovered as f64 / 136.0;
+    let (concurrent, sequential) = (recovered(&idx), recovered(&serial));
     assert!(
-        ratio >= 0.85,
-        "self-recover ratio {ratio:.2} after parallel apply (expected ≥ 0.85)",
+        concurrent + 800 / 200 >= sequential,
+        "{concurrent}/800 nodes found by their own vector after concurrent inserts, \
+         {sequential}/800 after sequential ones",
+    );
+}
+
+/// A vector of `dim` components in [-1, 1) with no order along `i`: a
+/// splitmix64 stream seeded by `i`. Sequential ids then carry no geometric
+/// locality, so the insert order does not favour one build over another.
+fn scattered_vector(i: u64, dim: usize) -> Vec<f32> {
+    let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    (0..dim)
+        .map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        })
+        .collect()
+}
+
+/// An update through a shared borrow moves the id to its new vector: the
+/// old node is never a result again, and the id is counted once.
+#[test]
+fn update_moves_the_id_and_retires_the_old_node() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
+    for i in 0..50u64 {
+        index.insert(i, vec![i as f32, 0.0, 0.0]);
+    }
+    let before = index.idx_for_id_for_test(7).expect("inserted");
+    index.insert(7, vec![1000.0, 0.0, 0.0]);
+    let after = index.idx_for_id_for_test(7).expect("still present");
+    assert_ne!(before, after, "an update builds the node in a new slot");
+    assert_eq!(index.nodes().state(before), data_level0::NodeState::Retired);
+    assert_eq!(index.len(), 50);
+    // The old position no longer answers for id 7; the new one does.
+    let near_old = index.search(&[7.0, 0.0, 0.0], 3);
+    assert!(
+        near_old.iter().all(|r| r.id != 7),
+        "retired node returned: {near_old:?}"
+    );
+    assert_eq!(index.search(&[1000.0, 0.0, 0.0], 1)[0].id, 7);
+    let exact = index.search_with_mode(&[7.0, 0.0, 0.0], 50, SearchMode::Exact);
+    assert_eq!(
+        exact.iter().filter(|r| r.id == 7).count(),
+        1,
+        "id counted once"
     );
 }
 
@@ -2580,7 +2647,7 @@ fn prune_racing_an_append_keeps_the_append() {
         index.insert(i, v);
     }
     for round in 0..200 {
-        index.set_outgoing(0, 0, &[]);
+        index.layer_update(0, 0, |_| Some(Vec::new()));
         let appending = std::sync::atomic::AtomicBool::new(true);
         let accepted = std::thread::scope(|s| {
             s.spawn(|| {
@@ -2590,7 +2657,7 @@ fn prune_racing_an_append_keeps_the_append() {
             });
             let mut accepted = Vec::new();
             for id in 1..=60u64 {
-                if index.cas_add_neighbour_to(0, 0, id) {
+                if index.layer_cas_append(0, 0, id) {
                     accepted.push(id);
                 }
                 std::thread::yield_now();
@@ -2623,7 +2690,7 @@ fn removal_racing_an_append_keeps_the_append() {
     }
     let doomed: Vec<u64> = (61..=90).collect();
     for round in 0..200 {
-        index.set_outgoing(0, 0, &doomed);
+        index.layer_update(0, 0, |_| Some(doomed.clone()));
         let accepted = std::thread::scope(|s| {
             s.spawn(|| {
                 for &id in &doomed {
@@ -2633,7 +2700,7 @@ fn removal_racing_an_append_keeps_the_append() {
             });
             let mut accepted = Vec::new();
             for id in 1..=34u64 {
-                if index.cas_add_neighbour_to(0, 0, id) {
+                if index.layer_cas_append(0, 0, id) {
                     accepted.push(id);
                 }
                 std::thread::yield_now();

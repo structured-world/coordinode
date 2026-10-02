@@ -27,16 +27,6 @@ fn ids_spread_over_shards_and_len_sums_them() {
     }
 }
 
-#[test]
-fn any_other_skips_the_excluded_index() {
-    let map = IdMap::with_capacity(4);
-    assert_eq!(map.any_other(0), None);
-    map.insert(1, 0);
-    assert_eq!(map.any_other(0), None);
-    map.insert(2, 3);
-    assert_eq!(map.any_other(0), Some(3));
-}
-
 /// Concurrent inserts of distinct ids all land; the last write per id wins.
 #[test]
 fn concurrent_inserts_land() {

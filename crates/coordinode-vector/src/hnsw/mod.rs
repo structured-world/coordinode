@@ -358,6 +358,9 @@ pub struct HnswIndex {
     /// Extended-RaBitQ) are `None` until calibration; the RaBitQ variant is
     /// fixed at calibration time and never mixed within one index.
     node_count: core::sync::atomic::AtomicUsize,
+    /// Number of ids in the index. Below `node_count` once updates retire
+    /// slots: an update moves its id to a new slot.
+    live_count: core::sync::atomic::AtomicUsize,
     /// Map from node ID to its index in the node store.
     id_to_idx: id_map::IdMap,
     /// Lock-free entry point: packed `(level, idx)` in a single
@@ -419,37 +422,13 @@ pub struct HnswIndex {
     data_level0: std::sync::OnceLock<data_level0::DataLevel0Block>,
 }
 
-/// Read-only result of the planning phase of an insert.
-///
-/// Produced by [`HnswIndex::compute_insert_plan`] (takes `&self`) and
-/// consumed by [`HnswIndex::apply_insert_plan`] (takes `&mut self`). The
-/// type carries no references into the index, so it can outlive the
-/// borrow used to compute it — required for batch ingestion where N plans
-/// are computed in parallel under `&self` and then applied one-by-one
-/// under `&mut self`.
-#[derive(Debug, Clone)]
-pub(crate) struct InsertPlan {
-    /// Node ID being inserted (the user-facing identifier, not the index).
-    pub id: u64,
-    /// Layer the new node is being inserted at (top of its layer stack).
-    pub new_level: usize,
-    /// One [`LayerPlan`] per layer from `new_level` down to `0`.
-    /// Empty when [`InsertPlan::is_first_node`] is true.
-    pub per_layer: Vec<LayerPlan>,
-    /// `true` if this plan was computed against an empty index. The apply
-    /// path uses this to short-circuit the bidirectional connection loop.
-    pub is_first_node: bool,
-}
-
-/// Per-layer outcome of the planning phase: which existing nodes (by
-/// index into [`HnswIndex::nodes`]) the new node should connect to, plus
-/// the layer-specific max-fanout used for the bidirectional prune.
+/// Per-layer outcome of planning an insert: which existing nodes the new node
+/// connects to, plus the layer-specific max fan-out used for the
+/// bidirectional prune.
 #[derive(Debug, Clone)]
 pub(crate) struct LayerPlan {
     pub level: usize,
-    /// Indices into [`HnswIndex::nodes`] of the chosen neighbours, ordered
-    /// nearest-first (which is also the source-of-truth for entry-point
-    /// hand-off between layers during apply).
+    /// Indices of the chosen neighbours, ordered nearest-first.
     pub selected_idxs: Vec<usize>,
     /// Max neighbours per side at this layer — `m_max0` at layer 0,
     /// `m` everywhere else.
@@ -687,6 +666,7 @@ impl HnswIndex {
         Self {
             config,
             node_count: core::sync::atomic::AtomicUsize::new(0),
+            live_count: core::sync::atomic::AtomicUsize::new(0),
             id_to_idx,
             entry_point: EntryPoint::new(),
             // max_level is derived from entry_point.load() at every
@@ -957,7 +937,7 @@ impl HnswIndex {
 
     /// Number of indexed vectors.
     pub fn len(&self) -> usize {
-        self.node_len()
+        self.live_count.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether a vector for `id` is in the graph.
@@ -967,7 +947,7 @@ impl HnswIndex {
 
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.node_len() == 0
+        self.len() == 0
     }
 
     /// Insert a vector into the index.
@@ -977,156 +957,51 @@ impl HnswIndex {
     /// n.emb = $new_vec` path where `on_vector_written` calls `insert()` for
     /// both CREATE and SET.
     ///
-    /// Internally two phases: a read-only graph traversal that picks the
-    /// neighbours for each layer, then a single-threaded mutation that
-    /// publishes the new node and its neighbour edges.
+    /// Through [`Self::insert_shared`], then the calibration it reports due.
     pub fn insert(&mut self, id: u64, vector: Vec<f32>) {
-        if !self.accepts_dim(vector.len()) {
-            warn!(
-                node_id = id,
-                dim = vector.len(),
-                index_dim = self
-                    .data_level0
-                    .get()
-                    .map(data_level0::DataLevel0Block::dim),
-                "HNSW insert rejected: vector dimension is zero or differs from the index"
-            );
-            return;
+        if self.insert_shared(id, &vector) {
+            self.calibrate_if_due();
         }
-        if let Some(idx) = self.id_to_idx.get(id) {
-            // The same vector again (a write maintained by more than one
-            // path, or re-delivered): the node already sits where it
-            // belongs, and reconnecting it only puts its edges at risk.
-            if self.read_node_f32(idx) == Some(vector.as_slice()) {
-                return;
-            }
-            // Node already indexed — update vector and reconnect in graph.
-            self.update_existing_node(idx, vector);
-            return;
-        }
-
-        let plan = self.compute_insert_plan(id, &vector);
-        self.apply_insert_plan(plan, vector);
     }
 
-    /// Batched insert. For `items.len() ≥ BATCH_PARALLEL_THRESHOLD`,
-    /// planning runs across the rayon thread pool and apply runs the
-    /// parallel path; the planning phase relies on the wait-free search
-    /// hot path.
+    /// Batched insert: the items go in concurrently across the rayon pool,
+    /// each through [`Self::insert_shared`] against the live graph, so every
+    /// insert links to what the earlier ones already published.
     ///
-    /// IDs already present in the index are routed through the sequential
-    /// `update_existing_node` path after the parallel batch is applied;
-    /// updates are rare in typical batch ingestion.
-    ///
-    /// Plans for the batch are computed against the pre-batch graph state.
-    /// Inside a batch, a later insert's plan does not see earlier inserts
-    /// from the same batch — acceptable for an approximate algorithm and
-    /// the standard trade-off for batched HNSW construction (see hnswlib's
-    /// `addPointsThreadPool`). Recall convergence is unaffected at typical
-    /// batch sizes (≤ 1k); for larger batches, callers may chunk.
-    ///
-    /// Expected throughput: 5-8× over per-item `insert` on multi-core
-    /// hardware (planning dominates ~80% of insert cost).
+    /// Until the graph holds `SEED_DENSITY` nodes the items go in one by one:
+    /// concurrent inserts into a near-empty graph would mostly see each other
+    /// still unlinked and connect poorly. Repeated ids keep their last
+    /// vector, as if inserted in order.
     pub fn insert_batch(&mut self, mut items: Vec<(u64, Vec<f32>)>) {
-        self.screen_dims(&mut items);
-        // Threshold below which rayon overhead exceeds the parallelism win.
-        // Tuned empirically; values from 4-32 perform equivalently on the
-        // current bench host. 16 keeps small admin-style batches sequential.
-        const BATCH_PARALLEL_THRESHOLD: usize = 16;
-
-        // Seed density: until the graph holds this many nodes, batched
-        // planning is unsafe because plans see a sparse / empty graph and
-        // produce under-connected (in the limit: disconnected) nodes.
-        // The seed phase inserts items one-by-one so each plan sees every
-        // prior insert. Beyond this point a few-stale plans are acceptable
-        // per the standard HNSW batch-construction trade-off.
+        use rayon::prelude::*;
         const SEED_DENSITY: usize = 64;
 
-        // Dedupe within the batch — last-write-wins for repeated ids.
-        // Without this, two `(5, vec_a)` and `(5, vec_b)` entries both
-        // pass the `!contains_key(&id)` check (the index has no id=5
-        // yet), both land in `inserts`, and the parallel apply creates
-        // two `nodes[*].id == 5` entries while `id_to_idx[5]` records
-        // only the second — diverging `nodes.len()` from logical
-        // membership. Found by proptest (concurrent_proptest test
-        // suite, 2026-05-22).
-        let mut deduped: std::collections::HashMap<u64, Vec<f32>> =
-            std::collections::HashMap::with_capacity(items.len());
-        for (id, vec) in items {
-            deduped.insert(id, vec);
+        self.screen_dims(&mut items);
+        // Concurrent inserts of one id finish in any order; keeping only the
+        // last occurrence keeps the batch's own order meaningful.
+        let mut last: rustc_hash::FxHashMap<u64, usize> = rustc_hash::FxHashMap::default();
+        for (pos, (id, _)) in items.iter().enumerate() {
+            last.insert(*id, pos);
         }
+        let mut items: Vec<(u64, Vec<f32>)> = items
+            .into_iter()
+            .enumerate()
+            .filter(|(pos, (id, _))| last.get(id) == Some(pos))
+            .map(|(_, item)| item)
+            .collect();
 
-        // Partition into fresh inserts and updates of existing IDs.
-        // Updates can't go through the plan/apply split because
-        // `update_existing_node` rebuilds the node's edges in place.
-        let mut updates = Vec::new();
-        let mut inserts = Vec::new();
-        for (id, vec) in deduped {
-            if self.id_to_idx.contains(id) {
-                updates.push((id, vec));
-            } else {
-                inserts.push((id, vec));
-            }
+        // As many one-by-one inserts as the graph lacks to reach the seed
+        // density; none once it is that dense (hence the clamp at zero).
+        let seed = items.len().min(SEED_DENSITY.saturating_sub(self.len()));
+        let rest = items.split_off(seed);
+        for (id, vector) in items {
+            self.insert_shared(id, &vector);
         }
-
-        // Seed phase: bring graph up to SEED_DENSITY before batching.
-        let mut iter = inserts.into_iter();
-        while self.node_len() < SEED_DENSITY {
-            match iter.next() {
-                Some((id, vec)) => self.insert(id, vec),
-                None => break,
-            }
-        }
-        // Rounds of parallel planning and serial apply. Every plan sees the
-        // graph as it stood before its round, so a round larger than that
-        // graph links most of its items only to what came before: one 5k
-        // batch over the 64-node seed turned the graph into a star around
-        // the seed. A round therefore holds at most as many items as the
-        // graph already has (doubling from the seed), up to the batch size
-        // the staleness trade-off is measured at.
-        const MAX_ROUND: usize = 1024;
-        loop {
-            let round_len = self.node_len().clamp(BATCH_PARALLEL_THRESHOLD, MAX_ROUND);
-            let round: Vec<(u64, Vec<f32>)> = iter.by_ref().take(round_len).collect();
-            if round.is_empty() {
-                break;
-            }
-            let plans: Vec<(InsertPlan, Vec<f32>)> = if round.len() >= BATCH_PARALLEL_THRESHOLD {
-                use rayon::prelude::*;
-                round
-                    .into_par_iter()
-                    .map(|(id, vec)| {
-                        let plan = self.compute_insert_plan(id, &vec);
-                        (plan, vec)
-                    })
-                    .collect()
-            } else {
-                round
-                    .into_iter()
-                    .map(|(id, vec)| {
-                        let plan = self.compute_insert_plan(id, &vec);
-                        (plan, vec)
-                    })
-                    .collect()
-            };
-
-            // The parallel apply path runs a post-batch prune-pass that
-            // backfills any back-edges dropped on capacity, so its resulting
-            // graph holds the batch recall contract (≥ 0.7 vs serial).
-            // Dispatch to it for large rounds; sequential apply for small.
-            if plans.len() >= BATCH_PARALLEL_THRESHOLD {
-                self.apply_insert_plans_parallel(plans);
-            } else {
-                for (plan, vec) in plans {
-                    self.apply_insert_plan(plan, vec);
-                }
-            }
-        }
-
-        for (id, vec) in updates {
-            // Routes to update_existing_node via the insert() shim.
-            self.insert(id, vec);
-        }
+        let this = &*self;
+        rest.par_iter().for_each(|(id, vector)| {
+            this.insert_shared(*id, vector);
+        });
+        self.calibrate_if_due();
     }
 
     /// Bulk-build path for static corpora where every vector is known
@@ -1184,31 +1059,14 @@ impl HnswIndex {
         bulk_build::bulk_build(self, items, true);
     }
 
-    /// Read-only planning phase of an insert. Picks the new node's layer,
-    /// runs the greedy descent + ef-search from the current entry point,
-    /// and records the chosen neighbour set per layer.
-    ///
-    /// Takes `&self` — multiple concurrent callers can plan in parallel
-    /// against the same (immutable) snapshot of the graph. The result is a
-    /// pure-data [`InsertPlan`] that [`apply_insert_plan`] consumes from a
-    /// single writer thread.
-    pub(crate) fn compute_insert_plan(&self, id: u64, vector: &[f32]) -> InsertPlan {
-        let new_level = self.random_level();
-
-        // EntryPoint stays empty until the first insert lands —
-        // `for_search()` returning None is the first-node fast path:
-        // no graph traversal possible, plan records empty neighbour
-        // sets so apply just pushes the seed node. Otherwise the
-        // single-load snapshot gives `(start_idx, top_level)` from
-        // ONE atomic read.
-        let Some((start_idx, top_level)) = self.entry_point.for_search() else {
-            return InsertPlan {
-                id,
-                new_level,
-                per_layer: Vec::new(),
-                is_first_node: true,
-            };
-        };
+    /// Choose the neighbours of a node at `vector` on every layer from
+    /// `new_level` down: the greedy descent and ef-search from the current
+    /// entry point, against the live graph. `None` while the index has no
+    /// entry point, i.e. no node to link to.
+    fn plan_links(&self, vector: &[f32], new_level: usize) -> Option<Vec<LayerPlan>> {
+        // The single-load snapshot gives `(start_idx, top_level)` from ONE
+        // atomic read.
+        let (start_idx, top_level) = self.entry_point.for_search()?;
         let mut current_ep = start_idx;
 
         // Step 1: greedy descent down to new_level + 1.
@@ -1262,66 +1120,47 @@ impl HnswIndex {
             });
         }
 
-        InsertPlan {
-            id,
-            new_level,
-            per_layer,
-            is_first_node: false,
-        }
+        Some(per_layer)
     }
 
-    /// Store the f32 vector of node `idx` in the layer-0 store, allocating
-    /// the store on the first call once `dim` is known and growing it to fit
-    /// `idx`. Neighbour lists are published separately through `layer_set` /
-    /// `layer_cas_append`.
-    ///
-    /// Returns `false`, writing nothing, when the vector's dimension is zero
-    /// or differs from the store's; concurrent first inserts of different
-    /// dimensions race to create the store, and only the winner's fits.
-    ///
-    /// # Safety
-    ///
-    /// The caller is the only writer of node `idx` and writes before the node
-    /// is reachable, or holds the index exclusively.
-    unsafe fn mirror_data_level0_vector(&self, idx: usize, vector: &[f32]) -> bool {
-        let dim = vector.len();
+    /// The node store for vectors of `dim` components, created on the first
+    /// call. `None` when `dim` is zero or differs from the store's:
+    /// concurrent first inserts of different dimensions race to create it,
+    /// and only the winner's fits.
+    fn store_for(&self, dim: usize) -> Option<&data_level0::DataLevel0Block> {
         if dim == 0 {
-            return false;
+            return None;
         }
         let block = self.data_level0.get_or_init(|| {
-            let capacity = (self.config.max_elements as usize).max(idx + 1);
             // Size the lists to the effective per-node layer-0 degree
             // (`config.m_max0`, already capped to `M_MAX0`), not the
             // compile-time `M_MAX0` cap.
-            data_level0::DataLevel0Block::new(capacity, self.config.m_max0, dim)
+            data_level0::DataLevel0Block::new(
+                (self.config.max_elements as usize).max(1),
+                self.config.m_max0,
+                dim,
+            )
         });
-        if block.dim() != dim {
-            return false;
-        }
-        // Grow rather than skip past capacity: this store holds every node's
-        // lists and scalars, including those inserted beyond the initial
-        // `max_elements` estimate, whether or not the vectors were offloaded.
-        block.ensure_capacity(idx + 1);
-        if block.has_f32() {
-            // SAFETY: idx < capacity after `ensure_capacity`, vector.len() ==
-            // block.dim() per the gate above, and the caller's exclusivity
-            // over node idx.
-            unsafe {
-                block.set_vector(idx, vector);
-            }
-        }
-        true
+        (block.dim() == dim).then_some(block)
     }
 
-    /// Whether a vector of `dim` components can go into this index: non-zero
-    /// and equal to the dimension of the first vector, which sized the store.
-    #[inline]
-    fn accepts_dim(&self, dim: usize) -> bool {
-        dim > 0
-            && self
-                .data_level0
-                .get()
-                .is_none_or(|block| block.dim() == dim)
+    /// Store the f32 vector of node `idx` in `block`, growing it to fit
+    /// `idx`: the store holds every node's lists and scalars, including those
+    /// inserted beyond the initial `max_elements` estimate, whether or not the
+    /// vectors were offloaded.
+    ///
+    /// # Safety
+    ///
+    /// `vector.len() == block.dim()`, and the caller is the only writer of
+    /// node `idx` and writes before the node is reachable, or holds the index
+    /// exclusively.
+    unsafe fn place_vector(block: &data_level0::DataLevel0Block, idx: usize, vector: &[f32]) {
+        block.ensure_capacity(idx + 1);
+        if block.has_f32() {
+            // SAFETY: idx < capacity after `ensure_capacity`; the length and
+            // exclusivity are the caller's.
+            unsafe { block.set_vector(idx, vector) };
+        }
     }
 
     /// Drop, with a warning, the batch items whose dimension is zero or
@@ -1539,35 +1378,13 @@ impl HnswIndex {
         self.rabitq_block.get()
     }
 
-    /// Publish the full layer-0 neighbour list of `idx` in the layer-0
-    /// store, replacing the previous list whole. Narrows the u64 graph
-    /// indices to the store's u32 ids (per-shard node count is well below
-    /// `u32::MAX`). No-op when the store is absent or does not cover `idx`.
-    fn mirror_layer0_neighbours_to_data_level0(&self, idx: usize, ids: &[u64]) {
-        let Some(block) = self.data_level0.get() else {
-            return;
-        };
-        if !block.contains(idx) {
-            return;
-        }
-        let n = ids.len().min(block.m_max0());
-        let mut buf = [0u32; M_MAX0];
-        for (slot, &id) in ids.iter().take(n).enumerate() {
-            buf[slot] = id as u32;
-        }
-        // SAFETY: idx < capacity (gate above); n <= m_max0 <= M_MAX0 so the
-        // slice fits the block's neighbour region.
-        unsafe {
-            block.set_neighbours(idx, &buf[..n]);
-        }
-    }
-
-    /// Add node `id` with no links yet: its vector, norms, codes and
-    /// `new_level` empty lists above layer 0, then count it. `None` when the
-    /// vector's dimension is zero or differs from the index's; the index is
-    /// left unchanged.
-    fn allocate_node(&mut self, id: u64, new_level: usize, vector: &[f32]) -> Option<usize> {
-        if !self.accepts_dim(vector.len()) {
+    /// Add node `id` with no links yet, in a slot of its own: its vector,
+    /// norms, codes and `new_level` empty lists above layer 0. The node stays
+    /// [`Reserved`](data_level0::NodeState::Reserved) and unreachable until
+    /// the caller links it. `None` when the vector's dimension is zero or
+    /// differs from the index's; then no slot is taken.
+    fn allocate_node(&self, id: u64, new_level: usize, vector: &[f32]) -> Option<usize> {
+        let Some(block) = self.store_for(vector.len()) else {
             warn!(
                 node_id = id,
                 dim = vector.len(),
@@ -1578,13 +1395,15 @@ impl HnswIndex {
                 "HNSW insert rejected: vector dimension is zero or differs from the index"
             );
             return None;
-        }
-        let idx = self.node_len();
-        // SAFETY: node idx is not counted yet, so nothing reads or links it,
-        // and `&mut self` excludes every other writer.
-        if !unsafe { self.mirror_data_level0_vector(idx, vector) } {
-            return None;
-        }
+        };
+        // The slot is this insert's alone: no link or entry point names it
+        // until the caller links the node.
+        let idx = self
+            .node_count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        // SAFETY: the dimension matches the store per `store_for`, and the
+        // fresh slot is unreachable and written by this insert only.
+        unsafe { Self::place_vector(block, idx, vector) };
 
         // Quantize if SQ8 is calibrated.
         let quantized = self.sq8_params.as_ref().map(|p| p.quantize(vector));
@@ -1611,224 +1430,144 @@ impl HnswIndex {
         }
 
         self.ensure_rabitq_block(idx, vector.len());
-        // SAFETY: `mirror_data_level0_vector` created the store and grew it
-        // to cover idx; node idx is not counted yet, so nothing reads or links
-        // it, and `&mut self` excludes every other writer.
+        // SAFETY: `place_vector` grew the store to cover idx; the slot is
+        // unreachable and written by this insert only.
         unsafe {
             self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
-            let store = self.nodes();
-            store.init_node(idx, id, metrics::norm_l2(vector), new_level);
-            store.set_codes(idx, quantized, rabitq_code);
+            block.init_node(idx, id, metrics::norm_l2(vector), new_level);
+            block.set_codes(idx, quantized, rabitq_code);
         }
-        self.id_to_idx.insert(id, idx);
-        self.node_count
-            .store(idx + 1, core::sync::atomic::Ordering::Release);
         Some(idx)
     }
 
-    pub(crate) fn apply_insert_plan(&mut self, plan: InsertPlan, vector: Vec<f32>) {
-        let InsertPlan {
-            id,
-            new_level,
-            per_layer,
-            is_first_node,
-        } = plan;
-        let Some(idx) = self.allocate_node(id, new_level, &vector) else {
-            return;
-        };
-
-        if is_first_node {
-            self.nodes().set_state(idx, data_level0::NodeState::Live);
-            // First insert seeds the entry-point. try_promote on a
-            // fresh EntryPoint always succeeds — no other writer
-            // has touched it yet, and we're holding &mut self.
-            let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
-            self.maybe_calibrate_and_offload(idx);
-            return;
-        }
-
-        for layer in per_layer {
-            let LayerPlan {
-                level,
-                selected_idxs,
-                max_conn,
-            } = layer;
-
-            // Outgoing: new_node → selected. We store internal indices
-            // (`idx`), not external `NodeId`s, so the search hot path can
-            // skip an `id_to_idx` HashMap lookup per neighbour visit (the
-            // dominant cost per profiler — see commit message).
-            let outgoing: Vec<u64> = selected_idxs.iter().map(|&n| n as u64).collect();
-            self.set_outgoing(idx, level, &outgoing);
-
-            // Bidirectional: selected → new_node (with optional prune).
-            for &neighbor_idx in &selected_idxs {
-                if level < self.node_levels(neighbor_idx) {
-                    self.add_neighbour_to(neighbor_idx, level, idx as u64, max_conn);
-                }
+    /// Insert `id` with `vector`, or move an existing `id` to `vector`,
+    /// through a shared borrow: inserts and searches run concurrently on the
+    /// same index, with no lock over the graph.
+    ///
+    /// The node is built in a slot of its own and becomes reachable only once
+    /// its payload and lists are in place: through its links, then the entry
+    /// point. An update builds the new node the same way and then retires the
+    /// old one, which stays navigable for readers that still reach it but is
+    /// never a result again; a node's vector never changes in place under a
+    /// reader. Inserting the same vector again is a no-op.
+    ///
+    /// Returns whether the codec's calibration threshold is reached with no
+    /// calibration run yet. Calibration rewrites every node's code and takes
+    /// the index exclusively, so the caller runs it with
+    /// [`Self::calibrate_if_due`].
+    pub fn insert_shared(&self, id: u64, vector: &[f32]) -> bool {
+        if let Some(current) = self.id_to_idx.get(id) {
+            if self.read_node_f32(current) == Some(vector) {
+                return false;
             }
         }
+        let new_level = self.random_level();
+        let Some(idx) = self.allocate_node(id, new_level, vector) else {
+            return false;
+        };
+        self.link_node(idx, id, new_level, vector);
         self.nodes().set_state(idx, data_level0::NodeState::Live);
-
-        // Promote the new node to entry-point if it pierced a new top
-        // layer. CAS-loop returns `NotNeeded` when another insert has
-        // already promoted past us (possible from a concurrent batch
-        // arriving at try_promote first); in that case we leave the
-        // existing higher-layer entry-point alone.
+        match self.id_to_idx.insert(id, idx) {
+            Some(old) => self.retire_node(old),
+            None => {
+                self.live_count
+                    .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        // Linked, so it may now head the descent if it reached a new top
+        // layer.
         let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
-
-        // SQ8 calibrate + offload happens after the topology is in place
-        // so search_layer can use f32 for the just-inserted node.
-        self.maybe_calibrate_and_offload(idx);
+        self.calibration_due()
     }
 
-    /// Parallel apply phase: applies many plans through a (serial
-    /// allocation, parallel edge-write) two-step.
-    ///
-    /// Step 1 (serial, `&mut self`):
-    ///   * push each new node into `nodes` + allocate matching atomic
-    ///     neighbour layers in `neighbours_l0` / `neighbours_upper`;
-    ///   * register the id → idx mapping;
-    ///   * promote `entry_point` / `max_level` if a plan's `new_level`
-    ///     pierces a new top.
-    ///
-    /// Step 2 (parallel, `&self` via `rayon::par_iter`):
-    ///   * each thread takes one allocated `(plan, idx)` pair and writes
-    ///     `set_outgoing` for the new node (conflict-free across distinct
-    ///     `idx`) plus `cas_add_neighbour_to` for each chosen back-edge
-    ///     (multi-writer-safe through `AtomicNeighbourList::cas_append`).
-    ///   * if a back-edge target is at capacity, the edge is dropped
-    ///     here; the post-batch prune-pass run by the caller backfills
-    ///     it.
-    ///
-    /// Step 3 (serial): call `maybe_calibrate_and_offload` once for the
-    /// last-allocated node; SQ8 calibration sees the post-batch state.
-    pub(crate) fn apply_insert_plans_parallel(&mut self, plans: Vec<(InsertPlan, Vec<f32>)>) {
-        if plans.is_empty() {
-            return;
-        }
-
-        // Step 1 — serial allocation phase.
-        let mut allocated: Vec<(InsertPlan, usize)> = Vec::with_capacity(plans.len());
-        for (plan, vec) in plans {
-            let new_level = plan.new_level;
-            let Some(idx) = self.allocate_node(plan.id, new_level, &vec) else {
-                continue;
-            };
-
-            // Entry-point promotion through the lock-free CAS-loop.
-            // The first insert (`nodes.len() == 1`) hits an empty
-            // EntryPoint and unconditionally installs; every later
-            // plan only wins when its `new_level` strictly exceeds the
-            // current top. Either way the post-condition holds the
-            // layer-promotion linearisability invariant:
-            // entry-point sits at the global max layer after the call
-            // returns. Still runs serially within this batch's
-            // allocation phase so the parallel writers below observe
-            // a consistent entry-point, but the primitive is now
-            // safe under cross-batch / cross-thread races too.
-            let _ = self.entry_point.try_promote(new_level as u8, idx as u64);
-
-            allocated.push((plan, idx));
-        }
-
-        // Step 2 — parallel edge writes. Failed back-edge appends are
-        // collected into a Mutex<Vec> so the day-4 prune-pass can backfill
-        // them serially under &mut self. The mutex is only contended on
-        // overflow (rare under typical workloads), so the parallel write
-        // path is still effectively wait-free in the hot case.
-        use rayon::prelude::*;
-        let backfill: std::sync::Mutex<Vec<(usize, usize, u64, usize)>> =
-            std::sync::Mutex::new(Vec::new());
-        allocated.par_iter().for_each(|(plan, idx)| {
-            if plan.is_first_node {
+    /// Link the freshly allocated node `idx` into the graph: plan against
+    /// the live graph, publish its own lists, then the back-edges that make it
+    /// reachable. The first node has no one to link to and seeds the entry
+    /// point instead; losing that race to another first node means linking to
+    /// it.
+    fn link_node(&self, idx: usize, id: u64, new_level: usize, vector: &[f32]) {
+        let per_layer = loop {
+            if let Some(plan) = self.plan_links(vector, new_level) {
+                break plan;
+            }
+            if self.entry_point.try_seed(new_level as u8, idx as u64) {
                 return;
             }
-            for layer in &plan.per_layer {
-                // Store internal indices in neighbour lists — search hot
-                // path reads them directly without an id→idx HashMap hop.
-                let outgoing: Vec<u64> = layer.selected_idxs.iter().map(|&n| n as u64).collect();
-                self.set_outgoing(*idx, layer.level, &outgoing);
-
-                for &neighbour_idx in &layer.selected_idxs {
-                    if layer.level < self.node_levels(neighbour_idx)
-                        && !self.cas_add_neighbour_to(neighbour_idx, layer.level, *idx as u64)
-                    {
-                        // cas_append returned false (list at capacity).
-                        // Record (neighbour_idx, level, idx_to_add, max_conn)
-                        // for the serial prune-pass below.
-                        backfill.lock().unwrap_or_else(|e| e.into_inner()).push((
-                            neighbour_idx,
-                            layer.level,
-                            *idx as u64,
-                            layer.max_conn,
-                        ));
-                    }
+        };
+        let store = self.nodes();
+        let per_layer: Vec<(usize, Vec<u64>, usize)> = per_layer
+            .into_iter()
+            .map(
+                |LayerPlan {
+                     level,
+                     selected_idxs,
+                     max_conn,
+                 }| {
+                    // An older node of the same id is about to be retired, and a
+                    // retired node is never a result: neither is worth a slot.
+                    let selected = selected_idxs
+                        .into_iter()
+                        .filter(|&n| {
+                            n != idx
+                                && store.state(n) != data_level0::NodeState::Retired
+                                && self.node_id(n) != id
+                        })
+                        .map(|n| n as u64)
+                        .collect();
+                    (level, selected, max_conn)
+                },
+            )
+            .collect();
+        // Every own list goes in before the first back-edge makes the node
+        // reachable: a search that reaches it on one layer descends through
+        // it, and an empty list below would leave that search nowhere to go.
+        for (level, selected, _) in &per_layer {
+            self.layer_update(idx, *level, |_| Some(selected.clone()));
+        }
+        for (level, selected, max_conn) in &per_layer {
+            for &n in selected {
+                let n = n as usize;
+                if *level < self.node_levels(n) {
+                    self.add_neighbour_to(n, *level, idx as u64, *max_conn);
                 }
             }
-        });
+        }
+    }
 
-        // Step 3 — parallel prune-pass with dedupe.
-        //
-        // Hub-vertex amplification: when many new nodes pick the same
-        // hot neighbour, the lossy parallel phase fills the
-        // per-neighbour backfill bucket K times. We group by
-        // (neighbour_idx, level) so each unique list pays prune cost
-        // once and then cas_appends all K queued ids in one batch:
-        //
-        //   O(K × prune) → O(prune + K) per hot list.
-        //
-        // Then the groups themselves are disjoint per neighbour_idx, so
-        // we run prune-pass via rayon par_iter — each thread touches a
-        // distinct neighbour list at (X, Y), no contention. This lifts
-        // the serial floor that would otherwise cap parallel speedup
-        // under Amdahl's law when hot vertices saturate.
-        let mut backfill = backfill.into_inner().unwrap_or_else(|e| e.into_inner());
-        backfill.sort_unstable_by_key(|&(nb, lvl, _, _)| (nb, lvl));
-
-        // Materialise the groups as `(neighbour_idx, level, max_conn,
-        // start..end)` so par_iter can dispatch each independently. We
-        // slice into the shared `backfill` vec below — no per-group
-        // allocation of ids.
-        let mut groups: Vec<(usize, usize, usize, std::ops::Range<usize>)> = Vec::new();
-        let mut i = 0;
-        while i < backfill.len() {
-            let (neighbour_idx, level, _, max_conn) = backfill[i];
-            let mut j = i + 1;
-            while j < backfill.len() && backfill[j].0 == neighbour_idx && backfill[j].1 == level {
-                j += 1;
+    /// Retire node `old`, replaced by a newer node of the same id: it stops
+    /// being a result, and its neighbours drop their edges to it. Edges that
+    /// other nodes keep to it still lead somewhere valid: the slot and its
+    /// lists stay in place for readers that reach it.
+    fn retire_node(&self, old: usize) {
+        self.nodes().set_state(old, data_level0::NodeState::Retired);
+        let n = self.node_len();
+        for level in 0..self.node_levels(old) {
+            for nb in self.layer_snapshot(old, level) {
+                let nb = nb as usize;
+                if nb < n && level < self.node_levels(nb) {
+                    self.remove_neighbour_from(nb, level, old as u64);
+                }
             }
-            groups.push((neighbour_idx, level, max_conn, i..j));
-            i = j;
         }
+    }
 
-        let backfill_ref = &backfill;
-        groups
-            .par_iter()
-            .for_each(|(neighbour_idx, level, max_conn, range)| {
-                // Collect the backfilled candidate ids for this
-                // (neighbour_idx, level) group and let the prune pass
-                // choose top-max_conn across the union of current
-                // neighbours and these queued candidates. The earlier
-                // "prune then cas_append" sequence dropped every backfill
-                // candidate because prune truncated *at* max_conn, leaving
-                // no room for the subsequent appends — the new closer
-                // candidates were silently discarded even when they
-                // should have replaced farther incumbents.
-                let extras: Vec<u64> = backfill_ref[range.clone()].iter().map(|e| e.2).collect();
-                self.prune_connections_with_extras(*neighbour_idx, *level, *max_conn, &extras);
-            });
+    /// Whether the configured codec has reached its calibration threshold
+    /// and has not been calibrated.
+    fn calibration_due(&self) -> bool {
+        let reached = self.len() >= self.config.calibration_threshold;
+        reached
+            && match self.config.quantization {
+                QuantizationCodec::Sq8 => self.sq8_params.is_none(),
+                QuantizationCodec::RaBitQ { .. } => self.rabitq_params.is_none(),
+                _ => false,
+            }
+    }
 
-        // Every allocated node is linked now.
-        for (_, idx) in &allocated {
-            self.nodes().set_state(*idx, data_level0::NodeState::Live);
-        }
-
-        // Step 4 — serial post-phase. SQ8 calibration sees the final
-        // population. We call once with the last allocated idx; the
-        // calibration path itself looks at `self.nodes` as a whole.
-        if let Some((_, last_idx)) = allocated.last() {
-            self.maybe_calibrate_and_offload(*last_idx);
+    /// Run the calibration [`Self::insert_shared`] reported as due, and the
+    /// offload that follows it. A no-op when none is due.
+    pub fn calibrate_if_due(&mut self) {
+        if self.calibration_due() {
+            self.maybe_calibrate_and_offload(0);
         }
     }
 
@@ -1836,7 +1575,7 @@ impl HnswIndex {
     /// node's f32 if offloading is active. Called at the end of `insert()`.
     fn maybe_calibrate_and_offload(&mut self, _just_inserted_idx: usize) {
         // Step 1: Auto-calibrate the configured codec when threshold reached.
-        let threshold_reached = self.node_len() >= self.config.calibration_threshold;
+        let threshold_reached = self.len() >= self.config.calibration_threshold;
         match self.config.quantization {
             QuantizationCodec::Sq8 if self.sq8_params.is_none() && threshold_reached => {
                 self.auto_calibrate();
@@ -1899,7 +1638,7 @@ impl HnswIndex {
         }
 
         // Search at layer 0 with ef candidates
-        let candidates = self.search_layer_query(query, current_ep, ef, 0);
+        let candidates = self.results_only(self.search_layer_query(query, current_ep, ef, 0));
 
         if self.is_quantized() {
             // Rerank candidates using exact f32 distance
@@ -2073,7 +1812,8 @@ impl HnswIndex {
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
 
-            let candidates = self.search_layer_ctx(&qctx, current_ep, current_ef, 0);
+            let candidates =
+                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0));
 
             // Convert to SearchResult with exact distances (rerank if quantized)
             let results: Vec<SearchResult> = if self.is_quantized() {
@@ -2164,7 +1904,7 @@ impl HnswIndex {
             .ef_search
             .max(self.config.rerank_candidates)
             .max(k);
-        let candidates = self.search_layer_ctx(&qctx, current_ep, ef, 0);
+        let candidates = self.results_only(self.search_layer_ctx(&qctx, current_ep, ef, 0));
 
         // Batch-load f32 vectors from storage for reranking
         let candidate_ids: Vec<u64> = candidates
@@ -2258,7 +1998,8 @@ impl HnswIndex {
 
         for round in 0..=max_expansion_rounds {
             stats.expansion_rounds = round;
-            let candidates = self.search_layer_ctx(&qctx, current_ep, current_ef, 0);
+            let candidates =
+                self.results_only(self.search_layer_ctx(&qctx, current_ep, current_ef, 0));
 
             // Batch-load f32 for reranking
             let candidate_ids: Vec<u64> = candidates
@@ -2322,155 +2063,6 @@ impl HnswIndex {
         (-uniform.ln() * self.level_mult).floor() as usize
     }
 
-    /// Update an already-indexed node's vector and rebuild its graph connections.
-    ///
-    /// Called by `insert()` when the node ID already exists, so a SET moves
-    /// the node to its new position rather than leaving it at the old one.
-    ///
-    /// Algorithm:
-    /// 1. Remove this node from all neighbors' connection lists.
-    /// 2. Clear this node's outgoing connections (preserving layer slots).
-    /// 3. Replace the stored vector (and update quantized representation).
-    /// 4. Re-run the HNSW insertion neighbourhood search from a valid entry point.
-    /// 5. Re-connect bidirectionally at each layer.
-    fn update_existing_node(&mut self, idx: usize, vector: Vec<f32>) {
-        let id = self.node_id(idx);
-        let n_levels = self.node_levels(idx);
-
-        // Step 1: Remove this node from every neighbour's connection list.
-        // Snapshot first to avoid simultaneous mutable + immutable borrows.
-        for level in 0..n_levels {
-            let neighbours = self.layer_snapshot(idx, level);
-            for neighbour_idx_u64 in neighbours {
-                let neighbour_idx = neighbour_idx_u64 as usize;
-                if neighbour_idx < self.node_len() && level < self.node_levels(neighbour_idx) {
-                    self.remove_neighbour_from(neighbour_idx, level, idx as u64);
-                }
-            }
-        }
-
-        // Step 2: Clear this node's outgoing connections (keep layer slot count).
-        for level in 0..n_levels {
-            self.clear_outgoing(idx, level);
-        }
-
-        // Step 3: Update vector and quantized representation.
-        let quantized = self.sq8_params.as_ref().map(|p| p.quantize(&vector));
-        let rabitq_code = self
-            .rabitq_params
-            .as_ref()
-            .and_then(|p| self.encode_rabitq(p, &vector));
-
-        // Overwrite f32 truth tier on existing-node update so the
-        // tier reflects the latest write.
-        if let Some(tier) = self.vector_tier.as_ref() {
-            if let Err(e) = tier.put_f32(id, &vector) {
-                warn!(node_id = id, error = %e, "vector_tier put_f32 on update failed");
-            }
-        }
-
-        // Refresh the stores so a subsequent search reads the updated vector,
-        // norms and codes, not the original insert's.
-        self.ensure_rabitq_block(idx, vector.len());
-        // SAFETY: idx is an existing node; `&mut self` excludes every other
-        // reader and writer while its vector, norms and codes change together.
-        // The dimension was checked on entry to `insert`.
-        unsafe {
-            self.mirror_data_level0_vector(idx, &vector);
-            self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
-            let store = self.nodes();
-            store.set_norm(idx, metrics::norm_l2(&vector));
-            store.set_codes(idx, quantized, rabitq_code);
-        }
-
-        // Step 4: Re-insert into the graph from a valid entry point.
-        // A single-node index has no connections to rebuild.
-        if self.node_len() == 1 {
-            return;
-        }
-
-        // Choose entry point: if the current entry_point IS this node, use any
-        // other node (the graph is connected, so any peer suffices).
-        // Single load: top_level and ep idx come from one snapshot.
-        let (ep_idx, top_level) = match self.entry_point.for_search() {
-            Some((ep, lvl)) if ep == idx => {
-                // Self is the entry-point — pick any peer.
-                let peer = self.id_to_idx.any_other(idx).unwrap_or(0);
-                (peer, lvl)
-            }
-            Some((ep, lvl)) => (ep, lvl),
-            // Empty index — preserved by the prior `nodes[idx]` access
-            // which would have panicked already if the graph was empty.
-            // Defensive fallback so the function is total.
-            None => (0, 0),
-        };
-
-        let node_level = n_levels - 1;
-        let mut current_ep = ep_idx;
-
-        // Step 4a: Greedy descent from top layer down to node_level+1.
-        for level in (node_level + 1..=top_level).rev() {
-            current_ep = self.search_layer_greedy(idx, current_ep, level);
-        }
-
-        // Step 4b: Reconnect at layers node_level down to 0.
-        for level in (0..=node_level.min(top_level)).rev() {
-            let ef = self.config.ef_construction;
-            let neighbours = self.search_layer(idx, current_ep, ef, level);
-
-            let max_conn = if level == 0 {
-                self.config.m_max0
-            } else {
-                self.config.m
-            };
-
-            // The node is still reachable through edges other nodes keep to
-            // it, so the search finds it first, at distance zero. Taken as its
-            // own neighbour it would become a self-loop and the entry point
-            // of the next layer down, where its edges are already cleared:
-            // the descent would find nothing else and leave it unreachable.
-            let selected: Vec<usize> = neighbours
-                .into_iter()
-                .map(|c| c.idx as usize)
-                .filter(|&n| n != idx)
-                .take(max_conn)
-                .collect();
-
-            // Connect this node to its new neighbours. Store internal
-            // indices (idx, not NodeId) so the search hot path skips the
-            // id_to_idx HashMap hop.
-            let outgoing: Vec<u64> = selected.iter().map(|&n| n as u64).collect();
-            self.set_outgoing(idx, level, &outgoing);
-
-            // Connect neighbours back (bi-directional).
-            for &neighbour_idx in &selected {
-                if level < self.node_levels(neighbour_idx) {
-                    self.add_neighbour_to(neighbour_idx, level, idx as u64, max_conn);
-                }
-            }
-
-            if !selected.is_empty() {
-                current_ep = selected[0];
-            }
-        }
-
-        // Offload (when active) freed the f32 from the contiguous blocks at
-        // calibration; the per-insert mirror is gated, so a re-inserted node in
-        // an offloaded index keeps no in-RAM f32 (rerank loads from disk).
-    }
-
-    /// Greedy search on a single layer (for traversal from top layers).
-    /// The node at `query_idx` must have an f32 vector (only used during insert
-    /// where the new node always has f32 available). Falls back to dequantized
-    /// SQ8 if f32 was unexpectedly dropped.
-    fn search_layer_greedy(&self, query_idx: usize, ep: usize, level: usize) -> usize {
-        let query_vec = self.get_node_f32_or_dequantized(query_idx);
-        // Build-path wrapper: callers are existing-node insert/reconnect
-        // loops, never search. Force f32 to keep graph quality consistent
-        // with the rest of construction (see `QueryCtx::new_for_build`).
-        self.search_layer_greedy_query_for_build(&query_vec, ep, level)
-    }
-
     fn search_layer_greedy_query(&self, query: &[f32], ep: usize, level: usize) -> usize {
         let ctx = QueryCtx::new(
             query,
@@ -2530,15 +2122,6 @@ impl HnswIndex {
         }
 
         current
-    }
-
-    /// Search layer with ef candidates (returns sorted by distance).
-    /// The node at `query_idx` must have an f32 vector (only used during insert).
-    /// Falls back to dequantized SQ8 if f32 was unexpectedly dropped.
-    fn search_layer(&self, query_idx: usize, ep: usize, ef: usize, level: usize) -> Vec<Candidate> {
-        let query_vec = self.get_node_f32_or_dequantized(query_idx);
-        // Build-path wrapper — see `search_layer_greedy` for rationale.
-        self.search_layer_query_for_build(&query_vec, ep, ef, level)
     }
 
     fn search_layer_query(
@@ -3291,6 +2874,15 @@ impl HnswIndex {
         self.data_level0.get_mut()
     }
 
+    /// `candidates` without the retired nodes: a node replaced by a newer
+    /// one of the same id still guides the descent but is never a result.
+    fn results_only(&self, mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+        if let Some(store) = self.data_level0.get() {
+            candidates.retain(|c| store.state(c.idx as usize) != data_level0::NodeState::Retired);
+        }
+        candidates
+    }
+
     /// External id of node `idx`.
     #[inline]
     fn node_id(&self, idx: usize) -> u64 {
@@ -3364,17 +2956,6 @@ impl HnswIndex {
         }
     }
 
-    /// Bulk-replace the neighbour set at `(idx, level)`. Layer 0 narrows the
-    /// ids to the compact layer-0 list.
-    fn layer_set(&self, idx: usize, level: usize, ids: &[u64]) {
-        if level == 0 {
-            self.mirror_layer0_neighbours_to_data_level0(idx, ids);
-        } else {
-            let n = ids.len().min(M_MAX0);
-            self.neighbours_at(idx, level).set(&ids[..n]);
-        }
-    }
-
     /// Publish `edit` of the neighbour list at `(idx, level)` under
     /// concurrent writers. `edit` receives the current ids and returns the
     /// complete new list, or `None` to keep it; when another writer replaced
@@ -3424,28 +3005,6 @@ impl HnswIndex {
         unsafe { self.nodes().levels(idx) }
     }
 
-    /// Replace the entire neighbour set at `(idx, level)` with `ids`, without
-    /// looking at the current list. Only for a list no other writer can
-    /// reach (a node being inserted) or under `&mut self`; a list shared
-    /// with concurrent writers is edited through [`Self::layer_update`].
-    /// Truncates to `M_MAX0` on overflow (logged at construction time).
-    fn set_outgoing(&self, idx: usize, level: usize, ids: &[u64]) {
-        let n = ids.len().min(M_MAX0);
-        self.layer_set(idx, level, &ids[..n]);
-    }
-
-    /// Multi-writer append-edge primitive. Tries to append `id` to
-    /// `(neighbour_idx, level)` via [`AtomicNeighbourList::cas_append`].
-    /// Returns `true` on success, `false` if the neighbour list is at
-    /// capacity (`m_max0`/`m`) and the caller must fall back to a single-
-    /// writer prune protocol.
-    ///
-    /// Used by the parallel apply path; the serial apply uses
-    /// [`add_neighbour_to`].
-    fn cas_add_neighbour_to(&self, neighbour_idx: usize, level: usize, id: u64) -> bool {
-        self.layer_cas_append(neighbour_idx, level, id)
-    }
-
     /// Append `id` to `(neighbour_idx, level)`. If the resulting list
     /// exceeds `max_conn`, run `prune_connections` to shrink back to the
     /// nearest `max_conn` neighbours. Every step publishes by CAS, so it is
@@ -3469,9 +3028,9 @@ impl HnswIndex {
             //
             // Fix: do the prune in-memory with the new id included, so it
             // competes fairly against existing neighbours. The kept set
-            // has ≤ `max_conn` elements (`≤ M_MAX0`) so `set_outgoing` is
-            // guaranteed to fit without truncation. Recomputed against the
-            // winning list if another writer replaced it meanwhile.
+            // has ≤ `max_conn` elements (`≤ M_MAX0`) so the published list
+            // fits without truncation. Recomputed against the winning list
+            // if another writer replaced it meanwhile.
             self.layer_update(neighbour_idx, level, |current| {
                 if current.contains(&id) {
                     return None;
@@ -3500,11 +3059,6 @@ impl HnswIndex {
                 .contains(&id)
                 .then(|| current.iter().copied().filter(|&nid| nid != id).collect())
         });
-    }
-
-    /// Clear the entire neighbour set at `(idx, level)`.
-    fn clear_outgoing(&mut self, idx: usize, level: usize) {
-        self.layer_set(idx, level, &[]);
     }
 
     /// Compute distance between two nodes in the graph.
@@ -3615,21 +3169,6 @@ impl HnswIndex {
             return self.distance_for_metric(&ctx, &vb);
         }
         f32::INFINITY
-    }
-
-    /// Get a node's vector for query purposes: f32 if available, else dequantized SQ8.
-    /// Used by search_layer_greedy/search_layer during insert when the node
-    /// should have f32 but may not if auto_calibrate offloaded early.
-    fn get_node_f32_or_dequantized(&self, idx: usize) -> Vec<f32> {
-        if let Some(v) = self.read_node_f32(idx) {
-            return v.to_vec();
-        }
-        if let Some(ref params) = self.sq8_params {
-            if let Some(q) = self.node_sq8(idx) {
-                return params.dequantize(q);
-            }
-        }
-        Vec::new()
     }
 
     /// Get a node's vector: f32 if available, otherwise dequantize from SQ8.

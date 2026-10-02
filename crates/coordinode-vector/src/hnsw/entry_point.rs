@@ -122,6 +122,22 @@ impl EntryPoint {
             .map(|(level, idx)| (idx as usize, level as usize))
     }
 
+    /// Make `(level, idx)` the entry point only if there is none yet.
+    /// Returns whether it was installed. The first node of an index has no
+    /// one to link to, so it becomes reachable by seeding the entry point;
+    /// any later node must be linked first and then go through
+    /// [`try_promote`](Self::try_promote).
+    pub fn try_seed(&self, level: u8, idx: u64) -> bool {
+        self.inner
+            .compare_exchange(
+                SENTINEL,
+                pack(level, idx),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
     /// Outcome of [`try_promote`] — communicates whether the caller's
     /// insert actually owns the entry-point now, or another insert
     /// already had a higher (or equal) level.
