@@ -773,7 +773,7 @@ fn sq8_new_inserts_after_calibration_are_quantized() {
 
     // Insert after calibration
     index.insert(100, vec![2.5, 0.5]);
-    let idx = *index.id_to_idx.get(&100).expect("inserted");
+    let idx = index.id_to_idx.get(100).expect("inserted");
     assert!(index.node_sq8(idx).is_some());
 }
 
@@ -1914,7 +1914,7 @@ fn atomic_neighbours_track_inserts_and_updates() {
             );
             for nid in &scratch {
                 assert!(
-                    idx.id_to_idx.contains_key(nid),
+                    (*nid as usize) < idx.node_len(),
                     "dangling neighbour {nid} at node {node_idx} level {level}",
                 );
             }

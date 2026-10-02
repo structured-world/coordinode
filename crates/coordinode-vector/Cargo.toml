@@ -11,7 +11,9 @@ publish.workspace = true
 coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 crossbeam-epoch = { workspace = true }
+parking_lot = { workspace = true }
 rayon = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 smallvec = { version = "1.16", features = ["serde", "union"] }
 thiserror = { workspace = true }

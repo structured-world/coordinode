@@ -30,6 +30,7 @@
 mod bulk_build;
 mod data_level0;
 mod entry_point;
+mod id_map;
 mod neighbours;
 mod rabitq_block;
 mod reorder;
@@ -358,7 +359,7 @@ pub struct HnswIndex {
     /// fixed at calibration time and never mixed within one index.
     node_count: core::sync::atomic::AtomicUsize,
     /// Map from node ID to its index in the node store.
-    id_to_idx: std::collections::HashMap<u64, usize>,
+    id_to_idx: id_map::IdMap,
     /// Lock-free entry point: packed `(level, idx)` in a single
     /// `AtomicU64` with `u64::MAX` as the "empty index" sentinel.
     /// Multiple inserts that land on novel max-layers race through
@@ -682,7 +683,7 @@ impl HnswIndex {
         // cost on the hot path. `max_elements` is advisory — exceeding it
         // is supported, the first overflow simply triggers Vec growth.
         let capacity = config.max_elements as usize;
-        let id_to_idx = std::collections::HashMap::with_capacity(capacity);
+        let id_to_idx = id_map::IdMap::with_capacity(capacity);
         Self {
             config,
             node_count: core::sync::atomic::AtomicUsize::new(0),
@@ -961,7 +962,7 @@ impl HnswIndex {
 
     /// Whether a vector for `id` is in the graph.
     pub fn contains(&self, id: u64) -> bool {
-        self.id_to_idx.contains_key(&id)
+        self.id_to_idx.contains(id)
     }
 
     /// Whether the index is empty.
@@ -992,7 +993,7 @@ impl HnswIndex {
             );
             return;
         }
-        if let Some(&idx) = self.id_to_idx.get(&id) {
+        if let Some(idx) = self.id_to_idx.get(id) {
             // The same vector again (a write maintained by more than one
             // path, or re-delivered): the node already sits where it
             // belongs, and reconnecting it only puts its edges at risk.
@@ -1061,7 +1062,7 @@ impl HnswIndex {
         let mut updates = Vec::new();
         let mut inserts = Vec::new();
         for (id, vec) in deduped {
-            if self.id_to_idx.contains_key(&id) {
+            if self.id_to_idx.contains(id) {
                 updates.push((id, vec));
             } else {
                 inserts.push((id, vec));
@@ -1426,7 +1427,7 @@ impl HnswIndex {
     /// Test accessor: resolve a node id to its current idx via the id→idx map.
     #[cfg(test)]
     fn idx_for_id_for_test(&self, id: u64) -> Option<usize> {
-        self.id_to_idx.get(&id).copied()
+        self.id_to_idx.get(id)
     }
 
     /// Copy the RaBitQ code (packed bytes) and scalar header of node `idx`
@@ -2381,12 +2382,7 @@ impl HnswIndex {
         let (ep_idx, top_level) = match self.entry_point.for_search() {
             Some((ep, lvl)) if ep == idx => {
                 // Self is the entry-point — pick any peer.
-                let peer = self
-                    .id_to_idx
-                    .values()
-                    .find(|&&i| i != idx)
-                    .copied()
-                    .unwrap_or(0);
+                let peer = self.id_to_idx.any_other(idx).unwrap_or(0);
                 (peer, lvl)
             }
             Some((ep, lvl)) => (ep, lvl),
