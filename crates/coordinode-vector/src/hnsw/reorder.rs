@@ -43,7 +43,7 @@ impl HnswIndex {
         let start = self
             .entry_point
             .for_search()
-            .map(|(_, idx)| idx)
+            .map(|(idx, _top_level)| idx)
             .unwrap_or(0);
         if start < n {
             new_of_old[start] = next_new;

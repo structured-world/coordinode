@@ -2509,6 +2509,42 @@ fn scattered_vector(i: u64, dim: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Updating the entry point keeps the index reachable: with a single node,
+/// the update's only link candidate is the node it replaces, so the
+/// replacement must take over the entry point or nothing leads to it.
+#[test]
+fn updating_the_entry_point_keeps_the_node_reachable() {
+    let mut index = HnswIndex::new(make_config(VectorMetric::L2));
+    index.insert(1, vec![0.0, 0.0]);
+    index.insert(1, vec![5.0, 5.0]);
+    let hits = index.search(&[5.0, 5.0], 1);
+    assert_eq!(hits.len(), 1, "the updated node is unreachable");
+    assert_eq!(hits[0].id, 1);
+    assert!(hits[0].score.abs() < 1e-6);
+    // With more nodes, updating whichever node is the entry point hands the
+    // entry point to the replacement, and every id stays findable.
+    for i in 2..30u64 {
+        index.insert(i, vec![i as f32, 1.0]);
+    }
+    let ep = index.entry_point_idx_for_test().expect("non-empty");
+    let ep_id = index.node_id(ep);
+    let moved = [ep_id as f32 + 0.25, 1.0];
+    index.insert(ep_id, moved.to_vec());
+    let replacement = index.idx_for_id_for_test(ep_id).expect("present");
+    assert_eq!(index.entry_point_idx_for_test(), Some(replacement));
+    assert_eq!(index.search(&moved, 1)[0].id, ep_id);
+    for i in 1..30u64 {
+        let at = if i == ep_id {
+            moved.to_vec()
+        } else if i == 1 {
+            vec![5.0, 5.0]
+        } else {
+            vec![i as f32, 1.0]
+        };
+        assert_eq!(index.search(&at, 1)[0].id, i, "id {i} lost");
+    }
+}
+
 /// An update through a shared borrow moves the id to its new vector: the
 /// old node is never a result again, and the id is counted once.
 #[test]

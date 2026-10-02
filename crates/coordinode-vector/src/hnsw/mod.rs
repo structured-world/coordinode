@@ -1252,7 +1252,8 @@ impl HnswIndex {
     /// lock-free state the reorder tests need to assert BFS rooting.
     #[cfg(test)]
     fn entry_point_idx_for_test(&self) -> Option<usize> {
-        self.entry_point.for_search().map(|(_, idx)| idx)
+        // `for_search` yields `(idx, top_level)`.
+        self.entry_point.for_search().map(|(idx, _)| idx)
     }
 
     /// Test accessor: snapshot of node `idx`'s layer-0 neighbour idxs.
@@ -1468,7 +1469,13 @@ impl HnswIndex {
         self.link_node(idx, id, new_level, vector);
         self.nodes().set_state(idx, data_level0::NodeState::Live);
         match self.id_to_idx.insert(id, idx) {
-            Some(old) => self.retire_node(old),
+            Some(old) => {
+                self.retire_node(old);
+                // The descent must not start from a node that is never a
+                // result: with a single node it is the only way in.
+                self.entry_point
+                    .try_replace(old as u64, new_level as u8, idx as u64);
+            }
             None => {
                 self.live_count
                     .fetch_add(1, core::sync::atomic::Ordering::AcqRel);

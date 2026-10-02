@@ -138,6 +138,28 @@ impl EntryPoint {
             .is_ok()
     }
 
+    /// Hand the entry point from node `old` to `(level, new)` if it still
+    /// names `old`, whatever the levels. Used when `old` is retired by an
+    /// update and `new` replaces it: a retired node is never a result, so the
+    /// descent must start from a node that can be one. Returns whether the
+    /// entry point moved.
+    pub fn try_replace(&self, old: u64, level: u8, new: u64) -> bool {
+        let new_word = pack(level, new);
+        loop {
+            let cur = self.inner.load(Ordering::SeqCst);
+            if cur == SENTINEL || unpack(cur).1 != old {
+                return false;
+            }
+            if self
+                .inner
+                .compare_exchange(cur, new_word, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     /// Outcome of [`try_promote`] — communicates whether the caller's
     /// insert actually owns the entry-point now, or another insert
     /// already had a higher (or equal) level.
