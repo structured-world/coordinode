@@ -4838,6 +4838,31 @@ struct TargetRowParams<'a> {
     edge_is_temporal: bool,
 }
 
+/// Every version of temporal node `target_id`, with its `valid_from`, read
+/// from the per-version keys; empty when the node has none.
+fn target_versions(
+    ctx: &mut ExecutionContext<'_>,
+    target_id: NodeId,
+) -> Result<Vec<(NodeRecord, Option<i64>)>, ExecutionError> {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let prefix = LocalNodeStore.version_prefix(ctx.shard_id, target_id);
+    ctx.sync_txn_state();
+    let scanned = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
+    let mut out: Vec<(NodeRecord, Option<i64>)> = Vec::with_capacity(scanned.len());
+    for (key, bytes) in scanned {
+        let Some((_, _, vf)) = coordinode_core::graph::node::decode_temporal_node_key(&key) else {
+            continue;
+        };
+        let rec = NodeRecord::from_msgpack(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!(
+                "target temporal node deserialization error: {e}"
+            ))
+        })?;
+        out.push((rec, Some(vf)));
+    }
+    Ok(out)
+}
+
 /// Fetch a target node and build output rows. Returns `Vec` because temporal
 /// edges fan out across versions: a single neighbor pair contributes one row
 /// per stored `valid_from`. Non-temporal edges still emit 0 or 1 rows.
@@ -4870,37 +4895,20 @@ fn build_target_rows(
     // Collect (record, optional valid_from) pairs to emit. Non-temporal
     // path produces one pair; temporal path produces one per version.
     let target_records: Vec<(NodeRecord, Option<i64>)> = if target_is_temporal {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        let prefix = LocalNodeStore.version_prefix(ctx.shard_id, target_id);
-        ctx.sync_txn_state();
-        let scanned = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
-        if scanned.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut out: Vec<(NodeRecord, Option<i64>)> = Vec::with_capacity(scanned.len());
-        for (key, bytes) in scanned {
-            let Some((_, _, vf)) = coordinode_core::graph::node::decode_temporal_node_key(&key)
-            else {
-                continue;
-            };
-            let rec = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-                ExecutionError::Serialization(format!(
-                    "target temporal node deserialization error: {e}"
-                ))
-            })?;
-            out.push((rec, Some(vf)));
-        }
-        if out.is_empty() {
-            return Ok(Vec::new());
-        }
-        out
+        target_versions(ctx, target_id)?
     } else {
-        let target_record = match ctx.mvcc_get_node(ctx.shard_id, target_id)? {
-            Some(rec) => rec,
-            None => return Ok(Vec::new()),
-        };
-        vec![(target_record, None)]
+        match ctx.mvcc_get_node(ctx.shard_id, target_id)? {
+            Some(rec) => vec![(rec, None)],
+            // No plain row: the target may be a temporal node the pattern
+            // does not name by label, which lives under per-version keys
+            // only. It is read the same way a labelled one is; a dangling
+            // edge finds no version either.
+            None => target_versions(ctx, target_id)?,
+        }
     };
+    if target_records.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // For each version (or the single non-temporal record), build a
     // base out_row carrying the target's properties + version axes,
