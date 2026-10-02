@@ -1473,15 +1473,27 @@ impl HnswIndex {
     /// hnswlib's super-linear MT4 scaling on sift-128 f32.
     #[inline]
     fn read_layer0_neighbours_into(&self, idx: usize, out: &mut Vec<u64>) {
-        // Primary: the contiguous `data_level0` block holds the neighbour ids
-        // (u32) in the SAME per-node block as the f32 vector, so a search visit
-        // reads both from one cache-resident block (hnswlib one-block-per-
-        // visit). Reads straight into `out`, widening u32 -> u64.
+        let guard = crossbeam_epoch::pin();
+        self.read_layer0_neighbours_with(idx, out, &guard);
+    }
+
+    /// [`Self::read_layer0_neighbours_into`] under the caller's epoch pin:
+    /// the search hot path pins once per layer pass and reads every visited
+    /// list under that one guard.
+    #[inline]
+    fn read_layer0_neighbours_with(
+        &self,
+        idx: usize,
+        out: &mut Vec<u64>,
+        guard: &crossbeam_epoch::Guard,
+    ) {
+        // `data_level0` holds every node's published layer-0 list (u32 ids);
+        // read straight into `out`, widening u32 -> u64.
         if let Some(block) = self.data_level0.as_ref() {
             if idx < block.capacity() {
                 // SAFETY: idx < capacity per the gate.
                 unsafe {
-                    block.read_neighbours_into_u64(idx, out);
+                    block.read_neighbours_into_u64(idx, out, guard);
                 }
                 return;
             }
@@ -2571,6 +2583,8 @@ impl HnswIndex {
     }
 
     fn search_layer_greedy_ctx(&self, ctx: &QueryCtx<'_>, ep: usize, level: usize) -> usize {
+        // One epoch pin for the descent; the list reads below nest in it.
+        let _epoch = crossbeam_epoch::pin();
         let mut current = ep;
         let mut current_dist = self.compute_distance(ctx, current);
 
@@ -2657,17 +2671,20 @@ impl HnswIndex {
         ef: usize,
         level: usize,
     ) -> Vec<Candidate> {
+        // One epoch pin for the whole layer pass, handed down to every
+        // layer-0 list read and prefetch, so a visit pays no pin of its own.
+        let guard = crossbeam_epoch::pin();
         // Dispatch on the configured rerank policy. Inline (the legacy
         // default) keeps the two-heap two-distance design that preserves
         // glove-class recall. EndOfSearch / None drop the per-visit f32
         // call and reach much higher QPS at the cost of using a noisy
         // cheap threshold during traversal; see [`RerankMode`].
         match self.config.rerank_mode {
-            RerankMode::Inline => self.search_layer_ctx_inline_rerank(ctx, ep, ef, level),
+            RerankMode::Inline => self.search_layer_ctx_inline_rerank(ctx, ep, ef, level, &guard),
             RerankMode::EndOfSearch => {
-                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level)
+                self.search_layer_ctx_end_of_search_rerank(ctx, ep, ef, level, &guard)
             }
-            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level),
+            RerankMode::None => self.search_layer_ctx_no_rerank(ctx, ep, ef, level, &guard),
         }
     }
 
@@ -2681,6 +2698,7 @@ impl HnswIndex {
         ep: usize,
         ef: usize,
         level: usize,
+        guard: &crossbeam_epoch::Guard,
     ) -> Vec<Candidate> {
         let ep_dist = self.compute_distance(ctx, ep);
 
@@ -2724,7 +2742,7 @@ impl HnswIndex {
                 continue;
             }
             if level == 0 {
-                self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
+                self.read_layer0_neighbours_with(closest.idx as usize, &mut connections, guard);
             } else {
                 connections.clear();
                 self.neighbours_at(closest.idx as usize, level)
@@ -2813,6 +2831,7 @@ impl HnswIndex {
         ep: usize,
         ef: usize,
         level: usize,
+        guard: &crossbeam_epoch::Guard,
     ) -> Vec<Candidate> {
         // Oversample: traverse the graph with a larger cheap-distance
         // frontier so the rerank pool sees more candidates. qdrant's
@@ -2821,7 +2840,7 @@ impl HnswIndex {
         let factor = self.config.rerank_oversample_factor.max(1.0);
         let frontier_ef = ((ef as f32) * factor).ceil() as usize;
 
-        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level);
+        let mut result_vec = self.search_layer_ctx_no_rerank(ctx, ep, frontier_ef, level, guard);
 
         // End-of-search rerank: replace every candidate's distance with
         // the exact f32 value, then sort by it. This is the only place
@@ -2848,6 +2867,7 @@ impl HnswIndex {
         ep: usize,
         ef: usize,
         level: usize,
+        guard: &crossbeam_epoch::Guard,
     ) -> Vec<Candidate> {
         // Two-heap pattern: cheap frontier vs accurate threshold.
         //
@@ -2931,7 +2951,7 @@ impl HnswIndex {
             // top inside `searchBaseLayerST`).
             if level == 0 {
                 if let (Some(next), Some(block)) = (candidates.peek(), self.data_level0.as_ref()) {
-                    block.prefetch_neighbours(next.idx as usize);
+                    block.prefetch_neighbours(next.idx as usize, guard);
                 }
             }
 
@@ -2944,7 +2964,11 @@ impl HnswIndex {
                 // the next id in `connections`.
                 {
                     if level == 0 {
-                        self.read_layer0_neighbours_into(closest.idx as usize, &mut connections);
+                        self.read_layer0_neighbours_with(
+                            closest.idx as usize,
+                            &mut connections,
+                            guard,
+                        );
                     } else {
                         connections.clear();
                         self.neighbours_at(closest.idx as usize, level)
@@ -3333,16 +3357,7 @@ impl HnswIndex {
     /// store, ids widened u32 -> u64); layers >= 1 read `neighbours_upper`.
     fn layer_snapshot_into(&self, idx: usize, level: usize, out: &mut Vec<u64>) {
         if level == 0 {
-            if let Some(block) = self.data_level0.as_ref() {
-                if idx < block.capacity() {
-                    // SAFETY: idx < capacity per the gate.
-                    unsafe {
-                        block.read_neighbours_into_u64(idx, out);
-                    }
-                    return;
-                }
-            }
-            out.clear();
+            self.read_layer0_neighbours_into(idx, out);
         } else {
             out.clear();
             self.neighbours_upper[idx][level - 1].snapshot_into(out);

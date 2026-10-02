@@ -10,6 +10,9 @@
 //! is working. A replaced list is retired through epoch-based reclamation and
 //! freed only once no pinned reader or writer can still hold it.
 //!
+//! Upper layers hold `u64` ids; layer 0 holds compact `u32` ids, which halve
+//! the bytes of the densest lists.
+//!
 //! Under `--cfg loom --cfg crossbeam_loom` the epoch machinery itself runs on
 //! loom's atomics, so `tests/loom_neighbours.rs` checks this exact publication
 //! path.
@@ -22,11 +25,12 @@ use loom::sync::atomic::Ordering;
 use std::sync::atomic::Ordering;
 
 /// One published neighbour list. Immutable once its descriptor points at it.
-struct List {
-    ids: Box<[u64]>,
+struct List<T> {
+    ids: Box<[T]>,
 }
 
-/// Neighbour list of one HNSW node at one layer, holding at most `N` ids.
+/// Neighbour list of one HNSW node at one layer, holding at most `N` ids of
+/// type `T`.
 ///
 /// # Concurrency contract
 ///
@@ -35,12 +39,12 @@ struct List {
 ///   under concurrent writers: each publishes one complete list by CAS and
 ///   retries against the current list when another writer won.
 #[doc(hidden)]
-pub struct AtomicNeighbourList<const N: usize> {
+pub struct AtomicNeighbourList<const N: usize, T = u64> {
     /// The published list; null is the empty list.
-    current: Atomic<List>,
+    current: Atomic<List<T>>,
 }
 
-impl<const N: usize> AtomicNeighbourList<N> {
+impl<const N: usize, T: Copy + PartialEq> AtomicNeighbourList<N, T> {
     /// An empty neighbour list.
     pub fn new() -> Self {
         Self {
@@ -54,10 +58,11 @@ impl<const N: usize> AtomicNeighbourList<N> {
         N
     }
 
-    /// The ids of the list published when `guard` loaded it. The slice lives
-    /// as long as the guard keeps the list from being reclaimed.
+    /// The ids of the list published when `guard` loaded it, with the
+    /// descriptor value they came from. The slice lives as long as the guard
+    /// keeps the list from being reclaimed.
     #[inline]
-    fn view<'g>(&self, guard: &'g Guard) -> (Shared<'g, List>, &'g [u64]) {
+    fn view<'g>(&self, guard: &'g Guard) -> (Shared<'g, List<T>>, &'g [T]) {
         let shared = self.current.load(Ordering::Acquire, guard);
         // SAFETY: a non-null descriptor points at a list that was fully
         // initialized before its Release CAS made it reachable, and the guard
@@ -68,11 +73,18 @@ impl<const N: usize> AtomicNeighbourList<N> {
         (shared, ids)
     }
 
+    /// The published ids, protected by `guard`. A caller that reads many
+    /// lists (a search) pins once and reads them all under one guard.
+    #[inline]
+    pub(crate) fn read<'g>(&self, guard: &'g Guard) -> &'g [T] {
+        self.view(guard).1
+    }
+
     /// Current number of neighbours.
     #[inline]
     pub fn len(&self) -> usize {
         let guard = epoch::pin();
-        self.view(&guard).1.len()
+        self.read(&guard).len()
     }
 
     /// Whether the list holds no neighbours.
@@ -82,14 +94,14 @@ impl<const N: usize> AtomicNeighbourList<N> {
     }
 
     /// Copy the published list into `out`, clearing it first.
-    pub fn snapshot_into(&self, out: &mut Vec<u64>) {
+    pub fn snapshot_into(&self, out: &mut Vec<T>) {
         out.clear();
         let guard = epoch::pin();
-        out.extend_from_slice(self.view(&guard).1);
+        out.extend_from_slice(self.read(&guard));
     }
 
     /// Allocating variant of [`snapshot_into`](Self::snapshot_into).
-    pub fn snapshot(&self) -> Vec<u64> {
+    pub fn snapshot(&self) -> Vec<T> {
         let mut out = Vec::new();
         self.snapshot_into(&mut out);
         out
@@ -99,7 +111,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     /// current ids and returns the complete new list, or `None` to leave the
     /// list as it is. A lost CAS calls `edit` again with the list that won.
     /// Returns whether a new list was published.
-    fn update(&self, mut edit: impl FnMut(&[u64]) -> Option<Box<[u64]>>) -> bool {
+    fn update(&self, mut edit: impl FnMut(&[T]) -> Option<Box<[T]>>) -> bool {
         let guard = epoch::pin();
         let (mut expected, mut ids) = self.view(&guard);
         loop {
@@ -136,7 +148,7 @@ impl<const N: usize> AtomicNeighbourList<N> {
     }
 
     /// Replace the whole list with `new`, truncated to `N` ids.
-    pub fn set(&self, new: &[u64]) {
+    pub fn set(&self, new: &[T]) {
         debug_assert!(
             new.len() <= N,
             "AtomicNeighbourList<{N}>::set received {} neighbours, would truncate",
@@ -148,10 +160,17 @@ impl<const N: usize> AtomicNeighbourList<N> {
 
     /// Append `id` under concurrent writers. Returns `false` when the list is
     /// already full; the caller then runs its prune protocol.
-    pub fn cas_append(&self, id: u64) -> bool {
+    pub fn cas_append(&self, id: T) -> bool {
+        self.cas_append_up_to(id, N)
+    }
+
+    /// [`cas_append`](Self::cas_append) with a capacity below `N` chosen at
+    /// run time (layer 0 holds `m_max0` ids, which the index configures).
+    pub(crate) fn cas_append_up_to(&self, id: T, cap: usize) -> bool {
+        let cap = cap.min(N);
         let mut full = false;
         self.update(|current| {
-            full = current.len() >= N;
+            full = current.len() >= cap;
             (!full).then(|| {
                 let mut next = Vec::with_capacity(current.len() + 1);
                 next.extend_from_slice(current);
@@ -164,12 +183,12 @@ impl<const N: usize> AtomicNeighbourList<N> {
 
     /// Replace the entire list contents: [`set`](Self::set).
     #[cfg(test)]
-    pub fn replace(&self, new: &[u64]) {
+    pub fn replace(&self, new: &[T]) {
         self.set(new);
     }
 }
 
-impl<const N: usize> Drop for AtomicNeighbourList<N> {
+impl<const N: usize, T> Drop for AtomicNeighbourList<N, T> {
     fn drop(&mut self) {
         // SAFETY: `&mut self` means no reader or writer of this list exists
         // any more; lists replaced earlier were handed to the epoch already.
@@ -183,13 +202,15 @@ impl<const N: usize> Drop for AtomicNeighbourList<N> {
     }
 }
 
-impl<const N: usize> Default for AtomicNeighbourList<N> {
+impl<const N: usize, T: Copy + PartialEq> Default for AtomicNeighbourList<N, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> std::fmt::Debug for AtomicNeighbourList<N> {
+impl<const N: usize, T: Copy + PartialEq + std::fmt::Debug> std::fmt::Debug
+    for AtomicNeighbourList<N, T>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snap = self.snapshot();
         f.debug_struct("AtomicNeighbourList")

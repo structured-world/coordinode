@@ -1,22 +1,17 @@
 use super::*;
 
+/// The block holds only the vectors: a node's stride is its f32 vector
+/// rounded up to 8 bytes, whatever `m_max0` is, because the neighbours live
+/// in their published lists.
 #[test]
-fn stride_matches_hnswlib_size_data_per_element_at_sift_128() {
-    // hnswlib's `size_data_per_element_` for d=128, M_MAX0=64 is
-    // 4 (count) + 64*4 (ids) + 128*4 (vec) = 772 B. Stride rounds
-    // up to the next multiple of 8 — same 776 hnswlib uses on
-    // alignment-strict configs.
-    let block = DataLevel0Block::new(1, 64, 128);
-    assert_eq!(block.stride(), 776);
-    assert_eq!(block.vector_offset, 4 + 64 * 4);
-}
-
-#[test]
-fn stride_matches_layout_at_glove_100() {
-    // glove d=100 M_MAX0=64: 4 + 256 + 400 = 660 B, stride aligned
-    // up to 664.
-    let block = DataLevel0Block::new(1, 64, 100);
-    assert_eq!(block.stride(), 664);
+fn stride_holds_the_vector_only() {
+    // sift d=128: 512 B, already a multiple of 8.
+    assert_eq!(DataLevel0Block::new(1, 64, 128).stride(), 512);
+    assert_eq!(DataLevel0Block::new(1, 16, 128).stride(), 512);
+    // glove d=100: 400 B.
+    assert_eq!(DataLevel0Block::new(1, 64, 100).stride(), 400);
+    // d=3: 12 B rounded up to 16.
+    assert_eq!(DataLevel0Block::new(1, 64, 3).stride(), 16);
 }
 
 #[test]
@@ -125,7 +120,7 @@ fn drop_f32_shrinks_stride_and_preserves_neighbours() {
         block.stride() < stride_before,
         "stride shrinks once the f32 slot is gone"
     );
-    // Neighbours survive the re-layout into the smaller stride.
+    // Neighbours survive: they never lived in the vector block.
     // SAFETY: idx < capacity.
     unsafe {
         assert_eq!(block.neighbour_count(0), 3);
@@ -277,6 +272,43 @@ fn cas_append_concurrent_writers_keep_count_consistent() {
     }
     out.sort_unstable();
     assert_eq!(out, (0..n_writers).collect::<Vec<_>>());
+}
+
+/// A reader during a whole-list replace of a layer-0 node sees the old list
+/// or the new one, never a list assembled from both. The writer alternates
+/// two disjoint 16-id lists; any snapshot holding ids of both is a mix.
+#[test]
+fn replace_is_observed_whole_on_layer0() {
+    let block = DataLevel0Block::new(1, M_MAX0, 8);
+    let a: Vec<u32> = (1..=16).collect();
+    let b: Vec<u32> = (101..=116).collect();
+    // SAFETY: idx 0 < capacity, 16 <= m_max0.
+    unsafe { block.set_neighbours(0, &a) };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (block_ref, a_ref, b_ref, stop_ref) = (&block, &a, &b, &stop);
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            for i in 0..200_000 {
+                let next = if i % 2 == 0 { b_ref } else { a_ref };
+                // SAFETY: idx 0 < capacity, 16 <= m_max0.
+                unsafe { block_ref.set_neighbours(0, next) };
+            }
+            stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        for _ in 0..3 {
+            s.spawn(move || {
+                let mut out = Vec::new();
+                while !stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: idx 0 < capacity.
+                    unsafe { block_ref.read_neighbours_into(0, &mut out) };
+                    assert!(
+                        out == *a_ref || out == *b_ref,
+                        "reader observed a mixed layer-0 list: {out:?}"
+                    );
+                }
+            });
+        }
+    });
 }
 
 #[test]
