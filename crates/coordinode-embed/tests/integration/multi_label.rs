@@ -2,6 +2,8 @@
 //! with every label of its pattern and matches on all of them, and
 //! `labels()` returns them all.
 
+#![allow(clippy::expect_used)]
+
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 

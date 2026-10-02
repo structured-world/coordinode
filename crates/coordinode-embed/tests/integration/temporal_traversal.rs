@@ -3,6 +3,8 @@
 //! the pattern leaves unlabelled has to be resolved the same way a labelled
 //! one is, never read as absent.
 
+#![allow(clippy::expect_used)]
+
 use coordinode_core::graph::types::Value;
 use coordinode_embed::Database;
 
