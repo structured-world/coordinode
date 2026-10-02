@@ -351,18 +351,12 @@ impl HnswConfig {
 /// HNSW index: in-memory approximate nearest neighbor graph.
 pub struct HnswIndex {
     config: HnswConfig,
-    /// Number of nodes. Every node's id, norms, f32 vector and neighbour
-    /// lists live in `data_level0` at stable addresses, indexed `0..len`.
+    /// Number of nodes. Every node's id, norms, f32 vector, codes and
+    /// neighbour lists live in `data_level0` at stable addresses, indexed
+    /// `0..len`. A node's SQ8 code and RaBitQ code (1-bit or 2/3/4-bit
+    /// Extended-RaBitQ) are `None` until calibration; the RaBitQ variant is
+    /// fixed at calibration time and never mixed within one index.
     node_count: core::sync::atomic::AtomicUsize,
-    /// SQ8-quantized vector, parallel to `nodes`. `None` until SQ8
-    /// calibration completes (or always None when SQ8 is disabled).
-    node_quantized: Vec<Option<Vec<u8>>>,
-    /// RaBitQ code (1-bit popcount kernel or 2/3/4-bit Extended-RaBitQ),
-    /// parallel to `nodes`. `None` until calibration completes; the
-    /// variant is fixed at calibration time and never mixed within one
-    /// index. This is the array the cosine-RaBitQ hot path hits on every
-    /// neighbour visit.
-    node_rabitq_codes: Vec<Option<RabitqEncoded>>,
     /// Map from node ID to its index in the node store.
     id_to_idx: std::collections::HashMap<u64, usize>,
     /// Lock-free entry point: packed `(level, idx)` in a single
@@ -410,10 +404,9 @@ pub struct HnswIndex {
     vector_tier: Option<crate::storage::VectorTierHandle>,
     /// Contiguous per-node RaBitQ code + scalar header, read by the cosine
     /// search fast path so a neighbour visit touches one stride-addressed
-    /// block instead of the per-node `Vec` behind `node_rabitq_codes`.
-    /// Allocated on the first insert of a RaBitQ-configured index; `None`
-    /// for other codecs and after a reorder (search then reads the SoA
-    /// codes).
+    /// block instead of the per-node `Vec` behind the node's code in the
+    /// store. Allocated on the first insert of a RaBitQ-configured index;
+    /// `None` for other codecs.
     rabitq_block: Option<rabitq_block::RabitqBlock>,
     /// The layer-0 store: the f32 vector of every node in one stride-
     /// addressed block (hnswlib `data_level0_memory_`) and every node's
@@ -689,8 +682,6 @@ impl HnswIndex {
         Self {
             config,
             node_count: core::sync::atomic::AtomicUsize::new(0),
-            node_quantized: Vec::with_capacity(capacity),
-            node_rabitq_codes: Vec::with_capacity(capacity),
             id_to_idx,
             entry_point: EntryPoint::new(),
             // max_level is derived from entry_point.load() at every
@@ -797,7 +788,9 @@ impl HnswIndex {
             .collect();
         for (i, enc) in encoded {
             self.mirror_rabitq_to_block(i, enc.as_ref());
-            self.node_rabitq_codes[i] = enc;
+            if let Some(store) = self.nodes_mut() {
+                store.set_rabitq(i, enc);
+            }
         }
         self.rabitq_params = Some(params);
     }
@@ -806,11 +799,7 @@ impl HnswIndex {
     /// Quantizes all existing nodes that don't have quantized vectors yet.
     /// If `offload_vectors` is enabled, drops f32 after quantizing.
     pub fn set_sq8_params(&mut self, params: Sq8Params) {
-        for idx in 0..self.node_len() {
-            if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
-                self.node_quantized[idx] = Some(code);
-            }
-        }
+        self.quantize_all(&params);
         // Offload: free the f32 from the layer-0 store so the RAM is actually
         // returned and `read_node_f32` reports None (rerank then loads f32
         // from disk).
@@ -820,6 +809,18 @@ impl HnswIndex {
             }
         }
         self.sq8_params = Some(params);
+    }
+
+    /// Give every node with an in-memory f32 vector its SQ8 code under
+    /// `params`.
+    fn quantize_all(&mut self, params: &Sq8Params) {
+        for idx in 0..self.node_len() {
+            if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
+                if let Some(store) = self.nodes_mut() {
+                    store.set_sq8(idx, Some(code));
+                }
+            }
+        }
     }
 
     /// Check if the node at `idx` has an in-memory f32 vector. Offloaded
@@ -856,11 +857,7 @@ impl HnswIndex {
             .filter_map(|idx| self.read_node_f32(idx))
             .collect();
         if let Some(params) = Sq8Params::calibrate(&refs) {
-            for idx in 0..self.node_len() {
-                if let Some(code) = self.read_node_f32(idx).map(|v| params.quantize(v)) {
-                    self.node_quantized[idx] = Some(code);
-                }
-            }
+            self.quantize_all(&params);
             // Offload: free the f32 from the layer-0 store so the RAM is
             // actually returned and `read_node_f32` reports None for these
             // nodes (rerank then loads f32 from disk via VectorLoader).
@@ -929,7 +926,9 @@ impl HnswIndex {
             .collect();
         for (i, enc) in encoded {
             self.mirror_rabitq_to_block(i, enc.as_ref());
-            self.node_rabitq_codes[i] = enc;
+            if let Some(store) = self.nodes_mut() {
+                store.set_rabitq(i, enc);
+            }
         }
         self.rabitq_params = Some(params);
     }
@@ -1423,7 +1422,7 @@ impl HnswIndex {
     /// into the code block, so the slot holds the node's current code or
     /// nothing. When the code cannot go in (no code, a width or length that
     /// does not match the slot) the slot is cleared: a zero `norm` sends search
-    /// to `node_rabitq_codes`, which costs speed, never a result.
+    /// to the node's code in the store, which costs speed, never a result.
     fn mirror_rabitq_to_block(&mut self, idx: usize, enc: Option<&RabitqEncoded>) {
         let Some(block) = self.rabitq_block.as_mut() else {
             return;
@@ -1588,13 +1587,12 @@ impl HnswIndex {
         self.mirror_data_level0_vector(idx, vector);
         // SAFETY: `mirror_data_level0_vector` created the store and grew it
         // to cover idx; `&mut self` excludes every other reader and writer.
-        unsafe {
-            self.nodes()
-                .init_node(idx, id, metrics::norm_l2(vector), new_level);
-        }
-        self.node_quantized.push(quantized);
         self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
-        self.node_rabitq_codes.push(rabitq_code);
+        unsafe {
+            let store = self.nodes();
+            store.init_node(idx, id, metrics::norm_l2(vector), new_level);
+            store.set_codes(idx, quantized, rabitq_code);
+        }
         self.id_to_idx.insert(id, idx);
         self.node_count
             .store(idx + 1, core::sync::atomic::Ordering::Release);
@@ -2331,18 +2329,18 @@ impl HnswIndex {
             }
         }
 
-        // Refresh the stores alongside the SoA write so a subsequent search
-        // reads the updated vector and code, not the original insert's.
+        // Refresh the stores so a subsequent search reads the updated vector,
+        // norms and codes, not the original insert's.
         self.ensure_rabitq_block(idx, vector.len());
         self.mirror_data_level0_vector(idx, &vector);
-        // SAFETY: idx is an existing node; `&mut self` excludes every other
-        // reader and writer while its vector and norms change together.
-        unsafe {
-            self.nodes().set_norm(idx, metrics::norm_l2(&vector));
-        }
-        self.node_quantized[idx] = quantized;
         self.mirror_rabitq_to_block(idx, rabitq_code.as_ref());
-        self.node_rabitq_codes[idx] = rabitq_code;
+        // SAFETY: idx is an existing node; `&mut self` excludes every other
+        // reader and writer while its vector, norms and codes change together.
+        unsafe {
+            let store = self.nodes();
+            store.set_norm(idx, metrics::norm_l2(&vector));
+            store.set_codes(idx, quantized, rabitq_code);
+        }
 
         // Step 4: Re-insert into the graph from a valid entry point.
         // A single-node index has no connections to rebuild.
@@ -2966,7 +2964,7 @@ impl HnswIndex {
         if matches!(self.config.metric, VectorMetric::Cosine) {
             // Code-block fast path: read packed code + scalars from the
             // per-node block instead of dereferencing the SoA
-            // `node_rabitq_codes[idx]`. Gated on byte-length match between
+            // per-node code in the store. Gated on byte-length match between
             // the slot and the query bit-planes so dims whose effective code
             // width differs from `dim/8` (e.g. dim=100 padded to 128) cleanly
             // fall through to the SoA path.
@@ -3004,14 +3002,14 @@ impl HnswIndex {
                     }
                 }
             }
-            // Nested, not a tuple pattern: a tuple would index
-            // `node_rabitq_codes[node_idx]` (random 72B-stride read,
-            // a guaranteed cache miss per visit) even when the params
-            // or query are None, i.e. on every unquantized search.
+            // Nested, not a tuple pattern: a tuple would read the node's
+            // RaBitQ code (random 72B-stride read, a guaranteed cache miss
+            // per visit) even when the params or query are None, i.e. on
+            // every unquantized search.
             if let (Some(params), Some(qenc)) =
                 (self.rabitq_params.as_ref(), ctx.rabitq_query.as_ref())
             {
-                if let Some(xcode) = self.node_rabitq_codes[node_idx].as_ref() {
+                if let Some(xcode) = self.node_rabitq(node_idx) {
                     match (qenc, xcode) {
                         // 1-bit data × 4-bit-plane query — paper §3.3.2 kernel.
                         // Lifts the cosine estimator from `O(1/√(D/4))` (legacy
@@ -3030,7 +3028,7 @@ impl HnswIndex {
             }
         }
         if let Some(params) = &self.sq8_params {
-            if let Some(quantized) = &self.node_quantized[node_idx] {
+            if let Some(quantized) = self.node_sq8(node_idx) {
                 let dequantized = params.dequantize(quantized);
                 return self.distance_for_metric(ctx, &dequantized);
             }
@@ -3048,12 +3046,12 @@ impl HnswIndex {
             // RaBitQ code is available, then feed the both-norms helper to
             // skip the `norm_l2(b)` pass per neighbour visit.
             if matches!(self.config.metric, VectorMetric::Cosine) {
-                // Nested, not a tuple pattern: a tuple would index
-                // `node_rabitq_codes[node_idx]` (random 72B-stride read,
-                // a cache miss per visit) even on unquantized indexes
-                // where the params are None.
+                // Nested, not a tuple pattern: a tuple would read the node's
+                // RaBitQ code (random 72B-stride read, a cache miss per
+                // visit) even on unquantized indexes where the params are
+                // None.
                 if let Some(params) = self.rabitq_params.as_ref() {
-                    if let Some(enc) = self.node_rabitq_codes[node_idx].as_ref() {
+                    if let Some(enc) = self.node_rabitq(node_idx) {
                         let b_norm = rabitq_code_norm(enc, params);
                         return 1.0
                             - metrics::cosine_similarity_with_both_norms(
@@ -3084,7 +3082,7 @@ impl HnswIndex {
         }
         // f32 offloaded — fall back to dequantized SQ8 (slightly less accurate)
         if let Some(ref params) = self.sq8_params {
-            if let Some(ref quantized) = self.node_quantized[node_idx] {
+            if let Some(quantized) = self.node_sq8(node_idx) {
                 let dequantized = params.dequantize(quantized);
                 return self.distance_for_metric(ctx, &dequantized);
             }
@@ -3238,6 +3236,23 @@ impl HnswIndex {
         self.data_level0
             .as_ref()
             .expect("a node exists only after the store was created")
+    }
+
+    /// Node `idx`'s SQ8 code, `None` before calibration.
+    #[inline(always)]
+    fn node_sq8(&self, idx: usize) -> Option<&[u8]> {
+        self.data_level0.as_ref()?.sq8(idx)
+    }
+
+    /// Node `idx`'s RaBitQ code, `None` before calibration.
+    #[inline(always)]
+    fn node_rabitq(&self, idx: usize) -> Option<&RabitqEncoded> {
+        self.data_level0.as_ref()?.rabitq(idx)
+    }
+
+    /// The node store for a calibration that rewrites every node's codes.
+    fn nodes_mut(&mut self) -> Option<&mut data_level0::DataLevel0Block> {
+        self.data_level0.as_mut()
     }
 
     /// External id of node `idx`.
@@ -3574,7 +3589,7 @@ impl HnswIndex {
             return v.to_vec();
         }
         if let Some(ref params) = self.sq8_params {
-            if let Some(ref q) = self.node_quantized[idx] {
+            if let Some(q) = self.node_sq8(idx) {
                 return params.dequantize(q);
             }
         }
@@ -3586,7 +3601,7 @@ impl HnswIndex {
         if let Some(v) = self.read_node_f32(idx) {
             return v.to_vec();
         }
-        if let Some(ref q) = self.node_quantized[idx] {
+        if let Some(q) = self.node_sq8(idx) {
             return params.dequantize(q);
         }
         Vec::new()
@@ -3612,8 +3627,8 @@ impl HnswIndex {
         // ef={200,800}) showed this helper at 33.7% of search_layer_ctx
         // cycles. The prefetch INSTRUCTIONS are near-free; the cost is
         // the SoA cache misses the helper performs to DECIDE what to
-        // prefetch — `node_rabitq_codes[idx]` (Option<RabitqEncoded>),
-        // `node_vectors[idx]` (Option<Vec<f32>>), `node_quantized[idx]`
+        // prefetch — the node's RaBitQ code (Option<RabitqEncoded>), its
+        // f32 vector (Option<Vec<f32>>) and its SQ8 code
         // (Option<Vec<u8>>) — three independent allocations sized at
         // ~1.18M slots each on glove. Reading three of them per
         // neighbour visit pulls three cache lines just to issue one
@@ -3629,14 +3644,14 @@ impl HnswIndex {
         // (one cache line + one Option discriminant + one enum match
         // instead of two cache lines + two Option discriminants).
         // Gate on the INDEX-level codec state before touching the
-        // per-node array: `node_rabitq_codes[idx]` is a random read
-        // with a 72B stride, and on unquantized indexes (codes all
-        // None) it was a guaranteed cache miss per neighbour visit
-        // spent only to DECIDE what to prefetch — perf measured it at
-        // ~32% of search_layer self-time on glove-50k ST. RaBitQ codes
-        // exist only after calibration, which requires `rabitq_params`.
+        // per-node code: it is a random read with a 72B stride, and on
+        // unquantized indexes (codes all None) it was a guaranteed cache
+        // miss per neighbour visit spent only to DECIDE what to prefetch —
+        // perf measured it at ~32% of search_layer self-time on glove-50k
+        // ST. RaBitQ codes exist only after calibration, which requires
+        // `rabitq_params`.
         if self.rabitq_params.is_some() && matches!(self.config.metric, VectorMetric::Cosine) {
-            if let Some(ref enc) = self.node_rabitq_codes[idx] {
+            if let Some(enc) = self.node_rabitq(idx) {
                 let code_words = match enc {
                     RabitqEncoded::OneBit(c) => c.code.as_ptr() as *const u8,
                     RabitqEncoded::Multi(c) => c.packed.as_ptr(),
@@ -3655,7 +3670,7 @@ impl HnswIndex {
                 return;
             }
         }
-        if let Some(ref q) = self.node_quantized[idx] {
+        if let Some(q) = self.node_sq8(idx) {
             prefetch_read_data(q.as_ptr());
         }
     }

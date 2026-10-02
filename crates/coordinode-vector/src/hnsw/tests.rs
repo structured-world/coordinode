@@ -52,7 +52,7 @@ fn assert_rabitq_block_matches_codes(index: &HnswIndex) {
         .rabitq_block()
         .expect("a RaBitQ index has a code block after inserts");
     for idx in 0..index.node_len() {
-        let soa = index.node_rabitq_codes[idx].as_ref();
+        let soa = index.node_rabitq(idx);
         assert!(
             matches!(soa, Some(RabitqEncoded::OneBit(_))),
             "node {idx} has no 1-bit code after calibration"
@@ -756,8 +756,8 @@ fn sq8_auto_calibrates_at_threshold() {
     assert!(index.sq8_params().is_some());
 
     // All nodes should now have quantized vectors
-    for q in &index.node_quantized {
-        assert!(q.is_some());
+    for idx in 0..index.node_len() {
+        assert!(index.node_sq8(idx).is_some());
     }
 }
 
@@ -774,7 +774,7 @@ fn sq8_new_inserts_after_calibration_are_quantized() {
     // Insert after calibration
     index.insert(100, vec![2.5, 0.5]);
     let idx = *index.id_to_idx.get(&100).expect("inserted");
-    assert!(index.node_quantized[idx].is_some());
+    assert!(index.node_sq8(idx).is_some());
 }
 
 #[test]
@@ -1000,10 +1000,8 @@ fn rabitq_recall_sanity_cosine() {
     );
     assert!(index.rabitq_params().is_some());
     // Every post-calibration node carries an encoded code.
-    let coded = index
-        .node_rabitq_codes
-        .iter()
-        .filter(|c| c.is_some())
+    let coded = (0..index.node_len())
+        .filter(|&i| index.node_rabitq(i).is_some())
         .count();
     assert_eq!(coded, n, "all {n} nodes should have RaBitQ codes");
 
@@ -1103,10 +1101,8 @@ fn rabitq_recall_cosine_dim_100_with_padding() {
     // Every post-calibration node must carry a code. If this fails,
     // calibration is the bug — codes are missing for some nodes and
     // search falls back to f32 for them, mixing two distance scales.
-    let coded = index
-        .node_rabitq_codes
-        .iter()
-        .filter(|c| c.is_some())
+    let coded = (0..index.node_len())
+        .filter(|&i| index.node_rabitq(i).is_some())
         .count();
     assert_eq!(
         coded, n,
@@ -1206,8 +1202,8 @@ fn extended_rabitq_recall_sanity_cosine_2bit() {
     // Every post-calibration node must carry a Multi(_) code with bits=2.
     // Encode "variant + bits" as a single u8 (0 = OneBit, 2/3/4 = Multi)
     // so the assertion lives in `assert_eq!` and avoids the `panic!` lint.
-    for (i, code_opt) in index.node_rabitq_codes.iter().enumerate() {
-        let code = code_opt.as_ref().expect("rabitq code populated");
+    for i in 0..index.node_len() {
+        let code = index.node_rabitq(i).expect("rabitq code populated");
         let bits = match code {
             RabitqEncoded::Multi(c) => c.bits,
             RabitqEncoded::OneBit(_) => 0,
@@ -1374,12 +1370,9 @@ fn set_rabitq_params_re_encodes_existing_nodes() {
     // Every node must now carry an encoded code, and that code must
     // match the persisted rotation's encoding of its f32 vector.
     for i in 0..index.node_len() {
-        let code_opt = &index.node_rabitq_codes[i];
-        assert!(
-            code_opt.is_some(),
-            "node {i} missing rabitq code after set_rabitq_params"
-        );
-        let code = code_opt.as_ref().expect("checked is_some above");
+        let code = index
+            .node_rabitq(i)
+            .expect("node missing rabitq code after set_rabitq_params");
         let expected =
             RabitqEncoded::OneBit(persisted.encode(index.read_node_f32(i).expect("f32 retained")));
         assert_eq!(*code, expected, "node {i} code mismatch after reload");
@@ -1404,9 +1397,7 @@ fn sq8_memory_savings() {
             .read_node_f32(i)
             .expect("f32 should be retained (offload_vectors=false)");
         assert_eq!(v.len(), dims as usize);
-        let q = index.node_quantized[i]
-            .as_ref()
-            .expect("should be quantized");
+        let q = index.node_sq8(i).expect("should be quantized");
         assert_eq!(q.len(), dims as usize);
         assert_eq!(std::mem::size_of_val(v), q.len() * 4);
     }
@@ -1437,8 +1428,8 @@ fn sq8_manual_calibration() {
 
     assert!(index.is_quantized());
     // All existing nodes should now be quantized
-    for q in &index.node_quantized {
-        assert!(q.is_some());
+    for idx in 0..index.node_len() {
+        assert!(index.node_sq8(idx).is_some());
     }
 
     // Search should work with quantization
@@ -1696,7 +1687,7 @@ fn offload_drops_f32_after_calibration() {
             index.node_id(i)
         );
         assert!(
-            index.node_quantized[i].is_some(),
+            index.node_sq8(i).is_some(),
             "quantized should be present (node {})",
             index.node_id(i)
         );

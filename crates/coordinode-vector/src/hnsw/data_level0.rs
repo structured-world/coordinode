@@ -34,8 +34,8 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use super::M_MAX0;
 use super::neighbours::AtomicNeighbourList;
+use super::{M_MAX0, RabitqEncoded};
 
 /// Per-node vector alignment: keeps every node's f32 vector f32-aligned and
 /// the next node on an 8-byte boundary.
@@ -84,6 +84,11 @@ struct Segment {
     /// Per-node lists above layer 0; their count is the node's top layer.
     /// Written once with the node's scalars, before the node is reachable.
     upper: Box<[UnsafeCell<UpperLists>]>,
+    /// Per-node SQ8 code. Written before the node is reachable, or for every
+    /// node at once by a calibration that holds the store exclusively.
+    sq8: Box<[UnsafeCell<Option<Vec<u8>>>]>,
+    /// Per-node RaBitQ code, under the same rule as `sq8`.
+    rabitq: Box<[UnsafeCell<Option<RabitqEncoded>>]>,
 }
 
 impl Segment {
@@ -99,6 +104,8 @@ impl Segment {
             meta: (0..cap).map(|_| NodeMeta::new()).collect(),
             inv_norms: (0..cap).map(|_| AtomicU32::new(0)).collect(),
             upper: (0..cap).map(|_| UnsafeCell::new(Box::default())).collect(),
+            sq8: (0..cap).map(|_| UnsafeCell::new(None)).collect(),
+            rabitq: (0..cap).map(|_| UnsafeCell::new(None)).collect(),
         }
     }
 
@@ -118,10 +125,11 @@ impl Segment {
     }
 }
 
-// SAFETY: the lists and scalars are `Sync`. The vector bytes and the upper
-// lists' box are written only by the writer that owns a node, before the node
-// is reachable, and read only after it was reached through a release-published
-// link or entry point; every other access goes through `&mut self`.
+// SAFETY: the lists and scalars are `Sync`. The vector bytes, the upper lists'
+// box and the codes are written only by the writer that owns a node, before
+// the node is reachable, and read only after it was reached through a
+// release-published link or entry point; every other write goes through
+// `&mut self` or an exclusive calibration.
 unsafe impl Sync for Segment {}
 
 /// The layer-0 store. See the module doc for layout and concurrency.
@@ -505,6 +513,78 @@ impl DataLevel0Block {
             let (segment, off) = self.locate(idx);
             let lists: &UpperLists = &*segment.upper.get_unchecked(off).get();
             lists.get_unchecked(level - 1)
+        }
+    }
+
+    /// Node `idx`'s SQ8 code, `None` when it has none or `idx` has no slot.
+    #[inline(always)]
+    pub(super) fn sq8(&self, idx: usize) -> Option<&[u8]> {
+        let (segment, off) = self.try_locate(idx)?;
+        // SAFETY: off lies inside the segment; a code is written only before
+        // its node is reachable or under exclusive access, so no write races
+        // this shared borrow.
+        let code: &Option<Vec<u8>> = unsafe { &*segment.sq8.get_unchecked(off).get() };
+        code.as_deref()
+    }
+
+    /// Node `idx`'s RaBitQ code, `None` when it has none or `idx` has no slot.
+    #[inline(always)]
+    pub(super) fn rabitq(&self, idx: usize) -> Option<&RabitqEncoded> {
+        let (segment, off) = self.try_locate(idx)?;
+        // SAFETY: as in `sq8`.
+        let code: &Option<RabitqEncoded> = unsafe { &*segment.rabitq.get_unchecked(off).get() };
+        code.as_ref()
+    }
+
+    /// Install node `idx`'s codes.
+    ///
+    /// # Safety
+    ///
+    /// `idx < self.capacity()`, and the caller is the only writer of node
+    /// `idx` and writes before the node is reachable, or holds the store
+    /// exclusively.
+    pub(super) unsafe fn set_codes(
+        &self,
+        idx: usize,
+        sq8: Option<Vec<u8>>,
+        rabitq: Option<RabitqEncoded>,
+    ) {
+        // SAFETY: caller bounds and exclusivity.
+        unsafe {
+            let (segment, off) = self.locate(idx);
+            *segment.sq8.get_unchecked(off).get() = sq8;
+            *segment.rabitq.get_unchecked(off).get() = rabitq;
+        }
+    }
+
+    /// Replace node `idx`'s SQ8 code (calibration).
+    pub(super) fn set_sq8(&mut self, idx: usize, code: Option<Vec<u8>>) {
+        if let Some((segment, off)) = self.try_locate(idx) {
+            // SAFETY: off lies inside the segment; `&mut self` excludes every
+            // reader.
+            unsafe { *segment.sq8.get_unchecked(off).get() = code };
+        }
+    }
+
+    /// Replace node `idx`'s RaBitQ code (calibration).
+    pub(super) fn set_rabitq(&mut self, idx: usize, code: Option<RabitqEncoded>) {
+        if let Some((segment, off)) = self.try_locate(idx) {
+            // SAFETY: as in `set_sq8`.
+            unsafe { *segment.rabitq.get_unchecked(off).get() = code };
+        }
+    }
+
+    /// Take node `idx`'s codes out, leaving none (reorder moves them).
+    pub(super) fn take_codes(&mut self, idx: usize) -> (Option<Vec<u8>>, Option<RabitqEncoded>) {
+        let Some((segment, off)) = self.try_locate(idx) else {
+            return (None, None);
+        };
+        // SAFETY: as in `set_sq8`.
+        unsafe {
+            (
+                (*segment.sq8.get_unchecked(off).get()).take(),
+                (*segment.rabitq.get_unchecked(off).get()).take(),
+            )
         }
     }
 

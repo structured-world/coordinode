@@ -16,21 +16,6 @@ use std::collections::VecDeque;
 
 use super::HnswIndex;
 
-/// Permute an owned `Vec<T>` into BFS order: `out[new] = old[old_of_new[new]]`.
-/// Pure index shuffle (no clone), so it works for non-`Clone` payloads like the
-/// RaBitQ codes. `old_of_new` must be a bijection of `0..vec.len()`.
-#[allow(
-    clippy::expect_used,
-    reason = "old_of_new is a verified bijection, so each slot is taken exactly once"
-)]
-fn permute_vec<T>(vec: Vec<T>, old_of_new: &[usize]) -> Vec<T> {
-    let mut slots: Vec<Option<T>> = vec.into_iter().map(Some).collect();
-    old_of_new
-        .iter()
-        .map(|&old| slots[old].take().expect("permutation is a bijection"))
-        .collect()
-}
-
 impl HnswIndex {
     /// Compute a BFS visit-order permutation of node indices.
     ///
@@ -179,15 +164,10 @@ impl HnswIndex {
 
         // --- Step B: rebuild every store in new order ---
 
-        // Per-node codes: pure index shuffle (payload is per-node, no remap).
-        let quant = std::mem::take(&mut self.node_quantized);
-        self.node_quantized = permute_vec(quant, &old_of_new);
-        let rabitq = std::mem::take(&mut self.node_rabitq_codes);
-        self.node_rabitq_codes = permute_vec(rabitq, &old_of_new);
-
         // Node store: every node rebuilt at its new index with its id, norm,
-        // f32 vector and remapped lists on every layer.
-        if let Some(old_block) = self.data_level0.take() {
+        // f32 vector, codes and remapped lists on every layer.
+        if let Some(mut old_block) = self.data_level0.take() {
+            let mut codes: Vec<_> = (0..n).map(|old| old_block.take_codes(old)).collect();
             let dim = old_block.dim();
             let m = old_block.m_max0();
             let cap = old_block.capacity().max(n);
@@ -199,10 +179,12 @@ impl HnswIndex {
             for (new, &old) in old_of_new.iter().enumerate() {
                 let (id, norm) = meta[old];
                 let per_layer = std::mem::take(&mut upper[old]);
+                let (sq8, rabitq) = std::mem::take(&mut codes[old]);
                 // SAFETY: new < n <= cap; `nb` is owned here, so nothing else
                 // reads or writes it.
                 unsafe {
                     nb.init_node(new, id, norm, per_layer.len());
+                    nb.set_codes(new, sq8, rabitq);
                     if has_f32 && !l0_vecs[old].is_empty() {
                         nb.set_vector(new, &l0_vecs[old]);
                     }
@@ -215,8 +197,8 @@ impl HnswIndex {
             self.data_level0 = Some(nb);
         }
 
-        // The code block is a copy of `node_rabitq_codes` laid out for the
-        // search fast path: refill it from the codes remapped above.
+        // The code block is a copy of the nodes' RaBitQ codes laid out for
+        // the search fast path: refill it from the codes moved above.
         self.rabitq_block = None;
         if let (Some(dim), Some(last)) = (
             self.data_level0
@@ -226,10 +208,10 @@ impl HnswIndex {
         ) {
             self.ensure_rabitq_block(last, dim);
         }
-        if let Some(block) = self.rabitq_block.as_mut() {
-            let cap = block.capacity();
-            for (idx, enc) in self.node_rabitq_codes.iter().enumerate().take(cap) {
-                if let Some(enc) = enc {
+        if let (Some(block), Some(store)) = (self.rabitq_block.as_mut(), self.data_level0.as_ref())
+        {
+            for idx in 0..n.min(block.capacity()) {
+                if let Some(enc) = store.rabitq(idx) {
                     Self::install_rabitq(block, idx, enc);
                 }
             }
