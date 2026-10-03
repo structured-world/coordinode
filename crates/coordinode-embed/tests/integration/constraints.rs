@@ -389,6 +389,128 @@ fn drop_constraint_lifts_it_and_its_index() {
     assert!(err.to_string().contains("not found"), "{err}");
 }
 
+/// A uniqueness constraint dropped and created again under the same name is
+/// judged by the data as it is at the second creation: a duplicate written
+/// in between refuses it and leaves the name free, and once it is gone the
+/// new constraint indexes the current values only, with nothing left over
+/// from the values its predecessor indexed.
+#[test]
+fn a_constraint_recreated_under_its_name_follows_the_current_data() {
+    use coordinode_query::index::ops::load_index_definition;
+    let (mut db, _dir) = open_db();
+    let create = "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE";
+    db.execute_cypher(create).expect("create");
+    db.execute_cypher("CREATE (:User {name: 'a', email: 'old@x'})")
+        .expect("indexed under the first constraint");
+
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop");
+    db.execute_cypher("MATCH (u:User {name: 'a'}) SET u.email = 'new@x'")
+        .expect("change the indexed value while unconstrained");
+    db.execute_cypher("CREATE (:User {name: 'b', email: 'new@x'})")
+        .expect("a duplicate while unconstrained");
+
+    let err = db
+        .execute_cypher(create)
+        .expect_err("the duplicate refuses it");
+    assert!(
+        err.to_string().contains("unique constraint violated"),
+        "{err}"
+    );
+    assert_eq!(stored_state(&db, "User", "user_email"), None);
+    assert!(
+        load_index_definition(db.engine(), "user_email")
+            .expect("load")
+            .is_none(),
+        "the refused creation leaves no index behind"
+    );
+
+    db.execute_cypher("MATCH (u:User {name: 'b'}) DELETE u")
+        .expect("remove the duplicate");
+    db.execute_cypher(create).expect("the name is free again");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+
+    expect_unique_violation(db.execute_cypher("CREATE (:User {name: 'c', email: 'new@x'})"));
+    db.execute_cypher("CREATE (:User {name: 'd', email: 'old@x'})")
+        .expect("the value the first constraint indexed is not held by anyone");
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:User {email: 'new@x'}) RETURN count(u) AS c"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:User {email: 'old@x'}) RETURN count(u) AS c"
+        ),
+        1
+    );
+}
+
+/// Two statements creating a constraint under the same name at the same
+/// time, on different labels: exactly one wins, the other is refused as a
+/// name clash or a concurrent change, and only the winner's label holds the
+/// constraint. Repeated so that the two commits actually overlap.
+#[test]
+fn concurrent_creates_under_one_name_have_exactly_one_winner() {
+    let (db, _dir) = open_db();
+    for round in 0..32 {
+        let name = format!("required_{round}");
+        let statements = [
+            format!("CREATE CONSTRAINT {name} FOR (n:Left) REQUIRE n.p{round} IS NOT NULL"),
+            format!("CREATE CONSTRAINT {name} FOR (n:Right) REQUIRE n.p{round} IS NOT NULL"),
+        ];
+        let start = std::sync::Barrier::new(2);
+        let outcomes: Vec<Result<(), DatabaseError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = statements
+                .iter()
+                .map(|statement| {
+                    let (db, start) = (&db, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        db.execute_cypher_shared(statement, None, None, None, None)
+                            .map(|_| ())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("the statement thread"))
+                .collect()
+        });
+
+        let winners: Vec<&str> = outcomes
+            .iter()
+            .zip(["Left", "Right"])
+            .filter(|(outcome, _)| outcome.is_ok())
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(winners.len(), 1, "round {round}: {outcomes:?}");
+        for outcome in &outcomes {
+            if let Err(err) = outcome {
+                assert!(
+                    names_existing(err, CatalogObject::Constraint, &name)
+                        || matches!(err, DatabaseError::Execution(ExecutionError::Conflict(_))),
+                    "round {round}: the loser is refused for the clash, got {err:?}"
+                );
+            }
+        }
+        for label in ["Left", "Right"] {
+            let expected = (label == winners[0]).then_some(ConstraintState::Active);
+            assert_eq!(
+                stored_state(&db, label, &name),
+                expected,
+                "round {round}, label {label}"
+            );
+        }
+    }
+}
+
 /// The index a constraint owns can only go with the constraint.
 #[test]
 fn drop_index_refuses_an_index_a_constraint_owns() {

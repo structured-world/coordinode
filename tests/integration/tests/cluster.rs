@@ -18,6 +18,7 @@
 //! | `a_server_that_still_holds_data_is_refused_as_a_joiner` | serve | The same machine started as a joiner refuses at startup and names the empty directory as the fix |
 //! | `a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor` | JoinNode, DecommissionNode | A machine with data grows to three and back to two with its data on both members; the step to one is refused naming the rule |
 //! | `a_new_leader_never_reissues_a_node_id` | ExecuteCypher | After the leader goes away the member that takes over creates a node beside the old ones, never over one |
+//! | `constraints_held_before_the_cluster_bind_every_member_after_a_leader_change` | ExecuteCypher, ListConstraints | Constraints that reached the members through the base snapshot are listed active on the new leader and refuse the writes that break them |
 //!
 //! ## Running
 //!
@@ -668,6 +669,111 @@ async fn a_unique_index_holds_across_a_leader_change() {
     assert!(
         matches!(rows[0].values[0].value, Some(Pv::IntValue(1))),
         "the indexed row is found once: {rows:?}"
+    );
+}
+
+/// Constraints a standalone machine held before it became a cluster reach the
+/// members added to it, which learn the pre-cluster state from a snapshot
+/// rather than from the log: the member that takes over after the first
+/// leader goes away lists them active with the index they own, and refuses
+/// the writes that break them.
+#[tokio::test(flavor = "multi_thread")]
+async fn constraints_held_before_the_cluster_bind_every_member_after_a_leader_change() {
+    use coordinode_integration::proto::v2::graph::{ConstraintState, ListConstraintsRequest};
+
+    let n1 = CoordinodeProcess::start().await;
+    n1.wait_for_leader(Duration::from_secs(15)).await;
+    for statement in [
+        "CREATE CONSTRAINT account_email FOR (a:Account) REQUIRE a.email IS UNIQUE",
+        "CREATE CONSTRAINT account_name FOR (a:Account) REQUIRE a.name IS NOT NULL",
+        "CREATE (:Account {email: 'a@x', name: 'first'})",
+    ] {
+        cypher_on(&n1, statement)
+            .await
+            .unwrap_or_else(|e| panic!("the standalone server runs {statement:?}: {e}"));
+    }
+
+    let (p2, p3) = (free_port(), free_port());
+    let n1 = n1.restart_as_cluster_member(1, &[p2, p3]).await;
+    n1.wait_for_leader(Duration::from_secs(20)).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[n1.port, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[n1.port, p2]).await;
+    let mut leader = n1.cluster_client().await;
+    for (id, address) in [(2u64, n2.member_addr()), (3u64, n3.member_addr())] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address,
+                pre_seeded: false,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("JoinNode({id}) must be accepted: {e}"));
+        wait_for_voters(&mut leader, id as usize, Duration::from_secs(40)).await;
+    }
+
+    drop(n1);
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let new_leader = loop {
+        let mut led = None;
+        for member in [&n2, &n3] {
+            if cypher_on(member, "CREATE (:Account {email: 'b@x', name: 'second'})")
+                .await
+                .is_ok()
+            {
+                led = Some(member);
+                break;
+            }
+        }
+        if let Some(member) = led {
+            break member;
+        }
+        assert!(Instant::now() < deadline, "no member took over");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let constraints = new_leader
+        .schema_client()
+        .await
+        .list_constraints(ListConstraintsRequest {})
+        .await
+        .expect("list constraints")
+        .into_inner()
+        .constraints;
+    let summary: Vec<(String, i32, String)> = constraints
+        .into_iter()
+        .map(|c| (c.name, c.state, c.backing_index))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                "account_email".to_string(),
+                ConstraintState::Active as i32,
+                "account_email".to_string()
+            ),
+            (
+                "account_name".to_string(),
+                ConstraintState::Active as i32,
+                String::new()
+            ),
+        ]
+    );
+
+    let duplicate = cypher_on(new_leader, "CREATE (:Account {email: 'a@x', name: 'dup'})")
+        .await
+        .expect_err("a duplicate of a value written before the cluster");
+    assert_eq!(
+        duplicate.code(),
+        tonic::Code::AlreadyExists,
+        "{duplicate:?}"
+    );
+    let unnamed = cypher_on(new_leader, "CREATE (:Account {email: 'c@x'})")
+        .await
+        .expect_err("a node without the required name");
+    assert_eq!(
+        unnamed.code(),
+        tonic::Code::FailedPrecondition,
+        "{unnamed:?}"
     );
 }
 
