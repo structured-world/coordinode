@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use crate::graph::types::{Value, VectorMetric};
 use crate::schema::computed::ComputedSpec;
 
+/// Fields the engine writes itself into every version of a temporal node:
+/// the system-time stamp and a deletion's tombstone flag. A label definition
+/// cannot declare them and no user write may set them, so a check of stored
+/// versions against a definition leaves them out.
+pub const TEMPORAL_ENGINE_FIELDS: [&str; 2] = ["__ingestion_ts__", "__deleted__"];
+
 /// A property definition within a label or edge type schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PropertyDef {

@@ -10958,7 +10958,16 @@ fn execute_update(
                         ))
                     })?;
                 let mut new_record = closing_record.clone();
-                let label_schema = ctx.load_current_label_schema(closing_record.primary_label())?;
+                let label = closing_record.primary_label().to_string();
+                let label_schema = ctx.load_current_label_schema(&label)?;
+                // The same admission as a SET of a non-temporal node, before
+                // anything is written: a refused item leaves the node with
+                // exactly the versions it had.
+                let violation = |property: &str, value: Option<&Value>| {
+                    refuse_engine_temporal_field(property).map(|()| {
+                        set_property_violation(label_schema.as_ref(), &label, property, value)
+                    })
+                };
 
                 // Step 2: apply each relevant SET item to the new record.
                 // Mark each item's index in `processed_temporal_items` so
@@ -10984,6 +10993,12 @@ fn execute_update(
                     match item {
                         crate::plan::SetItem::Property { property, expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?.map_to_document();
+                            if let Some(err) = violation(property, Some(&val))? {
+                                if skip_on_violation {
+                                    continue 'row_loop;
+                                }
+                                return Err(err);
+                            }
                             let by_name = stored_by_name(label_schema.as_ref(), property);
                             store_node_property(&mut new_record, property, val, by_name, ctx)?;
                         }
@@ -10993,6 +11008,14 @@ fn execute_update(
                         crate::plan::SetItem::ReplaceProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
+                                for (k, v) in &map {
+                                    if let Some(err) = violation(k, Some(v))? {
+                                        if skip_on_violation {
+                                            continue 'row_loop;
+                                        }
+                                        return Err(err);
+                                    }
+                                }
                                 // Clear existing user props, keep engine-managed
                                 // fields (__ingestion_ts__, valid_from, valid_to
                                 // are reapplied below).
@@ -11014,6 +11037,14 @@ fn execute_update(
                         crate::plan::SetItem::MergeProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
+                                for (k, v) in &map {
+                                    if let Some(err) = violation(k, Some(v))? {
+                                        if skip_on_violation {
+                                            continue 'row_loop;
+                                        }
+                                        return Err(err);
+                                    }
+                                }
                                 register_stored_ids(label_schema.as_ref(), &map, ctx)?;
                                 for (name, v) in map {
                                     let by_name = stored_by_name(label_schema.as_ref(), &name);
@@ -11038,6 +11069,12 @@ fn execute_update(
                                 return Err(ExecutionError::Unsupported(format!(
                                     "SET on temporal node `{var}`: empty property path"
                                 )));
+                            }
+                            if let Some(err) = violation(&path[0], None)? {
+                                if skip_on_violation {
+                                    continue 'row_loop;
+                                }
+                                return Err(err);
                             }
                             let (target, sub_path) =
                                 document_target(label_schema.as_ref(), path, ctx)?;
@@ -11072,6 +11109,12 @@ fn execute_update(
                             } else {
                                 path.as_slice()
                             };
+                            if let Some(err) = violation(&full_path[0], None)? {
+                                if skip_on_violation {
+                                    continue 'row_loop;
+                                }
+                                return Err(err);
+                            }
                             let (target, sub_path) =
                                 document_target(label_schema.as_ref(), full_path, ctx)?;
                             let delta = match function.as_str() {
@@ -11458,44 +11501,12 @@ fn execute_update(
 
                         // Collect potential schema violation into Option<ExecutionError> so we can
                         // choose between skip (ON VIOLATION SKIP) and fail (default) after the check.
-                        let schema_err: Option<ExecutionError> = if let Some(ref ls) = label_schema
-                        {
-                            match ls.mode {
-                                SchemaMode::Strict => match ls.get_property(property) {
-                                    None => Some(ExecutionError::SchemaViolation(format!(
-                                        "unknown property '{property}' for strict label '{label}'"
-                                    ))),
-                                    Some(def) if def.is_computed() => {
-                                        Some(ExecutionError::SchemaViolation(format!(
-                                            "cannot SET computed property '{property}'"
-                                        )))
-                                    }
-                                    Some(def) => validate_one(property, &val, def)
-                                        .map_err(|e| ExecutionError::SchemaViolation(e.to_string()))
-                                        .err(),
-                                },
-                                SchemaMode::Validated => {
-                                    if let Some(def) = ls.get_property(property) {
-                                        if def.is_computed() {
-                                            Some(ExecutionError::SchemaViolation(format!(
-                                                "cannot SET computed property '{property}'"
-                                            )))
-                                        } else {
-                                            validate_one(property, &val, def)
-                                                .map_err(|e| {
-                                                    ExecutionError::SchemaViolation(e.to_string())
-                                                })
-                                                .err()
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                                SchemaMode::Flexible => None,
-                            }
-                        } else {
-                            None
-                        };
+                        let schema_err = set_property_violation(
+                            label_schema.as_ref(),
+                            &label,
+                            property,
+                            Some(&val),
+                        );
 
                         // ON VIOLATION SKIP: silently drop this row and move to next.
                         // Default (Fail): propagate the error immediately.
@@ -11565,32 +11576,12 @@ fn execute_update(
                         Some(label) => ctx.load_current_label_schema(label)?,
                         None => None,
                     };
-                    let schema_err: Option<ExecutionError> = label_schema.as_ref().and_then(|ls| {
-                        let root = &path[0];
-                        let label = label.as_deref().unwrap_or_default();
-                        match ls.mode {
-                            SchemaMode::Strict => match ls.get_property(root) {
-                                None => Some(ExecutionError::SchemaViolation(format!(
-                                    "unknown property '{root}' for strict label '{label}'"
-                                ))),
-                                Some(def) if def.is_computed() => {
-                                    Some(ExecutionError::SchemaViolation(format!(
-                                        "cannot SET computed property '{root}'"
-                                    )))
-                                }
-                                Some(_) => None,
-                            },
-                            SchemaMode::Validated => match ls.get_property(root) {
-                                Some(def) if def.is_computed() => {
-                                    Some(ExecutionError::SchemaViolation(format!(
-                                        "cannot SET computed property '{root}'"
-                                    )))
-                                }
-                                _ => None,
-                            },
-                            SchemaMode::Flexible => None,
-                        }
-                    });
+                    let schema_err = set_property_violation(
+                        label_schema.as_ref(),
+                        label.as_deref().unwrap_or_default(),
+                        &path[0],
+                        None,
+                    );
                     if let Some(err) = schema_err {
                         if skip_on_violation {
                             continue 'row_loop;
@@ -11643,31 +11634,12 @@ fn execute_update(
                         Some(label) => ctx.load_current_label_schema(label)?,
                         None => None,
                     };
-                    let schema_err: Option<ExecutionError> = label_schema.as_ref().and_then(|ls| {
-                        let label = label.as_deref().unwrap_or_default();
-                        match ls.mode {
-                            SchemaMode::Strict => match ls.get_property(root_prop) {
-                                None => Some(ExecutionError::SchemaViolation(format!(
-                                    "unknown property '{root_prop}' for strict label '{label}'"
-                                ))),
-                                Some(def) if def.is_computed() => {
-                                    Some(ExecutionError::SchemaViolation(format!(
-                                        "cannot SET computed property '{root_prop}'"
-                                    )))
-                                }
-                                Some(_) => None,
-                            },
-                            SchemaMode::Validated => match ls.get_property(root_prop) {
-                                Some(def) if def.is_computed() => {
-                                    Some(ExecutionError::SchemaViolation(format!(
-                                        "cannot SET computed property '{root_prop}'"
-                                    )))
-                                }
-                                _ => None,
-                            },
-                            SchemaMode::Flexible => None,
-                        }
-                    });
+                    let schema_err = set_property_violation(
+                        label_schema.as_ref(),
+                        label.as_deref().unwrap_or_default(),
+                        root_prop,
+                        None,
+                    );
                     if let Some(err) = schema_err {
                         if skip_on_violation {
                             continue 'row_loop;
@@ -11752,58 +11724,10 @@ fn execute_update(
                         // In STRICT mode every key must be declared; VALIDATED checks declared keys only.
                         let label = record.primary_label().to_string();
                         let label_schema = ctx.load_current_label_schema(&label)?;
-                        if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
-                            let schema_err: Option<ExecutionError> = 'schema: {
-                                for (k, v) in map {
-                                    match ls.mode {
-                                        SchemaMode::Strict => match ls.get_property(k) {
-                                            None => {
-                                                break 'schema Some(
-                                                    ExecutionError::SchemaViolation(format!(
-                                                        "unknown property '{k}' for strict label '{label}'"
-                                                    )),
-                                                );
-                                            }
-                                            Some(def) if def.is_computed() => {
-                                                break 'schema Some(
-                                                    ExecutionError::SchemaViolation(format!(
-                                                        "cannot SET computed property '{k}'"
-                                                    )),
-                                                );
-                                            }
-                                            Some(def) => {
-                                                if let Err(e) = validate_one(k, v, def) {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(
-                                                            e.to_string(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        SchemaMode::Validated => {
-                                            if let Some(def) = ls.get_property(k) {
-                                                if def.is_computed() {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(format!(
-                                                            "cannot SET computed property '{k}'"
-                                                        )),
-                                                    );
-                                                }
-                                                if let Err(e) = validate_one(k, v, def) {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(
-                                                            e.to_string(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        SchemaMode::Flexible => {}
-                                    }
-                                }
-                                None
-                            };
+                        if let Value::Map(ref map) = map_val {
+                            let schema_err = map.iter().find_map(|(k, v)| {
+                                set_property_violation(label_schema.as_ref(), &label, k, Some(v))
+                            });
                             if let Some(err) = schema_err {
                                 if skip_on_violation {
                                     continue 'row_loop;
@@ -11903,58 +11827,10 @@ fn execute_update(
                         // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
                         let label = record.primary_label().to_string();
                         let label_schema = ctx.load_current_label_schema(&label)?;
-                        if let (Some(ref ls), Value::Map(ref map)) = (&label_schema, &map_val) {
-                            let schema_err: Option<ExecutionError> = 'schema: {
-                                for (k, v) in map {
-                                    match ls.mode {
-                                        SchemaMode::Strict => match ls.get_property(k) {
-                                            None => {
-                                                break 'schema Some(
-                                                    ExecutionError::SchemaViolation(format!(
-                                                        "unknown property '{k}' for strict label '{label}'"
-                                                    )),
-                                                );
-                                            }
-                                            Some(def) if def.is_computed() => {
-                                                break 'schema Some(
-                                                    ExecutionError::SchemaViolation(format!(
-                                                        "cannot SET computed property '{k}'"
-                                                    )),
-                                                );
-                                            }
-                                            Some(def) => {
-                                                if let Err(e) = validate_one(k, v, def) {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(
-                                                            e.to_string(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        SchemaMode::Validated => {
-                                            if let Some(def) = ls.get_property(k) {
-                                                if def.is_computed() {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(format!(
-                                                            "cannot SET computed property '{k}'"
-                                                        )),
-                                                    );
-                                                }
-                                                if let Err(e) = validate_one(k, v, def) {
-                                                    break 'schema Some(
-                                                        ExecutionError::SchemaViolation(
-                                                            e.to_string(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        SchemaMode::Flexible => {}
-                                    }
-                                }
-                                None
-                            };
+                        if let Value::Map(ref map) = map_val {
+                            let schema_err = map.iter().find_map(|(k, v)| {
+                                set_property_violation(label_schema.as_ref(), &label, k, Some(v))
+                            });
                             if let Some(err) = schema_err {
                                 if skip_on_violation {
                                     continue 'row_loop;
@@ -15055,6 +14931,49 @@ fn stored_by_name(schema: Option<&LabelSchema>, name: &str) -> bool {
         .is_some_and(|s| matches!(s.mode, SchemaMode::Validated) && s.get_property(name).is_none())
 }
 
+/// What refuses a SET of `property` on a node of `label` under `schema`: an
+/// undeclared property of a STRICT label, a computed property, or a `value`
+/// of another type than declared. `value` is `None` for a write below the
+/// property (a path or a document function), which only the declaration of
+/// the property itself answers for. `None` when the write is admitted.
+fn set_property_violation(
+    schema: Option<&LabelSchema>,
+    label: &str,
+    property: &str,
+    value: Option<&Value>,
+) -> Option<ExecutionError> {
+    let schema = schema?;
+    let def = match (&schema.mode, schema.get_property(property)) {
+        (SchemaMode::Flexible, _) | (SchemaMode::Validated, None) => return None,
+        (SchemaMode::Strict, None) => {
+            return Some(ExecutionError::SchemaViolation(format!(
+                "unknown property '{property}' for strict label '{label}'"
+            )));
+        }
+        (_, Some(def)) => def,
+    };
+    if def.is_computed() {
+        return Some(ExecutionError::SchemaViolation(format!(
+            "cannot SET computed property '{property}'"
+        )));
+    }
+    value
+        .and_then(|v| validate_one(property, v, def).err())
+        .map(|e| ExecutionError::SchemaViolation(e.to_string()))
+}
+
+/// Refuse a user write of a field the engine keeps in every version of a
+/// temporal node.
+fn refuse_engine_temporal_field(property: &str) -> Result<(), ExecutionError> {
+    if coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&property) {
+        return Err(ExecutionError::Unsupported(format!(
+            "SET on '{property}' is reserved: this field is engine-managed on temporal \
+             labels and cannot be assigned by SET"
+        )));
+    }
+    Ok(())
+}
+
 /// Set property `name` of `record` where its schema keeps it, dropping a copy
 /// left in the other place: a record holds one value per name, so no read
 /// can see an older one.
@@ -15998,7 +15917,7 @@ fn execute_alter_label(
 /// the user-supplied property declarations. Rejects:
 ///   - Duplicate label (label already has a current-revision pointer)
 ///   - Reserved engine-internal property names (`__ingestion_ts__`,
-///     `__src__`, `__tgt__`, `__type__`) — these are populated/owned by the
+///     `__deleted__`, `__src__`, `__tgt__`, `__type__`): these are populated/owned by the
 ///     engine; user declarations would shadow them. `valid_from` and
 ///     `valid_to` are user-supplied and may be declared.
 ///   - Unsupported property type spellings
@@ -16034,10 +15953,9 @@ fn execute_create_node_type(
     // temporal labels — engine validates
     // their type and invariants at write time but does not own the values.
     for decl in properties {
-        if matches!(
-            decl.name.as_str(),
-            "__ingestion_ts__" | "__src__" | "__tgt__" | "__type__"
-        ) {
+        if coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&decl.name.as_str())
+            || matches!(decl.name.as_str(), "__src__" | "__tgt__" | "__type__")
+        {
             return Err(ExecutionError::Unsupported(format!(
                 "property name '{}' is reserved for engine-internal use and \
                  cannot be declared in CREATE NODE TYPE",

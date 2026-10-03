@@ -46,6 +46,7 @@ mod integration {
     mod schema_publication;
     mod shared_engine;
     mod temporal_node_reads;
+    mod temporal_strict_schema;
     mod temporal_traversal;
     mod text_index;
     mod tiered_cache;

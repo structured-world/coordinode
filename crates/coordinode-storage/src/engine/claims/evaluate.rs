@@ -495,6 +495,16 @@ fn record_violation(
             .map_or_else(|| "invalid".to_string(), |e| e.to_string())
     };
     let mut props = record.props;
+    // The engine stamps every version of a temporal node with its own
+    // metadata after the write was validated; the definition answers only
+    // for what users wrote.
+    if schema.temporal {
+        props.retain(|id, _| {
+            !names.get(id).is_some_and(|name| {
+                coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&name.as_str())
+            })
+        });
+    }
     let Some(extra) = record.extra.filter(|e| !e.is_empty()) else {
         return validate_properties(schema, &props, names).err().map(first);
     };
