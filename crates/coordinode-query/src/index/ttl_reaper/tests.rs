@@ -858,7 +858,7 @@ fn seed_unique_content(engine: &StorageEngine, value: &str, node: NodeId) {
             &mut txn,
             &index,
             &no_fields,
-            node,
+            coordinode_core::index::derive::EntryOwner::node(node.as_raw()),
             None,
             Some(&[Value::String(value.into())]),
         )

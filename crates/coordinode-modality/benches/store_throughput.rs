@@ -396,7 +396,7 @@ fn bench_index_put_scan(c: &mut Criterion) {
                     &mut txn,
                     &index,
                     &no_fields,
-                    NodeId::from_raw(i),
+                    coordinode_core::index::derive::EntryOwner::node(i),
                     None,
                     Some(&[Value::Int(i as i64)]),
                 )

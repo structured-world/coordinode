@@ -155,6 +155,7 @@ fn derived_record_sources_follow_their_record() {
                 },
             },
             node_id: 9,
+            valid_from: None,
             old: None,
             new: DerivedSource::UnitRecord(ordinal),
         })

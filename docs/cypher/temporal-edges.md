@@ -57,8 +57,10 @@ Non-temporal labels (the default — `CREATE NODE TYPE User WITH (...)` without 
 
 A `CREATE (n:Person {...})` on a temporal label writes a per-version record keyed by `(node_id, valid_from)`. Every mutation that changes user-visible state — `SET`, `REMOVE`, `DELETE`, `DETACH DOCUMENT`, an `ATTACH DOCUMENT` targeting this node — produces a new version through the same close-current + open-new dance:
 
-1. The matched version's record is rewritten in place with `valid_to = NOW` (HLC commit-ts).
+1. The matched version's record is rewritten in place with `valid_to = NOW`.
 2. A new record is written at `valid_from = NOW`, carrying the mutated state with `valid_to` absent and a fresh `__ingestion_ts__`.
+
+`NOW` is one instant per statement, in epoch microseconds: the same instant the statement's reads project at, so the version a `MATCH` found valid is the one the mutation closes.
 
 The same `node_id` survives across versions — the per-version key suffix is what changes. History before `NOW` is always preserved.
 
@@ -79,19 +81,41 @@ Specifics per mutation surface:
 
 ## Reading temporal nodes
 
-`MATCH (n:Person)` and `MATCH (a)-[:E]->(n:Person)` both materialise **every version** of each matched node by default — one row per version, with `n.valid_from`, `n.valid_to`, and any user props on that version. Pattern predicates `WHERE (a)-[:E]->(:Person)` match if **any** version of the candidate carries the label.
+`MATCH (n:Person)`, `MATCH (a)-[:E]->(n:Person)` and an index lookup such as `MATCH (n:Person {name: 'Ada'})` return **the state of each node valid now**: at most one row per node, the version whose interval `[valid_from, valid_to)` contains the statement's `NOW`. The interval is half open: a version is valid from its `valid_from` up to, not including, its `valid_to`; a missing `valid_to` means open-ended.
 
-Filter to the current state with `WHERE n.valid_to IS NULL AND coalesce(n.__deleted__, false) = false`; for a point in time, use a literal comparison on `n.valid_from` / `n.valid_to`. There is no `AS OF VALID_TIME <ts>` clause yet; the literal comparison is the way to take a time slice.
+What is valid now does not depend on write order. A version backfilled after the current one, or an open-ended version that starts in the future, does not replace the current state. A node has no row when nothing is valid now:
+
+- it was deleted (its tombstone version is valid now);
+- its only versions start in the future, or ended in the past;
+- `NOW` falls in a gap between two of its versions.
+
+`valid_to IS NULL` alone is not a test for "current": a version with a known future end is current until that end, and an open-ended version that starts in the future is not current yet.
+
+To read the timeline at another instant, add `temporal_active_at(n, t)` as a conjunct of the `WHERE` with `t` a literal or parameter in epoch microseconds:
+
+```cypher
+MATCH (n:Person {name: 'Ada'})
+WHERE temporal_active_at(n, 1710460800000000)   // 2024-03-15
+RETURN n.title
+```
+
+The node is then projected at `t` instead of `NOW`, with the same rules: a deleted, not-yet-valid or gap state at `t` gives no row. An instant computed from another variable of the row does not select the projection; such a predicate filters the rows projected at `NOW`.
+
+Indexes on a temporal label hold every value any version of the node ever had, so a lookup by a past value still finds the node at a past instant, and a lookup by a value the node no longer holds finds nothing now.
+
+`AS OF TIMESTAMP <ts>` is a separate axis: it reads the database as it was committed at system time `<ts>`, and inside that snapshot the node is still projected at the valid-time `NOW` (or at the `temporal_active_at` instant). Combine both for "what did the database believe at `<ts>` about valid-time `t`".
+
+Not available yet for nodes: enumerating every version of a node in one `MATCH`, and an `AS OF VALID_TIME` clause.
 
 ## Writing temporal edges
 
-Every `CREATE` of a temporal edge **must** provide a `valid_from` epoch-ms timestamp:
+Every `CREATE` of a temporal edge **must** provide a `valid_from` timestamp in epoch microseconds:
 
 ```cypher
 MATCH (a:Person {name: 'Alice'}), (c:Company {name: 'Acme'})
 CREATE (a)-[:WORKS_AT {
-  valid_from: 1577836800000,  // 2020-01-01
-  valid_to:   1688083200000,  // 2023-06-30
+  valid_from: 1577836800000000,  // 2020-01-01
+  valid_to:   1688083200000000,  // 2023-06-30
   role: 'SWE'
 }]->(c)
 ```
@@ -102,7 +126,7 @@ To add a new version of the same edge, just `CREATE` again with a different `val
 
 ```cypher
 MATCH (a:Person {name: 'Alice'}), (c:Company {name: 'Google'})
-CREATE (a)-[:WORKS_AT {valid_from: 1688169600000, role: 'Staff'}]->(c)
+CREATE (a)-[:WORKS_AT {valid_from: 1688169600000000, role: 'Staff'}]->(c)
 ```
 
 Versions are keyed by `(type, src, tgt, valid_from)` — two versions cannot start at the same instant on the same pair.
@@ -114,7 +138,7 @@ The canonical way to "end" an ongoing temporal version is to set its `valid_to` 
 ```cypher
 MATCH (a:Person {name: 'Alice'})-[r:WORKS_AT]->(c:Company {name: 'Google'})
 WHERE r.valid_to IS NULL                  // pick the open version
-SET r.valid_to = 1735603200000            // 2024-12-31
+SET r.valid_to = 1735603200000000         // 2024-12-31
 ```
 
 The version stays in the graph (a plain `MATCH` still returns it) and just answers `false` to `temporal_active_at(r, t)` for `t >= valid_to`. The matched row carries `r.valid_from`, which keys the per-version edgeprop entry — `SET` updates exactly that entry without creating a new version.
@@ -147,7 +171,7 @@ To restrict to a point in time, use **`temporal_active_at(r, t)`**:
 
 ```cypher
 MATCH (a:Person {name: 'Alice'})-[r:WORKS_AT]->(c:Company)
-WHERE temporal_active_at(r, 1710460800000)   // 2024-03-15
+WHERE temporal_active_at(r, 1710460800000000)   // 2024-03-15
 RETURN c.name AS employer
 ```
 
@@ -157,7 +181,7 @@ To restrict to a window, use **`temporal_overlaps(r, t_start, t_end)`**:
 
 ```cypher
 MATCH (a:Person {name: 'Alice'})-[r:WORKS_AT]->(c:Company)
-WHERE temporal_overlaps(r, 1672531200000, 1704067200000)   // calendar year 2023
+WHERE temporal_overlaps(r, 1672531200000000, 1704067200000000)   // calendar year 2023
 RETURN c.name, r.role
 ```
 
@@ -169,9 +193,9 @@ The planner pushes a literal `temporal_active_at(r, T)` predicate down into the 
 
 ```
 Project
-  Filter(temporal_active_at(r, 1700000000000))
+  Filter(temporal_active_at(r, 1700000000000000))
     Traverse(a -[r:WORKS_AT]-> b)
-      temporal_filter(r=r, valid_from<=1700000000000, valid_to>1700000000000)
+      temporal_filter(r=r, valid_from<=1700000000000000, valid_to>1700000000000000)
       NodeScan(a)
 ```
 
@@ -181,7 +205,7 @@ The push-down currently triggers on `temporal_active_at(r, <int_literal>)`. Para
 
 ## Modeling guidelines
 
-- **Pick one `valid_from` convention per type and stick with it.** Epoch milliseconds (`INT`) is the engine-native form and is what `temporal_active_at` / `temporal_overlaps` compare against. If you take input as ISO-8601, convert once at the application boundary.
+- **Pick one `valid_from` convention per type and stick with it.** Epoch microseconds (`INT`) is the engine-native form: it is what the engine assigns on every mutation and what `temporal_active_at` / `temporal_overlaps` compare against. If you take input as ISO-8601, convert once at the application boundary.
 - **Don't overlap versions in your data.** The engine accepts overlapping versions (two rows with overlapping `[valid_from, valid_to)` on the same pair), and `temporal_active_at` will return true for both. Application invariants like "exactly one open version per pair" are not enforced by the engine.
 - **Reserve `DELETE` for true erasure.** Closing a version is `SET r.valid_to`. Hard-deleting history because of a typo loses the audit trail; create a corrective version instead.
 - **A non-temporal edge type with `valid_from` / `valid_to` properties is NOT the same thing.** Non-temporal edges have one row per `(src, tgt)` — a second `CREATE` overwrites the first. Temporal edges keep both. If you want history, declare `TEMPORAL`.
@@ -195,7 +219,7 @@ The push-down currently triggers on `temporal_active_at(r, <int_literal>)`. Para
 
 ## Interval invariants enforced at write time
 
-- `valid_from` must be `INT` or `TIMESTAMP` (epoch milliseconds). `NULL` or any other type is rejected at `CREATE`.
+- `valid_from` must be `INT` or `TIMESTAMP` (epoch microseconds). `NULL` or any other type is rejected at `CREATE`.
 - `valid_to`, if present, must be strictly greater than `valid_from`. Zero-duration versions (`valid_to == valid_from`) and inverted intervals (`valid_to < valid_from`) are rejected.
 - The engine **does not** enforce non-overlapping open versions. Two rows whose `[valid_from, valid_to)` intervals overlap on the same `(src, tgt)` pair are accepted; both will return true to `temporal_active_at` during the overlap. Application code is responsible for the "exactly one open version per pair" invariant if that is the desired semantics.
 
@@ -206,6 +230,6 @@ The push-down currently triggers on `temporal_active_at(r, <int_literal>)`. Para
 ## Limitations
 
 - **Parallel traversal** is bypassed for temporal queries; large fan-out runs sequentially.
-- **No `AS OF TIMESTAMP $t` sugar** that rewrites to `temporal_active_at` yet; use the helper functions directly.
+- **No valid-time clause.** `AS OF TIMESTAMP $t` selects the system-time snapshot (what the database knew at commit time `$t`), never a valid-time instant; for valid time use `temporal_active_at` / `temporal_overlaps` directly.
 - **Adjacency posting tracks existence only.** A traversal that doesn't bind the edge variable (`MATCH (a)-->(b) RETURN a, b`) sees the pair once, not once per version. Reference `r` to materialize per-version rows.
 - **Variable-length paths and edge mutation.** `MATCH (a)-[r:T*1..3]-(b) DELETE r` (or `SET r.x`) acts on the **last hop** of the matched path, not all of them. For multi-hop edits, prefer explicit single-hop patterns.

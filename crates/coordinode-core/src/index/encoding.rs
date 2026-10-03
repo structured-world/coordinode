@@ -161,6 +161,22 @@ pub fn encode_index_key(name: &str, tuple: &[u8], node_id: u64) -> Vec<u8> {
     out
 }
 
+/// Entry of the version of temporal node `node_id` that starts at
+/// `valid_from` under `tuple` in the non-unique index `name`:
+/// `idx:<name>:<tuple>:<node_id u64 BE><valid_from>`, empty value, with
+/// `valid_from` in the order-preserving form of an integer. A node's
+/// versions sort together, oldest first.
+pub fn encode_version_index_key(
+    name: &str,
+    tuple: &[u8],
+    node_id: u64,
+    valid_from: i64,
+) -> Vec<u8> {
+    let mut out = encode_index_key(name, tuple, node_id);
+    out.extend_from_slice(&((valid_from as u64) ^ (1 << 63)).to_be_bytes());
+    out
+}
+
 /// Prefix of every entry of the unique index `name`.
 pub fn unique_index_prefix(name: &str) -> Vec<u8> {
     named_prefix(UNIQUE_PREFIX, name)
@@ -178,11 +194,52 @@ pub fn encode_unique_index_key(name: &str, tuple: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Node id in the trailing 8 bytes of a non-unique entry key, or in the value
-/// of a unique entry.
-pub fn decode_node_id(bytes: &[u8]) -> Option<u64> {
-    let tail: [u8; 8] = bytes.get(bytes.len().checked_sub(8)?..)?.try_into().ok()?;
-    Some(u64::from_be_bytes(tail))
+/// The owner a non-unique entry key of the index `name` names: the node id,
+/// and the version's `valid_from` for an entry of one version of a temporal
+/// node ([`encode_version_index_key`]). `None` for a key that is no entry of
+/// that index.
+pub fn decode_index_entry(name: &str, key: &[u8]) -> Option<(u64, Option<i64>)> {
+    let rest = key.strip_prefix(index_prefix(name).as_slice())?;
+    let owner = rest.get(tuple_len(rest)?..)?.strip_prefix(b":")?;
+    let node_id = u64::from_be_bytes(owner.get(..8)?.try_into().ok()?);
+    match owner.len() {
+        8 => Some((node_id, None)),
+        16 => {
+            let raw = u64::from_be_bytes(owner.get(8..)?.try_into().ok()?);
+            Some((node_id, Some((raw ^ (1 << 63)) as i64)))
+        }
+        _ => None,
+    }
+}
+
+/// Length of the encoded tuple `bytes` starts with: the elements up to the
+/// `:` that ends it, which is no element tag. `None` when an element is
+/// malformed or the tuple does not end.
+fn tuple_len(bytes: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        match *bytes.get(at)? {
+            b':' => return Some(at),
+            TAG_NULL | TAG_FALSE | TAG_TRUE => at += 1,
+            TAG_INT | TAG_FLOAT | TAG_TIMESTAMP => at += 9,
+            TAG_STRING | TAG_BINARY => {
+                at += 1;
+                // Escaped payload: a `0x00` not followed by `0xFF` ends it.
+                loop {
+                    let byte = *bytes.get(at)?;
+                    at += 1;
+                    if byte == 0 {
+                        if bytes.get(at) == Some(&0xFF) {
+                            at += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Prefix of every entry the index `name` wrote under the layout that

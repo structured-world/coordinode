@@ -97,9 +97,49 @@ fn non_unique_entries_sort_by_value_then_id() {
     let k2 = encode_index_key("idx", &alice, 2);
     let k3 = encode_index_key("idx", &bob, 1);
     assert!(k1 < k2 && k2 < k3);
-    assert_eq!(decode_node_id(&k2), Some(2));
+    assert_eq!(decode_index_entry("idx", &k2), Some((2, None)));
     assert!(k1.starts_with(&index_value_prefix("idx", &alice)));
     assert!(k1.starts_with(&index_prefix("idx")));
+}
+
+/// An entry of a temporal node's version carries the node and the version
+/// start: a node's versions sort together, oldest first (negative starts
+/// before positive), and both decode back whatever the tuple holds.
+#[test]
+fn version_entries_carry_node_and_valid_from() {
+    let tricky = encode_tuple(&[
+        Value::String("a\0:\u{ff}".into()),
+        Value::Int(58),
+        Value::Binary(vec![0, b':', 0xFF, 0]),
+        Value::Bool(true),
+    ])
+    .expect("indexable");
+    let older = encode_version_index_key("idx", &tricky, 7, -5);
+    let newer = encode_version_index_key("idx", &tricky, 7, 3);
+    let other = encode_version_index_key("idx", &tricky, 8, i64::MIN);
+    assert!(older < newer && newer < other);
+    assert!(older.starts_with(&index_value_prefix("idx", &tricky)));
+    assert_eq!(decode_index_entry("idx", &older), Some((7, Some(-5))));
+    assert_eq!(decode_index_entry("idx", &newer), Some((7, Some(3))));
+    assert_eq!(decode_index_entry("idx", &other), Some((8, Some(i64::MIN))));
+    assert_eq!(
+        decode_index_entry("idx", &encode_index_key("idx", &tricky, 9)),
+        Some((9, None))
+    );
+}
+
+/// A key of another index, a truncated owner or a malformed tuple decodes to
+/// nothing rather than to a wrong node.
+#[test]
+fn foreign_or_malformed_keys_decode_to_nothing() {
+    let value = enc(Value::Int(1));
+    let key = encode_index_key("idx", &value, 1);
+    assert_eq!(decode_index_entry("other", &key), None);
+    assert_eq!(decode_index_entry("idx", &key[..key.len() - 1]), None);
+    let mut bad = index_prefix("idx");
+    bad.extend_from_slice(&[0x7F, b':']);
+    bad.extend_from_slice(&1u64.to_be_bytes());
+    assert_eq!(decode_index_entry("idx", &bad), None);
 }
 
 /// One index name is never a prefix of another's entries, whatever the

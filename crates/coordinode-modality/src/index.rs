@@ -11,7 +11,8 @@
 //! ([`coordinode_core::index::encoding`]):
 //!
 //! - a non-unique index writes `idx:<name>:<tuple>:<node_id>` with an empty
-//!   value, one entry per node, found by a prefix scan;
+//!   value, one entry per node, found by a prefix scan; on a temporal label
+//!   the key also carries the version's `valid_from`, one entry per version;
 //! - a unique index writes `uidx:<name>:<tuple>` whose value is the holder's
 //!   node id. Keyed by the value alone, the entry is its own uniqueness claim:
 //!   two transactions inserting one value write one key, and write-write
@@ -25,9 +26,9 @@
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::derive::{membership_effects, tuples};
+use coordinode_core::index::derive::{EntryOwner, membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_node_id, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
+    decode_index_entry, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
     legacy_index_prefix, unique_index_prefix,
 };
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
@@ -46,13 +47,14 @@ use crate::index_def::{IndexDefinition, IndexProfile, IndexState, NamespaceIndex
     note = "use `LocalIndexStore`, the CE implementation over a statement transaction"
 )]
 pub trait IndexStore {
-    /// Stage the entry changes of `node_id`'s membership in `index` moving
-    /// from `old` to `new` (`None`: no entry), in the index's profile. A
-    /// RESOLVED index stages the entries as writes the unit logs; a DERIVED
-    /// one stages them for this transaction's reads and conflicts, and the
-    /// unit logs the change sealed under `index`'s binding, with property
-    /// field ids from `field_of`. A unique entry is removed only while
-    /// `node_id` holds it; for a unique value the caller has checked
+    /// Stage the entry changes of `owner`'s membership in `index` moving
+    /// from `old` to `new` (`None`: no entry), in the index's profile. The
+    /// owner is a node, or one version of a temporal node. A RESOLVED index
+    /// stages the entries as writes the unit logs; a DERIVED one stages them
+    /// for this transaction's reads and conflicts, and the unit logs the
+    /// change sealed under `index`'s binding, with property field ids from
+    /// `field_of`. A unique entry is removed only while the owner's node
+    /// holds it; for a unique value the caller has checked
     /// [`Self::unique_conflict`] first. Returns how many entries were put.
     ///
     /// # Errors
@@ -63,7 +65,7 @@ pub trait IndexStore {
         txn: &mut Transaction,
         index: &IndexDefinition,
         field_of: &dyn Fn(&str) -> Option<u32>,
-        node_id: NodeId,
+        owner: EntryOwner,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> StoreResult<usize>;
@@ -96,8 +98,10 @@ pub trait IndexStore {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>>;
 
-    /// The nodes whose entry holds exactly `values`, as the transaction sees
-    /// it. `None` when the values have no key, so the index cannot answer.
+    /// The nodes with an entry holding exactly `values`, as the transaction
+    /// sees it, each once (a temporal node has an entry per version that
+    /// holds them). `None` when the values have no key, so the index cannot
+    /// answer.
     ///
     /// # Errors
     ///
@@ -109,7 +113,8 @@ pub trait IndexStore {
         values: &[Value],
     ) -> StoreResult<Option<Vec<NodeId>>>;
 
-    /// Every node with an entry in `index`, in key order.
+    /// The node of every entry in `index`, in key order: a temporal node once
+    /// per version with an entry.
     ///
     /// # Errors
     ///
@@ -252,7 +257,8 @@ pub trait IndexStore {
 /// let store = LocalIndexStore::new(&engine);
 /// assert_eq!(store.unique_conflict(&mut txn, &index, &email, NodeId::from_raw(1))?, None);
 /// let no_fields = |_: &str| None;
-/// store.stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(1), None, Some(&email))?;
+/// let owner = coordinode_core::index::derive::EntryOwner::node(1);
+/// store.stage_membership(&mut txn, &index, &no_fields, owner, None, Some(&email))?;
 /// assert_eq!(
 ///     store.unique_conflict(&mut txn, &index, &email, NodeId::from_raw(2))?,
 ///     Some(NodeId::from_raw(1))
@@ -308,11 +314,12 @@ impl IndexStore for LocalIndexStore<'_> {
         txn: &mut Transaction,
         index: &IndexDefinition,
         field_of: &dyn Fn(&str) -> Option<u32>,
-        node_id: NodeId,
+        owner: EntryOwner,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> StoreResult<usize> {
-        let mut effects = membership_effects(&index.name, index.unique, node_id.as_raw(), old, new);
+        let node_id = NodeId::from_raw(owner.node_id);
+        let mut effects = membership_effects(&index.name, index.unique, owner, old, new);
         if index.unique {
             // A value another node holds now (taken in this transaction) is
             // not this node's to release.
@@ -341,7 +348,7 @@ impl IndexStore for LocalIndexStore<'_> {
             }
             IndexProfile::Derived => txn.stage_derived(
                 &index.binding(field_of),
-                node_id.as_raw(),
+                owner,
                 old.map(<[Value]>::to_vec),
                 new.map(<[Value]>::to_vec),
                 &effects,
@@ -411,10 +418,14 @@ impl IndexStore for LocalIndexStore<'_> {
             if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
                 continue;
             }
-            if let Some(id) = decode_node_id(&key) {
+            if let Some((id, _)) = decode_index_entry(&index.name, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }
+        // A temporal node's versions holding the value are one node; the
+        // scan appends this transaction's own entries after the stored ones.
+        out.sort_unstable();
+        out.dedup();
         Ok(Some(out))
     }
 
@@ -439,7 +450,7 @@ impl IndexStore for LocalIndexStore<'_> {
             }
             if index.unique {
                 out.push(decode_holder(&value)?);
-            } else if let Some(id) = decode_node_id(&key) {
+            } else if let Some((id, _)) = decode_index_entry(&index.name, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }

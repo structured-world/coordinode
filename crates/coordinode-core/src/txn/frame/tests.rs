@@ -308,9 +308,56 @@ fn derive(node_id: u64, new: DerivedSource) -> Mutation {
     Mutation::Derive(DerivedIndexWork {
         binding: binding(crate::index::derive::KEY_CODEC),
         node_id,
+        valid_from: None,
         old: Some(vec![crate::graph::types::Value::String("old@x".into())]),
         new,
     })
+}
+
+/// An owner tag that is neither a node nor a version is refused by the
+/// decoder rather than read as some other owner.
+#[test]
+fn an_unknown_owner_tag_is_refused() {
+    const MARK: i64 = 0x7A7A_7A7A_7A7A_7A7A;
+    let Mutation::Derive(mut work) = derive(1, DerivedSource::Values(None)) else {
+        unreachable!("derive builds a Derive mutation")
+    };
+    work.valid_from = Some(MARK);
+    let mut body = header(1);
+    Encoder::default()
+        .op(&Mutation::Derive(work), &mut body)
+        .expect("op");
+    let at = body
+        .windows(8)
+        .position(|w| w == MARK.to_be_bytes())
+        .expect("the version is in the body");
+    assert_eq!(body[at - 1], OWNER_VERSION);
+    body[at - 1] = 7;
+    assert!(matches!(
+        decode(&signed(body)),
+        Err(FrameError::UnknownTag(7))
+    ));
+}
+
+/// Work for a version of a temporal node round-trips with its valid_from,
+/// negative and extreme starts included, beside work for a plain node.
+#[test]
+fn version_work_round_trips_its_valid_from() {
+    let version = |node_id, valid_from| {
+        let Mutation::Derive(mut work) = derive(node_id, DerivedSource::Values(None)) else {
+            unreachable!("derive builds a Derive mutation")
+        };
+        work.valid_from = Some(valid_from);
+        Mutation::Derive(work)
+    };
+    let unit = proposal(vec![
+        version(1, -5),
+        derive(2, DerivedSource::Values(None)),
+        version(3, i64::MIN),
+        version(4, i64::MAX),
+    ]);
+    let frame = encode_proposal(&unit).expect("encode");
+    assert_eq!(decode(&frame).expect("decode"), unit);
 }
 
 /// DERIVED work round-trips with its binding, inputs and source, and the
@@ -547,6 +594,7 @@ fn an_unsupported_interpretation_is_refused() {
     let work = Mutation::Derive(DerivedIndexWork {
         binding: binding(crate::index::derive::KEY_CODEC + 1),
         node_id: 1,
+        valid_from: None,
         old: None,
         new: DerivedSource::Values(None),
     });

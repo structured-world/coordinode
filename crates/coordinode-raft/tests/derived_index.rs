@@ -122,7 +122,12 @@ fn unique_email() -> IndexBinding {
 /// The entry key and value of `node_id` holding `email`.
 fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
     let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
-    entry("u_email", true, &tuple, node_id)
+    entry(
+        "u_email",
+        true,
+        &tuple,
+        coordinode_core::index::derive::EntryOwner::node(node_id),
+    )
 }
 
 /// A unit that writes `node_id`'s record with `email` and derives its entry
@@ -147,6 +152,7 @@ fn write_email(
             Mutation::Derive(DerivedIndexWork {
                 binding: unique_email(),
                 node_id,
+                valid_from: None,
                 old: old.map(|o| vec![Value::String(o.into())]),
                 new: DerivedSource::UnitRecord(0),
             }),

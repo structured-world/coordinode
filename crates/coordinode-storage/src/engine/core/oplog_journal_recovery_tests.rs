@@ -1272,6 +1272,7 @@ mod derived {
                     interpretation: email_index(),
                 },
                 node_id,
+                valid_from: None,
                 old: old.map(|o| vec![Value::String(o.into())]),
                 new: DerivedSource::UnitRecord(0),
             }),

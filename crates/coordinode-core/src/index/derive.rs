@@ -9,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::encoding::{encode_index_key, encode_tuple, encode_unique_index_key};
+use super::encoding::{
+    encode_index_key, encode_tuple, encode_unique_index_key, encode_version_index_key,
+};
 use crate::graph::node::NodeRecord;
 use crate::graph::types::Value;
 
@@ -152,56 +154,94 @@ impl IndexInterpretation {
         })
     }
 
-    /// The entry effects of a node's membership moving from `old` to `new`;
-    /// see [`membership_effects`].
+    /// The entry effects of a membership moving from `old` to `new`; see
+    /// [`membership_effects`].
     pub fn membership_effects(
         &self,
-        node_id: u64,
+        owner: EntryOwner,
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> Vec<EntryEffect> {
-        membership_effects(&self.name, self.unique, node_id, old, new)
+        membership_effects(&self.name, self.unique, owner, old, new)
     }
 }
 
-/// The entry of `node_id` under `tuple` in the index `name`: keyed by the
-/// value alone and holding the node when `unique`, keyed by value and node
+/// Whose membership an entry records: a node, or one version of a temporal
+/// node, named by the `valid_from` it starts at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntryOwner {
+    /// The node.
+    pub node_id: u64,
+    /// The version's `valid_from`; `None` for a node that is not temporal.
+    pub valid_from: Option<i64>,
+}
+
+impl EntryOwner {
+    /// A node that is not temporal: one membership per node.
+    pub const fn node(node_id: u64) -> Self {
+        Self {
+            node_id,
+            valid_from: None,
+        }
+    }
+
+    /// The version of temporal node `node_id` that starts at `valid_from`.
+    pub const fn version(node_id: u64, valid_from: i64) -> Self {
+        Self {
+            node_id,
+            valid_from: Some(valid_from),
+        }
+    }
+}
+
+/// The entry of `owner` under `tuple` in the index `name`: keyed by the
+/// value alone and holding the node when `unique`, keyed by value and owner
 /// with an empty value otherwise.
-pub fn entry(name: &str, unique: bool, tuple: &[u8], node_id: u64) -> (Vec<u8>, Vec<u8>) {
+pub fn entry(name: &str, unique: bool, tuple: &[u8], owner: EntryOwner) -> (Vec<u8>, Vec<u8>) {
     if unique {
         (
             encode_unique_index_key(name, tuple),
-            node_id.to_be_bytes().to_vec(),
+            owner.node_id.to_be_bytes().to_vec(),
         )
     } else {
-        (encode_index_key(name, tuple, node_id), Vec::new())
+        let key = match owner.valid_from {
+            Some(valid_from) => encode_version_index_key(name, tuple, owner.node_id, valid_from),
+            None => encode_index_key(name, tuple, owner.node_id),
+        };
+        (key, Vec::new())
     }
 }
 
-/// The entry effects in the index `name` of a node's membership moving from
+/// The entry effects in the index `name` of `owner`'s membership moving from
 /// `old` to `new`: a delete for each tuple it leaves, a put for each it
 /// enters. A tuple in both is untouched.
+///
+/// A unique entry is keyed by the value alone and claims it for the node,
+/// whichever of its versions holds it. A version of a temporal node leaving a
+/// value therefore keeps the claim: another version of the node may hold the
+/// value too, and the node holds it in its history either way.
 pub fn membership_effects(
     name: &str,
     unique: bool,
-    node_id: u64,
+    owner: EntryOwner,
     old: Option<&[Value]>,
     new: Option<&[Value]>,
 ) -> Vec<EntryEffect> {
     let before = old.map(tuples).unwrap_or_default();
     let after = new.map(tuples).unwrap_or_default();
     let mut effects = Vec::with_capacity(before.len() + after.len());
+    let releases = !(unique && owner.valid_from.is_some());
     for tuple in &before {
-        if after.binary_search(tuple).is_err() {
+        if releases && after.binary_search(tuple).is_err() {
             effects.push(EntryEffect {
-                key: entry(name, unique, tuple, node_id).0,
+                key: entry(name, unique, tuple, owner).0,
                 value: None,
             });
         }
     }
     for tuple in &after {
         if before.binary_search(tuple).is_err() {
-            let (key, value) = entry(name, unique, tuple, node_id);
+            let (key, value) = entry(name, unique, tuple, owner);
             effects.push(EntryEffect {
                 key,
                 value: Some(value),
@@ -359,8 +399,11 @@ pub fn resolve_unit(
                 interpretation.record_membership(&record)
             }
         };
-        let derived =
-            interpretation.membership_effects(work.node_id, work.old.as_deref(), new.as_deref());
+        let owner = EntryOwner {
+            node_id: work.node_id,
+            valid_from: work.valid_from,
+        };
+        let derived = interpretation.membership_effects(owner, work.old.as_deref(), new.as_deref());
         if effects.len() + derived.len() > max_effects {
             return Err(DeriveError::FanOut(max_effects));
         }

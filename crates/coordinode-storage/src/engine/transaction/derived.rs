@@ -8,18 +8,20 @@
 //! node had when the transaction began and the one it ends with, and every
 //! member derives the entries from those.
 
-use coordinode_core::graph::node::{NodeRecord, decode_node_key};
+use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_core::graph::types::Value;
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// One node's membership change in one DERIVED index.
+/// One node's (or temporal node version's) membership change in one DERIVED
+/// index.
 #[derive(Debug, Clone)]
 struct Change {
     binding: IndexBinding,
-    node_id: u64,
+    owner: EntryOwner,
     /// The membership before the transaction.
     old: Option<Vec<Value>>,
     /// The membership after the latest statement.
@@ -29,9 +31,9 @@ struct Change {
 /// DERIVED index work staged by one transaction.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DerivedLedger {
-    /// In the order each (index, node) was first changed.
+    /// In the order each (index, owner) was first changed.
     changes: Vec<Change>,
-    by_target: FxHashMap<(String, u64), usize>,
+    by_target: FxHashMap<(String, EntryOwner), usize>,
     /// The index-partition keys staged for DERIVED indexes.
     keys: FxHashSet<Vec<u8>>,
     /// The index definitions this transaction's effects are bound to, in
@@ -45,13 +47,13 @@ pub(crate) struct DerivedLedger {
 }
 
 impl DerivedLedger {
-    /// Record that `node_id`'s membership in the index `binding` names moves
+    /// Record that `owner`'s membership in the index `binding` names moves
     /// from `old` to `new`, staging `keys` in the write buffer. A later change
-    /// of the same node in the same index keeps the first `old`.
+    /// of the same owner in the same index keeps the first `old`.
     pub(crate) fn stage(
         &mut self,
         binding: &IndexBinding,
-        node_id: u64,
+        owner: EntryOwner,
         old: Option<Vec<Value>>,
         new: Option<Vec<Value>>,
         keys: impl IntoIterator<Item = Vec<u8>>,
@@ -60,14 +62,14 @@ impl DerivedLedger {
             self.staged_effects += 1;
             self.keys.insert(key);
         }
-        let target = (binding.interpretation.name.clone(), node_id);
+        let target = (binding.interpretation.name.clone(), owner);
         match self.by_target.get(&target) {
             Some(&at) => self.changes[at].new = new,
             None => {
                 self.by_target.insert(target, self.changes.len());
                 self.changes.push(Change {
                     binding: binding.clone(),
-                    node_id,
+                    owner,
                     old,
                     new,
                 });
@@ -104,7 +106,7 @@ impl DerivedLedger {
             sealed += change
                 .binding
                 .interpretation
-                .membership_effects(change.node_id, change.old.as_deref(), change.new.as_deref())
+                .membership_effects(change.owner, change.old.as_deref(), change.new.as_deref())
                 .len();
             if sealed > max {
                 return Err(max);
@@ -119,8 +121,14 @@ impl DerivedLedger {
     /// membership travels as values. A change that ends where it began
     /// derives nothing and is left out.
     pub(crate) fn seal(self, mutations: &mut Vec<Mutation>) {
-        // The last whole-record put of each node, unless an operand follows it.
-        let mut records: FxHashMap<u64, Option<u32>> = FxHashMap::default();
+        // The last whole-record put of each node or temporal node version,
+        // unless an operand follows it.
+        let owner_of = |key: &[u8]| match decode_node_key(key) {
+            Some((_, node)) => Some(EntryOwner::node(node.as_raw())),
+            None => decode_temporal_node_key(key)
+                .map(|(_, node, valid_from)| EntryOwner::version(node.as_raw(), valid_from)),
+        };
+        let mut records: FxHashMap<EntryOwner, Option<u32>> = FxHashMap::default();
         for (at, mutation) in mutations.iter().enumerate() {
             match mutation {
                 Mutation::Put {
@@ -128,8 +136,8 @@ impl DerivedLedger {
                     key,
                     ..
                 } => {
-                    if let (Some((_, node)), Ok(at)) = (decode_node_key(key), u32::try_from(at)) {
-                        records.insert(node.as_raw(), Some(at));
+                    if let (Some(owner), Ok(at)) = (owner_of(key), u32::try_from(at)) {
+                        records.insert(owner, Some(at));
                     }
                 }
                 Mutation::Merge {
@@ -137,8 +145,8 @@ impl DerivedLedger {
                     key,
                     ..
                 } => {
-                    if let Some((_, node)) = decode_node_key(key) {
-                        records.insert(node.as_raw(), None);
+                    if let Some(owner) = owner_of(key) {
+                        records.insert(owner, None);
                     }
                 }
                 _ => {}
@@ -148,22 +156,19 @@ impl DerivedLedger {
             if change.old == change.new {
                 continue;
             }
-            let from_record = records
-                .get(&change.node_id)
-                .copied()
-                .flatten()
-                .filter(|&at| {
-                    // The record must yield exactly the membership the
-                    // transaction saw; anything else travels as values.
-                    record_membership(mutations, at, &change.binding) == Some(change.new.clone())
-                });
+            let from_record = records.get(&change.owner).copied().flatten().filter(|&at| {
+                // The record must yield exactly the membership the
+                // transaction saw; anything else travels as values.
+                record_membership(mutations, at, &change.binding) == Some(change.new.clone())
+            });
             let new = match from_record {
                 Some(at) => DerivedSource::UnitRecord(at),
                 None => DerivedSource::Values(change.new),
             };
             mutations.push(Mutation::Derive(DerivedIndexWork {
                 binding: change.binding,
-                node_id: change.node_id,
+                node_id: change.owner.node_id,
+                valid_from: change.owner.valid_from,
                 old: change.old,
                 new,
             }));

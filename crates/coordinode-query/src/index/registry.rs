@@ -10,6 +10,7 @@ use std::sync::RwLock;
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
@@ -51,6 +52,9 @@ pub struct UniqueClaim {
 pub struct PropertyChange<'a> {
     /// The node.
     pub node_id: NodeId,
+    /// The `valid_from` of the temporal node's version that changes; `None`
+    /// for a node that is not temporal.
+    pub valid_from: Option<i64>,
     /// Its primary label.
     pub label: &'a str,
     /// The properties that change.
@@ -61,14 +65,28 @@ pub struct PropertyChange<'a> {
     pub after: &'a dyn Fn(&str) -> Option<Value>,
 }
 
-/// A node as it is created, or as it was before it is deleted.
+/// A node, or one version of a temporal node, as it is created, or as it was
+/// before it is deleted.
 pub struct NodeState<'a> {
     /// The node.
     pub node_id: NodeId,
+    /// The version's `valid_from` for a temporal node; `None` for a node
+    /// that is not temporal.
+    pub valid_from: Option<i64>,
     /// Its primary label.
     pub label: &'a str,
     /// Its properties.
     pub value_of: &'a dyn Fn(&str) -> Option<Value>,
+}
+
+impl NodeState<'_> {
+    /// Whose entries the state holds: the node, or its version.
+    fn owner(&self) -> EntryOwner {
+        EntryOwner {
+            node_id: self.node_id.as_raw(),
+            valid_from: self.valid_from,
+        }
+    }
 }
 
 /// The field id a property name is bound to now, which a DERIVED effect is
@@ -338,7 +356,7 @@ impl IndexRegistry {
                 engine,
                 txn,
                 &index,
-                node.node_id,
+                node.owner(),
                 node.value_of,
                 field_of,
                 claims,
@@ -374,16 +392,11 @@ impl IndexRegistry {
                 continue;
             }
             bind(txn, &index, version)?;
-            stage(
-                engine,
-                txn,
-                &index,
-                field_of,
-                change.node_id,
-                old,
-                new,
-                claims,
-            )?;
+            let owner = EntryOwner {
+                node_id: change.node_id.as_raw(),
+                valid_from: change.valid_from,
+            };
+            stage(engine, txn, &index, field_of, owner, old, new, claims)?;
         }
         Ok(())
     }
@@ -404,7 +417,7 @@ impl IndexRegistry {
         {
             if let Some(values) = entry_values(&index, node.value_of) {
                 bind(txn, &index, version)?;
-                store.stage_membership(txn, &index, field_of, node.node_id, Some(&values), None)?;
+                store.stage_membership(txn, &index, field_of, node.owner(), Some(&values), None)?;
             }
         }
         Ok(())
@@ -426,15 +439,15 @@ fn bind(
     Ok(())
 }
 
-/// Stage the entry `index` holds for a node whose properties `value_of`
-/// answers, if the node has one there, and say whether it did. A unique
-/// value another node holds refuses the write; a unique value claimed is
-/// appended to `claims`.
+/// Stage the entry `index` holds for `owner` (a node, or one version of a
+/// temporal node) whose properties `value_of` answers, if it has one there,
+/// and say whether it did. A unique value another node holds refuses the
+/// write; a unique value claimed is appended to `claims`.
 pub fn stage_node_entry(
     engine: &StorageEngine,
     txn: &mut Transaction,
     index: &IndexDefinition,
-    node_id: NodeId,
+    owner: EntryOwner,
     value_of: &dyn Fn(&str) -> Option<Value>,
     field_of: FieldOf<'_>,
     claims: &mut Vec<UniqueClaim>,
@@ -445,7 +458,7 @@ pub fn stage_node_entry(
             txn,
             index,
             field_of,
-            node_id,
+            owner,
             None,
             Some(values),
             claims,
@@ -468,7 +481,7 @@ pub fn record_lookup<'r>(
     }
 }
 
-/// Stage one node's membership in `index` moving from `old` to `new`,
+/// Stage `owner`'s membership in `index` moving from `old` to `new`,
 /// refusing a unique value another node holds, and say whether an entry was
 /// put.
 #[allow(clippy::too_many_arguments)]
@@ -477,11 +490,12 @@ fn stage(
     txn: &mut Transaction,
     index: &IndexDefinition,
     field_of: FieldOf<'_>,
-    node_id: NodeId,
+    owner: EntryOwner,
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
     claims: &mut Vec<UniqueClaim>,
 ) -> Result<bool, IndexWriteError> {
+    let node_id = NodeId::from_raw(owner.node_id);
     let store = LocalIndexStore::new(engine);
     if index.unique {
         if let Some(values) = &new {
@@ -490,14 +504,8 @@ fn stage(
             }
         }
     }
-    let written = store.stage_membership(
-        txn,
-        index,
-        field_of,
-        node_id,
-        old.as_deref(),
-        new.as_deref(),
-    )? > 0;
+    let written =
+        store.stage_membership(txn, index, field_of, owner, old.as_deref(), new.as_deref())? > 0;
     if index.unique && written {
         if let Some(values) = new {
             claims.push(UniqueClaim {

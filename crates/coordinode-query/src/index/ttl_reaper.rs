@@ -163,8 +163,10 @@ impl BtreeIndexes {
                 .or_else(|| record.get_extra(name).cloned())
         };
         let field_of = |name: &str| self.fields.get(name).copied();
+        // The reaper reads only node keys that are not temporal versions.
         let node = super::registry::NodeState {
             node_id,
+            valid_from: None,
             label,
             value_of: &lookup,
         };

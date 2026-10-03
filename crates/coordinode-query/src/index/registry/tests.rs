@@ -49,6 +49,7 @@ fn create(
         &mut t,
         &NodeState {
             node_id: NodeId::from_raw(id),
+            valid_from: None,
             label: "User",
             value_of: &lookup,
         },
@@ -73,6 +74,7 @@ fn change(
         &mut t,
         &PropertyChange {
             node_id: NodeId::from_raw(id),
+            valid_from: None,
             label: "User",
             properties: &[property],
             before: &before,
@@ -239,6 +241,7 @@ fn a_deleted_node_leaves_the_index() {
         &mut txn(&engine),
         &NodeState {
             node_id: NodeId::from_raw(1),
+            valid_from: None,
             label: "User",
             value_of: &props_lookup(&props),
         },

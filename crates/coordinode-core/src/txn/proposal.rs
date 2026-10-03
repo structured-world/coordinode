@@ -198,6 +198,9 @@ pub struct DerivedIndexWork {
     pub binding: IndexBinding,
     /// The node.
     pub node_id: u64,
+    /// The `valid_from` of the node's version whose membership changes, for
+    /// a temporal node; `None` for a node that is not temporal.
+    pub valid_from: Option<i64>,
     /// Its membership before the unit, or `None` when it had no entry.
     pub old: Option<Vec<crate::graph::types::Value>>,
     /// Its membership after the unit.

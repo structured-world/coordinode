@@ -2739,6 +2739,57 @@ fn clone_node_temporal_as_of_before_existence_errors() {
     );
 }
 
+/// `AS OF <ts>` after the source's only version ended finds no state to clone:
+/// the version that started last before `<ts>` is not valid at `<ts>`.
+#[test]
+fn clone_node_temporal_as_of_after_the_end_errors() {
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000, valid_to: 2000})")
+        .expect("seed");
+
+    let err = db
+        .execute_cypher(
+            "MATCH (a:Emp {name: 'Alice'}) WHERE temporal_active_at(a, 1500) \
+             CLONE NODE a AS b AS OF 5000",
+        )
+        .expect_err("no state is valid at valid-time 5000");
+    assert!(
+        format!("{err}").contains("not found"),
+        "AS OF after the end must error clearly: {err}"
+    );
+}
+
+/// `AS OF <ts>` after the source was deleted finds its tombstone, not a state
+/// to clone.
+#[test]
+fn clone_node_temporal_as_of_after_delete_errors() {
+    let mut db = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal type");
+    db.execute_cypher("CREATE (a:Emp {name: 'Alice', valid_from: 1000})")
+        .expect("seed");
+    db.execute_cypher("MATCH (a:Emp {name: 'Alice'}) DELETE a")
+        .expect("delete");
+
+    let err = db
+        .execute_cypher(&format!(
+            "MATCH (a:Emp {{name: 'Alice'}}) WHERE temporal_active_at(a, 1500) \
+             CLONE NODE a AS b AS OF {}",
+            i64::MAX
+        ))
+        .expect_err("the source is deleted at that valid-time");
+    assert!(
+        format!("{err}").contains("not found"),
+        "AS OF after the delete must error clearly: {err}"
+    );
+}
+
 // ── REDIRECT EDGES ────────────────────────────────────────────────────
 
 /// REDIRECT EDGES moves an outgoing edge off the source onto the destination:
@@ -5704,7 +5755,7 @@ fn create_temporal_nodes_each_with_own_valid_from_match_returns_all() {
     let rows = db
         .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf")
         .expect("MATCH temporal");
-    assert_eq!(rows.len(), 3, "every version must be returned: {rows:?}");
+    assert_eq!(rows.len(), 3, "each node's current state: {rows:?}");
 
     let mut vfs: Vec<i64> = rows
         .iter()
@@ -5810,11 +5861,11 @@ fn temporal_and_non_temporal_coexist_in_same_db() {
     db.execute_cypher("CREATE (c:Company {name: 'Acme'})")
         .expect("Company");
 
-    // Person MATCH returns 2 versions.
+    // Person MATCH returns the two Person nodes' current states.
     let people = db
         .execute_cypher("MATCH (p:Person) RETURN p.name AS name")
         .expect("MATCH Person");
-    assert_eq!(people.len(), 2, "two Person versions: {people:?}");
+    assert_eq!(people.len(), 2, "two Person nodes: {people:?}");
 
     // Company MATCH returns the single non-temporal node — temporal
     // Person versions do NOT bleed into the Company scan.
@@ -5845,37 +5896,33 @@ fn delete_on_temporal_node_writes_tombstone_and_closes_open_version() {
     db.execute_cypher("MATCH (p:Person) DELETE p")
         .expect("DELETE on temporal must succeed");
 
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, \
-             p.valid_to AS vt, p.__deleted__ AS deleted",
-        )
+    // The node no longer exists now.
+    let now = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name")
         .expect("MATCH after delete");
+    assert!(now.is_empty(), "a deleted node has no current row: {now:?}");
 
-    assert!(
-        rows.len() >= 2,
-        "after tombstone there must be at least the original closed version and the tombstone: {rows:?}"
+    // History: the original version closed where the tombstone opens.
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    assert_eq!(rows.len(), 2, "original + tombstone: {rows:?}");
+    let original = &rows[0];
+    let tombstone = &rows[1];
+    assert_eq!(original.get("valid_from"), Some(&Value::Int(100)));
+    assert_eq!(original.get("name"), Some(&Value::String("Alice".into())));
+    assert_eq!(tombstone.get("__deleted__"), Some(&Value::Bool(true)));
+    assert_eq!(
+        original.get("valid_to"),
+        tombstone.get("valid_from"),
+        "the original closes where the tombstone opens: {rows:?}"
     );
+    assert_eq!(tombstone.get("name"), None, "a tombstone carries no props");
 
-    // Find the tombstone row (deleted = true).
-    let tombstone = rows
-        .iter()
-        .find(|r| matches!(r.get("deleted"), Some(Value::Bool(true))))
-        .expect("tombstone row with __deleted__=true must exist");
-    assert!(
-        matches!(tombstone.get("vf"), Some(Value::Int(_))),
-        "tombstone must have a valid_from"
-    );
-
-    // The original version (vf=100) must have valid_to set (was closed).
-    let original = rows
-        .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("original valid_from=100 row must still exist");
-    assert!(
-        matches!(original.get("vt"), Some(Value::Int(_))),
-        "original open version must have valid_to set after delete: {original:?}"
-    );
+    // The state before the deletion is still readable at its instant.
+    let past = db
+        .execute_cypher("MATCH (p:Person) WHERE temporal_active_at(p, 150) RETURN p.name AS name")
+        .expect("MATCH in the past");
+    assert_eq!(past.len(), 1, "{past:?}");
+    assert_eq!(past[0].get("name"), Some(&Value::String("Alice".into())));
 }
 
 /// DELETE on a non-temporal node is unaffected by the temporal tombstone
@@ -5914,19 +5961,19 @@ fn delete_on_already_closed_temporal_node_is_safe() {
     .expect("CREATE NODE TYPE");
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, valid_to: 200})")
         .expect("CREATE closed temporal");
-    // Delete the closed version.
-    db.execute_cypher("MATCH (p:Person) DELETE p")
+    // Delete the closed version, matched at an instant inside it.
+    db.execute_cypher("MATCH (p:Person) WHERE temporal_active_at(p, 150) DELETE p")
         .expect("DELETE on closed temporal must not error");
-    let rows = db
-        .execute_cypher("MATCH (p:Person) RETURN p.valid_from AS vf, p.__deleted__ AS deleted")
-        .expect("MATCH after delete");
-    // Original (closed) + tombstone.
-    assert!(rows.len() >= 2, "rows after delete: {rows:?}");
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r.get("deleted"), Some(Value::Bool(true)))),
-        "tombstone row must exist: {rows:?}"
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    // Original (closed, its end untouched) + tombstone.
+    assert_eq!(rows.len(), 2, "rows after delete: {rows:?}");
+    assert_eq!(rows[0].get("valid_from"), Some(&Value::Int(100)));
+    assert_eq!(
+        rows[0].get("valid_to"),
+        Some(&Value::Int(200)),
+        "a closed version keeps its end: {rows:?}"
     );
+    assert_eq!(rows[1].get("__deleted__"), Some(&Value::Bool(true)));
 }
 
 /// REMOVE n.<prop> on a temporal node writes a NEW version
@@ -5946,38 +5993,30 @@ fn remove_property_on_temporal_node_writes_new_version_without_prop() {
     db.execute_cypher("MATCH (p:Person) REMOVE p.nickname")
         .expect("REMOVE on temporal must succeed (close+open)");
 
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, \
-             p.valid_to AS vt, p.nickname AS nick",
-        )
-        .expect("MATCH after REMOVE");
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
+    let (original, new_version) = (&rows[0], &rows[1]);
 
-    // Original (vf=100) closed, still has nickname.
-    let original = rows
-        .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("original vf=100 row");
+    // Original (vf=100) closed where the new one opens, still has nickname.
+    assert_eq!(original.get("valid_from"), Some(&Value::Int(100)));
     assert_eq!(
-        original.get("nick"),
+        original.get("nickname"),
         Some(&Value::String("Ali".into())),
         "original version preserved nickname: {original:?}"
     );
-    assert!(
-        matches!(original.get("vt"), Some(Value::Int(_))),
-        "original closed with valid_to: {original:?}"
-    );
+    assert_eq!(original.get("valid_to"), new_version.get("valid_from"));
 
-    // New version (vf != 100) has no nickname.
-    let new_version = rows
-        .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("new version row");
-    assert!(
-        matches!(new_version.get("nick"), None | Some(Value::Null)),
+    // New version has no nickname, and is what a bare MATCH sees now.
+    assert_eq!(
+        new_version.get("nickname"),
+        None,
         "new version must not have nickname: {new_version:?}"
     );
+    let now = db
+        .execute_cypher("MATCH (p:Person) RETURN p.nickname AS nick")
+        .expect("MATCH after REMOVE");
+    assert_eq!(now.len(), 1, "one current row: {now:?}");
+    assert!(matches!(now[0].get("nick"), None | Some(Value::Null)));
 }
 
 /// REMOVE valid_from / valid_to on a temporal node is rejected — these
@@ -5994,7 +6033,9 @@ fn remove_bitemporal_axis_on_temporal_node_is_rejected() {
 
     for axis in ["valid_from", "valid_to"] {
         let err = db
-            .execute_cypher(&format!("MATCH (p:Person) REMOVE p.{axis}"))
+            .execute_cypher(&format!(
+                "MATCH (p:Person) WHERE temporal_active_at(p, 150) REMOVE p.{axis}"
+            ))
             .expect_err(&format!("REMOVE p.{axis} must reject"));
         let msg = format!("{err}");
         assert!(msg.contains(axis), "error must mention {axis}: {msg}");
@@ -6038,23 +6079,20 @@ fn set_nested_property_path_on_temporal_node_writes_new_version() {
     db.execute_cypher("MATCH (p:Person) SET p.config.host = 'new'")
         .expect("nested SET on temporal must succeed");
 
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.config AS config",
-        )
-        .expect("MATCH after nested SET");
-    assert!(
-        rows.len() >= 2,
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    assert_eq!(
+        rows.len(),
+        2,
         "must have old + new version after nested SET: {rows:?}"
     );
 
     // Original (vf=100) closed, still has config.host = 'old'.
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original vf=100 row");
     assert!(
-        matches!(original.get("vt"), Some(Value::Int(_))),
+        matches!(original.get("valid_to"), Some(Value::Int(_))),
         "original closed: {original:?}"
     );
     if let Some(Value::Document(rmpv::Value::Map(entries))) = original.get("config") {
@@ -6070,7 +6108,7 @@ fn set_nested_property_path_on_temporal_node_writes_new_version() {
     // New version: config.host = 'new'.
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new version row");
     if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("config") {
         let host = entries.iter().find_map(|(k, v)| match (k, v) {
@@ -6103,17 +6141,13 @@ fn remove_nested_property_path_on_temporal_node_writes_new_version() {
     db.execute_cypher("MATCH (p:Person) REMOVE p.config.port")
         .expect("nested REMOVE on temporal must succeed");
 
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.config AS config",
-        )
-        .expect("MATCH after nested REMOVE");
-    assert!(rows.len() >= 2, "old + new: {rows:?}");
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
 
     // Original keeps port=80.
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     if let Some(Value::Document(rmpv::Value::Map(entries))) = original.get("config") {
         assert!(
@@ -6129,7 +6163,7 @@ fn remove_nested_property_path_on_temporal_node_writes_new_version() {
     // New version has no port.
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("config") {
         assert!(
@@ -6165,10 +6199,8 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
     db.execute_cypher("MATCH (b:Bag) SET doc_push(b.data.items, 'b')")
         .expect("doc_push on temporal must succeed");
 
-    let rows = db
-        .execute_cypher("MATCH (b:Bag) RETURN b.valid_from AS vf, b.valid_to AS vt, b.data AS data")
-        .expect("MATCH after doc_push");
-    assert!(rows.len() >= 2, "old + new: {rows:?}");
+    let rows = super::helpers::temporal_versions(&db, "Bag");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
 
     let extract_items = |row: &std::collections::BTreeMap<String, Value>| -> Vec<rmpv::Value> {
         if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("data") {
@@ -6185,11 +6217,11 @@ fn doc_push_on_temporal_node_writes_new_version_with_append() {
 
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     assert_eq!(extract_items(original).len(), 1, "original keeps 1 item");
     let new_items = extract_items(new_version);
@@ -6213,10 +6245,8 @@ fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
     db.execute_cypher("MATCH (c:Counter) SET doc_inc(c.stats.views, 5)")
         .expect("doc_inc on temporal");
 
-    let rows = db
-        .execute_cypher("MATCH (c:Counter) RETURN c.valid_from AS vf, c.stats AS stats")
-        .expect("MATCH");
-    assert!(rows.len() >= 2);
+    let rows = super::helpers::temporal_versions(&db, "Counter");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
 
     let extract_views = |row: &std::collections::BTreeMap<String, Value>| -> Option<f64> {
         if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("stats") {
@@ -6235,11 +6265,11 @@ fn doc_inc_on_temporal_node_writes_new_version_with_increment() {
 
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     assert_eq!(extract_views(original), Some(10.0));
     assert_eq!(extract_views(new_version), Some(15.0));
@@ -6262,9 +6292,7 @@ fn multiple_nested_set_items_on_temporal_node_produce_one_new_version() {
     db.execute_cypher("MATCH (p:Person) SET p.addr.street = 's2', p.addr.city = 'c2'")
         .expect("multi-SET");
 
-    let rows = db
-        .execute_cypher("MATCH (p:Person) RETURN p.valid_from AS vf, p.addr AS addr")
-        .expect("MATCH");
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(
         rows.len(),
         2,
@@ -6273,7 +6301,7 @@ fn multiple_nested_set_items_on_temporal_node_produce_one_new_version() {
 
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     if let Some(Value::Document(rmpv::Value::Map(entries))) = new_version.get("addr") {
         let street = entries
@@ -6363,12 +6391,11 @@ fn temporal_create_accepts_negative_valid_from() {
     assert!(by_vf[0].0 < 0 && by_vf[1].0 > 0);
 }
 
-/// `MATCH (a)-[:E]->(b:TempLabel) RETURN b`: traversal into a temporal
-/// target label materialises every version of the target (prefix scan
-/// over `node:<shard>:<target_uid>:*`) instead of silently emitting zero
-/// rows. Each version emits its own row.
+/// `MATCH (a)-[:E]->(b:TempLabel) RETURN b`: a traversal into a temporal
+/// target lands on the target's state valid now, one row, and on its earlier
+/// state when `temporal_active_at` names an instant inside it.
 #[test]
-fn traverse_into_temporal_label_materialises_all_versions() {
+fn traverse_into_temporal_label_lands_on_the_state_at_the_instant() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -6388,35 +6415,32 @@ fn traverse_into_temporal_label_materialises_all_versions() {
     db.execute_cypher("MATCH (p:Person) SET p.nickname = 'Ali'")
         .expect("SET to produce second version");
 
-    // The traversal must now emit two rows — one per version of p.
+    // Now: the new version only.
     let rows = db
         .execute_cypher(
             "MATCH (o:Org)-[:KNOWS]->(p:Person) \
              RETURN p.valid_from AS vf, p.nickname AS nick",
         )
         .expect("traversal into temporal target succeeds");
-    assert!(
-        rows.len() >= 2,
-        "must emit at least one row per target version, got: {rows:?}"
-    );
-
-    let original = rows
-        .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("original vf=100 row");
-    assert!(
-        matches!(original.get("nick"), None | Some(Value::Null)),
-        "original version has no nickname: {original:?}"
-    );
-
-    let new_version = rows
-        .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("new version row");
+    assert_eq!(rows.len(), 1, "one row, the state valid now: {rows:?}");
     assert_eq!(
-        new_version.get("nick"),
+        rows[0].get("nick"),
         Some(&Value::String("Ali".into())),
-        "new version carries nickname: {new_version:?}"
+        "new version carries nickname: {rows:?}"
+    );
+
+    // At an instant inside the original version: the original only.
+    let past = db
+        .execute_cypher(
+            "MATCH (o:Org)-[:KNOWS]->(p:Person) WHERE temporal_active_at(p, 150) \
+             RETURN p.valid_from AS vf, p.nickname AS nick",
+        )
+        .expect("traversal at a past instant");
+    assert_eq!(past.len(), 1, "one row, the state at 150: {past:?}");
+    assert_eq!(past[0].get("vf"), Some(&Value::Int(100)));
+    assert!(
+        matches!(past[0].get("nick"), None | Some(Value::Null)),
+        "original version has no nickname: {past:?}"
     );
 }
 
@@ -6444,10 +6468,10 @@ fn traverse_into_non_temporal_label_still_single_row() {
 }
 
 /// Edge case: variable-length traversal `(a)-[:E*1..2]->(b:TempLabel)`
-/// must also fan out across target versions (varlen path also routes
-/// through `build_target_rows`).
+/// resolves the target the same way (varlen also routes through
+/// `build_target_rows`): its state now, its earlier state at a named instant.
 #[test]
-fn varlen_traverse_into_temporal_label_fans_out_versions() {
+fn varlen_traverse_into_temporal_label_lands_on_the_state_at_the_instant() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -6466,23 +6490,25 @@ fn varlen_traverse_into_temporal_label_fans_out_versions() {
         .expect("produce v2");
 
     let rows = db
-        .execute_cypher("MATCH (o:Org)-[:KNOWS*1..2]->(p:Person) RETURN p.valid_from AS vf")
+        .execute_cypher("MATCH (o:Org)-[:KNOWS*1..2]->(p:Person) RETURN p.nickname AS nick")
         .expect("varlen traversal");
-    assert!(
-        rows.len() >= 2,
-        "varlen must fan out target versions: {rows:?}"
-    );
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r.get("vf"), Some(Value::Int(100))))
-    );
+    assert_eq!(rows.len(), 1, "the state valid now: {rows:?}");
+    assert_eq!(rows[0].get("nick"), Some(&Value::String("Ali".into())));
+
+    let past = db
+        .execute_cypher(
+            "MATCH (o:Org)-[:KNOWS*1..2]->(p:Person) WHERE temporal_active_at(p, 150) \
+             RETURN p.valid_from AS vf",
+        )
+        .expect("varlen traversal at a past instant");
+    assert_eq!(past.len(), 1, "the state at 150: {past:?}");
+    assert_eq!(past[0].get("vf"), Some(&Value::Int(100)));
 }
 
-/// Edge case: target node with multiple labels including a
-/// temporal one — fan-out triggers based on ANY temporal label among
-/// the requested target_labels.
+/// Edge case: a target requested through a temporal label resolves its
+/// timeline: the state valid now, the earlier one at a named instant.
 #[test]
-fn traverse_into_multi_label_temporal_target_fans_out_versions() {
+fn traverse_into_multi_label_temporal_target_lands_on_the_state_at_the_instant() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -6500,15 +6526,20 @@ fn traverse_into_multi_label_temporal_target_fans_out_versions() {
     db.execute_cypher("MATCH (p:Person) SET p.role = 'engineer'")
         .expect("produce v2");
 
-    // Requesting via temporal label gets per-version fan-out.
     let rows = db
-        .execute_cypher("MATCH (o:Org)-[:KNOWS]->(p:Person) RETURN p.valid_from AS vf")
+        .execute_cypher("MATCH (o:Org)-[:KNOWS]->(p:Person) RETURN p.role AS role")
         .expect("traverse");
-    assert!(rows.len() >= 2, "rows: {rows:?}");
-    assert!(
-        rows.iter()
-            .any(|r| matches!(r.get("vf"), Some(Value::Int(100))))
-    );
+    assert_eq!(rows.len(), 1, "rows: {rows:?}");
+    assert_eq!(rows[0].get("role"), Some(&Value::String("engineer".into())));
+
+    let past = db
+        .execute_cypher(
+            "MATCH (o:Org)-[:KNOWS]->(p:Person) WHERE temporal_active_at(p, 150) \
+             RETURN p.valid_from AS vf",
+        )
+        .expect("traverse at a past instant");
+    assert_eq!(past.len(), 1, "rows: {past:?}");
+    assert_eq!(past[0].get("vf"), Some(&Value::Int(100)));
 }
 
 /// doc_pull on a temporal node array property writes a
@@ -6525,9 +6556,8 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
         .expect("CREATE");
     db.execute_cypher("MATCH (b:Bag) SET doc_pull(b.data.items, 'b')")
         .expect("doc_pull on temporal");
-    let rows = db
-        .execute_cypher("MATCH (b:Bag) RETURN b.valid_from AS vf, b.data AS data")
-        .expect("MATCH");
+    let rows = super::helpers::temporal_versions(&db, "Bag");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
     let extract_items = |row: &std::collections::BTreeMap<String, Value>| -> Vec<rmpv::Value> {
         if let Some(Value::Document(rmpv::Value::Map(entries))) = row.get("data") {
             for (k, v) in entries {
@@ -6542,11 +6572,11 @@ fn doc_pull_on_temporal_node_writes_new_version_with_removed_element() {
     };
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     assert_eq!(extract_items(original).len(), 3, "original keeps 3");
     let new_items = extract_items(new_version);
@@ -6608,21 +6638,17 @@ fn merge_properties_on_temporal_node_writes_new_version() {
         .expect("seed");
     db.execute_cypher("MATCH (p:Person) SET p += {age: 31, city: 'NYC'}")
         .expect("MergeProperties on temporal");
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.valid_from AS vf, p.age AS age, p.city AS city, p.name AS name",
-        )
-        .expect("MATCH");
-    assert!(rows.len() >= 2);
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     assert_eq!(original.get("age"), Some(&Value::Int(30)));
     assert!(matches!(original.get("city"), None | Some(Value::Null)));
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     assert_eq!(new_version.get("age"), Some(&Value::Int(31)));
     assert_eq!(new_version.get("city"), Some(&Value::String("NYC".into())));
@@ -6649,26 +6675,31 @@ fn replace_properties_on_temporal_node_writes_new_version_with_full_replace() {
         .expect("seed");
     db.execute_cypher("MATCH (p:Person) SET p = {name: 'Bob', age: 40}")
         .expect("ReplaceProperties on temporal");
-    let rows = db
-        .execute_cypher("MATCH (p:Person) RETURN p.valid_from AS vf, p.name AS name, p.age AS age")
-        .expect("MATCH");
-    assert!(rows.len() >= 2);
+    let rows = super::helpers::temporal_versions(&db, "Person");
+    assert_eq!(rows.len(), 2, "old + new: {rows:?}");
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original");
     assert_eq!(original.get("name"), Some(&Value::String("Alice".into())));
     assert_eq!(original.get("age"), Some(&Value::Int(30)));
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new");
     assert_eq!(new_version.get("name"), Some(&Value::String("Bob".into())));
     assert_eq!(new_version.get("age"), Some(&Value::Int(40)));
-    // valid_from / valid_to / __ingestion_ts__ axes must still exist on
-    // the new version (Replace cleared user props but axes are
-    // re-applied by close+open machinery).
-    assert!(matches!(new_version.get("vf"), Some(Value::Int(_))));
+    // The engine-managed axes survive the replace on the stored record
+    // (Replace cleared user props, close+open re-applies the axes).
+    assert!(matches!(
+        new_version.get("__ingestion_ts__"),
+        Some(Value::Int(_))
+    ));
+    assert_eq!(
+        original.get("valid_to"),
+        new_version.get("valid_from"),
+        "the original closes where the new version opens: {rows:?}"
+    );
 }
 
 /// Empty path REMOVE on temporal node is rejected — the close+open
@@ -6838,10 +6869,8 @@ fn empirical_attach_document_from_temporal_source() {
 }
 
 /// ATTACH DOCUMENT INTO a TEMPORAL target works end-to-end. The pattern
-/// traverses into the temporal target (per-version target fan-out), and
-/// ATTACH applies the
-/// DocDelta::SetPath via the close+open dance against the matched
-/// per-version target record.
+/// traverses into the temporal target's state valid now, and ATTACH applies
+/// the DocDelta::SetPath via the close+open dance against that version.
 #[test]
 fn attach_document_into_temporal_target_writes_new_version_with_property() {
     use coordinode_core::graph::types::Value;
@@ -6864,18 +6893,14 @@ fn attach_document_into_temporal_target_writes_new_version_with_property() {
 
     // Person now has two versions: original (vf=100, no address) closed,
     // and new version (vf=NOW) carrying the attached address doc.
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, p.address AS addr",
-        )
-        .expect("MATCH Person after ATTACH");
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
-    let new_version = rows
-        .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
-        .expect("new version row");
+    let (original, new_version) = (&rows[0], &rows[1]);
+    assert_eq!(original.get("valid_from"), Some(&Value::Int(100)));
+    assert_eq!(original.get("address"), None, "{original:?}");
+    assert_eq!(original.get("valid_to"), new_version.get("valid_from"));
     assert!(
-        matches!(new_version.get("addr"), Some(Value::Document(_))),
+        matches!(new_version.get("address"), Some(Value::Document(_))),
         "new version carries attached address doc: {new_version:?}"
     );
 }
@@ -6905,20 +6930,15 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
 
     // Person now has two versions: original (vf=100, has address) closed,
     // and the new version (vf=NOW, no address) open.
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.valid_from AS vf, p.valid_to AS vt, \
-             p.address AS address",
-        )
-        .expect("MATCH Person after detach");
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(rows.len(), 2, "exactly the old + new version: {rows:?}");
 
     let original = rows
         .iter()
-        .find(|r| matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("original vf=100 row");
     assert!(
-        matches!(original.get("vt"), Some(Value::Int(_))),
+        matches!(original.get("valid_to"), Some(Value::Int(_))),
         "original closed: {original:?}"
     );
     assert!(
@@ -6928,7 +6948,7 @@ fn detach_document_from_temporal_source_writes_new_version_without_property() {
 
     let new_version = rows
         .iter()
-        .find(|r| !matches!(r.get("vf"), Some(Value::Int(100))))
+        .find(|r| !matches!(r.get("valid_from"), Some(Value::Int(100))))
         .expect("new version row");
     assert!(
         matches!(new_version.get("address"), None | Some(Value::Null)),
@@ -7054,12 +7074,9 @@ fn empirical_upsert_on_create_into_temporal_label() {
 }
 
 /// Pattern predicate `WHERE (a)-[:E]->(:Temp)` works on a temporal
-/// target. The destination label-filter prefix-scans every version of the
-/// candidate node and returns true if ANY version carries all the
-/// requested labels ("every version is a fact", the default without an
-/// AS OF clause).
+/// target: the candidate's state valid now carries the requested labels.
 #[test]
-fn pattern_predicate_into_temporal_label_matches_any_version() {
+fn pattern_predicate_into_temporal_label_matches_the_current_state() {
     use coordinode_core::graph::types::Value;
     let mut db = open_db();
     db.execute_cypher("CREATE NODE TYPE Person TEMPORAL")
@@ -7076,9 +7093,9 @@ fn pattern_predicate_into_temporal_label_matches_any_version() {
     db.execute_cypher("MATCH (o:Org), (p:Person) CREATE (o)-[:KNOWS]->(p)")
         .expect("seed edge");
 
-    // Mutate the temporal target to produce a second version. Both
-    // versions still carry the :Person label, so the pattern predicate
-    // must still match.
+    // Mutate the temporal target to produce a second version. The new,
+    // current version still carries the :Person label, so the pattern
+    // predicate must still match, once.
     db.execute_cypher("MATCH (p:Person) SET p.nickname = 'Ali'")
         .expect("SET on temporal");
 
@@ -7094,8 +7111,8 @@ fn pattern_predicate_into_temporal_label_matches_any_version() {
 }
 
 /// Edge case: negated pattern predicate `WHERE NOT (a)-[:E]->(:Temp)`
-/// inverts the "any version matches" semantics — returns true only when
-/// no neighbour version carries the requested labels.
+/// inverts the current-state match: returns true only when no neighbour's
+/// state valid now carries the requested labels.
 #[test]
 fn negated_pattern_predicate_into_temporal_label_returns_when_no_match() {
     use coordinode_core::graph::types::Value;
@@ -7150,17 +7167,24 @@ fn temporal_set_valid_to_closes_version_in_place() {
     db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.valid_to = 200")
         .expect("close-version SET valid_to");
 
-    // Verify: MATCH should still find ONE row (the same version), but
-    // with valid_to now populated to 200.
-    let rows = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, p.valid_to AS vt",
-        )
-        .expect("MATCH after close");
+    // Verify: still ONE stored version (the same one), with valid_to now
+    // populated to 200.
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(rows.len(), 1, "single closed version: {rows:?}");
     assert_eq!(rows[0].get("name"), Some(&Value::String("Alice".into())));
-    assert_eq!(rows[0].get("vf"), Some(&Value::Int(100)));
-    assert_eq!(rows[0].get("vt"), Some(&Value::Int(200)));
+    assert_eq!(rows[0].get("valid_from"), Some(&Value::Int(100)));
+    assert_eq!(rows[0].get("valid_to"), Some(&Value::Int(200)));
+
+    // Ended in the past: no state now, the state inside the interval.
+    let now = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name")
+        .expect("MATCH after close");
+    assert!(now.is_empty(), "closed in the past: {now:?}");
+    let inside = db
+        .execute_cypher("MATCH (p:Person) WHERE temporal_active_at(p, 150) RETURN p.valid_to AS vt")
+        .expect("MATCH inside the interval");
+    assert_eq!(inside.len(), 1, "{inside:?}");
+    assert_eq!(inside[0].get("vt"), Some(&Value::Int(200)));
 }
 
 /// SET valid_to = NULL on a closed temporal version re-opens it (removes
@@ -7176,15 +7200,19 @@ fn temporal_set_valid_to_null_reopens_version() {
     db.execute_cypher("CREATE (p:Person {name: 'Alice', valid_from: 100, valid_to: 200})")
         .expect("seed closed version");
 
-    // Re-open by setting valid_to = NULL.
-    db.execute_cypher("MATCH (p:Person) WHERE p.valid_to = 200 SET p.valid_to = NULL")
-        .expect("re-open SET valid_to NULL");
+    // Re-open by setting valid_to = NULL on the version matched inside it.
+    db.execute_cypher(
+        "MATCH (p:Person) WHERE temporal_active_at(p, 150) AND p.valid_to = 200 \
+         SET p.valid_to = NULL",
+    )
+    .expect("re-open SET valid_to NULL");
 
+    // Open again: the version is the state valid now.
     use coordinode_core::graph::types::Value;
     let rows = db
         .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.valid_to AS vt")
         .expect("MATCH after reopen");
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 1, "the reopened version is current: {rows:?}");
     // After remove, valid_to is absent — Cypher returns Null.
     assert!(
         matches!(rows[0].get("vt"), None | Some(Value::Null)),
@@ -7244,63 +7272,45 @@ fn temporal_set_property_close_and_open_new_version() {
     db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob'")
         .expect("temporal SET non-valid_to must succeed");
 
-    // Post-state: TWO versions of the same logical node — old closed +
-    // new open. Both have the same `node_id` (verified via id() in a
-    // single MATCH bind).
-    let post = db
-        .execute_cypher(
-            "MATCH (p:Person) RETURN p.name AS name, p.valid_from AS vf, p.valid_to AS vt, \
-             p.__ingestion_ts__ AS its",
-        )
-        .unwrap();
+    // Post-state: TWO stored versions of the same logical node (same id),
+    // old closed + new open, in valid_from order.
+    let post = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(post.len(), 2, "must be 2 versions: {post:?}");
-
-    // Sort by valid_from to make ordering deterministic.
-    let mut sorted: Vec<_> = post
-        .iter()
-        .map(|r| {
-            let vf = match r.get("vf") {
-                Some(Value::Int(i)) => *i,
-                _ => 0,
-            };
-            (vf, r.clone())
-        })
-        .collect();
-    sorted.sort_by_key(|(vf, _)| *vf);
+    let (old, new) = (&post[0], &post[1]);
+    assert_eq!(old.get("id"), new.get("id"), "one node: {post:?}");
 
     // Old version: valid_from=100, valid_to=NOW(new), name='Alice'.
-    let old = &sorted[0].1;
     assert_eq!(old.get("name"), Some(&Value::String("Alice".into())));
-    assert_eq!(old.get("vf"), Some(&Value::Int(100)));
-    let old_vt = old.get("vt");
+    assert_eq!(old.get("valid_from"), Some(&Value::Int(100)));
+    let old_vt = old.get("valid_to");
     assert!(
         matches!(old_vt, Some(Value::Int(_))),
         "old version's valid_to must be set: {old_vt:?}"
     );
 
     // New version: valid_from=NOW, valid_to=NULL, name='Bob'.
-    let new = &sorted[1].1;
     assert_eq!(new.get("name"), Some(&Value::String("Bob".into())));
-    let new_vf = match new.get("vf") {
-        Some(Value::Int(i)) => *i,
-        _ => panic!("new vf must be Int"),
-    };
-    let old_vt_i = match old_vt {
-        Some(Value::Int(i)) => *i,
-        _ => panic!("old vt must be Int"),
-    };
     assert_eq!(
-        new_vf, old_vt_i,
+        new.get("valid_from"),
+        old_vt,
         "new version's valid_from must equal old version's valid_to"
     );
-    assert!(
-        matches!(new.get("vt"), None | Some(Value::Null)),
-        "new version's valid_to must be NULL (open)"
+    assert_eq!(
+        new.get("valid_to"),
+        None,
+        "new version's valid_to must be absent (open)"
     );
     assert!(
-        matches!(new.get("its"), Some(Value::Int(_))),
+        matches!(new.get("__ingestion_ts__"), Some(Value::Int(_))),
         "new version must have __ingestion_ts__"
     );
+
+    // A bare MATCH sees the new version only.
+    let now = db
+        .execute_cypher("MATCH (p:Person) RETURN p.name AS name")
+        .unwrap();
+    assert_eq!(now.len(), 1, "{now:?}");
+    assert_eq!(now[0].get("name"), Some(&Value::String("Bob".into())));
 }
 
 /// Multiple SET items in one clause produce ONE new version (not N),
@@ -7320,16 +7330,12 @@ fn temporal_set_multiple_items_one_new_version() {
     db.execute_cypher("MATCH (p:Person) WHERE p.valid_to IS NULL SET p.name = 'Bob', p.age = 31")
         .expect("multi-item SET on temporal must produce one new version");
 
-    let rows = db
-        .execute_cypher("MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.valid_from AS vf")
-        .unwrap();
+    let rows = super::helpers::temporal_versions(&db, "Person");
     assert_eq!(rows.len(), 2, "exactly 2 versions: {rows:?}");
 
-    // Find the open one (the newer version).
-    let new = rows
-        .iter()
-        .find(|r| matches!(r.get("name"), Some(Value::String(s)) if s == "Bob"))
-        .expect("new version with name=Bob");
+    // The newer version carries both items.
+    let new = &rows[1];
+    assert_eq!(new.get("name"), Some(&Value::String("Bob".into())));
     assert_eq!(new.get("age"), Some(&Value::Int(31)));
 }
 
@@ -7450,17 +7456,14 @@ fn temporal_valid_from_is_microseconds_on_both_sides() {
     db.execute_cypher("MATCH (a:Emp) WHERE a.valid_to IS NULL SET a.name = 'Alicia'")
         .expect("mutate temporal node");
 
-    let rows = db
-        .execute_cypher("MATCH (n:Emp) RETURN n.valid_from AS vf")
-        .expect("scan versions");
-    let mut vfs: Vec<i64> = rows
+    let rows = super::helpers::temporal_versions(&db, "Emp");
+    let vfs: Vec<i64> = rows
         .iter()
-        .filter_map(|r| match r.get("vf") {
+        .filter_map(|r| match r.get("valid_from") {
             Some(Value::Int(v) | Value::Timestamp(v)) => Some(*v),
             _ => None,
         })
         .collect();
-    vfs.sort_unstable();
 
     assert_eq!(
         vfs.len(),

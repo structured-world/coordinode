@@ -252,7 +252,12 @@ mod derived {
     /// The entry key and value of `node_id` holding `email`.
     fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
         let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
-        entry("u_email", true, &tuple, node_id)
+        entry(
+            "u_email",
+            true,
+            &tuple,
+            crate::index::derive::EntryOwner::node(node_id),
+        )
     }
 
     /// A unit that writes `node_id`'s record with `email` and derives its
@@ -272,6 +277,7 @@ mod derived {
                     interpretation: unique_email(),
                 },
                 node_id,
+                valid_from: None,
                 old: None,
                 new: DerivedSource::UnitRecord(0),
             }),

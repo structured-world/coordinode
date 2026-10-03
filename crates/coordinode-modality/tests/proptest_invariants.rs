@@ -10,6 +10,7 @@
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
@@ -53,10 +54,10 @@ proptest! {
         let mut txn = Transaction::begin(engine, Some(&oracle), oracle.next());
         let no_fields = |_: &str| None;
         store
-            .stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(1), None, Some(&[Value::Int(a)]))
+            .stage_membership(&mut txn, &index, &no_fields, EntryOwner::node(1), None, Some(&[Value::Int(a)]))
             .unwrap();
         store
-            .stage_membership(&mut txn, &index, &no_fields, NodeId::from_raw(2), None, Some(&[Value::Int(b)]))
+            .stage_membership(&mut txn, &index, &no_fields, EntryOwner::node(2), None, Some(&[Value::Int(b)]))
             .unwrap();
         let all = store.scan_entry_ids(&mut txn, &index).unwrap();
         // Two entries regardless of value equality: they share the

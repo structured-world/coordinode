@@ -18,6 +18,56 @@ use coordinode_query::executor::runner::{AdaptiveConfig, ExecutionContext, Write
 use coordinode_storage::engine::StorageSnapshot;
 use coordinode_storage::engine::core::StorageEngine;
 
+/// Every stored version of every temporal node labelled `label`, in key order
+/// (by node, then by `valid_from`): the history a bare MATCH, which projects
+/// each node's state valid now, does not show. Each row holds `id`,
+/// `valid_from` and the version's properties by name, `valid_to` and
+/// `__deleted__` included when the version carries them.
+#[allow(clippy::expect_used)]
+pub fn temporal_versions(
+    db: &coordinode_embed::Database,
+    label: &str,
+) -> Vec<std::collections::BTreeMap<String, coordinode_core::graph::types::Value>> {
+    use coordinode_core::graph::node::{NodeRecord, decode_temporal_node_key};
+    use coordinode_core::graph::types::Value;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+
+    // The shard an embedded database keeps its nodes in.
+    const SHARD: u16 = 1;
+    let interner = db.interner().expect("interner");
+    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+        db.engine(),
+        None,
+        Timestamp::ZERO,
+        None,
+    );
+    let scanned = LocalNodeStore
+        .prefix_scan_tracked(&mut txn, &LocalNodeStore.shard_scan_prefix(SHARD))
+        .expect("scan nodes");
+    let mut out = Vec::new();
+    for (key, bytes) in scanned {
+        let Some((_, id, valid_from)) = decode_temporal_node_key(&key) else {
+            continue;
+        };
+        let record = NodeRecord::from_msgpack(&bytes).expect("decode version");
+        if !record.has_label(label) {
+            continue;
+        }
+        let mut row = std::collections::BTreeMap::new();
+        for (field, value) in &record.props {
+            let name = interner.resolve(*field).expect("registered field");
+            row.insert(name.to_string(), value.clone());
+        }
+        for (name, value) in record.extra.iter().flatten() {
+            row.insert(name.clone(), value.clone());
+        }
+        row.insert("id".to_string(), Value::Int(id.as_raw() as i64));
+        row.insert("valid_from".to_string(), Value::Int(valid_from));
+        out.push(row);
+    }
+    out
+}
+
 /// Build an ExecutionContext in legacy mode (no MVCC, no oracle).
 ///
 /// Used by tests that write directly to engine without MVCC versioning.
@@ -37,6 +87,8 @@ pub fn make_ctx_legacy<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
+        valid_now: coordinode_query::executor::runner::wall_clock_us(),
+        temporal_instants: Vec::new(),
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
@@ -107,6 +159,8 @@ pub fn make_ctx_mvcc<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
+        valid_now: coordinode_query::executor::runner::wall_clock_us(),
+        temporal_instants: Vec::new(),
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),
@@ -178,6 +232,8 @@ pub fn make_ctx_with_pipeline<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
+        valid_now: coordinode_query::executor::runner::wall_clock_us(),
+        temporal_instants: Vec::new(),
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),

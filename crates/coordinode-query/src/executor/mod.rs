@@ -7,6 +7,7 @@ pub mod eval;
 pub mod eval_neutral;
 pub mod row;
 pub mod runner;
+pub(crate) mod temporal_read;
 pub mod vector_predicate;
 
 pub use row::Row;

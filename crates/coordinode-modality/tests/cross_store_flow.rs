@@ -11,6 +11,7 @@
 use coordinode_core::graph::edge::EdgeProperties;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
@@ -128,7 +129,7 @@ fn node_edge_index_document_flow() {
                 &mut txn,
                 &by_name,
                 &no_fields,
-                alice,
+                EntryOwner::node(alice.as_raw()),
                 None,
                 Some(&[Value::String("alice".into())]),
             )
@@ -138,7 +139,7 @@ fn node_edge_index_document_flow() {
                 &mut txn,
                 &by_name,
                 &no_fields,
-                bob,
+                EntryOwner::node(bob.as_raw()),
                 None,
                 Some(&[Value::String("bob".into())]),
             )

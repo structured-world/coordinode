@@ -2674,6 +2674,13 @@ impl Database {
         let mut fields_view = self.fields.current()?;
         let vector_loader =
             StorageVectorLoader::new(Arc::clone(&self.engine), fields_view.clone(), self.shard_id);
+        // The statement's valid-time NOW. A cursor page keeps the instant of
+        // the cursor's first page, the time its snapshot was pinned at, so
+        // pages read one timeline projection however long the client takes.
+        let valid_now = match (scan_paging.as_ref(), session.snapshot_read_ts) {
+            (Some(_), Some(pinned)) => i64::try_from(pinned).unwrap_or(i64::MAX),
+            _ => coordinode_query::executor::runner::wall_clock_us(),
+        };
         let mut ctx = ExecutionContext {
             engine: &self.engine,
             interner: &mut fields_view,
@@ -2685,6 +2692,8 @@ impl Database {
             adaptive: self.adaptive_config.clone(),
             dedup_varlen_targets: false,
             snapshot_ts: named_read_ts,
+            valid_now,
+            temporal_instants: Vec::new(),
             snapshot_pin: None,
             warnings: Vec::new(),
             write_stats: WriteStats::default(),

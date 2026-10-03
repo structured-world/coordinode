@@ -45,8 +45,13 @@ fn enter(
     node: NodeId,
 ) -> usize {
     store
-        .stage_membership(t, index, &no_fields, node, None, Some(values))
+        .stage_membership(t, index, &no_fields, owner(node), None, Some(values))
         .unwrap()
+}
+
+/// `node`, not temporal, as the owner of its entries.
+fn owner(node: NodeId) -> EntryOwner {
+    EntryOwner::node(node.as_raw())
 }
 
 /// Stage `node` leaving `index`, where it held `values`.
@@ -58,7 +63,7 @@ fn leave(
     node: NodeId,
 ) {
     store
-        .stage_membership(t, index, &no_fields, node, Some(values), None)
+        .stage_membership(t, index, &no_fields, owner(node), Some(values), None)
         .unwrap();
 }
 
@@ -334,6 +339,49 @@ fn clearing_an_index_removes_its_entries_only() {
     assert_eq!(store.scan_entry_ids(&mut t, &other).unwrap(), vec![id(3)]);
 }
 
+/// Versions of a temporal node have entries of their own: two versions
+/// holding one value make one candidate node, and a version leaving the
+/// value removes only its entry, in both profiles.
+#[test]
+fn version_entries_answer_once_and_move_alone() {
+    for index in [
+        IndexDefinition::btree("user_name", "User", "name"),
+        derived(IndexDefinition::btree("user_name", "User", "name")),
+    ] {
+        let fx = open_engine();
+        let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+        let store = LocalIndexStore::new(&fx.engine);
+        let (first, second) = (EntryOwner::version(1, 100), EntryOwner::version(1, 200));
+
+        let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        for version in [first, second] {
+            store
+                .stage_membership(&mut t, &index, &no_fields, version, None, Some(&s("ada")))
+                .unwrap();
+        }
+        assert_eq!(
+            store.scan_exact(&mut t, &index, &s("ada")).unwrap(),
+            Some(vec![id(1)]),
+            "one candidate for the node's two versions"
+        );
+        commit(&mut t).unwrap();
+
+        let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        store
+            .stage_membership(&mut t, &index, &no_fields, first, Some(&s("ada")), None)
+            .unwrap();
+        commit(&mut t).unwrap();
+
+        let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+        assert_eq!(
+            store.scan_exact(&mut t, &index, &s("ada")).unwrap(),
+            Some(vec![id(1)]),
+            "the second version still holds the value"
+        );
+        assert_eq!(store.scan_entry_ids(&mut t, &index).unwrap(), vec![id(1)]);
+    }
+}
+
 /// A DERIVED index reads its own entries before commit, holds them after,
 /// moves them on a change and leaves nothing of a rolled-back statement:
 /// the same view a RESOLVED index gives.
@@ -359,7 +407,7 @@ fn a_derived_index_gives_the_resolved_view() {
             &mut t,
             &index,
             &no_fields,
-            id(1),
+            owner(id(1)),
             Some(&s("alice")),
             Some(&s("bob")),
         )

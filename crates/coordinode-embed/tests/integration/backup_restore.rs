@@ -319,21 +319,17 @@ fn temporal_node_survives_binary_roundtrip() {
     db1.execute_cypher("CREATE (:Person {name: 'Alice', valid_from: 1640995200000})")
         .unwrap();
 
-    let (mut db2, _keep_dir2) = dump_restore_binary(&db1);
+    let (db2, _keep_dir2) = dump_restore_binary(&db1);
 
-    let rows = db2
-        .execute_cypher(
-            "MATCH (n:Person {name: 'Alice'}) \
-             RETURN n.valid_from AS vf, n.valid_to AS vt",
-        )
-        .expect("MATCH temporal on restored db");
+    // Every stored version, not only the state valid now.
+    let rows = super::helpers::temporal_versions(&db2, "Person");
     assert_eq!(rows.len(), 2, "both temporal versions must restore");
 
     // Both versions present, distinct by valid_from. Sort by vf for
     // deterministic assertions.
     let mut versions: Vec<_> = rows
         .into_iter()
-        .map(|r| (r.get("vf").cloned(), r.get("vt").cloned()))
+        .map(|r| (r.get("valid_from").cloned(), r.get("valid_to").cloned()))
         .collect();
     versions.sort_by_key(|(vf, _)| match vf {
         Some(Value::Int(t)) => *t,
@@ -513,30 +509,28 @@ fn every_temporal_node_version_survives_every_format() {
             .unwrap();
         db1.execute_cypher("CREATE (:Person {name: 'Alice', valid_from: 2000})")
             .unwrap();
-        let versions = |db: &mut Database| {
-            let mut rows: Vec<(i64, Option<Value>)> = db
-                .execute_cypher(
-                    "MATCH (n:Person {name: 'Alice'}) \
-                     RETURN id(n) AS id, n.valid_from AS vf",
-                )
-                .unwrap()
+        // Every stored version, not only the state valid now.
+        let versions = |db: &Database| {
+            super::helpers::temporal_versions(db, "Person")
                 .into_iter()
-                .map(|r| match r.get("id") {
-                    Some(Value::Int(id)) => (*id, r.get("vf").cloned()),
-                    other => panic!("no id: {other:?}"),
+                .map(|r| {
+                    (
+                        r.get("id").cloned(),
+                        r.get("valid_from").cloned(),
+                        r.get("valid_to").cloned(),
+                        r.get("name").cloned(),
+                    )
                 })
-                .collect();
-            rows.sort_by_key(|(id, vf)| (*id, format!("{vf:?}")));
-            rows
+                .collect::<Vec<_>>()
         };
-        let expected = versions(&mut db1);
+        let expected = versions(&db1);
         assert_eq!(expected.len(), 2);
 
         let dir2 = tempfile::tempdir().unwrap();
-        let mut db2 = Database::open(dir2.path()).unwrap();
+        let db2 = Database::open(dir2.path()).unwrap();
         db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
             .unwrap();
-        assert_eq!(versions(&mut db2), expected, "{format:?}");
+        assert_eq!(versions(&db2), expected, "{format:?}");
     }
 }
 

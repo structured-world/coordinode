@@ -377,6 +377,8 @@ fn make_ctx<'a>(
         adaptive: AdaptiveConfig::default(),
         dedup_varlen_targets: false,
         snapshot_ts: None,
+        valid_now: super::wall_clock_us(),
+        temporal_instants: Vec::new(),
         snapshot_pin: None,
         warnings: Vec::new(),
         write_stats: WriteStats::default(),

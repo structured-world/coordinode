@@ -135,8 +135,9 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     let a = encode_tuple(&[s("a")]).expect("a");
     let c = encode_tuple(&[s("c")]).expect("c");
     let key = |t: &[u8]| encode_index_key("user_email", t, 7);
+    let node = EntryOwner::node(7);
 
-    let enter = index.membership_effects(7, None, Some(&[s("a")]));
+    let enter = index.membership_effects(node, None, Some(&[s("a")]));
     assert_eq!(
         enter,
         vec![EntryEffect {
@@ -145,7 +146,7 @@ fn membership_effects_are_the_difference_of_the_two_states() {
         }]
     );
 
-    let leave = index.membership_effects(7, Some(&[s("a")]), None);
+    let leave = index.membership_effects(node, Some(&[s("a")]), None);
     assert_eq!(
         leave,
         vec![EntryEffect {
@@ -156,7 +157,7 @@ fn membership_effects_are_the_difference_of_the_two_states() {
 
     let old = [Value::Array(vec![s("a"), s("b")])];
     let new = [Value::Array(vec![s("b"), s("c")])];
-    let change = index.membership_effects(7, Some(&old), Some(&new));
+    let change = index.membership_effects(node, Some(&old), Some(&new));
     assert_eq!(
         change,
         vec![
@@ -172,7 +173,7 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     );
     assert!(
         index
-            .membership_effects(7, Some(&[s("b")]), Some(&[s("b")]))
+            .membership_effects(node, Some(&[s("b")]), Some(&[s("b")]))
             .is_empty()
     );
 }
@@ -183,10 +184,66 @@ fn a_unique_entry_holds_its_node() {
     let index = interp(true, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
     assert_eq!(
-        index.membership_effects(9, None, Some(&[s("a")])),
+        index.membership_effects(EntryOwner::node(9), None, Some(&[s("a")])),
         vec![EntryEffect {
             key: encode_unique_index_key("user_email", &a),
             value: Some(9u64.to_be_bytes().to_vec()),
+        }]
+    );
+}
+
+/// A version of a temporal node has entries of its own, keyed by node and
+/// valid_from: two versions holding one value are two entries, and a
+/// version leaving a value removes only its own.
+#[test]
+fn a_version_entry_carries_its_valid_from() {
+    use crate::index::encoding::encode_version_index_key;
+    let index = interp(false, false, None);
+    let a = encode_tuple(&[s("a")]).expect("a");
+    let first = index.membership_effects(EntryOwner::version(7, 100), None, Some(&[s("a")]));
+    let second = index.membership_effects(EntryOwner::version(7, 200), None, Some(&[s("a")]));
+    assert_eq!(
+        first,
+        vec![EntryEffect {
+            key: encode_version_index_key("user_email", &a, 7, 100),
+            value: Some(Vec::new()),
+        }]
+    );
+    assert_ne!(first[0].key, second[0].key, "one entry per version");
+    assert_eq!(
+        index.membership_effects(EntryOwner::version(7, 100), Some(&[s("a")]), None),
+        vec![EntryEffect {
+            key: encode_version_index_key("user_email", &a, 7, 100),
+            value: None,
+        }]
+    );
+}
+
+/// A unique claim is the node's, whichever version holds the value: a
+/// version leaving the value keeps the claim, so another version of the
+/// node holding it, or the node's history, is not left unprotected.
+#[test]
+fn a_version_leaving_a_unique_value_keeps_the_claim() {
+    let index = interp(true, false, None);
+    let a = encode_tuple(&[s("a")]).expect("a");
+    let b = encode_tuple(&[s("b")]).expect("b");
+    assert_eq!(
+        index.membership_effects(
+            EntryOwner::version(9, 100),
+            Some(&[s("a")]),
+            Some(&[s("b")])
+        ),
+        vec![EntryEffect {
+            key: encode_unique_index_key("user_email", &b),
+            value: Some(9u64.to_be_bytes().to_vec()),
+        }]
+    );
+    // A node that is not temporal releases what it leaves.
+    assert_eq!(
+        index.membership_effects(EntryOwner::node(9), Some(&[s("a")]), None),
+        vec![EntryEffect {
+            key: encode_unique_index_key("user_email", &a),
+            value: None,
         }]
     );
 }
@@ -266,6 +323,7 @@ mod resolve {
                 interpretation: index.clone(),
             },
             node_id,
+            valid_from: None,
             old,
             new,
         })
@@ -326,6 +384,30 @@ mod resolve {
                 },
                 idx_put(encode_index_key("user_email", &new, 7), Vec::new()),
             ]
+        );
+    }
+
+    /// Work sealed for a version of a temporal node derives that version's
+    /// entry, keyed by node and valid_from, at every member.
+    #[test]
+    fn version_work_derives_the_versions_entry() {
+        use crate::index::encoding::encode_version_index_key;
+        let index = interp(false, false, None);
+        let Mutation::Derive(mut version_work) =
+            work(&index, 7, None, DerivedSource::Values(Some(vec![s("v")])))
+        else {
+            unreachable!("work builds a Derive mutation")
+        };
+        version_work.valid_from = Some(-3);
+        let tuple = encode_tuple(&[s("v")]).expect("v");
+        assert_eq!(
+            resolve_unit(&[Mutation::Derive(version_work)], 16)
+                .expect("resolve")
+                .as_ref(),
+            &[idx_put(
+                encode_version_index_key("user_email", &tuple, 7, -3),
+                Vec::new()
+            )]
         );
     }
 

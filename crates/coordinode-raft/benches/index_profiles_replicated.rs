@@ -127,13 +127,18 @@ fn unit(id_gen: &ProposalIdGenerator, n: u64, derived: bool) -> RaftProposal {
         Mutation::Derive(DerivedIndexWork {
             binding: binding(),
             node_id: n,
+            valid_from: None,
             old: None,
             new: DerivedSource::UnitRecord(0),
         })
     } else {
         let effect = binding()
             .interpretation
-            .membership_effects(n, None, Some(&[Value::String(email)]))
+            .membership_effects(
+                coordinode_core::index::derive::EntryOwner::node(n),
+                None,
+                Some(&[Value::String(email)]),
+            )
             .pop()
             .expect("one entry");
         Mutation::Put {

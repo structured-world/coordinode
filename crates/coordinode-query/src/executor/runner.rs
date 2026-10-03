@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use coordinode_core::graph::edge::{AdjDirection, AdjKeyParts, PostingList, decode_edge_props};
 use coordinode_core::graph::intern::{DictionaryError, FieldInterner};
 use coordinode_core::graph::node::NodeIdAllocator;
-use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeRecord, decode_temporal_node_key};
 use coordinode_core::graph::types::{Value, VectorConsistencyMode, VectorMvccStats};
 use coordinode_core::schema::definition::{
     EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType, SchemaMode,
@@ -639,6 +639,15 @@ pub struct ExecutionContext<'a> {
     /// Snapshot timestamp for AS OF TIMESTAMP queries (microseconds since epoch).
     /// When set, reads return data as of this point in time.
     pub snapshot_ts: Option<i64>,
+    /// The statement's valid-time NOW, in microseconds since the epoch: the
+    /// instant a temporal node read projects its timeline at unless the query
+    /// names another. Bound once, so every read and write of one statement
+    /// sees the same instant; independent of `snapshot_ts`.
+    pub valid_now: i64,
+    /// Valid-time instants a query named for a node variable (a
+    /// `temporal_active_at(n, t)` conjunct), innermost last. Reads of that
+    /// variable project at the named instant instead of `valid_now`.
+    pub temporal_instants: Vec<(String, i64)>,
     /// GC-watermark pin for an `AS OF TIMESTAMP` read, held for the
     /// statement so compaction cannot collect the history it reads. `None`
     /// for reads at the current snapshot (never below the watermark).
@@ -1329,11 +1338,13 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
-    /// Stage the B-tree index entries of `record`, a node being created. A
-    /// unique value another node holds refuses the write.
+    /// Stage the B-tree index entries of `record`, a node being created, or
+    /// the version of a temporal node starting at `valid_from`. A unique
+    /// value another node holds refuses the write.
     pub fn index_node_created(
         &mut self,
         node_id: NodeId,
+        valid_from: Option<i64>,
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
         let Some(registry) = self.btree_index_registry else {
@@ -1353,8 +1364,60 @@ impl<'a> ExecutionContext<'a> {
                 &mut self.txn,
                 &crate::index::registry::NodeState {
                     node_id,
+                    valid_from,
                     label,
                     value_of: &lookup,
+                },
+                &field_of,
+                &mut self.key_claims.indexes,
+            )
+            .map_err(index_write_error)
+    }
+
+    /// Move the B-tree index entries of the version of temporal node
+    /// `node_id` starting at `valid_from` as its record changes in place
+    /// from `before` to `after` (closing it, reopening it). Each version has
+    /// entries of its own, so only this version's move.
+    pub fn index_version_changed(
+        &mut self,
+        node_id: NodeId,
+        valid_from: i64,
+        before: &NodeRecord,
+        after: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let label = before.primary_label();
+        if !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let changed: Vec<&str> = before
+            .props
+            .keys()
+            .chain(after.props.keys())
+            .filter(|field| before.props.get(field) != after.props.get(field))
+            .filter_map(|field| interner.resolve(*field))
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let before_of = crate::index::registry::record_lookup(before, interner);
+        let after_of = crate::index::registry::record_lookup(after, interner);
+        let field_of = |name: &str| interner.lookup(name);
+        registry
+            .on_property_changed(
+                self.engine,
+                &mut self.txn,
+                &crate::index::PropertyChange {
+                    node_id,
+                    valid_from: Some(valid_from),
+                    label,
+                    properties: &changed,
+                    before: &before_of,
+                    after: &after_of,
                 },
                 &field_of,
                 &mut self.key_claims.indexes,
@@ -1396,6 +1459,7 @@ impl<'a> ExecutionContext<'a> {
                 &mut self.txn,
                 &crate::index::PropertyChange {
                     node_id,
+                    valid_from: None,
                     label,
                     properties: &[property],
                     before: &before,
@@ -1443,6 +1507,7 @@ impl<'a> ExecutionContext<'a> {
                 &mut self.txn,
                 &crate::index::PropertyChange {
                     node_id,
+                    valid_from: None,
                     label,
                     properties,
                     before: &before_of,
@@ -1490,6 +1555,7 @@ impl<'a> ExecutionContext<'a> {
                 &mut self.txn,
                 &crate::index::PropertyChange {
                     node_id,
+                    valid_from: None,
                     label,
                     properties: &changed,
                     before: &before,
@@ -1551,6 +1617,7 @@ impl<'a> ExecutionContext<'a> {
             &mut self.txn,
             &crate::index::registry::NodeState {
                 node_id,
+                valid_from: None,
                 label,
                 value_of: &lookup,
             },
@@ -1796,22 +1863,6 @@ impl<'a> ExecutionContext<'a> {
         Ok(Some(record))
     }
 
-    /// Read a temporal node's valid-version active at `at_ms` — the version
-    /// whose `valid_from <= at_ms` is largest. Used to read the source body for
-    /// CLONE NODE on a temporal label (current version when `at_ms = NOW`, a
-    /// historical version with `AS OF <ts>`). `None` if no version is at-or-
-    /// before that instant.
-    pub fn mvcc_get_node_at(
-        &mut self,
-        shard_id: u16,
-        node_id: NodeId,
-        at_ms: i64,
-    ) -> Result<Option<NodeRecord>, ExecutionError> {
-        use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        self.sync_txn_state();
-        Ok(LocalNodeStore.get_at(&self.txn, shard_id, node_id, at_ms)?)
-    }
-
     /// MVCC-aware typed node write. Buffers the put through
     /// [`Self::mvcc_put`] (for atomic flush + RYOW visibility). Replaces
     /// `encode_node_key + record.to_msgpack + mvcc_put` triples scattered
@@ -1907,6 +1958,44 @@ impl<'a> ExecutionContext<'a> {
         Ok(Some(record))
     }
 
+    /// The field ids a timeline projection reads. Looked up, never
+    /// registered: a read does not add names to the dictionary.
+    pub(crate) fn timeline_fields(&self) -> crate::executor::temporal_read::TimelineFields {
+        crate::executor::temporal_read::TimelineFields {
+            valid_to: self.interner.lookup("valid_to"),
+            deleted: self.interner.lookup("__deleted__"),
+        }
+    }
+
+    /// The valid-time instant reads of node variable `variable` project at:
+    /// the innermost instant the query named for it, else `valid_now`.
+    pub(crate) fn instant_for(&self, variable: &str) -> i64 {
+        self.temporal_instants
+            .iter()
+            .rev()
+            .find(|(v, _)| v == variable)
+            .map_or(self.valid_now, |(_, at)| *at)
+    }
+
+    /// The state of temporal node `node_id`'s timeline at `at`, read from all
+    /// of its versions under the statement's snapshot (OCC-tracked).
+    pub(crate) fn temporal_node_state(
+        &mut self,
+        node_id: NodeId,
+        at: i64,
+    ) -> Result<crate::executor::temporal_read::StateAt, ExecutionError> {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
+        self.sync_txn_state();
+        let scanned = LocalNodeStore.prefix_scan_tracked(&mut self.txn, &prefix)?;
+        let versions = decode_versions(&scanned)?;
+        Ok(crate::executor::temporal_read::state_at(
+            versions,
+            at,
+            self.timeline_fields(),
+        ))
+    }
+
     /// MVCC-aware typed write of a temporal node version.
     ///
     /// Buffers the put at the 25-byte temporal key (shard, id,
@@ -1923,6 +2012,43 @@ impl<'a> ExecutionContext<'a> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         self.sync_txn_state();
         Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
+    }
+
+    /// Close the version of temporal node `node_id` that starts at
+    /// `valid_from`: write `record`, that version, with its `valid_to` set to
+    /// `valid_to`, and move the version's index entries with it.
+    pub fn close_temporal_version(
+        &mut self,
+        node_id: NodeId,
+        valid_from: i64,
+        record: &mut NodeRecord,
+        valid_to: i64,
+    ) -> Result<(), ExecutionError> {
+        let vt_fid = self.field_id("valid_to")?;
+        // The record before the close, kept only when an index may read it.
+        let open = if self.indexes_label(record.primary_label()) {
+            Some(record.clone())
+        } else {
+            None
+        };
+        record.set(vt_fid, Value::Int(valid_to));
+        self.mvcc_put_node_temporal(self.shard_id, node_id, valid_from, record)?;
+        match open {
+            Some(open) => self.index_version_changed(node_id, valid_from, &open, record),
+            None => Ok(()),
+        }
+    }
+
+    /// Write `record` as the new version of temporal node `node_id` that
+    /// starts at `valid_from`, with the version's index entries.
+    pub fn open_temporal_version(
+        &mut self,
+        node_id: NodeId,
+        valid_from: i64,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        self.mvcc_put_node_temporal(self.shard_id, node_id, valid_from, record)?;
+        self.index_node_created(node_id, Some(valid_from), record)
     }
 
     /// MVCC-aware typed delete of a temporal node version (tombstone
@@ -3111,10 +3237,18 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
                 _ => None,
             };
+            // `temporal_active_at(n, t)` names the instant the read binding
+            // `n` (a scan, an index lookup, a traversal) projects temporal
+            // timelines at; without it `n` is read at the statement's NOW
+            // and the predicate could only reject.
+            let scope = ctx.temporal_instants.len();
+            named_instants(predicate, &mut ctx.temporal_instants);
             let rows = match keyed {
-                Some(rows) => rows,
-                None => execute_op(input, ctx)?,
+                Some(rows) => Ok(rows),
+                None => execute_op(input, ctx),
             };
+            ctx.temporal_instants.truncate(scope);
+            let rows = rows?;
             let corr = ctx.correlated_row.clone();
             if neutral_contains_subplan(predicate) {
                 // Storage-aware path: correlated subplans need edge lookups.
@@ -4183,12 +4317,32 @@ fn execute_node_scan(
             .map(|p| (p.resume.clone(), p.limit))
         {
             Some((resume, limit)) => {
-                let page = LocalNodeStore.prefix_scan_paged_tracked(
+                let mut page = LocalNodeStore.prefix_scan_paged_tracked(
                     &mut ctx.txn,
                     &prefix_bytes,
                     resume.as_deref(),
                     limit,
                 )?;
+                // A page that ends inside one temporal node's versions would
+                // project a partial timeline: read that node's versions whole
+                // and resume after the last of them.
+                if !page.exhausted {
+                    let cut = page
+                        .rows
+                        .last()
+                        .and_then(|(key, _)| decode_temporal_node_key(key));
+                    if let Some((shard, node_id, _)) = cut {
+                        let all = LocalNodeStore.prefix_scan_tracked(
+                            &mut ctx.txn,
+                            &LocalNodeStore.version_prefix(shard, node_id),
+                        )?;
+                        page.rows.retain(|(key, _)| {
+                            decode_temporal_node_key(key).is_none_or(|(_, id, _)| id != node_id)
+                        });
+                        page.last_key = all.last().map(|(key, _)| key.clone());
+                        page.rows.extend(all);
+                    }
+                }
                 if let Some(paging) = ctx.scan_paging.as_mut() {
                     paging.last_key = page.last_key;
                     paging.exhausted = page.exhausted;
@@ -4199,10 +4353,43 @@ fn execute_node_scan(
         }
     };
 
+    // A temporal node's versions sort together under its id; they are
+    // gathered and the node contributes the state valid at the instant this
+    // variable reads at, or nothing.
+    let at = ctx.instant_for(variable);
+    let fields = ctx.timeline_fields();
+    let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
+    let mut versions_of: Option<NodeId> = None;
     for (key_bytes, value_bytes) in &scan_results {
         let record = NodeRecord::from_msgpack(value_bytes).map_err(|e| {
             ExecutionError::Serialization(format!("node deserialization error: {e}"))
         })?;
+        if let Some((_, node_id, valid_from)) = decode_temporal_node_key(key_bytes) {
+            if versions_of != Some(node_id) {
+                if let Some(previous) = versions_of.replace(node_id) {
+                    push_temporal_state(
+                        &mut results,
+                        previous,
+                        std::mem::take(&mut versions),
+                        (at, fields),
+                        (variable, labels, property_filters),
+                        ctx,
+                    )?;
+                }
+            }
+            versions.push((valid_from, record));
+            continue;
+        }
+        if let Some(previous) = versions_of.take() {
+            push_temporal_state(
+                &mut results,
+                previous,
+                std::mem::take(&mut versions),
+                (at, fields),
+                (variable, labels, property_filters),
+                ctx,
+            )?;
+        }
         let node_id = decode_node_id_from_key(key_bytes);
         if let Some(row) =
             node_row_if_matching(variable, labels, node_id, &record, property_filters, ctx)?
@@ -4210,8 +4397,89 @@ fn execute_node_scan(
             results.push(row);
         }
     }
+    if let Some(previous) = versions_of {
+        push_temporal_state(
+            &mut results,
+            previous,
+            versions,
+            (at, fields),
+            (variable, labels, property_filters),
+            ctx,
+        )?;
+    }
 
     Ok(results)
+}
+
+/// Add the row for one temporal node's gathered `versions`: its state valid
+/// at the read instant, when that state is live and matches the pattern.
+fn push_temporal_state(
+    results: &mut Vec<Row>,
+    node_id: NodeId,
+    versions: Vec<(i64, NodeRecord)>,
+    (at, fields): (i64, crate::executor::temporal_read::TimelineFields),
+    (variable, labels, property_filters): (&str, &[String], &[(String, crate::plan::expr::Expr)]),
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let Some((_, record)) =
+        crate::executor::temporal_read::state_at(versions, at, fields).positive()
+    else {
+        return Ok(());
+    };
+    if let Some(row) = node_row_if_matching(
+        variable,
+        labels,
+        node_id.as_raw(),
+        &record,
+        property_filters,
+        ctx,
+    )? {
+        results.push(row);
+    }
+    Ok(())
+}
+
+/// Append to `out` the instant each `temporal_active_at(n, t)` conjunct of
+/// `predicate` names for node variable `n`, when `t` is a value that does not
+/// depend on the row. A disjunct, or an instant read from the row, names
+/// nothing: the predicate then filters the rows projected at NOW.
+fn named_instants(predicate: &crate::plan::expr::Expr, out: &mut Vec<(String, i64)>) {
+    use crate::plan::expr::{BinOp, Expr};
+    match predicate {
+        Expr::Binary {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            named_instants(left, out);
+            named_instants(right, out);
+        }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("temporal_active_at") => {
+            if let [Expr::Variable(v), at] = args.as_slice() {
+                if let Ok(Value::Int(t) | Value::Timestamp(t)) = eval_neutral(at, &Row::new()) {
+                    out.push((v.clone(), t));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `(valid_from, record)` versions among scanned node rows, in key order.
+fn decode_versions(
+    scanned: &[(Vec<u8>, Vec<u8>)],
+) -> Result<Vec<(i64, NodeRecord)>, ExecutionError> {
+    let mut out = Vec::with_capacity(scanned.len());
+    for (key, bytes) in scanned {
+        let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
+            continue;
+        };
+        let record = NodeRecord::from_msgpack(bytes).map_err(|e| {
+            ExecutionError::Serialization(format!("temporal node deserialization error: {e}"))
+        })?;
+        out.push((valid_from, record));
+    }
+    Ok(out)
 }
 
 /// Bind `var`'s label columns for `record` and return its primary label:
@@ -4543,19 +4811,9 @@ fn execute_btree_index_scan(
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Safe-reject: B-tree index lookup returns node ids, then reads node
-    // records via 16-byte `encode_node_key` to project. Temporal records
-    // live at the 25-byte per-version key — would silently return None and
-    // the row is dropped. Serving this needs version-aware index entries
-    // (`(node_id, valid_from)` point identity).
-    if let Ok(Some(s)) = ctx.load_current_label_schema(label) {
-        if s.temporal {
-            return Err(ExecutionError::Unsupported(format!(
-                "B-tree index scan on temporal label '{label}' is not yet \
-                 supported: index entries do not carry the version key."
-            )));
-        }
-    }
+    let temporal = ctx
+        .load_current_label_schema(label)?
+        .is_some_and(|s| s.temporal);
 
     // Evaluate the lookup value. A correlated key (e.g. `WHERE a.pid = e.s`
     // driven per outer row) resolves against `correlated_row`; a literal /
@@ -4585,53 +4843,46 @@ fn execute_btree_index_scan(
         );
     };
 
+    // A temporal node's entries are the union of the values its versions
+    // ever held, so a candidate resolves to its state valid at the instant
+    // this variable reads at; one with no live state there is no match.
+    let records: Vec<Option<NodeRecord>> = if temporal {
+        let at = ctx.instant_for(variable);
+        let mut states = Vec::with_capacity(ids.len());
+        for id in &ids {
+            states.push(
+                ctx.temporal_node_state(*id, at)?
+                    .positive()
+                    .map(|(_, record)| record),
+            );
+        }
+        states
+    } else {
+        use coordinode_modality::NodeStore as _;
+        // One batched multi_get (single version snapshot + batched bloom/SST
+        // traversal) rather than a per-id lookup loop.
+        coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?
+    };
+
     let mut results = Vec::with_capacity(ids.len());
-
-    use coordinode_modality::NodeStore as _;
-    let nodes = coordinode_modality::LocalNodeStore;
-
-    // Materialize every matching node in one batched multi_get (single version
-    // snapshot + batched bloom/SST traversal) rather than a per-id lookup loop.
-    let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
-
+    let labels = [label.to_string()];
     for (id, record_opt) in ids.into_iter().zip(records) {
-        let raw_id = id.as_raw();
+        // A deleted node leaves stale entries behind.
         let Some(record) = record_opt else {
-            // Node was deleted since the index entry was created — skip stale entry.
             continue;
         };
-
-        // Verify label matches (guards against stale index entries for deleted/relabeled nodes).
-        if !record.has_label(label) {
-            continue;
-        }
-        // The index finds a list by each of its elements; the equality the
-        // query asked holds only for the value itself.
+        // The index finds a list by each of its elements, and a temporal
+        // node by any value it ever held; the equality the query asked holds
+        // only for the value the record carries itself.
         let held = crate::index::registry::record_lookup(&record, ctx.interner)(property);
         if held.as_ref() != Some(&lookup_val) {
             continue;
         }
-
-        let mut row = Row::new();
-        row.insert(variable.to_string(), Value::Int(raw_id as i64));
-
-        // Add properties under `variable.prop` columns.
-        for (field_id, value) in &record.props {
-            if let Some(field_name) = ctx.interner.resolve(*field_id) {
-                row.insert(format!("{variable}.{field_name}"), value.clone());
-            }
+        // The label check guards against entries of relabeled nodes.
+        if let Some(row) = node_row_if_matching(variable, &labels, id.as_raw(), &record, &[], ctx)?
+        {
+            results.push(row);
         }
-        if let Some(extra) = &record.extra {
-            for (name, value) in extra {
-                row.insert(format!("{variable}.{name}"), value.clone());
-            }
-        }
-
-        let primary_label = insert_label_columns(&mut row, variable, &record);
-
-        inject_computed_properties(&mut row, variable, &primary_label, ctx);
-
-        results.push(row);
     }
 
     Ok(results)
@@ -4824,16 +5075,11 @@ fn execute_traverse(
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Traversal into a temporal target label materialises EVERY version
-    // of the target node (prefix-scan over `node:<shard>:<target_uid>:*`).
-    // The version's `valid_from` is surfaced as `<target>.valid_from`, and
-    // each version emits its own row so downstream RETURN / WHERE can
-    // filter by interval. There is no `AS OF VALID_TIME` narrowing here:
-    // the read is "all versions", the same default as label-scoped MATCH
-    // on temporal labels.
-    //
-    // Behaviour is detected per target label at row-build time; the
-    // dispatch happens in `build_target_rows`.
+    // Traversal into a temporal target lands on the target's state valid at
+    // the instant its variable reads at (the statement's NOW unless a
+    // `temporal_active_at` conjunct names one), as a label-scoped MATCH
+    // does; a target with no live state there gives no row. Detected per
+    // target at row-build time in `build_target_rows`.
 
     if let Some(lb) = params.length {
         execute_varlen_traverse(input_rows, params, lb, ctx)
@@ -4920,29 +5166,20 @@ struct TargetRowParams<'a> {
     edge_is_temporal: bool,
 }
 
-/// Every version of temporal node `target_id`, with its `valid_from`, read
-/// from the per-version keys; empty when the node has none.
-fn target_versions(
+/// The state of temporal node `target_id` at the instant `variable` reads at,
+/// with its `valid_from`; empty when the node has no live state then.
+fn temporal_target_state(
     ctx: &mut ExecutionContext<'_>,
     target_id: NodeId,
+    variable: &str,
 ) -> Result<Vec<(NodeRecord, Option<i64>)>, ExecutionError> {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-    let prefix = LocalNodeStore.version_prefix(ctx.shard_id, target_id);
-    ctx.sync_txn_state();
-    let scanned = LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix)?;
-    let mut out: Vec<(NodeRecord, Option<i64>)> = Vec::with_capacity(scanned.len());
-    for (key, bytes) in scanned {
-        let Some((_, _, vf)) = coordinode_core::graph::node::decode_temporal_node_key(&key) else {
-            continue;
-        };
-        let rec = NodeRecord::from_msgpack(&bytes).map_err(|e| {
-            ExecutionError::Serialization(format!(
-                "target temporal node deserialization error: {e}"
-            ))
-        })?;
-        out.push((rec, Some(vf)));
-    }
-    Ok(out)
+    let at = ctx.instant_for(variable);
+    Ok(ctx
+        .temporal_node_state(target_id, at)?
+        .positive()
+        .map(|(valid_from, record)| (record, Some(valid_from)))
+        .into_iter()
+        .collect())
 }
 
 /// Fetch a target node and build output rows. Returns `Vec` because temporal
@@ -4962,11 +5199,9 @@ fn build_target_rows(
 
     let target_id = NodeId::from_raw(target_uid);
 
-    // Detect whether ANY of the target labels is temporal. If
-    // so, every version of the target is materialised (prefix scan);
-    // otherwise the legacy 16-byte point read is used. Detection runs
-    // at row-build time — label schemas don't change within a single
-    // query, so the lookup is cheap enough not to cache further.
+    // A temporal target is read as its timeline's state at the instant the
+    // target variable reads at; any other target by a point read. Label
+    // schemas do not change within one query, so the per-row check is cheap.
     let target_is_temporal = target_labels.iter().any(|lbl| {
         ctx.load_current_label_schema(lbl)
             .ok()
@@ -4974,10 +5209,9 @@ fn build_target_rows(
             .is_some_and(|s| s.temporal)
     });
 
-    // Collect (record, optional valid_from) pairs to emit. Non-temporal
-    // path produces one pair; temporal path produces one per version.
+    // At most one (record, valid_from) pair: the target's state, if any.
     let target_records: Vec<(NodeRecord, Option<i64>)> = if target_is_temporal {
-        target_versions(ctx, target_id)?
+        temporal_target_state(ctx, target_id, target_variable)?
     } else {
         match ctx.mvcc_get_node(ctx.shard_id, target_id)? {
             Some(rec) => vec![(rec, None)],
@@ -4985,7 +5219,7 @@ fn build_target_rows(
             // does not name by label, which lives under per-version keys
             // only. It is read the same way a labelled one is; a dangling
             // edge finds no version either.
-            None => target_versions(ctx, target_id)?,
+            None => temporal_target_state(ctx, target_id, target_variable)?,
         }
     };
     if target_records.is_empty() {
@@ -9888,8 +10122,9 @@ fn execute_create_node(
         }
 
         // Index entries, in the statement transaction, from the values as
-        // stored; a unique value another node holds refuses the write.
-        ctx.index_node_created(node_id, &record)?;
+        // stored, under the version for a temporal label; a unique value
+        // another node holds refuses the write.
+        ctx.index_node_created(node_id, valid_from_for_key, &record)?;
 
         if !row_key.is_empty() {
             ctx.claim_table_key(&table_label, row_key, node_id)?;
@@ -10328,12 +10563,13 @@ fn execute_update(
                         )));
                     }
                 };
-                // NOW must be strictly greater than the matched version's
-                // valid_from so the new version's interval is valid. If the
-                // wall clock is at or before valid_from (legitimate during
-                // backfill / replay scenarios) we bump to valid_from + 1 µs.
-                let new_valid_from = if now_us > current_valid_from {
-                    now_us
+                // The new version opens at the statement's NOW, the instant
+                // its reads saw the matched version valid at, and strictly
+                // after that version's valid_from so its interval is valid.
+                // A version that starts at or after NOW (backfill / replay)
+                // is followed 1 µs later.
+                let new_valid_from = if ctx.valid_now > current_valid_from {
+                    ctx.valid_now
                 } else {
                     current_valid_from + 1
                 };
@@ -10522,18 +10758,17 @@ fn execute_update(
                 new_record.set(vf_fid, Value::Int(new_valid_from));
                 new_record.props.remove(&vt_fid);
                 new_record.set(its_fid, Value::Int(now_us));
-                closing_record.set(vt_fid, Value::Int(new_valid_from));
 
-                // Step 3: write close-current (mutate at same per-version key).
-                ctx.mvcc_put_node_temporal(
-                    ctx.shard_id,
+                // Step 3: close-current at its per-version key.
+                ctx.close_temporal_version(
                     node_id,
                     current_valid_from,
-                    &closing_record,
+                    &mut closing_record,
+                    new_valid_from,
                 )?;
 
-                // Step 4: write open-new (at fresh per-version key for NOW).
-                ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
+                // Step 4: open-new at the fresh per-version key for NOW.
+                ctx.open_temporal_version(node_id, new_valid_from, &new_record)?;
                 ctx.write_stats.nodes_created += 1;
                 // One new version ROW: the statistics counters track stored
                 // rows (what a partition scan would count), so a temporal
@@ -10801,17 +11036,32 @@ fn execute_update(
                                      valid_from={valid_from})"
                                 ))
                             })?;
-                        let field_id = ctx.field_id("valid_to")?;
                         match new_valid_to {
-                            Some(vt) => record.set(field_id, Value::Int(vt)),
+                            Some(vt) => {
+                                ctx.close_temporal_version(node_id, valid_from, &mut record, vt)?;
+                            }
                             None => {
                                 // Re-open a closed version: drop the
                                 // `valid_to` field entirely so the version
                                 // becomes open again.
+                                let field_id = ctx.field_id("valid_to")?;
+                                let closed = ctx
+                                    .indexes_label(record.primary_label())
+                                    .then(|| record.clone());
                                 record.props.remove(&field_id);
+                                ctx.mvcc_put_node_temporal(
+                                    ctx.shard_id,
+                                    node_id,
+                                    valid_from,
+                                    &record,
+                                )?;
+                                if let Some(closed) = closed {
+                                    ctx.index_version_changed(
+                                        node_id, valid_from, &closed, &record,
+                                    )?;
+                                }
                             }
                         }
-                        ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, valid_from, &record)?;
                         ctx.write_stats.properties_set += 1;
                         out_row.insert(
                             format!("{variable}.valid_to"),
@@ -11606,8 +11856,9 @@ fn execute_remove(
                         )));
                     }
                 };
-                let new_valid_from = if now_us > current_valid_from {
-                    now_us
+                // Opens at the statement's NOW, as the temporal SET does.
+                let new_valid_from = if ctx.valid_now > current_valid_from {
+                    ctx.valid_now
                 } else {
                     current_valid_from + 1
                 };
@@ -11676,16 +11927,14 @@ fn execute_remove(
                 new_record.set(vf_fid, Value::Int(new_valid_from));
                 new_record.props.remove(&vt_fid);
                 new_record.set(its_fid, Value::Int(now_us));
-                closing_record.set(vt_fid, Value::Int(new_valid_from));
 
-                ctx.mvcc_put_node_temporal(
-                    ctx.shard_id,
+                ctx.close_temporal_version(
                     node_id,
                     current_valid_from,
-                    &closing_record,
+                    &mut closing_record,
+                    new_valid_from,
                 )?;
-
-                ctx.mvcc_put_node_temporal(ctx.shard_id, node_id, new_valid_from, &new_record)?;
+                ctx.open_temporal_version(node_id, new_valid_from, &new_record)?;
                 // One new version ROW (row-count semantics, same as the SET
                 // close-current + open-new path).
                 ctx.stat_node_created(&new_record);
@@ -11946,8 +12195,10 @@ fn execute_delete(
     if !temporal_node_deletes.is_empty() {
         let now_us = current_hlc_us() as i64;
         for (row_idx, var, node_id, current_valid_from, _primary) in &temporal_node_deletes {
-            let new_valid_from = if now_us > *current_valid_from {
-                now_us
+            // The tombstone opens at the statement's NOW, as the temporal
+            // SET's new version does.
+            let new_valid_from = if ctx.valid_now > *current_valid_from {
+                ctx.valid_now
             } else {
                 current_valid_from + 1
             };
@@ -11966,12 +12217,11 @@ fn execute_delete(
             let deleted_fid = ctx.field_id("__deleted__")?;
             let was_open = !closing_record.props.contains_key(&vt_fid);
             if was_open {
-                closing_record.set(vt_fid, Value::Int(new_valid_from));
-                ctx.mvcc_put_node_temporal(
-                    ctx.shard_id,
+                ctx.close_temporal_version(
                     *node_id,
                     *current_valid_from,
-                    &closing_record,
+                    &mut closing_record,
+                    new_valid_from,
                 )?;
             }
 
@@ -12618,14 +12868,12 @@ fn execute_clone_node(
             _ => continue,
         };
 
-        // Epoch microseconds from the same HLC every other engine-assigned
-        // valid_from comes from. A wall-clock read in milliseconds here would
-        // put a clone's first version three orders of magnitude below every
-        // version any other write path produces, and out of scale with the
-        // valid-time predicates.
-        let now_us = current_hlc_us() as i64;
-        // `AS OF <ts>` selects the source's valid-version active at that
-        // valid-time instant; default is the current version (active now).
+        // The statement's NOW, in the epoch microseconds of every valid-time
+        // value: the instant the clone's first version opens at and the
+        // source's state is read at by default.
+        let now_us = ctx.valid_now;
+        // `AS OF <ts>` selects the source's state valid at that valid-time
+        // instant; default is the state valid now.
         let as_of_us: Option<i64> = match as_of {
             Some(expr) => match eval_neutral(expr, row)? {
                 Value::Int(us) => Some(us),
@@ -12640,12 +12888,14 @@ fn execute_clone_node(
             None => None,
         };
         // Non-temporal nodes read through the point key; temporal nodes have no
-        // point key (per-version layout), so read the valid-version active at the
-        // requested instant (the current version when there is no AS OF).
+        // point key (per-version layout), so read the state valid at the
+        // requested instant. A deleted or not-yet-valid source has none.
         let source_rec = match ctx.mvcc_get_node(ctx.shard_id, a_id)? {
             Some(r) if as_of_us.is_none() => r,
             _ => ctx
-                .mvcc_get_node_at(ctx.shard_id, a_id, as_of_us.unwrap_or(now_us))?
+                .temporal_node_state(a_id, as_of_us.unwrap_or(now_us))?
+                .positive()
+                .map(|(_, record)| record)
                 .ok_or_else(|| {
                     let suffix = as_of_us
                         .map(|t| format!(" as of valid-time {t}"))
@@ -13764,8 +14014,9 @@ fn execute_detach_document(
                 )));
             };
             let now_us = current_hlc_us() as i64;
-            let new_valid_from = if now_us > current_valid_from {
-                now_us
+            // Opens at the statement's NOW, as the temporal SET does.
+            let new_valid_from = if ctx.valid_now > current_valid_from {
+                ctx.valid_now
             } else {
                 current_valid_from + 1
             };
@@ -13803,9 +14054,9 @@ fn execute_detach_document(
                 &[delta],
             );
 
-            // Refresh bitemporal axis fields on both records.
+            // Refresh bitemporal axis fields on the new record (the closing
+            // one gets its valid_to as it is written).
             let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
-            closing_record.set(vt_fid, Value::Int(new_valid_from));
             new_record.set(vf_fid, Value::Int(new_valid_from));
             new_record.props.remove(&vt_fid);
             new_record.set(its_fid, Value::Int(now_us));
@@ -13821,8 +14072,8 @@ fn execute_detach_document(
                         .into(),
                 )
             })?;
-            ctx.mvcc_put_node_temporal(ctx.shard_id, source_id, current_vf, &closing_record)?;
-            ctx.mvcc_put_node_temporal(ctx.shard_id, source_id, new_valid_from, &new_record)?;
+            ctx.close_temporal_version(source_id, current_vf, &mut closing_record, new_valid_from)?;
+            ctx.open_temporal_version(source_id, new_valid_from, &new_record)?;
             ctx.write_stats.properties_removed += 1;
         } else {
             emit_property_removal(source_id, property_path, field_id_opt, ctx)?;
@@ -14344,8 +14595,9 @@ fn execute_attach_document(
                 )));
             };
             let now_us = current_hlc_us() as i64;
-            let new_valid_from = if now_us > current_valid_from {
-                now_us
+            // Opens at the statement's NOW, as the temporal SET does.
+            let new_valid_from = if ctx.valid_now > current_valid_from {
+                ctx.valid_now
             } else {
                 current_valid_from + 1
             };
@@ -14369,7 +14621,6 @@ fn execute_attach_document(
             );
 
             let [vf_fid, vt_fid, its_fid] = temporal_field_ids(ctx)?;
-            closing_record.set(vt_fid, Value::Int(new_valid_from));
             new_record.set(vf_fid, Value::Int(new_valid_from));
             new_record.props.remove(&vt_fid);
             new_record.set(its_fid, Value::Int(now_us));
@@ -14384,8 +14635,8 @@ fn execute_attach_document(
                         .into(),
                 )
             })?;
-            ctx.mvcc_put_node_temporal(ctx.shard_id, target_id, current_vf, &closing_record)?;
-            ctx.mvcc_put_node_temporal(ctx.shard_id, target_id, new_valid_from, &new_record)?;
+            ctx.close_temporal_version(target_id, current_vf, &mut closing_record, new_valid_from)?;
+            ctx.open_temporal_version(target_id, new_valid_from, &new_record)?;
             ctx.write_stats.properties_set += 1;
         } else {
             emit_attach_set_path(target_id, target_property_path, doc, ctx)?;
@@ -15672,6 +15923,14 @@ fn current_hlc_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// The wall clock in microseconds since the epoch, the valid-time unit: what
+/// a statement binds as its [`ExecutionContext::valid_now`].
+pub fn wall_clock_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
 /// Load the existing trigger-name list for an index key, append `name`, and

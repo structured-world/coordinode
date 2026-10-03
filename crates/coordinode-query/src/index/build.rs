@@ -17,7 +17,8 @@
 //! cannot land.
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{NodeRecord, decode_node_key};
+use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_modality::{LocalNodeStore, NodeStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
@@ -90,8 +91,9 @@ pub struct Backfill<'a> {
 
 impl<'a> Backfill<'a> {
     /// Stage and commit the entries of every stored node of `index`'s label,
-    /// committing each page through `commit`. Returns the number of nodes
-    /// read into the index. Call once `index` is registered with the writers.
+    /// committing each page through `commit`. Returns the number of entries
+    /// staged: one per node, and one per version of a temporal node.
+    /// Call once `index` is registered with the writers.
     ///
     /// # Errors
     ///
@@ -127,9 +129,16 @@ impl<'a> Backfill<'a> {
             let mut read = Vec::with_capacity(page.rows.len());
             let mut staged = 0u64;
             for (key, bytes) in &page.rows {
-                // Temporal versions are keyed apart and not indexed.
-                let Some((_, node_id)) = decode_node_key(key) else {
-                    continue;
+                // A temporal node has an entry per version, as its writers
+                // stage one for each version they write.
+                let owner = match decode_node_key(key) {
+                    Some((_, node_id)) => EntryOwner::node(node_id.as_raw()),
+                    None => match decode_temporal_node_key(key) {
+                        Some((_, node_id, valid_from)) => {
+                            EntryOwner::version(node_id.as_raw(), valid_from)
+                        }
+                        None => continue,
+                    },
                 };
                 let record = NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
                     kind: "node record",
@@ -144,7 +153,7 @@ impl<'a> Backfill<'a> {
                     self.engine,
                     &mut txn,
                     index,
-                    node_id,
+                    owner,
                     &lookup,
                     &field_of,
                     &mut claims,

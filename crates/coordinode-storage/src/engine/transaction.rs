@@ -1057,12 +1057,13 @@ impl<'a> Transaction<'a> {
         Ok(())
     }
 
-    /// Stage one node's membership change in a DERIVED index: the entry
-    /// effects go to the write buffer, as for any index, so this transaction
-    /// reads them and its unique values conflict with a concurrent writer of
-    /// the same value; the unit logs the change as sealed work under
-    /// `binding` instead of the entries. `old` is the membership the node
-    /// had before this change, `new` the one it has after.
+    /// Stage one membership change in a DERIVED index, of a node or of one
+    /// version of a temporal node (`owner`): the entry effects go to the
+    /// write buffer, as for any index, so this transaction reads them and its
+    /// unique values conflict with a concurrent writer of the same value; the
+    /// unit logs the change as sealed work under `binding` instead of the
+    /// entries. `old` is the membership before this change, `new` the one
+    /// after.
     ///
     /// # Errors
     ///
@@ -1070,7 +1071,7 @@ impl<'a> Transaction<'a> {
     pub fn stage_derived(
         &mut self,
         binding: &coordinode_core::txn::proposal::IndexBinding,
-        node_id: u64,
+        owner: coordinode_core::index::derive::EntryOwner,
         old: Option<Vec<coordinode_core::graph::types::Value>>,
         new: Option<Vec<coordinode_core::graph::types::Value>>,
         effects: &[coordinode_core::index::derive::EntryEffect],
@@ -1083,7 +1084,7 @@ impl<'a> Transaction<'a> {
         }
         self.derived.stage(
             binding,
-            node_id,
+            owner,
             old,
             new,
             effects.iter().map(|e| e.key.clone()),

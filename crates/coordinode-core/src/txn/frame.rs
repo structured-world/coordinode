@@ -48,6 +48,12 @@ const KIND_MASK: u8 = 0b111;
 const SOURCE_UNIT_RECORD: u8 = 0;
 const SOURCE_VALUES: u8 = 1;
 
+/// A DERIVED change of a node that is not temporal.
+const OWNER_NODE: u8 = 0;
+/// A DERIVED change of one version of a temporal node: its `valid_from`
+/// follows as 8 bytes big-endian.
+const OWNER_VERSION: u8 = 1;
+
 const FLAG_BYPASS_RATE_LIMITER: u8 = 1;
 
 /// Every partition in its frame number, the same numbering the snapshot and
@@ -362,6 +368,13 @@ impl<'a> Encoder<'a> {
                 // binding: the second and later are references.
                 self.encoded_bytes(to_msgpack(&work.binding)?, out);
                 put_varint(work.node_id, out);
+                match work.valid_from {
+                    Some(valid_from) => {
+                        out.push(OWNER_VERSION);
+                        out.extend_from_slice(&valid_from.to_be_bytes());
+                    }
+                    None => out.push(OWNER_NODE),
+                }
                 self.encoded_bytes(to_msgpack(&work.old)?, out);
                 match &work.new {
                     DerivedSource::UnitRecord(ordinal) => {
@@ -444,8 +457,8 @@ const FRAME_HEADER_MAX: usize = 1 + 3 * 10 + 1 + 10 + 4;
 
 /// Most bytes of tags, lengths and varints one operation adds to the bytes
 /// it carries: a DERIVED operation's tag, three slice lengths, node id,
-/// source tag and ordinal.
-const MAX_OP_OVERHEAD: usize = 1 + 3 * 10 + 10 + 1 + 10;
+/// owner tag and version, source tag and ordinal.
+const MAX_OP_OVERHEAD: usize = 1 + 3 * 10 + 10 + 1 + 8 + 1 + 10;
 
 /// [`check_proposal`] against `limits`.
 fn check_within<'a>(unit: impl Into<UnitRef<'a>>, limits: &DecodeLimits) -> Result<(), FrameError> {
@@ -757,6 +770,15 @@ impl<'a> Decoder<'a> {
         let binding: IndexBinding = from_msgpack(self.slice()?)?;
         binding.interpretation.check_supported()?;
         let node_id = self.reader.varint()?;
+        let valid_from = match self.reader.u8()? {
+            OWNER_NODE => None,
+            OWNER_VERSION => {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(self.reader.take(8)?);
+                Some(i64::from_be_bytes(raw))
+            }
+            other => return Err(FrameError::UnknownTag(other)),
+        };
         let old = from_msgpack(self.slice()?)?;
         let new = match self.reader.u8()? {
             SOURCE_UNIT_RECORD => {
@@ -774,6 +796,7 @@ impl<'a> Decoder<'a> {
         Ok(DerivedIndexWork {
             binding,
             node_id,
+            valid_from,
             old,
             new,
         })
