@@ -146,6 +146,10 @@ pub struct SessionStats {
     /// client that writes and then writes again conditionally needs no read
     /// in between.
     pub commit_ts: u64,
+    /// The commit timestamp a read served by a read-only member reflects:
+    /// the member does not run its group's version and applies nothing past
+    /// it. Zero for a read served by a member that runs its group's version.
+    pub read_as_of_ts: u64,
 }
 
 /// Neutral error class for a failed request. The binding maps this to its

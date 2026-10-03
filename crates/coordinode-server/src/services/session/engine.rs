@@ -22,6 +22,7 @@ use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::Database;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
+use coordinode_raft::cluster::version::{MemberState, VersionGate};
 use coordinode_session::{CursorEngine, EngineError, QueryCursor, SessionStats};
 use parking_lot::RwLock;
 
@@ -34,11 +35,32 @@ const KEYSET_PAGE: usize = 1024;
 /// A [`CursorEngine`] that runs statements through the embedded [`Database`].
 pub struct DatabaseCursorEngine {
     database: Arc<RwLock<Database>>,
+    /// This member's version view; `None` outside a cluster.
+    version: Option<Arc<VersionGate>>,
 }
 
 impl DatabaseCursorEngine {
     pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self { database }
+        Self {
+            database,
+            version: None,
+        }
+    }
+
+    /// Label the reads this member serves while it does not run its group's
+    /// version with what they are as of.
+    pub fn with_version(mut self, version: Option<Arc<VersionGate>>) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// What a read starting now is as of: the last commit applied, while this
+    /// member is read-only; zero while it serves current reads.
+    fn read_as_of(&self) -> u64 {
+        match self.version.as_ref().map(|v| v.state()) {
+            Some(MemberState::Mismatched(m)) => m.as_of,
+            _ => 0,
+        }
     }
 }
 
@@ -54,16 +76,22 @@ impl CursorEngine for DatabaseCursorEngine {
         } else {
             Some(params)
         };
+        let read_as_of_ts = self.read_as_of();
         // Keyset path: auto-commit read whose plan pages by a single NodeScan.
         // An interactive statement (txid != 0) reuses the parked transaction
         // and cannot re-pin a snapshot per page, so it always materializes.
         if txid == 0 && self.database.read().keyset_pageable(query) {
-            let cursor = KeysetCursor::open(Arc::clone(&self.database), query.to_string(), params)?;
+            let cursor = KeysetCursor::open(
+                Arc::clone(&self.database),
+                query.to_string(),
+                params,
+                read_as_of_ts,
+            )?;
             return Ok(Box::new(cursor));
         }
 
         let db = self.database.read();
-        let (rows, stats) = if txid == 0 {
+        let (rows, mut stats) = if txid == 0 {
             let result = db
                 .execute_cypher_shared(query, params, None, None, None)
                 .map_err(|e| EngineError(e.to_string()))?;
@@ -77,6 +105,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 .map_err(|e| EngineError(e.to_string()))?;
             (rows_to_values(&rows), SessionStats::default())
         };
+        stats.read_as_of_ts = read_as_of_ts;
         Ok(Box::new(MaterializedCursor {
             columns: rows.0,
             rows: rows.1,
@@ -122,6 +151,9 @@ struct KeysetCursor {
     exhausted: bool,
     pending: VecDeque<Vec<Value>>,
     stats: SessionStats,
+    /// What the whole scan is as of on a read-only member, zero otherwise:
+    /// its pages all read the snapshot pinned when it opened.
+    read_as_of_ts: u64,
 }
 
 impl KeysetCursor {
@@ -131,6 +163,7 @@ impl KeysetCursor {
         database: Arc<RwLock<Database>>,
         query: String,
         params: Option<HashMap<String, Value>>,
+        read_as_of_ts: u64,
     ) -> Result<Self, EngineError> {
         let mut cursor = Self {
             database,
@@ -142,6 +175,7 @@ impl KeysetCursor {
             exhausted: false,
             pending: VecDeque::new(),
             stats: SessionStats::default(),
+            read_as_of_ts,
         };
         // Drive the scan until columns are established. A heavy Filter can empty
         // a leading page while later pages still produce rows, so loop rather
@@ -169,7 +203,10 @@ impl KeysetCursor {
         self.read_ts = Some(page.read_ts);
         self.resume = page.last_key;
         self.exhausted = page.exhausted;
-        self.stats = write_stats(&page.write_stats);
+        self.stats = SessionStats {
+            read_as_of_ts: self.read_as_of_ts,
+            ..write_stats(&page.write_stats)
+        };
         if self.columns.is_empty() {
             if let Some(first) = page.rows.first() {
                 self.columns = first.keys().cloned().collect();

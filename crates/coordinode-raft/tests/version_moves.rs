@@ -20,6 +20,7 @@ use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_core::version::VersionPair;
 use coordinode_raft::cluster::version::MemberState;
 use coordinode_raft::cluster::{NodeOptions, RaftNode};
+use coordinode_raft::read_fence::{ReadConcern, ReadFenceError, ReadPreference};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -236,6 +237,39 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
         let ahead = mismatch(write(m3.node(), &ids, "node:on-3", 110));
         assert!(!ahead.behind);
         assert_eq!((ahead.own, ahead.group), (pair(1), pair(0)));
+        // It serves what it holds, labelled as of its last applied commit,
+        // and refuses the reads that would have to be current.
+        let mut fence = m3.node().read_fence();
+        fence
+            .apply_default(ReadPreference::Nearest, ReadConcern::Local)
+            .await
+            .expect("a local read is served");
+        assert_eq!(fence.as_of(), Some(ahead.as_of));
+        for (preference, concern) in [
+            (ReadPreference::Nearest, ReadConcern::Majority),
+            (ReadPreference::Nearest, ReadConcern::Linearizable),
+            (ReadPreference::Primary, ReadConcern::Local),
+        ] {
+            let refused = m3
+                .node()
+                .read_fence()
+                .apply_default(preference, concern)
+                .await;
+            assert!(
+                matches!(refused, Err(ReadFenceError::ReadOnly(_))),
+                "{preference:?}/{concern:?}: {refused:?}"
+            );
+        }
+        assert!(
+            matches!(
+                m3.node()
+                    .read_fence()
+                    .wait_for_index(u64::MAX, Duration::from_secs(30))
+                    .await,
+                Err(ReadFenceError::ReadOnly(_))
+            ),
+            "a causal wait on a position it will never reach is refused at once"
+        );
         write(m1.node(), &ids, "node:during", 120).expect("the old side still holds a majority");
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(

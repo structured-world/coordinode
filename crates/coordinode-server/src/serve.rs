@@ -1400,6 +1400,9 @@ pub(crate) async fn serve(
                 let svc = services::session::SessionSvc::new(
                     Arc::clone(&database),
                     Arc::clone(&session_registry),
+                    raft_node_shared
+                        .as_ref()
+                        .map(|raft| Arc::clone(raft.version())),
                 );
                 // In a cluster, a session reports what its node can
                 // actually do: whether a leader is reachable, and so

@@ -168,6 +168,13 @@ pub enum ReadFenceError {
     /// Underlying Raft error (e.g., not initialized, fatal state).
     #[error("Raft error during read fence: {0}")]
     Raft(String),
+
+    /// This member does not run its group's version: it serves reads only as
+    /// of what it last applied, so a read that needs proof of currency (the
+    /// leader, a majority or linearizable concern, a causal wait on a later
+    /// position) is refused.
+    #[error("this member is read-only and cannot prove its reads current: {0}")]
+    ReadOnly(coordinode_core::version::Mismatch),
 }
 
 /// Per-request read fence handle.
@@ -200,6 +207,9 @@ pub struct ReadFence {
     /// overrides and integration tests). Tests use this to trigger `StaleReplica`
     /// reliably without needing to write 10K+ log entries of real lag.
     staleness_lag_override: Option<u64>,
+    /// This member's version view; a member that does not run its group's
+    /// version serves only reads that need no proof of currency.
+    version: Option<Arc<crate::cluster::version::VersionGate>>,
 }
 
 impl ReadFence {
@@ -215,7 +225,33 @@ impl ReadFence {
             raft,
             staleness_threshold: None,
             staleness_lag_override: None,
+            version: None,
         }
+    }
+
+    /// Hold reads to what `gate` says this member may serve.
+    pub(crate) fn with_version_gate(
+        mut self,
+        gate: Arc<crate::cluster::version::VersionGate>,
+    ) -> Self {
+        self.version = Some(gate);
+        self
+    }
+
+    /// Why this member is read-only, `None` while it runs its group's
+    /// version.
+    fn read_only(&self) -> Option<coordinode_core::version::Mismatch> {
+        match self.version.as_ref()?.state() {
+            crate::cluster::version::MemberState::Mismatched(m) => Some(m),
+            crate::cluster::version::MemberState::Matched => None,
+        }
+    }
+
+    /// The commit timestamp a read served here is as of, while this member
+    /// is read-only; `None` while it runs its group's version and serves
+    /// current reads.
+    pub fn as_of(&self) -> Option<u64> {
+        self.read_only().map(|m| m.as_of)
     }
 
     /// Inject a specific lag value for `staleness_entries()`.
@@ -253,6 +289,19 @@ impl ReadFence {
         // Bound on the one blocking check here, the linearizable lease read.
         timeout: Duration,
     ) -> Result<(), ReadFenceError> {
+        // A read-only member's consensus is a frozen view: what it believes
+        // about leadership and lag says nothing current. It serves what it
+        // holds, labelled as of (`as_of`), and refuses every read that needs
+        // to be current.
+        if let Some(m) = self.read_only() {
+            let needs_currency = preference == ReadPreference::Primary
+                || matches!(concern, ReadConcern::Majority | ReadConcern::Linearizable);
+            if needs_currency {
+                metrics::counter!("coordinode_version_refused_reads_total").increment(1);
+                return Err(ReadFenceError::ReadOnly(m));
+            }
+            return Ok(());
+        }
         let is_leader = self.check_is_leader().await;
 
         // --- Step 1: read preference role check ---
@@ -350,6 +399,12 @@ impl ReadFence {
             let current = *self.applied_rx.borrow();
             if current >= target {
                 return Ok(());
+            }
+            // A read-only member receives nothing, so a later position never
+            // arrives: refuse by name instead of waiting out the timeout.
+            if let Some(m) = self.read_only() {
+                metrics::counter!("coordinode_version_refused_reads_total").increment(1);
+                return Err(ReadFenceError::ReadOnly(m));
             }
             let changed = tokio::time::timeout_at(deadline, self.applied_rx.changed()).await;
             match changed {

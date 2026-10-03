@@ -1752,6 +1752,7 @@ impl RaftNode {
     /// executing a query to enforce routing and consistency guarantees.
     pub fn read_fence(&self) -> crate::read_fence::ReadFence {
         crate::read_fence::ReadFence::new(self.applied_rx.clone(), Arc::clone(&self.raft))
+            .with_version_gate(Arc::clone(&self.version))
     }
 
     /// Get this node's ID.

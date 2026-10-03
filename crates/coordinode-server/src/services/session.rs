@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
+use coordinode_raft::cluster::version::VersionGate;
 use coordinode_session::{
     ConnectionSettings, ConnectionState, ErrorCode, InOp, Ordering as CoreOrdering, OutEvent,
     SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
@@ -46,9 +47,15 @@ pub struct SessionSvc {
 impl SessionSvc {
     /// Create the binding, backing its sessions with the embedded database and
     /// registering each session in the shared `registry` so it is visible to
-    /// `SHOW SESSIONS` / `SHOW TRANSACTIONS`.
-    pub fn new(database: Arc<RwLock<Database>>, registry: Arc<SessionRegistry>) -> Self {
-        let engine = Arc::new(DatabaseCursorEngine::new(database));
+    /// `SHOW SESSIONS` / `SHOW TRANSACTIONS`. In a cluster, `version` labels
+    /// the reads of a member that does not run its group's version with what
+    /// they are as of.
+    pub fn new(
+        database: Arc<RwLock<Database>>,
+        registry: Arc<SessionRegistry>,
+        version: Option<Arc<VersionGate>>,
+    ) -> Self {
+        let engine = Arc::new(DatabaseCursorEngine::new(database).with_version(version));
         Self {
             manager: SessionManager::new(engine, registry),
         }
@@ -312,6 +319,7 @@ fn stats_to_proto(stats: SessionStats) -> query::QueryStats {
         applied_index: stats.applied_index,
         served_by_leader: stats.served_by_leader,
         commit_ts: stats.commit_ts,
+        read_as_of_ts: stats.read_as_of_ts,
     }
 }
 

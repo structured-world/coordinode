@@ -702,6 +702,8 @@ fn mismatch_metadata(m: &coordinode_core::version::Mismatch) -> Vec<(&'static st
 
 /// Convert a ReadFenceError to a tonic Status.
 fn fence_error_to_status(err: ReadFenceError) -> Status {
+    use crate::services::error_details::{Reason, status_with_reason};
+    use tonic::Code;
     match err {
         ReadFenceError::NotFollower => Status::failed_precondition(err.to_string()),
         ReadFenceError::NotLeader => Status::failed_precondition(err.to_string()),
@@ -711,6 +713,14 @@ fn fence_error_to_status(err: ReadFenceError) -> Status {
             Status::deadline_exceeded(err.to_string())
         }
         ReadFenceError::Raft(e) => Status::internal(format!("Raft error: {e}")),
+        // Named like a refused write: the same metadata says why this member
+        // is read-only and where the current reads are.
+        ReadFenceError::ReadOnly(ref m) => status_with_reason(
+            Code::FailedPrecondition,
+            err.to_string(),
+            Reason::MemberReadOnly,
+            mismatch_metadata(m),
+        ),
     }
 }
 
@@ -908,6 +918,9 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     applied_index: 0,
                     served_by_leader: false,
                     commit_ts: 0,
+                    // The transaction's commit decides; on a read-only member
+                    // it is refused there.
+                    read_as_of_ts: 0,
                 }),
             }));
         }
@@ -996,45 +1009,46 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // after_index fence if the client supplied one.
         // In standalone mode (raft_node = None), all writes are immediately visible
         // and applied_index is always 0 — causal fences are trivially satisfied.
-        let (applied_index, served_by_leader) = if let Some(ref raft) = self.raft_node {
-            let preference = ReadPreference::from_proto(req.read_preference);
-            let mut fence = raft.read_fence();
-            if let Err(e) = fence.apply_default(preference, concern).await {
-                // The request needs the leader and this node is not it. Pass it
-                // along rather than making the caller find the leader itself:
-                // that is what a client without a topology map cannot do, and
-                // this node already knows the answer. Once forwarded, a request
-                // is answered rather than passed on again.
-                match raft.current_leader() {
-                    Some(leader_id)
-                        if !already_forwarded
-                            && matches!(
-                                e,
-                                ReadFenceError::NotLeader
-                                    | ReadFenceError::LinearizableRequiresLeader
-                            ) =>
-                    {
-                        return self.forward_to_leader(leader_id, req).await;
+        let (applied_index, served_by_leader, read_as_of_ts) =
+            if let Some(ref raft) = self.raft_node {
+                let preference = ReadPreference::from_proto(req.read_preference);
+                let mut fence = raft.read_fence();
+                if let Err(e) = fence.apply_default(preference, concern).await {
+                    // The request needs the leader and this node is not it. Pass it
+                    // along rather than making the caller find the leader itself:
+                    // that is what a client without a topology map cannot do, and
+                    // this node already knows the answer. Once forwarded, a request
+                    // is answered rather than passed on again.
+                    match raft.current_leader() {
+                        Some(leader_id)
+                            if !already_forwarded
+                                && matches!(
+                                    e,
+                                    ReadFenceError::NotLeader
+                                        | ReadFenceError::LinearizableRequiresLeader
+                                ) =>
+                        {
+                            return self.forward_to_leader(leader_id, req).await;
+                        }
+                        _ => return Err(fence_error_to_status(e)),
                     }
-                    _ => return Err(fence_error_to_status(e)),
                 }
-            }
 
-            // Causal fence: block until applied_index >= after_idx.
-            // after_idx = 0 means no fence (default).
-            if after_idx > 0 {
-                fence
-                    .wait_for_index(after_idx, READ_FENCE_TIMEOUT)
-                    .await
-                    .map_err(fence_error_to_status)?;
-            }
+                // Causal fence: block until applied_index >= after_idx.
+                // after_idx = 0 means no fence (default).
+                if after_idx > 0 {
+                    fence
+                        .wait_for_index(after_idx, READ_FENCE_TIMEOUT)
+                        .await
+                        .map_err(fence_error_to_status)?;
+                }
 
-            let idx = fence.applied_index();
-            let is_leader = raft.is_leader().await;
-            (idx, is_leader)
-        } else {
-            (0u64, false)
-        };
+                let idx = fence.applied_index();
+                let is_leader = raft.is_leader().await;
+                (idx, is_leader, fence.as_of().unwrap_or(0))
+            } else {
+                (0u64, false, 0u64)
+            };
 
         // Build executor-level concerns from the proto request, then execute
         // through the unified entry point so they actually reach the executor
@@ -1191,6 +1205,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 // transaction, whose timestamp belongs to the commit that
                 // ends it.
                 commit_ts: write_stats.commit_ts.unwrap_or(0),
+                read_as_of_ts,
             }),
         }))
     }
