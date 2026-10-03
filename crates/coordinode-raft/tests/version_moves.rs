@@ -346,6 +346,83 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
     assert!(result.is_ok(), "TIMED OUT");
 }
 
+/// A move abandoned before it reaches a majority: the updated member is
+/// removed (the removal committed first), its directory discarded after, and
+/// it is added back empty at the version the group runs. The group writes
+/// throughout and the re-added member catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_is_abandoned_by_removing_and_re_adding_the_updated_member() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let ids = ProposalIdGenerator::with_base(3u64 << 48);
+        let [mut m1, mut m2, mut m3] = group_of_three(0).await;
+        write(m1.node(), &ids, "node:before", 100).expect("write before the move");
+
+        m3.update(1).await;
+        mismatch(write(m3.node(), &ids, "node:on-3", 110));
+        write(m1.node(), &ids, "node:during", 120).expect("the old side holds a majority");
+
+        // Abandon: the removal commits while member 3 still holds its
+        // directory, which is discarded only after.
+        m1.node()
+            .remove_node(3)
+            .await
+            .expect("remove the updated member");
+        write(m1.node(), &ids, "node:removed", 130).expect("two voters of two write");
+        m3.node
+            .take()
+            .expect("running")
+            .shutdown()
+            .await
+            .expect("shutdown 3");
+        let fresh = tempfile::tempdir().expect("fresh directory");
+        m3.engine = open_engine(fresh.path());
+        m3._dir = fresh;
+        m3.node = Some(
+            RaftNode::open_joining_with_options(
+                3,
+                Arc::clone(&m3.engine),
+                format!("127.0.0.1:{}", m3.port).parse().expect("addr"),
+                options(0),
+            )
+            .await
+            .expect("open 3 empty"),
+        );
+        m1.node()
+            .add_node(3, format!("http://127.0.0.1:{}", m3.port))
+            .await
+            .expect("add 3 back");
+        m1.node()
+            .change_membership(vec![1, 2, 3])
+            .await
+            .expect("three voters again");
+        write(m1.node(), &ids, "node:after", 140).expect("the group writes");
+
+        eventually("member 3 matches", || {
+            m3.node().version().state() == MemberState::Matched
+        })
+        .await;
+        for key in ["node:before", "node:during", "node:removed", "node:after"] {
+            eventually(&format!("member 3 holds {key}"), || holds(&m3.engine, key)).await;
+        }
+        assert!(
+            !holds(&m3.engine, "node:on-3"),
+            "a refused write never lands"
+        );
+        assert_eq!(
+            m1.node().version_report().group_pair.map(|r| r.pair),
+            Some(pair(0))
+        );
+
+        for m in [&mut m1, &mut m2, &mut m3] {
+            if let Some(node) = m.node.take() {
+                node.shutdown().await.expect("shutdown");
+            }
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}
+
 /// Write `key` on `node` off the runtime, giving up after `wait`: a write
 /// that cannot reach a majority neither commits nor fails at once.
 async fn try_write(
