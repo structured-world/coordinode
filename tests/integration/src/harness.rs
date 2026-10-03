@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::proto::{
     admin::cluster_service_client::ClusterServiceClient,
-    graph::schema_service_client::SchemaServiceClient,
     query::cypher_service_client::CypherServiceClient,
+    v2::graph::schema_service_client::SchemaServiceClient,
 };
 
 /// A running coordinode process bound to an ephemeral port + temp data dir.
@@ -27,6 +27,8 @@ pub struct CoordinodeProcess {
     /// Ops port, whose `/ready` says the server is serving: the listeners
     /// are bound before storage opens, so an open port proves nothing yet.
     ops_port: u16,
+    /// REST/JSON port, which transcodes to the gRPC services.
+    pub rest_port: u16,
     // Wrapped in Option so `restart()` can take it without needing unsafe.
     // Always `Some` except briefly during `restart()`.
     data_dir: Option<tempfile::TempDir>,
@@ -54,16 +56,17 @@ impl CoordinodeProcess {
     /// instead of a timeout or a test that talks to someone else's server.
     async fn spawn_on_free_port(
         data_dir: tempfile::TempDir,
-        spawn: impl Fn(u16, u16, PathBuf) -> Child,
+        spawn: impl Fn(u16, u16, u16, PathBuf) -> Child,
     ) -> Self {
         const ATTEMPTS: u32 = 5;
         let mut last_exit = None;
         for _ in 0..ATTEMPTS {
-            let (port, ops_port) = (free_port(), free_port());
+            let (port, ops_port, rest_port) = (free_port(), free_port(), free_port());
             let mut proc = Self {
-                child: spawn(port, ops_port, data_dir.path().to_path_buf()),
+                child: spawn(port, ops_port, rest_port, data_dir.path().to_path_buf()),
                 port,
                 ops_port,
+                rest_port,
                 data_dir: None,
             };
             match proc.wait_until_ready(Duration::from_secs(15)).await {
@@ -92,11 +95,12 @@ impl CoordinodeProcess {
     pub async fn start_cluster_member(node_id: u64, port: u16, peer_ports: &[u16]) -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
         let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
-        let ops_port = free_port();
+        let (ops_port, rest_port) = (free_port(), free_port());
         let child = spawn_cluster_binary(
             node_id,
             port,
             ops_port,
+            rest_port,
             &peers,
             data_dir.path().to_path_buf(),
         );
@@ -104,6 +108,7 @@ impl CoordinodeProcess {
             child,
             port,
             ops_port,
+            rest_port,
             data_dir: Some(data_dir),
         };
         // The port is fixed by the caller (peers already name it), so a
@@ -197,8 +202,8 @@ impl CoordinodeProcess {
             .take()
             .expect("data_dir missing: restart called twice?");
         let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
-        Self::spawn_on_free_port(data_dir, |port, ops_port, data| {
-            spawn_cluster_binary(node_id, port, ops_port, &peers, data)
+        Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
+            spawn_cluster_binary(node_id, port, ops_port, rest_port, &peers, data)
         })
         .await
     }
@@ -211,6 +216,42 @@ impl CoordinodeProcess {
     /// This process's address as a cluster member (see [`member_addr`]).
     pub fn member_addr(&self) -> String {
         member_addr(self.port)
+    }
+
+    /// Send one HTTP/1.1 request with an optional JSON body to this process's
+    /// REST port; returns the status code and the raw response body.
+    pub fn rest_request(&self, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+        use std::io::{Read, Write};
+
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, self.rest_port));
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect("connect to the REST port");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let body = body.unwrap_or("");
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let status = response
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {response:?}"));
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        (status, body)
     }
 
     /// Build a `SchemaServiceClient` connected to this process.
@@ -588,12 +629,12 @@ fn answers_ready(port: u16) -> bool {
 }
 
 /// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:OPS_PORT
-/// --rest-addr [::1]:0 --data DATA_DIR`.
+/// --rest-addr [::1]:REST_PORT --data DATA_DIR`.
 ///
-/// The ops port is chosen by the harness so it can ask `/ready`; the REST
-/// port is left to the OS. Concurrent test servers would otherwise fight
-/// over the defaults (:7084, :7081), and a taken port fails the start.
-fn spawn_binary(port: u16, ops_port: u16, data_dir: PathBuf) -> Child {
+/// Every port is chosen by the harness, so a test can ask `/ready` and reach
+/// the REST surface; concurrent test servers would otherwise fight over the
+/// defaults (:7084, :7081), and a taken port fails the start.
+fn spawn_binary(port: u16, ops_port: u16, rest_port: u16, data_dir: PathBuf) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
@@ -602,7 +643,7 @@ fn spawn_binary(port: u16, ops_port: u16, data_dir: PathBuf) -> Child {
         .arg("--ops-addr")
         .arg(format!("[::1]:{ops_port}"))
         .arg("--rest-addr")
-        .arg("[::1]:0")
+        .arg(format!("[::1]:{rest_port}"))
         .arg("--data")
         .arg(&data_dir)
         // Suppress server logs from test output; set RUST_LOG=debug for debugging.
@@ -639,6 +680,7 @@ fn spawn_cluster_binary(
     node_id: u64,
     port: u16,
     ops_port: u16,
+    rest_port: u16,
     peers: &[String],
     data_dir: PathBuf,
 ) -> Child {
@@ -656,7 +698,7 @@ fn spawn_cluster_binary(
         .arg("--ops-addr")
         .arg(format!("[::1]:{ops_port}"))
         .arg("--rest-addr")
-        .arg("[::1]:0")
+        .arg(format!("[::1]:{rest_port}"))
         .arg("--data")
         .arg(&data_dir)
         .env(

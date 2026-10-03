@@ -16,7 +16,7 @@ pub mod vector_worker;
 
 pub use coordinode_core::txn::transaction::CommitReceipt;
 pub use db::{
-    AfterCommitDispatchReport, DEFAULT_VECTOR_BUILD_WAIT, Database, DatabaseError,
-    TriggerDispatchConfig,
+    AfterCommitDispatchReport, ConstraintDeclaration, DEFAULT_VECTOR_BUILD_WAIT, Database,
+    DatabaseError, LabelConstraint, TriggerDispatchConfig,
 };
 pub use repair::RepairReport;

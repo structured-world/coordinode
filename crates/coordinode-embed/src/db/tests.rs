@@ -423,6 +423,7 @@ fn a_lease_granted_during_a_restore_sends_it_back_to_the_check() {
         fields: db.fields.as_ref(),
         raise_lease: &raise,
         build_indexes: &|| Ok(()),
+        check_constraints: &|| Ok(()),
     };
     let dump = concat!(
         r#"{"type":"node","id":1,"labels":["User"],"properties":{"name":"a"}}"#,
@@ -724,6 +725,18 @@ fn explain_shows_vector_consistency_for_vector_queries() {
 /// CREATE which triggers the B-tree unique index → "unique constraint violated".
 ///
 /// Expected: MERGE finds the existing node and applies SET s.name = 'updated'.
+/// Require `property` of `label` to be unique, through a named constraint.
+fn require_unique(db: &Database, label: &str, property: &str) {
+    db.create_constraint(crate::db::ConstraintDeclaration {
+        name: None,
+        label: label.into(),
+        properties: vec![property.into()],
+        kind: coordinode_core::schema::definition::ConstraintKind::Unique,
+        if_not_exists: false,
+    })
+    .expect("create the uniqueness constraint");
+}
+
 #[test]
 fn merge_on_existing_node_with_unique_constraint_does_not_error() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
@@ -733,9 +746,10 @@ fn merge_on_existing_node_with_unique_constraint_does_not_error() {
 
     // Create label with a unique segment_id property.
     let mut schema = LabelSchema::new_node_id("Segment");
-    schema.add_property(PropertyDef::new("segment_id", PropertyType::Int).unique());
+    schema.add_property(PropertyDef::new("segment_id", PropertyType::Int));
     schema.add_property(PropertyDef::new("name", PropertyType::String));
     db.create_label_schema(schema).expect("create schema");
+    require_unique(&db, "Segment", "segment_id");
 
     // Create the initial node.
     db.execute_cypher("CREATE (s:Segment {segment_id: 42, name: 'original'})")
@@ -780,9 +794,10 @@ fn merge_with_params_on_existing_unique_node_does_not_error() {
     let mut db = Database::open(dir.path()).expect("open");
 
     let mut schema = LabelSchema::new_node_id("Segment");
-    schema.add_property(PropertyDef::new("segment_id", PropertyType::Int).unique());
+    schema.add_property(PropertyDef::new("segment_id", PropertyType::Int));
     schema.add_property(PropertyDef::new("name", PropertyType::String));
     db.create_label_schema(schema).expect("create schema");
+    require_unique(&db, "Segment", "segment_id");
 
     // Create node via params.
     let mut create_params = std::collections::HashMap::new();
@@ -842,12 +857,9 @@ fn merge_strict_mode_unique_id_string_literal_does_not_error() {
 
     // STRICT mode, unique id property (INT).
     let mut schema = LabelSchema::new_node_id("TestNode");
-    schema.add_property(
-        PropertyDef::new("id", PropertyType::String)
-            .unique()
-            .not_null(),
-    );
+    schema.add_property(PropertyDef::new("id", PropertyType::String).not_null());
     db.create_label_schema(schema).expect("create schema");
+    require_unique(&db, "TestNode", "id");
 
     // Create node.
     db.execute_cypher("CREATE (n:TestNode {id: 'x1'})")
@@ -885,12 +897,9 @@ fn merge_on_existing_unique_node_after_restart_does_not_error() {
         let mut db = Database::open(dir.path()).expect("open");
 
         let mut schema = LabelSchema::new_node_id("TestNode");
-        schema.add_property(
-            PropertyDef::new("id", PropertyType::String)
-                .unique()
-                .not_null(),
-        );
+        schema.add_property(PropertyDef::new("id", PropertyType::String).not_null());
         db.create_label_schema(schema).expect("create schema");
+        require_unique(&db, "TestNode", "id");
 
         db.execute_cypher("CREATE (n:TestNode {id: 'x1'})")
             .expect("create node");

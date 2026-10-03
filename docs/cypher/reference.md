@@ -432,10 +432,12 @@ must have exactly that type: a float is not an `INTEGER`.
   validating, and enforced on every write from then on, while its index is
   built over the stored nodes; it becomes active when the build finishes.
   Stored duplicates fail the statement and remove both. A build cut short
-  (the server stopped mid-way) leaves the constraint validating and still
-  enforced; `CREATE CONSTRAINT ... IF NOT EXISTS` then fails saying the
-  validation did not finish, and `DROP CONSTRAINT` followed by a new
-  `CREATE CONSTRAINT` validates it again. While a presence or type
+  (the server stopped mid-way) is finished when the database next opens,
+  on the leader in a cluster: the constraint becomes active once its index
+  holds every stored node, or, if the stored data breaks it, it is removed
+  with its index and the event is logged. While a validation is in
+  progress, `CREATE CONSTRAINT ... IF NOT EXISTS` naming it fails saying
+  the validation did not finish. While a presence or type
   constraint is created, the commit checks every stored node of the label
   with writes to that label held back for the duration of the scan.
 - **Names.** Constraint and index names share one namespace across all
@@ -448,8 +450,26 @@ must have exactly that type: a float is not an `INTEGER`.
 - **Results.** `CREATE CONSTRAINT` returns `constraint`, `label`,
   `properties`, `kind` and `created`, plus `nodes_indexed` for a unique or key
   constraint. `DROP CONSTRAINT` returns the same columns with `dropped`.
+- **Fits the definition.** A constraint that could never hold under the
+  label's definition is refused: a type other than the property's declared
+  type, a property that is computed, or a presence requirement on a property
+  a `STRICT` label does not declare. Changing a definition later (its mode,
+  or its properties through the schema API) is refused the same way while a
+  constraint it would break exists.
+- **Refusals.** A name already taken fails with gRPC `ALREADY_EXISTS`, reason
+  `CATALOG_OBJECT_EXISTS` (SQLSTATE `42710`); a missing constraint with
+  `NOT_FOUND`, reason `CATALOG_OBJECT_NOT_FOUND` (SQLSTATE `42704`); a
+  constraint the definition contradicts, or one still validating, with
+  `FAILED_PRECONDITION`, reason `CATALOG_CHANGE_REFUSED` (SQLSTATE `55000`).
+  The metadata of the first two carries `object` and `name`.
+- **Schema API.** `coordinode.v2.graph.SchemaService` creates, drops and lists
+  the same constraints (`CreateConstraint`, `DropConstraint`,
+  `ListConstraints`, or `/v2/graph/schema/constraints` over REST); each one
+  reports its state and the index it owns. A label definition there carries no
+  uniqueness: a unique property is a constraint.
 - A `COLUMNAR` table cannot take a constraint: its rows are written outside
-  the transaction a constraint is enforced in.
+  the transaction a constraint is enforced in. A table that has a constraint
+  cannot be dropped until its constraints are.
 
 #### CREATE VECTOR INDEX / DROP VECTOR INDEX ✅
 

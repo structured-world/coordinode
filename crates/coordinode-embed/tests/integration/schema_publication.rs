@@ -101,7 +101,7 @@ fn proposals_writing(recording: &Recording, prefix: &[u8]) -> Vec<Vec<Mutation>>
 
 #[test]
 fn a_label_schema_revision_and_its_pointer_publish_together() {
-    let (mut db, recording, _dir) = open(None);
+    let (db, recording, _dir) = open(None);
     let revision = db
         .create_label_schema(LabelSchema::new_node_id("Person"))
         .unwrap();
@@ -130,7 +130,7 @@ fn a_label_schema_revision_and_its_pointer_publish_together() {
 
 #[test]
 fn an_edge_type_schema_revision_and_its_pointer_publish_together() {
-    let (mut db, recording, _dir) = open(None);
+    let (db, recording, _dir) = open(None);
     db.create_edge_type_schema(EdgeTypeSchema::new("KNOWS"))
         .unwrap();
     let pointer = encode_edge_type_current_revision_key("KNOWS");
@@ -204,7 +204,7 @@ fn a_refused_definition_fails_the_call_and_registers_nothing() {
         "a refused definition registered an index"
     );
 
-    let (mut db, _recording, _dir) = open(Some(b"schema:"));
+    let (db, _recording, _dir) = open(Some(b"schema:"));
     assert!(
         db.create_label_schema(LabelSchema::new_node_id("Person"))
             .is_err()

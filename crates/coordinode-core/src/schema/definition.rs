@@ -1,8 +1,9 @@
 //! Graph schema: label and edge type declarations with property definitions.
 //!
 //! Schema is declared per label (node type) and per edge type. Every node has
-//! exactly one primary label. Properties have declared types with optional
-//! constraints (NOT NULL, DEFAULT, UNIQUE).
+//! exactly one primary label. Properties have declared types, requiredness
+//! and defaults; uniqueness and the other named constraints of a label are
+//! separate [`NodeConstraint`]s.
 //!
 //! Schema is stored in the `schema:` partition and cached in memory.
 
@@ -28,7 +29,9 @@ pub struct PropertyDef {
     /// Default value (if any). Applied when the property is missing on read.
     pub default: Option<Value>,
 
-    /// Whether this property has a UNIQUE constraint.
+    /// A uniqueness flag that earlier releases stored with the property.
+    /// Never set now: uniqueness is a named constraint of the label, and a
+    /// definition that sets this flag is refused.
     pub unique: bool,
 }
 
@@ -53,12 +56,6 @@ impl PropertyDef {
     /// Set a default value.
     pub fn with_default(mut self, value: Value) -> Self {
         self.default = Some(value);
-        self
-    }
-
-    /// Set UNIQUE constraint.
-    pub fn unique(mut self) -> Self {
-        self.unique = true;
         self
     }
 
@@ -316,10 +313,9 @@ pub struct LabelSchema {
     /// entry. CE labels carry `[primary_node_id(1)]` permanently.
     pub shard_keys: Vec<ShardKeySpec>,
 
-    /// Schema snapshot revision. Bumped by any `ALTER LABEL`
-    /// operation that changes write-path semantics: `placement`, `shard_keys`,
-    /// or `mode`. Property additions or removals do NOT bump this — they are
-    /// mutations of the current snapshot. The revision is the key suffix for
+    /// Schema snapshot revision. Every published change of the definition or
+    /// of its constraints is a new revision, and a published revision is
+    /// never rewritten. The revision is the key suffix for
     /// `schema:label:<name>:<revision>` and is what `current_revision`
     /// pointer names.
     ///
@@ -510,6 +506,41 @@ impl LabelSchema {
     pub fn remove_constraint(&mut self, name: &str) -> Option<NodeConstraint> {
         let at = self.constraints.iter().position(|c| c.name == name)?;
         Some(self.constraints.remove(at))
+    }
+
+    /// Why `constraint` cannot hold under this definition, or `None` when it
+    /// can: it names a computed property, requires a type other than the one
+    /// declared, or requires a property a STRICT label never stores.
+    pub fn constraint_conflict(&self, constraint: &NodeConstraint) -> Option<String> {
+        for name in &constraint.properties {
+            match self.properties.get(name) {
+                Some(p) if p.is_computed() => {
+                    return Some(format!(
+                        "property `{name}` of :{} is computed and cannot be constrained",
+                        self.name
+                    ));
+                }
+                Some(p) => {
+                    if let ConstraintKind::Type(required) = &constraint.kind {
+                        if &p.property_type != required {
+                            return Some(format!(
+                                "property `{name}` of :{} is declared {}, so a value of type \
+                                 {required} can never be stored",
+                                self.name, p.property_type
+                            ));
+                        }
+                    }
+                }
+                None if self.is_strict() && constraint.requires_presence() => {
+                    return Some(format!(
+                        "the STRICT label :{} does not declare `{name}`, so no node can carry it",
+                        self.name
+                    ));
+                }
+                None => {}
+            }
+        }
+        None
     }
 
     /// How this label addresses its rows when it is a relational TABLE;

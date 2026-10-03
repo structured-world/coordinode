@@ -65,7 +65,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 // Graph types referenced by query protos
                 format!("{proto_root_str}/coordinode/v1/graph/graph.proto"),
-                format!("{proto_root_str}/coordinode/v1/graph/schema.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/blob.proto"),
                 // Common types
                 format!("{proto_root_str}/coordinode/v1/common/types.proto"),

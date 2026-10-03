@@ -2092,15 +2092,12 @@ async fn grpc_write_concern_majority_accepted_in_standalone() {
 }
 
 /// gRPC ALTER LABEL through Cypher bumps `schema_revision` visible via
-/// the subsequent SchemaService.list_labels response. This regression test
-/// closes the C-decision wiring gap: ALTER LABEL was bumping
-/// `schema_revision` on the persisted LabelSchema, but no gRPC integration
-/// test verified the response value crossed the proto boundary correctly
-/// after the rename.
+/// the subsequent SchemaService.list_labels response: the persisted
+/// revision crosses the proto boundary.
 #[tokio::test]
 async fn grpc_alter_label_bumps_schema_revision_visible_via_list_labels() {
-    use crate::proto::graph as graph_proto;
-    use crate::proto::graph::schema_service_server::SchemaService;
+    use crate::proto::v2::graph as graph_proto;
+    use crate::proto::v2::graph::schema_service_server::SchemaService;
     use crate::services::schema::SchemaServiceImpl;
 
     let dir = tempfile::tempdir().expect("tempdir");

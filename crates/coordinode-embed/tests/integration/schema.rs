@@ -12,6 +12,18 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+/// Require `property` of `label` to be unique, through a named constraint.
+fn require_unique(db: &Database, label: &str, property: &str) {
+    db.create_constraint(coordinode_embed::ConstraintDeclaration {
+        name: None,
+        label: label.into(),
+        properties: vec![property.into()],
+        kind: coordinode_core::schema::definition::ConstraintKind::Unique,
+        if_not_exists: false,
+    })
+    .expect("create the uniqueness constraint");
+}
+
 // ── Schema DDL ──────────────────────────────────────────────────────
 
 #[test]
@@ -131,7 +143,7 @@ fn create_label_schema_persists_across_reopen() {
 
     // Create schema and persist it.
     {
-        let mut db = Database::open(dir.path()).expect("open");
+        let db = Database::open(dir.path()).expect("open");
         let mut schema = LabelSchema::new_node_id("Member");
         schema.add_property(PropertyDef::new("handle", PropertyType::String).not_null());
         schema.add_property(PropertyDef::new("score", PropertyType::Int));
@@ -170,8 +182,9 @@ fn create_label_schema_unique_constraint_enforced_after_reopen() {
     {
         let mut db = Database::open(dir.path()).expect("open");
         let mut schema = LabelSchema::new_node_id("Account");
-        schema.add_property(PropertyDef::new("email", PropertyType::String).unique());
+        schema.add_property(PropertyDef::new("email", PropertyType::String));
         db.create_label_schema(schema).expect("create schema");
+        require_unique(&db, "Account", "email");
         db.execute_cypher("CREATE (u:Account {email: 'bob@test.com'})")
             .expect("first create should succeed");
     }
@@ -192,18 +205,19 @@ fn create_label_schema_unique_constraint_enforced_after_reopen() {
     }
 }
 
-/// `unique: true` property → B-tree unique index is registered and enforced.
-/// Regression test: duplicate value via MERGE must fail after create_label_schema.
+/// A uniqueness constraint created after the type definition is enforced on
+/// the next write. Regression test: a duplicate value after MERGE must fail.
 #[test]
 fn create_label_schema_unique_constraint_enforced() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 
     let (mut db, _dir) = open_db();
 
-    // Declare User label with unique email.
+    // Declare User label, then make its email unique.
     let mut schema = LabelSchema::new_node_id("User");
-    schema.add_property(PropertyDef::new("email", PropertyType::String).unique());
+    schema.add_property(PropertyDef::new("email", PropertyType::String));
     db.create_label_schema(schema).expect("create schema");
+    require_unique(&db, "User", "email");
 
     // First MERGE with unique email — should succeed.
     db.execute_cypher("MERGE (u:User {email: 'alice@test.com'})")
@@ -223,8 +237,8 @@ fn create_label_schema_unique_constraint_enforced() {
     );
 }
 
-/// `unique: true` index is backfilled for nodes that existed before schema creation.
-/// Backfill completes without error; the index is queryable after backfill.
+/// The index of a uniqueness constraint is backfilled from the nodes stored
+/// before it; after the backfill it enforces the constraint.
 #[test]
 fn create_label_schema_unique_backfills_existing_nodes() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
@@ -237,11 +251,11 @@ fn create_label_schema_unique_backfills_existing_nodes() {
     db.execute_cypher("CREATE (u:Product {sku: 'B2'})")
         .expect("create B2");
 
-    // Now declare schema with unique sku — must backfill without error.
+    // Now declare the schema and make sku unique: the backfill must succeed.
     let mut schema = LabelSchema::new_node_id("Product");
-    schema.add_property(PropertyDef::new("sku", PropertyType::String).unique());
-    db.create_label_schema(schema)
-        .expect("backfill should succeed");
+    schema.add_property(PropertyDef::new("sku", PropertyType::String));
+    db.create_label_schema(schema).expect("create schema");
+    require_unique(&db, "Product", "sku");
 
     // After backfill, duplicate sku must be rejected.
     let result = db.execute_cypher("CREATE (u:Product {sku: 'A1'})");
@@ -259,7 +273,7 @@ fn create_edge_type_schema_persists() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let mut db = Database::open(dir.path()).expect("open");
+        let db = Database::open(dir.path()).expect("open");
         let mut schema = EdgeTypeSchema::new("WORKS_AT");
         schema.add_property(PropertyDef::new("since", PropertyType::Timestamp).not_null());
         schema.add_property(PropertyDef::new("role", PropertyType::String));
@@ -282,13 +296,14 @@ fn create_edge_type_schema_persists() {
     }
 }
 
-/// create_label_schema is idempotent — calling it twice with the same name updates
-/// the schema (schema revision increases) without error.
+/// Calling create_label_schema again replaces the type facts at the next
+/// revision, so a writer validated under the previous definition is held to
+/// the new one rather than committing beside it.
 #[test]
-fn create_label_schema_idempotent() {
+fn create_label_schema_replaces_at_the_next_revision() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     let mut schema_v1 = LabelSchema::new_node_id("Tag");
     schema_v1.add_property(PropertyDef::new("name", PropertyType::String));
@@ -299,11 +314,7 @@ fn create_label_schema_idempotent() {
     schema_v2.add_property(PropertyDef::new("count", PropertyType::Int));
     let v2 = db.create_label_schema(schema_v2).expect("second create");
 
-    // The schema revision (the key suffix) is bumped only by
-    // ALTER LABEL operations affecting placement/shard_keys — not by
-    // property-set differences across idempotent calls to
-    // `create_label_schema`. Both writes overwrite the same versioned key.
-    assert_eq!(v1, v2);
+    assert_eq!(v2, v1 + 1);
 }
 
 /// Current-revision pointer is written together with the schema body on
@@ -317,7 +328,7 @@ fn current_revision_pointer_written_alongside_label_schema() {
     };
     use coordinode_storage::engine::partition::Partition;
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     let mut schema = LabelSchema::new_node_id("Project");
     schema.add_property(PropertyDef::new("name", PropertyType::String));
@@ -363,7 +374,7 @@ fn current_revision_pointer_written_alongside_edge_type_schema() {
     };
     use coordinode_storage::engine::partition::Partition;
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     let schema = EdgeTypeSchema::new("OWNED_BY");
     let version = db
@@ -402,7 +413,7 @@ fn hash_placement_label_roundtrips() {
     };
     use coordinode_storage::engine::partition::Partition;
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     let mut schema = LabelSchema::new("Order", PlacementPolicy::Hash("customer_id".to_string()));
     schema.add_property(PropertyDef::new("customer_id", PropertyType::String));
@@ -438,7 +449,7 @@ fn range_placement_label_roundtrips() {
     };
     use coordinode_storage::engine::partition::Partition;
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     let mut schema = LabelSchema::new("Event", PlacementPolicy::Range("timestamp".to_string()));
     schema.add_property(PropertyDef::new("timestamp", PropertyType::Timestamp));
@@ -467,7 +478,7 @@ fn range_placement_label_roundtrips() {
 fn three_placement_kinds_coexist_in_schema_partition() {
     use coordinode_core::schema::definition::{LabelSchema, PlacementPolicy};
 
-    let (mut db, _dir) = open_db();
+    let (db, _dir) = open_db();
 
     db.create_label_schema(LabelSchema::new("User", PlacementPolicy::NodeId))
         .expect("user");

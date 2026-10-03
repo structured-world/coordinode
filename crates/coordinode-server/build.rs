@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_root_str}/coordinode/v1/query/vector.proto"),
                 format!("{proto_root_str}/coordinode/v1/query/text.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/graph.proto"),
-                format!("{proto_root_str}/coordinode/v1/graph/schema.proto"),
+                format!("{proto_root_str}/coordinode/v2/graph/schema.proto"),
                 format!("{proto_root_str}/coordinode/v1/graph/blob.proto"),
                 format!("{proto_root_str}/coordinode/v1/session/session.proto"),
                 format!("{proto_root_str}/coordinode/v1/health/health.proto"),

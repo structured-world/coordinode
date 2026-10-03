@@ -742,3 +742,88 @@ fn an_edge_written_after_the_export_snapshot_is_not_exported() {
         assert!(rows.is_empty(), "{format:?}: restored {rows:?}");
     }
 }
+
+/// Restored data that breaks a constraint the target declared is reported by
+/// the restore, naming the node, instead of landing past the check every
+/// other write meets.
+#[test]
+fn restored_data_breaking_a_constraint_is_reported() {
+    let dir1 = tempfile::tempdir().unwrap();
+    let mut db1 = Database::open(dir1.path()).unwrap();
+    db1.execute_cypher("CREATE (:User {email: 'a@x'})").unwrap();
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut db2 = Database::open(dir2.path()).unwrap();
+    db2.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.name IS NOT NULL")
+        .unwrap();
+    let refused = db2
+        .restore(
+            BackupFormat::Cypher,
+            &dump_of(&db1, BackupFormat::Cypher),
+            &RestoreOptions::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            coordinode_embed::backup::restore::RestoreError::Constraints(_)
+        ),
+        "got {refused:?}"
+    );
+}
+
+/// Constraints travel with a dump that brings its schema: the restored
+/// database holds each one under its name, in the state it had, with the
+/// unique index it owns, and enforces them. A cypher dump carries data only,
+/// so its target declares them and the restored data is held to them.
+#[test]
+fn constraints_survive_a_restore_in_every_format() {
+    use coordinode_core::schema::definition::ConstraintState;
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    const CONSTRAINTS: [&str; 3] = [
+        "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
+        "CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL",
+        "CREATE CONSTRAINT user_age FOR (u:User) REQUIRE u.age IS :: INTEGER",
+    ];
+    for format in OWN_FORMATS {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        for statement in CONSTRAINTS {
+            db1.execute_cypher(statement).unwrap();
+        }
+        db1.execute_cypher("CREATE (:User {email: 'a@x', name: 'a', age: 1})")
+            .unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut db2 = Database::open(dir2.path()).unwrap();
+        if format == BackupFormat::Cypher {
+            for statement in CONSTRAINTS {
+                db2.execute_cypher(statement).unwrap();
+            }
+        }
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{format:?}: restore: {e}"));
+
+        let schema = LocalSchemaStore::new(db2.engine())
+            .load_label("User")
+            .unwrap()
+            .unwrap_or_else(|| panic!("{format:?}: the schema is restored"));
+        for name in ["user_email", "user_name", "user_age"] {
+            assert_eq!(
+                schema.constraint(name).map(|c| c.state),
+                Some(ConstraintState::Active),
+                "{format:?}: {name}"
+            );
+        }
+        db2.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})")
+            .expect_err("the restored value is held by the unique constraint");
+        db2.execute_cypher("CREATE (:User {email: 'b@x'})")
+            .expect_err("the name is required");
+        db2.execute_cypher("CREATE (:User {email: 'c@x', name: 'c', age: 'old'})")
+            .expect_err("the age is an integer");
+        db2.execute_cypher("DROP CONSTRAINT user_email")
+            .unwrap_or_else(|e| panic!("{format:?}: the name is restored: {e}"));
+        db2.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})")
+            .unwrap_or_else(|e| panic!("{format:?}: its index went with it: {e}"));
+    }
+}

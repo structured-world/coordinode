@@ -2,8 +2,8 @@
 """
 Generate gRPC API reference documentation from .proto files.
 
-Parses all proto files in proto/coordinode/v1/ and generates
-markdown pages in docs/api/ — one page per service, one for common
+Parses all proto files under proto/coordinode/ (every package version) and
+generates markdown pages in docs/api/: one page per service, one for common
 types shared across services, and an index page.
 
 Run: python3 scripts/gen-api-docs.py
@@ -17,11 +17,11 @@ from dataclasses import dataclass, field as dc_field
 from typing import Optional
 
 ROOT = Path(__file__).parent.parent
-PROTO_DIR = ROOT / "proto" / "coordinode" / "v1"
+PROTO_DIR = ROOT / "proto" / "coordinode"
 DOCS_API_DIR = ROOT / "docs" / "api"
 
 GITHUB_PROTO_BASE = (
-    "https://github.com/structured-world/coordinode-proto-ce/blob/main/coordinode/v1"
+    "https://github.com/structured-world/coordinode-proto-ce/blob/main/coordinode"
 )
 
 # Services to document with their display order and page slug
@@ -147,7 +147,7 @@ COMMENT_RE = re.compile(r"^\s*//\s?(.*)")
 PACKAGE_RE = re.compile(r"^\s*package\s+([\w.]+);")
 SERVICE_RE = re.compile(r"^\s*service\s+(\w+)\s*\{")
 RPC_RE = re.compile(
-    r"^\s*rpc\s+(\w+)\s*\((stream\s+)?(\w+)\)\s*returns\s*\((stream\s+)?(\w+)\)"
+    r"^\s*rpc\s+(\w+)\s*\((stream\s+)?([\w.]+)\)\s*returns\s*\((stream\s+)?([\w.]+)\)"
 )
 MESSAGE_RE = re.compile(r"^\s*message\s+(\w+)\s*\{")
 ENUM_RE = re.compile(r"^\s*enum\s+(\w+)\s*\{")

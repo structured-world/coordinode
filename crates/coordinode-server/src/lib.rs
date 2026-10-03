@@ -46,6 +46,17 @@ pub mod proto {
             tonic::include_proto!("coordinode.v1.admin");
         }
     }
+    // Generated v2 code names the v1 types it imports by their package path
+    // (`super::super::v1::common::PropertyValue`).
+    pub mod v1 {
+        pub use super::common;
+        pub use super::query;
+    }
+    pub mod v2 {
+        pub mod graph {
+            tonic::include_proto!("coordinode.v2.graph");
+        }
+    }
 }
 
 mod admin;

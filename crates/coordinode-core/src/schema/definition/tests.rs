@@ -4,14 +4,83 @@ use super::*;
 fn property_def_builder() {
     let prop = PropertyDef::new("email", PropertyType::String)
         .not_null()
-        .unique()
         .with_default(Value::String("unknown@example.com".into()));
 
     assert_eq!(prop.name, "email");
     assert!(matches!(prop.property_type, PropertyType::String));
     assert!(prop.not_null);
-    assert!(prop.unique);
+    // Uniqueness is a constraint of the label, never a flag a definition sets.
+    assert!(!prop.unique);
     assert!(prop.default.is_some());
+}
+
+/// A type constraint that names a type other than the declared one could
+/// only ever hold for null, so the definition refuses it.
+#[test]
+fn constraint_conflict_refuses_a_type_other_than_the_declared_one() {
+    let mut schema = LabelSchema::new_node_id("User");
+    schema.add_property(PropertyDef::new("age", PropertyType::Int));
+    let conflict = schema
+        .constraint_conflict(&constraint(
+            "t",
+            &["age"],
+            ConstraintKind::Type(PropertyType::String),
+        ))
+        .expect("a STRING constraint on an INT property is refused");
+    assert!(conflict.contains("declared INT"), "{conflict}");
+    assert_eq!(
+        schema.constraint_conflict(&constraint(
+            "t",
+            &["age"],
+            ConstraintKind::Type(PropertyType::Int)
+        )),
+        None
+    );
+}
+
+/// A presence constraint on a property a STRICT label never stores could
+/// never hold for any node; FLEXIBLE stores it, so it may.
+#[test]
+fn constraint_conflict_refuses_presence_of_an_undeclared_strict_property() {
+    let mut strict = LabelSchema::new_node_id("User");
+    strict.set_mode(SchemaMode::Strict);
+    assert!(
+        strict
+            .constraint_conflict(&constraint("n", &["email"], ConstraintKind::NotNull))
+            .is_some()
+    );
+    // Uniqueness of a property that is never stored is vacuous, not broken.
+    assert_eq!(
+        strict.constraint_conflict(&constraint("u", &["email"], ConstraintKind::Unique)),
+        None
+    );
+    let mut flexible = LabelSchema::new_node_id("User");
+    flexible.set_mode(SchemaMode::Flexible);
+    assert_eq!(
+        flexible.constraint_conflict(&constraint("n", &["email"], ConstraintKind::NotNull)),
+        None
+    );
+}
+
+/// A computed property is evaluated, never stored, so nothing can be
+/// required of its stored value.
+#[test]
+fn constraint_conflict_refuses_a_computed_property() {
+    let mut schema = LabelSchema::new_node_id("Doc");
+    schema.add_property(PropertyDef::computed(
+        "_ttl",
+        crate::schema::computed::ComputedSpec::Ttl {
+            duration_secs: 60,
+            anchor_field: "created".into(),
+            scope: crate::schema::computed::TtlScope::Node,
+            target_field: None,
+        },
+    ));
+    assert!(
+        schema
+            .constraint_conflict(&constraint("u", &["_ttl"], ConstraintKind::Unique))
+            .is_some()
+    );
 }
 
 #[test]

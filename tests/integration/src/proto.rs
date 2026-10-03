@@ -15,6 +15,20 @@ pub mod graph {
     include!(concat!(env!("OUT_DIR"), "/coordinode.v1.graph.rs"));
 }
 
+/// Generated v2 code names the v1 types it imports by their package path
+/// (`super::super::v1::common::PropertyValue`).
+pub mod v1 {
+    pub use super::common;
+    pub use super::query;
+}
+
+#[allow(clippy::all, dead_code)]
+pub mod v2 {
+    pub mod graph {
+        include!(concat!(env!("OUT_DIR"), "/coordinode.v2.graph.rs"));
+    }
+}
+
 #[allow(clippy::all, dead_code)]
 pub mod replication {
     include!(concat!(env!("OUT_DIR"), "/coordinode.v1.replication.rs"));

@@ -56,6 +56,21 @@ fn startup_jitter(interval: std::time::Duration, node_id: u64) -> std::time::Dur
     interval / 16 * slot
 }
 
+/// The URL the in-process REST proxy reaches the gRPC listener bound at
+/// `bound` by: that address, or the loopback of its family when the listener
+/// takes every interface. A fixed `127.0.0.1` misses a listener bound to an
+/// IPv6 or a single interface address.
+#[cfg(feature = "rest-proxy")]
+fn local_upstream(bound: SocketAddr) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let ip = match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, bound.port()))
+}
+
 /// Run the server until SIGTERM or Ctrl+C.
 ///
 /// `config_path` selects the YAML config file (absent = built-in defaults);
@@ -250,6 +265,8 @@ pub(crate) async fn serve(
     let grpc_incoming = tonic::transport::server::TcpIncoming::bind(addr)
         .map_err(|e| format!("cannot bind the gRPC address {addr}: {e}"))?
         .with_nodelay(Some(true));
+    #[cfg(feature = "rest-proxy")]
+    let grpc_upstream = local_upstream(grpc_incoming.local_addr()?);
     // The ops and REST ports are claimed here too. A node running without its
     // ops listener has no /ready of its own, so a health check against that
     // port would get its answer from whatever holds it; one running without
@@ -961,10 +978,11 @@ pub(crate) async fn serve(
     }
 
     // Rebuild the B-tree indexes a store kept in the entry layout that
-    // preceded transactional entries. The rebuild is written through the log,
-    // so the leader runs it; a member that is not leading looks again at each
+    // preceded transactional entries, and finish the builds an earlier
+    // process left unfinished. Both are written through the log, so the
+    // leader runs them; a member that is not leading looks again at each
     // applied entry (a new leader's first entry among them) until it leads or
-    // another member's rebuild reaches it through apply.
+    // another member's work reaches it through apply.
     {
         let db = Arc::clone(&database);
         let rn = Arc::clone(&raft_node);
@@ -981,12 +999,20 @@ pub(crate) async fn serve(
                     continue;
                 }
                 let db2 = Arc::clone(&db);
-                match tokio::task::spawn_blocking(move || db2.read().rebuild_legacy_btree_indexes())
-                    .await
+                match tokio::task::spawn_blocking(move || {
+                    let db = db2.read();
+                    let rebuilt = db.rebuild_legacy_btree_indexes()?;
+                    db.resume_interrupted_index_builds()
+                        .map(|resumed| (rebuilt, resumed))
+                })
+                .await
                 {
-                    Ok(Ok(rebuilt)) => {
+                    Ok(Ok((rebuilt, resumed))) => {
                         if rebuilt > 0 {
                             tracing::info!(rebuilt, "B-tree indexes rebuilt in the current layout");
+                        }
+                        if resumed > 0 {
+                            tracing::info!(resumed, "interrupted B-tree index builds finished");
                         }
                         break;
                     }
@@ -1080,7 +1106,6 @@ pub(crate) async fn serve(
         };
         static DESCRIPTOR_BYTES: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/coordinode.descriptor.bin"));
-        let grpc_upstream = format!("http://127.0.0.1:{}", addr.port());
         // The proxy would otherwise mount its own /health and /metrics on the
         // REST port, reporting proxy state. CoordiNode publishes those for the
         // database itself on the ops port, which is where the documented
@@ -1330,7 +1355,7 @@ pub(crate) async fn serve(
                 .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
-            proto::graph::schema_service_server::SchemaServiceServer::new(schema_service)
+            proto::v2::graph::schema_service_server::SchemaServiceServer::new(schema_service)
                 .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
@@ -1441,3 +1466,7 @@ fn unix_now_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros() as u64)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;

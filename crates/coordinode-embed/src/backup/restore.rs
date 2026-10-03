@@ -78,6 +78,13 @@ pub enum RestoreError {
     #[error("the restored nodes are in, but their indexes could not be built: {0}")]
     Indexes(String),
 
+    /// The records are in, but a node breaks a constraint of its label, or
+    /// a restored constraint's name is held by another label. The load
+    /// stays recorded; a rerun of the same input after the cause is removed
+    /// finishes it.
+    #[error("the restored nodes are in, but they break a constraint: {0}")]
+    Constraints(String),
+
     /// The format has no logical restore through this path.
     #[error("{0:?} is not restored record by record; install it as a snapshot")]
     Unsupported(BackupFormat),
@@ -149,6 +156,10 @@ pub(crate) struct RestoreTarget<'a> {
     /// Build every declared index from the nodes in the store, once the
     /// records are in: the load writes them past index maintenance.
     pub(crate) build_indexes: &'a (dyn Fn() -> Result<(), String> + 'a),
+    /// Check the nodes in the store against every constraint and record the
+    /// name of each constraint the load brought, once the indexes are built:
+    /// the load writes the records and schemas past every check.
+    pub(crate) check_constraints: &'a (dyn Fn() -> Result<(), String> + 'a),
 }
 
 /// See [`RestoreTarget::raise_lease`].
@@ -292,6 +303,7 @@ pub(crate) fn run(
     // crash before they are whole reruns it, which builds them again.
     coordinode_storage::engine::stats::rebuild_node_counters(engine).map_err(storage)?;
     (target.build_indexes)().map_err(RestoreError::Indexes)?;
+    (target.check_constraints)().map_err(RestoreError::Constraints)?;
     // Every record durable before the load stops being unfinished.
     engine.persist().map_err(storage)?;
     engine

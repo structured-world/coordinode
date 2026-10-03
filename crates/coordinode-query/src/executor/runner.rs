@@ -74,6 +74,26 @@ impl std::fmt::Display for HistoricalIndexKind {
     }
 }
 
+/// The kind of a named catalog object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogObject {
+    Label,
+    EdgeType,
+    Constraint,
+    Index,
+}
+
+impl std::fmt::Display for CatalogObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Label => "label",
+            Self::EdgeType => "edge type",
+            Self::Constraint => "constraint",
+            Self::Index => "index",
+        })
+    }
+}
+
 /// Execution error.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
@@ -275,6 +295,30 @@ pub enum ExecutionError {
         /// The key column the statement targeted.
         column: String,
     },
+
+    /// A catalog object of the name already exists. Nothing changed.
+    #[error("{object} '{name}' already exists")]
+    CatalogObjectExists {
+        /// What kind of object holds the name.
+        object: CatalogObject,
+        /// The name.
+        name: String,
+    },
+
+    /// No catalog object of the name exists. Nothing changed.
+    #[error("{object} '{name}' not found")]
+    CatalogObjectMissing {
+        /// What kind of object was looked for.
+        object: CatalogObject,
+        /// The name.
+        name: String,
+    },
+
+    /// A catalog change the current catalog refuses: a definition its
+    /// constraints cannot hold under, an object still being validated, a
+    /// dependency that forbids it. Nothing changed.
+    #[error("catalog change refused: {0}")]
+    CatalogRefused(String),
 
     /// L1 cycle protection trip: cumulative trigger cascade depth
     /// for the current originating mutation exceeded its limit. `chain` lists
@@ -1373,6 +1417,19 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalSchemaStore::new(self.engine).load_label_txn(&mut self.txn, name)?)
     }
 
+    /// Read the label schema a DDL statement writes the next revision of,
+    /// conditioning the statement's commit on it still being the current
+    /// one: two statements changing one label's schema cannot both build on
+    /// the same revision.
+    pub fn load_label_schema_for_update(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<LabelSchema>, ExecutionError> {
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).load_label_for_update_txn(&mut self.txn, name)?)
+    }
+
     /// Read the current edge type schema by name. Returns `None` if no schema
     /// is declared for this edge type.
     ///
@@ -1785,13 +1842,16 @@ impl<'a> ExecutionContext<'a> {
     /// through this statement's commit path, outside the statement
     /// transaction: DDL whose record is written on the condition of its
     /// version, so two concurrent changes cannot both build on one state.
-    pub fn commit_catalog_change(
+    pub fn commit_catalog_change<E>(
         &mut self,
         stage: impl FnOnce(
             &mut coordinode_storage::engine::transaction::Transaction<'_>,
-        ) -> Result<(), coordinode_modality::StoreError>,
-    ) -> Result<(), ExecutionError> {
-        use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
+        ) -> Result<(), E>,
+    ) -> Result<(), ExecutionError>
+    where
+        ExecutionError: From<E>,
+    {
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
         let mut txn = match self.mvcc_oracle {
             Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
             None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
@@ -1806,14 +1866,7 @@ impl<'a> ExecutionContext<'a> {
                 drain_buffer: self.drain_buffer,
                 nvme_write_buffer: self.nvme_write_buffer,
             })
-            .map_err(|e| match e {
-                CommitError::RevisionMismatch { .. } | CommitError::Conflict(_) => {
-                    ExecutionError::Unsupported(
-                        "the catalog record changed concurrently; retry the statement".into(),
-                    )
-                }
-                other => ExecutionError::Unsupported(format!("commit DDL: {other}")),
-            })?;
+            .map_err(catalog_commit_error)?;
         if let Some(index) = outcome.applied_index {
             self.write_stats.applied_index = self.write_stats.applied_index.max(Some(index));
         }
@@ -15886,11 +15939,21 @@ fn execute_alter_label(
 
     // Load existing schema via pointer or create a new one.
     let mut schema = ctx
-        .load_current_label_schema(label)?
+        .load_label_schema_for_update(label)?
         .unwrap_or_else(|| LabelSchema::new_node_id(label));
 
     schema.set_mode(mode);
-    schema.schema_revision += 1;
+    schema.schema_revision = next_revision(&schema)?;
+    if let Some((name, conflict)) = schema.constraints().iter().find_map(|c| {
+        schema
+            .constraint_conflict(c)
+            .map(|why| (c.name.clone(), why))
+    }) {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "label '{label}' cannot be set to {mode}: constraint '{name}' could not hold: \
+             {conflict}"
+        )));
+    }
 
     // The new mode governs the nodes already stored. The commit decides this
     // authoritatively with no write under the old mode beside it; checking
@@ -15946,13 +16009,13 @@ fn execute_create_node_type(
         LabelSchema, PlacementPolicy, PropertyDef, PropertyType,
     };
 
-    // Reject if the label was registered before (either via explicit DDL or
-    // via implicit label creation on first node write — both write a current-
-    // revision pointer at schema:current_revision:label:<name>).
-    if ctx.load_current_label_schema(name)?.is_some() {
-        return Err(ExecutionError::Unsupported(format!(
-            "label '{name}' already exists"
-        )));
+    // Reject if the label already has a schema; a concurrent definition of
+    // the same label refuses this commit.
+    if ctx.load_label_schema_for_update(name)?.is_some() {
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Label,
+            name: name.to_string(),
+        });
     }
 
     // Reject reserved engine-internal property names. `__ingestion_ts__`
@@ -16048,9 +16111,19 @@ fn execute_create_table(
         LabelSchema, PlacementPolicy, PropertyDef, StorageLayout,
     };
 
-    if ctx.load_current_label_schema(name)?.is_some() {
+    if ctx.load_label_schema_for_update(name)?.is_some() {
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Label,
+            name: name.to_string(),
+        });
+    }
+    // Uniqueness of a column is a constraint the table would have to own, not
+    // a flag of the column, and a TABLE cannot own one yet: the declaration is
+    // refused before anything of the table is written.
+    if let Some(col) = columns.iter().find(|c| c.unique) {
         return Err(ExecutionError::Unsupported(format!(
-            "label '{name}' already exists"
+            "UNIQUE on column '{}' of table '{name}' is not supported; the table was not created",
+            col.name
         )));
     }
 
@@ -16066,9 +16139,6 @@ fn execute_create_table(
         // Primary-key columns are implicitly NOT NULL.
         if col.not_null || primary_key.iter().any(|pk| pk == &col.name) {
             prop = prop.not_null();
-        }
-        if col.unique {
-            prop = prop.unique();
         }
         schema.add_property(prop);
     }
@@ -16110,11 +16180,20 @@ fn execute_drop_table(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let Some(schema) = ctx.load_current_label_schema(name)? else {
-        return Err(ExecutionError::Unsupported(format!(
-            "no such table '{name}'"
-        )));
+    let Some(schema) = ctx.load_label_schema_for_update(name)? else {
+        return Err(ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Label,
+            name: name.to_string(),
+        });
     };
+    // A constraint depends on the table: dropping the table would leave its
+    // name taken and its index maintained with nothing to hold.
+    if let Some(constraint) = schema.constraints().first() {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "table '{name}' has constraint '{}'; drop its constraints first",
+            constraint.name
+        )));
+    }
     if !schema.is_table() {
         return Err(ExecutionError::Unsupported(format!(
             "'{name}' is not a table; DROP TABLE applies only to relational tables"
@@ -16166,9 +16245,10 @@ fn execute_create_edge_type(
     //  2. legacy unparametrised existence marker at revision 1 → set by
     //     implicit edge registration in `create_edges_for_correlated_row`.
     if ctx.mvcc_edge_type_exists(name)? {
-        return Err(ExecutionError::Unsupported(format!(
-            "edge type '{name}' already exists"
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::EdgeType,
+            name: name.to_string(),
+        });
     }
 
     let mut schema = EdgeTypeSchema::new(name);
@@ -17307,10 +17387,11 @@ fn execute_create_btree_index(
 ) -> Result<Vec<Row>, ExecutionError> {
     // Indexes and constraints share one namespace: a uniqueness constraint's
     // index carries the constraint's name.
-    if let Some(holder) = ctx.constraint_label(name)? {
-        return Err(ExecutionError::Unsupported(format!(
-            "a constraint named '{name}' already exists on :{holder}"
-        )));
+    if ctx.constraint_label(name)?.is_some() {
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Constraint,
+            name: name.to_string(),
+        });
     }
     let mut def = crate::index::IndexDefinition::btree(name, label, property);
     if unique {
@@ -17368,10 +17449,10 @@ fn publish_index_build(
         ));
     };
     if registry.get(&def.name).is_some() {
-        return Err(ExecutionError::Unsupported(format!(
-            "index '{}' already exists",
-            def.name
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Index,
+            name: def.name,
+        });
     }
 
     let engine = ctx.engine;
@@ -17593,10 +17674,13 @@ fn execute_drop_btree_index(
     };
     let engine = ctx.engine;
     let store = LocalIndexStore::new(engine);
-    let (def, version) = stored_definition(name, engine)?
-        .ok_or_else(|| ExecutionError::Unsupported(format!("index '{name}' not found")))?;
+    let (def, version) =
+        stored_definition(name, engine)?.ok_or_else(|| ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Index,
+            name: name.to_string(),
+        })?;
     if let Some(constraint) = &def.owner {
-        return Err(ExecutionError::Unsupported(format!(
+        return Err(ExecutionError::CatalogRefused(format!(
             "index '{name}' belongs to constraint '{constraint}'; drop the constraint instead"
         )));
     }
@@ -17727,7 +17811,7 @@ fn execute_create_constraint(
             .as_ref()
             .is_some_and(|c| c.state == ConstraintState::Validating)
         {
-            return Err(ExecutionError::Unsupported(format!(
+            return Err(ExecutionError::CatalogRefused(format!(
                 "constraint '{}' exists on :{holder} but its validation did not finish; \
                  drop it and create it again",
                 constraint.name
@@ -17740,10 +17824,10 @@ fn execute_create_constraint(
                 ("created", false),
             )]);
         }
-        return Err(ExecutionError::Unsupported(format!(
-            "constraint '{}' already exists on :{holder}",
-            constraint.name
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Constraint,
+            name: constraint.name,
+        });
     }
     let schema = ctx.load_current_label_schema(label)?;
     if let Some(existing) = schema.as_ref().and_then(|s| {
@@ -17752,7 +17836,7 @@ fn execute_create_constraint(
             .find(|c| c.same_requirement(&constraint))
     }) {
         if existing.state == ConstraintState::Validating {
-            return Err(ExecutionError::Unsupported(format!(
+            return Err(ExecutionError::CatalogRefused(format!(
                 "an equivalent constraint '{}' exists on :{label} but its validation did not \
                  finish; drop it and create it again",
                 existing.name
@@ -17761,17 +17845,26 @@ fn execute_create_constraint(
         if if_not_exists {
             return Ok(vec![constraint_row(existing, label, ("created", false))]);
         }
-        return Err(ExecutionError::Unsupported(format!(
-            "an equivalent constraint '{}' already exists on :{label}",
-            existing.name
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Constraint,
+            name: existing.name.clone(),
+        });
     }
     // The rows of a COLUMNAR table are written outside the transaction a
     // schema revision binds, so nothing could hold them to the constraint
     // while it is enabled.
     if schema.as_ref().is_some_and(LabelSchema::is_columnar) {
-        return Err(ExecutionError::Unsupported(format!(
+        return Err(ExecutionError::CatalogRefused(format!(
             "constraints on the COLUMNAR table '{label}' are not supported"
+        )));
+    }
+    if let Some(conflict) = schema
+        .as_ref()
+        .and_then(|s| s.constraint_conflict(&constraint))
+    {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "constraint '{}' cannot hold: {conflict}",
+            constraint.name
         )));
     }
     if constraint.owns_index()
@@ -17779,10 +17872,10 @@ fn execute_create_constraint(
             .btree_index_registry
             .is_some_and(|r| r.get(&constraint.name).is_some())
     {
-        return Err(ExecutionError::Unsupported(format!(
-            "an index named '{}' already exists",
-            constraint.name
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Index,
+            name: constraint.name,
+        });
     }
 
     let read_revision = schema.as_ref().map(|s| s.schema_revision);
@@ -17829,7 +17922,7 @@ fn execute_create_constraint(
     let mut stage_constraint =
         |txn: &mut coordinode_storage::engine::transaction::Transaction<'_>| {
             let store = LocalSchemaStore::new(engine);
-            let current = store.load_label_txn(txn, label)?;
+            let current = store.load_label_for_update_txn(txn, label)?;
             if current.map(|s| s.schema_revision) != read_revision {
                 return Err(StoreError::Invariant(format!(
                     "the schema of :{label} changed while the constraint was being created; \
@@ -17865,35 +17958,14 @@ fn execute_create_constraint(
         Ok(n) => n,
         Err(e) => {
             let failure = abandon_index_build(&build, e, ctx, |txn| {
-                let store = LocalSchemaStore::new(engine);
-                if let Some(mut latest) = store.load_label_txn(txn, label)? {
-                    if latest.remove_constraint(name).is_some() {
-                        latest.schema_revision = next_revision(&latest).map_err(store_error)?;
-                        store.save_label_admitting_txn(txn, &latest)?;
-                    }
-                }
-                store.release_constraint_name_txn(txn, name)
+                stage_constraint_withdrawal(engine, txn, label, name)
             });
             ctx.label_schema_cache.remove(label);
             return Err(failure);
         }
     };
     let finished = finish_index_build(build, ctx, |txn| {
-        let store = LocalSchemaStore::new(engine);
-        let mut latest = store.load_label_txn(txn, label)?.ok_or_else(|| {
-            StoreError::Invariant(format!("the schema of :{label} was dropped meanwhile"))
-        })?;
-        let Some(validating) = latest
-            .constraint_mut(name)
-            .filter(|c| c.state == ConstraintState::Validating)
-        else {
-            return Err(StoreError::Invariant(format!(
-                "constraint '{name}' was dropped while it was being validated"
-            )));
-        };
-        validating.state = ConstraintState::Active;
-        latest.schema_revision = next_revision(&latest).map_err(store_error)?;
-        store.save_label_admitting_txn(txn, &latest)
+        stage_constraint_activation(engine, txn, label, name)
     });
     ctx.label_schema_cache.remove(label);
     finished?;
@@ -17905,6 +17977,67 @@ fn execute_create_constraint(
         Value::Int(i64::try_from(indexed).unwrap_or(i64::MAX)),
     );
     Ok(vec![row])
+}
+
+/// Stage, in the catalog commit that publishes a validated index as ready,
+/// the activation of constraint `name` of `label` that owns it: a new
+/// revision of the label's latest schema with the constraint active. A
+/// constraint already active (its index rebuilt) stays as it is: a rebuild
+/// never suspends it. Fails when the constraint is gone (dropped meanwhile).
+///
+/// # Errors
+///
+/// The constraint is gone, or the schema could not be read or staged.
+pub fn stage_constraint_activation(
+    engine: &StorageEngine,
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    label: &str,
+    name: &str,
+) -> Result<(), coordinode_modality::StoreError> {
+    use coordinode_core::schema::definition::ConstraintState;
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _, StoreError};
+    let store = LocalSchemaStore::new(engine);
+    let mut latest = store
+        .load_label_for_update_txn(txn, label)?
+        .ok_or_else(|| {
+            StoreError::Invariant(format!("the schema of :{label} was dropped meanwhile"))
+        })?;
+    let Some(constraint) = latest.constraint_mut(name) else {
+        return Err(StoreError::Invariant(format!(
+            "constraint '{name}' was dropped while it was being validated"
+        )));
+    };
+    if constraint.state == ConstraintState::Active {
+        return Ok(());
+    }
+    constraint.state = ConstraintState::Active;
+    latest.schema_revision = next_revision(&latest).map_err(store_error)?;
+    store.save_label_admitting_txn(txn, &latest)
+}
+
+/// Stage, in the catalog commit that withdraws an index whose validation
+/// failed, the withdrawal of constraint `name` of `label` that owns it: a
+/// new revision of the label's latest schema without it, and its name
+/// released.
+///
+/// # Errors
+///
+/// The schema or the name record could not be read or staged.
+pub fn stage_constraint_withdrawal(
+    engine: &StorageEngine,
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    label: &str,
+    name: &str,
+) -> Result<(), coordinode_modality::StoreError> {
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    let store = LocalSchemaStore::new(engine);
+    if let Some(mut latest) = store.load_label_for_update_txn(txn, label)? {
+        if latest.remove_constraint(name).is_some() {
+            latest.schema_revision = next_revision(&latest).map_err(store_error)?;
+            store.save_label_admitting_txn(txn, &latest)?;
+        }
+    }
+    store.release_constraint_name_txn(txn, name)
 }
 
 /// The revision a change of `schema` is published at.
@@ -17945,9 +18078,10 @@ fn execute_drop_constraint(
             row.insert("dropped".to_string(), Value::Bool(false));
             return Ok(vec![row]);
         }
-        return Err(ExecutionError::Unsupported(format!(
-            "constraint '{name}' not found"
-        )));
+        return Err(ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Constraint,
+            name: name.to_string(),
+        });
     };
     let schema = ctx.load_current_label_schema(&label)?;
     let read_revision = schema.as_ref().map(|s| s.schema_revision);
@@ -17973,7 +18107,7 @@ fn execute_drop_constraint(
     let engine = ctx.engine;
     let dropped = ctx.commit_catalog_change(|txn| {
         let store = LocalSchemaStore::new(engine);
-        let current = store.load_label_txn(txn, &label)?;
+        let current = store.load_label_for_update_txn(txn, &label)?;
         if current.map(|s| s.schema_revision) != read_revision {
             return Err(StoreError::Invariant(format!(
                 "the schema of :{label} changed while the constraint was being dropped; \
@@ -18061,6 +18195,23 @@ fn execute_procedure_call(
         }
     }
     Ok(out)
+}
+
+/// The error a catalog change fails with when its commit is refused: a record
+/// it was conditioned on, or a key it wrote, changed concurrently, which a
+/// retry re-reads; anything else as any commit reports it.
+pub fn catalog_commit_error(
+    err: coordinode_storage::engine::transaction::CommitError,
+) -> ExecutionError {
+    use coordinode_storage::engine::transaction::CommitError;
+    match err {
+        CommitError::RevisionMismatch { .. } | CommitError::Conflict(_) => {
+            ExecutionError::Conflict(
+                "the catalog record changed concurrently; retry the statement".into(),
+            )
+        }
+        other => commit_err_to_execution(other),
+    }
 }
 
 /// Map a Layer-3 [`CommitError`](coordinode_storage::engine::transaction::CommitError)

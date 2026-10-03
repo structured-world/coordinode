@@ -138,6 +138,23 @@ pub enum Reason {
     /// `checkpoint` (the last position acknowledged). Terminal for that
     /// incarnation: registering the id again starts a new one.
     ConsumerTerminated,
+    /// A request field has a value the server refuses: missing, malformed
+    /// or contradicting another field. Nothing changed. Metadata carries
+    /// `field`, the path of the field; `BadRequest` describes the violation.
+    /// Terminal: the same request is refused again.
+    InvalidField,
+    /// A catalog object of the name already exists: a label, edge type,
+    /// constraint or index. Nothing changed. Metadata carries `object` and
+    /// `name`, also given as `ResourceInfo`. Terminal for that name.
+    CatalogObjectExists,
+    /// No catalog object of the name exists. Nothing changed. Metadata
+    /// carries `object` and `name`, also given as `ResourceInfo`.
+    CatalogObjectNotFound,
+    /// A catalog change the catalog's current state refuses: a definition
+    /// its constraints cannot hold under, a constraint still being
+    /// validated, a dependency that forbids it. Nothing changed. Terminal
+    /// until that state changes.
+    CatalogChangeRefused,
 }
 
 impl Reason {
@@ -168,6 +185,10 @@ impl Reason {
             Reason::ConstraintViolation => "CONSTRAINT_VIOLATION",
             Reason::RetentionLost => "RETENTION_LOST",
             Reason::ConsumerTerminated => "CONSUMER_TERMINATED",
+            Reason::InvalidField => "INVALID_FIELD",
+            Reason::CatalogObjectExists => "CATALOG_OBJECT_EXISTS",
+            Reason::CatalogObjectNotFound => "CATALOG_OBJECT_NOT_FOUND",
+            Reason::CatalogChangeRefused => "CATALOG_CHANGE_REFUSED",
         }
     }
 
@@ -225,6 +246,40 @@ pub fn status_with_reason(
     if let Some(delay) = reason.retry_delay() {
         details.set_retry_info(Some(delay));
     }
+    Status::with_error_details(code, message, details)
+}
+
+/// `INVALID_ARGUMENT` for request field `field` (its path, such as
+/// `properties[2].type`), with the violation in `BadRequest`.
+pub fn invalid_field(field: impl Into<String>, description: impl Into<String>) -> Status {
+    let field = field.into();
+    let description = description.into();
+    let metadata = std::collections::HashMap::from([("field".to_string(), field.clone())]);
+    let mut details =
+        ErrorDetails::with_error_info(Reason::InvalidField.as_str(), ERROR_DOMAIN, metadata);
+    details.add_bad_request_violation(field.clone(), description.clone());
+    Status::with_error_details(
+        Code::InvalidArgument,
+        format!("{field}: {description}"),
+        details,
+    )
+}
+
+/// A status naming catalog object `name` of kind `object`, as the subject of
+/// `reason`, with the object also given as `ResourceInfo`.
+pub fn catalog_object_status(
+    code: Code,
+    message: impl Into<String>,
+    reason: Reason,
+    object: &str,
+    name: &str,
+) -> Status {
+    let metadata = std::collections::HashMap::from([
+        ("object".to_string(), object.to_string()),
+        ("name".to_string(), name.to_string()),
+    ]);
+    let mut details = ErrorDetails::with_error_info(reason.as_str(), ERROR_DOMAIN, metadata);
+    details.set_resource_info(object, name, "", "");
     Status::with_error_details(code, message, details)
 }
 

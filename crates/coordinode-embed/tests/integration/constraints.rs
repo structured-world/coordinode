@@ -17,12 +17,22 @@ use coordinode_embed::Database;
 use coordinode_embed::db::DatabaseError;
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 use coordinode_query::executor::row::Row;
-use coordinode_query::executor::runner::ExecutionError;
+use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Database::open(dir.path()).expect("open db");
     (db, dir)
+}
+
+/// Whether `err` refuses a change because a catalog object of kind `object`
+/// named `name` already exists.
+fn names_existing(err: &DatabaseError, object: CatalogObject, name: &str) -> bool {
+    matches!(
+        err,
+        DatabaseError::Execution(ExecutionError::CatalogObjectExists { object: o, name: n })
+            if *o == object && n == name
+    )
 }
 
 /// The state of constraint `name` on `label` as stored.
@@ -406,7 +416,10 @@ fn names_and_if_not_exists() {
     let err = db
         .execute_cypher("CREATE CONSTRAINT c1 FOR (o:Org) REQUIRE o.name IS NOT NULL")
         .expect_err("name taken on another label");
-    assert!(err.to_string().contains("already exists"), "{err}");
+    assert!(
+        names_existing(&err, CatalogObject::Constraint, "c1"),
+        "{err}"
+    );
     let rows = db
         .execute_cypher("CREATE CONSTRAINT c1 IF NOT EXISTS FOR (o:Org) REQUIRE o.name IS NOT NULL")
         .expect("if not exists");
@@ -415,7 +428,11 @@ fn names_and_if_not_exists() {
     let err = db
         .execute_cypher("CREATE CONSTRAINT c2 FOR (u:User) REQUIRE u.email IS NOT NULL")
         .expect_err("equivalent constraint");
-    assert!(err.to_string().contains("equivalent"), "{err}");
+    // The equivalent constraint already in place is the one named.
+    assert!(
+        names_existing(&err, CatalogObject::Constraint, "c1"),
+        "{err}"
+    );
     let rows = db
         .execute_cypher("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS NOT NULL")
         .expect("equivalent with if not exists");
@@ -424,7 +441,10 @@ fn names_and_if_not_exists() {
     let err = db
         .execute_cypher("CREATE INDEX c1 ON :User(name)")
         .expect_err("indexes and constraints share names");
-    assert!(err.to_string().contains("constraint named 'c1'"), "{err}");
+    assert!(
+        names_existing(&err, CatalogObject::Constraint, "c1"),
+        "{err}"
+    );
 
     let rows = db
         .execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.age IS :: INTEGER")
@@ -526,13 +546,13 @@ fn a_writer_in_flight_cannot_slip_past_activation() {
 
 // ── Validation lifecycle ─────────────────────────────────────────────
 
-/// A uniqueness constraint whose validation was interrupted (a crash after
-/// it was published and before its backfill finished) stays validating:
-/// it is enforced, it is never taken as established, a repeat of the
-/// statement says so instead of reporting it in place, and DROP removes it
-/// and its index together.
+/// An interrupted validation (a crash after the constraint was published and
+/// before its backfill finished) is finished when the database opens again;
+/// stored data that breaks it withdraws the constraint with its index and
+/// name in one commit, since the interrupted statement never acknowledged
+/// it, and never leaves it reading as active.
 #[test]
-fn an_interrupted_validation_stays_validating_until_dropped() {
+fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
     use coordinode_core::schema::definition::{
         LabelSchema, NodeConstraint, SchemaMode, encode_constraint_name_key,
     };
@@ -542,9 +562,12 @@ fn an_interrupted_validation_stays_validating_until_dropped() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
-        // What the first commit of CREATE CONSTRAINT leaves: the constraint
-        // as validating, its index as building, the name taken.
-        let db = Database::open(dir.path()).expect("open");
+        // What the first commit of CREATE CONSTRAINT leaves over data that
+        // breaks it: the constraint as validating, its index as building,
+        // the name taken.
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:User {email: 'same'}), (:User {email: 'same'})")
+            .expect("duplicates");
         let mut schema = LabelSchema::new_node_id("User");
         schema.set_mode(SchemaMode::Flexible);
         schema.add_constraint(NodeConstraint {
@@ -577,31 +600,19 @@ fn an_interrupted_validation_stays_validating_until_dropped() {
     let mut db = Database::open(dir.path()).expect("reopen");
     assert_eq!(
         stored_state(&db, "User", "user_email"),
-        Some(ConstraintState::Validating),
-        "a constraint whose validation never finished does not read as active"
+        None,
+        "the refused constraint is withdrawn, never left reading as active"
     );
-    db.execute_cypher("CREATE (:User {email: 'a@x'})")
-        .expect("first holder");
-    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
-
-    let err = db
-        .execute_cypher(
-            "CREATE CONSTRAINT user_email IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE",
-        )
-        .expect_err("not reported as in place");
-    assert!(err.to_string().contains("did not finish"), "{err}");
-
-    db.execute_cypher("DROP CONSTRAINT user_email")
-        .expect("drop");
-    assert_eq!(stored_state(&db, "User", "user_email"), None);
     assert!(
         load_index_definition(db.engine(), "user_email")
             .expect("load")
             .is_none(),
-        "the index went with the constraint"
+        "its index went with it"
     );
-    db.execute_cypher("CREATE (:User {email: 'a@x'})")
-        .expect("uniqueness lifted");
+    db.execute_cypher("CREATE (:User {email: 'same'})")
+        .expect("no uniqueness is left behind");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("the name is free");
 }
 
 /// A uniqueness constraint whose validation finished is stored as active.
@@ -798,4 +809,212 @@ fn a_nested_write_is_judged_by_the_state_it_leaves() {
         ),
         1
     );
+}
+
+/// A build that fails over stored duplicates withdraws only its own
+/// constraint: another constraint of the label created while it was being
+/// validated stays active, and the failed one's name is free again.
+#[test]
+fn a_failed_validation_withdraws_only_its_own_constraint() {
+    use coordinode_query::index::ops::load_index_definition;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE (:User {email: 'same', name: 'a'}), (:User {email: 'same', name: 'b'})",
+    )
+    .expect("duplicates");
+    let outcome = create_while_held(
+        &db,
+        "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
+        "user_email",
+        |db| {
+            db.execute_cypher_shared(
+                "CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("another constraint during the validation");
+        },
+    );
+    let err = outcome.expect_err("the stored duplicates refuse it");
+    assert!(err.contains("unique constraint violated"), "{err}");
+
+    assert_eq!(stored_state(&db, "User", "user_email"), None);
+    assert_eq!(
+        stored_state(&db, "User", "user_name"),
+        Some(ConstraintState::Active),
+        "the constraint created meanwhile survives the withdrawal"
+    );
+    assert!(
+        load_index_definition(db.engine(), "user_email")
+            .expect("load")
+            .is_none()
+    );
+    expect_violation(db.execute_cypher("CREATE (:User {email: 'x'})"));
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.name IS NOT NULL")
+        .expect_err("an equivalent constraint exists under another name");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("the failed name is free");
+}
+
+/// Set by the parent of the interrupted-build test; the child does nothing
+/// without it.
+const INTERRUPTED_CHILD_DIR: &str = "COORDINODE_CONSTRAINT_INTERRUPTED_CHILD_DIR";
+
+/// Child half of `a_kill_between_publication_and_activation_leaves_it_validating`:
+/// a uniqueness constraint published by its first commit, its backfill held
+/// by an older open transaction, and death before the commit that makes it
+/// active.
+#[test]
+fn interrupted_child_publishes_a_constraint_then_aborts() {
+    let Some(dir) = std::env::var_os(INTERRUPTED_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("seed");
+    let db = &db;
+    let _held = db.begin_transaction();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let _ = db.execute_cypher_shared(
+                "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
+                None,
+                None,
+                None,
+                None,
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while stored_state(db, "User", "user_email") != Some(ConstraintState::Validating) {
+            assert!(std::time::Instant::now() < deadline, "never published");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::process::abort();
+    });
+}
+
+/// A process killed between the commit that publishes a uniqueness
+/// constraint and the one that activates it leaves, after the journal
+/// replay, a build the next open finishes: the stored node that predates
+/// the constraint is indexed, the constraint becomes active only then, and
+/// a duplicate of that stored value is refused.
+#[test]
+fn a_kill_between_publication_and_activation_is_finished_on_open() {
+    use coordinode_query::index::IndexState;
+    use coordinode_query::index::ops::load_index_definition;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::constraints::interrupted_child_publishes_a_constraint_then_aborts",
+            "--nocapture",
+        ])
+        .env(INTERRUPTED_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after the publication, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let mut db = Database::open(dir.path()).expect("reopen after the kill");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+    let def = load_index_definition(db.engine(), "user_email")
+        .expect("load")
+        .expect("the index is published");
+    assert_eq!(def.state, IndexState::Ready);
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+    let rows = db
+        .execute_cypher(
+            "CREATE CONSTRAINT user_email IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE",
+        )
+        .expect("in place");
+    assert_eq!(rows[0].get("created"), Some(&Value::Bool(false)));
+}
+
+/// Set by the parent of the replay test; the child does nothing without it.
+const REPLAY_CHILD_DIR: &str = "COORDINODE_CONSTRAINT_REPLAY_CHILD_DIR";
+
+/// Child half of `constraint_ddl_survives_a_kill_and_replay`: constraint DDL
+/// and a write, then death without a single destructor, as under SIGKILL.
+#[test]
+fn replay_child_creates_constraints_then_aborts() {
+    let Some(dir) = std::env::var_os(REPLAY_CHILD_DIR) else {
+        return;
+    };
+    let mut db = Database::open(std::path::Path::new(&dir)).expect("open in child");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("unique");
+    db.execute_cypher("CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL")
+        .expect("not null");
+    db.execute_cypher("CREATE CONSTRAINT user_age FOR (u:User) REQUIRE u.age IS UNIQUE")
+        .expect("dropped below");
+    db.execute_cypher("CREATE (:User {email: 'a@x', name: 'a', age: 1})")
+        .expect("write");
+    db.execute_cypher("DROP CONSTRAINT user_age").expect("drop");
+    std::process::abort();
+}
+
+/// Constraint DDL acknowledged before a kill is what the replayed database
+/// holds: each surviving constraint in force with its state, name and
+/// index, the dropped one gone with its index, and none of it half applied.
+#[test]
+fn constraint_ddl_survives_a_kill_and_replay() {
+    use coordinode_query::index::ops::load_index_definition;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "integration::constraints::replay_child_creates_constraints_then_aborts",
+            "--nocapture",
+        ])
+        .env(REPLAY_CHILD_DIR, dir.path())
+        .status()
+        .expect("run the child");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must die by abort after its DDL, got {status:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(!status.success(), "the child must die, got {status:?}");
+
+    let mut db = Database::open(dir.path()).expect("reopen after the kill");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+    assert_eq!(
+        stored_state(&db, "User", "user_name"),
+        Some(ConstraintState::Active)
+    );
+    assert_eq!(stored_state(&db, "User", "user_age"), None);
+    assert!(
+        load_index_definition(db.engine(), "user_age")
+            .expect("load")
+            .is_none(),
+        "the dropped constraint's index is gone"
+    );
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})"));
+    expect_violation(db.execute_cypher("CREATE (:User {email: 'b@x'})"));
+    db.execute_cypher("CREATE (:User {email: 'c@x', name: 'c', age: 1})")
+        .expect("the dropped uniqueness holds no more");
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("the name survived the replay");
 }

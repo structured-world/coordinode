@@ -28,6 +28,72 @@ fn create_columnar_table_creates_tree_and_persists_schema() {
     );
 }
 
+/// A table with a constraint is not dropped from under it: the constraint
+/// would keep its name and its index with nothing to constrain. Once the
+/// constraint is dropped, the table drops and the name is free again.
+#[test]
+fn a_table_with_a_constraint_is_not_dropped_from_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::open(dir.path()).expect("open db");
+    db.execute_cypher("CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)")
+        .expect("create table");
+    db.execute_cypher("CREATE CONSTRAINT acct_email FOR (a:Acct) REQUIRE a.email IS UNIQUE")
+        .expect("constraint");
+
+    let err = db
+        .execute_cypher("DROP TABLE Acct")
+        .expect_err("the constraint depends on the table");
+    assert!(err.to_string().contains("acct_email"), "{err}");
+    assert_eq!(db.constraints().expect("constraints").len(), 1);
+
+    db.execute_cypher("DROP CONSTRAINT acct_email")
+        .expect("drop constraint");
+    db.execute_cypher("DROP TABLE Acct").expect("drop table");
+    db.execute_cypher("CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING)")
+        .expect("the name is free");
+    db.execute_cypher("CREATE CONSTRAINT acct_email FOR (a:Acct) REQUIRE a.email IS UNIQUE")
+        .expect("so is the constraint name");
+}
+
+/// UNIQUE on a column is refused before anything of the table is written, in
+/// either layout: no schema, no index, no columnar tree, nothing after a
+/// reopen, and the same table without the clause can still be created.
+#[test]
+fn a_unique_column_is_refused_and_leaves_nothing() {
+    for storage in ["ROW", "COLUMNAR"] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = Database::open(dir.path()).expect("open db");
+            let err = db
+                .execute_cypher(&format!(
+                    "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING UNIQUE) \
+                     STORAGE {storage}"
+                ))
+                .expect_err("UNIQUE on a column is refused");
+            assert!(err.to_string().contains("UNIQUE"), "{storage}: {err}");
+            assert!(
+                db.engine().columnar_table_tree("Acct").is_none(),
+                "{storage}"
+            );
+            assert!(db.label_schemas().expect("labels").is_empty(), "{storage}");
+            assert!(
+                db.constraints().expect("constraints").is_empty(),
+                "{storage}"
+            );
+        }
+        let mut db = Database::open(dir.path()).expect("reopen");
+        assert!(
+            db.engine().columnar_table_tree("Acct").is_none(),
+            "{storage}"
+        );
+        assert!(db.label_schemas().expect("labels").is_empty(), "{storage}");
+        db.execute_cypher(&format!(
+            "CREATE TABLE Acct (id BIGINT PRIMARY KEY, email STRING) STORAGE {storage}"
+        ))
+        .unwrap_or_else(|e| panic!("{storage}: the name stays free: {e}"));
+    }
+}
+
 #[test]
 fn create_row_table_persists_without_columnar_tree() {
     let dir = tempfile::tempdir().unwrap();

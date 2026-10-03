@@ -1,5 +1,7 @@
 use super::*;
-use crate::proto::graph::schema_service_server::SchemaService;
+use crate::proto::v2::graph::schema_service_server::SchemaService;
+use crate::services::error_details::ERROR_DOMAIN;
+use tonic_types::StatusExt;
 
 fn test_service() -> (SchemaServiceImpl, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -9,13 +11,66 @@ fn test_service() -> (SchemaServiceImpl, tempfile::TempDir) {
     (SchemaServiceImpl::new(database), dir)
 }
 
+fn scalar(s: schema::ScalarType) -> Option<schema::PropertyType> {
+    Some(schema::PropertyType {
+        r#type: Some(schema::property_type::Type::Scalar(s as i32)),
+    })
+}
+
+/// A stored property of scalar type `s`.
+fn prop(name: &str, s: schema::ScalarType, required: bool) -> schema::PropertyDefinition {
+    schema::PropertyDefinition {
+        name: name.to_string(),
+        r#type: scalar(s),
+        required,
+        default_value: None,
+    }
+}
+
+/// A label definition with `properties` in `mode`.
+fn label(
+    name: &str,
+    properties: Vec<schema::PropertyDefinition>,
+    mode: schema::SchemaMode,
+) -> schema::CreateLabelRequest {
+    schema::CreateLabelRequest {
+        name: name.to_string(),
+        properties,
+        computed_properties: vec![],
+        schema_mode: mode as i32,
+        temporal: false,
+    }
+}
+
+fn unique(name: &str, label: &str, property: &str) -> schema::CreateConstraintRequest {
+    schema::CreateConstraintRequest {
+        name: name.to_string(),
+        target: Some(schema::create_constraint_request::Target::Label(
+            label.to_string(),
+        )),
+        properties: vec![property.to_string()],
+        kind: schema::ConstraintKind::Unique as i32,
+        property_type: None,
+        if_not_exists: false,
+    }
+}
+
+/// The reason a refusal names, checked against this server's domain.
+fn reason(status: &Status) -> String {
+    let info = status
+        .get_details_error_info()
+        .unwrap_or_else(|| panic!("no ErrorInfo on {status:?}"));
+    assert_eq!(info.domain, ERROR_DOMAIN);
+    info.reason
+}
+
 /// list_labels returns empty on a fresh database.
 #[tokio::test]
 async fn list_labels_empty_db() {
     let (svc, _dir) = test_service();
 
     let resp = svc
-        .list_labels(Request::new(graph::ListLabelsRequest {}))
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
         .await
         .expect("list_labels should succeed");
 
@@ -36,24 +91,21 @@ async fn list_labels_returns_existing_labels() {
             .expect("create");
     }
 
-    let labels: Vec<String> = svc
-        .list_labels(Request::new(graph::ListLabelsRequest {}))
+    let labels = svc
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
         .await
         .expect("list_labels should succeed")
         .into_inner()
-        .labels
-        .into_iter()
-        .map(|l| l.name)
-        .collect();
+        .labels;
 
-    assert!(
-        labels.contains(&"Person".to_string()),
-        "should contain Person, got: {labels:?}"
-    );
-    assert!(
-        labels.contains(&"City".to_string()),
-        "should contain City, got: {labels:?}"
-    );
+    // Labels the stored nodes carry without a definition are listed as such.
+    for name in ["City", "Person"] {
+        let found = labels
+            .iter()
+            .find(|l| l.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {labels:?}"));
+        assert!(!found.declared, "{name} has no definition");
+    }
 }
 
 /// list_edge_types returns empty on a fresh database.
@@ -62,7 +114,7 @@ async fn list_edge_types_empty_db() {
     let (svc, _dir) = test_service();
 
     let resp = svc
-        .list_edge_types(Request::new(graph::ListEdgeTypesRequest {}))
+        .list_edge_types(Request::new(schema::ListEdgeTypesRequest {}))
         .await
         .expect("list_edge_types should succeed");
 
@@ -83,7 +135,7 @@ async fn list_edge_types_returns_existing_types() {
     }
 
     let edge_types: Vec<String> = svc
-        .list_edge_types(Request::new(graph::ListEdgeTypesRequest {}))
+        .list_edge_types(Request::new(schema::ListEdgeTypesRequest {}))
         .await
         .expect("list_edge_types should succeed")
         .into_inner()
@@ -104,129 +156,391 @@ async fn list_edge_types_returns_existing_types() {
 
 // ── create_label / create_edge_type persist the schema ──
 
-/// A property type or schema mode the protocol does not define is refused,
-/// not stored as STRING or STRICT: a client sending a newer enum value would
-/// otherwise get a schema it never asked for, silently.
+/// A property type, schema mode or constraint kind the protocol does not
+/// define is refused as an invalid field, not stored as some default: a
+/// client sending a newer enum value would otherwise get a schema it never
+/// asked for, silently.
 #[tokio::test]
 async fn unknown_enum_values_are_refused_not_defaulted() {
     let (svc, _dir) = test_service();
+    let invalid = |status: Status, field: &str| {
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(reason(&status), "INVALID_FIELD");
+        let violations = status
+            .get_details_bad_request()
+            .expect("BadRequest")
+            .field_violations;
+        assert_eq!(violations[0].field, field, "{violations:?}");
+    };
 
-    let unknown_type = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Unknown".to_string(),
-            properties: vec![graph::PropertyDefinition {
-                name: "p".to_string(),
-                r#type: 42,
-                required: false,
-                unique: false,
-            }],
-            computed_properties: vec![],
-            schema_mode: graph::SchemaMode::Strict as i32,
-        }))
+    let mut unknown_type = prop("p", schema::ScalarType::String, false);
+    unknown_type.r#type = Some(schema::PropertyType {
+        r#type: Some(schema::property_type::Type::Scalar(42)),
+    });
+    invalid(
+        svc.create_label(Request::new(label(
+            "Unknown",
+            vec![unknown_type.clone()],
+            schema::SchemaMode::Strict,
+        )))
         .await
-        .expect_err("an unknown property type must be refused");
-    assert_eq!(unknown_type.code(), tonic::Code::InvalidArgument);
+        .expect_err("an unknown property type must be refused"),
+        "properties[0].type",
+    );
 
-    let unknown_mode = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Unknown".to_string(),
-            properties: vec![],
-            computed_properties: vec![],
-            schema_mode: 42,
-        }))
-        .await
-        .expect_err("an unknown schema mode must be refused");
-    assert_eq!(unknown_mode.code(), tonic::Code::InvalidArgument);
+    let mut unknown_mode = label("Unknown", vec![], schema::SchemaMode::Strict);
+    unknown_mode.schema_mode = 42;
+    invalid(
+        svc.create_label(Request::new(unknown_mode))
+            .await
+            .expect_err("an unknown schema mode must be refused"),
+        "schema_mode",
+    );
 
-    let unknown_edge_type = svc
-        .create_edge_type(Request::new(graph::CreateEdgeTypeRequest {
+    invalid(
+        svc.create_edge_type(Request::new(schema::CreateEdgeTypeRequest {
             name: "UNKNOWN".to_string(),
-            properties: vec![graph::PropertyDefinition {
-                name: "p".to_string(),
-                r#type: 42,
-                required: false,
-                unique: false,
-            }],
+            properties: vec![unknown_type],
+            temporal: false,
         }))
         .await
-        .expect_err("an unknown edge property type must be refused");
-    assert_eq!(unknown_edge_type.code(), tonic::Code::InvalidArgument);
+        .expect_err("an unknown edge property type must be refused"),
+        "properties[0].type",
+    );
+
+    let mut unknown_kind = unique("u", "User", "email");
+    unknown_kind.kind = 42;
+    invalid(
+        svc.create_constraint(Request::new(unknown_kind))
+            .await
+            .expect_err("an unknown constraint kind must be refused"),
+        "kind",
+    );
+
+    // None of the refused requests reached the catalog.
+    let db = svc.database.read();
+    assert!(db.label_schemas().expect("labels").is_empty());
+    assert!(db.constraints().expect("constraints").is_empty());
 }
 
-/// create_label persists schema and returns version > 0.
+/// A property without a type, a repeated name, or a constraint whose shape
+/// its kind does not allow is refused before anything is written.
+#[tokio::test]
+async fn malformed_definitions_and_constraints_are_refused() {
+    let (svc, _dir) = test_service();
+
+    let mut untyped = prop("p", schema::ScalarType::String, false);
+    untyped.r#type = None;
+    let status = svc
+        .create_label(Request::new(label(
+            "L",
+            vec![untyped],
+            schema::SchemaMode::Strict,
+        )))
+        .await
+        .expect_err("a property needs a type");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let status = svc
+        .create_label(Request::new(label(
+            "L",
+            vec![
+                prop("p", schema::ScalarType::String, false),
+                prop("p", schema::ScalarType::Int64, false),
+            ],
+            schema::SchemaMode::Strict,
+        )))
+        .await
+        .expect_err("a property is declared once");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let mut two_not_null = unique("n", "L", "a");
+    two_not_null.kind = schema::ConstraintKind::NotNull as i32;
+    two_not_null.properties.push("b".into());
+    let status = svc
+        .create_constraint(Request::new(two_not_null))
+        .await
+        .expect_err("NOT NULL constrains one property");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let mut typed_unique = unique("u", "L", "a");
+    typed_unique.property_type = scalar(schema::ScalarType::String);
+    let status = svc
+        .create_constraint(Request::new(typed_unique))
+        .await
+        .expect_err("only a type constraint names a type");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    let db = svc.database.read();
+    assert!(db.label_schemas().expect("labels").is_empty());
+    assert!(db.constraints().expect("constraints").is_empty());
+}
+
+/// create_label persists the type facts, answers with them as stored, and
+/// declares no constraint.
 #[tokio::test]
 async fn create_label_persists_schema() {
     let (svc, _dir) = test_service();
 
-    let resp = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Article".to_string(),
-            properties: vec![
-                graph::PropertyDefinition {
-                    name: "title".to_string(),
-                    r#type: graph::PropertyType::String as i32,
-                    required: true,
-                    unique: false,
-                },
-                graph::PropertyDefinition {
-                    name: "slug".to_string(),
-                    r#type: graph::PropertyType::String as i32,
-                    required: false,
-                    unique: true,
-                },
-            ],
-            computed_properties: vec![],
+    let mut slug = prop("slug", schema::ScalarType::String, false);
+    slug.default_value = Some(value_to_proto_pub(&Value::String("untitled".into())));
+    let label = svc
+        .create_label(Request::new(label(
+            "Article",
+            vec![prop("title", schema::ScalarType::String, true), slug],
             // Unspecified means STRICT.
-            schema_mode: graph::SchemaMode::Unspecified as i32,
-        }))
+            schema::SchemaMode::Unspecified,
+        )))
         .await
-        .expect("create_label should succeed");
+        .expect("create_label should succeed")
+        .into_inner();
 
-    let label = resp.into_inner();
     assert_eq!(label.name, "Article");
-    assert!(
-        label.schema_revision > 0,
-        "schema_revision must be positive after persist"
-    );
+    assert!(label.declared);
+    assert_eq!(label.schema_mode, schema::SchemaMode::Strict as i32);
+    assert!(label.schema_revision > 0);
     assert_eq!(label.properties.len(), 2);
+    let slug = label
+        .properties
+        .iter()
+        .find(|p| p.name == "slug")
+        .expect("slug");
+    assert_eq!(
+        slug.default_value.as_ref().map(proto_to_value_pub),
+        Some(Value::String("untitled".into()))
+    );
 
-    // Verify schema is in storage.
-    use coordinode_storage::engine::partition::Partition;
-    let db = svc.database.write();
-    let key = coordinode_core::schema::definition::encode_label_schema_key("Article", 1);
-    let bytes = db
-        .engine()
-        .get(Partition::Schema, &key)
-        .expect("storage get")
+    let db = svc.database.read();
+    let stored = db
+        .label_schemas()
+        .expect("labels")
+        .into_iter()
+        .find(|s| s.name == "Article")
         .expect("schema must be persisted");
-    let schema = coordinode_core::schema::definition::LabelSchema::from_msgpack(&bytes)
-        .expect("deserialize");
-    assert_eq!(schema.name, "Article");
-    assert_eq!(schema.properties.len(), 2);
-    // `slug` must be unique.
-    assert!(schema.get_property("slug").is_some_and(|p| p.unique));
+    assert_eq!(stored.properties.len(), 2);
+    assert!(stored.get_property("title").is_some_and(|p| p.not_null));
+    assert!(
+        stored.constraints().is_empty(),
+        "a type declares no constraint"
+    );
 }
 
-/// create_label with unique property → duplicate CREATE fails.
+/// Defining a label that already has a definition is refused as an existing
+/// catalog object, and the first definition stays.
+#[tokio::test]
+async fn a_label_is_defined_once() {
+    let (svc, _dir) = test_service();
+    svc.create_label(Request::new(label(
+        "Article",
+        vec![prop("title", schema::ScalarType::String, true)],
+        schema::SchemaMode::Strict,
+    )))
+    .await
+    .expect("first definition");
+
+    let status = svc
+        .create_label(Request::new(label(
+            "Article",
+            vec![],
+            schema::SchemaMode::Flexible,
+        )))
+        .await
+        .expect_err("a second definition is refused");
+    assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    assert_eq!(reason(&status), "CATALOG_OBJECT_EXISTS");
+    let resource = status.get_details_resource_info().expect("ResourceInfo");
+    assert_eq!(
+        (
+            resource.resource_type.as_str(),
+            resource.resource_name.as_str()
+        ),
+        ("label", "Article")
+    );
+    let stored = svc
+        .database
+        .read()
+        .label_schemas()
+        .expect("labels")
+        .into_iter()
+        .find(|s| s.name == "Article")
+        .expect("Article");
+    assert_eq!(stored.mode, SchemaMode::Strict);
+}
+
+/// A uniqueness constraint is created apart from the type: it answers with
+/// its state and the index it owns, is listed, refuses a duplicate value,
+/// and dropping it leaves the type as it was.
+#[tokio::test]
+async fn a_uniqueness_constraint_is_created_listed_enforced_and_dropped() {
+    let (svc, _dir) = test_service();
+    svc.create_label(Request::new(label(
+        "Customer",
+        vec![prop("email", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    )))
+    .await
+    .expect("create_label");
+
+    let created = svc
+        .create_constraint(Request::new(unique("customer_email", "Customer", "email")))
+        .await
+        .expect("create_constraint")
+        .into_inner();
+    assert_eq!(created.kind, schema::ConstraintKind::Unique as i32);
+    assert_eq!(created.state, schema::ConstraintState::Active as i32);
+    assert_eq!(created.backing_index, "customer_email");
+    assert_eq!(created.property_type, None);
+
+    let listed = svc
+        .list_constraints(Request::new(schema::ListConstraintsRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .constraints;
+    assert_eq!(listed, vec![created]);
+
+    {
+        let mut db = svc.database.write();
+        db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
+            .expect("first create");
+        assert!(
+            db.execute_cypher("CREATE (c:Customer {email: 'x@test.com'})")
+                .is_err(),
+            "duplicate email must be rejected by the constraint"
+        );
+    }
+
+    let status = svc
+        .create_constraint(Request::new(unique("customer_email", "Customer", "email")))
+        .await
+        .expect_err("the name is taken");
+    assert_eq!(status.code(), tonic::Code::AlreadyExists);
+    assert_eq!(reason(&status), "CATALOG_OBJECT_EXISTS");
+
+    svc.drop_constraint(Request::new(schema::DropConstraintRequest {
+        name: "customer_email".into(),
+        if_exists: false,
+    }))
+    .await
+    .expect("drop");
+    let status = svc
+        .drop_constraint(Request::new(schema::DropConstraintRequest {
+            name: "customer_email".into(),
+            if_exists: false,
+        }))
+        .await
+        .expect_err("already dropped");
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(reason(&status), "CATALOG_OBJECT_NOT_FOUND");
+    svc.drop_constraint(Request::new(schema::DropConstraintRequest {
+        name: "customer_email".into(),
+        if_exists: true,
+    }))
+    .await
+    .expect("IF EXISTS");
+    let labels = svc
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
+        .await
+        .expect("labels")
+        .into_inner()
+        .labels;
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].properties.len(), 1, "the type is unchanged");
+}
+
+/// A type constraint answers with the type it requires; one that contradicts
+/// the declared type is refused by the catalog's state.
+#[tokio::test]
+async fn a_type_constraint_names_its_type_and_must_fit_the_declaration() {
+    let (svc, _dir) = test_service();
+    svc.create_label(Request::new(label(
+        "Doc",
+        vec![prop("size", schema::ScalarType::Int64, false)],
+        schema::SchemaMode::Flexible,
+    )))
+    .await
+    .expect("create_label");
+
+    let mut typed = unique("doc_size_type", "Doc", "size");
+    typed.kind = schema::ConstraintKind::PropertyType as i32;
+    typed.property_type = scalar(schema::ScalarType::Int64);
+    let created = svc
+        .create_constraint(Request::new(typed.clone()))
+        .await
+        .expect("a fitting type constraint")
+        .into_inner();
+    assert_eq!(created.property_type, scalar(schema::ScalarType::Int64));
+    assert_eq!(created.backing_index, "", "a type constraint owns no index");
+
+    typed.name = "doc_size_string".into();
+    typed.property_type = scalar(schema::ScalarType::String);
+    let status = svc
+        .create_constraint(Request::new(typed))
+        .await
+        .expect_err("STRING contradicts the declared INT64");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    assert_eq!(reason(&status), "CATALOG_CHANGE_REFUSED");
+}
+
+/// Structured property types round-trip: vector dimensions and metric, and
+/// array element types, as declared.
+#[tokio::test]
+async fn structured_property_types_round_trip() {
+    let (svc, _dir) = test_service();
+    let vector = schema::PropertyType {
+        r#type: Some(schema::property_type::Type::Vector(schema::VectorType {
+            dimensions: 384,
+            metric: crate::proto::v1::query::DistanceMetric::L2 as i32,
+        })),
+    };
+    let tags = schema::PropertyType {
+        r#type: Some(schema::property_type::Type::Array(Box::new(
+            schema::ArrayType {
+                element: scalar(schema::ScalarType::String).map(Box::new),
+            },
+        ))),
+    };
+    let mut emb = prop("emb", schema::ScalarType::String, false);
+    emb.r#type = Some(vector.clone());
+    let mut tag_list = prop("tags", schema::ScalarType::String, false);
+    tag_list.r#type = Some(tags.clone());
+    let created = svc
+        .create_label(Request::new(label(
+            "Item",
+            vec![emb, tag_list],
+            schema::SchemaMode::Validated,
+        )))
+        .await
+        .expect("create_label")
+        .into_inner();
+    let type_of = |name: &str| {
+        created
+            .properties
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.r#type.clone())
+    };
+    assert_eq!(type_of("emb"), Some(vector));
+    assert_eq!(type_of("tags"), Some(tags));
+}
+
+/// A uniqueness constraint created after the type is enforced on the next
+/// CREATE.
 #[tokio::test]
 async fn create_label_unique_property_enforces_constraint() {
     let (svc, _dir) = test_service();
 
-    // Declare label with unique email.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Customer".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "email".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: true,
-        }],
-        computed_properties: vec![],
+    svc.create_label(Request::new(label(
+        "Customer",
+        vec![prop("email", schema::ScalarType::String, false)],
         // Unspecified means STRICT.
-        schema_mode: graph::SchemaMode::Unspecified as i32,
-    }))
+        schema::SchemaMode::Unspecified,
+    )))
     .await
     .expect("create_label");
+    svc.create_constraint(Request::new(unique("customer_email", "Customer", "email")))
+        .await
+        .expect("create_constraint");
 
     // First node — should succeed.
     {
@@ -250,25 +564,21 @@ async fn create_label_unique_property_enforces_constraint() {
 /// (ON MATCH), NOT fall through to CREATE and throw "unique constraint violated".
 ///
 /// Regression test for the gRPC repro:
-///   SchemaService/CreateLabel (unique id) → CREATE node → MERGE same id → ERROR
+///   CreateLabel + CreateConstraint (unique id) → CREATE node → MERGE same id
 #[tokio::test]
 async fn merge_on_existing_unique_node_does_not_error() {
     let (svc, _dir) = test_service();
 
-    // Create label with unique id (STRING) via SchemaService path.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "TestNode".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "id".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: true,
-            unique: true,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "TestNode",
+        vec![prop("id", schema::ScalarType::String, true)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label");
+    svc.create_constraint(Request::new(unique("testnode_id", "TestNode", "id")))
+        .await
+        .expect("create_constraint");
 
     // Create initial node.
     {
@@ -294,42 +604,43 @@ async fn merge_on_existing_unique_node_does_not_error() {
     }
 }
 
-/// create_edge_type persists schema and returns version > 0.
+/// create_edge_type persists the definition and lists it with its type facts;
+/// a second definition of the type is refused.
 #[tokio::test]
 async fn create_edge_type_persists_schema() {
     let (svc, _dir) = test_service();
 
-    let resp = svc
-        .create_edge_type(Request::new(graph::CreateEdgeTypeRequest {
+    let et = svc
+        .create_edge_type(Request::new(schema::CreateEdgeTypeRequest {
             name: "FOLLOWS".to_string(),
-            properties: vec![graph::PropertyDefinition {
-                name: "since".to_string(),
-                r#type: graph::PropertyType::Timestamp as i32,
-                required: true,
-                unique: false,
-            }],
+            properties: vec![prop("since", schema::ScalarType::Timestamp, true)],
+            temporal: true,
         }))
         .await
-        .expect("create_edge_type should succeed");
-
-    let et = resp.into_inner();
+        .expect("create_edge_type should succeed")
+        .into_inner();
     assert_eq!(et.name, "FOLLOWS");
+    assert!(et.declared && et.temporal);
     assert!(et.schema_revision > 0);
+    assert!(et.properties[0].required);
 
-    // Verify in storage.
-    use coordinode_storage::engine::partition::Partition;
-    let db = svc.database.write();
-    let key = coordinode_core::schema::definition::encode_edge_type_schema_key("FOLLOWS", 1);
-    let bytes = db
-        .engine()
-        .get(Partition::Schema, &key)
-        .expect("storage get")
-        .expect("edge schema must be persisted");
-    let schema = coordinode_core::schema::definition::EdgeTypeSchema::from_msgpack(&bytes)
-        .expect("deserialize");
-    assert_eq!(schema.name, "FOLLOWS");
-    assert_eq!(schema.properties.len(), 1);
-    assert!(schema.get_property("since").is_some_and(|p| p.not_null));
+    let listed = svc
+        .list_edge_types(Request::new(schema::ListEdgeTypesRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .edge_types;
+    assert_eq!(listed, vec![et]);
+
+    let status = svc
+        .create_edge_type(Request::new(schema::CreateEdgeTypeRequest {
+            name: "FOLLOWS".to_string(),
+            properties: vec![],
+            temporal: false,
+        }))
+        .await
+        .expect_err("defined once");
+    assert_eq!(status.code(), tonic::Code::AlreadyExists);
 }
 
 /// list_labels returns schema properties for declared labels.
@@ -337,32 +648,20 @@ async fn create_edge_type_persists_schema() {
 async fn list_labels_returns_schema_properties() {
     let (svc, _dir) = test_service();
 
-    // Declare label with known properties.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Post".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "title".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: true,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "views".to_string(),
-                r#type: graph::PropertyType::Int64 as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "Post",
+        vec![
+            prop("title", schema::ScalarType::String, true),
+            prop("views", schema::ScalarType::Int64, false),
         ],
-        computed_properties: vec![],
         // Unspecified means STRICT.
-        schema_mode: graph::SchemaMode::Unspecified as i32,
-    }))
+        schema::SchemaMode::Unspecified,
+    )))
     .await
     .expect("create_label");
 
     let labels = svc
-        .list_labels(Request::new(graph::ListLabelsRequest {}))
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
         .await
         .expect("list_labels")
         .into_inner()
@@ -402,65 +701,44 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
     // Declare label with a TIMESTAMP anchor and a TTL COMPUTED property (60s,
     // Node scope). The TtlReaper background thread is not used here — we call
     // reap_computed_ttl() directly to avoid real-time sleeping.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Session".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "started_at".to_string(),
-            r#type: graph::PropertyType::Timestamp as i32,
-            required: true,
-            unique: false,
-        }],
-        computed_properties: vec![graph::ComputedPropertyDefinition {
+    let session = |name: &str| {
+        let mut request = label(
+            name,
+            vec![prop("started_at", schema::ScalarType::Timestamp, true)],
+            // The test exercises the TTL reaper, not schema enforcement.
+            schema::SchemaMode::Flexible,
+        );
+        request.computed_properties = vec![schema::ComputedPropertyDefinition {
             name: "_ttl".to_string(),
-            computed_type: graph::ComputedType::Ttl as i32,
+            computed_type: schema::ComputedType::Ttl as i32,
             // A TTL does not use the formula.
-            formula_type: graph::DecayFormulaType::Unspecified as i32,
+            formula_type: schema::DecayFormulaType::Unspecified as i32,
             duration_secs: 60, // 60 seconds lifetime
             anchor_field: "started_at".to_string(),
-            scope: graph::TtlScopeType::Node as i32,
+            scope: schema::TtlScopeType::Node as i32,
             ..Default::default()
-        }],
-        // The test exercises the TTL reaper, not schema enforcement.
-        schema_mode: graph::SchemaMode::Flexible as i32,
-    }))
-    .await
-    .expect("create_label with TTL should succeed");
-
-    // Verify the response echoes computed_properties.
-    let resp = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Session2".to_string(),
-            properties: vec![graph::PropertyDefinition {
-                name: "started_at".to_string(),
-                r#type: graph::PropertyType::Timestamp as i32,
-                required: true,
-                unique: false,
-            }],
-            computed_properties: vec![graph::ComputedPropertyDefinition {
-                name: "_ttl".to_string(),
-                computed_type: graph::ComputedType::Ttl as i32,
-                formula_type: graph::DecayFormulaType::Unspecified as i32,
-                duration_secs: 60,
-                anchor_field: "started_at".to_string(),
-                scope: graph::TtlScopeType::Node as i32,
-                ..Default::default()
-            }],
-            // The test exercises the TTL reaper, not schema enforcement.
-            schema_mode: graph::SchemaMode::Flexible as i32,
-        }))
+        }];
+        request
+    };
+    svc.create_label(Request::new(session("Session")))
         .await
-        .expect("create_label should succeed");
+        .expect("create_label with TTL should succeed");
 
-    let label = resp.into_inner();
+    // The response carries the computed property as stored.
+    let label = svc
+        .create_label(Request::new(session("Session2")))
+        .await
+        .expect("create_label should succeed")
+        .into_inner();
     assert_eq!(
         label.computed_properties.len(),
         1,
-        "response must echo computed_properties"
+        "response must carry computed_properties"
     );
     assert_eq!(label.computed_properties[0].name, "_ttl");
     assert_eq!(
         label.computed_properties[0].computed_type,
-        graph::ComputedType::Ttl as i32
+        schema::ComputedType::Ttl as i32
     );
     assert_eq!(label.computed_properties[0].duration_secs, 60);
     assert_eq!(label.computed_properties[0].anchor_field, "started_at");
@@ -549,33 +827,29 @@ async fn create_label_with_ttl_computed_property_reaper_deletes_expired_node() {
 async fn create_label_with_decay_computed_property_list_labels_returns_it() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Article".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "published_at".to_string(),
-            r#type: graph::PropertyType::Timestamp as i32,
-            required: true,
-            unique: false,
-        }],
-        computed_properties: vec![graph::ComputedPropertyDefinition {
-            name: "relevance".to_string(),
-            computed_type: graph::ComputedType::Decay as i32,
-            formula_type: graph::DecayFormulaType::Linear as i32,
-            initial: 1.0,
-            target: 0.0,
-            duration_secs: 604800, // 7 days
-            anchor_field: "published_at".to_string(),
-            ..Default::default()
-        }],
+    let mut request = label(
+        "Article",
+        vec![prop("published_at", schema::ScalarType::Timestamp, true)],
         // Unspecified means STRICT.
-        schema_mode: graph::SchemaMode::Unspecified as i32,
-    }))
-    .await
-    .expect("create_label with DECAY should succeed");
+        schema::SchemaMode::Unspecified,
+    );
+    request.computed_properties = vec![schema::ComputedPropertyDefinition {
+        name: "relevance".to_string(),
+        computed_type: schema::ComputedType::Decay as i32,
+        formula_type: schema::DecayFormulaType::Linear as i32,
+        initial: 1.0,
+        target: 0.0,
+        duration_secs: 604800, // 7 days
+        anchor_field: "published_at".to_string(),
+        ..Default::default()
+    }];
+    svc.create_label(Request::new(request))
+        .await
+        .expect("create_label with DECAY should succeed");
 
     // list_labels must return the computed property back to the caller.
     let labels = svc
-        .list_labels(Request::new(graph::ListLabelsRequest {}))
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
         .await
         .expect("list_labels")
         .into_inner()
@@ -600,8 +874,8 @@ async fn create_label_with_decay_computed_property_list_labels_returns_it() {
 
     let cp = &article.computed_properties[0];
     assert_eq!(cp.name, "relevance");
-    assert_eq!(cp.computed_type, graph::ComputedType::Decay as i32);
-    assert_eq!(cp.formula_type, graph::DecayFormulaType::Linear as i32);
+    assert_eq!(cp.computed_type, schema::ComputedType::Decay as i32);
+    assert_eq!(cp.formula_type, schema::DecayFormulaType::Linear as i32);
     assert!((cp.initial - 1.0).abs() < f64::EPSILON);
     assert!((cp.target - 0.0).abs() < f64::EPSILON);
     assert_eq!(cp.duration_secs, 604800);
@@ -613,25 +887,19 @@ async fn create_label_with_decay_computed_property_list_labels_returns_it() {
 async fn create_label_computed_type_unspecified_returns_error() {
     let (svc, _dir) = test_service();
 
-    let result = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Bad".to_string(),
-            properties: vec![],
-            computed_properties: vec![graph::ComputedPropertyDefinition {
-                name: "broken".to_string(),
-                computed_type: graph::ComputedType::Unspecified as i32,
-                duration_secs: 60,
-                anchor_field: "ts".to_string(),
-                ..Default::default()
-            }],
-            schema_mode: graph::SchemaMode::Unspecified as i32,
-        }))
-        .await;
-
-    assert!(
-        result.is_err(),
-        "UNSPECIFIED computed_type must be rejected"
-    );
+    let mut request = label("Bad", vec![], schema::SchemaMode::Unspecified);
+    request.computed_properties = vec![schema::ComputedPropertyDefinition {
+        name: "broken".to_string(),
+        computed_type: schema::ComputedType::Unspecified as i32,
+        duration_secs: 60,
+        anchor_field: "ts".to_string(),
+        ..Default::default()
+    }];
+    let status = svc
+        .create_label(Request::new(request))
+        .await
+        .expect_err("UNSPECIFIED computed_type must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 }
 
 /// proto_to_computed_spec rejects empty anchor_field.
@@ -639,22 +907,24 @@ async fn create_label_computed_type_unspecified_returns_error() {
 async fn create_label_computed_empty_anchor_field_returns_error() {
     let (svc, _dir) = test_service();
 
-    let result = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Bad2".to_string(),
-            properties: vec![],
-            computed_properties: vec![graph::ComputedPropertyDefinition {
-                name: "ttl".to_string(),
-                computed_type: graph::ComputedType::Ttl as i32,
-                duration_secs: 60,
-                anchor_field: String::new(), // empty — must be rejected
-                ..Default::default()
-            }],
-            schema_mode: graph::SchemaMode::Unspecified as i32,
-        }))
-        .await;
-
-    assert!(result.is_err(), "empty anchor_field must be rejected");
+    let mut request = label("Bad2", vec![], schema::SchemaMode::Unspecified);
+    request.computed_properties = vec![schema::ComputedPropertyDefinition {
+        name: "ttl".to_string(),
+        computed_type: schema::ComputedType::Ttl as i32,
+        duration_secs: 60,
+        anchor_field: String::new(), // empty: must be rejected
+        ..Default::default()
+    }];
+    let status = svc
+        .create_label(Request::new(request))
+        .await
+        .expect_err("empty anchor_field must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    let violations = status
+        .get_details_bad_request()
+        .expect("BadRequest")
+        .field_violations;
+    assert_eq!(violations[0].field, "computed_properties[0].anchor_field");
 }
 
 // ── SchemaMode via gRPC: CREATE/SET enforcement ─────────────────────────
@@ -669,17 +939,11 @@ async fn strict_mode_set_unknown_property_rejected() {
     let (svc, _dir) = test_service();
 
     // Declare User label with schema_mode=STRICT, only `name` declared.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "User".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "name".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "User",
+        vec![prop("name", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -736,17 +1000,11 @@ async fn flexible_mode_set_unknown_property_allowed() {
     let (svc, _dir) = test_service();
 
     // Declare Device label with schema_mode=FLEXIBLE, only `id` declared.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Device".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "id".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Flexible as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Device",
+        vec![prop("id", schema::ScalarType::String, false)],
+        schema::SchemaMode::Flexible,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -772,31 +1030,24 @@ async fn schema_mode_echoed_in_response_and_list() {
     let (svc, _dir) = test_service();
 
     // Create with VALIDATED mode.
-    let resp = svc
-        .create_label(Request::new(graph::CreateLabelRequest {
-            name: "Event".to_string(),
-            properties: vec![graph::PropertyDefinition {
-                name: "ts".to_string(),
-                r#type: graph::PropertyType::Timestamp as i32,
-                required: false,
-                unique: false,
-            }],
-            computed_properties: vec![],
-            schema_mode: graph::SchemaMode::Validated as i32,
-        }))
+    let created = svc
+        .create_label(Request::new(label(
+            "Event",
+            vec![prop("ts", schema::ScalarType::Timestamp, false)],
+            schema::SchemaMode::Validated,
+        )))
         .await
-        .expect("create_label should succeed");
-
-    let label = resp.into_inner();
+        .expect("create_label should succeed")
+        .into_inner();
     assert_eq!(
-        label.schema_mode,
-        graph::SchemaMode::Validated as i32,
-        "create_label response must echo schema_mode=VALIDATED"
+        created.schema_mode,
+        schema::SchemaMode::Validated as i32,
+        "create_label response must carry schema_mode=VALIDATED"
     );
 
     // list_labels must return the persisted mode.
     let labels = svc
-        .list_labels(Request::new(graph::ListLabelsRequest {}))
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
         .await
         .expect("list_labels")
         .into_inner()
@@ -809,7 +1060,7 @@ async fn schema_mode_echoed_in_response_and_list() {
 
     assert_eq!(
         event.schema_mode,
-        graph::SchemaMode::Validated as i32,
+        schema::SchemaMode::Validated as i32,
         "list_labels must return schema_mode=VALIDATED for Event"
     );
 }
@@ -822,17 +1073,11 @@ async fn schema_mode_echoed_in_response_and_list() {
 async fn strict_mode_create_type_mismatch_rejected() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Sensor".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "reading".to_string(),
-            r#type: graph::PropertyType::Float64 as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Sensor",
+        vec![prop("reading", schema::ScalarType::Float64, false)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -853,17 +1098,11 @@ async fn strict_mode_create_type_mismatch_rejected() {
 async fn validated_mode_type_mismatch_rejected_but_extra_accepted() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Log".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "level".to_string(),
-            r#type: graph::PropertyType::Int64 as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Log",
+        vec![prop("level", schema::ScalarType::Int64, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -892,17 +1131,11 @@ async fn strict_mode_create_with_unknown_property_rejected() {
     let (svc, _dir) = test_service();
 
     // Declare Product label with STRICT mode; only `sku` declared.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Product".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "sku".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Product",
+        vec![prop("sku", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -935,17 +1168,11 @@ async fn strict_mode_create_with_unknown_property_rejected() {
 async fn validated_mode_set_extra_accepted_mismatch_rejected() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Metric".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "value".to_string(),
-            r#type: graph::PropertyType::Float64 as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Metric",
+        vec![prop("value", schema::ScalarType::Float64, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -979,25 +1206,14 @@ async fn validated_mode_set_extra_accepted_mismatch_rejected() {
 async fn strict_mode_create_missing_required_property_rejected() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Task".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "title".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: true,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "priority".to_string(),
-                r#type: graph::PropertyType::Int64 as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "Task",
+        vec![
+            prop("title", schema::ScalarType::String, true),
+            prop("priority", schema::ScalarType::Int64, false),
         ],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -1039,17 +1255,11 @@ async fn multi_update_strict_node_fails_whole_query() {
     let (svc, _dir) = test_service();
 
     // Declare STRICT schema for Monitored label (only `host` property).
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Monitored".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "host".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Monitored",
+        vec![prop("host", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label should succeed");
 
@@ -1084,25 +1294,14 @@ async fn multi_update_strict_node_fails_whole_query() {
 async fn strict_mode_merge_on_create_set_rejected_for_unknown_property() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Product".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "sku".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "price".to_string(),
-                r#type: graph::PropertyType::Float64 as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "Product",
+        vec![
+            prop("sku", schema::ScalarType::String, false),
+            prop("price", schema::ScalarType::Float64, false),
         ],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Product");
 
@@ -1130,25 +1329,14 @@ async fn strict_mode_merge_on_create_set_rejected_for_unknown_property() {
 async fn strict_mode_replace_properties_rejects_unknown_key() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Config".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "host".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "port".to_string(),
-                r#type: graph::PropertyType::Int64 as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "Config",
+        vec![
+            prop("host", schema::ScalarType::String, false),
+            prop("port", schema::ScalarType::Int64, false),
         ],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Config");
 
@@ -1182,25 +1370,14 @@ async fn strict_mode_replace_properties_rejects_unknown_key() {
 async fn strict_mode_merge_properties_rejects_unknown_key() {
     let (svc, _dir) = test_service();
 
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "AppService".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "name".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "version".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "AppService",
+        vec![
+            prop("name", schema::ScalarType::String, false),
+            prop("version", schema::ScalarType::String, false),
         ],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label AppService");
 
@@ -1235,25 +1412,14 @@ async fn on_violation_skip_excludes_violating_nodes() {
     let (svc, _dir) = test_service();
 
     // Gadget has a strict schema: only 'name' and 'status' are allowed.
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Gadget".to_string(),
-        properties: vec![
-            graph::PropertyDefinition {
-                name: "name".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
-            graph::PropertyDefinition {
-                name: "status".to_string(),
-                r#type: graph::PropertyType::String as i32,
-                required: false,
-                unique: false,
-            },
+    svc.create_label(Request::new(label(
+        "Gadget",
+        vec![
+            prop("name", schema::ScalarType::String, false),
+            prop("status", schema::ScalarType::String, false),
         ],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Gadget");
 
@@ -1308,17 +1474,11 @@ async fn on_violation_skip_excludes_violating_nodes() {
 #[tokio::test]
 async fn strict_mode_property_path_rejects_unknown_root() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Device".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "serial".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: true,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Device",
+        vec![prop("serial", schema::ScalarType::String, true)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Device");
 
@@ -1342,17 +1502,11 @@ async fn strict_mode_property_path_rejects_unknown_root() {
 #[tokio::test]
 async fn strict_mode_doc_function_rejects_unknown_root() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Shelf".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "name".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: true,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Shelf",
+        vec![prop("name", schema::ScalarType::String, true)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Shelf");
 
@@ -1377,17 +1531,11 @@ async fn strict_mode_doc_function_rejects_unknown_root() {
 #[tokio::test]
 async fn validated_mode_replace_properties_allows_unknown_key() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Server".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "host".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Server",
+        vec![prop("host", schema::ScalarType::String, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Server");
 
@@ -1417,17 +1565,11 @@ async fn validated_mode_replace_properties_allows_unknown_key() {
 #[tokio::test]
 async fn validated_mode_merge_properties_allows_unknown_key() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Cache".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "size".to_string(),
-            r#type: graph::PropertyType::Int64 as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Cache",
+        vec![prop("size", schema::ScalarType::Int64, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Cache");
 
@@ -1478,17 +1620,11 @@ async fn labels_function_subscript_access() {
 #[tokio::test]
 async fn validated_mode_property_path_allows_unknown_root() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Sensor".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "id".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Sensor",
+        vec![prop("id", schema::ScalarType::String, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Sensor");
 
@@ -1512,17 +1648,11 @@ async fn validated_mode_property_path_allows_unknown_root() {
 #[tokio::test]
 async fn validated_mode_doc_function_allows_unknown_root() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Bin".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "tag".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Bin",
+        vec![prop("tag", schema::ScalarType::String, false)],
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Bin");
 
@@ -1546,17 +1676,11 @@ async fn validated_mode_doc_function_allows_unknown_root() {
 #[tokio::test]
 async fn on_violation_skip_with_property_path() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Relay".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "state".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: graph::SchemaMode::Strict as i32,
-    }))
+    svc.create_label(Request::new(label(
+        "Relay",
+        vec![prop("state", schema::ScalarType::String, false)],
+        schema::SchemaMode::Strict,
+    )))
     .await
     .expect("create_label Relay");
 
@@ -1610,19 +1734,12 @@ async fn on_violation_skip_with_property_path() {
 #[tokio::test]
 async fn schema_label_cache_multiple_paths_same_node() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Config".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "cfg".to_string(),
-            // DOCUMENT is inferred at runtime.
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
+    svc.create_label(Request::new(label(
+        "Config",
+        vec![prop("cfg", schema::ScalarType::String, false)],
         // Extra paths are allowed.
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Config");
 
@@ -1670,18 +1787,12 @@ async fn schema_label_cache_multiple_paths_same_node() {
 #[tokio::test]
 async fn schema_label_cache_multiple_doc_functions_same_node() {
     let (svc, _dir) = test_service();
-    svc.create_label(Request::new(graph::CreateLabelRequest {
-        name: "Queue".to_string(),
-        properties: vec![graph::PropertyDefinition {
-            name: "jobs".to_string(),
-            r#type: graph::PropertyType::String as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
+    svc.create_label(Request::new(label(
+        "Queue",
+        vec![prop("jobs", schema::ScalarType::String, false)],
         // Extra roots are allowed.
-        schema_mode: graph::SchemaMode::Validated as i32,
-    }))
+        schema::SchemaMode::Validated,
+    )))
     .await
     .expect("create_label Queue");
 

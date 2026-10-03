@@ -19,13 +19,72 @@ use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::common::{
     PropertyValue, Vector, property_value::Value as PvKind,
 };
-use coordinode_integration::proto::graph::{
-    CreateLabelRequest, PropertyDefinition, PropertyType, SchemaMode,
-};
 use coordinode_integration::proto::query::{ExecuteCypherRequest, Row};
+use coordinode_integration::proto::v2::graph::{
+    ConstraintKind, CreateConstraintRequest, CreateLabelRequest, PropertyDefinition, PropertyType,
+    ScalarType, SchemaMode, VectorType, create_constraint_request, property_type,
+};
 use std::collections::HashMap;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// A stored property of type `t`.
+fn property(name: &str, t: property_type::Type, required: bool) -> PropertyDefinition {
+    PropertyDefinition {
+        name: name.to_string(),
+        r#type: Some(PropertyType { r#type: Some(t) }),
+        required,
+        default_value: None,
+    }
+}
+
+fn string_type() -> property_type::Type {
+    property_type::Type::Scalar(ScalarType::String as i32)
+}
+
+/// A vector type with no fixed length: values of any length are accepted.
+fn any_vector_type() -> property_type::Type {
+    property_type::Type::Vector(VectorType {
+        dimensions: 0,
+        metric: 0,
+    })
+}
+
+/// Define label `name` with `properties` in `mode`.
+async fn create_label(
+    proc: &CoordinodeProcess,
+    name: &str,
+    properties: Vec<PropertyDefinition>,
+    mode: SchemaMode,
+) {
+    proc.schema_client()
+        .await
+        .create_label(CreateLabelRequest {
+            name: name.to_string(),
+            properties,
+            computed_properties: vec![],
+            schema_mode: mode as i32,
+            temporal: false,
+        })
+        .await
+        .expect("create_label");
+}
+
+/// Require `property` of `label` to be unique, through a named constraint.
+async fn require_unique(proc: &CoordinodeProcess, label: &str, property: &str) {
+    proc.schema_client()
+        .await
+        .create_constraint(CreateConstraintRequest {
+            name: String::new(),
+            target: Some(create_constraint_request::Target::Label(label.to_string())),
+            properties: vec![property.to_string()],
+            kind: ConstraintKind::Unique as i32,
+            property_type: None,
+            if_not_exists: false,
+        })
+        .await
+        .expect("create_constraint");
+}
 
 /// Execute a Cypher query and return rows as column-name → PropertyValue maps.
 async fn cypher(
@@ -86,27 +145,19 @@ fn pv_string(s: &str) -> PropertyValue {
 
 // ── Vector property declared over gRPC ────────────────────────────────────────
 
-/// A VECTOR property declared over gRPC carries no dimensions, so the schema
-/// records 0 ("unset") and a vector of any length must be accepted.
+/// A VECTOR property declared over gRPC without dimensions records 0
+/// ("unset"), and a vector of any length must be accepted.
 #[tokio::test]
 async fn vector_write_to_grpc_declared_property_succeeds() {
     let proc = CoordinodeProcess::start().await;
 
-    // Create label with VECTOR property via gRPC SchemaService.
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "VecNode".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "emb".to_string(),
-            r#type: PropertyType::Vector as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Strict as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "VecNode",
+        vec![property("emb", any_vector_type(), false)],
+        SchemaMode::Strict,
+    )
+    .await;
 
     // Write a 4-dimensional vector — must succeed even though schema has dimensions=0.
     let mut params = HashMap::new();
@@ -127,20 +178,13 @@ async fn vector_zero_dimensions_survives_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // Step 1: create schema + write initial vector BEFORE restart.
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "VecRestart".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "emb".to_string(),
-            r#type: PropertyType::Vector as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Strict as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "VecRestart",
+        vec![property("emb", any_vector_type(), false)],
+        SchemaMode::Strict,
+    )
+    .await;
 
     let mut params = HashMap::new();
     params.insert("vec".to_string(), pv_vector(vec![1.0, 0.0, 0.0]));
@@ -174,20 +218,13 @@ async fn vector_zero_dimensions_survives_restart() {
 #[tokio::test]
 async fn a_vector_property_survives_a_crash() {
     let proc = CoordinodeProcess::start().await;
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "VecCrash".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "emb".to_string(),
-            r#type: PropertyType::Vector as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Strict as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "VecCrash",
+        vec![property("emb", any_vector_type(), false)],
+        SchemaMode::Strict,
+    )
+    .await;
     let mut params = HashMap::new();
     params.insert("vec".to_string(), pv_vector(vec![1.0, 0.0, 0.0]));
     cypher(&proc, "CREATE (n:VecCrash {emb: $vec})", params)
@@ -256,20 +293,14 @@ async fn properties_named_by_a_map_survive_a_crash() {
 async fn merge_on_existing_unique_key_matches() {
     let proc = CoordinodeProcess::start().await;
 
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "UniqueNode".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "id".to_string(),
-            r#type: PropertyType::String as i32,
-            required: true,
-            unique: true,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Strict as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "UniqueNode",
+        vec![property("id", string_type(), true)],
+        SchemaMode::Strict,
+    )
+    .await;
+    require_unique(&proc, "UniqueNode", "id").await;
 
     // Create the initial node.
     let mut params = HashMap::new();
@@ -300,20 +331,14 @@ async fn merge_on_existing_unique_key_matches() {
 async fn merge_on_existing_unique_key_matches_after_restart() {
     let proc = CoordinodeProcess::start().await;
 
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "UniqueRestart".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "id".to_string(),
-            r#type: PropertyType::String as i32,
-            required: true,
-            unique: true,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Strict as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "UniqueRestart",
+        vec![property("id", string_type(), true)],
+        SchemaMode::Strict,
+    )
+    .await;
+    require_unique(&proc, "UniqueRestart", "id").await;
 
     // Create node before restart.
     let mut params = HashMap::new();
@@ -352,20 +377,13 @@ async fn flexible_vector_search_survives_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // Create a Flexible-mode label with a VECTOR property.
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "FlexVec".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "emb".to_string(),
-            r#type: PropertyType::Vector as i32,
-            required: false,
-            unique: false,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Flexible as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "FlexVec",
+        vec![property("emb", any_vector_type(), false)],
+        SchemaMode::Flexible,
+    )
+    .await;
 
     // Insert nodes with vectors before restart.
     for i in 0u32..5 {
@@ -544,20 +562,14 @@ async fn flexible_match_visible_after_restart() {
     let proc = CoordinodeProcess::start().await;
 
     // 1. Create a FLEXIBLE label with one unique declared property.
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "FlexPersist".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "key".to_string(),
-            r#type: PropertyType::String as i32,
-            required: false,
-            unique: true,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Flexible as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "FlexPersist",
+        vec![property("key", string_type(), false)],
+        SchemaMode::Flexible,
+    )
+    .await;
+    require_unique(&proc, "FlexPersist", "key").await;
 
     // 2. Create a node with an extra (non-schema) property — exercises FLEXIBLE path.
     let mut params = HashMap::new();
@@ -643,20 +655,14 @@ async fn flexible_match_visible_after_restart() {
 #[tokio::test]
 async fn a_unique_constraint_survives_a_crash() {
     let proc = CoordinodeProcess::start().await;
-    let mut sc = proc.schema_client().await;
-    sc.create_label(CreateLabelRequest {
-        name: "CrashUnique".to_string(),
-        properties: vec![PropertyDefinition {
-            name: "key".to_string(),
-            r#type: PropertyType::String as i32,
-            required: false,
-            unique: true,
-        }],
-        computed_properties: vec![],
-        schema_mode: SchemaMode::Flexible as i32,
-    })
-    .await
-    .expect("create_label");
+    create_label(
+        &proc,
+        "CrashUnique",
+        vec![property("key", string_type(), false)],
+        SchemaMode::Flexible,
+    )
+    .await;
+    require_unique(&proc, "CrashUnique", "key").await;
     cypher_q(&proc, "CREATE (:CrashUnique {key: 'k1'})")
         .await
         .expect("create before the crash");

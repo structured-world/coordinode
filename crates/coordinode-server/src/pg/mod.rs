@@ -162,12 +162,28 @@ fn command_tag(query: &str) -> Tag {
 /// conflict is `40001 serialization_failure`, the class drivers retry the
 /// whole transaction on; write pressure is `53000 insufficient_resources`;
 /// a write that reached a follower is `25006 read_only_sql_transaction`, what
-/// a PostgreSQL standby answers. Everything else stays `XX000 internal_error`.
+/// a PostgreSQL standby answers. A name a table already holds is `42P07
+/// duplicate_table`, one another catalog object holds `42710
+/// duplicate_object`; a missing table is `42P01 undefined_table`, another
+/// missing object `42704 undefined_object`; a catalog change the catalog's
+/// state refuses is `55000 object_not_in_prerequisite_state`. Everything else
+/// stays `XX000 internal_error`.
 fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
     use coordinode_core::schema::definition::ConstraintKind;
     use coordinode_embed::db::DatabaseError;
-    use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
     match error {
+        DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Label,
+            ..
+        }) => "42P07",
+        DatabaseError::Execution(ExecutionError::CatalogObjectExists { .. }) => "42710",
+        DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Label,
+            ..
+        }) => "42P01",
+        DatabaseError::Execution(ExecutionError::CatalogObjectMissing { .. }) => "42704",
+        DatabaseError::Execution(ExecutionError::CatalogRefused(_)) => "55000",
         DatabaseError::Execution(
             ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
         ) => "23505",

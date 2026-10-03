@@ -99,8 +99,18 @@ A table is a label with declared, typed columns. It is created with the same
 statement from Cypher and from SQL (over the PostgreSQL wire protocol):
 
 ```sql
-CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING, email STRING UNIQUE)
+CREATE TABLE Account (id BIGINT PRIMARY KEY, name STRING, email STRING)
 ```
+
+`UNIQUE` on a column is not supported yet: a `CREATE TABLE` that declares it
+is refused and creates nothing. On a `ROW` table, make a column unique with a
+named constraint instead:
+
+```cypher
+CREATE CONSTRAINT account_email FOR (a:Account) REQUIRE a.email IS UNIQUE
+```
+
+A table that has a constraint cannot be dropped until its constraints are.
 
 Every row is a node, and like every node it gets its own
 [`elementId`](../cypher/identity.md), issued by the database. The key you

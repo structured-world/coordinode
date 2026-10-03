@@ -1,15 +1,38 @@
 use super::*;
-use coordinode_core::schema::definition::PropertyDef;
+use coordinode_core::schema::definition::{
+    ConstraintKind, ConstraintState, NodeConstraint, PropertyDef,
+};
 
+/// A property only part of a composite key, or only required, identifies no
+/// node alone: no unique input and no upsert for it.
+#[test]
+fn composite_keys_and_presence_constraints_give_no_upsert() {
+    let mut pair = LabelSchema::new_node_id("Pair");
+    pair.add_property(PropertyDef::new("a", PropertyType::Int));
+    pair.add_property(PropertyDef::new("b", PropertyType::Int));
+    pair.add_constraint(constraint("pair_key", &["a", "b"], ConstraintKind::NodeKey));
+    pair.add_constraint(constraint("pair_a", &["a"], ConstraintKind::NotNull));
+    let sdl = generate_graphql_sdl(&[&pair], &[]);
+    assert!(!sdl.contains("upsertPair"), "{sdl}");
+    assert!(!sdl.contains("PairUniqueInput"), "{sdl}");
+}
+
+fn constraint(name: &str, properties: &[&str], kind: ConstraintKind) -> NodeConstraint {
+    NodeConstraint {
+        name: name.into(),
+        properties: properties.iter().map(|p| (*p).to_string()).collect(),
+        kind,
+        state: ConstraintState::Active,
+    }
+}
+
+/// `email` is unique through a constraint; `name` and `age` are not.
 fn make_user_schema() -> LabelSchema {
     let mut schema = LabelSchema::new_node_id("User");
     schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
-    schema.add_property(
-        PropertyDef::new("email", PropertyType::String)
-            .not_null()
-            .unique(),
-    );
+    schema.add_property(PropertyDef::new("email", PropertyType::String).not_null());
     schema.add_property(PropertyDef::new("age", PropertyType::Int));
+    schema.add_constraint(constraint("user_email", &["email"], ConstraintKind::Unique));
     schema
 }
 

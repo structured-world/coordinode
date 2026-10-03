@@ -158,6 +158,16 @@ pub trait SchemaStore {
     fn load_label_txn(&self, txn: &mut Transaction, name: &str)
     -> StoreResult<Option<LabelSchema>>;
 
+    /// Load the label schema as committed now, to write its next revision
+    /// in `txn`: the commit is conditioned on that schema still being the
+    /// current one, so a change committed in between refuses it rather than
+    /// being overwritten.
+    fn load_label_for_update_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<LabelSchema>>;
+
     /// Load the current edge type schema through a transaction (tracked read).
     fn load_edge_type_txn(
         &self,
@@ -489,6 +499,21 @@ impl SchemaStore for LocalSchemaStore<'_> {
                 kind: "label schema",
                 message: format!("decode failed for '{name}' rev {revision}: {e}"),
             })
+    }
+
+    fn load_label_for_update_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<LabelSchema>> {
+        let pointer_key = encode_label_current_revision_key(name);
+        // Every change of a label's schema writes its pointer. The version is
+        // read before the schema: a change landing between the two reads
+        // refuses the commit instead of passing under the older schema.
+        let version = txn.record_version(Partition::Schema, &pointer_key)?;
+        let current = self.load_label(name)?;
+        txn.expect_version(Partition::Schema, &pointer_key, version)?;
+        Ok(current)
     }
 
     fn load_edge_type_txn(

@@ -172,15 +172,31 @@ fn generate_input_types(label: &LabelSchema) -> String {
     )
 }
 
-/// Generate unique input type for upsert WHERE clause.
-/// Only includes properties marked as unique.
-fn generate_unique_input(label: &LabelSchema) -> String {
-    let name = &label.name;
-    let unique_props: Vec<(&String, &coordinode_core::schema::definition::PropertyDef)> = label
+/// The declared properties that alone identify a node of `label`: each is the
+/// whole of a `UNIQUE` or `NODE KEY` constraint, so one value finds at most
+/// one node. A property only part of a composite key identifies nothing alone.
+fn unique_key_properties(
+    label: &LabelSchema,
+) -> Vec<(&String, &coordinode_core::schema::definition::PropertyDef)> {
+    use coordinode_core::schema::definition::ConstraintKind;
+    label
         .properties
         .iter()
-        .filter(|(_, pd)| pd.unique)
-        .collect();
+        .filter(|(name, _)| {
+            label.constraints().iter().any(|c| {
+                matches!(c.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
+                    && c.properties.len() == 1
+                    && &c.properties[0] == *name
+            })
+        })
+        .collect()
+}
+
+/// Generate unique input type for upsert WHERE clause: the properties a
+/// uniqueness or key constraint makes identifying on their own.
+fn generate_unique_input(label: &LabelSchema) -> String {
+    let name = &label.name;
+    let unique_props = unique_key_properties(label);
 
     if unique_props.is_empty() {
         return String::new();
@@ -266,9 +282,8 @@ fn generate_mutation_type(labels: &[&LabelSchema], edge_types: &[&EdgeTypeSchema
         ));
         fields.push(format!("  delete{name}(id: ID!): Boolean!"));
 
-        // Upsert mutation (only if label has unique properties)
-        let has_unique = label.properties.values().any(|pd| pd.unique);
-        if has_unique {
+        // Upsert mutation (only if a property identifies a node on its own)
+        if !unique_key_properties(label).is_empty() {
             fields.push(format!(
                 "  upsert{name}(where: {name}UniqueInput!, onCreate: Create{name}Input!, onMatch: Update{name}Input!): {name}!"
             ));

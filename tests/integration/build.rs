@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(
             &[
-                format!("{proto_root_str}/coordinode/v1/graph/schema.proto"),
+                format!("{proto_root_str}/coordinode/v2/graph/schema.proto"),
                 format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
                 format!("{proto_root_str}/coordinode/v1/session/session.proto"),
                 format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),

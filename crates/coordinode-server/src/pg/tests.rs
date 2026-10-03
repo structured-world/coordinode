@@ -200,6 +200,43 @@ fn constraint_violations_carry_their_postgres_sqlstate() {
     );
 }
 
+/// Catalog refusals carry the SQLSTATE PostgreSQL gives them: a table name
+/// taken is `42P07`, another object's `42710`; a missing table `42P01`,
+/// another missing object `42704`; a change the catalog's state refuses
+/// `55000`.
+#[test]
+fn catalog_refusals_carry_their_postgres_sqlstate() {
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+
+    let exists = |object| {
+        DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+            object,
+            name: "x".into(),
+        })
+    };
+    let missing = |object| {
+        DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
+            object,
+            name: "x".into(),
+        })
+    };
+    let cases = [
+        (exists(CatalogObject::Label), "42P07"),
+        (exists(CatalogObject::Constraint), "42710"),
+        (exists(CatalogObject::Index), "42710"),
+        (missing(CatalogObject::Label), "42P01"),
+        (missing(CatalogObject::Constraint), "42704"),
+        (
+            DatabaseError::Execution(ExecutionError::CatalogRefused("x".into())),
+            "55000",
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(super::sqlstate(&error), expected, "{error:?}");
+    }
+}
+
 /// A driver sees a duplicate key as `23505 unique_violation`, the code it
 /// branches on for exactly this, and a key change as `42P10`.
 /// Refusals a client retries carry the SQLSTATE a PostgreSQL driver retries

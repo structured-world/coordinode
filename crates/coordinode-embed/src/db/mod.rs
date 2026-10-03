@@ -476,6 +476,17 @@ fn apply_session_vector_consistency(
     }
 }
 
+/// A lowered plan ready to run, with the identity the advisor records it by.
+struct Statement {
+    plan: planner::logical::LogicalPlan,
+    /// Canonical form of the statement, literals scrubbed.
+    canonical: String,
+    /// Fingerprint over the canonical form.
+    fingerprint: u64,
+    /// The bound a `vector_build_wait` hint named, if any.
+    build_wait: Option<Duration>,
+}
+
 #[derive(Debug, Clone)]
 struct CachedPlan {
     /// Canonical form (literals scrubbed) — fed to the advisor.
@@ -1124,6 +1135,7 @@ impl Database {
         // through the log.
         if !follow_raft_applies {
             db.rebuild_legacy_btree_indexes()?;
+            db.resume_interrupted_index_builds()?;
         }
         Ok(db)
     }
@@ -2545,7 +2557,46 @@ impl Database {
             }
         };
         apply_session_vector_consistency(&mut plan, hinted, session.vector_consistency);
+        self.run_plan(
+            Statement {
+                plan,
+                canonical,
+                fingerprint: fp,
+                build_wait: hinted_build_wait,
+            },
+            source,
+            params,
+            session,
+            txn_mode,
+            scan_paging,
+        )
+    }
 
+    /// Run a lowered plan as one statement: index selection, parameter
+    /// binding, snapshot, execution, commit and the advisor record. Every
+    /// statement goes through here, whatever produced its plan.
+    fn run_plan(
+        &self,
+        statement: Statement,
+        source: Option<&SourceContext>,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        session: &QuerySession,
+        txn_mode: TxnMode,
+        scan_paging: &mut Option<ScanPaging>,
+    ) -> Result<
+        (
+            Vec<Row>,
+            WriteStats,
+            Option<coordinode_storage::engine::transaction::TransactionState>,
+        ),
+        DatabaseError,
+    > {
+        let Statement {
+            plan,
+            canonical,
+            fingerprint: fp,
+            build_wait: hinted_build_wait,
+        } = statement;
         // The statistics are computed only when a push-down decision needs
         // them: every write invalidates them, so computing them for each
         // statement would put a storage read behind one shared lock on the
@@ -3056,26 +3107,45 @@ impl Database {
     /// Commit the catalog change `stage` makes in a transaction of its own,
     /// through the write pipeline, so the conditions it states (record
     /// versions, names that must be free) are decided at its commit.
-    fn commit_catalog(
+    fn commit_catalog<E>(
         &self,
         stage: impl FnOnce(
             &mut coordinode_storage::engine::transaction::Transaction<'_>,
-        ) -> Result<(), coordinode_modality::StoreError>,
+        ) -> Result<(), E>,
+    ) -> Result<(), DatabaseError>
+    where
+        DatabaseError: From<E>,
+    {
+        let mut txn = self.begin_catalog_txn();
+        stage(&mut txn)?;
+        self.commit_catalog_txn(txn)
+    }
+
+    /// A transaction for one catalog change.
+    fn begin_catalog_txn(&self) -> coordinode_storage::engine::transaction::Transaction<'_> {
+        coordinode_storage::engine::transaction::Transaction::begin(
+            &self.engine,
+            Some(&self.oracle),
+            self.oracle.next(),
+        )
+    }
+
+    /// Commit catalog change `txn` through the write pipeline.
+    fn commit_catalog_txn(
+        &self,
+        mut txn: coordinode_storage::engine::transaction::Transaction<'_>,
     ) -> Result<(), DatabaseError> {
-        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
         let wc = self.write_concern;
-        let commit_ctx = CommitContext {
+        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &wc,
             pipeline: Some(self.pipeline.as_ref()),
             id_gen: Some(&self.proposal_id_gen),
             drain_buffer: None,
             nvme_write_buffer: None,
         };
-        let mut txn = Transaction::begin(&self.engine, Some(&self.oracle), self.oracle.next());
-        stage(&mut txn)?;
         txn.note_schema_change();
         txn.commit(&commit_ctx)
-            .map_err(|e| DatabaseError::Other(format!("publish schema change: {e}")))?;
+            .map_err(coordinode_query::executor::runner::catalog_commit_error)?;
         Ok(())
     }
 
@@ -3128,75 +3198,6 @@ impl Database {
         Ok(())
     }
 
-    /// Persist a label schema to storage and auto-create unique B-tree indexes.
-    ///
-    /// Idempotent: existing schema for this label is replaced. For each property
-    /// with `unique = true`, a B-tree unique index is created (if not already
-    /// present) from the nodes already stored.
-    ///
-    /// Returns the schema revision after persistence.
-    ///
-    /// # Errors
-    ///
-    /// Stored nodes already share a value of a property declared unique: the
-    /// index cannot be built and the schema is not published.
-    pub fn create_label_schema(
-        &mut self,
-        schema: coordinode_core::schema::definition::LabelSchema,
-    ) -> Result<u64, DatabaseError> {
-        // 1. The unique indexes first: a schema that declares a property
-        //    unique is published only once the index enforcing it exists.
-        let label_name = schema.name.clone();
-        let unique_props: Vec<String> = schema
-            .properties
-            .values()
-            .filter(|p| p.unique)
-            .map(|p| p.name.clone())
-            .collect();
-        for prop_name in unique_props {
-            let idx_name = format!("{}_{}", label_name.to_lowercase(), prop_name.to_lowercase());
-            if self.index_registry.get(&idx_name).is_some() {
-                continue;
-            }
-            self.build_btree_index(
-                coordinode_query::index::IndexDefinition::btree(&idx_name, &label_name, &prop_name)
-                    .unique(),
-                FailedBuild::Withdraw,
-            )?;
-        }
-
-        // 2. Publish the schema in one transaction: the version-prefixed body
-        //    and the current_revision pointer land together, and the commit
-        //    checks every stored node of the label against the schema with
-        //    no write validated under the previous one beside it. A schema
-        //    the stored nodes break is refused, not published.
-        let wc = self.write_concern;
-        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
-            write_concern: &wc,
-            pipeline: Some(self.pipeline.as_ref()),
-            id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: None,
-            nvme_write_buffer: None,
-        };
-        let mut txn = coordinode_storage::engine::transaction::Transaction::begin(
-            &self.engine,
-            Some(&self.oracle),
-            self.oracle.next(),
-        );
-        {
-            use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-            LocalSchemaStore::new(&self.engine).save_label_txn(&mut txn, &schema)?;
-        }
-        txn.commit(&commit_ctx).map_err(|e| {
-            DatabaseError::Semantic(format!(
-                "schema for label '{}' not published: {e}",
-                schema.name
-            ))
-        })?;
-
-        Ok(schema.schema_revision)
-    }
-
     /// Create the B-tree index `def` from the nodes already stored.
     ///
     /// The definition is published as building, with any entries left under
@@ -3216,10 +3217,8 @@ impl Database {
     ) -> Result<u64, DatabaseError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
         use coordinode_query::index::IndexState;
-        use coordinode_storage::engine::partition::Partition;
         let store = LocalIndexStore::new(&self.engine);
         let name = def.name.clone();
-        let key = def.schema_key();
         def.layout = ENTRY_LAYOUT;
         if def.maintenance.epoch == 0 {
             // A new index, or one from before maintenance bindings: it takes
@@ -3231,16 +3230,38 @@ impl Database {
             written: 0,
             estimated_total: 0,
         };
-        let replaced = self.engine.record_version(Partition::Schema, &key)?;
+        let replaced = store.definition_version(&name)?;
         self.commit_catalog(|txn| {
-            txn.expect_version(Partition::Schema, &key, replaced)?;
+            store.expect_definition_txn(txn, &name, replaced)?;
             store.clear_txn(txn, &name)?;
             store.put_definition_txn(txn, &def)
         })?;
-        let definition_version = self.engine.record_version(Partition::Schema, &key)?;
+        let definition_version = store.definition_version(&name)?;
         self.index_registry
             .register_published(&self.engine, def.clone())?;
+        self.complete_btree_build(def, definition_version, on_failure)
+    }
 
+    /// Fill the building B-tree index `def`, published at
+    /// `definition_version`, from the stored nodes and publish it ready, or,
+    /// when the stored data refuses it, withdraw it or keep it failed as
+    /// `on_failure` says. Every commit is bound to that record. The
+    /// constraint that owns the index becomes active with it, or is
+    /// withdrawn with it, in the same commit. Returns the number of nodes
+    /// indexed.
+    fn complete_btree_build(
+        &self,
+        mut def: coordinode_query::index::IndexDefinition,
+        definition_version: Option<u64>,
+        on_failure: FailedBuild,
+    ) -> Result<u64, DatabaseError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        use coordinode_query::executor::runner::{
+            stage_constraint_activation, stage_constraint_withdrawal,
+        };
+        use coordinode_query::index::IndexState;
+        let store = LocalIndexStore::new(&self.engine);
+        let name = def.name.clone();
         let fields = self.fields.current()?;
         let wc = self.write_concern;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
@@ -3264,8 +3285,14 @@ impl Database {
             Ok(indexed) => {
                 def.state = IndexState::Ready;
                 self.commit_catalog(|txn| {
-                    txn.expect_version(Partition::Schema, &key, definition_version)?;
-                    store.put_definition_txn(txn, &def)
+                    store.expect_definition_txn(txn, &name, definition_version)?;
+                    store.put_definition_txn(txn, &def)?;
+                    match &def.owner {
+                        Some(owner) => {
+                            stage_constraint_activation(&self.engine, txn, &def.label, owner)
+                        }
+                        None => Ok(()),
+                    }
                 })?;
                 self.index_registry.register_published(&self.engine, def)?;
                 Ok(indexed)
@@ -3274,9 +3301,18 @@ impl Database {
                 match on_failure {
                     FailedBuild::Withdraw => {
                         self.commit_catalog(|txn| {
-                            txn.expect_version(Partition::Schema, &key, definition_version)?;
+                            store.expect_definition_txn(txn, &name, definition_version)?;
                             store.delete_definition_txn(txn, &name)?;
-                            store.clear_txn(txn, &name)
+                            store.clear_txn(txn, &name)?;
+                            match &def.owner {
+                                Some(owner) => stage_constraint_withdrawal(
+                                    &self.engine,
+                                    txn,
+                                    &def.label,
+                                    owner,
+                                ),
+                                None => Ok(()),
+                            }
                         })?;
                         self.index_registry.unregister(&name);
                     }
@@ -3285,7 +3321,7 @@ impl Database {
                             reason: e.to_string(),
                         };
                         self.commit_catalog(|txn| {
-                            txn.expect_version(Partition::Schema, &key, definition_version)?;
+                            store.expect_definition_txn(txn, &name, definition_version)?;
                             store.put_definition_txn(txn, &def)
                         })?;
                         self.index_registry.register_published(&self.engine, def)?;
@@ -3347,6 +3383,54 @@ impl Database {
         Ok(rebuilt)
     }
 
+    /// Finish every B-tree index build an earlier process left unfinished: a
+    /// definition still building, whose statement never returned. Each is
+    /// filled from the stored nodes, bound to its record as it stands, and
+    /// published ready, its owning constraint active with it; one the stored
+    /// data refuses is withdrawn with its owning constraint, which the
+    /// interrupted statement never acknowledged, and reported. Returns how
+    /// many builds were finished.
+    ///
+    /// # Errors
+    ///
+    /// Publishing through the log failed (this member is not the leader).
+    pub fn resume_interrupted_index_builds(&self) -> Result<usize, DatabaseError> {
+        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
+        use coordinode_query::index::{IndexState, IndexType};
+        let interrupted: Vec<_> = self
+            .index_registry
+            .all()
+            .into_iter()
+            .filter(|d| {
+                d.index_type == IndexType::BTree
+                    && d.layout == ENTRY_LAYOUT
+                    && matches!(d.state, IndexState::Building { .. })
+            })
+            .collect();
+        let store = LocalIndexStore::new(&self.engine);
+        let mut finished = 0;
+        for def in interrupted {
+            let name = def.name.clone();
+            let version = store.definition_version(&name)?;
+            match self.complete_btree_build(def, version, FailedBuild::Withdraw) {
+                Ok(_) => {
+                    finished += 1;
+                    tracing::info!(index = %name, "finished an interrupted B-tree index build");
+                }
+                Err(DatabaseError::Execution(e @ ExecutionError::UniqueViolation { .. })) => {
+                    tracing::error!(
+                        index = %name,
+                        error = %e,
+                        "the stored data breaks an interrupted index build; the index and the \
+                         constraint that owns it are withdrawn"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(finished)
+    }
+
     /// Reload the index definitions from the schema partition, so a member
     /// that applied another member's CREATE or DROP INDEX maintains and uses
     /// the same indexes. Cluster deployments call this whenever the applied
@@ -3355,31 +3439,6 @@ impl Database {
         self.index_registry
             .load_all(&self.engine)
             .map_err(DatabaseError::Storage)
-    }
-
-    /// Persist an edge type schema to storage.
-    ///
-    /// Idempotent: existing schema for this edge type is replaced.
-    /// Returns the schema revision after persistence.
-    pub fn create_edge_type_schema(
-        &mut self,
-        schema: coordinode_core::schema::definition::EdgeTypeSchema,
-    ) -> Result<u64, DatabaseError> {
-        use coordinode_core::schema::definition::{
-            encode_edge_type_current_revision_key, encode_edge_type_schema_key,
-        };
-
-        let key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
-        let bytes = schema
-            .to_msgpack()
-            .map_err(|e| DatabaseError::Other(format!("serialize edge type schema: {e}")))?;
-        let pointer_key = encode_edge_type_current_revision_key(&schema.name);
-        // Revision and pointer in one proposal, as for a label schema.
-        self.publish_schema(vec![
-            Self::schema_put(key, bytes),
-            Self::schema_put(pointer_key, schema.schema_revision.to_be_bytes().to_vec()),
-        ])?;
-        Ok(schema.schema_revision)
     }
 
     /// Get a reference to the vector index registry.
@@ -3532,11 +3591,13 @@ impl Database {
                 .map_err(|e| e.to_string())
         };
         let build_indexes = || self.build_indexes_over_stored_nodes();
+        let check_constraints = || self.check_constraints_over_stored_nodes();
         let target = crate::backup::restore::RestoreTarget {
             engine: &self.engine,
             fields: self.fields.as_ref(),
             raise_lease: &raise,
             build_indexes: &build_indexes,
+            check_constraints: &check_constraints,
         };
         crate::backup::restore::run(&target, format, source, options)
     }
@@ -3592,6 +3653,68 @@ impl Database {
             self.shard_id,
             &text,
         );
+        Ok(())
+    }
+
+    /// Check every stored node against the presence and type constraints of
+    /// its label, and record the name of every constraint a schema holds:
+    /// the records and schemas a restore writes reach no check on their way
+    /// in. Uniqueness is checked by the index build that runs first.
+    fn check_constraints_over_stored_nodes(&self) -> Result<(), String> {
+        use coordinode_core::schema::definition::{NodeConstraint, encode_constraint_name_key};
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        use coordinode_storage::engine::partition::Partition;
+
+        let labels = LocalSchemaStore::new(&self.engine)
+            .list_labels()
+            .map_err(|e| format!("read the label schemas: {e}"))?;
+        for schema in &labels {
+            for constraint in schema.constraints() {
+                let key = encode_constraint_name_key(&constraint.name);
+                match self
+                    .engine
+                    .get(Partition::Schema, &key)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(holder) if holder.as_ref() == schema.name.as_bytes() => {}
+                    Some(holder) => {
+                        return Err(format!(
+                            "constraint '{}' of :{} is also held by :{}",
+                            constraint.name,
+                            schema.name,
+                            String::from_utf8_lossy(&holder)
+                        ));
+                    }
+                    None => self
+                        .engine
+                        .put(Partition::Schema, &key, schema.name.as_bytes())
+                        .map_err(|e| e.to_string())?,
+                }
+            }
+            if !schema
+                .constraints()
+                .iter()
+                .any(NodeConstraint::checks_each_node)
+            {
+                continue;
+            }
+            let staged = std::collections::HashMap::new();
+            if let Some(violation) =
+                coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
+                    &self.engine,
+                    schema,
+                    &staged,
+                )
+                .map_err(|e| e.to_string())?
+            {
+                return Err(format!(
+                    "node {} of :{} ({})",
+                    violation.node.to_element_id(),
+                    schema.name,
+                    violation.reason
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3656,9 +3779,11 @@ impl Database {
 }
 
 mod after_commit;
+mod catalog;
 mod fields;
 mod id_lease;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
+pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use fields::FieldDictionary;
 
 #[cfg(test)]

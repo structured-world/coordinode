@@ -194,7 +194,7 @@ fn convert_params(
 /// Whatever a caller may branch on also carries a machine-readable reason in
 /// the status details, so branching does not require reading prose either. See
 /// [`crate::services::error_details`].
-fn db_error_to_status(err: DatabaseError) -> Status {
+pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
     use crate::services::error_details::{Reason, status_with_reason};
     use coordinode_query::executor::eval::EvalError;
     use coordinode_query::executor::runner::ExecutionError;
@@ -351,6 +351,32 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 rendered,
                 Reason::KeyImmutable,
                 [("table", table.clone()), ("column", column.clone())],
+            );
+        }
+        DatabaseError::Execution(ExecutionError::CatalogObjectExists { object, name }) => {
+            return crate::services::error_details::catalog_object_status(
+                Code::AlreadyExists,
+                rendered,
+                Reason::CatalogObjectExists,
+                &object.to_string(),
+                name,
+            );
+        }
+        DatabaseError::Execution(ExecutionError::CatalogObjectMissing { object, name }) => {
+            return crate::services::error_details::catalog_object_status(
+                Code::NotFound,
+                rendered,
+                Reason::CatalogObjectNotFound,
+                &object.to_string(),
+                name,
+            );
+        }
+        DatabaseError::Execution(ExecutionError::CatalogRefused(_)) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::CatalogChangeRefused,
+                [],
             );
         }
         // Transaction lifecycle. NOT_FOUND rather than INVALID_ARGUMENT: the

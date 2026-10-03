@@ -208,14 +208,12 @@ fn a_typed_schema_change_is_validated_against_stored_nodes() {
 
 // ── Regression: revision-bump semantics ─────────────────────────────
 
-/// ALTER LABEL ... SET SCHEMA <mode> must bump `schema_revision` (mode change is
-/// a write-path mutation). Adding a property via `Database::
-/// create_label_schema` (or implicit declaration on first node insert) must
-/// NOT bump `schema_revision` (properties mutate the current snapshot in
-/// place). Together these enforce the lexicon decision: revisions track DDL
-/// snapshot identity, not arbitrary field changes.
+/// Every change of a label's definition publishes the next `schema_revision`:
+/// a replacement through `Database::create_label_schema` and each ALTER LABEL
+/// ... SET SCHEMA <mode>. A published revision is never rewritten, so a
+/// writer validated under one is refused once another is in force.
 #[test]
-fn alter_label_mode_bumps_revision_but_property_add_does_not() {
+fn every_definition_change_publishes_the_next_revision() {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType};
 
     let (mut db, _dir) = open_db();
@@ -229,16 +227,16 @@ fn alter_label_mode_bumps_revision_but_property_add_does_not() {
         "fresh label must start at schema_revision=1"
     );
 
-    // Adding another property through a fresh create with the same name is
-    // idempotent and must NOT advance the revision — property mutations are
-    // snapshot edits, not new revisions.
+    // Replacing the definition is a new revision: a writer validated under
+    // the previous one is held to the new definition, never committed beside
+    // it under the same revision.
     let mut schema_v2 = LabelSchema::new_node_id("Doc");
     schema_v2.add_property(PropertyDef::new("title", PropertyType::String));
     schema_v2.add_property(PropertyDef::new("body", PropertyType::String));
     let rev_after_property_add = db.create_label_schema(schema_v2).expect("re-create");
     assert_eq!(
-        rev_after_property_add, 1,
-        "adding a property must NOT bump schema_revision"
+        rev_after_property_add, 2,
+        "replacing the definition publishes the next schema_revision"
     );
 
     // ALTER LABEL SET SCHEMA <mode> mutates write-path semantics → MUST bump.
@@ -247,8 +245,8 @@ fn alter_label_mode_bumps_revision_but_property_add_does_not() {
         .expect("alter mode");
     let version_after_mode = rows[0].get("version");
     assert!(
-        matches!(version_after_mode, Some(Value::Int(v)) if *v >= 2),
-        "ALTER LABEL SET SCHEMA must bump schema_revision to >= 2, got: {version_after_mode:?}"
+        matches!(version_after_mode, Some(Value::Int(3))),
+        "ALTER LABEL SET SCHEMA must bump schema_revision to 3, got: {version_after_mode:?}"
     );
 
     // A subsequent mode change bumps again.
@@ -257,7 +255,7 @@ fn alter_label_mode_bumps_revision_but_property_add_does_not() {
         .expect("alter mode again");
     let version_after_second = rows2[0].get("version");
     assert!(
-        matches!(version_after_second, Some(Value::Int(v)) if *v >= 3),
-        "second ALTER LABEL SET SCHEMA must bump again to >= 3, got: {version_after_second:?}"
+        matches!(version_after_second, Some(Value::Int(4))),
+        "second ALTER LABEL SET SCHEMA must bump again to 4, got: {version_after_second:?}"
     );
 }

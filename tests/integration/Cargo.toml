@@ -28,6 +28,10 @@ path = "tests/cluster.rs"
 name = "cypher"
 path = "tests/cypher.rs"
 
+[[test]]
+name = "schema"
+path = "tests/schema.rs"
+
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"

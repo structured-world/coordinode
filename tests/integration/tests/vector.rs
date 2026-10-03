@@ -14,10 +14,10 @@ use coordinode_integration::harness::CoordinodeProcess;
 use coordinode_integration::proto::common::{
     PropertyValue, Vector, property_value::Value as PvKind,
 };
-use coordinode_integration::proto::graph::{
-    CreateLabelRequest, PropertyDefinition, PropertyType, SchemaMode,
-};
 use coordinode_integration::proto::query::{ExecuteCypherRequest, Row};
+use coordinode_integration::proto::v2::graph::{
+    CreateLabelRequest, PropertyDefinition, PropertyType, SchemaMode, VectorType, property_type,
+};
 use std::collections::HashMap;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -91,12 +91,20 @@ async fn set_updates_hnsw_graph_position() {
         name: "Item".to_string(),
         properties: vec![PropertyDefinition {
             name: "emb".to_string(),
-            r#type: PropertyType::Vector as i32,
+            // No fixed length: the vector index takes its dimensions from
+            // its own definition.
+            r#type: Some(PropertyType {
+                r#type: Some(property_type::Type::Vector(VectorType {
+                    dimensions: 0,
+                    metric: 0,
+                })),
+            }),
             required: false,
-            unique: false,
+            default_value: None,
         }],
         computed_properties: vec![],
         schema_mode: SchemaMode::Flexible as i32,
+        temporal: false,
     })
     .await
     .expect("create_label");
