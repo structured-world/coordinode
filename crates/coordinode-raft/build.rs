@@ -42,7 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // shared pure-Rust transport codec (no C FFI). Both generated client and
         // server use it, so the framing stays symmetric.
         .codec_path("coordinode_wire::ZstdCodec")
-        .compile_protos(&[raft_proto], &[proto_root_str])?;
+        .compile_protos(&[raft_proto], std::slice::from_ref(&proto_root_str))?;
+
+    // The version handshake keeps tonic's plain protobuf codec: the transport
+    // codec above may change between releases, the handshake never does.
+    let handshake_proto = format!("{proto_root_str}/coordinode/internode/handshake.proto");
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&[handshake_proto], &[proto_root_str])?;
 
     Ok(())
 }

@@ -185,6 +185,12 @@ pub enum ExecutionError {
         leader_id: Option<u64>,
     },
 
+    /// The write reached a member that does not run its group's version.
+    /// Nothing was applied; the same write succeeds at the leader named in
+    /// the refusal, when one is known.
+    #[error("this member is read-only: {0}")]
+    Mismatched(coordinode_core::version::Mismatch),
+
     /// An `AS OF TIMESTAMP` older than the MVCC retention horizon. History
     /// that old may already be collected, so the read is refused instead of
     /// answering from whatever survived. The horizon moves with the clock
@@ -18236,6 +18242,7 @@ fn commit_err_to_execution(
         CommitError::Serialization(msg) => ExecutionError::Serialization(msg),
         CommitError::Backpressure => ExecutionError::Backpressure,
         CommitError::NotLeader { leader_id } => ExecutionError::NotLeader { leader_id },
+        CommitError::Mismatched(m) => ExecutionError::Mismatched(m),
         // A caller error, not a transient one: retrying the same statement
         // stages the same deltas and is refused again.
         CommitError::CounterOverflow { key } => ExecutionError::Serialization(format!(

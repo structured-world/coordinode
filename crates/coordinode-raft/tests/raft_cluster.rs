@@ -16,7 +16,7 @@ use coordinode_core::txn::proposal::{
     RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::{RaftNode, RaftNodeError};
+use coordinode_raft::cluster::{NodeOptions, RaftNode, RaftNodeError};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
@@ -1466,12 +1466,15 @@ async fn cluster_background_snapshot_trigger() {
             ..Default::default()
         };
 
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&engine),
             listen_addr,
             format!("http://127.0.0.1:{p1}"),
-            snap_config,
+            NodeOptions {
+                snapshots: snap_config,
+                ..Default::default()
+            },
         )
         .await
         .expect("open leader with short trigger");
@@ -1540,15 +1543,18 @@ async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
             Tier::Warm,
         )]);
         let engine = Arc::new(StorageEngine::open(&config).expect("open"));
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&engine),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
-            SnapshotTriggerConfig {
-                logs_since_last: u64::MAX,
-                log_bytes: 64 * 1024,
-                check_interval: Duration::from_secs(3600),
+            NodeOptions {
+                snapshots: SnapshotTriggerConfig {
+                    logs_since_last: u64::MAX,
+                    log_bytes: 64 * 1024,
+                    check_interval: Duration::from_secs(3600),
+                },
+                ..Default::default()
             },
         )
         .await
@@ -1623,12 +1629,15 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
             log_bytes: 0, // the size criterion is always satisfied
             ..Default::default()
         };
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&engine),
             listen_addr,
             format!("http://127.0.0.1:{p1}"),
-            snap_config,
+            NodeOptions {
+                snapshots: snap_config,
+                ..Default::default()
+            },
         )
         .await
         .expect("open leader");
@@ -1751,12 +1760,15 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
             ..Default::default()
         };
 
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
-            snap_config,
+            NodeOptions {
+                snapshots: snap_config,
+                ..Default::default()
+            },
         )
         .await
         .expect("leader");
@@ -2274,12 +2286,15 @@ async fn cluster_snapshot_multi_chunk_transfer() {
             ..Default::default()
         };
 
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
-            snap_config,
+            NodeOptions {
+                snapshots: snap_config,
+                ..Default::default()
+            },
         )
         .await
         .expect("leader");
@@ -3102,12 +3117,15 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
             log_bytes: u64::MAX,
             ..Default::default()
         };
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
-            snap_config,
+            NodeOptions {
+                snapshots: snap_config,
+                ..Default::default()
+            },
         )
         .await
         .expect("leader");
@@ -4973,14 +4991,17 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
         };
         let dir1 = tempfile::tempdir().expect("d1");
         let e1 = open(&dir1);
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("a"),
             format!("http://127.0.0.1:{p1}"),
-            coordinode_raft::cluster::SnapshotTriggerConfig {
-                check_interval: Duration::from_secs(3600),
-                log_bytes: u64::MAX,
+            NodeOptions {
+                snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
+                    check_interval: Duration::from_secs(3600),
+                    log_bytes: u64::MAX,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

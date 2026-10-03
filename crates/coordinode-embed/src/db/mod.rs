@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use coordinode_core::graph::intern::{FieldInterner, FieldRegistrar};
 use coordinode_core::graph::node::{NodeId, NodeIdAllocator};
 use coordinode_core::graph::types::VectorConsistencyMode;
-use coordinode_core::txn::proposal::ProposalIdGenerator;
+use coordinode_core::txn::proposal::{ProposalIdGenerator, fresh_proposal_id_base};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::{AdvisorContext, DismissedSet, QueryRegistry, SourceContext};
@@ -168,23 +168,6 @@ pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::
 /// behind: past this the applies do not wait, the queue drops, and the
 /// worker rebuilds its indexes from the store.
 const APPLIED_QUEUE_CAPACITY: usize = 16_384;
-
-/// A starting point for this process's proposal ids: random, so it repeats
-/// neither an earlier incarnation's ids (whose log the state machine
-/// re-applies after a restart) nor another member's.
-///
-/// `RandomState` draws its keys from OS entropy once per process and steps
-/// them per instance; hashing the wall clock through it yields a fresh 64-bit
-/// value without another dependency.
-pub fn fresh_proposal_id_base() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    hasher.write_u128(now);
-    hasher.finish()
-}
 
 /// Canonical f32-vector coercion (handles `Value::Vector` and numeric
 /// `Value::Array`). Re-exported so `crate::db::try_extract_vector` callers
@@ -691,6 +674,12 @@ pub enum DatabaseError {
         /// election is in flight.
         leader_id: Option<u64>,
     },
+
+    /// The write reached a member that does not run its group's version: it
+    /// is read-only. Nothing was applied. Names both versions and the leader
+    /// when known.
+    #[error("this member is read-only: {0}")]
+    Mismatched(coordinode_core::version::Mismatch),
 
     /// A snapshot read (`ReadConcern.at_timestamp`) older than the MVCC
     /// retention horizon. History that old may already be collected, so the
@@ -1979,6 +1968,8 @@ impl Database {
             CommitError::Backpressure => DatabaseError::WriteBackpressure,
             // Retryable at a different address: the leader.
             CommitError::NotLeader { leader_id } => DatabaseError::NotLeader { leader_id },
+            // Retryable at the leader, or here once this member is updated.
+            CommitError::Mismatched(m) => DatabaseError::Mismatched(m),
             // Not retryable: the same statement stages the same deltas.
             CommitError::CounterOverflow { key } => DatabaseError::Other(format!(
                 "counter '{key}' would leave the i64 range; nothing was written"

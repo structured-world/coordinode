@@ -20,6 +20,7 @@
 pub mod grpc_server;
 pub mod nemesis;
 pub(crate) mod network;
+pub mod version;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 pub use grpc_server::RaftGrpcHandler;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
+use version::{HandshakeService, VersionGate};
 
 use crate::proto::replication::raft_service_server::RaftServiceServer;
 
@@ -81,6 +83,124 @@ impl SnapshotTriggerConfig {
             ..default_raft_config()
         }
     }
+}
+
+/// How a node is opened beyond its identity, storage and address.
+#[derive(Default)]
+pub struct NodeOptions {
+    /// When the node snapshots its state.
+    pub snapshots: SnapshotTriggerConfig,
+    /// The embedding application's format epoch, half of the version pair
+    /// members are matched on. A server runs zero.
+    pub host_epoch: u64,
+}
+
+/// The consensus group a node's handshake speaks for: one group per node
+/// today.
+const GROUP_ID: u64 = 0;
+
+/// The version gate of member `node_id`, over its state machine's record
+/// of the group's pair.
+fn version_gate(
+    node_id: u64,
+    state_machine: &CoordinodeStateMachine,
+    host_epoch: u64,
+) -> Arc<VersionGate> {
+    Arc::new(VersionGate::new(
+        node_id,
+        GROUP_ID,
+        coordinode_core::version::VersionPair::current(host_epoch),
+        state_machine.subscribe_group_pair(),
+        state_machine.applied_commit_ts_handle(),
+    ))
+}
+
+/// The frozen version exchange of the member `gate` speaks for, to serve
+/// beside its consensus service.
+fn handshake_server(
+    gate: &Arc<VersionGate>,
+) -> crate::proto::internode::version_handshake_server::VersionHandshakeServer<HandshakeService> {
+    crate::proto::internode::version_handshake_server::VersionHandshakeServer::new(
+        HandshakeService::new(Arc::clone(gate)),
+    )
+}
+
+/// Keep the gate's view of the leader current, and while this node leads,
+/// record its pair as the group's when the group does not run it yet: the
+/// first leader at a pair commits it as soon as it leads.
+fn spawn_version_watch(
+    raft: Arc<RaftInstance>,
+    gate: Arc<VersionGate>,
+    oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+) -> tokio::task::JoinHandle<()> {
+    // An engine opened without an oracle stamps writes from a counter; the
+    // record then takes a wall-clock stamp of its own.
+    let oracle =
+        oracle.unwrap_or_else(|| Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()));
+    let ids = coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
+        coordinode_core::txn::proposal::fresh_proposal_id_base(),
+    );
+    tokio::spawn(async move {
+        use openraft::rt::watch::WatchReceiver;
+        let mut metrics = raft.metrics();
+        // The term this node last recorded its pair in, so a refused or
+        // lost attempt is retried once per change, not in a loop.
+        let mut recorded_in: Option<u64> = None;
+        loop {
+            let (leader, leading_term) = {
+                let m = metrics.borrow_watched();
+                let leader = m.current_leader.map(|id| {
+                    let addr = m
+                        .membership_config
+                        .membership()
+                        .get_node(&id)
+                        .map(|n| n.addr.clone())
+                        .unwrap_or_default();
+                    (id, addr)
+                });
+                let leading = m.state.is_leader() && m.vote.is_committed();
+                (leader, leading.then_some(m.vote.leader_id().term))
+            };
+            gate.set_leader(leader);
+            if let Some(term) = leading_term {
+                if recorded_in != Some(term) {
+                    if let Some(pair) = gate.pair_to_record() {
+                        let request = record_pair_request(pair, ids.next(), oracle.next());
+                        match raft.client_write(request).await {
+                            Ok(_) => {
+                                tracing::info!(%pair, term, "recorded the group's version pair");
+                                recorded_in = Some(term);
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, %pair, "recording the group's version pair");
+                            }
+                        }
+                    } else {
+                        recorded_in = Some(term);
+                    }
+                }
+            }
+            if metrics.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// The entry recording `pair` as the group's.
+fn record_pair_request(
+    pair: coordinode_core::version::VersionPair,
+    id: coordinode_core::txn::proposal::ProposalId,
+    at: coordinode_core::txn::timestamp::Timestamp,
+) -> crate::storage::Request {
+    use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
+    crate::storage::Request::single(RaftProposal {
+        id,
+        mutations: vec![Mutation::Command(MetadataCommand::RecordGroupPair { pair })],
+        commit_ts: at,
+        start_ts: at,
+        bypass_rate_limiter: true,
+    })
 }
 
 /// How long opening a node that is its group's only voter waits for it to
@@ -151,6 +271,10 @@ pub struct RaftNode {
     closing: tokio::sync::watch::Sender<bool>,
     /// Snapshot trigger background task abort handle.
     _snapshot_trigger: Option<tokio::task::JoinHandle<()>>,
+    /// This member's version view, shared with its network and handler.
+    version: Arc<VersionGate>,
+    /// Keeps the gate's leader current and records the group's pair.
+    version_watch: tokio::task::JoinHandle<()>,
     /// How long a membership change waits for the previous one to settle,
     /// in ms. See [`Self::set_membership_settle_timeout`].
     membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
@@ -253,22 +377,21 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
     ) -> Result<Self, RaftNodeError> {
-        Self::open_with_oracle_and_snapshot_config(
-            node_id,
-            engine,
-            oracle,
-            SnapshotTriggerConfig::default(),
-        )
-        .await
+        Self::open_with_oracle_and_options(node_id, engine, oracle, NodeOptions::default()).await
     }
 
-    /// Like `open_with_oracle` but with custom snapshot trigger configuration.
-    pub async fn open_with_oracle_and_snapshot_config(
+    /// Like `open_with_oracle`, with the snapshot policy and host epoch of
+    /// `options`.
+    pub async fn open_with_oracle_and_options(
         node_id: u64,
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-        snap_config: SnapshotTriggerConfig,
+        options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
+        let NodeOptions {
+            snapshots: snap_config,
+            host_epoch,
+        } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -280,9 +403,11 @@ impl RaftNode {
         // engine itself stamps writes with (see the cluster constructors
         // for why the state machine must advance it).
         let oracle = oracle.or_else(|| engine.oracle());
-        let state_machine = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle)
-            .map_err(|e| RaftNodeError::Init(e.to_string()))?
-            .with_engine_work(log_store.engine_work());
+        let state_machine =
+            CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle.clone())
+                .map_err(|e| RaftNodeError::Init(e.to_string()))?
+                .with_engine_work(log_store.engine_work());
+        let version = version_gate(node_id, &state_machine, host_epoch);
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -367,6 +492,7 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
+        let version_watch = spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), oracle);
 
         Ok(Self {
             raft,
@@ -383,6 +509,8 @@ impl RaftNode {
             // No peers to call.
             closing: tokio::sync::watch::Sender::new(false),
             _snapshot_trigger: Some(snap_handle),
+            version,
+            version_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -417,26 +545,29 @@ impl RaftNode {
         listen_addr: std::net::SocketAddr,
         advertise_addr: String,
     ) -> Result<Self, RaftNodeError> {
-        Self::open_cluster_with_snapshot_config(
+        Self::open_cluster_with_options(
             node_id,
             engine,
             listen_addr,
             advertise_addr,
-            SnapshotTriggerConfig::default(),
+            NodeOptions::default(),
         )
         .await
     }
 
-    /// Like `open_cluster` but with custom snapshot trigger configuration.
-    ///
-    /// Useful for tests that need a short trigger interval.
-    pub async fn open_cluster_with_snapshot_config(
+    /// Like `open_cluster`, with the snapshot policy and host epoch of
+    /// `options`.
+    pub async fn open_cluster_with_options(
         node_id: u64,
         engine: Arc<StorageEngine>,
         listen_addr: std::net::SocketAddr,
         advertise_addr: String,
-        snap_config: SnapshotTriggerConfig,
+        options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
+        let NodeOptions {
+            snapshots: snap_config,
+            host_epoch,
+        } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -453,6 +584,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
+        let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -461,6 +593,7 @@ impl RaftNode {
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
+            gate: Arc::clone(&version),
         };
 
         let raft: RaftInstance =
@@ -510,12 +643,16 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
         let incoming =
             tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let handler =
-            RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
+        let handler = RaftGrpcHandler::new(
+            Arc::clone(&raft),
+            crate::snapshot::snapshot_dir(&engine),
+            Arc::clone(&version),
+        );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server =
-            tonic::transport::Server::builder().add_service(RaftServiceServer::new(handler));
+        let server = tonic::transport::Server::builder()
+            .add_service(RaftServiceServer::new(handler))
+            .add_service(handshake_server(&version));
 
         let grpc_task = tokio::spawn(async move {
             let graceful = server.serve_with_incoming_shutdown(incoming, async {
@@ -536,6 +673,8 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
+        let version_watch =
+            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
 
         Ok(Self {
             raft,
@@ -551,6 +690,8 @@ impl RaftNode {
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             closing,
             _snapshot_trigger: Some(snap_handle),
+            version,
+            version_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -587,22 +728,27 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         advertise_addr: String,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        Self::open_cluster_embedded_with_snapshot_config(
+        Self::open_cluster_embedded_with_options(
             node_id,
             engine,
             advertise_addr,
-            SnapshotTriggerConfig::default(),
+            NodeOptions::default(),
         )
         .await
     }
 
-    /// Like `open_cluster_embedded` but with custom snapshot trigger configuration.
-    pub async fn open_cluster_embedded_with_snapshot_config(
+    /// Like `open_cluster_embedded`, with the snapshot policy and host epoch
+    /// of `options`.
+    pub async fn open_cluster_embedded_with_options(
         node_id: u64,
         engine: Arc<StorageEngine>,
         advertise_addr: String,
-        snap_config: SnapshotTriggerConfig,
+        options: NodeOptions,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        let NodeOptions {
+            snapshots: snap_config,
+            host_epoch,
+        } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -619,6 +765,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
+        let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -627,6 +774,7 @@ impl RaftNode {
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
+            gate: Arc::clone(&version),
         };
 
         let raft: RaftInstance =
@@ -667,8 +815,11 @@ impl RaftNode {
 
         // Build the gRPC handler — caller registers it into the main tonic router.
         // No internal gRPC server is started here.
-        let handler =
-            RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
+        let handler = RaftGrpcHandler::new(
+            Arc::clone(&raft),
+            crate::snapshot::snapshot_dir(&engine),
+            Arc::clone(&version),
+        );
 
         let snap_handle = spawn_snapshot_trigger(
             Arc::clone(&raft),
@@ -677,6 +828,8 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
+        let version_watch =
+            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
 
         let node = Self {
             raft,
@@ -693,6 +846,8 @@ impl RaftNode {
             grpc_task: std::sync::Mutex::new(None),
             closing,
             _snapshot_trigger: Some(snap_handle),
+            version,
+            version_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -714,20 +869,20 @@ impl RaftNode {
         node_id: u64,
         engine: Arc<StorageEngine>,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
-        Self::open_joining_embedded_with_snapshot_config(
-            node_id,
-            engine,
-            SnapshotTriggerConfig::default(),
-        )
-        .await
+        Self::open_joining_embedded_with_options(node_id, engine, NodeOptions::default()).await
     }
 
-    /// Like `open_joining_embedded` but with custom snapshot trigger configuration.
-    pub async fn open_joining_embedded_with_snapshot_config(
+    /// Like `open_joining_embedded`, with the snapshot policy and host epoch
+    /// of `options`.
+    pub async fn open_joining_embedded_with_options(
         node_id: u64,
         engine: Arc<StorageEngine>,
-        snap_config: SnapshotTriggerConfig,
+        options: NodeOptions,
     ) -> Result<(Self, RaftGrpcHandler), RaftNodeError> {
+        let NodeOptions {
+            snapshots: snap_config,
+            host_epoch,
+        } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -745,6 +900,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
         refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
+        let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -753,6 +909,7 @@ impl RaftNode {
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
+            gate: Arc::clone(&version),
         };
 
         let raft: RaftInstance =
@@ -765,8 +922,11 @@ impl RaftNode {
         let raft = Arc::new(raft);
 
         // Build the gRPC handler — caller registers it into the main tonic router.
-        let handler =
-            RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
+        let handler = RaftGrpcHandler::new(
+            Arc::clone(&raft),
+            crate::snapshot::snapshot_dir(&engine),
+            Arc::clone(&version),
+        );
 
         let snap_handle = spawn_snapshot_trigger(
             Arc::clone(&raft),
@@ -775,6 +935,8 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
+        let version_watch =
+            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
 
         tracing::info!(
             node_id,
@@ -796,6 +958,8 @@ impl RaftNode {
             grpc_task: std::sync::Mutex::new(None),
             closing,
             _snapshot_trigger: Some(snap_handle),
+            version,
+            version_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -817,22 +981,21 @@ impl RaftNode {
         engine: Arc<StorageEngine>,
         listen_addr: std::net::SocketAddr,
     ) -> Result<Self, RaftNodeError> {
-        Self::open_joining_with_snapshot_config(
-            node_id,
-            engine,
-            listen_addr,
-            SnapshotTriggerConfig::default(),
-        )
-        .await
+        Self::open_joining_with_options(node_id, engine, listen_addr, NodeOptions::default()).await
     }
 
-    /// Like `open_joining` but with custom snapshot trigger configuration.
-    pub async fn open_joining_with_snapshot_config(
+    /// Like `open_joining`, with the snapshot policy and host epoch of
+    /// `options`.
+    pub async fn open_joining_with_options(
         node_id: u64,
         engine: Arc<StorageEngine>,
         listen_addr: std::net::SocketAddr,
-        snap_config: SnapshotTriggerConfig,
+        options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
+        let NodeOptions {
+            snapshots: snap_config,
+            host_epoch,
+        } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
             LogStore::open(Arc::clone(&engine)).map_err(|e| RaftNodeError::Init(e.to_string()))?;
@@ -850,6 +1013,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
         refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
+        let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -858,6 +1022,7 @@ impl RaftNode {
         let network = GrpcNetworkFactory {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
+            gate: Arc::clone(&version),
         };
 
         let raft: RaftInstance =
@@ -878,12 +1043,16 @@ impl RaftNode {
             .map_err(|e| RaftNodeError::Init(format!("bind {listen_addr}: {e}")))?;
         let incoming =
             tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let handler =
-            RaftGrpcHandler::new(Arc::clone(&raft), crate::snapshot::snapshot_dir(&engine));
+        let handler = RaftGrpcHandler::new(
+            Arc::clone(&raft),
+            crate::snapshot::snapshot_dir(&engine),
+            Arc::clone(&version),
+        );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server =
-            tonic::transport::Server::builder().add_service(RaftServiceServer::new(handler));
+        let server = tonic::transport::Server::builder()
+            .add_service(RaftServiceServer::new(handler))
+            .add_service(handshake_server(&version));
 
         let grpc_task = tokio::spawn(async move {
             let graceful = server.serve_with_incoming_shutdown(incoming, async {
@@ -903,6 +1072,8 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
+        let version_watch =
+            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
 
         Ok(Self {
             raft,
@@ -918,6 +1089,8 @@ impl RaftNode {
             grpc_task: std::sync::Mutex::new(Some(grpc_task)),
             closing,
             _snapshot_trigger: Some(snap_handle),
+            version,
+            version_watch,
             membership_settle_timeout_ms: core::sync::atomic::AtomicU64::new(
                 DEFAULT_MEMBERSHIP_SETTLE_TIMEOUT_MS,
             ),
@@ -1272,6 +1445,22 @@ impl RaftNode {
             Arc::clone(&self.raft),
             Arc::clone(&self.append_notifier),
         )
+        .with_version_gate(Arc::clone(&self.version))
+    }
+
+    /// This member's version view: its pair, its group's, and whether it
+    /// serves writes.
+    pub fn version(&self) -> &Arc<VersionGate> {
+        &self.version
+    }
+
+    /// The frozen version exchange, for a caller that serves this node's
+    /// [`RaftGrpcHandler`] on its own router: register both.
+    pub fn handshake_service(
+        &self,
+    ) -> crate::proto::internode::version_handshake_server::VersionHandshakeServer<HandshakeService>
+    {
+        handshake_server(&self.version)
     }
 
     /// The log store's local-append notifier, so a pipeline built elsewhere
@@ -1802,6 +1991,7 @@ impl RaftNode {
     /// gracefully, handing leadership over if it leads; a node alone just
     /// stops.
     pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
+        self.version_watch.abort();
         let has_peers = self.has_voter_peers();
 
         let result = if has_peers {

@@ -5,6 +5,7 @@ pub mod columnar;
 pub mod compress;
 pub mod engine;
 pub mod error;
+pub mod format;
 pub mod oplog;
 pub mod placement;
 pub mod scrub;

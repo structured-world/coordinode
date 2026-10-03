@@ -42,7 +42,7 @@ use openraft::{OptionalSend, RaftLogReader, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 
 use coordinode_core::txn::frame::{DecodeLimits, decode_proposal, encode_proposal};
-use coordinode_core::txn::proposal::{Mutation, RaftProposal};
+use coordinode_core::txn::proposal::{MetadataCommand, Mutation, RaftProposal};
 use coordinode_storage::engine::core::{
     RaftApplyFence, RaftApplyState, RaftCoverage, StorageEngine,
 };
@@ -961,6 +961,10 @@ struct DedupEntry {
     seen: Instant,
 }
 
+/// The version pairs a group recorded, oldest first. A handful over the life
+/// of a group: one per version move.
+pub type GroupPairs = Arc<[coordinode_core::version::RecordedPair]>;
+
 /// Storage-backed Raft state machine.
 ///
 /// Applies committed Raft entries (mutations) to the database via StorageEngine.
@@ -1000,6 +1004,13 @@ pub struct CoordinodeStateMachine {
     applied_tx: tokio::sync::watch::Sender<u64>,
     /// Receiver side kept to prevent channel closure.
     applied_rx: tokio::sync::watch::Receiver<u64>,
+    /// Every version pair the group recorded in its applied state, oldest
+    /// first, republished whenever an applied entry or an installed snapshot
+    /// moves it.
+    group_pair_tx: tokio::sync::watch::Sender<GroupPairs>,
+    /// The highest commit timestamp applied here: what a member that stops
+    /// receiving entries serves its reads as of.
+    applied_commit_ts: Arc<core::sync::atomic::AtomicU64>,
     /// Per-shard `maxAssigned` watermark over HLC commit_ts.
     /// Distinct from `applied_tx` (Raft log index). Advanced after every
     /// successful proposal apply so snapshot readers can `WaitForTs(T)`
@@ -1263,6 +1274,12 @@ impl CoordinodeStateMachine {
         });
         engine.register_raft_fence(Arc::clone(&gate) as Arc<dyn RaftApplyFence>);
         let engine_work = EngineWork::default();
+        let group_pairs = coordinode_storage::engine::metadata::group_pair_records(&engine)
+            .map_err(|e| io::Error::other(format!("read the group's version pairs: {e}")))?;
+        let (group_pair_tx, _) = tokio::sync::watch::channel(Arc::from(group_pairs));
+        // Until an entry applies, what the store holds is as of the clock it
+        // reopened at.
+        let reopened_at = engine.oracle().map_or(0, |o| o.current().as_raw());
 
         Ok(Self {
             engine,
@@ -1273,6 +1290,8 @@ impl CoordinodeStateMachine {
             last_dedup_gc: Mutex::new(Instant::now()),
             applied_tx,
             applied_rx,
+            group_pair_tx,
+            applied_commit_ts: Arc::new(core::sync::atomic::AtomicU64::new(reopened_at)),
             max_assigned,
             snapshot_builds: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             replay_skip,
@@ -1334,6 +1353,30 @@ impl CoordinodeStateMachine {
     /// Get the current applied log index (non-blocking).
     pub fn applied_index(&self) -> u64 {
         *self.applied_rx.borrow()
+    }
+
+    /// Subscribe to the version pairs the group recorded, as applied here.
+    pub fn subscribe_group_pair(&self) -> tokio::sync::watch::Receiver<GroupPairs> {
+        self.group_pair_tx.subscribe()
+    }
+
+    /// Handle to the highest commit timestamp applied here.
+    pub fn applied_commit_ts_handle(&self) -> Arc<core::sync::atomic::AtomicU64> {
+        Arc::clone(&self.applied_commit_ts)
+    }
+
+    /// Reread the group's recorded pair after the applied state moved it.
+    fn refresh_group_pair(&self) -> Result<(), io::Error> {
+        let pairs = coordinode_storage::engine::metadata::group_pair_records(&self.engine)
+            .map_err(|e| io::Error::other(format!("read the group's version pairs: {e}")))?;
+        self.group_pair_tx.send_if_modified(|current| {
+            let moved = **current != *pairs;
+            if moved {
+                *current = Arc::from(pairs);
+            }
+            moved
+        });
+        Ok(())
     }
 
     fn load_log_id(
@@ -1605,12 +1648,26 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
             let response = match &entry.payload {
                 openraft::entry::EntryPayload::Normal(request) => {
                     let mut total = 0;
+                    let mut records_pair = false;
                     for (sub, proposal) in request.proposals.iter().enumerate() {
                         let sub = u32::try_from(sub).map_err(|_| {
                             io::Error::other(format!("entry {index} carries over 2^32 proposals"))
                         })?;
                         let r = self.apply_proposal_under(proposal, index, sub, &gate.applies)?;
                         total += r.mutations_applied;
+                        self.applied_commit_ts.fetch_max(
+                            proposal.commit_ts.as_raw(),
+                            core::sync::atomic::Ordering::Release,
+                        );
+                        records_pair |= proposal.mutations.iter().any(|m| {
+                            matches!(
+                                m,
+                                Mutation::Command(MetadataCommand::RecordGroupPair { .. })
+                            )
+                        });
+                    }
+                    if records_pair {
+                        self.refresh_group_pair()?;
                     }
                     Response {
                         mutations_applied: total,
@@ -1763,6 +1820,7 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         self.folded = next;
         gate.applies.reset(next);
         gate.last = meta.last_log_id;
+        self.refresh_group_pair()?;
 
         *self
             .last_applied

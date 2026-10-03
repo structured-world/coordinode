@@ -616,6 +616,12 @@ pub(crate) async fn serve(
             std::time::Duration::from_secs(n.get())
         }),
     };
+    // A server is not embedded in an application with a format of its own:
+    // its host epoch is zero.
+    let options = coordinode_raft::cluster::NodeOptions {
+        snapshots,
+        host_epoch: 0,
+    };
     let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
         let peer_count = peers_list.len();
         if node_id == 1 {
@@ -624,11 +630,11 @@ pub(crate) async fn serve(
                 node_id, "cluster mode: bootstrap leader (open_cluster_embedded)"
             );
             let (rn, handler) =
-                coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_snapshot_config(
+                coordinode_raft::cluster::RaftNode::open_cluster_embedded_with_options(
                     node_id,
                     Arc::clone(&engine),
                     effective_advertise,
-                    snapshots,
+                    options,
                 )
                 .await
                 .map_err(|e| format!("failed to open cluster Raft node: {e}"))?;
@@ -639,10 +645,10 @@ pub(crate) async fn serve(
                 node_id, "cluster mode: joining node (open_joining_embedded)"
             );
             let (rn, handler) =
-                coordinode_raft::cluster::RaftNode::open_joining_embedded_with_snapshot_config(
+                coordinode_raft::cluster::RaftNode::open_joining_embedded_with_options(
                     node_id,
                     Arc::clone(&engine),
-                    snapshots,
+                    options,
                 )
                 .await
                 .map_err(|e| format!("failed to open joining Raft node: {e}"))?;
@@ -650,11 +656,11 @@ pub(crate) async fn serve(
         }
     } else {
         info!(node_id, "standalone mode: single-node Raft (StubNetwork)");
-        let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_snapshot_config(
+        let rn = coordinode_raft::cluster::RaftNode::open_with_oracle_and_options(
             node_id,
             Arc::clone(&engine),
             Some(Arc::clone(&oracle)),
-            snapshots,
+            options,
         )
         .await
         .map_err(|e| format!("failed to open Raft node: {e}"))?;
@@ -1418,6 +1424,8 @@ pub(crate) async fn serve(
     if let Some(handler) = raft_grpc_handler {
         use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
         routes.add_service(RaftServiceServer::new(handler));
+        // The frozen exchange a member of another version is answered with.
+        routes.add_service(raft_node.handshake_service());
         info!(node_id, "RaftService registered on :7080 (shared port)");
 
         // SegmentTransferService: receive bulk segment pushes (replication

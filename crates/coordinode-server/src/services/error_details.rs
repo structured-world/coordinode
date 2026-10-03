@@ -95,6 +95,13 @@ pub enum Reason {
     /// Metadata carries `leader_id` when the cluster has named one, so the
     /// caller can retry at the right node instead of guessing.
     NotLeader,
+    /// The write reached a member that does not run the version its group
+    /// runs, so it is read-only. Nothing was applied. Metadata carries
+    /// `member_engine_format`, `member_host_epoch`, `group_engine_format`,
+    /// `group_host_epoch`, `behind` (whether the group moved past this
+    /// member), `as_of_ts` (what its reads are as of), and `leader_id` and
+    /// `leader_addr` when known, so the caller retries at the leader.
+    MemberReadOnly,
     /// A time-travel read (`AS OF TIMESTAMP`, `ReadConcern.at_timestamp`)
     /// older than the MVCC retention horizon; that history may be collected.
     /// Metadata carries `oldest_readable_ts`, the earliest timestamp the same
@@ -177,6 +184,7 @@ impl Reason {
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::NotLeader => "NOT_LEADER",
+            Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
             Reason::IndexNotHistorical => "INDEX_NOT_HISTORICAL",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
@@ -211,6 +219,8 @@ impl Reason {
     /// else. When the metadata names a leader the retry is a redirect; when
     /// an election is still in flight it is a short poll, and the client's own
     /// backoff governs how often, which is why the floor here stays zero.
+    /// A read-only member answers the same way: the write belongs at the
+    /// leader its metadata names.
     ///
     /// A version mismatch deliberately advises nothing. The caller named a
     /// version, so what happens next is its decision and not a delay: it may
@@ -219,9 +229,10 @@ impl Reason {
     /// just disproved.
     pub const fn retry_delay(self) -> Option<std::time::Duration> {
         match self {
-            Reason::TransactionConflict | Reason::InvariantRefused | Reason::NotLeader => {
-                Some(std::time::Duration::ZERO)
-            }
+            Reason::TransactionConflict
+            | Reason::InvariantRefused
+            | Reason::NotLeader
+            | Reason::MemberReadOnly => Some(std::time::Duration::ZERO),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
             _ => None,
         }

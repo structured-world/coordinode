@@ -22,6 +22,10 @@ use coordinode_core::graph::node::{
     node_lease_key,
 };
 use coordinode_core::txn::proposal::{MetadataCommand, Mutation, PartitionId};
+use coordinode_core::version::{
+    GROUP_PAIR_KEY_PREFIX, RecordedPair, VersionPair, decode_group_pair_key, decode_pair,
+    encode_pair, group_pair_key,
+};
 use lsm_tree::Guard as _;
 
 use crate::engine::core::StorageEngine;
@@ -42,7 +46,56 @@ pub(crate) fn decide(
             ceiling,
             token,
         } => decide_lease(engine, *base, *ceiling, token),
+        MetadataCommand::RecordGroupPair { pair } => decide_group_pair(engine, *pair),
     }
+}
+
+/// A new record only when the pair changes: a leader re-elected at the pair
+/// the group already runs records nothing.
+fn decide_group_pair(engine: &StorageEngine, pair: VersionPair) -> StorageResult<Vec<Mutation>> {
+    let last = recorded_group_pair(engine)?;
+    if last.is_some_and(|r| r.pair == pair) {
+        return Ok(Vec::new());
+    }
+    let seq = last.map_or(1, |r| r.seq + 1);
+    Ok(vec![schema_put(group_pair_key(seq), encode_pair(pair))])
+}
+
+/// Every pair the group recorded, oldest first.
+///
+/// # Errors
+///
+/// A record's key or value does not decode.
+pub fn group_pair_records(engine: &StorageEngine) -> StorageResult<Vec<RecordedPair>> {
+    let malformed = || StorageError::Serialization("a group pair record does not decode".into());
+    let mut records = Vec::new();
+    for guard in engine.prefix_scan(Partition::Schema, GROUP_PAIR_KEY_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        records.push(RecordedPair {
+            seq: decode_group_pair_key(&key).ok_or_else(malformed)?,
+            pair: decode_pair(&value).ok_or_else(malformed)?,
+        });
+    }
+    Ok(records)
+}
+
+/// The last pair the group recorded, `None` before its first record.
+///
+/// # Errors
+///
+/// The last record's key or value does not decode.
+pub fn recorded_group_pair(engine: &StorageEngine) -> StorageResult<Option<RecordedPair>> {
+    let Some(guard) = engine
+        .prefix_scan_rev(Partition::Schema, GROUP_PAIR_KEY_PREFIX)?
+        .next()
+    else {
+        return Ok(None);
+    };
+    let (key, value) = guard.into_inner()?;
+    let malformed = || StorageError::Serialization("a group pair record does not decode".into());
+    let seq = decode_group_pair_key(&key).ok_or_else(malformed)?;
+    let pair = decode_pair(&value).ok_or_else(malformed)?;
+    Ok(Some(RecordedPair { pair, seq }))
 }
 
 fn schema_put(key: Vec<u8>, value: Vec<u8>) -> Mutation {

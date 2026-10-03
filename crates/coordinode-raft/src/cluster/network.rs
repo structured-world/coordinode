@@ -16,6 +16,13 @@ use openraft::raft::StreamAppendResult;
 use openraft::raft::TransferLeaderError;
 use openraft::{OptionalSend, RaftNetworkFactory};
 
+use std::sync::Arc;
+
+use coordinode_core::version::Handshake;
+
+use super::version::{VersionGate, read_handshake, write_handshake};
+use crate::proto::internode::HandshakeRecord;
+use crate::proto::internode::version_handshake_client::VersionHandshakeClient;
 use crate::proto::replication::RaftPayload;
 use crate::proto::replication::raft_service_client::RaftServiceClient;
 use crate::storage::TypeConfig;
@@ -47,6 +54,28 @@ fn tonic_to_rpc_error(status: tonic::Status) -> RPCError<C> {
         std::io::ErrorKind::ConnectionAborted,
         format!("gRPC error: {status}"),
     )))
+}
+
+// ── Version records ────────────────────────────────────────────────
+
+/// A call carrying this member's version record.
+fn stamped<T>(gate: &VersionGate, body: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(body);
+    write_handshake(request.metadata_mut(), &gate.local_handshake());
+    request
+}
+
+/// Learn the peer's version record from an answer's metadata.
+fn learn(gate: &VersionGate, metadata: &tonic::metadata::MetadataMap) {
+    if let Ok(peer) = read_handshake(metadata) {
+        gate.observe(&peer);
+    }
+}
+
+/// [`tonic_to_rpc_error`], learning the peer's record from a refusal first.
+fn refused(gate: &VersionGate, status: tonic::Status) -> RPCError<C> {
+    learn(gate, status.metadata());
+    tonic_to_rpc_error(status)
 }
 
 // ── Shutdown ───────────────────────────────────────────────────────
@@ -104,6 +133,9 @@ pub struct GrpcNetworkFactory {
     pub(crate) local_node_id: u64,
     /// Fails every peer call once this node shuts down.
     pub(crate) closing: Closing,
+    /// This member's version view: stamps every call, learns from every
+    /// answer.
+    pub(crate) gate: Arc<VersionGate>,
 }
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
@@ -118,8 +150,10 @@ impl RaftNetworkFactory<C> for GrpcNetworkFactory {
             local_node_id: self.local_node_id,
             target_node_id: target,
             addr: node.addr.clone(),
+            channel: None,
             client: None,
             closing: self.closing.clone(),
+            gate: Arc::clone(&self.gate),
         }
     }
 }
@@ -148,9 +182,13 @@ pub struct GrpcNetwork {
     /// Target peer node id, for the test-only partition nemesis gate.
     target_node_id: u64,
     addr: String,
+    /// The one channel to the peer, shared by the consensus client and the
+    /// version exchange.
+    channel: Option<tonic::transport::Channel>,
     client: Option<RaftServiceClient<tonic::transport::Channel>>,
     /// Fails this peer's calls once this node shuts down.
     closing: Closing,
+    gate: Arc<VersionGate>,
 }
 
 impl GrpcNetwork {
@@ -188,7 +226,55 @@ impl GrpcNetwork {
     async fn get_client(
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {
+        self.ensure_peer_matches().await?;
         if self.client.is_none() {
+            let channel = self.get_channel()?;
+            self.client = Some(RaftServiceClient::new(channel));
+        }
+
+        // Safe: we just set client above if it was None
+        self.client.as_mut().ok_or_else(|| {
+            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                "client initialization failed",
+            )))
+        })
+    }
+
+    /// A peer last seen at another pair is sent the version exchange alone:
+    /// nothing of the consensus goes to it until it reports this member's
+    /// pair.
+    async fn ensure_peer_matches(&mut self) -> Result<(), RPCError<C>> {
+        if self.gate.peer_matches(self.target_node_id) != Some(false) {
+            return Ok(());
+        }
+        let channel = self.get_channel()?;
+        let mut exchange = VersionHandshakeClient::new(channel);
+        let answer = exchange
+            .exchange(HandshakeRecord {
+                record: self.gate.local_handshake().encode(),
+            })
+            .await
+            .map_err(tonic_to_rpc_error)?;
+        if let Ok(peer) = Handshake::decode(&answer.into_inner().record) {
+            self.gate.observe(&peer);
+        }
+        if self.gate.peer_matches(self.target_node_id) == Some(true) {
+            return Ok(());
+        }
+        Err(RPCError::Unreachable(Unreachable::new(
+            &std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "node {} runs another version than {}",
+                    self.target_node_id,
+                    self.gate.pair()
+                ),
+            ),
+        )))
+    }
+
+    fn get_channel(&mut self) -> Result<tonic::transport::Channel, RPCError<C>> {
+        if self.channel.is_none() {
             let endpoint = coordinode_wire::peer_endpoint(&self.addr)
                 .map_err(|e| {
                     RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
@@ -204,15 +290,12 @@ impl GrpcNetwork {
             // RPC and automatically reconnect if the connection drops.
             // This replaces the previous connect().await which created a
             // one-shot connection that couldn't recover from network drops.
-            let channel = endpoint.connect_lazy();
-
-            self.client = Some(RaftServiceClient::new(channel));
+            self.channel = Some(endpoint.connect_lazy());
         }
-
-        // Safe: we just set client above if it was None
-        self.client.as_mut().ok_or_else(|| {
+        // A channel is a cheap handle onto the one connection.
+        self.channel.clone().ok_or_else(|| {
             RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                "client initialization failed",
+                "channel initialization failed",
             )))
         })
     }
@@ -236,12 +319,17 @@ impl NetVote<C> for GrpcNetwork {
             return Err(e);
         }
         let closing = self.closing.clone();
+        let gate = Arc::clone(&self.gate);
         unless_closing(&closing, async {
+            let request = stamped(
+                &gate,
+                RaftPayload {
+                    data: serialize(&rpc)?,
+                },
+            );
             let client = self.get_client().await?;
-            let payload = RaftPayload {
-                data: serialize(&rpc)?,
-            };
-            let response = client.vote(payload).await.map_err(tonic_to_rpc_error)?;
+            let response = client.vote(request).await.map_err(|s| refused(&gate, s))?;
+            learn(&gate, response.metadata());
             deserialize(&response.into_inner().data)
         })
         .await
@@ -266,6 +354,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
         let partition = self.partitioned();
         let (local, target) = (self.local_node_id, self.target_node_id);
         let closing = self.closing.clone();
+        let gate = Arc::clone(&self.gate);
         Box::pin(async move {
             if let Some(e) = partition {
                 return Err(e);
@@ -287,11 +376,12 @@ impl NetStreamAppend<C> for GrpcNetwork {
             // Call bidi streaming RPC
             let response = unless_closing(&closing, async {
                 client
-                    .stream_append(request_stream)
+                    .stream_append(stamped(&gate, request_stream))
                     .await
-                    .map_err(tonic_to_rpc_error)
+                    .map_err(|s| refused(&gate, s))
             })
             .await?;
+            learn(&gate, response.metadata());
 
             // Map response stream: RaftPayload → deserialize → StreamAppendResult.
             // A reply across a blocked link is lost, as it would be on the wire.
@@ -349,6 +439,7 @@ impl NetSnapshot<C> for GrpcNetwork {
         }
         let target_addr = self.addr.clone();
         let closing = self.closing.clone();
+        let gate = Arc::clone(&self.gate);
         let client = self.get_client().await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e.to_string());
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
@@ -427,11 +518,12 @@ impl NetSnapshot<C> for GrpcNetwork {
         // If replication is cancelled (leader steps down, follower removed),
         // abort the transfer immediately instead of blocking on send.
         let cancel_boxed = Box::pin(cancel);
-        let grpc_fut = client.snapshot(request_stream);
+        let grpc_fut = client.snapshot(stamped(&gate, request_stream));
 
         let response = tokio::select! {
             result = grpc_fut => {
                 result.map_err(|status| {
+                    learn(&gate, status.metadata());
                     openraft::error::StreamingError::Unreachable(Unreachable::new(
                         &std::io::Error::new(
                             std::io::ErrorKind::ConnectionAborted,
@@ -454,6 +546,7 @@ impl NetSnapshot<C> for GrpcNetwork {
             }
         };
 
+        learn(&gate, response.metadata());
         let resp_data = response.into_inner().data;
         let snap_response: openraft::raft::SnapshotResponse<C> = rmp_serde::from_slice(&resp_data)
             .map_err(|e| {
@@ -480,18 +573,23 @@ impl NetTransferLeader<C> for GrpcNetwork {
             return Err(e);
         }
         let closing = self.closing.clone();
+        let gate = Arc::clone(&self.gate);
         unless_closing(&closing, async {
+            let request = stamped(
+                &gate,
+                RaftPayload {
+                    data: serialize(&req)?,
+                },
+            );
             let client = self.get_client().await?;
-            let payload = RaftPayload {
-                data: serialize(&req)?,
-            };
             // The server maps any application-level transfer error to a gRPC
             // Status (→ outer RPCError below); a successful RPC means the
             // remote accepted the transfer, so the inner result is Ok.
-            client
-                .transfer_leader(payload)
+            let response = client
+                .transfer_leader(request)
                 .await
-                .map_err(tonic_to_rpc_error)?;
+                .map_err(|s| refused(&gate, s))?;
+            learn(&gate, response.metadata());
             Ok(Ok(()))
         })
         .await

@@ -115,6 +115,11 @@ pub enum CommitError {
         /// The node the cluster last named leader, if any.
         leader_id: Option<u64>,
     },
+    /// This member does not run the version its group runs, so it takes no
+    /// writes. Nothing was applied. Kept structured so every layer above can
+    /// name both versions and the leader to retry at.
+    #[error("this member is read-only: {0}")]
+    Mismatched(coordinode_core::version::Mismatch),
     /// The deltas staged for one counter sum to a value outside `i64`.
     /// Nothing was applied. A counter operand carries no base, so a sum that
     /// cannot exist is only discoverable where it is assembled; refusing it
@@ -202,6 +207,7 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
         // Kept structured all the way up: the caller's response is to retry at
         // the leader, and it needs the id to do that.
         ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },
+        ProposalError::Mismatched(m) => CommitError::Mismatched(m),
         other => CommitError::Serialization(format!("proposal pipeline error: {other}")),
     }
 }

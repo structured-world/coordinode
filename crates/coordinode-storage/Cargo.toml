@@ -14,6 +14,9 @@ lz4 = ["lsm-tree/lz4", "dep:lz4_flex"]
 # with it unless the configuration says otherwise.
 zstd = ["lsm-tree/zstd"]
 encryption = ["lsm-tree/encryption"]
+# A test build that can run one engine format above its own, with a step
+# that migrates its directories to it. Never in a shipped build.
+test-format-bump = ["coordinode-core/test-format-bump"]
 # Native columnar SST block type for the relational TABLE modality
 # (STORAGE COLUMNAR). Enables the lsm-tree columnar batch ingest + projected
 # scan API. A CE capability, on by default; `--no-default-features` drops it.

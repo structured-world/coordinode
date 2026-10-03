@@ -11,4 +11,8 @@ pub mod proto {
     pub mod replication {
         tonic::include_proto!("coordinode.v1.replication");
     }
+    /// The frozen version handshake between members.
+    pub mod internode {
+        tonic::include_proto!("coordinode.internode");
+    }
 }

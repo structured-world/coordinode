@@ -310,6 +310,9 @@ pub struct RaftProposalPipeline {
     /// cannot be told apart from a majority and are served as one (a stronger
     /// wait, never a weaker one).
     append_notifier: Option<Arc<AppendNotifier>>,
+    /// Refuses every write while this member does not run its group's
+    /// version.
+    version: Option<Arc<crate::cluster::version::VersionGate>>,
 }
 
 impl RaftProposalPipeline {
@@ -320,6 +323,26 @@ impl RaftProposalPipeline {
             rate_limiter: RateLimiter::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
             append_notifier: None,
+            version: None,
+        }
+    }
+
+    /// Refuse writes whenever `gate` says this member does not run its
+    /// group's version.
+    pub fn with_version_gate(mut self, gate: Arc<crate::cluster::version::VersionGate>) -> Self {
+        self.version = Some(gate);
+        self
+    }
+
+    /// The refusal of a member that does not run its group's version.
+    fn check_version(&self) -> Result<(), ProposalError> {
+        use crate::cluster::version::MemberState;
+        match self.version.as_ref().map(|g| g.state()) {
+            Some(MemberState::Mismatched(m)) => {
+                metrics::counter!("coordinode_version_refused_writes_total").increment(1);
+                Err(ProposalError::Mismatched(m))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -339,6 +362,7 @@ impl RaftProposalPipeline {
             rate_limiter: RateLimiter::new(max_pending),
             runtime: tokio::runtime::Handle::try_current().ok(),
             append_notifier: None,
+            version: None,
         }
     }
 
@@ -382,6 +406,7 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
+        self.check_version()?;
         {
             use openraft::rt::watch::WatchReceiver;
             let rx = self.raft.metrics();
@@ -423,6 +448,7 @@ impl RaftProposalPipeline {
         use openraft::rt::watch::WatchReceiver;
 
         check_proposal(proposal)?;
+        self.check_version()?;
         let mut metrics_rx = self.raft.metrics();
         let (members, majority) = {
             let m = metrics_rx.borrow_watched();
@@ -540,6 +566,7 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
+        self.check_version()?;
         let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 

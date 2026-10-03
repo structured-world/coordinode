@@ -330,12 +330,15 @@ async fn a_stopped_node_leaves_its_directory_free_while_the_trigger_probes() {
     let id_gen = ProposalIdGenerator::new();
     for round in 0..8u64 {
         let engine = open_engine(dir.path());
-        let node = RaftNode::open_with_oracle_and_snapshot_config(
+        let node = RaftNode::open_with_oracle_and_options(
             1,
             Arc::clone(&engine),
             None,
-            coordinode_raft::cluster::SnapshotTriggerConfig {
-                check_interval: Duration::from_millis(1),
+            coordinode_raft::cluster::NodeOptions {
+                snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
+                    check_interval: Duration::from_millis(1),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

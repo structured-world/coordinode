@@ -27,6 +27,11 @@ rustc-hash = { workspace = true }
 # that drive the watermark (raft, query) provide their own runtime.
 tokio = { workspace = true, features = ["sync", "time"] }
 
+[features]
+# Lets COORDINODE_TEST_ENGINE_FORMAT_BUMP raise the engine format version,
+# so a test suite runs two versions side by side. Never in a shipped build.
+test-format-bump = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }

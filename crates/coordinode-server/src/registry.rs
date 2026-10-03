@@ -147,7 +147,7 @@ pub(crate) fn build_consumer_registry(
         engine,
         pipeline,
         Arc::new(ProposalIdGenerator::with_base(
-            coordinode_embed::db::fresh_proposal_id_base(),
+            coordinode_core::txn::proposal::fresh_proposal_id_base(),
         )),
         Arc::new(SystemClock),
         source,

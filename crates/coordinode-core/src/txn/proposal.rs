@@ -102,6 +102,24 @@ impl Default for ProposalIdGenerator {
     }
 }
 
+/// A starting point for this process's proposal ids: random, so it repeats
+/// neither an earlier incarnation's ids (whose log the state machine
+/// re-applies after a restart) nor another member's.
+///
+/// `RandomState` draws its keys from OS entropy once per process and steps
+/// them per instance; hashing the wall clock through it yields a fresh 64-bit
+/// value without another dependency.
+pub fn fresh_proposal_id_base() -> u64 {
+    // no-std: a caller-provided entropy source.
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    hasher.write_u128(now);
+    hasher.finish()
+}
+
 /// A single mutation within a proposal.
 ///
 /// Represents a versioned put or delete on a specific partition and key.
@@ -241,6 +259,12 @@ pub enum MetadataCommand {
         /// Identifies the grant, so the proposer can tell it won.
         token: [u8; crate::graph::node::NODE_LEASE_TOKEN_LEN],
     },
+    /// Record that the group runs `pair` from here on, unless the last
+    /// record already says so. Proposed by the first leader at a pair.
+    RecordGroupPair {
+        /// The pair the leader runs.
+        pair: crate::version::VersionPair,
+    },
 }
 
 impl MetadataCommand {
@@ -250,6 +274,7 @@ impl MetadataCommand {
             Self::RegisterFields { names } => names.iter().map(|n| n.len() + 2).sum(),
             Self::AdoptFields { bindings } => bindings.iter().map(|(n, _)| n.len() + 6).sum(),
             Self::GrantNodeLease { token, .. } => 16 + token.len(),
+            Self::RecordGroupPair { .. } => 12,
         }
     }
 }
@@ -497,6 +522,11 @@ pub enum ProposalError {
     /// internal retry attempts were exhausted (Raft-level timeout).
     #[error("write concern timeout: {timeout_ms}ms exceeded")]
     WriteConcernTimeout { timeout_ms: u32 },
+
+    /// This member does not run the version its group runs, so it takes no
+    /// writes. The error names both versions and the leader when known.
+    #[error("this member is read-only: {0}")]
+    Mismatched(crate::version::Mismatch),
 
     /// The proposal cannot be written to the log: it exceeds a frame bound,
     /// or carries DERIVED work no member could derive. Nothing was proposed.

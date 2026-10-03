@@ -198,8 +198,12 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
         DatabaseError::WriteBackpressure
         | DatabaseError::Execution(ExecutionError::Backpressure) => "53000",
+        // read_only_sql_transaction: this member takes no writes, the leader
+        // does, and a read-only member is read-only for the same reason.
         DatabaseError::NotLeader { .. }
-        | DatabaseError::Execution(ExecutionError::NotLeader { .. }) => "25006",
+        | DatabaseError::Execution(ExecutionError::NotLeader { .. })
+        | DatabaseError::Mismatched(_)
+        | DatabaseError::Execution(ExecutionError::Mismatched(_)) => "25006",
         _ => "XX000",
     }
 }

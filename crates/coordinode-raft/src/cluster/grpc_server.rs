@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures_util::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+use super::version::{VersionGate, read_handshake, refusal_status, write_handshake};
 use crate::proto::replication::raft_service_server::RaftService;
 use crate::proto::replication::{RaftEmpty, RaftPayload};
 use crate::storage::{CoordinodeStateMachine, TypeConfig};
@@ -22,13 +23,38 @@ pub struct RaftGrpcHandler {
     /// The node's snapshot directory, where a received snapshot is staged so
     /// the install publishes it in place.
     snapshot_dir: PathBuf,
+    /// Refuses calls from members of another version before their payload
+    /// is read.
+    gate: Arc<VersionGate>,
 }
 
 impl RaftGrpcHandler {
     /// A handler for `raft`, staging received snapshots in `snapshot_dir`
-    /// (see [`crate::snapshot::snapshot_dir`]).
-    pub fn new(raft: Arc<RaftInstance>, snapshot_dir: PathBuf) -> Self {
-        Self { raft, snapshot_dir }
+    /// (see [`crate::snapshot::snapshot_dir`]) and admitting calls through
+    /// `gate`.
+    pub fn new(raft: Arc<RaftInstance>, snapshot_dir: PathBuf, gate: Arc<VersionGate>) -> Self {
+        Self {
+            raft,
+            snapshot_dir,
+            gate,
+        }
+    }
+
+    /// Admit a call by its version record, or the status refusing it.
+    fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.gate
+            .admit(read_handshake(request.metadata()))
+            .map_err(|refusal| {
+                metrics::counter!("coordinode_version_refused_calls_total").increment(1);
+                refusal_status(&refusal, &self.gate.local_handshake())
+            })
+    }
+
+    /// `body` as the call's response, carrying this member's record.
+    fn answer<T>(&self, body: T) -> Response<T> {
+        let mut response = Response::new(body);
+        write_handshake(response.metadata_mut(), &self.gate.local_handshake());
+        response
     }
 }
 
@@ -44,6 +70,7 @@ fn de<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, Status> {
 #[tonic::async_trait]
 impl RaftService for RaftGrpcHandler {
     async fn vote(&self, request: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
+        self.admit(&request)?;
         let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&request.into_inner().data)?;
 
         let vote_resp = self
@@ -52,7 +79,7 @@ impl RaftService for RaftGrpcHandler {
             .await
             .map_err(|e| Status::internal(format!("vote: {e}")))?;
 
-        Ok(Response::new(RaftPayload {
+        Ok(self.answer(RaftPayload {
             data: ser(&vote_resp)?,
         }))
     }
@@ -61,6 +88,7 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
+        self.admit(&request)?;
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&request.into_inner().data)?;
 
         let resp = self
@@ -69,7 +97,7 @@ impl RaftService for RaftGrpcHandler {
             .await
             .map_err(|e| Status::internal(format!("append_entries: {e}")))?;
 
-        Ok(Response::new(RaftPayload { data: ser(&resp)? }))
+        Ok(self.answer(RaftPayload { data: ser(&resp)? }))
     }
 
     type StreamAppendStream = Pin<Box<dyn Stream<Item = Result<RaftPayload, Status>> + Send>>;
@@ -78,6 +106,7 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<Self::StreamAppendStream>, Status> {
+        self.admit(&request)?;
         let input = request.into_inner();
 
         // Deserialize incoming RaftPayload stream → AppendEntriesRequest stream
@@ -126,13 +155,14 @@ impl RaftService for RaftGrpcHandler {
             fatal.map(|fatal| Err(Status::unavailable(format!("raft stopped: {fatal}"))))
         });
 
-        Ok(Response::new(Box::pin(output_stream.chain(stopped))))
+        Ok(self.answer(Box::pin(output_stream.chain(stopped)) as Self::StreamAppendStream))
     }
 
     async fn snapshot(
         &self,
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<RaftPayload>, Status> {
+        self.admit(&request)?;
         let mut stream = request.into_inner();
 
         // ── Chunked snapshot protocol ──────────────────────────────
@@ -251,13 +281,14 @@ impl RaftService for RaftGrpcHandler {
         let resp_bytes = ser(&response)?;
 
         tracing::info!(chunk_count, "chunked snapshot installation complete");
-        Ok(Response::new(RaftPayload { data: resp_bytes }))
+        Ok(self.answer(RaftPayload { data: resp_bytes }))
     }
 
     async fn transfer_leader(
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftEmpty>, Status> {
+        self.admit(&request)?;
         let req: openraft::raft::TransferLeaderRequest<TypeConfig> =
             de(&request.into_inner().data)?;
 
@@ -271,6 +302,6 @@ impl RaftService for RaftGrpcHandler {
             .map_err(|e| Status::internal(format!("transfer_leader: {e}")))?
             .map_err(|e| Status::internal(format!("transfer_leader rejected: {e}")))?;
 
-        Ok(Response::new(RaftEmpty {}))
+        Ok(self.answer(RaftEmpty {}))
     }
 }

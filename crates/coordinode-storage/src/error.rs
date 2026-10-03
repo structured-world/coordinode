@@ -128,6 +128,25 @@ pub enum StorageError {
         /// The first index the oplog still holds.
         first_retained: u64,
     },
+
+    /// The data directory was written in an engine format this release
+    /// cannot open: newer than its own, or older than the one format before
+    /// it, which it migrates. Opening it changes nothing.
+    #[error(
+        "data directory {path} is in engine format {found}; this release runs format {runs} \
+         and opens only format {runs} or {previous}{hint}",
+        // Format numbering starts at 1, so the one before always exists.
+        previous = runs - 1,
+        hint = if found < runs { "; open it with the release that runs the next format first" } else { "" }
+    )]
+    UnsupportedFormat {
+        /// The directory refused.
+        path: String,
+        /// The engine format its marker names.
+        found: u32,
+        /// The engine format this release runs.
+        runs: u32,
+    },
 }
 
 impl From<lsm_tree::Error> for StorageError {

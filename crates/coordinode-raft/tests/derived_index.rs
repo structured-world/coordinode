@@ -288,14 +288,17 @@ async fn a_member_joining_from_a_snapshot_derives_the_log_tail() {
         let (p1, p2) = (alloc_port(), alloc_port());
         let dir1 = tempfile::tempdir().expect("d1");
         let e1 = open_engine(&dir1);
-        let n1 = RaftNode::open_cluster_with_snapshot_config(
+        let n1 = RaftNode::open_cluster_with_options(
             1,
             Arc::clone(&e1),
             format!("127.0.0.1:{p1}").parse().expect("addr"),
             format!("http://127.0.0.1:{p1}"),
-            coordinode_raft::cluster::SnapshotTriggerConfig {
-                check_interval: Duration::from_secs(3600),
-                log_bytes: u64::MAX,
+            coordinode_raft::cluster::NodeOptions {
+                snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
+                    check_interval: Duration::from_secs(3600),
+                    log_bytes: u64::MAX,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )

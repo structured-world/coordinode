@@ -422,3 +422,41 @@ fn a_journaled_command_that_decides_nothing_appends_nothing() {
     assert_eq!(journaled(&engine), after_binding + 1, "a new binding does");
     assert_eq!(bound_id(&engine, "b").unwrap(), Some(2));
 }
+
+fn record_pair(engine: u32, host_epoch: u64) -> Mutation {
+    Mutation::Command(MetadataCommand::RecordGroupPair {
+        pair: VersionPair { engine, host_epoch },
+    })
+}
+
+/// The group's pair records are numbered in application order; a leader
+/// re-elected at the pair already recorded adds none, and a move to any
+/// other pair, the host epoch alone included, adds the next one.
+#[test]
+fn group_pair_records_follow_application_order() {
+    let dir = TempDir::new().unwrap();
+    let (engine, oracle) = open(&dir);
+    assert_eq!(recorded_group_pair(&engine).unwrap(), None);
+    apply(&engine, oracle.next().as_raw(), record_pair(1, 0));
+    apply(&engine, oracle.next().as_raw(), record_pair(1, 0));
+    let first = recorded_group_pair(&engine).unwrap().unwrap();
+    assert_eq!(first.seq, 1);
+    assert_eq!(
+        first.pair,
+        VersionPair {
+            engine: 1,
+            host_epoch: 0
+        }
+    );
+
+    apply(&engine, oracle.next().as_raw(), record_pair(1, 7));
+    let moved = recorded_group_pair(&engine).unwrap().unwrap();
+    assert_eq!(moved.seq, 2);
+    assert_eq!(moved.pair.host_epoch, 7);
+    assert!(moved.is_later_than(&first));
+
+    // A record of the earlier pair after the move is a new record too: the
+    // log, not the pair's value, orders them.
+    apply(&engine, oracle.next().as_raw(), record_pair(1, 0));
+    assert_eq!(recorded_group_pair(&engine).unwrap().unwrap().seq, 3);
+}

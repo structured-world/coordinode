@@ -496,6 +496,18 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 metadata,
             );
         }
+        // A write to a member that does not run its group's version. Like a
+        // write to a follower: the request is fine and the server available,
+        // it came to a member that takes no writes, and the metadata names
+        // where to send it and why this member refuses.
+        DatabaseError::Mismatched(m) | DatabaseError::Execution(ExecutionError::Mismatched(m)) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::MemberReadOnly,
+                mismatch_metadata(m),
+            );
+        }
         // A time-travel read older than the retention horizon. OUT_OF_RANGE
         // rather than FAILED_PRECONDITION: the same read is valid at a later
         // timestamp, and the metadata says from which one, so a caller can
@@ -668,6 +680,24 @@ pub(crate) fn write_concern_to_proto(wc: &WriteConcern) -> replication::WriteCon
         } as i32,
         timeout_ms: wc.timeout_ms,
     }
+}
+
+/// The metadata of a read-only member's refusal: both versions, what its
+/// reads are as of, and the leader to retry at when known.
+fn mismatch_metadata(m: &coordinode_core::version::Mismatch) -> Vec<(&'static str, String)> {
+    let mut metadata = vec![
+        ("member_engine_format", m.own.engine.to_string()),
+        ("member_host_epoch", m.own.host_epoch.to_string()),
+        ("group_engine_format", m.group.engine.to_string()),
+        ("group_host_epoch", m.group.host_epoch.to_string()),
+        ("behind", m.behind.to_string()),
+        ("as_of_ts", m.as_of.to_string()),
+    ];
+    if let Some((id, addr)) = &m.leader {
+        metadata.push(("leader_id", id.to_string()));
+        metadata.push(("leader_addr", addr.clone()));
+    }
+    metadata
 }
 
 /// Convert a ReadFenceError to a tonic Status.

@@ -416,6 +416,10 @@ impl StorageEngine {
         oracle: Option<std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         journal_config: Option<OplogJournalConfig>,
     ) -> StorageResult<Self> {
+        // Before anything reads the directory: a directory of another engine
+        // format is migrated or refused here, never opened as it is.
+        crate::format::prepare(config)?;
+
         // Built here rather than inside the coordinator: the capacity scanner
         // is spawned below, before the coordinator exists, and its cascade
         // eviction compacts — so it needs to publish and read the same
@@ -1439,7 +1443,8 @@ impl StorageEngine {
                 summary.max_seqno = summary.max_seqno.max(info.seqno);
             }
         }
-        Ok(())
+        // The copy is a directory of this engine's format, opened as one.
+        crate::format::write_marker(target, coordinode_core::version::engine_format_version())
     }
 
     /// Open a checkpoint written by [`Self::create_checkpoint`] as a plain
@@ -2348,7 +2353,8 @@ impl StorageEngine {
                 dictionary = match command {
                     MetadataCommand::RegisterFields { .. } => DictionaryChange::Extended,
                     MetadataCommand::AdoptFields { .. } => DictionaryChange::Replaced,
-                    MetadataCommand::GrantNodeLease { .. } => DictionaryChange::None,
+                    MetadataCommand::GrantNodeLease { .. }
+                    | MetadataCommand::RecordGroupPair { .. } => DictionaryChange::None,
                 };
             }
             effects.extend(decided_effects);
