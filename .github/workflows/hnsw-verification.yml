@@ -60,19 +60,27 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run miri on hnsw::neighbours::tests
-        # The neighbours module holds every atomic primitive of the lock-free
-        # HNSW write path (cas_append, snapshot_into, set, replace). Miri
-        # scans the abstract Rust machine for undefined behaviour — bad
-        # atomic orderings, uninitialised reads, type-punning aliasing, etc.
-        # Higher-level integration tests use rayon and would time out under
-        # miri; they are covered by the proptest stress in the regular CI
-        # job and the loom job below.
+      - name: Run miri on the publication and level-0 storage tests
+        # These modules hold every atomic primitive of the lock-free HNSW
+        # write path: whole-list publication with epoch retirement
+        # (neighbours) and the level-0 store that publishes through it,
+        # including its growth (data_level0). Miri
+        # scans the abstract Rust machine for undefined behaviour: bad atomic
+        # orderings, uninitialised reads, aliasing. Higher-level integration
+        # tests use rayon and would time out under miri; they are covered by
+        # the proptest stress in the regular CI job and the loom job below.
+        #
+        # Tree Borrows, because crossbeam-epoch itself violates Stacked
+        # Borrows while walking its global participant list on every pin
+        # (crossbeam-rs/crossbeam#545), so the default model aborts inside
+        # the reclamation library before reaching our code. Its global
+        # collector also lives for the whole process, hence ignore-leaks.
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-permissive-provenance -Zmiri-tree-borrows -Zmiri-ignore-leaks
         run: |
           cd crates/coordinode-vector
-          cargo +nightly miri test --lib hnsw::neighbours::tests --no-fail-fast
+          cargo +nightly miri test --lib --no-fail-fast -- \
+            hnsw::neighbours:: hnsw::data_level0::
 
   loom-neighbours:
     name: Loom — AtomicNeighbourList interleavings

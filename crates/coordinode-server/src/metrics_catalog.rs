@@ -129,6 +129,39 @@ fn register_query_metrics() {
         "coordinode_vector_index_lag_hlc",
         "Vector index freshness lag per {label, property}: committed HLC minus indexed HLC (microseconds)"
     );
+    // Neighbour-list publication of each vector index, per {label, property}.
+    metrics::describe_gauge!(
+        "coordinode_vector_index_retired_bytes",
+        "Bytes of replaced neighbour lists a running search or insert may still read, not yet freed"
+    );
+    metrics::describe_gauge!(
+        "coordinode_vector_index_retired_lists",
+        "Replaced neighbour lists not yet freed"
+    );
+    metrics::describe_gauge!(
+        "coordinode_vector_index_oldest_operation_seconds",
+        "Age of the oldest search, insert or removal running on the index, which holds replaced lists"
+    );
+    metrics::describe_gauge!(
+        "coordinode_vector_index_retired_nodes",
+        "Removed or replaced nodes whose slots are not yet free for reuse"
+    );
+    metrics::describe_gauge!(
+        "coordinode_vector_index_free_slots",
+        "Slots free for the next inserts to reuse"
+    );
+    metrics::describe_counter!(
+        "coordinode_vector_index_lost_cas_total",
+        "Neighbour-list publications that lost to a concurrent writer and were recomputed"
+    );
+    metrics::describe_counter!(
+        "coordinode_vector_index_admission_waits_total",
+        "Writes held off until replaced lists fell under vector_retired_bytes_budget"
+    );
+    metrics::describe_counter!(
+        "coordinode_vector_index_admission_wait_microseconds_total",
+        "Total time writes were held off by vector_retired_bytes_budget"
+    );
 
     // Full-text search
     metrics::describe_gauge!(
