@@ -418,7 +418,7 @@ impl StorageEngine {
     ) -> StorageResult<Self> {
         // Before anything reads the directory: a directory of another engine
         // format is migrated or refused here, never opened as it is.
-        crate::format::prepare(config)?;
+        let format = crate::format::prepare(config)?;
 
         // Built here rather than inside the coordinator: the capacity scanner
         // is spawned below, before the coordinator exists, and its cascade
@@ -983,6 +983,10 @@ impl StorageEngine {
         coordinator.set_retention_window_us(retention_window_to_us(
             std::time::Duration::from_secs(config.retention_window_secs),
         ));
+        // The open succeeded: a migrated directory now records its format.
+        // An open refused above leaves the old marker, so the store it
+        // refused stays as its writer left it.
+        crate::format::settle(&format)?;
         Ok(Self {
             flush_manager: Some(flush_manager),
             compaction_scheduler: Some(compaction_scheduler),

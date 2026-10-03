@@ -46,10 +46,12 @@ fn a_new_directory_is_marked_with_the_current_format() {
 fn an_unmarked_directory_with_data_is_format_zero() {
     let root = tempfile::tempdir().expect("tempdir");
     touch(root.path(), "schema");
-    assert_eq!(
-        prepare_dir(root.path(), 1, STEPS).expect("migrate"),
-        FormatOpen::Migrated { from: 0 }
-    );
+    let opened = prepare_dir(root.path(), 1, STEPS).expect("migrate");
+    assert!(matches!(
+        opened,
+        FormatOpen::Migrated { from: 0, to: 1, .. }
+    ));
+    settle(&opened).expect("settle");
     assert_eq!(read_marker(root.path()).expect("read"), Some(1));
 
     let older = tempfile::tempdir().expect("tempdir");
@@ -75,12 +77,46 @@ fn the_previous_format_migrates_through_its_step() {
     let root = tempfile::tempdir().expect("tempdir");
     touch(root.path(), "schema");
     write_marker(root.path(), 4).expect("mark");
-    assert_eq!(
-        prepare_dir(root.path(), 5, STEPS).expect("migrate"),
-        FormatOpen::Migrated { from: 4 }
-    );
+    let opened = prepare_dir(root.path(), 5, STEPS).expect("migrate");
+    assert!(matches!(
+        opened,
+        FormatOpen::Migrated { from: 4, to: 5, .. }
+    ));
     assert!(root.path().join("migrated").exists());
+    assert_eq!(
+        read_marker(root.path()).expect("read"),
+        Some(4),
+        "the marker waits for the open to succeed"
+    );
+    settle(&opened).expect("settle");
     assert_eq!(read_marker(root.path()).expect("read"), Some(5));
+}
+
+/// Preparing a store of the previous format writes no marker; the engine's
+/// successful open does. A store the open refuses after the step (a released
+/// store whose journal coverage cannot be proven) therefore stays as its
+/// writer left it.
+#[test]
+fn a_migration_is_recorded_by_the_open_that_succeeds() {
+    use crate::engine::config::{EndpointConfig, Media, Tier};
+    use crate::engine::core::StorageEngine;
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        root.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let runs = coordinode_core::version::engine_format_version();
+    drop(StorageEngine::open(&config).expect("open"));
+    // A store with data and no marker: format 0.
+    std::fs::remove_file(root.path().join(MARKER_FILE)).expect("unmark");
+    let opened = prepare(&config).expect("prepare");
+    assert!(matches!(opened, FormatOpen::Migrated { from: 0, .. }));
+    assert_eq!(read_marker(root.path()).expect("read"), None);
+    drop(StorageEngine::open(&config).expect("reopen migrates"));
+    assert_eq!(read_marker(root.path()).expect("read"), Some(runs));
 }
 
 /// A directory two formats behind, or written by a newer release, is

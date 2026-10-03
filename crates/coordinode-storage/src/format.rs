@@ -4,9 +4,10 @@
 //! its primary endpoint. A release opens a directory of its own format, and
 //! migrates one written by the format just before it, once and in one
 //! direction: every step of [`MIGRATIONS`] that starts at the directory's
-//! format runs, and the marker moves only after the step has made its work
-//! durable, so a crash part way repeats the step on the next open. A
-//! directory of any other format is refused by name and left untouched.
+//! format runs, and the marker moves only once the whole open has succeeded
+//! ([`settle`]), so a crash part way, or an open that refuses the directory
+//! for another reason, leaves the old marker and repeats the step next time.
+//! A directory of any other format is refused by name and left untouched.
 //! A directory with data and no marker was written before the marker
 //! existed, which is format 0.
 
@@ -19,8 +20,8 @@ use crate::error::{StorageError, StorageResult};
 pub const MARKER_FILE: &str = "ENGINE_FORMAT";
 
 /// One step of directory migration: turns a directory written by format
-/// `from` into one of format `from + 1`. A step is idempotent, since a crash
-/// before the marker moves runs it again.
+/// `from` into one of format `from + 1`. A step is idempotent, since an open
+/// that ends before the marker moves runs it again.
 pub struct MigrationStep {
     /// The format the step reads.
     pub from: u32,
@@ -48,7 +49,7 @@ fn no_change(_: &Path) -> StorageResult<()> {
 }
 
 /// What opening a directory did to its format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatOpen {
     /// No durable directory to mark: every endpoint is volatile.
     Volatile,
@@ -56,11 +57,25 @@ pub enum FormatOpen {
     Created,
     /// Already in the current format.
     Current,
-    /// Migrated from the named format to the current one.
+    /// Migrated from the named format to the current one; the marker moves
+    /// when [`settle`] is called after the open succeeds.
     Migrated {
+        /// The directory migrated.
+        dir: PathBuf,
         /// The format the directory was in.
         from: u32,
+        /// The format it is in now.
+        to: u32,
     },
+}
+
+/// Record the format a migration reached, once the open that ran it has
+/// succeeded. Nothing to do for any other outcome.
+pub fn settle(opened: &FormatOpen) -> StorageResult<()> {
+    match opened {
+        FormatOpen::Migrated { dir, to, .. } => write_marker(dir, *to),
+        _ => Ok(()),
+    }
 }
 
 /// Bring the primary endpoint's directory to the engine format this
@@ -107,8 +122,11 @@ pub fn prepare_dir(dir: &Path, runs: u32, steps: &[MigrationStep]) -> StorageRes
     let step = steps.iter().find(|s| s.from == found).ok_or_else(refuse)?;
     tracing::info!(dir = %dir.display(), from = found, to = runs, "migrating the data directory");
     (step.migrate)(dir)?;
-    write_marker(dir, runs)?;
-    Ok(FormatOpen::Migrated { from: found })
+    Ok(FormatOpen::Migrated {
+        dir: dir.to_path_buf(),
+        from: found,
+        to: runs,
+    })
 }
 
 /// The format a directory's marker names, `None` without a marker.

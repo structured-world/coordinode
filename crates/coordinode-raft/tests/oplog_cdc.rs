@@ -309,9 +309,12 @@ async fn cdc_tailer_delivers_raft_proposals() {
     );
 
     // Each proposal's entry carries its commit timestamp and a real term.
+    // The log also holds the entry the leader records the group's version
+    // pair with, stamped from the clock rather than in this test's range.
+    let written = 2001..=2000 + n_proposals;
     let proposal_ts: Vec<u64> = batch
         .iter()
-        .filter(|(e, _)| e.ts > 2000)
+        .filter(|(e, _)| written.contains(&e.ts))
         .map(|(e, _)| {
             assert!(e.term >= 1, "entry {} has term {}", e.index, e.term);
             e.ts
