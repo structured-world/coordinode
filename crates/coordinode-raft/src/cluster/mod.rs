@@ -132,6 +132,7 @@ fn spawn_version_watch(
     raft: Arc<RaftInstance>,
     gate: Arc<VersionGate>,
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
+    space: Arc<coordinode_storage::engine::space::SpaceGuard>,
 ) -> tokio::task::JoinHandle<()> {
     // An engine opened without an oracle stamps writes from a counter; the
     // record then takes a wall-clock stamp of its own.
@@ -162,8 +163,16 @@ fn spawn_version_watch(
                 (leader, leading.then_some(m.vote.leader_id().term))
             };
             gate.set_leader(leader);
+            // Whether a record this leader owes waits for disk space: then
+            // the task wakes on its own to look again, not only on a change.
+            let mut waits_for_space = false;
             if let Some(term) = leading_term {
-                if recorded_in != Some(term) {
+                // A log append on a full disk fails its fsync and stops the
+                // node; the record waits for space like any write. A refused
+                // or lost attempt is retried on the next change.
+                let room = space.admit().is_ok();
+                waits_for_space = recorded_in != Some(term) && !room;
+                if recorded_in != Some(term) && room {
                     if let Some(pair) = gate.pair_to_record() {
                         let request = record_pair_request(pair, ids.next(), oracle.next());
                         match raft.client_write(request).await {
@@ -180,12 +189,25 @@ fn spawn_version_watch(
                     }
                 }
             }
-            if metrics.changed().await.is_err() {
+            if waits_for_space {
+                tokio::select! {
+                    changed = metrics.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(SPACE_RECHECK) => {}
+                }
+            } else if metrics.changed().await.is_err() {
                 break;
             }
         }
     })
 }
+
+/// How often a leader that owes the group's version record looks again for
+/// the disk space to write it.
+const SPACE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The entry recording `pair` as the group's.
 fn record_pair_request(
@@ -492,7 +514,12 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
-        let version_watch = spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), oracle);
+        let version_watch = spawn_version_watch(
+            Arc::clone(&raft),
+            Arc::clone(&version),
+            oracle,
+            Arc::clone(engine.space()),
+        );
 
         Ok(Self {
             raft,
@@ -647,6 +674,7 @@ impl RaftNode {
             Arc::clone(&raft),
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
+            Arc::clone(engine.space()),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -673,8 +701,12 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
-        let version_watch =
-            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
+        let version_watch = spawn_version_watch(
+            Arc::clone(&raft),
+            Arc::clone(&version),
+            engine.oracle(),
+            Arc::clone(engine.space()),
+        );
 
         Ok(Self {
             raft,
@@ -819,6 +851,7 @@ impl RaftNode {
             Arc::clone(&raft),
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
+            Arc::clone(engine.space()),
         );
 
         let snap_handle = spawn_snapshot_trigger(
@@ -828,8 +861,12 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
-        let version_watch =
-            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
+        let version_watch = spawn_version_watch(
+            Arc::clone(&raft),
+            Arc::clone(&version),
+            engine.oracle(),
+            Arc::clone(engine.space()),
+        );
 
         let node = Self {
             raft,
@@ -926,6 +963,7 @@ impl RaftNode {
             Arc::clone(&raft),
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
+            Arc::clone(engine.space()),
         );
 
         let snap_handle = spawn_snapshot_trigger(
@@ -935,8 +973,12 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
-        let version_watch =
-            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
+        let version_watch = spawn_version_watch(
+            Arc::clone(&raft),
+            Arc::clone(&version),
+            engine.oracle(),
+            Arc::clone(engine.space()),
+        );
 
         tracing::info!(
             node_id,
@@ -1047,6 +1089,7 @@ impl RaftNode {
             Arc::clone(&raft),
             crate::snapshot::snapshot_dir(&engine),
             Arc::clone(&version),
+            Arc::clone(engine.space()),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1072,8 +1115,12 @@ impl RaftNode {
             snap_config,
             applied_rx.clone(),
         );
-        let version_watch =
-            spawn_version_watch(Arc::clone(&raft), Arc::clone(&version), engine.oracle());
+        let version_watch = spawn_version_watch(
+            Arc::clone(&raft),
+            Arc::clone(&version),
+            engine.oracle(),
+            Arc::clone(engine.space()),
+        );
 
         Ok(Self {
             raft,
@@ -1446,6 +1493,7 @@ impl RaftNode {
             Arc::clone(&self.append_notifier),
         )
         .with_version_gate(Arc::clone(&self.version))
+        .with_space_guard(Arc::clone(self.engine.space()))
     }
 
     /// This member's version view: its pair, its group's, and whether it
@@ -1497,11 +1545,13 @@ impl RaftNode {
     /// graceful cleanup.
     pub fn batch_pipeline(&self) -> WaitForMajorityService {
         WaitForMajorityService::spawn_default(Arc::clone(&self.raft), RateLimiter::default())
+            .with_space_guard(Arc::clone(self.engine.space()))
     }
 
     /// Create a [`WaitForMajorityService`] with custom batch configuration.
     pub fn batch_pipeline_with_config(&self, config: BatchConfig) -> WaitForMajorityService {
         WaitForMajorityService::spawn(Arc::clone(&self.raft), RateLimiter::default(), config)
+            .with_space_guard(Arc::clone(self.engine.space()))
     }
 
     /// Get the current applied log index (non-blocking).
@@ -2684,6 +2734,12 @@ fn spawn_snapshot_trigger(
                 }
                 continue;
             };
+            // A snapshot is a full copy of the store written to disk; with the
+            // disk below its reserve it waits, and the next probe asks again.
+            if engine.space().is_paused() {
+                tracing::debug!(reason, "snapshot trigger: waiting for disk space");
+                continue;
+            }
 
             match raft.trigger().snapshot().await {
                 Ok(()) => {

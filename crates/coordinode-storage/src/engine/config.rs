@@ -769,6 +769,18 @@ pub struct StorageConfig {
     /// configuration lacks and is replaced by this configuration's default
     /// on open. Set through the builder of the same name.
     pub relocated: bool,
+
+    /// Free space, in bytes, below which every new write is refused before
+    /// it reaches the disk, on any filesystem under a durable endpoint. A
+    /// write that hit a full disk would fail in an fsync of the consensus
+    /// log and stop the node; refusing it first keeps the node serving
+    /// reads. Default 1 GiB. Retunable at runtime through the engine.
+    pub min_free_bytes: u64,
+
+    /// Free space, in bytes, every durable endpoint's filesystem needs
+    /// before refused writes are admitted again; at least `min_free_bytes`.
+    /// Default 2 GiB.
+    pub resume_free_bytes: u64,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -931,6 +943,8 @@ impl StorageConfig {
             drain_buffer_capacity_bytes: 100 * 1024 * 1024,
             nvme_write_buffer_path: None,
             relocated: false,
+            min_free_bytes: crate::engine::space::DEFAULT_MIN_FREE_BYTES,
+            resume_free_bytes: crate::engine::space::DEFAULT_RESUME_FREE_BYTES,
         }
     }
 

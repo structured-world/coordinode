@@ -129,6 +129,22 @@ pub enum StorageError {
         first_retained: u64,
     },
 
+    /// The filesystem under a durable endpoint has less free space than the
+    /// reserve, so writes are refused before any reaches the disk; reads go
+    /// on. Writes are admitted again once space is freed.
+    #[error(
+        "no space: {available_bytes} bytes free under {path}, below the {min_free_bytes}-byte \
+         reserve; writes are refused until space is freed, reads continue"
+    )]
+    OutOfSpace {
+        /// The endpoint path with the least free space.
+        path: String,
+        /// Free bytes there at the last reading.
+        available_bytes: u64,
+        /// The reserve writes need.
+        min_free_bytes: u64,
+    },
+
     /// The data directory was written in an engine format this release
     /// cannot open: newer than its own, or older than the one format before
     /// it, which it migrates. Opening it changes nothing.

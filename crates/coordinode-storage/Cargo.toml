@@ -36,6 +36,9 @@ io-uring = ["lsm-tree/io-uring"]
 
 [dependencies]
 coordinode-core = { workspace = true }
+# Free space of the filesystem under each endpoint (statvfs / GetDiskFreeSpaceEx),
+# for refusing writes before the disk fills instead of failing an fsync.
+fs4 = "0.13"
 
 # Guard table on the hot commit path: an 8-byte userspace-fast-path mutex
 # rather than std's ~40-byte futex-backed one.

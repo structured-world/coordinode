@@ -271,6 +271,16 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
             DatabaseError::Execution(ExecutionError::NotLeader { leader_id: None }),
             "25006",
         ),
+        (
+            DatabaseError::Execution(ExecutionError::Storage(
+                coordinode_storage::error::StorageError::OutOfSpace {
+                    path: "/data".to_string(),
+                    available_bytes: 1,
+                    min_free_bytes: 2,
+                },
+            )),
+            "53100",
+        ),
     ];
     for (error, expected) in cases {
         assert_eq!(super::sqlstate(&error), expected, "{error:?}");

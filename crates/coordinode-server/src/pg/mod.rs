@@ -161,6 +161,8 @@ fn command_tag(query: &str) -> Tag {
 /// and this server does not, is `42P10 invalid_column_reference`. A write
 /// conflict is `40001 serialization_failure`, the class drivers retry the
 /// whole transaction on; write pressure is `53000 insufficient_resources`;
+/// a write refused because the disk is below its reserve is `53100
+/// disk_full`;
 /// a write that reached a follower is `25006 read_only_sql_transaction`, what
 /// a PostgreSQL standby answers. A name a table already holds is `42P07
 /// duplicate_table`, one another catalog object holds `42710
@@ -198,6 +200,11 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
         DatabaseError::WriteBackpressure
         | DatabaseError::Execution(ExecutionError::Backpressure) => "53000",
+        // disk_full: the disk is below its reserve, writes wait for space.
+        DatabaseError::Storage(coordinode_storage::error::StorageError::OutOfSpace { .. })
+        | DatabaseError::Execution(ExecutionError::Storage(
+            coordinode_storage::error::StorageError::OutOfSpace { .. },
+        )) => "53100",
         // read_only_sql_transaction: this member takes no writes, the leader
         // does, and a read-only member is read-only for the same reason.
         DatabaseError::NotLeader { .. }

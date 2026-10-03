@@ -208,6 +208,15 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
         // the leader, and it needs the id to do that.
         ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },
         ProposalError::Mismatched(m) => CommitError::Mismatched(m),
+        ProposalError::OutOfSpace {
+            path,
+            available_bytes,
+            min_free_bytes,
+        } => CommitError::Storage(StorageError::OutOfSpace {
+            path,
+            available_bytes,
+            min_free_bytes,
+        }),
         other => CommitError::Serialization(format!("proposal pipeline error: {other}")),
     }
 }

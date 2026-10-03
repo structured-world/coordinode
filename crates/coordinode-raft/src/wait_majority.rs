@@ -96,6 +96,8 @@ struct BatchEntry {
 pub struct WaitForMajorityService {
     tx: mpsc::Sender<BatchEntry>,
     handle: tokio::task::JoinHandle<()>,
+    /// Refuses proposals while the disk is below its free-space reserve.
+    space: Option<Arc<coordinode_storage::engine::space::SpaceGuard>>,
 }
 
 impl std::fmt::Debug for WaitForMajorityService {
@@ -116,7 +118,21 @@ impl WaitForMajorityService {
 
         let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config));
 
-        Self { tx, handle }
+        Self {
+            tx,
+            handle,
+            space: None,
+        }
+    }
+
+    /// Refuse proposals while `guard` reports the disk below its reserve,
+    /// before they reach the log.
+    pub fn with_space_guard(
+        mut self,
+        guard: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    ) -> Self {
+        self.space = Some(guard);
+        self
     }
 
     /// Spawn with default configuration.
@@ -140,6 +156,11 @@ impl WaitForMajorityService {
         // Refused here, alone: in a batch it would fail the log write of
         // every proposal it shares an entry with.
         coordinode_core::txn::frame::check_proposal(&proposal)?;
+        if let Some(space) = &self.space {
+            space
+                .admit()
+                .map_err(crate::proposal::storage_to_proposal_err)?;
+        }
         let (response_tx, response_rx) = oneshot::channel();
 
         self.tx

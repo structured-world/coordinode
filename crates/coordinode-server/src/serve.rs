@@ -175,6 +175,8 @@ pub(crate) async fn serve(
         max_invariant_claims: _,
         max_commits_in_flight: _,
         snapshot_wait_ms: _,
+        min_free_bytes: _,
+        resume_free_bytes: _,
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
@@ -549,6 +551,14 @@ pub(crate) async fn serve(
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
+                    // A checkpoint copies the store to disk; with the disk
+                    // below its reserve it waits for the next tick.
+                    if ckpt_engine.space().is_paused() {
+                        tracing::warn!(
+                            "periodic checkpoint skipped: disk below its free-space reserve"
+                        );
+                        continue;
+                    }
                     let eng = Arc::clone(&ckpt_engine);
                     let dir = checkpoint_dir.clone();
                     let now_secs = std::time::SystemTime::now()

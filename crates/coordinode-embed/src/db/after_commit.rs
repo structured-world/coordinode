@@ -76,6 +76,10 @@ impl Default for TriggerDispatchConfig {
 /// bound somehow fails to stop. Far above any real per-drive trigger volume.
 const MAX_EXECUTIONS_PER_PASS: usize = 100_000;
 
+/// How soon a pass that found writes paused for disk space looks again, in
+/// microseconds.
+const SPACE_RECHECK_US: u64 = 1_000_000;
+
 thread_local! {
     /// Reentrancy guard: a trigger body executes through `execute_cypher_impl`,
     /// which would otherwise inline-drain again. The outer dispatch pass already
@@ -145,6 +149,15 @@ impl Database {
             return report;
         }
         let _guard = DispatchGuard;
+
+        // Writes are paused until disk space is freed: every body would be
+        // refused for a reason that is not its own, and its retry or
+        // dead-letter bookkeeping with it. The queue waits, untouched, and is
+        // looked at again shortly.
+        if self.engine.space().is_paused() {
+            report.next_due_us = Some(now_us().saturating_add(SPACE_RECHECK_US));
+            return report;
+        }
 
         // Events handled this pass — a disabled or rescheduled-due event must
         // not be re-collected and spun on within the same drive.

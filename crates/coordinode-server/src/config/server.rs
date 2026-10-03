@@ -310,6 +310,12 @@ pub struct ServerConfig {
     /// How long a read waits, in ms, for commits still landing before it is
     /// answered from a view that stops behind them (`None` = 5).
     pub snapshot_wait_ms: Option<u64>,
+    /// Free disk space, in bytes, below which every write is refused before
+    /// it reaches the disk; reads go on (`None` = 1 GiB).
+    pub min_free_bytes: Option<u64>,
+    /// Free disk space, in bytes, needed before refused writes are admitted
+    /// again (`None` = 2 GiB; at least `min_free_bytes`).
+    pub resume_free_bytes: Option<u64>,
     /// The shard whose node rows this engine holds (`None` = 0). The invariant
     /// guard resolves a node from its id alone and needs it to build the key.
     pub node_shard: Option<u16>,
@@ -436,6 +442,8 @@ impl Default for ServerConfig {
             max_invariant_claims: None,
             max_commits_in_flight: None,
             snapshot_wait_ms: None,
+            min_free_bytes: None,
+            resume_free_bytes: None,
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
@@ -705,6 +713,12 @@ impl ServerConfig {
         }
         if let Some(limit) = self.max_commits_in_flight {
             cfg.max_commits_in_flight = limit;
+        }
+        if let Some(bytes) = self.min_free_bytes {
+            cfg.min_free_bytes = bytes;
+        }
+        if let Some(bytes) = self.resume_free_bytes {
+            cfg.resume_free_bytes = bytes;
         }
         if let Some(ms) = self.snapshot_wait_ms {
             cfg.snapshot_wait_ms = ms;

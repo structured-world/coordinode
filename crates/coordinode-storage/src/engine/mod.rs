@@ -18,6 +18,7 @@ pub mod partition;
 pub mod pending;
 pub mod retention_stats;
 pub mod routing;
+pub mod space;
 pub mod stats;
 pub mod tap;
 pub mod transaction;

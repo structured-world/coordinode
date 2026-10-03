@@ -84,6 +84,11 @@ pub enum Reason {
     /// The write would exceed the endpoint's storage quota. Metadata carries
     /// `endpoint_id`, `used_bytes` and `hard_limit_bytes`.
     CapacityExhausted,
+    /// The disk under the data directory is below its free-space reserve, so
+    /// writes are refused before any reaches the disk; reads go on. Metadata
+    /// carries `path`, `available_bytes` and `min_free_bytes`. Retry once
+    /// space is freed.
+    StorageFull,
     /// A schema rule refused the write: an undeclared property on a strict
     /// label, or an attempt to set a computed one.
     SchemaViolation,
@@ -181,6 +186,7 @@ impl Reason {
             Reason::RevisionMismatch => "REVISION_MISMATCH",
             Reason::TransactionTooLarge => "TRANSACTION_TOO_LARGE",
             Reason::CapacityExhausted => "CAPACITY_EXHAUSTED",
+            Reason::StorageFull => "STORAGE_FULL",
             Reason::SchemaViolation => "SCHEMA_VIOLATION",
             Reason::WriteBackpressure => "WRITE_BACKPRESSURE",
             Reason::NotLeader => "NOT_LEADER",
@@ -234,6 +240,9 @@ impl Reason {
             | Reason::NotLeader
             | Reason::MemberReadOnly => Some(std::time::Duration::ZERO),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
+            // Space comes back when someone frees it, not soon: a floor that
+            // keeps clients from hammering a node that only serves reads.
+            Reason::StorageFull => Some(std::time::Duration::from_secs(5)),
             _ => None,
         }
     }

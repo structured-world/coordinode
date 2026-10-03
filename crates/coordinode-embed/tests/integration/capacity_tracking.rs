@@ -1635,3 +1635,45 @@ fn tantivy_index_bytes_can_push_endpoint_to_full() {
         "Full from FTS bytes must still gate writes, got: {result:?}",
     );
 }
+
+/// An embedded database whose disk is below its free-space reserve refuses
+/// every write with "no space" before anything reaches its journal, answers
+/// reads as before, and takes writes again once space is freed. Queued
+/// AFTER COMMIT trigger events wait instead of spending retry attempts.
+#[test]
+fn an_embedded_database_out_of_space_refuses_writes_and_keeps_reading() {
+    use coordinode_embed::Database;
+    let dir = TempDir::new().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:User {name: 'before'})")
+        .expect("write with room");
+
+    db.engine().space().set_reserve(u64::MAX, u64::MAX);
+    let err = db
+        .execute_cypher("CREATE (:User {name: 'full'})")
+        .expect_err("no space");
+    assert!(err.to_string().contains("no space"), "{err}");
+    let rows = db
+        .execute_cypher("MATCH (u:User) RETURN u.name AS name")
+        .expect("reads go on");
+    assert_eq!(rows.len(), 1, "the refused write left nothing behind");
+
+    // Nothing an AFTER COMMIT dispatch does may land while paused, and it
+    // reports when to look again.
+    let report = db.dispatch_after_commit_triggers();
+    assert_eq!(report.dead_lettered + report.retried + report.fired, 0);
+    assert!(
+        report.next_due_us.is_some(),
+        "the paused queue is looked at again"
+    );
+
+    db.engine().space().set_reserve(0, 0);
+    db.execute_cypher("CREATE (:User {name: 'after'})")
+        .expect("writes resume once space is freed");
+    assert_eq!(
+        db.execute_cypher("MATCH (u:User) RETURN u.name AS name")
+            .expect("read")
+            .len(),
+        2
+    );
+}

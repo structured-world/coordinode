@@ -227,6 +227,10 @@ pub struct StorageEngine {
     applied_feed: Arc<crate::engine::applied::AppliedFeed>,
     /// The transactions open here (see [`Self::await_transactions_through`]).
     open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
+    /// Refuses new writes while the disk under a durable endpoint is below
+    /// its free-space reserve; shared with the consensus layer, which checks
+    /// it before anything reaches its log.
+    space: Arc<crate::engine::space::SpaceGuard>,
 }
 
 /// An inclusive `[min, max]` user-key range, as reported by a lossy open
@@ -1021,7 +1025,15 @@ impl StorageEngine {
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
+            space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
         })
+    }
+
+    /// The free-space guard: new writes are refused while it is paused, and
+    /// a layer that writes ahead of the engine (a consensus log) checks it
+    /// first.
+    pub fn space(&self) -> &Arc<crate::engine::space::SpaceGuard> {
+        &self.space
     }
 
     /// The cached write-pressure verdict (one relaxed atomic load), latched
@@ -2466,6 +2478,9 @@ impl StorageEngine {
     /// journalled but failed to apply stays uncovered and is replayed on the
     /// next open.
     pub fn commit_journaled(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
+        // Refused before the journal append, which is the write a full disk
+        // would fail in.
+        self.space.admit()?;
         if mutations.iter().any(|m| matches!(m, Mutation::Command(_))) {
             // The decision, the journal append and the apply happen under one
             // lock: the journal then records each decision's effects in the

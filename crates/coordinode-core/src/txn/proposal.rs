@@ -523,6 +523,21 @@ pub enum ProposalError {
     #[error("write concern timeout: {timeout_ms}ms exceeded")]
     WriteConcernTimeout { timeout_ms: u32 },
 
+    /// The disk under a durable endpoint is below its free-space reserve, so
+    /// the write was refused before anything was written; reads go on.
+    #[error(
+        "no space: {available_bytes} bytes free under {path}, below the {min_free_bytes}-byte \
+         reserve; writes are refused until space is freed, reads continue"
+    )]
+    OutOfSpace {
+        /// The endpoint path with the least free space.
+        path: String,
+        /// Free bytes there.
+        available_bytes: u64,
+        /// The reserve writes need.
+        min_free_bytes: u64,
+    },
+
     /// This member does not run the version its group runs, so it takes no
     /// writes. The error names both versions and the leader when known.
     #[error("this member is read-only: {0}")]

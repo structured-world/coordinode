@@ -28,7 +28,7 @@ use crate::storage::{AppendNotifier, CoordinodeStateMachine, Request, TypeConfig
 /// now — only the capacity case needs structured propagation today,
 /// since it carries operator-actionable metadata (endpoint id +
 /// limits) that the gRPC handler maps to `Status::resource_exhausted`.
-fn storage_to_proposal_err(e: StorageError) -> ProposalError {
+pub(crate) fn storage_to_proposal_err(e: StorageError) -> ProposalError {
     match e {
         StorageError::CapacityExhausted {
             endpoint_id,
@@ -38,6 +38,15 @@ fn storage_to_proposal_err(e: StorageError) -> ProposalError {
             endpoint_id,
             used_bytes,
             hard_limit_bytes,
+        },
+        StorageError::OutOfSpace {
+            path,
+            available_bytes,
+            min_free_bytes,
+        } => ProposalError::OutOfSpace {
+            path,
+            available_bytes,
+            min_free_bytes,
         },
         other => ProposalError::Storage(other.to_string()),
     }
@@ -128,6 +137,10 @@ impl<'a> LocalProposalPipeline<'a> {
 
 impl ProposalPipeline for LocalProposalPipeline<'_> {
     fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
+        self.engine
+            .space()
+            .admit()
+            .map_err(storage_to_proposal_err)?;
         // The whole proposal lands at one seqno, its commit_ts, so a
         // snapshot at commit_ts sees all of it and one tick earlier none.
         self.engine
@@ -202,6 +215,12 @@ impl ProposalPipeline for OwnedLocalProposalPipeline {
                 .commit_journaled(&proposal.mutations, proposal.commit_ts.as_raw())
                 .map_err(storage_to_proposal_err)?;
         } else {
+            // Refused before the apply and the flush that would hit a full
+            // disk; `commit_journaled` checks for itself.
+            self.engine
+                .space()
+                .admit()
+                .map_err(storage_to_proposal_err)?;
             // The whole proposal lands at one seqno, its commit_ts.
             self.engine
                 .apply_proposal_at(&proposal.mutations, proposal.commit_ts.as_raw())
@@ -313,6 +332,10 @@ pub struct RaftProposalPipeline {
     /// Refuses every write while this member does not run its group's
     /// version.
     version: Option<Arc<crate::cluster::version::VersionGate>>,
+    /// Refuses every write while the disk is below its free-space reserve,
+    /// before the write reaches the log: a log append that hit a full disk
+    /// would fail its fsync and stop consensus for good.
+    space: Option<Arc<coordinode_storage::engine::space::SpaceGuard>>,
 }
 
 impl RaftProposalPipeline {
@@ -324,6 +347,7 @@ impl RaftProposalPipeline {
             runtime: tokio::runtime::Handle::try_current().ok(),
             append_notifier: None,
             version: None,
+            space: None,
         }
     }
 
@@ -334,16 +358,27 @@ impl RaftProposalPipeline {
         self
     }
 
-    /// The refusal of a member that does not run its group's version.
-    fn check_version(&self) -> Result<(), ProposalError> {
+    /// Refuse writes while `guard` reports the disk below its reserve.
+    pub fn with_space_guard(
+        mut self,
+        guard: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    ) -> Self {
+        self.space = Some(guard);
+        self
+    }
+
+    /// The refusals a write meets before it reaches the log: a member that
+    /// does not run its group's version, a disk below its reserve.
+    fn check_admission(&self) -> Result<(), ProposalError> {
         use crate::cluster::version::MemberState;
-        match self.version.as_ref().map(|g| g.state()) {
-            Some(MemberState::Mismatched(m)) => {
-                metrics::counter!("coordinode_version_refused_writes_total").increment(1);
-                Err(ProposalError::Mismatched(m))
-            }
-            _ => Ok(()),
+        if let Some(MemberState::Mismatched(m)) = self.version.as_ref().map(|g| g.state()) {
+            metrics::counter!("coordinode_version_refused_writes_total").increment(1);
+            return Err(ProposalError::Mismatched(m));
         }
+        if let Some(space) = &self.space {
+            space.admit().map_err(storage_to_proposal_err)?;
+        }
+        Ok(())
     }
 
     /// Create a pipeline that can wait for `w:1` / `w:N` through the log
@@ -363,6 +398,7 @@ impl RaftProposalPipeline {
             runtime: tokio::runtime::Handle::try_current().ok(),
             append_notifier: None,
             version: None,
+            space: None,
         }
     }
 
@@ -406,7 +442,7 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
-        self.check_version()?;
+        self.check_admission()?;
         {
             use openraft::rt::watch::WatchReceiver;
             let rx = self.raft.metrics();
@@ -448,7 +484,7 @@ impl RaftProposalPipeline {
         use openraft::rt::watch::WatchReceiver;
 
         check_proposal(proposal)?;
-        self.check_version()?;
+        self.check_admission()?;
         let mut metrics_rx = self.raft.metrics();
         let (members, majority) = {
             let m = metrics_rx.borrow_watched();
@@ -566,7 +602,7 @@ impl RaftProposalPipeline {
         proposal: &RaftProposal,
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
-        self.check_version()?;
+        self.check_admission()?;
         let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 

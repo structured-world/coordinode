@@ -26,18 +26,38 @@ pub struct RaftGrpcHandler {
     /// Refuses calls from members of another version before their payload
     /// is read.
     gate: Arc<VersionGate>,
+    /// While the disk is below its free-space reserve, entries and snapshots
+    /// from the leader are refused as unavailable, so the leader retries
+    /// later: consensus pauses here instead of failing a log fsync on a full
+    /// disk, which would stop it for good.
+    space: Arc<coordinode_storage::engine::space::SpaceGuard>,
 }
 
 impl RaftGrpcHandler {
     /// A handler for `raft`, staging received snapshots in `snapshot_dir`
-    /// (see [`crate::snapshot::snapshot_dir`]) and admitting calls through
-    /// `gate`.
-    pub fn new(raft: Arc<RaftInstance>, snapshot_dir: PathBuf, gate: Arc<VersionGate>) -> Self {
+    /// (see [`crate::snapshot::snapshot_dir`]), admitting calls through
+    /// `gate` and taking writes only while `space` has room.
+    pub fn new(
+        raft: Arc<RaftInstance>,
+        snapshot_dir: PathBuf,
+        gate: Arc<VersionGate>,
+        space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    ) -> Self {
         Self {
             raft,
             snapshot_dir,
             gate,
+            space,
         }
+    }
+
+    /// Refuse a call that would write the log or install a snapshot while
+    /// the disk is below its reserve. UNAVAILABLE: the leader backs off and
+    /// sends again once space is freed.
+    fn admit_write(&self) -> Result<(), Status> {
+        self.space
+            .admit()
+            .map_err(|e| Status::unavailable(e.to_string()))
     }
 
     /// Admit a call by its version record, or the status refusing it.
@@ -90,6 +110,11 @@ impl RaftService for RaftGrpcHandler {
     ) -> Result<Response<RaftPayload>, Status> {
         self.admit(&request)?;
         let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&request.into_inner().data)?;
+        // A heartbeat writes nothing and keeps this member following its
+        // leader; only entries wait for space.
+        if !req.entries.is_empty() {
+            self.admit_write()?;
+        }
 
         let resp = self
             .raft
@@ -112,7 +137,10 @@ impl RaftService for RaftGrpcHandler {
         // Deserialize incoming RaftPayload stream → AppendEntriesRequest stream
         let input_stream = input.filter_map(|result| async move {
             match result {
-                Ok(payload) => match rmp_serde::from_slice(&payload.data) {
+                Ok(payload) => match rmp_serde::from_slice::<
+                    openraft::raft::AppendEntriesRequest<TypeConfig>,
+                >(&payload.data)
+                {
                     Ok(req) => Some(req),
                     Err(e) => {
                         tracing::warn!("stream_append deserialize error: {e}");
@@ -125,6 +153,31 @@ impl RaftService for RaftGrpcHandler {
                 }
             }
         });
+
+        // Heartbeats pass while the disk is below its reserve; the first
+        // request carrying entries then ends the stream, and the reply stream
+        // ends with UNAVAILABLE so the leader backs off and sends again later.
+        let space = Arc::clone(&self.space);
+        let cut = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let cut_in = Arc::clone(&cut);
+        let input_stream = input_stream.take_while(move |req| {
+            let pass = req.entries.is_empty() || !space.is_paused();
+            if !pass {
+                cut_in.store(true, core::sync::atomic::Ordering::Release);
+            }
+            futures_util::future::ready(pass)
+        });
+        let no_space =
+            futures_util::stream::once(
+                async move { cut.load(core::sync::atomic::Ordering::Acquire) },
+            )
+            .filter_map(|cut| async move {
+                cut.then(|| {
+                    Err(Status::unavailable(
+                        "no space: this member takes no entries until disk space is freed",
+                    ))
+                })
+            });
 
         // Feed to openraft's stream_append — it handles everything
         let output = self.raft.stream_append(input_stream);
@@ -155,7 +208,9 @@ impl RaftService for RaftGrpcHandler {
             fatal.map(|fatal| Err(Status::unavailable(format!("raft stopped: {fatal}"))))
         });
 
-        Ok(self.answer(Box::pin(output_stream.chain(stopped)) as Self::StreamAppendStream))
+        Ok(self.answer(
+            Box::pin(output_stream.chain(stopped).chain(no_space)) as Self::StreamAppendStream
+        ))
     }
 
     async fn snapshot(
@@ -163,6 +218,7 @@ impl RaftService for RaftGrpcHandler {
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<RaftPayload>, Status> {
         self.admit(&request)?;
+        self.admit_write()?;
         let mut stream = request.into_inner();
 
         // ── Chunked snapshot protocol ──────────────────────────────

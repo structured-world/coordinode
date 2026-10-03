@@ -58,7 +58,48 @@ pub fn db_err_to_status(context: &str, err: DatabaseError) -> Status {
     if let Some(inner) = capacity_exhausted_inner(&err) {
         return capacity_exhausted_status(context, inner);
     }
+    if let Some(inner) = out_of_space_inner(&err) {
+        return out_of_space_status(context, inner);
+    }
     Status::internal(format!("{context}: {err}"))
+}
+
+/// Locate a `StorageError::OutOfSpace` in either shape a refused write
+/// surfaces in: a direct engine write, or the proposal pipeline's carry
+/// through the executor.
+fn out_of_space_inner(err: &DatabaseError) -> Option<&StorageError> {
+    let storage = match err {
+        DatabaseError::Storage(s) => s,
+        DatabaseError::Execution(coordinode_query::executor::runner::ExecutionError::Storage(
+            s,
+        )) => s,
+        _ => return None,
+    };
+    matches!(storage, StorageError::OutOfSpace { .. }).then_some(storage)
+}
+
+/// A write refused because the disk is below its free-space reserve:
+/// RESOURCE_EXHAUSTED with reason STORAGE_FULL. Reads go on; the write is
+/// retried once space is freed. Pre: `err` IS `StorageError::OutOfSpace`.
+fn out_of_space_status(context: &str, err: &StorageError) -> Status {
+    let StorageError::OutOfSpace {
+        path,
+        available_bytes,
+        min_free_bytes,
+    } = err
+    else {
+        return Status::internal(format!("{context}: {err}"));
+    };
+    error_details::status_with_reason(
+        tonic::Code::ResourceExhausted,
+        format!("{context}: {err}"),
+        error_details::Reason::StorageFull,
+        [
+            ("path", path.clone()),
+            ("available_bytes", available_bytes.to_string()),
+            ("min_free_bytes", min_free_bytes.to_string()),
+        ],
+    )
 }
 
 /// Locate a `StorageError::CapacityExhausted` anywhere in the
@@ -91,6 +132,9 @@ fn capacity_exhausted_inner(err: &DatabaseError) -> Option<&StorageError> {
 pub fn storage_err_to_status(context: &str, err: StorageError) -> Status {
     if matches!(err, StorageError::CapacityExhausted { .. }) {
         return capacity_exhausted_status(context, &err);
+    }
+    if matches!(err, StorageError::OutOfSpace { .. }) {
+        return out_of_space_status(context, &err);
     }
     Status::internal(format!("{context}: {err}"))
 }
@@ -175,6 +219,41 @@ mod db_err_to_status_tests {
         );
         assert!(status.message().contains("create_node"));
         assert!(status.message().contains("ep-hot"));
+    }
+
+    /// A write refused for disk space reaches the client as
+    /// RESOURCE_EXHAUSTED / STORAGE_FULL in both shapes it surfaces in,
+    /// with the numbers in the metadata and a retry floor.
+    #[test]
+    fn out_of_space_maps_to_resource_exhausted_storage_full() {
+        let refusal = || StorageError::OutOfSpace {
+            path: "/data".to_string(),
+            available_bytes: 100,
+            min_free_bytes: 1 << 30,
+        };
+        for err in [
+            DatabaseError::Storage(refusal()),
+            DatabaseError::Execution(coordinode_query::executor::runner::ExecutionError::Storage(
+                refusal(),
+            )),
+        ] {
+            let status = db_err_to_status("execute", err);
+            assert_eq!(status.code(), Code::ResourceExhausted);
+            assert!(
+                status.message().contains("no space"),
+                "{}",
+                status.message()
+            );
+            let details = tonic_types::StatusExt::get_error_details(&status);
+            let info = details.error_info().expect("error info");
+            assert_eq!(info.reason, "STORAGE_FULL");
+            assert_eq!(
+                info.metadata.get("available_bytes").map(String::as_str),
+                Some("100")
+            );
+            assert_eq!(info.metadata.get("path").map(String::as_str), Some("/data"));
+            assert!(details.retry_info().is_some(), "a retry floor is advised");
+        }
     }
 
     #[test]
