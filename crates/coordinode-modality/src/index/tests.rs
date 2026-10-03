@@ -307,8 +307,9 @@ fn compound_entries_are_told_apart_by_every_column() {
     );
 }
 
-/// The clear mutations cover every entry of the index, in both shapes, and
-/// no entry of another index.
+/// Clearing an index in a transaction removes every entry of the index, in
+/// both shapes, and no entry of another index, when the transaction
+/// commits and not before.
 #[test]
 fn clearing_an_index_removes_its_entries_only() {
     let fx = open_engine();
@@ -324,14 +325,15 @@ fn clearing_an_index_removes_its_entries_only() {
     enter(&store, &mut t, &other, &s("a"), id(3));
     commit(&mut t).unwrap();
 
-    for mutation in store.clear_mutations("i") {
-        let Mutation::RemoveRange { start, end, .. } = mutation else {
-            panic!("a clear is range tombstones");
-        };
-        fx.engine
-            .remove_range(Partition::Idx, &start, &end)
-            .unwrap();
-    }
+    let mut clear = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    store.clear_txn(&mut clear, "i").unwrap();
+    let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
+    assert_eq!(
+        store.scan_entry_ids(&mut t, &plain).unwrap(),
+        vec![id(1)],
+        "nothing is removed before the commit"
+    );
+    commit(&mut clear).unwrap();
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     assert!(store.scan_entry_ids(&mut t, &plain).unwrap().is_empty());

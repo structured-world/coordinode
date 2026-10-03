@@ -272,6 +272,14 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             let c = build_drop_index_clause(pair)?;
             clauses.push(Clause::DropIndex(c));
         }
+        Rule::create_constraint_clause => {
+            let c = build_create_constraint_clause(pair)?;
+            clauses.push(Clause::CreateConstraint(c));
+        }
+        Rule::drop_constraint_clause => {
+            let c = build_drop_constraint_clause(pair)?;
+            clauses.push(Clause::DropConstraint(c));
+        }
         Rule::alter_index_clause => {
             let mut name = String::new();
             let mut maintenance = None;
@@ -1684,6 +1692,118 @@ fn build_drop_index_clause(pair: Pair<'_, Rule>) -> Result<DropIndexClause, Pars
     }
 
     Ok(DropIndexClause { name })
+}
+
+/// Build `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE ...`.
+/// Every property reference must use the pattern's variable; existence and
+/// type constraints take one property.
+fn build_create_constraint_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::CreateConstraintClause, ParseError> {
+    use coordinode_core::schema::definition::ConstraintKind;
+
+    let mut name = None;
+    let mut if_not_exists = false;
+    let mut variable = String::new();
+    let mut label = String::new();
+    let mut references: Vec<(String, String)> = Vec::new();
+    let mut kind = None;
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            // The optional name precedes the pattern; the label follows it.
+            Rule::identifier if variable.is_empty() => name = Some(inner.as_str().to_string()),
+            Rule::identifier => label = inner.as_str().to_string(),
+            Rule::if_not_exists => if_not_exists = true,
+            Rule::variable => variable = inner.as_str().to_string(),
+            Rule::constraint_properties => {
+                for property in inner.into_inner() {
+                    let mut parts = property.into_inner();
+                    let owner = parts.next().map(|p| p.as_str().to_string());
+                    let key = parts.next().map(|p| p.as_str().to_string());
+                    if let (Some(owner), Some(key)) = (owner, key) {
+                        references.push((owner, key));
+                    }
+                }
+            }
+            Rule::constraint_predicate => {
+                for predicate in inner.into_inner() {
+                    kind = Some(match predicate.as_rule() {
+                        Rule::constraint_unique => ConstraintKind::Unique,
+                        Rule::constraint_not_null => ConstraintKind::NotNull,
+                        Rule::constraint_node_key => ConstraintKind::NodeKey,
+                        Rule::constraint_type => {
+                            let type_name = predicate
+                                .into_inner()
+                                .find(|p| p.as_rule() == Rule::constraint_type_name)
+                                .map(|p| p.as_str().to_string())
+                                .unwrap_or_default();
+                            let property_type =
+                                coordinode_core::schema::definition::PropertyType::from_type_name(
+                                    &type_name,
+                                )
+                                .ok_or_else(|| {
+                                    ParseError::Invalid(format!(
+                                        "CREATE CONSTRAINT: unknown property type '{type_name}'"
+                                    ))
+                                })?;
+                            ConstraintKind::Type(property_type)
+                        }
+                        // `IS` itself.
+                        _ => continue,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let kind =
+        kind.ok_or_else(|| ParseError::Invalid("CREATE CONSTRAINT requires an IS clause".into()))?;
+    let mut properties = Vec::with_capacity(references.len());
+    for (owner, key) in references {
+        if owner != variable {
+            return Err(ParseError::Invalid(format!(
+                "CREATE CONSTRAINT: '{owner}.{key}' does not refer to the constrained node '{variable}'"
+            )));
+        }
+        if properties.contains(&key) {
+            return Err(ParseError::Invalid(format!(
+                "CREATE CONSTRAINT: property '{key}' is named twice"
+            )));
+        }
+        properties.push(key);
+    }
+    let single = matches!(kind, ConstraintKind::NotNull | ConstraintKind::Type(_));
+    if single && properties.len() != 1 {
+        return Err(ParseError::Invalid(
+            "CREATE CONSTRAINT: an IS NOT NULL or type constraint takes exactly one property"
+                .into(),
+        ));
+    }
+    Ok(crate::cypher::ast::CreateConstraintClause {
+        name,
+        if_not_exists,
+        label,
+        properties,
+        kind,
+    })
+}
+
+/// Build `DROP CONSTRAINT name [IF EXISTS]`.
+fn build_drop_constraint_clause(
+    pair: Pair<'_, Rule>,
+) -> Result<crate::cypher::ast::DropConstraintClause, ParseError> {
+    let mut name = String::new();
+    let mut if_exists = false;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::identifier => name = inner.as_str().to_string(),
+            Rule::if_exists => if_exists = true,
+            _ => {}
+        }
+    }
+    Ok(crate::cypher::ast::DropConstraintClause { name, if_exists })
 }
 
 fn build_create_vector_index_clause(

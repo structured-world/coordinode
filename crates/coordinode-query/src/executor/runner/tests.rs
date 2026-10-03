@@ -421,6 +421,7 @@ fn make_ctx<'a>(
         foreach_scope: None,
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
+        label_schema_cache: std::collections::HashMap::new(),
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
@@ -5640,12 +5641,23 @@ fn drop_index_removes_from_registry() {
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let registry = crate::index::IndexRegistry::new();
 
-    // Pre-register an index.
-    let def = crate::index::IndexDefinition::btree("to_drop", "User", "age");
-    registry.register_in_memory(def);
-    assert!(registry.get("to_drop").is_some());
-
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    // DROP INDEX acts on the stored catalog, so the index is created the way
+    // a statement creates it.
+    execute_op(
+        &LogicalOp::CreateIndex {
+            name: "to_drop".to_string(),
+            label: "User".to_string(),
+            property: "age".to_string(),
+            unique: false,
+            sparse: false,
+            filter: None,
+            maintenance: None,
+        },
+        &mut ctx,
+    )
+    .expect("CREATE INDEX failed");
+    assert!(registry.get("to_drop").is_some());
 
     let result = execute_op(
         &LogicalOp::DropIndex {

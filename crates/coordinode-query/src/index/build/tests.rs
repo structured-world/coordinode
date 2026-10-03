@@ -2,7 +2,7 @@ use super::*;
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::write_concern::WriteConcern;
-use coordinode_modality::{IndexStore as _, LocalIndexStore};
+use coordinode_modality::LocalIndexStore;
 use coordinode_storage::engine::transaction::CommitContext;
 
 struct Fixture {
@@ -64,6 +64,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         interner: &fx.interner,
         shard_id: 1,
         own_open: 0,
+        definition_version: None,
     }
 }
 
@@ -186,5 +187,39 @@ fn a_page_that_read_a_changed_node_is_read_again() {
     assert!(
         lookup(&fx, &index, "alice@x").is_empty(),
         "the value the node no longer holds must not be indexed"
+    );
+}
+
+/// A build whose definition is dropped and created again before one of its
+/// pages commits stops, and that page writes no entry under the name the
+/// new definition now holds.
+#[test]
+fn a_page_of_a_replaced_definition_writes_nothing() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("alice@x"));
+
+    let store = LocalIndexStore::new(&fx.engine);
+    let index = IndexDefinition::btree("user_email", "User", "email");
+    store.put_definition(&index).expect("publish");
+    let published = store.definition_version(&index.name).expect("version");
+    assert!(published.is_some());
+
+    let mut build = backfill(&fx);
+    build.definition_version = published;
+    let mut first = true;
+    let err = build
+        .run(&index, &mut |txn| {
+            if std::mem::take(&mut first) {
+                // DROP and CREATE of the same name between the page's read and
+                // its commit.
+                store.put_definition(&index).expect("recreate");
+            }
+            commit(txn)
+        })
+        .expect_err("the definition moved");
+    assert!(matches!(err, BackfillError::Superseded), "{err:?}");
+    assert!(
+        lookup(&fx, &index, "alice@x").is_empty(),
+        "a page of the old build must not land under the new definition"
     );
 }

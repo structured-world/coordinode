@@ -2333,6 +2333,144 @@ fn create_index_does_not_shadow_create_node() {
     );
 }
 
+// --- CREATE CONSTRAINT / DROP CONSTRAINT DDL ---
+
+use coordinode_core::schema::definition::ConstraintKind;
+
+fn create_constraint(input: &str) -> crate::cypher::ast::CreateConstraintClause {
+    let q = parse_ok(input);
+    assert_eq!(q.clauses.len(), 1, "{input}");
+    match q.clauses.into_iter().next() {
+        Some(Clause::CreateConstraint(c)) => c,
+        other => panic!("expected CreateConstraint for {input:?}, got {other:?}"),
+    }
+}
+
+/// A named uniqueness constraint keeps its name, label and property.
+#[test]
+fn create_constraint_unique_named() {
+    let c =
+        create_constraint("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE");
+    assert_eq!(c.name.as_deref(), Some("user_email"));
+    assert!(!c.if_not_exists);
+    assert_eq!(c.label, "User");
+    assert_eq!(c.properties, vec!["email".to_string()]);
+    assert_eq!(c.kind, ConstraintKind::Unique);
+}
+
+/// The name is optional, and IF NOT EXISTS is recognised with or without it.
+#[test]
+fn create_constraint_unnamed_and_if_not_exists() {
+    let c = create_constraint(
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS NOT NULL",
+    );
+    assert_eq!(c.name, None);
+    assert!(c.if_not_exists);
+    assert_eq!(c.label, "User");
+    assert_eq!(c.kind, ConstraintKind::NotNull);
+
+    let c = create_constraint(
+        "create constraint user_email if not exists for (u:User) require u.email is unique",
+    );
+    assert_eq!(c.name.as_deref(), Some("user_email"));
+    assert!(c.if_not_exists);
+}
+
+/// A composite node key keeps the property order of the statement.
+#[test]
+fn create_constraint_composite_node_key() {
+    let c = create_constraint(
+        "CREATE CONSTRAINT person_key FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    );
+    assert_eq!(c.properties, vec!["first".to_string(), "last".to_string()]);
+    assert_eq!(c.kind, ConstraintKind::NodeKey);
+
+    let c = create_constraint("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.a, p.b) IS UNIQUE");
+    assert_eq!(c.properties, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(c.kind, ConstraintKind::Unique);
+}
+
+/// Both type spellings resolve through the shared type-name table.
+#[test]
+fn create_constraint_property_type() {
+    use coordinode_core::schema::definition::PropertyType;
+    let c = create_constraint("CREATE CONSTRAINT FOR (n:Item) REQUIRE n.qty IS :: INTEGER");
+    assert_eq!(c.kind, ConstraintKind::Type(PropertyType::Int));
+    let c = create_constraint("CREATE CONSTRAINT FOR (n:Item) REQUIRE n.name IS TYPED STRING");
+    assert_eq!(c.kind, ConstraintKind::Type(PropertyType::String));
+    let c = create_constraint("CREATE CONSTRAINT FOR (n:Item) REQUIRE n.at IS ::POINT");
+    assert_eq!(c.kind, ConstraintKind::Type(PropertyType::Geo));
+}
+
+/// An unknown type name is refused instead of being stored as a constraint
+/// nothing can satisfy.
+#[test]
+fn create_constraint_unknown_type_is_refused() {
+    let err = parse_err("CREATE CONSTRAINT FOR (n:Item) REQUIRE n.qty IS :: NUMBERISH");
+    assert!(
+        err.to_string()
+            .contains("unknown property type 'NUMBERISH'"),
+        "{err}"
+    );
+}
+
+/// A property reference must use the constrained node's variable.
+#[test]
+fn create_constraint_foreign_variable_is_refused() {
+    let err = parse_err("CREATE CONSTRAINT FOR (u:User) REQUIRE x.email IS UNIQUE");
+    assert!(
+        err.to_string()
+            .contains("'x.email' does not refer to the constrained node 'u'"),
+        "{err}"
+    );
+    let err = parse_err("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.a, q.b) IS NODE KEY");
+    assert!(err.to_string().contains("'q.b'"), "{err}");
+}
+
+/// Existence and type constraints take exactly one property; a key cannot
+/// name a property twice.
+#[test]
+fn create_constraint_property_count_is_checked() {
+    let err = parse_err("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.a, p.b) IS NOT NULL");
+    assert!(err.to_string().contains("exactly one property"), "{err}");
+    let err = parse_err("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.a, p.b) IS :: STRING");
+    assert!(err.to_string().contains("exactly one property"), "{err}");
+    let err = parse_err("CREATE CONSTRAINT FOR (p:Person) REQUIRE (p.a, p.a) IS NODE KEY");
+    assert!(err.to_string().contains("named twice"), "{err}");
+}
+
+/// Statements without the pattern or the predicate do not parse.
+#[test]
+fn create_constraint_incomplete_statements_are_refused() {
+    parse_err("CREATE CONSTRAINT c REQUIRE n.a IS UNIQUE");
+    parse_err("CREATE CONSTRAINT c FOR (n:L) REQUIRE n.a");
+    parse_err("CREATE CONSTRAINT c FOR (n) REQUIRE n.a IS UNIQUE");
+}
+
+#[test]
+fn drop_constraint_with_and_without_if_exists() {
+    let q = parse_ok("DROP CONSTRAINT user_email");
+    match &q.clauses[0] {
+        Clause::DropConstraint(c) => {
+            assert_eq!(c.name, "user_email");
+            assert!(!c.if_exists);
+        }
+        other => panic!("expected DropConstraint, got {other:?}"),
+    }
+    let q = parse_ok("DROP CONSTRAINT user_email IF EXISTS");
+    match &q.clauses[0] {
+        Clause::DropConstraint(c) => assert!(c.if_exists),
+        other => panic!("expected DropConstraint, got {other:?}"),
+    }
+}
+
+/// Constraint DDL keywords stay usable as ordinary identifiers elsewhere.
+#[test]
+fn constraint_keywords_do_not_shadow_identifiers() {
+    let q = parse_ok("MATCH (n:Constraint) RETURN n.require AS r, n.typed AS t");
+    assert_eq!(q.clauses.len(), 2);
+}
+
 #[test]
 fn subscript_access_on_function_call() {
     // labels(n)[0] → Subscript { expr: FunctionCall("labels", [Variable("n")]), index: Literal(0) }

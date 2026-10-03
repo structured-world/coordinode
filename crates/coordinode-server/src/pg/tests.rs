@@ -167,6 +167,39 @@ async fn invalid_sql_returns_error_not_disconnect() {
         .expect("connection still usable after error");
 }
 
+/// A node constraint violation carries the SQLSTATE PostgreSQL gives the same
+/// refusal: a missing required value is `23502 not_null_violation`, for a
+/// plain NOT NULL and a node key alike, and a value of another type than the
+/// constraint requires is `23514 check_violation`.
+#[test]
+fn constraint_violations_carry_their_postgres_sqlstate() {
+    use coordinode_core::schema::definition::{ConstraintKind, PropertyType};
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::ExecutionError;
+
+    let violation = |kind| {
+        DatabaseError::Execution(ExecutionError::ConstraintViolation {
+            constraint: "c".into(),
+            kind: Box::new(kind),
+            label: "T".into(),
+            property: "p".into(),
+            element_id: "0000000000001".into(),
+        })
+    };
+    assert_eq!(
+        super::sqlstate(&violation(ConstraintKind::NotNull)),
+        "23502"
+    );
+    assert_eq!(
+        super::sqlstate(&violation(ConstraintKind::NodeKey)),
+        "23502"
+    );
+    assert_eq!(
+        super::sqlstate(&violation(ConstraintKind::Type(PropertyType::Int))),
+        "23514"
+    );
+}
+
 /// A driver sees a duplicate key as `23505 unique_violation`, the code it
 /// branches on for exactly this, and a key change as `42P10`.
 /// Refusals a client retries carry the SQLSTATE a PostgreSQL driver retries

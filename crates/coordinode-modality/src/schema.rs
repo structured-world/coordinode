@@ -17,7 +17,7 @@
 
 use coordinode_core::schema::definition::{
     EDGE_TYPE_SCHEMA_KEY_PREFIX, EdgeTypeSchema, LabelSchema, decode_edge_type_schema_key_name,
-    encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    encode_constraint_name_key, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
     encode_label_current_revision_key, encode_label_schema_key,
 };
 use coordinode_storage::Guard;
@@ -169,6 +169,18 @@ pub trait SchemaStore {
     /// transaction's write buffer; applied atomically at commit.
     fn save_label_txn(&self, txn: &mut Transaction, schema: &LabelSchema) -> StoreResult<()>;
 
+    /// Persist a revision that requires nothing of a node the current one
+    /// does not (a constraint removed, or one moving from validating to
+    /// active), without checking the stored nodes against it: they satisfy
+    /// it because they satisfy the current one. A writer validated under the
+    /// current revision is still refused at its commit, the pointer having
+    /// moved; a concurrent change of the label's schema conflicts on it.
+    fn save_label_admitting_txn(
+        &self,
+        txn: &mut Transaction,
+        schema: &LabelSchema,
+    ) -> StoreResult<()>;
+
     /// Drop a label (DROP TABLE / DROP label) by tombstoning its
     /// current-revision pointer on the transaction. The body revisions are left
     /// in place but become unreachable, so the label resolves to "not declared"
@@ -202,6 +214,28 @@ pub trait SchemaStore {
     /// registered type with only a marker still has adjacency a reaper must
     /// clean, so unlike [`Self::list_edge_types`] this does not drop them.
     fn list_edge_type_names_engine(&self) -> StoreResult<Vec<String>>;
+
+    /// The label that holds the constraint `name`, read through the
+    /// transaction; `None` when no label has a constraint of that name.
+    fn constraint_label_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<String>>;
+
+    /// Record that `label` holds the constraint `name`, on the condition that
+    /// no label holds it when the transaction commits: of two statements
+    /// taking one name, one commits.
+    fn claim_constraint_name_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        label: &str,
+    ) -> StoreResult<()>;
+
+    /// Release the constraint name `name`, on the condition that its record
+    /// is still the one read now when the transaction commits.
+    fn release_constraint_name_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
 }
 
 /// CE single-shard implementation of [`SchemaStore`]. Operates
@@ -508,6 +542,29 @@ impl SchemaStore for LocalSchemaStore<'_> {
         Ok(())
     }
 
+    fn save_label_admitting_txn(
+        &self,
+        txn: &mut Transaction,
+        schema: &LabelSchema,
+    ) -> StoreResult<()> {
+        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
+            kind: "label schema",
+            message: format!("encode '{}': {e}", schema.name),
+        })?;
+        txn.put(
+            Partition::Schema,
+            &encode_label_schema_key(&schema.name, schema.schema_revision),
+            &body,
+        )?;
+        txn.put(
+            Partition::Schema,
+            &encode_label_current_revision_key(&schema.name),
+            &schema.schema_revision.to_be_bytes(),
+        )?;
+        txn.note_schema_change();
+        Ok(())
+    }
+
     fn drop_label_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
         let pointer_key = encode_label_current_revision_key(name);
         txn.delete(Partition::Schema, &pointer_key)?;
@@ -586,6 +643,42 @@ impl SchemaStore for LocalSchemaStore<'_> {
             }
         }
         Ok(types)
+    }
+
+    fn constraint_label_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> StoreResult<Option<String>> {
+        let Some(bytes) = txn.get(Partition::Schema, &encode_constraint_name_key(name))? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| StoreError::Decode {
+                kind: "constraint name",
+                message: format!("label of constraint '{name}': {e}"),
+            })
+    }
+
+    fn claim_constraint_name_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        label: &str,
+    ) -> StoreResult<()> {
+        let key = encode_constraint_name_key(name);
+        txn.expect_version(Partition::Schema, &key, None)?;
+        txn.put(Partition::Schema, &key, label.as_bytes())?;
+        Ok(())
+    }
+
+    fn release_constraint_name_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
+        let key = encode_constraint_name_key(name);
+        let version = self.engine.record_version(Partition::Schema, &key)?;
+        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.delete(Partition::Schema, &key)?;
+        Ok(())
     }
 }
 

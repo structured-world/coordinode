@@ -155,19 +155,28 @@ fn command_tag(query: &str) -> Tag {
 
 /// The SQLSTATE a PostgreSQL driver branches on for `error` (PostgreSQL
 /// documentation, Appendix A "PostgreSQL Error Codes"). A duplicate key is
-/// `23505 unique_violation`; changing a key column, which PostgreSQL permits
+/// `23505 unique_violation`, a missing required value `23502
+/// not_null_violation`, a value of another type than a constraint requires
+/// `23514 check_violation`; changing a key column, which PostgreSQL permits
 /// and this server does not, is `42P10 invalid_column_reference`. A write
 /// conflict is `40001 serialization_failure`, the class drivers retry the
 /// whole transaction on; write pressure is `53000 insufficient_resources`;
 /// a write that reached a follower is `25006 read_only_sql_transaction`, what
 /// a PostgreSQL standby answers. Everything else stays `XX000 internal_error`.
 fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
+    use coordinode_core::schema::definition::ConstraintKind;
     use coordinode_embed::db::DatabaseError;
     use coordinode_query::executor::runner::ExecutionError;
     match error {
         DatabaseError::Execution(
             ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
         ) => "23505",
+        DatabaseError::Execution(ExecutionError::ConstraintViolation { kind, .. })
+            if matches!(**kind, ConstraintKind::Type(_)) =>
+        {
+            "23514"
+        }
+        DatabaseError::Execution(ExecutionError::ConstraintViolation { .. }) => "23502",
         DatabaseError::Execution(ExecutionError::KeyImmutable { .. }) => "42P10",
         DatabaseError::TransactionConflict { .. }
         | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",

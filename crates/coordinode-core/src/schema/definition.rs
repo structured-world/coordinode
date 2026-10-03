@@ -105,6 +105,27 @@ pub enum PropertyType {
     Computed(ComputedSpec),
 }
 
+impl PropertyType {
+    /// The scalar type a DDL type name denotes, in the cypher, SQL or Neo4j
+    /// spelling, any case; `None` for an unknown name and for the types that
+    /// take parameters (vectors, arrays, computed properties).
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_uppercase().as_str() {
+            "BIGINT" | "INT" | "INTEGER" | "SMALLINT" => Self::Int,
+            "FLOAT" | "DOUBLE" | "REAL" => Self::Float,
+            "STRING" | "TEXT" | "VARCHAR" => Self::String,
+            "BOOL" | "BOOLEAN" => Self::Bool,
+            "TIMESTAMP" => Self::Timestamp,
+            "BLOB" => Self::Blob,
+            "BINARY" => Self::Binary,
+            "GEO" | "POINT" => Self::Geo,
+            "MAP" => Self::Map,
+            "DOCUMENT" => Self::Document,
+            _ => return None,
+        })
+    }
+}
+
 impl std::fmt::Display for PropertyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -334,6 +355,87 @@ pub struct LabelSchema {
     /// NodeId. Read through [`LabelSchema::table_key`].
     #[serde(default)]
     keyed_by_row_id: bool,
+
+    /// Named constraints on the nodes of this label, in creation order. Part
+    /// of the schema revision, so enabling one binds the revision that every
+    /// writer validated under. Read through [`LabelSchema::constraints`].
+    #[serde(default)]
+    constraints: Vec<NodeConstraint>,
+}
+
+/// What a node constraint requires of the properties it names.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConstraintKind {
+    /// No two nodes share the values; a node missing any of them is not
+    /// constrained.
+    Unique,
+    /// The property is present and not null.
+    NotNull,
+    /// Every property is present and not null, and no two nodes share the
+    /// values.
+    NodeKey,
+    /// A present, non-null value has this type.
+    Type(PropertyType),
+}
+
+impl std::fmt::Display for ConstraintKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unique => write!(f, "UNIQUE"),
+            Self::NotNull => write!(f, "NOT NULL"),
+            Self::NodeKey => write!(f, "NODE KEY"),
+            Self::Type(t) => write!(f, "TYPE {t}"),
+        }
+    }
+}
+
+/// Where a constraint is in its life.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConstraintState {
+    /// Published and enforced on every write, while its index is still being
+    /// validated against the stored data: the guarantee over that data is
+    /// not established yet. A constraint left here by an interrupted build
+    /// stays enforced until it is dropped.
+    Validating,
+    /// Validated against the stored data and enforced on every write.
+    Active,
+}
+
+/// A named constraint on the nodes whose primary label is the schema's label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeConstraint {
+    /// The constraint name, unique in the database. A uniqueness or key
+    /// constraint's index carries the same name.
+    pub name: String,
+    /// The constrained properties, in declaration order.
+    pub properties: Vec<String>,
+    /// What the constraint requires.
+    pub kind: ConstraintKind,
+    /// Where it is in its life.
+    pub state: ConstraintState,
+}
+
+impl NodeConstraint {
+    /// Whether every constrained property must be present and not null.
+    pub fn requires_presence(&self) -> bool {
+        matches!(self.kind, ConstraintKind::NotNull | ConstraintKind::NodeKey)
+    }
+
+    /// Whether the constraint owns the unique index named after it.
+    pub fn owns_index(&self) -> bool {
+        matches!(self.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
+    }
+
+    /// Whether the constraint checks each node on its own (presence or
+    /// type), as opposed to only across nodes through its index.
+    pub fn checks_each_node(&self) -> bool {
+        !matches!(self.kind, ConstraintKind::Unique)
+    }
+
+    /// Whether `other` requires the same thing of the same properties.
+    pub fn same_requirement(&self, other: &NodeConstraint) -> bool {
+        self.kind == other.kind && self.properties == other.properties
+    }
 }
 
 /// How a relational TABLE addresses its rows.
@@ -379,7 +481,35 @@ impl LabelSchema {
             primary_key: Vec::new(),
             storage_layout: StorageLayout::Row,
             keyed_by_row_id: false,
+            constraints: Vec::new(),
         }
+    }
+
+    /// The constraints on this label's nodes, in creation order.
+    pub fn constraints(&self) -> &[NodeConstraint] {
+        &self.constraints
+    }
+
+    /// The constraint named `name`, if this label has it.
+    pub fn constraint(&self, name: &str) -> Option<&NodeConstraint> {
+        self.constraints.iter().find(|c| c.name == name)
+    }
+
+    /// The constraint named `name`, to change its state.
+    pub fn constraint_mut(&mut self, name: &str) -> Option<&mut NodeConstraint> {
+        self.constraints.iter_mut().find(|c| c.name == name)
+    }
+
+    /// Add a constraint. The caller bumps the revision: a new constraint
+    /// changes what a write must satisfy.
+    pub fn add_constraint(&mut self, constraint: NodeConstraint) {
+        self.constraints.push(constraint);
+    }
+
+    /// Remove the constraint named `name`, returning it.
+    pub fn remove_constraint(&mut self, name: &str) -> Option<NodeConstraint> {
+        let at = self.constraints.iter().position(|c| c.name == name)?;
+        Some(self.constraints.remove(at))
     }
 
     /// How this label addresses its rows when it is a relational TABLE;
@@ -663,6 +793,16 @@ pub fn encode_label_schema_key(name: &str, revision: u64) -> Vec<u8> {
 pub fn encode_label_current_revision_key(name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(30 + name.len());
     key.extend_from_slice(b"schema:current_revision:label:");
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+/// Encode the key naming the label that holds a constraint:
+/// `schema:constraint:<name>`. Value: the label name, UTF-8. One key per
+/// name keeps constraint names unique across labels.
+pub fn encode_constraint_name_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(18 + name.len());
+    key.extend_from_slice(b"schema:constraint:");
     key.extend_from_slice(name.as_bytes());
     key
 }

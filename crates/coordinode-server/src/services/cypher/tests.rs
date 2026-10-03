@@ -2397,6 +2397,37 @@ fn a_key_change_maps_to_failed_precondition_with_the_column() {
     assert_eq!(info.metadata.get("column").map(String::as_str), Some("id"));
 }
 
+/// A write breaking a node constraint is FAILED_PRECONDITION /
+/// CONSTRAINT_VIOLATION, naming the constraint, what it requires, the label,
+/// the property and the node, with no retry advice.
+#[test]
+fn a_constraint_violation_maps_to_failed_precondition_with_the_constraint() {
+    use coordinode_core::schema::definition::{ConstraintKind, PropertyType};
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(
+        ExecutionError::ConstraintViolation {
+            constraint: "item_qty".into(),
+            kind: Box::new(ConstraintKind::Type(PropertyType::Int)),
+            label: "Item".into(),
+            property: "qty".into(),
+            element_id: "0000000000007".into(),
+        },
+    ));
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "CONSTRAINT_VIOLATION");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("constraint"), Some("item_qty"));
+    assert_eq!(meta("kind"), Some("TYPE INT"));
+    assert_eq!(meta("label"), Some("Item"));
+    assert_eq!(meta("property"), Some("qty"));
+    assert_eq!(meta("element_id"), Some("0000000000007"));
+    assert!(details.retry_info().is_none(), "terminal: no retry advice");
+}
+
 /// SNAPSHOT read pinned at `u64::MAX` sees everything ever committed: the
 /// inclusive pin saturates at the top instead of wrapping to an empty past.
 #[tokio::test]

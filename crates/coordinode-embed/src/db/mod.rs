@@ -1934,6 +1934,10 @@ impl Database {
             Some(&self.oracle),
             state,
         );
+        // Constraints judge each node as the whole transaction leaves it,
+        // not as one of its statements did.
+        let fields = self.fields.current()?;
+        coordinode_query::executor::runner::check_post_state(&mut txn, &self.engine, &fields)?;
         let wc = self.write_concern;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
             write_concern: &wc,
@@ -2745,6 +2749,7 @@ impl Database {
             foreach_scope: None,
             feedback_cache: Some(self.feedback_cache.clone()),
             schema_label_cache: std::collections::HashMap::new(),
+            label_schema_cache: std::collections::HashMap::new(),
             applied_watermark: None,
             read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(
             ),
@@ -3048,6 +3053,32 @@ impl Database {
         Ok(())
     }
 
+    /// Commit the catalog change `stage` makes in a transaction of its own,
+    /// through the write pipeline, so the conditions it states (record
+    /// versions, names that must be free) are decided at its commit.
+    fn commit_catalog(
+        &self,
+        stage: impl FnOnce(
+            &mut coordinode_storage::engine::transaction::Transaction<'_>,
+        ) -> Result<(), coordinode_modality::StoreError>,
+    ) -> Result<(), DatabaseError> {
+        use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+        let wc = self.write_concern;
+        let commit_ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: Some(self.pipeline.as_ref()),
+            id_gen: Some(&self.proposal_id_gen),
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        let mut txn = Transaction::begin(&self.engine, Some(&self.oracle), self.oracle.next());
+        stage(&mut txn)?;
+        txn.note_schema_change();
+        txn.commit(&commit_ctx)
+            .map_err(|e| DatabaseError::Other(format!("publish schema change: {e}")))?;
+        Ok(())
+    }
+
     /// A Schema put for `publish_schema`.
     fn schema_put(key: Vec<u8>, value: Vec<u8>) -> coordinode_core::txn::proposal::Mutation {
         coordinode_core::txn::proposal::Mutation::Put {
@@ -3168,14 +3199,16 @@ impl Database {
 
     /// Create the B-tree index `def` from the nodes already stored.
     ///
-    /// The definition is published as building, with range tombstones over
-    /// any entries left under its name, in one log entry; writers maintain
-    /// the index from then on while the backfill fills in the stored nodes;
-    /// the definition is then published as ready. A backfill that fails
-    /// withdraws a new index; an existing one being rebuilt (`on_failure`
-    /// [`FailedBuild::Keep`]) stays, marked failed, so its constraint still
-    /// holds for new writes while lookups stop using it. Returns the number
-    /// of nodes indexed.
+    /// The definition is published as building, with any entries left under
+    /// its name removed, in one catalog commit conditioned on the record it
+    /// replaces (none for a new index); writers maintain the index from then
+    /// on while the backfill fills in the stored nodes, every page bound to
+    /// the published record; the definition is then published as ready, on
+    /// the same condition. A backfill that fails withdraws a new index; an
+    /// existing one being rebuilt (`on_failure` [`FailedBuild::Keep`]) stays,
+    /// marked failed, so its constraint still holds for new writes while
+    /// lookups stop using it. The writers stop maintaining an index only once
+    /// its withdrawal is durable. Returns the number of nodes indexed.
     fn build_btree_index(
         &self,
         mut def: coordinode_query::index::IndexDefinition,
@@ -3183,8 +3216,10 @@ impl Database {
     ) -> Result<u64, DatabaseError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
         use coordinode_query::index::IndexState;
+        use coordinode_storage::engine::partition::Partition;
         let store = LocalIndexStore::new(&self.engine);
         let name = def.name.clone();
+        let key = def.schema_key();
         def.layout = ENTRY_LAYOUT;
         if def.maintenance.epoch == 0 {
             // A new index, or one from before maintenance bindings: it takes
@@ -3196,9 +3231,13 @@ impl Database {
             written: 0,
             estimated_total: 0,
         };
-        let mut publish = vec![store.definition_put_mutation(&def)?];
-        publish.extend(store.clear_mutations(&name));
-        self.publish_schema(publish)?;
+        let replaced = self.engine.record_version(Partition::Schema, &key)?;
+        self.commit_catalog(|txn| {
+            txn.expect_version(Partition::Schema, &key, replaced)?;
+            store.clear_txn(txn, &name)?;
+            store.put_definition_txn(txn, &def)
+        })?;
+        let definition_version = self.engine.record_version(Partition::Schema, &key)?;
         self.index_registry
             .register_published(&self.engine, def.clone())?;
 
@@ -3217,29 +3256,38 @@ impl Database {
             interner: &fields,
             shard_id: self.shard_id,
             own_open: 0,
+            definition_version,
         }
         .run(&def, &mut |txn| txn.commit(&commit_ctx).map(|_| ()));
 
         match built {
             Ok(indexed) => {
                 def.state = IndexState::Ready;
-                self.publish_schema(vec![store.definition_put_mutation(&def)?])?;
+                self.commit_catalog(|txn| {
+                    txn.expect_version(Partition::Schema, &key, definition_version)?;
+                    store.put_definition_txn(txn, &def)
+                })?;
                 self.index_registry.register_published(&self.engine, def)?;
                 Ok(indexed)
             }
             Err(e) => {
                 match on_failure {
                     FailedBuild::Withdraw => {
+                        self.commit_catalog(|txn| {
+                            txn.expect_version(Partition::Schema, &key, definition_version)?;
+                            store.delete_definition_txn(txn, &name)?;
+                            store.clear_txn(txn, &name)
+                        })?;
                         self.index_registry.unregister(&name);
-                        let mut withdraw = vec![store.definition_delete_mutation(&name)];
-                        withdraw.extend(store.clear_mutations(&name));
-                        self.publish_schema(withdraw)?;
                     }
                     FailedBuild::Keep => {
                         def.state = IndexState::Failed {
                             reason: e.to_string(),
                         };
-                        self.publish_schema(vec![store.definition_put_mutation(&def)?])?;
+                        self.commit_catalog(|txn| {
+                            txn.expect_version(Partition::Schema, &key, definition_version)?;
+                            store.put_definition_txn(txn, &def)
+                        })?;
                         self.index_registry.register_published(&self.engine, def)?;
                     }
                 }

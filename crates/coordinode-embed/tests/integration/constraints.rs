@@ -1,0 +1,801 @@
+//! Node constraint DDL end to end: `CREATE CONSTRAINT` / `DROP CONSTRAINT`
+//! through Cypher, the writes they refuse on every path, their activation
+//! against stored data and against writers in flight, and their survival
+//! across a restart.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use coordinode_core::graph::types::Value;
+use coordinode_core::schema::definition::{ConstraintKind, ConstraintState, PropertyType};
+use coordinode_core::txn::proposal::{
+    Mutation, ProposalError, ProposalOutcome, ProposalPipeline, RaftProposal,
+};
+use coordinode_embed::Database;
+use coordinode_embed::db::DatabaseError;
+use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+use coordinode_query::executor::row::Row;
+use coordinode_query::executor::runner::ExecutionError;
+
+fn open_db() -> (Database, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open db");
+    (db, dir)
+}
+
+/// The state of constraint `name` on `label` as stored.
+fn stored_state(db: &Database, label: &str, name: &str) -> Option<ConstraintState> {
+    LocalSchemaStore::new(db.engine())
+        .load_label(label)
+        .expect("load schema")
+        .and_then(|s| s.constraint(name).map(|c| c.state))
+}
+
+/// A pipeline that, while `refuse` is set, refuses every proposal deleting
+/// an index definition and applies everything else: a catalog commit that
+/// fails after the statement decided to make it.
+struct RefuseDefinitionDeletes {
+    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
+    refuse: Arc<AtomicBool>,
+}
+
+impl ProposalPipeline for RefuseDefinitionDeletes {
+    fn propose_and_wait(&self, proposal: &RaftProposal) -> Result<ProposalOutcome, ProposalError> {
+        let deletes_definition = proposal
+            .mutations
+            .iter()
+            .any(|m| matches!(m, Mutation::Delete { key, .. } if key.starts_with(b"schema:idx:")));
+        if deletes_definition && self.refuse.load(Ordering::SeqCst) {
+            return Err(ProposalError::Storage("definition delete refused".into()));
+        }
+        self.inner.propose_and_wait(proposal)
+    }
+}
+
+/// A database whose index-definition deletes are refused while the returned
+/// flag is set.
+fn open_db_refusing_definition_deletes() -> (Database, Arc<AtomicBool>, tempfile::TempDir) {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+    use coordinode_storage::engine::core::StorageEngine;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, oracle.clone()).expect("engine"));
+    let refuse = Arc::new(AtomicBool::new(false));
+    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(RefuseDefinitionDeletes {
+        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
+        refuse: Arc::clone(&refuse),
+    });
+    let db = Database::from_engine(dir.path(), engine, oracle, pipeline).expect("open db");
+    (db, refuse, dir)
+}
+
+fn count(db: &mut Database, query: &str) -> i64 {
+    let rows = db.execute_cypher(query).expect("count query");
+    match rows[0].get("c") {
+        Some(Value::Int(n)) => *n,
+        other => panic!("expected an integer count, got {other:?}"),
+    }
+}
+
+/// The constraint violation `result` must be, as (constraint, kind, property).
+fn expect_violation(result: Result<Vec<Row>, DatabaseError>) -> (String, ConstraintKind, String) {
+    match result {
+        Err(DatabaseError::Execution(ExecutionError::ConstraintViolation {
+            constraint,
+            kind,
+            property,
+            ..
+        })) => (constraint, *kind, property),
+        other => panic!("expected a constraint violation, got {other:?}"),
+    }
+}
+
+fn expect_unique_violation(result: Result<Vec<Row>, DatabaseError>) -> String {
+    match result {
+        Err(DatabaseError::Execution(ExecutionError::UniqueViolation { index, .. })) => index,
+        other => panic!("expected a unique violation, got {other:?}"),
+    }
+}
+
+// ── NOT NULL ─────────────────────────────────────────────────────────
+
+/// A node created without a required property is refused and nothing of the
+/// statement is stored.
+#[test]
+fn not_null_refuses_a_create_without_the_property() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("create constraint");
+
+    let (constraint, kind, property) =
+        expect_violation(db.execute_cypher("CREATE (u:User {name: 'a'})"));
+    assert_eq!(constraint, "user_email");
+    assert_eq!(kind, ConstraintKind::NotNull);
+    assert_eq!(property, "email");
+    // An explicit null is as missing as an absent property.
+    expect_violation(db.execute_cypher("CREATE (u:User {name: 'b', email: null})"));
+    assert_eq!(count(&mut db, "MATCH (u:User) RETURN count(u) AS c"), 0);
+
+    db.execute_cypher("CREATE (u:User {name: 'c', email: 'c@x'})")
+        .expect("a node with the property is accepted");
+    assert_eq!(count(&mut db, "MATCH (u:User) RETURN count(u) AS c"), 1);
+}
+
+/// SET to null and REMOVE of a required property are refused, and the stored
+/// value stays.
+#[test]
+fn not_null_refuses_set_null_and_remove() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("create constraint");
+    db.execute_cypher("CREATE (u:User {name: 'a', email: 'a@x'})")
+        .expect("create");
+
+    expect_violation(db.execute_cypher("MATCH (u:User) SET u.email = null"));
+    expect_violation(db.execute_cypher("MATCH (u:User) REMOVE u.email"));
+    expect_violation(db.execute_cypher("MATCH (u:User) SET u = {name: 'only'}"));
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:User) WHERE u.email = 'a@x' RETURN count(u) AS c"
+        ),
+        1
+    );
+    // Writes that keep the property are untouched by the constraint.
+    db.execute_cypher("MATCH (u:User) SET u.email = 'b@x', u.age = 3")
+        .expect("a write keeping the property");
+}
+
+/// A constraint judges the node as the transaction leaves it, not each step
+/// of building it: a node created bare and filled in by the same statement,
+/// or by a later statement of the same transaction, is accepted, and one
+/// left without the property at commit is refused.
+#[test]
+fn a_node_completed_before_commit_satisfies_the_constraint() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("create constraint");
+
+    db.execute_cypher("CREATE (u:User) SET u.email = 'a@x'")
+        .expect("created and completed in one statement");
+    db.execute_cypher("UNWIND [{email: 'b@x'}, {email: 'c@x'}] AS r CREATE (u:User) SET u = r")
+        .expect("the batch-create shape");
+
+    let txn = db.begin_transaction();
+    db.execute_in_transaction(txn, "CREATE (u:User {name: 'd'})", None)
+        .expect("incomplete inside the transaction");
+    db.execute_in_transaction(txn, "MATCH (u:User {name: 'd'}) SET u.email = 'd@x'", None)
+        .expect("completed by a later statement");
+    db.commit_transaction(txn).expect("complete at commit");
+
+    let txn = db.begin_transaction();
+    db.execute_in_transaction(txn, "CREATE (u:User {name: 'e'})", None)
+        .expect("incomplete inside the transaction");
+    let refused = db
+        .commit_transaction(txn)
+        .expect_err("still incomplete at commit");
+    assert!(refused.to_string().contains("violated"), "{refused}");
+
+    expect_violation(db.execute_cypher("CREATE (u:User) SET u.name = 'f'"));
+    assert_eq!(count(&mut db, "MATCH (u:User) RETURN count(u) AS c"), 4);
+}
+
+/// MERGE creating a node is a write like any other.
+#[test]
+fn not_null_applies_to_merge() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("create constraint");
+    expect_violation(db.execute_cypher("MERGE (u:User {name: 'm'})"));
+    db.execute_cypher("MERGE (u:User {name: 'm', email: 'm@x'})")
+        .expect("a merge carrying the property");
+    assert_eq!(count(&mut db, "MATCH (u:User) RETURN count(u) AS c"), 1);
+}
+
+/// A constraint holds in every schema mode, on properties the schema never
+/// declared: a VALIDATED label keeps them in its overflow map, a label
+/// without a schema is FLEXIBLE.
+#[test]
+fn not_null_holds_on_undeclared_properties_in_every_mode() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("ALTER LABEL Device SET SCHEMA VALIDATED")
+        .expect("validated");
+    db.execute_cypher("CREATE CONSTRAINT FOR (d:Device) REQUIRE d.serial IS NOT NULL")
+        .expect("constraint on a validated label");
+    expect_violation(db.execute_cypher("CREATE (d:Device {model: 'x'})"));
+    db.execute_cypher("CREATE (d:Device {model: 'x', serial: 's1'})")
+        .expect("an overflow property satisfies it");
+
+    db.execute_cypher("CREATE CONSTRAINT FOR (l:Log) REQUIRE l.at IS NOT NULL")
+        .expect("constraint on a label without a schema");
+    expect_violation(db.execute_cypher("CREATE (l:Log {msg: 'x'})"));
+    // The schema the constraint created keeps the label flexible: any other
+    // property is still accepted.
+    db.execute_cypher("CREATE (l:Log {msg: 'x', at: 1, anything: true})")
+        .expect("flexible label");
+}
+
+/// Enabling a constraint that a stored node already breaks fails, names the
+/// node, and leaves no constraint behind.
+#[test]
+fn creation_is_refused_when_a_stored_node_breaks_it() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (u:User {name: 'old'})")
+        .expect("create");
+    let err = db
+        .execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect_err("a stored node lacks the property");
+    let message = err.to_string();
+    assert!(message.contains("user_email"), "{message}");
+    assert!(message.contains("breaks it"), "{message}");
+
+    // Nothing was enabled: writes without the property still go through and
+    // the name is free.
+    db.execute_cypher("CREATE (u:User {name: 'new'})")
+        .expect("no constraint in force");
+    let rows = db
+        .execute_cypher("DROP CONSTRAINT user_email IF EXISTS")
+        .expect("drop if exists");
+    assert_eq!(rows[0].get("dropped"), Some(&Value::Bool(false)));
+}
+
+// ── Type ─────────────────────────────────────────────────────────────
+
+/// A type constraint refuses a value of another type and does not require
+/// the property.
+#[test]
+fn type_constraint_refuses_values_of_another_type() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT item_qty FOR (i:Item) REQUIRE i.qty IS :: INTEGER")
+        .expect("create constraint");
+
+    let (constraint, kind, property) =
+        expect_violation(db.execute_cypher("CREATE (i:Item {qty: 'many'})"));
+    assert_eq!(constraint, "item_qty");
+    assert_eq!(kind, ConstraintKind::Type(PropertyType::Int));
+    assert_eq!(property, "qty");
+    expect_violation(db.execute_cypher("CREATE (i:Item {qty: 1.5})"));
+
+    db.execute_cypher("CREATE (i:Item {qty: 3})")
+        .expect("an integer");
+    db.execute_cypher("CREATE (i:Item {name: 'no qty'})")
+        .expect("a type constraint does not require the property");
+    expect_violation(db.execute_cypher("MATCH (i:Item {qty: 3}) SET i.qty = 'three'"));
+    assert_eq!(count(&mut db, "MATCH (i:Item) RETURN count(i) AS c"), 2);
+}
+
+// ── UNIQUE / NODE KEY ────────────────────────────────────────────────
+
+/// A uniqueness constraint refuses a second holder of a value through the
+/// index it owns, and leaves nodes without the value unconstrained.
+#[test]
+fn unique_constraint_refuses_a_second_holder() {
+    let (mut db, _dir) = open_db();
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("create constraint");
+    assert_eq!(rows[0].get("created"), Some(&Value::Bool(true)));
+
+    db.execute_cypher("CREATE (u:User {email: 'a@x'})")
+        .expect("first holder");
+    let index = expect_unique_violation(db.execute_cypher("CREATE (u:User {email: 'a@x'})"));
+    assert_eq!(index, "user_email");
+    db.execute_cypher("CREATE (u:User {name: 'no email'})")
+        .expect("missing value");
+    db.execute_cypher("CREATE (u:User {name: 'no email either'})")
+        .expect("two nodes without the value do not collide");
+    assert_eq!(count(&mut db, "MATCH (u:User) RETURN count(u) AS c"), 3);
+}
+
+/// Stored duplicates refuse the constraint, and neither it nor its index is
+/// left behind.
+#[test]
+fn unique_creation_is_refused_on_stored_duplicates() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'a@x'}), (:User {email: 'a@x'})")
+        .expect("duplicates");
+    expect_unique_violation(
+        db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE"),
+    );
+    // The name is free for an index and for a constraint.
+    db.execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .expect("no index of that name remains");
+    db.execute_cypher("DROP INDEX user_email").expect("drop");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("no constraint of that name remains");
+}
+
+/// A node key requires every property and refuses a second holder of the
+/// combination; one shared column alone is fine.
+#[test]
+fn node_key_requires_every_property_and_a_distinct_combination() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE CONSTRAINT person_key FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    )
+    .expect("create constraint");
+
+    let (constraint, kind, property) =
+        expect_violation(db.execute_cypher("CREATE (p:Person {first: 'Ada'})"));
+    assert_eq!(constraint, "person_key");
+    assert_eq!(kind, ConstraintKind::NodeKey);
+    assert_eq!(property, "last");
+
+    db.execute_cypher("CREATE (p:Person {first: 'Ada', last: 'Lovelace'})")
+        .expect("first key");
+    db.execute_cypher("CREATE (p:Person {first: 'Ada', last: 'Byron'})")
+        .expect("one shared column is a different key");
+    let index = expect_unique_violation(
+        db.execute_cypher("CREATE (p:Person {first: 'Ada', last: 'Lovelace'})"),
+    );
+    assert_eq!(index, "person_key");
+    expect_violation(db.execute_cypher("MATCH (p:Person {last: 'Byron'}) REMOVE p.first"));
+    assert_eq!(count(&mut db, "MATCH (p:Person) RETURN count(p) AS c"), 2);
+}
+
+// ── DROP / names ─────────────────────────────────────────────────────
+
+/// Dropping a constraint lifts it and removes the index it owned.
+#[test]
+fn drop_constraint_lifts_it_and_its_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("unique");
+    db.execute_cypher("CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL")
+        .expect("not null");
+    db.execute_cypher("CREATE (u:User {name: 'a', email: 'a@x'})")
+        .expect("create");
+
+    let rows = db
+        .execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop unique");
+    assert_eq!(rows[0].get("dropped"), Some(&Value::Bool(true)));
+    db.execute_cypher("CREATE (u:User {name: 'b', email: 'a@x'})")
+        .expect("uniqueness lifted");
+    db.execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .expect("the owned index went with the constraint");
+
+    db.execute_cypher("DROP CONSTRAINT user_name")
+        .expect("drop not null");
+    db.execute_cypher("CREATE (u:User {email: 'c@x'})")
+        .expect("presence lifted");
+
+    let err = db
+        .execute_cypher("DROP CONSTRAINT user_name")
+        .expect_err("already dropped");
+    assert!(err.to_string().contains("not found"), "{err}");
+}
+
+/// The index a constraint owns can only go with the constraint.
+#[test]
+fn drop_index_refuses_an_index_a_constraint_owns() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("create constraint");
+    let err = db
+        .execute_cypher("DROP INDEX user_email")
+        .expect_err("owned index");
+    assert!(err.to_string().contains("belongs to constraint"), "{err}");
+    db.execute_cypher("CREATE (u:User {email: 'a@x'})")
+        .expect("create");
+    expect_unique_violation(db.execute_cypher("CREATE (u:User {email: 'a@x'})"));
+}
+
+/// Names are unique across labels and shared with indexes; IF NOT EXISTS
+/// turns a repeat into a no-op, and an unnamed constraint gets a name from
+/// what it constrains.
+#[test]
+fn names_and_if_not_exists() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT c1 FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("create");
+
+    let err = db
+        .execute_cypher("CREATE CONSTRAINT c1 FOR (o:Org) REQUIRE o.name IS NOT NULL")
+        .expect_err("name taken on another label");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT c1 IF NOT EXISTS FOR (o:Org) REQUIRE o.name IS NOT NULL")
+        .expect("if not exists");
+    assert_eq!(rows[0].get("created"), Some(&Value::Bool(false)));
+
+    let err = db
+        .execute_cypher("CREATE CONSTRAINT c2 FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect_err("equivalent constraint");
+    assert!(err.to_string().contains("equivalent"), "{err}");
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("equivalent with if not exists");
+    assert_eq!(rows[0].get("constraint"), Some(&Value::String("c1".into())));
+
+    let err = db
+        .execute_cypher("CREATE INDEX c1 ON :User(name)")
+        .expect_err("indexes and constraints share names");
+    assert!(err.to_string().contains("constraint named 'c1'"), "{err}");
+
+    let rows = db
+        .execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.age IS :: INTEGER")
+        .expect("unnamed");
+    assert_eq!(
+        rows[0].get("constraint"),
+        Some(&Value::String("User_age_type".into()))
+    );
+    db.execute_cypher("DROP CONSTRAINT User_age_type")
+        .expect("drop by the derived name");
+    let rows = db
+        .execute_cypher("DROP CONSTRAINT missing IF EXISTS")
+        .expect("if exists");
+    assert_eq!(rows[0].get("dropped"), Some(&Value::Bool(false)));
+}
+
+/// A COLUMNAR table's rows bypass the transaction a constraint binds, so it
+/// cannot take one.
+#[test]
+fn columnar_tables_refuse_constraints() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TABLE Trade (id BIGINT PRIMARY KEY, sym STRING) STORAGE COLUMNAR")
+        .expect("columnar table");
+    let err = db
+        .execute_cypher("CREATE CONSTRAINT FOR (t:Trade) REQUIRE t.sym IS NOT NULL")
+        .expect_err("columnar");
+    assert!(err.to_string().contains("COLUMNAR"), "{err}");
+}
+
+// ── Temporal, restart, concurrency ───────────────────────────────────
+
+/// Every version of a temporal node is held to the constraint.
+#[test]
+fn constraints_hold_on_temporal_versions() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE NODE TYPE Event TEMPORAL")
+        .expect("temporal label");
+    db.execute_cypher("ALTER LABEL Event SET SCHEMA FLEXIBLE")
+        .expect("flexible");
+    db.execute_cypher("CREATE CONSTRAINT FOR (e:Event) REQUIRE e.kind IS NOT NULL")
+        .expect("create constraint");
+    expect_violation(db.execute_cypher("CREATE (e:Event {valid_from: 1})"));
+    db.execute_cypher("CREATE (e:Event {valid_from: 1, kind: 'start'})")
+        .expect("a version carrying the property");
+    expect_violation(db.execute_cypher("MATCH (e:Event) SET e.kind = null"));
+}
+
+/// A constraint is part of the stored schema: it is in force after a
+/// restart.
+#[test]
+fn constraints_survive_a_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+            .expect("not null");
+        db.execute_cypher("CREATE CONSTRAINT user_key FOR (u:User) REQUIRE u.email IS UNIQUE")
+            .expect("unique");
+        db.execute_cypher("CREATE (u:User {email: 'a@x'})")
+            .expect("create");
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    expect_violation(db.execute_cypher("CREATE (u:User {name: 'x'})"));
+    expect_unique_violation(db.execute_cypher("CREATE (u:User {email: 'a@x'})"));
+}
+
+/// A writer that validated under the schema before the constraint and
+/// commits after it cannot slip a breaking node in: the constraint, whose
+/// scan could not see the uncommitted node, is enabled, and the writer's
+/// commit is refused because the schema it validated under is gone.
+#[test]
+fn a_writer_in_flight_cannot_slip_past_activation() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (u:User {email: 'seed@x'})")
+        .expect("seed");
+    let txn = db.begin_transaction();
+    db.execute_in_transaction(txn, "CREATE (u:User {name: 'late'})", None)
+        .expect("a write staged before the constraint");
+
+    db.execute_cypher("CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("the stored nodes satisfy it");
+    let refused = db
+        .commit_transaction(txn)
+        .expect_err("the write validated under the old schema");
+    assert!(
+        matches!(refused, DatabaseError::TransactionConflict { .. })
+            || refused.to_string().contains("no longer holds"),
+        "{refused}"
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (u:User) WHERE u.email IS NULL RETURN count(u) AS c"
+        ),
+        0
+    );
+    expect_violation(db.execute_cypher("CREATE (u:User {name: 'after'})"));
+}
+
+// ── Validation lifecycle ─────────────────────────────────────────────
+
+/// A uniqueness constraint whose validation was interrupted (a crash after
+/// it was published and before its backfill finished) stays validating:
+/// it is enforced, it is never taken as established, a repeat of the
+/// statement says so instead of reporting it in place, and DROP removes it
+/// and its index together.
+#[test]
+fn an_interrupted_validation_stays_validating_until_dropped() {
+    use coordinode_core::schema::definition::{
+        LabelSchema, NodeConstraint, SchemaMode, encode_constraint_name_key,
+    };
+    use coordinode_query::index::ops::{load_index_definition, save_index_definition};
+    use coordinode_query::index::{IndexDefinition, IndexState};
+    use coordinode_storage::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        // What the first commit of CREATE CONSTRAINT leaves: the constraint
+        // as validating, its index as building, the name taken.
+        let db = Database::open(dir.path()).expect("open");
+        let mut schema = LabelSchema::new_node_id("User");
+        schema.set_mode(SchemaMode::Flexible);
+        schema.add_constraint(NodeConstraint {
+            name: "user_email".into(),
+            properties: vec!["email".into()],
+            kind: ConstraintKind::Unique,
+            state: ConstraintState::Validating,
+        });
+        LocalSchemaStore::new(db.engine())
+            .save_label(&schema)
+            .expect("plant the schema");
+        let mut def = IndexDefinition::compound("user_email", "User", vec!["email".into()])
+            .unique()
+            .sparse()
+            .owned_by("user_email");
+        def.state = IndexState::Building {
+            written: 0,
+            estimated_total: 0,
+        };
+        save_index_definition(db.engine(), &def).expect("plant the index");
+        db.engine()
+            .put(
+                Partition::Schema,
+                &encode_constraint_name_key("user_email"),
+                b"User",
+            )
+            .expect("plant the name");
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Validating),
+        "a constraint whose validation never finished does not read as active"
+    );
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("first holder");
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+
+    let err = db
+        .execute_cypher(
+            "CREATE CONSTRAINT user_email IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE",
+        )
+        .expect_err("not reported as in place");
+    assert!(err.to_string().contains("did not finish"), "{err}");
+
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop");
+    assert_eq!(stored_state(&db, "User", "user_email"), None);
+    assert!(
+        load_index_definition(db.engine(), "user_email")
+            .expect("load")
+            .is_none(),
+        "the index went with the constraint"
+    );
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("uniqueness lifted");
+}
+
+/// A uniqueness constraint whose validation finished is stored as active.
+#[test]
+fn a_created_uniqueness_constraint_ends_active() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("seed");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("create");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+}
+
+/// Run `statement` on another thread while the backfill of the constraint
+/// it creates is held at its start by an older open transaction; `meanwhile`
+/// runs once the constraint is published as validating, then the older
+/// transaction ends and the build goes on. Returns the statement's outcome.
+fn create_while_held(
+    db: &Database,
+    statement: &str,
+    name: &str,
+    meanwhile: impl FnOnce(&Database),
+) -> Result<(), String> {
+    let held = db.begin_transaction();
+    std::thread::scope(|s| {
+        let build = s.spawn(|| db.execute_cypher_shared(statement, None, None, None, None));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while stored_state(db, "User", name) != Some(ConstraintState::Validating) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the constraint was never published as validating"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        meanwhile(db);
+        db.rollback_transaction(held)
+            .expect("end the older transaction");
+        build
+            .join()
+            .expect("the build thread")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Another change of the label's schema landing while a uniqueness
+/// constraint is validated survives the constraint's activation, and both
+/// hold afterwards.
+#[test]
+fn a_schema_change_during_validation_survives_activation() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'a@x', name: 'a'})")
+        .expect("seed");
+    create_while_held(
+        &db,
+        "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
+        "user_email",
+        |db| {
+            db.execute_cypher_shared(
+                "CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("a change landing during the validation");
+        },
+    )
+    .expect("the uniqueness constraint activates");
+
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+    assert_eq!(
+        stored_state(&db, "User", "user_name"),
+        Some(ConstraintState::Active)
+    );
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})"));
+    expect_violation(db.execute_cypher("CREATE (:User {email: 'c@x'})"));
+}
+
+/// A constraint dropped while it is being validated is gone for good: the
+/// build stops without writing under the name, and nothing of either is
+/// left.
+#[test]
+fn a_constraint_dropped_during_validation_leaves_nothing() {
+    use coordinode_query::index::ops::load_index_definition;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("seed");
+    let outcome = create_while_held(
+        &db,
+        "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
+        "user_email",
+        |db| {
+            db.execute_cypher_shared("DROP CONSTRAINT user_email", None, None, None, None)
+                .expect("drop during the validation");
+        },
+    );
+    assert!(outcome.is_err(), "the superseded build fails: {outcome:?}");
+
+    assert_eq!(stored_state(&db, "User", "user_email"), None);
+    assert!(
+        load_index_definition(db.engine(), "user_email")
+            .expect("load")
+            .is_none()
+    );
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("no uniqueness is left behind");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.name IS NOT NULL")
+        .expect_err("stored nodes lack a name");
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS NOT NULL")
+        .expect("the name is free");
+}
+
+/// A build that fails over stored duplicates and whose withdrawal is then
+/// refused keeps the index it published maintained and enforced: in force
+/// here exactly as it is stored, not dropped from memory ahead of a commit
+/// that never landed.
+#[test]
+fn a_refused_withdrawal_keeps_the_published_index_enforced() {
+    use coordinode_query::index::ops::load_index_definition;
+    let (mut db, refuse, _dir) = open_db_refusing_definition_deletes();
+    db.execute_cypher("CREATE (:User {email: 'same'}), (:User {email: 'same'})")
+        .expect("duplicates");
+    refuse.store(true, Ordering::SeqCst);
+    let err = db
+        .execute_cypher("CREATE UNIQUE INDEX user_email ON :User(email)")
+        .expect_err("duplicates");
+    assert!(err.to_string().contains("was not withdrawn"), "{err}");
+    assert!(
+        load_index_definition(db.engine(), "user_email")
+            .expect("load")
+            .is_some(),
+        "the definition is still stored"
+    );
+    db.execute_cypher("CREATE (:User {email: 'new'})")
+        .expect("first holder");
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'new'})"));
+
+    refuse.store(false, Ordering::SeqCst);
+    db.execute_cypher("DROP INDEX user_email").expect("drop");
+    db.execute_cypher("CREATE (:User {email: 'new'})")
+        .expect("withdrawn now");
+}
+
+/// A DROP CONSTRAINT whose commit is refused changes nothing: the
+/// constraint and its index stay in force.
+#[test]
+fn a_refused_drop_keeps_the_constraint_in_force() {
+    let (mut db, refuse, _dir) = open_db_refusing_definition_deletes();
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("create");
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("first holder");
+
+    refuse.store(true, Ordering::SeqCst);
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect_err("the commit is refused");
+    assert_eq!(
+        stored_state(&db, "User", "user_email"),
+        Some(ConstraintState::Active)
+    );
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+
+    refuse.store(false, Ordering::SeqCst);
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop");
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("lifted");
+}
+
+/// A node set to a document under a nested path breaks a type constraint on
+/// that property as the transaction leaves it, while a later plain SET in
+/// the same statement that restores the type is accepted.
+#[test]
+fn a_nested_write_is_judged_by_the_state_it_leaves() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE CONSTRAINT item_qty FOR (i:Item) REQUIRE i.qty IS :: INTEGER")
+        .expect("create");
+    db.execute_cypher("CREATE (:Item {name: 'a', qty: 1})")
+        .expect("seed");
+    expect_violation(db.execute_cypher("MATCH (i:Item) SET i.qty.unit = 'kg'"));
+    db.execute_cypher("MATCH (i:Item) SET i.qty.unit = 'kg', i.qty = 2")
+        .expect("restored before the commit");
+    assert_eq!(
+        count(
+            &mut db,
+            "MATCH (i:Item) WHERE i.qty = 2 RETURN count(i) AS c"
+        ),
+        1
+    );
+}

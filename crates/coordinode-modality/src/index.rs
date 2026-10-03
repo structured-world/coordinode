@@ -31,7 +31,7 @@ use coordinode_core::index::encoding::{
     decode_index_entry, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
     legacy_index_prefix, unique_index_prefix,
 };
-use coordinode_core::txn::proposal::{Mutation, PartitionId};
+use coordinode_core::txn::proposal::Mutation;
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -125,20 +125,14 @@ pub trait IndexStore {
         index: &IndexDefinition,
     ) -> StoreResult<Vec<NodeId>>;
 
-    /// The mutations removing every entry of the index `name`, of both
-    /// shapes: one range tombstone each.
-    fn clear_mutations(&self, name: &str) -> Vec<Mutation>;
-
-    /// The mutation storing `def` in the catalog, for DDL that commits it in
-    /// one log entry with other effects.
+    /// Stage the removal of every entry of the index `name`, of both shapes,
+    /// with the transaction's commit: for DDL that drops or replaces the
+    /// definition in the same commit, which fences every writer bound to it.
     ///
     /// # Errors
     ///
-    /// An encoding failure.
-    fn definition_put_mutation(&self, def: &IndexDefinition) -> StoreResult<Mutation>;
-
-    /// The mutation removing the definition `name` from the catalog.
-    fn definition_delete_mutation(&self, name: &str) -> Mutation;
+    /// A storage failure in legacy (no-MVCC) mode, which removes at once.
+    fn clear_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
 
     /// Apply one unit of mutations straight to the engine as one batch, for a
     /// context that has no log to replicate them through.
@@ -236,6 +230,20 @@ pub trait IndexStore {
     ///
     /// A storage failure.
     fn definition_version(&self, name: &str) -> StoreResult<Option<u64>>;
+
+    /// Write the transaction only while the definition record of `name` is
+    /// at `version` when it commits (`None`: while no definition holds the
+    /// name), so DDL and builds act on the definition they inspected.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn expect_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
 }
 
 /// CE implementation of [`IndexStore`].
@@ -457,31 +465,11 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(out)
     }
 
-    fn clear_mutations(&self, name: &str) -> Vec<Mutation> {
-        [index_prefix(name), unique_index_prefix(name)]
-            .into_iter()
-            .map(|start| Mutation::RemoveRange {
-                partition: PartitionId::Idx,
-                end: prefix_end(&start),
-                start,
-            })
-            .collect()
-    }
-
-    fn definition_put_mutation(&self, def: &IndexDefinition) -> StoreResult<Mutation> {
-        Ok(Mutation::Put {
-            partition: PartitionId::Schema,
-            key: def.schema_key(),
-            value: rmp_serde::to_vec(def)
-                .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?,
-        })
-    }
-
-    fn definition_delete_mutation(&self, name: &str) -> Mutation {
-        Mutation::Delete {
-            partition: PartitionId::Schema,
-            key: definition_key(name),
+    fn clear_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
+        for start in [index_prefix(name), unique_index_prefix(name)] {
+            txn.remove_range(Partition::Idx, &start, &prefix_end(&start))?;
         }
+        Ok(())
     }
 
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()> {
@@ -580,6 +568,15 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(self
             .engine
             .record_version(Partition::Schema, &definition_key(name))?)
+    }
+
+    fn expect_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        Ok(txn.expect_version(Partition::Schema, &definition_key(name), version)?)
     }
 }
 

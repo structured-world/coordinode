@@ -376,6 +376,81 @@ ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED     -- default for new indexes
 - An unknown option, or a profile other than `resolved` / `derived`, is
   refused.
 
+#### CREATE CONSTRAINT / DROP CONSTRAINT ✅
+
+Named constraints on the nodes of a label.
+
+```cypher
+CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE
+CREATE CONSTRAINT FOR (u:User) REQUIRE u.email IS NOT NULL
+CREATE CONSTRAINT person_key FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY
+CREATE CONSTRAINT item_qty FOR (i:Item) REQUIRE i.qty IS :: INTEGER
+CREATE CONSTRAINT item_name IF NOT EXISTS FOR (i:Item) REQUIRE i.name IS TYPED STRING
+DROP CONSTRAINT user_email
+DROP CONSTRAINT user_email IF EXISTS
+```
+
+| Requirement | Properties | A node breaks it when |
+|-------------|------------|-----------------------|
+| `IS UNIQUE` | one or more | another node of the label holds the same values; a node missing any of them is not constrained |
+| `IS NOT NULL` | one | the property is missing or null |
+| `IS NODE KEY` | one or more | any property is missing or null, or another node holds the same values |
+| `IS :: <type>` / `IS TYPED <type>` | one | the property holds a value of another type; a missing property is allowed |
+
+Type names: `INTEGER` / `INT` / `BIGINT`, `FLOAT`, `STRING`, `BOOLEAN`,
+`TIMESTAMP`, `BLOB`, `BINARY`, `POINT` / `GEO`, `MAP`, `DOCUMENT`. A value
+must have exactly that type: a float is not an `INTEGER`.
+
+- **Every write path.** `CREATE`, `MERGE`, `SET`, `REMOVE`, `SET n = {...}`,
+  nested-path `SET n.a.b = ...`, `MERGE NODES`, document operations, SQL and
+  the gRPC write services are held to the same constraints, in every schema
+  mode (`STRICT`, `VALIDATED`, `FLEXIBLE`) and on properties the schema never
+  declared. Every version of a temporal node is held to them.
+- **Judged at commit.** A node is checked as the transaction leaves it, not
+  at each step of building it: `CREATE (u:User) SET u.email = $e` passes a
+  `NOT NULL` on `email`, and so does an interactive transaction that creates
+  the node in one statement and sets the property in a later one. A node
+  still breaking a constraint when the transaction commits fails the commit,
+  and nothing of the transaction is written.
+- **Violations.** A missing, null or mistyped value fails the statement with
+  `constraint ... violated`, naming the constraint, the label, the property
+  and the node; nothing of the statement is written (gRPC
+  `FAILED_PRECONDITION` with reason `CONSTRAINT_VIOLATION` and metadata
+  `constraint`, `kind`, `label`, `property`, `element_id`; SQLSTATE `23502`,
+  or `23514` for a type, over the PostgreSQL wire). A second holder of a
+  unique or key value fails as a unique index does: `unique constraint
+  violated`, gRPC `DUPLICATE_KEY`, SQLSTATE `23505`.
+- **Creating over stored data.** `CREATE CONSTRAINT` checks every stored node
+  of the label before it returns. A node that breaks it fails the statement,
+  naming that node, and nothing is created. A transaction that wrote a node of
+  the label before the constraint existed and commits after it is refused at
+  commit; retried, it runs under the constraint.
+- **Index.** A `UNIQUE` or `NODE KEY` constraint owns a unique index with the
+  constraint's name. It answers lookups like any index; `DROP INDEX` refuses
+  it, `DROP CONSTRAINT` removes it together with the constraint.
+- **Validating.** A `UNIQUE` or `NODE KEY` constraint is published as
+  validating, and enforced on every write from then on, while its index is
+  built over the stored nodes; it becomes active when the build finishes.
+  Stored duplicates fail the statement and remove both. A build cut short
+  (the server stopped mid-way) leaves the constraint validating and still
+  enforced; `CREATE CONSTRAINT ... IF NOT EXISTS` then fails saying the
+  validation did not finish, and `DROP CONSTRAINT` followed by a new
+  `CREATE CONSTRAINT` validates it again. While a presence or type
+  constraint is created, the commit checks every stored node of the label
+  with writes to that label held back for the duration of the scan.
+- **Names.** Constraint and index names share one namespace across all
+  labels. A constraint created without a name is named
+  `<Label>_<properties>_<unique|not_null|node_key|type>`. `IF NOT EXISTS`
+  makes the statement a no-op (`created` is `false`) when a constraint of
+  that name, or one with the same requirement on the same properties of the
+  label, exists. `DROP CONSTRAINT ... IF EXISTS` returns `dropped: false` for
+  a missing constraint; without it, a missing one fails.
+- **Results.** `CREATE CONSTRAINT` returns `constraint`, `label`,
+  `properties`, `kind` and `created`, plus `nodes_indexed` for a unique or key
+  constraint. `DROP CONSTRAINT` returns the same columns with `dropped`.
+- A `COLUMNAR` table cannot take a constraint: its rows are written outside
+  the transaction a constraint is enforced in.
+
 #### CREATE VECTOR INDEX / DROP VECTOR INDEX ✅
 
 HNSW approximate nearest-neighbor index.

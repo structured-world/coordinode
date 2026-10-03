@@ -34,6 +34,7 @@ clause = {
   | create_text_index_clause
   | create_vector_index_clause
   | create_index_clause
+  | create_constraint_clause
   | create_edge_type_clause
   | create_node_type_clause
   | create_table_clause
@@ -58,6 +59,7 @@ clause = {
   | drop_text_index_clause
   | drop_vector_index_clause
   | drop_index_clause
+  | drop_constraint_clause
   | delete_clause
   | set_clause
   | remove_clause
@@ -252,6 +254,35 @@ index_option  = { identifier ~ ":" ~ string_literal }
 
 // DROP INDEX idx_name
 drop_index_clause = { kw_drop ~ kw_index ~ identifier }
+
+// --- CREATE/DROP CONSTRAINT (node constraints) ---
+//
+//   CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+//     REQUIRE n.p | (n.p, n.q, ...)
+//     IS UNIQUE | IS NOT NULL | IS NODE KEY | IS :: TYPE | IS TYPED TYPE
+//   DROP CONSTRAINT name [IF EXISTS]
+//
+// The name is optional, so it may not be one of the words that follow it.
+create_constraint_clause = {
+    kw_create ~ kw_constraint ~ (!(kw_if | kw_for) ~ identifier)? ~ if_not_exists?
+    ~ kw_for ~ "(" ~ variable ~ ":" ~ identifier ~ ")"
+    ~ kw_require ~ constraint_properties ~ constraint_predicate
+}
+if_not_exists          = { kw_if ~ kw_not ~ kw_exists }
+constraint_properties  = { constraint_property | "(" ~ constraint_property ~ ("," ~ constraint_property)* ~ ")" }
+constraint_property    = { variable ~ "." ~ identifier }
+constraint_predicate   = {
+    kw_is ~ (constraint_unique | constraint_not_null | constraint_node_key | constraint_type)
+}
+constraint_unique      = { kw_unique }
+constraint_not_null    = { kw_not ~ kw_null }
+constraint_node_key    = { kw_node ~ kw_key }
+constraint_type        = { ("::" | kw_typed) ~ constraint_type_name }
+// Any type word (cypher, SQL or Neo4j spelling); resolved when built.
+constraint_type_name   = @{ ASCII_ALPHA+ ~ !(ASCII_ALPHANUMERIC | "_") }
+
+drop_constraint_clause = { kw_drop ~ kw_constraint ~ identifier ~ if_exists? }
+if_exists              = { kw_if ~ kw_exists }
 
 // ALTER INDEX idx_name SET MAINTENANCE RESOLVED | DERIVED | INHERIT
 alter_index_clause = { kw_alter ~ kw_index ~ identifier ~ kw_set ~ kw_maintenance ~ index_maintenance }
@@ -992,6 +1023,11 @@ kw_enable      = @{ ^"enable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_disable     = @{ ^"disable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_maintenance = @{ ^"maintenance" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_namespace   = @{ ^"namespace" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_constraint  = @{ ^"constraint" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_require     = @{ ^"require" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_if          = @{ ^"if" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_for         = @{ ^"for" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_typed       = @{ ^"typed" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

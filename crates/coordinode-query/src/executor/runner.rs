@@ -240,6 +240,29 @@ pub enum ExecutionError {
         element_id: String,
     },
 
+    /// A write would leave a node breaking a constraint of its label: a
+    /// required property missing or null, or a value of the wrong type.
+    /// Nothing was written.
+    #[error(
+        "constraint `{constraint}` ({kind}) violated on :{label}: property `{property}` of node \
+         {element_id} {}",
+        constraint_problem(kind)
+    )]
+    ConstraintViolation {
+        /// The constraint.
+        constraint: String,
+        /// What it requires: presence (`NOT NULL`, `NODE KEY`) or a type.
+        /// Boxed: a property type is large, and every result carries this
+        /// error's size.
+        kind: Box<coordinode_core::schema::definition::ConstraintKind>,
+        /// The constrained label.
+        label: String,
+        /// The property that breaks it.
+        property: String,
+        /// The elementId of the node.
+        element_id: String,
+    },
+
     /// A statement tried to change the key of an existing row. A row's key is
     /// its identity and does not change; delete the row and insert a new one.
     #[error(
@@ -295,6 +318,95 @@ impl KeyClaims {
 impl From<crate::index::UniqueViolation> for ExecutionError {
     fn from(v: crate::index::UniqueViolation) -> Self {
         unique_violation(v)
+    }
+}
+
+/// The refusal of a write that leaves `node` breaking a constraint of
+/// `label`. Any other validation error is a schema violation.
+fn constraint_violation(
+    e: coordinode_core::schema::validation::ValidationError,
+    label: &str,
+    node: NodeId,
+) -> ExecutionError {
+    use coordinode_core::schema::validation::ValidationError;
+    match e {
+        ValidationError::ConstraintViolation {
+            constraint,
+            kind,
+            property,
+        } => ExecutionError::ConstraintViolation {
+            constraint,
+            kind: Box::new(kind),
+            label: label.to_string(),
+            property,
+            element_id: node.to_element_id(),
+        },
+        other => ExecutionError::SchemaViolation(other.to_string()),
+    }
+}
+
+/// Check every node `txn` recorded for a post-state check against the
+/// presence and type constraints of its primary label, as the transaction
+/// leaves it: its buffered record with its pending document deltas applied.
+/// Called once, right before the commit, so a node built up over several
+/// writes or statements is judged as it lands, never mid-way. Reading each
+/// label's schema binds the commit to the revision checked against.
+///
+/// # Errors
+///
+/// The first node that breaks a constraint, or a read that failed.
+pub fn check_post_state(
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    engine: &StorageEngine,
+    interner: &FieldInterner,
+) -> Result<(), ExecutionError> {
+    use coordinode_core::graph::node::{decode_node_key, decode_temporal_node_key};
+    use coordinode_modality::{LocalNodeStore, LocalSchemaStore, SchemaStore as _};
+    let mut keys = txn.take_post_state_checks();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let store = LocalSchemaStore::new(engine);
+    let mut schemas: HashMap<String, Option<LabelSchema>> = HashMap::new();
+    for key in keys {
+        let Some(record) = LocalNodeStore::post_state(txn, &key)? else {
+            continue;
+        };
+        let label = record.primary_label();
+        if label.is_empty() {
+            continue;
+        }
+        if !schemas.contains_key(label) {
+            let schema = store.load_label_txn(txn, label)?;
+            schemas.insert(label.to_string(), schema);
+        }
+        let Some(Some(schema)) = schemas.get(label) else {
+            continue;
+        };
+        let lookup = crate::index::registry::record_lookup(&record, interner);
+        if let Err(e) = coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
+        {
+            let node = decode_node_key(&key)
+                .map(|(_, node)| node)
+                .or_else(|| decode_temporal_node_key(&key).map(|(_, node, _)| node))
+                .ok_or_else(|| {
+                    ExecutionError::Serialization("a recorded node key does not decode".into())
+                })?;
+            return Err(constraint_violation(e, label, node));
+        }
+    }
+    Ok(())
+}
+
+/// What is wrong with a property that breaks a constraint of `kind`.
+fn constraint_problem(kind: &coordinode_core::schema::definition::ConstraintKind) -> &'static str {
+    match kind {
+        coordinode_core::schema::definition::ConstraintKind::Type(_) => {
+            "has a value of another type"
+        }
+        _ => "is missing or null",
     }
 }
 
@@ -838,6 +950,11 @@ pub struct ExecutionContext<'a> {
     /// changes the primary label after node creation), so the cache is always
     /// valid for the lifetime of the statement. No invalidation required.
     pub schema_label_cache: HashMap<NodeId, String>,
+    /// Per-statement cache: label → its schema, `None` for a label without
+    /// one. Read on the first node write of a label, which binds the
+    /// statement's commit to that schema revision; dropped for a label whose
+    /// schema the statement changes.
+    pub label_schema_cache: HashMap<String, Option<LabelSchema>>,
     /// Named query parameters bound to this statement.
     ///
     /// Populated before `execute()` is called. Accessible inside aggregate
@@ -1295,6 +1412,7 @@ impl<'a> ExecutionContext<'a> {
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
         self.sync_txn_state();
+        self.label_schema_cache.remove(&schema.name);
         Ok(LocalSchemaStore::new(self.engine).save_label_txn(&mut self.txn, schema)?)
     }
 
@@ -1303,7 +1421,16 @@ impl<'a> ExecutionContext<'a> {
     pub fn drop_current_label_schema(&mut self, name: &str) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
         self.sync_txn_state();
+        self.label_schema_cache.remove(name);
         Ok(LocalSchemaStore::new(self.engine).drop_label_txn(&mut self.txn, name)?)
+    }
+
+    /// The label holding the constraint `name`, or `None` when no label has
+    /// a constraint of that name.
+    pub fn constraint_label(&mut self, name: &str) -> Result<Option<String>, ExecutionError> {
+        use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+        self.sync_txn_state();
+        Ok(LocalSchemaStore::new(self.engine).constraint_label_txn(&mut self.txn, name)?)
     }
 
     /// MVCC-aware delete: buffers tombstone in write_buffer for atomic flush.
@@ -1626,11 +1753,13 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// Fill `index` from the stored nodes, one log entry per page through
-    /// this statement's commit path. Call once the index is registered with
-    /// the writers.
+    /// this statement's commit path, each page bound to the definition
+    /// record at `definition_version`. Call once the index is registered
+    /// with the writers.
     pub fn backfill_index(
         &mut self,
         index: &crate::index::IndexDefinition,
+        definition_version: Option<u64>,
     ) -> Result<u64, crate::index::build::BackfillError> {
         let write_concern = self.write_concern;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
@@ -1647,6 +1776,7 @@ impl<'a> ExecutionContext<'a> {
             shard_id: self.shard_id,
             // This statement's own transaction is open throughout.
             own_open: 1,
+            definition_version,
         }
         .run(index, &mut |txn| txn.commit(&commit_ctx).map(|_| ()))
     }
@@ -1863,10 +1993,6 @@ impl<'a> ExecutionContext<'a> {
         Ok(Some(record))
     }
 
-    /// MVCC-aware typed node write. Buffers the put through
-    /// [`Self::mvcc_put`] (for atomic flush + RYOW visibility). Replaces
-    /// `encode_node_key + record.to_msgpack + mvcc_put` triples scattered
-    /// across CREATE / SET / UPDATE executors.
     /// Stage the planner-statistics counter deltas for a node row created
     /// with `record`'s labels (total +1, each label +1). Called at every
     /// site that also counts `write_stats.nodes_created`, so the counters
@@ -1883,6 +2009,11 @@ impl<'a> ExecutionContext<'a> {
         LocalStatsStore.node_deleted(&mut self.txn, record.labels.iter().map(String::as_str));
     }
 
+    /// MVCC-aware typed node write: buffers the put on the transaction for
+    /// atomic flush and RYOW visibility. Every node write passes here or
+    /// through its temporal and columnar twins, which is where a node of a
+    /// constrained label is recorded for the check of the state the
+    /// transaction leaves it in.
     pub fn mvcc_put_node(
         &mut self,
         shard_id: u16,
@@ -1892,8 +2023,54 @@ impl<'a> ExecutionContext<'a> {
         // Delegate to Layer-4 LocalNodeStore (owns key encoding + msgpack);
         // the put buffers on the transaction for atomic flush.
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        if self.label_checks_nodes(record.primary_label())? {
+            self.txn
+                .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
+                    shard_id, node_id,
+                ));
+        }
         self.sync_txn_state();
         Ok(LocalNodeStore.put(&mut self.txn, shard_id, node_id, record)?)
+    }
+
+    /// Whether `label` has a presence or type constraint, which every node
+    /// written under it is checked against before the commit. Reading the
+    /// label's schema binds this statement's commit to that revision, so a
+    /// constraint enabled meanwhile refuses the commit instead of missing
+    /// the write.
+    pub fn label_checks_nodes(&mut self, label: &str) -> Result<bool, ExecutionError> {
+        use coordinode_core::schema::definition::NodeConstraint;
+        if label.is_empty() {
+            return Ok(false);
+        }
+        if !self.label_schema_cache.contains_key(label) {
+            let schema = self.load_current_label_schema(label)?;
+            self.label_schema_cache.insert(label.to_string(), schema);
+        }
+        Ok(matches!(
+            self.label_schema_cache.get(label),
+            Some(Some(schema)) if schema.constraints().iter().any(NodeConstraint::checks_each_node)
+        ))
+    }
+
+    /// Refuse `record`, the state node `node_id` is stored in by a write that
+    /// lands at once, outside the transaction, when it breaks a presence or
+    /// type constraint of its primary label.
+    fn check_constraints_now(
+        &mut self,
+        node_id: NodeId,
+        record: &NodeRecord,
+    ) -> Result<(), ExecutionError> {
+        let label = record.primary_label();
+        if !self.label_checks_nodes(label)? {
+            return Ok(());
+        }
+        let Some(Some(schema)) = self.label_schema_cache.get(label) else {
+            return Ok(());
+        };
+        let lookup = crate::index::registry::record_lookup(record, self.interner);
+        coordinode_core::schema::validation::check_node_constraints(schema, &lookup)
+            .map_err(|e| constraint_violation(e, label, node_id))
     }
 
     /// Write a node record into a `STORAGE COLUMNAR` table's own tree.
@@ -1907,11 +2084,12 @@ impl<'a> ExecutionContext<'a> {
     /// un-flushed row is replayed on the next open (crash recovery); the
     /// per-statement flush bounds how much must be replayed.
     pub fn columnar_put_node(
-        &self,
+        &mut self,
         label: &str,
         node_id: NodeId,
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
+        self.check_constraints_now(node_id, record)?;
         let key = coordinode_core::graph::node::encode_node_key(self.shard_id, node_id);
         let bytes = record.to_msgpack().map_err(|e| {
             ExecutionError::Serialization(format!("columnar node {} encode: {e}", node_id.as_raw()))
@@ -2010,6 +2188,15 @@ impl<'a> ExecutionContext<'a> {
         record: &NodeRecord,
     ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        if self.label_checks_nodes(record.primary_label())? {
+            self.txn.note_post_state_check(
+                &coordinode_core::graph::node::encode_temporal_node_key(
+                    shard_id,
+                    node_id,
+                    valid_from_ms,
+                ),
+            );
+        }
         self.sync_txn_state();
         Ok(LocalNodeStore.put_temporal(&mut self.txn, shard_id, node_id, valid_from_ms, record)?)
     }
@@ -2408,9 +2595,27 @@ impl<'a> ExecutionContext<'a> {
     /// callers build it via `DocDelta::encode()`. Used by SET / REMOVE
     /// nested-path executors (e.g. `SET n.config.host = "x"`,
     /// `REMOVE n.tags[0]`).
-    pub fn mvcc_merge_node_delta(&mut self, shard_id: u16, node_id: NodeId, operand: Vec<u8>) {
+    ///
+    /// A document delta makes its root property a document whatever it held
+    /// before, so a node of a constrained label is recorded for the check of
+    /// the state the transaction leaves it in, as a whole write is.
+    pub fn mvcc_merge_node_delta(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+        operand: Vec<u8>,
+    ) -> Result<(), ExecutionError> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        if let Some(label) = self.schema_label_for_node(shard_id, node_id)? {
+            if self.label_checks_nodes(&label)? {
+                self.txn
+                    .note_post_state_check(&coordinode_core::graph::node::encode_node_key(
+                        shard_id, node_id,
+                    ));
+            }
+        }
         LocalNodeStore.buffer_node_delta(&mut self.txn, shard_id, node_id, operand);
+        Ok(())
     }
 
     /// MVCC-aware typed node delete. Buffers a tombstone for the
@@ -2453,6 +2658,8 @@ impl<'a> ExecutionContext<'a> {
         // locus: OCC validation, commit_ts assignment, write-concern
         // fan-out, and the Raft proposal pipeline all live in `Transaction`.
         self.sync_txn_state();
+        // Constraints judge each node as the statement leaves it.
+        check_post_state(&mut self.txn, self.engine, self.interner)?;
         // Asked before the commit drains the buffers, which is the only
         // moment the answer exists.
         let wrote = !self.txn.write_buffer_is_empty() || self.txn.has_pending_merges();
@@ -3888,6 +4095,25 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         ),
 
         LogicalOp::DropIndex { name } => execute_drop_btree_index(name, ctx),
+
+        LogicalOp::CreateConstraint {
+            name,
+            if_not_exists,
+            label,
+            properties,
+            kind,
+        } => execute_create_constraint(
+            name.as_deref(),
+            *if_not_exists,
+            label,
+            properties,
+            kind,
+            ctx,
+        ),
+
+        LogicalOp::DropConstraint { name, if_exists } => {
+            execute_drop_constraint(name, *if_exists, ctx)
+        }
 
         LogicalOp::AlterIndexMaintenance { name, profile } => {
             execute_alter_index_maintenance(name, *profile, ctx)
@@ -11325,7 +11551,7 @@ fn execute_update(
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
-                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
                     ctx.write_stats.properties_set += 1;
 
                     let path_str = path.join(".");
@@ -11441,7 +11667,7 @@ fn execute_update(
                     let operand = delta.encode().map_err(|e| {
                         ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                     })?;
-                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
                     ctx.write_stats.properties_set += 1;
                 }
                 crate::plan::SetItem::ReplaceProperties { variable, expr } => {
@@ -12135,7 +12361,7 @@ fn execute_remove(
                         let operand = delta.encode().map_err(|e| {
                             ExecutionError::Serialization(format!("DocDelta encode: {e}"))
                         })?;
-                        ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+                        ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
                     }
                     ctx.write_stats.properties_removed += 1;
 
@@ -14395,7 +14621,7 @@ fn emit_property_removal(
     let operand = delta
         .encode()
         .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
-    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand);
+    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
     ctx.write_stats.properties_removed += 1;
     Ok(())
 }
@@ -14949,7 +15175,7 @@ fn emit_attach_set_path(
     let operand = delta
         .encode()
         .map_err(|e| ExecutionError::Serialization(format!("DocDelta encode: {e}")))?;
-    ctx.mvcc_merge_node_delta(ctx.shard_id, target_id, operand);
+    ctx.mvcc_merge_node_delta(ctx.shard_id, target_id, operand)?;
     ctx.write_stats.properties_set += 1;
     Ok(())
 }
@@ -15805,20 +16031,7 @@ fn execute_create_node_type(
 fn resolve_table_column_type(
     type_name: &str,
 ) -> Option<coordinode_core::schema::definition::PropertyType> {
-    use coordinode_core::schema::definition::PropertyType;
-    Some(match type_name {
-        "BIGINT" | "INT" | "INTEGER" | "SMALLINT" => PropertyType::Int,
-        "FLOAT" | "DOUBLE" | "REAL" => PropertyType::Float,
-        "STRING" | "TEXT" | "VARCHAR" => PropertyType::String,
-        "BOOL" | "BOOLEAN" => PropertyType::Bool,
-        "TIMESTAMP" => PropertyType::Timestamp,
-        "BLOB" => PropertyType::Blob,
-        "BINARY" => PropertyType::Binary,
-        "GEO" => PropertyType::Geo,
-        "MAP" => PropertyType::Map,
-        "DOCUMENT" => PropertyType::Document,
-        _ => return None,
-    })
+    coordinode_core::schema::definition::PropertyType::from_type_name(type_name)
 }
 
 /// CREATE TABLE: declare a relational TABLE label. Persists a
@@ -17075,8 +17288,8 @@ fn execute_drop_vector_index(
 
 /// Execute `CREATE [UNIQUE] [SPARSE] INDEX idx ON :Label(prop) [WHERE pred]`.
 ///
-/// The definition is published as building, with range tombstones over any
-/// entries a dropped index of the same name left, in one log entry. Writers
+/// The definition is published as building, with any entries a dropped
+/// index of the same name left removed, in one catalog commit. Writers
 /// maintain the index from then on; the backfill fills in the nodes already
 /// stored; the definition is then published as ready, and only then answers
 /// lookups. Stored data that breaks a unique index fails the statement and
@@ -17092,21 +17305,13 @@ fn execute_create_btree_index(
     maintenance: Option<crate::index::IndexProfile>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let Some(registry) = ctx.btree_index_registry else {
-        return Err(ExecutionError::Unsupported(
-            "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
-        ));
-    };
-
-    // Reject duplicate index names.
-    if registry.get(name).is_some() {
+    // Indexes and constraints share one namespace: a uniqueness constraint's
+    // index carries the constraint's name.
+    if let Some(holder) = ctx.constraint_label(name)? {
         return Err(ExecutionError::Unsupported(format!(
-            "index '{name}' already exists"
+            "a constraint named '{name}' already exists on :{holder}"
         )));
     }
-
-    let store = LocalIndexStore::new(ctx.engine);
     let mut def = crate::index::IndexDefinition::btree(name, label, property);
     if unique {
         def = def.unique();
@@ -17117,40 +17322,12 @@ fn execute_create_btree_index(
     if let Some(f) = filter {
         def = def.with_filter(f.clone());
     }
-    // The binding is resolved once, here, and recorded: a later change of
-    // the namespace default does not reinterpret this index.
-    let (policy, _) = store.index_policy()?;
-    def.maintenance = policy.resolve(maintenance, 1);
-    def.state = IndexState::Building {
-        written: 0,
-        estimated_total: 0,
-    };
-
-    let mut publish = vec![store.definition_put_mutation(&def)?];
-    publish.extend(store.clear_mutations(name));
-    ctx.propose_mutations(publish)?;
-    registry.register_published(ctx.engine, def.clone())?;
-
-    let backfilled = match ctx.backfill_index(&def) {
+    let build = publish_index_build(def, maintenance, ctx, |_| Ok(()))?;
+    let backfilled = match ctx.backfill_index(&build.def, build.version) {
         Ok(n) => n,
-        Err(e) => {
-            // Withdraw the index everywhere: the definition and whatever
-            // entries the backfill and the writers staged under it.
-            registry.unregister(name);
-            let mut withdraw = vec![store.definition_delete_mutation(name)];
-            withdraw.extend(store.clear_mutations(name));
-            ctx.propose_mutations(withdraw)?;
-            return Err(match e {
-                crate::index::build::BackfillError::Duplicate(v) => unique_violation(v),
-                other => ExecutionError::Unsupported(format!("build index '{name}': {other}")),
-            });
-        }
+        Err(e) => return Err(abandon_index_build(&build, e, ctx, |_| Ok(()))),
     };
-
-    def.state = IndexState::Ready;
-    ctx.propose_mutations(vec![store.definition_put_mutation(&def)?])?;
-    let maintenance = def.maintenance;
-    registry.register_published(ctx.engine, def)?;
+    let maintenance = finish_index_build(build, ctx, |_| Ok(()))?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -17161,6 +17338,131 @@ fn execute_create_btree_index(
     row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
     insert_maintenance(&mut row, &maintenance);
     Ok(vec![row])
+}
+
+/// A B-tree index build in flight: the definition as published and the
+/// version of its record, which every page of the backfill and the commit
+/// that closes the build are bound to. A build whose definition was dropped
+/// or replaced meanwhile writes nothing more under the name.
+struct IndexBuild {
+    def: crate::index::IndexDefinition,
+    version: Option<u64>,
+}
+
+/// Publish B-tree index `def` as building in one catalog commit together
+/// with `with`: on the condition that no definition holds the name when it
+/// commits, with any entries left under the name removed. Writers maintain
+/// the index from this commit on.
+fn publish_index_build(
+    mut def: crate::index::IndexDefinition,
+    maintenance: Option<crate::index::IndexProfile>,
+    ctx: &mut ExecutionContext<'_>,
+    mut with: impl FnMut(
+        &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    ) -> Result<(), coordinode_modality::StoreError>,
+) -> Result<IndexBuild, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let Some(registry) = ctx.btree_index_registry else {
+        return Err(ExecutionError::Unsupported(
+            "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
+        ));
+    };
+    if registry.get(&def.name).is_some() {
+        return Err(ExecutionError::Unsupported(format!(
+            "index '{}' already exists",
+            def.name
+        )));
+    }
+
+    let engine = ctx.engine;
+    let store = LocalIndexStore::new(engine);
+    // The binding is resolved once, here, and recorded: a later change of
+    // the namespace default does not reinterpret this index.
+    let (policy, _) = store.index_policy()?;
+    def.maintenance = policy.resolve(maintenance, 1);
+    def.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+
+    ctx.commit_catalog_change(|txn| {
+        store.expect_definition_txn(txn, &def.name, None)?;
+        store.clear_txn(txn, &def.name)?;
+        store.put_definition_txn(txn, &def)?;
+        with(txn)
+    })?;
+    let version = store.definition_version(&def.name)?;
+    registry.register_published(engine, def.clone())?;
+    Ok(IndexBuild { def, version })
+}
+
+/// Publish the index of `build` as ready in one catalog commit together with
+/// `with`, on the condition that its definition is still the one the build
+/// published. Returns the maintenance binding it was given.
+fn finish_index_build(
+    build: IndexBuild,
+    ctx: &mut ExecutionContext<'_>,
+    mut with: impl FnMut(
+        &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    ) -> Result<(), coordinode_modality::StoreError>,
+) -> Result<crate::index::IndexMaintenance, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let engine = ctx.engine;
+    let store = LocalIndexStore::new(engine);
+    let mut def = build.def;
+    def.state = IndexState::Ready;
+    ctx.commit_catalog_change(|txn| {
+        store.expect_definition_txn(txn, &def.name, build.version)?;
+        store.put_definition_txn(txn, &def)?;
+        with(txn)
+    })?;
+    let maintenance = def.maintenance;
+    if let Some(registry) = ctx.btree_index_registry {
+        registry.register_published(engine, def)?;
+    }
+    Ok(maintenance)
+}
+
+/// Withdraw the index of `build`, whose backfill failed with `failure`: its
+/// definition and every entry go in one catalog commit together with `with`,
+/// on the condition that the definition is still the one the build
+/// published, and writers stop maintaining it once that commit is durable.
+/// Returns the error the statement fails with.
+fn abandon_index_build(
+    build: &IndexBuild,
+    failure: crate::index::build::BackfillError,
+    ctx: &mut ExecutionContext<'_>,
+    mut with: impl FnMut(
+        &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    ) -> Result<(), coordinode_modality::StoreError>,
+) -> ExecutionError {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let name = &build.def.name;
+    let failure = match failure {
+        crate::index::build::BackfillError::Duplicate(v) => unique_violation(v),
+        other => ExecutionError::Unsupported(format!("build index '{name}': {other}")),
+    };
+    let store = LocalIndexStore::new(ctx.engine);
+    let withdrawn = ctx.commit_catalog_change(|txn| {
+        store.expect_definition_txn(txn, name, build.version)?;
+        store.delete_definition_txn(txn, name)?;
+        store.clear_txn(txn, name)?;
+        with(txn)
+    });
+    match withdrawn {
+        Ok(()) => {
+            if let Some(registry) = ctx.btree_index_registry {
+                registry.unregister(name);
+            }
+            failure
+        }
+        // The definition is somebody else's now, or the catalog could not
+        // be written: the build's failure stays the answer, and what was
+        // left behind is named.
+        Err(e) => ExecutionError::Unsupported(format!(
+            "{failure}; the index '{name}' was not withdrawn: {e}"
+        )),
+    }
 }
 
 /// The maintenance binding of an index as result columns: the effective
@@ -17224,11 +17526,7 @@ fn execute_alter_index_maintenance(
     def.maintenance = policy.resolve(profile, epoch);
     let staged = def.clone();
     ctx.commit_catalog_change(|txn| {
-        txn.expect_version(
-            coordinode_storage::engine::partition::Partition::Schema,
-            &staged.schema_key(),
-            version,
-        )?;
+        store.expect_definition_txn(txn, name, version)?;
         store.put_definition_txn(txn, &staged)
     })?;
     let to = def.maintenance;
@@ -17279,31 +17577,37 @@ fn execute_set_namespace_index_default(
     Ok(vec![row])
 }
 
-/// Execute `DROP INDEX idx`: the definition and every entry go in one log
-/// entry, and the index stops being maintained here.
+/// Execute `DROP INDEX idx`: the definition and every entry go in one
+/// catalog commit, on the condition that the definition is still the one
+/// inspected here, and the index stops being maintained once it is durable.
+/// The index a constraint enforces goes only with the constraint.
 fn execute_drop_btree_index(
     name: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
     let Some(registry) = ctx.btree_index_registry else {
         return Err(ExecutionError::Unsupported(
             "DROP INDEX requires btree_index_registry in ExecutionContext".into(),
         ));
     };
-
-    // Verify the index exists before attempting to drop it.
-    let def = registry
-        .get(name)
+    let engine = ctx.engine;
+    let store = LocalIndexStore::new(engine);
+    let (def, version) = stored_definition(name, engine)?
         .ok_or_else(|| ExecutionError::Unsupported(format!("index '{name}' not found")))?;
+    if let Some(constraint) = &def.owner {
+        return Err(ExecutionError::Unsupported(format!(
+            "index '{name}' belongs to constraint '{constraint}'; drop the constraint instead"
+        )));
+    }
 
     let label = def.label.clone();
     let property = def.property().to_string();
-
-    use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let store = LocalIndexStore::new(ctx.engine);
-    let mut drop = vec![store.definition_delete_mutation(name)];
-    drop.extend(store.clear_mutations(name));
-    ctx.propose_mutations(drop)?;
+    ctx.commit_catalog_change(|txn| {
+        store.expect_definition_txn(txn, name, version)?;
+        store.delete_definition_txn(txn, name)?;
+        store.clear_txn(txn, name)
+    })?;
     registry.unregister(name);
 
     let mut row = Row::new();
@@ -17312,6 +17616,388 @@ fn execute_drop_btree_index(
     row.insert("property".to_string(), Value::String(property));
     row.insert("dropped".to_string(), Value::Bool(true));
     Ok(vec![row])
+}
+
+/// The stored definition of index `name` and the version of its record, read
+/// as one: a definition replaced between the two reads is reported as a
+/// concurrent change rather than paired with another one's version.
+fn stored_definition(
+    name: &str,
+    engine: &StorageEngine,
+) -> Result<Option<(crate::index::IndexDefinition, Option<u64>)>, ExecutionError> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let store = LocalIndexStore::new(engine);
+    let version = store.definition_version(name)?;
+    let def = store.load_definition(name)?;
+    if store.definition_version(name)? != version {
+        return Err(ExecutionError::Unsupported(format!(
+            "the definition of index '{name}' changed concurrently; retry the statement"
+        )));
+    }
+    Ok(def.map(|d| (d, version)))
+}
+
+/// The name a constraint created without one gets: its label, properties and
+/// kind, so repeating the statement names the same constraint.
+fn derived_constraint_name(
+    label: &str,
+    properties: &[String],
+    kind: &coordinode_core::schema::definition::ConstraintKind,
+) -> String {
+    use coordinode_core::schema::definition::ConstraintKind;
+    let suffix = match kind {
+        ConstraintKind::Unique => "unique",
+        ConstraintKind::NotNull => "not_null",
+        ConstraintKind::NodeKey => "node_key",
+        ConstraintKind::Type(_) => "type",
+    };
+    format!("{label}_{}_{suffix}", properties.join("_"))
+}
+
+/// The result row of constraint DDL.
+fn constraint_row(
+    constraint: &coordinode_core::schema::definition::NodeConstraint,
+    label: &str,
+    changed: (&str, bool),
+) -> Row {
+    let mut row = Row::new();
+    row.insert(
+        "constraint".to_string(),
+        Value::String(constraint.name.clone()),
+    );
+    row.insert("label".to_string(), Value::String(label.to_string()));
+    row.insert(
+        "properties".to_string(),
+        Value::Array(
+            constraint
+                .properties
+                .iter()
+                .map(|p| Value::String(p.clone()))
+                .collect(),
+        ),
+    );
+    row.insert(
+        "kind".to_string(),
+        Value::String(constraint.kind.to_string()),
+    );
+    row.insert(changed.0.to_string(), Value::Bool(changed.1));
+    row
+}
+
+/// Execute `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE ...`.
+///
+/// A presence or type constraint lands as a new revision of the label's
+/// schema whose commit checks every stored node of the label against it,
+/// with writers validated under the old revision held out; those committing
+/// later are refused and retried under the new one.
+///
+/// A uniqueness or key constraint lands the same way, as validating, in the
+/// one commit that publishes the unique index it owns: writers enforce it
+/// from that commit on while the backfill checks the stored nodes, and a
+/// second commit, bound to the index definition the first published, makes
+/// both active. Stored duplicates withdraw both in one commit. A build
+/// interrupted in between leaves the constraint validating, enforced, and
+/// reported as unfinished until it is dropped.
+fn execute_create_constraint(
+    name: Option<&str>,
+    if_not_exists: bool,
+    label: &str,
+    properties: &[String],
+    kind: &coordinode_core::schema::definition::ConstraintKind,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_core::schema::definition::{ConstraintKind, ConstraintState, NodeConstraint};
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _, StoreError};
+
+    let constraint = NodeConstraint {
+        name: name.map_or_else(
+            || derived_constraint_name(label, properties, kind),
+            str::to_string,
+        ),
+        properties: properties.to_vec(),
+        kind: kind.clone(),
+        state: ConstraintState::Validating,
+    };
+
+    if let Some(holder) = ctx.constraint_label(&constraint.name)? {
+        let existing = ctx
+            .load_current_label_schema(&holder)?
+            .and_then(|s| s.constraint(&constraint.name).cloned());
+        if existing
+            .as_ref()
+            .is_some_and(|c| c.state == ConstraintState::Validating)
+        {
+            return Err(ExecutionError::Unsupported(format!(
+                "constraint '{}' exists on :{holder} but its validation did not finish; \
+                 drop it and create it again",
+                constraint.name
+            )));
+        }
+        if if_not_exists {
+            return Ok(vec![constraint_row(
+                existing.as_ref().unwrap_or(&constraint),
+                &holder,
+                ("created", false),
+            )]);
+        }
+        return Err(ExecutionError::Unsupported(format!(
+            "constraint '{}' already exists on :{holder}",
+            constraint.name
+        )));
+    }
+    let schema = ctx.load_current_label_schema(label)?;
+    if let Some(existing) = schema.as_ref().and_then(|s| {
+        s.constraints()
+            .iter()
+            .find(|c| c.same_requirement(&constraint))
+    }) {
+        if existing.state == ConstraintState::Validating {
+            return Err(ExecutionError::Unsupported(format!(
+                "an equivalent constraint '{}' exists on :{label} but its validation did not \
+                 finish; drop it and create it again",
+                existing.name
+            )));
+        }
+        if if_not_exists {
+            return Ok(vec![constraint_row(existing, label, ("created", false))]);
+        }
+        return Err(ExecutionError::Unsupported(format!(
+            "an equivalent constraint '{}' already exists on :{label}",
+            existing.name
+        )));
+    }
+    // The rows of a COLUMNAR table are written outside the transaction a
+    // schema revision binds, so nothing could hold them to the constraint
+    // while it is enabled.
+    if schema.as_ref().is_some_and(LabelSchema::is_columnar) {
+        return Err(ExecutionError::Unsupported(format!(
+            "constraints on the COLUMNAR table '{label}' are not supported"
+        )));
+    }
+    if constraint.owns_index()
+        && ctx
+            .btree_index_registry
+            .is_some_and(|r| r.get(&constraint.name).is_some())
+    {
+        return Err(ExecutionError::Unsupported(format!(
+            "an index named '{}' already exists",
+            constraint.name
+        )));
+    }
+
+    let read_revision = schema.as_ref().map(|s| s.schema_revision);
+    let mut next = match schema {
+        Some(mut s) => {
+            s.schema_revision = next_revision(&s)?;
+            s
+        }
+        // A label without a schema is enforced as FLEXIBLE; the schema the
+        // constraint creates keeps that.
+        None => {
+            let mut s = LabelSchema::new_node_id(label);
+            s.set_mode(SchemaMode::Flexible);
+            s
+        }
+    };
+    let mut published = constraint.clone();
+    if !constraint.owns_index() {
+        published.state = ConstraintState::Active;
+    }
+    next.add_constraint(published.clone());
+
+    // The commit decides this authoritatively; checking here as well names
+    // the node that refuses it.
+    if constraint.checks_each_node() {
+        let staged = std::collections::HashMap::new();
+        if let Some(violation) =
+            coordinode_storage::engine::claims::evaluate::first_label_schema_violation(
+                ctx.engine, &next, &staged,
+            )?
+        {
+            return Err(ExecutionError::SchemaViolation(format!(
+                "cannot create constraint '{}': node {} breaks it ({})",
+                constraint.name,
+                violation.node.to_element_id(),
+                violation.reason
+            )));
+        }
+    }
+
+    let engine = ctx.engine;
+    // The revision this statement checked must still be the one in force
+    // when its successor lands, and the name must still be free.
+    let mut stage_constraint =
+        |txn: &mut coordinode_storage::engine::transaction::Transaction<'_>| {
+            let store = LocalSchemaStore::new(engine);
+            let current = store.load_label_txn(txn, label)?;
+            if current.map(|s| s.schema_revision) != read_revision {
+                return Err(StoreError::Invariant(format!(
+                    "the schema of :{label} changed while the constraint was being created; \
+                     retry the statement"
+                )));
+            }
+            store.save_label_txn(txn, &next)?;
+            store.claim_constraint_name_txn(txn, &constraint.name, label)
+        };
+
+    if !constraint.owns_index() {
+        let committed = ctx.commit_catalog_change(stage_constraint);
+        ctx.label_schema_cache.remove(label);
+        committed?;
+        return Ok(vec![constraint_row(&published, label, ("created", true))]);
+    }
+
+    let mut def =
+        crate::index::IndexDefinition::compound(&constraint.name, label, properties.to_vec())
+            .unique()
+            .owned_by(&constraint.name);
+    // A node missing a value is not constrained by uniqueness; a key
+    // requires the values, which its per-node part enforces.
+    if constraint.kind == ConstraintKind::Unique {
+        def = def.sparse();
+    }
+    let build = publish_index_build(def, None, ctx, &mut stage_constraint);
+    ctx.label_schema_cache.remove(label);
+    let build = build?;
+
+    let name = constraint.name.as_str();
+    let indexed = match ctx.backfill_index(&build.def, build.version) {
+        Ok(n) => n,
+        Err(e) => {
+            let failure = abandon_index_build(&build, e, ctx, |txn| {
+                let store = LocalSchemaStore::new(engine);
+                if let Some(mut latest) = store.load_label_txn(txn, label)? {
+                    if latest.remove_constraint(name).is_some() {
+                        latest.schema_revision = next_revision(&latest).map_err(store_error)?;
+                        store.save_label_admitting_txn(txn, &latest)?;
+                    }
+                }
+                store.release_constraint_name_txn(txn, name)
+            });
+            ctx.label_schema_cache.remove(label);
+            return Err(failure);
+        }
+    };
+    let finished = finish_index_build(build, ctx, |txn| {
+        let store = LocalSchemaStore::new(engine);
+        let mut latest = store.load_label_txn(txn, label)?.ok_or_else(|| {
+            StoreError::Invariant(format!("the schema of :{label} was dropped meanwhile"))
+        })?;
+        let Some(validating) = latest
+            .constraint_mut(name)
+            .filter(|c| c.state == ConstraintState::Validating)
+        else {
+            return Err(StoreError::Invariant(format!(
+                "constraint '{name}' was dropped while it was being validated"
+            )));
+        };
+        validating.state = ConstraintState::Active;
+        latest.schema_revision = next_revision(&latest).map_err(store_error)?;
+        store.save_label_admitting_txn(txn, &latest)
+    });
+    ctx.label_schema_cache.remove(label);
+    finished?;
+
+    published.state = ConstraintState::Active;
+    let mut row = constraint_row(&published, label, ("created", true));
+    row.insert(
+        "nodes_indexed".to_string(),
+        Value::Int(i64::try_from(indexed).unwrap_or(i64::MAX)),
+    );
+    Ok(vec![row])
+}
+
+/// The revision a change of `schema` is published at.
+fn next_revision(
+    schema: &coordinode_core::schema::definition::LabelSchema,
+) -> Result<u64, ExecutionError> {
+    schema.schema_revision.checked_add(1).ok_or_else(|| {
+        ExecutionError::Unsupported(format!(
+            "label '{}' has no schema revision left",
+            schema.name
+        ))
+    })
+}
+
+/// An execution error raised while staging a catalog change.
+fn store_error(e: ExecutionError) -> coordinode_modality::StoreError {
+    coordinode_modality::StoreError::Invariant(e.to_string())
+}
+
+/// Execute `DROP CONSTRAINT name [IF EXISTS]`: one catalog commit removes the
+/// constraint from a new revision of the label's schema, releases its name,
+/// and removes the index it owns with every entry, on the condition that
+/// the index definition is still the one inspected here. Writers stop
+/// maintaining the index once that commit is durable.
+fn execute_drop_constraint(
+    name: &str,
+    if_exists: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::{
+        IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _, StoreError,
+    };
+
+    let Some(label) = ctx.constraint_label(name)? else {
+        if if_exists {
+            let mut row = Row::new();
+            row.insert("constraint".to_string(), Value::String(name.to_string()));
+            row.insert("dropped".to_string(), Value::Bool(false));
+            return Ok(vec![row]);
+        }
+        return Err(ExecutionError::Unsupported(format!(
+            "constraint '{name}' not found"
+        )));
+    };
+    let schema = ctx.load_current_label_schema(&label)?;
+    let read_revision = schema.as_ref().map(|s| s.schema_revision);
+    let Some(mut next) = schema else {
+        return Err(ExecutionError::Unsupported(format!(
+            "constraint '{name}' names :{label}, which has no schema"
+        )));
+    };
+    let Some(removed) = next.remove_constraint(name) else {
+        return Err(ExecutionError::Unsupported(format!(
+            "constraint '{name}' names :{label}, whose schema does not hold it"
+        )));
+    };
+    next.schema_revision = next_revision(&next)?;
+    // The index this constraint owns, as stored now: the commit removes it
+    // only while it is still that record.
+    let index = if removed.owns_index() {
+        stored_definition(name, ctx.engine)?.filter(|(def, _)| def.owner.as_deref() == Some(name))
+    } else {
+        None
+    };
+
+    let engine = ctx.engine;
+    let dropped = ctx.commit_catalog_change(|txn| {
+        let store = LocalSchemaStore::new(engine);
+        let current = store.load_label_txn(txn, &label)?;
+        if current.map(|s| s.schema_revision) != read_revision {
+            return Err(StoreError::Invariant(format!(
+                "the schema of :{label} changed while the constraint was being dropped; \
+                 retry the statement"
+            )));
+        }
+        store.save_label_admitting_txn(txn, &next)?;
+        store.release_constraint_name_txn(txn, name)?;
+        if let Some((_, version)) = &index {
+            let indexes = LocalIndexStore::new(engine);
+            indexes.expect_definition_txn(txn, name, *version)?;
+            indexes.delete_definition_txn(txn, name)?;
+            indexes.clear_txn(txn, name)?;
+        }
+        Ok(())
+    });
+    ctx.label_schema_cache.remove(&label);
+    dropped?;
+    if index.is_some() {
+        if let Some(registry) = ctx.btree_index_registry {
+            registry.unregister(name);
+        }
+    }
+    Ok(vec![constraint_row(&removed, &label, ("dropped", true))])
 }
 
 /// Execute a procedure call: once per input row, with the arguments evaluated

@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use crate::graph::types::Value;
-use crate::schema::definition::{LabelSchema, PropertyDef, PropertyType};
+use crate::schema::definition::{
+    ConstraintKind, LabelSchema, NodeConstraint, PropertyDef, PropertyType,
+};
 
 /// Validation error for property values.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +50,16 @@ pub enum ValidationError {
 
     /// Attempt to SET a COMPUTED (read-only) property.
     ComputedReadOnly { property: String },
+
+    /// A node breaks a named constraint of its label.
+    ConstraintViolation {
+        /// The constraint name.
+        constraint: String,
+        /// What it requires.
+        kind: ConstraintKind,
+        /// The property that breaks it.
+        property: String,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -97,6 +109,22 @@ impl std::fmt::Display for ValidationError {
             Self::ComputedReadOnly { property } => {
                 write!(f, "cannot SET COMPUTED property '{property}' (read-only)")
             }
+            Self::ConstraintViolation {
+                constraint,
+                kind: ConstraintKind::Type(expected),
+                property,
+            } => write!(
+                f,
+                "constraint `{constraint}` violated: '{property}' must be of type {expected}"
+            ),
+            Self::ConstraintViolation {
+                constraint,
+                kind,
+                property,
+            } => write!(
+                f,
+                "constraint `{constraint}` ({kind}) violated: '{property}' is required"
+            ),
         }
     }
 }
@@ -259,6 +287,25 @@ pub fn validate_properties(
         }
     }
 
+    // Constraints hold in every schema mode, on declared and undeclared
+    // properties alike.
+    if schema
+        .constraints()
+        .iter()
+        .any(NodeConstraint::checks_each_node)
+    {
+        let value_of = |name: &str| {
+            field_names
+                .iter()
+                .find(|(_, n)| n.as_str() == name)
+                .and_then(|(id, _)| props.get(id))
+                .cloned()
+        };
+        if let Err(e) = check_node_constraints(schema, &value_of) {
+            errors.push(e);
+        }
+    }
+
     // Check NOT NULL for missing properties
     for (prop_name, def) in &schema.properties {
         if def.not_null && def.default.is_none() {
@@ -280,6 +327,33 @@ pub fn validate_properties(
     } else {
         Err(errors)
     }
+}
+
+/// Check a node whose properties `value_of` answers against the presence and
+/// type constraints of its label, returning the first one it breaks.
+/// Uniqueness is the constraint's index's to decide, across nodes.
+pub fn check_node_constraints(
+    schema: &LabelSchema,
+    value_of: &dyn Fn(&str) -> Option<Value>,
+) -> Result<(), ValidationError> {
+    for constraint in schema.constraints() {
+        for property in &constraint.properties {
+            let value = value_of(property).filter(|v| !v.is_null());
+            let broken = match (&constraint.kind, &value) {
+                (_, None) => constraint.requires_presence(),
+                (ConstraintKind::Type(expected), Some(v)) => !value_matches_type(v, expected),
+                _ => false,
+            };
+            if broken {
+                return Err(ValidationError::ConstraintViolation {
+                    constraint: constraint.name.clone(),
+                    kind: constraint.kind.clone(),
+                    property: property.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

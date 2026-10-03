@@ -1009,6 +1009,88 @@ fn into_state_resume_preserves_buffer_occ_and_read_ts() {
     assert!(occ_before.is_none());
 }
 
+/// A range removal staged by a transaction lands with its commit and not
+/// before, in one unit with its point writes elsewhere, and survives the
+/// transaction being parked between statements.
+#[test]
+fn a_staged_range_removal_lands_with_the_commit() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    engine.put(Partition::Idx, b"idx:a:1", b"").unwrap();
+    engine.put(Partition::Idx, b"idx:a:2", b"").unwrap();
+    engine.put(Partition::Idx, b"idx:b:1", b"").unwrap();
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.remove_range(Partition::Idx, b"idx:a:", b"idx:a;")
+        .unwrap();
+    txn.put(Partition::Schema, b"schema:idx:a", b"gone")
+        .unwrap();
+    assert!(
+        engine.get(Partition::Idx, b"idx:a:1").unwrap().is_some(),
+        "nothing is removed before the commit"
+    );
+    let mut txn = Transaction::resume(&engine, Some(&oracle), txn.into_state());
+    txn.commit(&ctx).expect("commit");
+
+    assert!(engine.get(Partition::Idx, b"idx:a:1").unwrap().is_none());
+    assert!(engine.get(Partition::Idx, b"idx:a:2").unwrap().is_none());
+    assert!(
+        engine.get(Partition::Idx, b"idx:b:1").unwrap().is_some(),
+        "a key outside the range stays"
+    );
+    assert!(
+        engine
+            .get(Partition::Schema, b"schema:idx:a")
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A transaction whose only effect is a range removal is a writing commit,
+/// not a read-only one.
+#[test]
+fn a_commit_of_only_a_range_removal_writes() {
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    engine.put(Partition::Idx, b"idx:a:1", b"").unwrap();
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.remove_range(Partition::Idx, b"idx:a:", b"idx:a;")
+        .unwrap();
+    txn.commit(&ctx).expect("commit");
+    assert!(engine.get(Partition::Idx, b"idx:a:1").unwrap().is_none());
+}
+
+/// Keys recorded for a post-state check survive parking and are handed out
+/// once.
+#[test]
+fn post_state_checks_survive_parking_and_are_taken_once() {
+    let (engine, oracle, _d) = test_engine();
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.note_post_state_check(b"node:1");
+    txn.note_post_state_check(b"node:2");
+    let mut txn = Transaction::resume(&engine, Some(&oracle), txn.into_state());
+    txn.note_post_state_check(b"node:1");
+    let mut taken = txn.take_post_state_checks();
+    taken.sort_unstable();
+    taken.dedup();
+    assert_eq!(taken, vec![b"node:1".to_vec(), b"node:2".to_vec()]);
+    assert!(txn.take_post_state_checks().is_empty());
+}
+
 #[test]
 fn prefix_scan_overlays_buffer_over_snapshot() {
     let (engine, oracle, _d) = test_engine();

@@ -399,14 +399,19 @@ pub fn first_label_schema_violation(
 ) -> StorageResult<Option<LabelSchemaViolation>> {
     use coordinode_core::graph::node::NodeRecord;
 
-    // A flexible schema checks only NOT NULL; without one there is nothing
-    // a stored node can break, and the scan is skipped.
+    // A flexible schema checks only NOT NULL and the per-node constraints;
+    // without either there is nothing a stored node can break, and the scan
+    // is skipped. Uniqueness is decided by the constraint's index build.
     if !schema.mode.validates_declared()
         && !schema.mode.rejects_unknown()
         && !schema
             .properties
             .values()
             .any(|p| p.not_null && p.default.is_none())
+        && !schema
+            .constraints()
+            .iter()
+            .any(coordinode_core::schema::definition::NodeConstraint::checks_each_node)
     {
         return Ok(None);
     }

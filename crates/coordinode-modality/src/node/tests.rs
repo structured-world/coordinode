@@ -59,6 +59,121 @@ fn rec(label: &str) -> NodeRecord {
     NodeRecord::new(label)
 }
 
+/// The post-state of a node is its stored record with the transaction's
+/// pending deltas applied: a nested set turns its root into a document, a
+/// property removal removes it, an overflow-targeted delta reaches the
+/// overflow map. Asking stages nothing.
+#[test]
+fn post_state_applies_pending_deltas_without_staging() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    use coordinode_core::graph::types::Value;
+    let db = open();
+    let id = NodeId::from_raw(9);
+    let mut record = rec("Item");
+    record.set(1, Value::Int(3));
+    record.set(2, Value::String("drop me".into()));
+    db.write(|s, t| s.put(t, 0, id, &record).expect("put"));
+
+    let mut t = db.read();
+    let delta = |d: DocDelta| d.encode().expect("encode");
+    LocalNodeStore.buffer_node_delta(
+        &mut t,
+        0,
+        id,
+        delta(DocDelta::SetPath {
+            target: PathTarget::PropField(1),
+            path: vec!["unit".into()],
+            value: rmpv::Value::from("kg"),
+        }),
+    );
+    LocalNodeStore.buffer_node_delta(
+        &mut t,
+        0,
+        id,
+        delta(DocDelta::RemoveProperty {
+            target: PathTarget::PropField(2),
+            key: None,
+        }),
+    );
+    LocalNodeStore.buffer_node_delta(
+        &mut t,
+        0,
+        id,
+        delta(DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["note".into()],
+            value: rmpv::Value::from("x"),
+        }),
+    );
+
+    let key = encode_node_key(0, id);
+    let state = LocalNodeStore::post_state(&t, &key)
+        .expect("post state")
+        .expect("the node exists");
+    assert!(
+        matches!(state.get(1), Some(Value::Document(_))),
+        "{state:?}"
+    );
+    assert!(state.get(2).is_none(), "the removed property is gone");
+    assert_eq!(state.get_extra("note"), Some(&Value::String("x".into())));
+    assert!(
+        t.buffered(Partition::Node, &key).is_none(),
+        "asking for the post-state stages nothing"
+    );
+    assert_eq!(t.node_deltas().len(), 3, "the deltas stay pending");
+
+    let missing = encode_node_key(0, NodeId::from_raw(10));
+    assert!(
+        LocalNodeStore::post_state(&t, &missing)
+            .expect("read")
+            .is_none()
+    );
+}
+
+/// Reading a node back inside the transaction that buffered deltas on it
+/// sees what the commit will store: a removed property is gone, and an
+/// overflow-targeted delta reaches the overflow map.
+#[test]
+fn materialized_deltas_match_what_the_commit_stores() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    use coordinode_core::graph::types::Value;
+    let db = open();
+    let id = NodeId::from_raw(11);
+    let mut record = rec("Item");
+    record.set(2, Value::String("drop me".into()));
+    db.write(|s, t| s.put(t, 0, id, &record).expect("put"));
+
+    let mut t = db.read();
+    let delta = |d: DocDelta| d.encode().expect("encode");
+    LocalNodeStore.buffer_node_delta(
+        &mut t,
+        0,
+        id,
+        delta(DocDelta::RemoveProperty {
+            target: PathTarget::PropField(2),
+            key: None,
+        }),
+    );
+    LocalNodeStore.buffer_node_delta(
+        &mut t,
+        0,
+        id,
+        delta(DocDelta::SetPath {
+            target: PathTarget::Extra,
+            path: vec!["note".into()],
+            value: rmpv::Value::from("x"),
+        }),
+    );
+    let key = encode_node_key(0, id);
+    LocalNodeStore::materialize_pending_deltas(&mut t, &key).expect("materialize");
+    let seen = LocalNodeStore.get(&t, 0, id).expect("get").expect("exists");
+    assert!(
+        seen.get(2).is_none(),
+        "the removed property is gone: {seen:?}"
+    );
+    assert_eq!(seen.get_extra("note"), Some(&Value::String("x".into())));
+}
+
 #[test]
 fn non_temporal_round_trip() {
     let db = open();

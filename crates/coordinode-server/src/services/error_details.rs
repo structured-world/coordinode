@@ -122,6 +122,11 @@ pub enum Reason {
     /// A statement tried to change a key column of an existing row. Metadata
     /// carries `table` and `column`. Terminal.
     KeyImmutable,
+    /// A write would leave a node breaking a constraint of its label: a
+    /// required property missing or null, or a value of another type.
+    /// Nothing was written. Metadata carries `constraint`, `kind`, `label`,
+    /// `property` and `element_id`. Terminal: the same write is refused again.
+    ConstraintViolation,
     /// A change stream's position is no longer covered by the retained log:
     /// the entries after it were purged, so the stream cannot continue from
     /// there without a gap. Metadata carries `requested_index` and
@@ -160,6 +165,7 @@ impl Reason {
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
             Reason::DuplicateKey => "DUPLICATE_KEY",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
+            Reason::ConstraintViolation => "CONSTRAINT_VIOLATION",
             Reason::RetentionLost => "RETENTION_LOST",
             Reason::ConsumerTerminated => "CONSUMER_TERMINATED",
         }

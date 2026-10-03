@@ -20,7 +20,7 @@ use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
-use coordinode_modality::{LocalNodeStore, NodeStore, StoreError};
+use coordinode_modality::{IndexStore as _, LocalNodeStore, NodeStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitError, Transaction};
 
@@ -63,6 +63,11 @@ pub enum BackfillError {
          retry once they have ended"
     )]
     OlderTransactions(usize),
+    /// The definition being built was dropped or replaced meanwhile: its
+    /// entries belong to whatever holds the name now, and this build writes
+    /// none of them.
+    #[error("the index definition changed while it was being built")]
+    Superseded,
 }
 
 impl From<IndexWriteError> for BackfillError {
@@ -87,6 +92,11 @@ pub struct Backfill<'a> {
     /// Transactions of the caller itself that are open while it runs the
     /// backfill (the statement creating the index), not waited for.
     pub own_open: usize,
+    /// The version of the definition record the builder published. Each
+    /// page commits only while the record is still at it, so a page of a
+    /// build whose index was dropped or recreated meanwhile writes nothing.
+    /// `None` for a definition without a stored record.
+    pub definition_version: Option<u64>,
 }
 
 impl<'a> Backfill<'a> {
@@ -123,6 +133,10 @@ impl<'a> Backfill<'a> {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
             };
+            if self.definition_version.is_some() {
+                txn.bind_index_definition(&index.schema_key(), self.definition_version)
+                    .map_err(StoreError::from)?;
+            }
             let page =
                 nodes.prefix_scan_paged_tracked(&mut txn, &prefix, start_after.as_deref(), PAGE)?;
             let mut claims = Vec::new();
@@ -168,7 +182,18 @@ impl<'a> Backfill<'a> {
             let committed = if unchanged {
                 match commit(&mut txn) {
                     Ok(()) => true,
-                    Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => false,
+                    Err(CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }) => {
+                        // A conflict over the page's nodes is read again; a
+                        // definition that moved is not this build's any more.
+                        if self.definition_version.is_some()
+                            && coordinode_modality::LocalIndexStore::new(self.engine)
+                                .definition_version(&index.name)?
+                                != self.definition_version
+                        {
+                            return Err(BackfillError::Superseded);
+                        }
+                        false
+                    }
                     Err(e) => return Err(BackfillError::Commit(e)),
                 }
             } else {

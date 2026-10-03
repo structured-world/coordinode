@@ -65,6 +65,8 @@ impl Query {
                 | Clause::DropEncryptedIndex(_)
                 | Clause::CreateIndex(_)
                 | Clause::DropIndex(_)
+                | Clause::CreateConstraint(_)
+                | Clause::DropConstraint(_)
                 | Clause::AlterIndex(_)
                 | Clause::AlterNamespaceIndexDefault(_)
                 | Clause::CreateVectorIndex(_)
@@ -137,6 +139,10 @@ pub enum Clause {
     DropEncryptedIndex(DropEncryptedIndexClause),
     CreateIndex(CreateIndexClause),
     DropIndex(DropIndexClause),
+    /// `CREATE CONSTRAINT ... FOR (n:Label) REQUIRE ...`: a node constraint.
+    CreateConstraint(CreateConstraintClause),
+    /// `DROP CONSTRAINT name [IF EXISTS]`.
+    DropConstraint(DropConstraintClause),
     /// `ALTER INDEX <name> SET MAINTENANCE ...`: explicit profile transition.
     AlterIndex(AlterIndexClause),
     /// `ALTER NAMESPACE SET INDEX MAINTENANCE ...`: the namespace default.
@@ -395,6 +401,32 @@ pub struct AlterIndexClause {
 pub struct DropIndexClause {
     /// Index name to drop.
     pub name: String,
+}
+
+/// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateConstraintClause {
+    /// The constraint's name; `None` lets the engine name it.
+    pub name: Option<String>,
+    /// `IF NOT EXISTS`: an equivalent constraint already in place is not an
+    /// error.
+    pub if_not_exists: bool,
+    /// The label constrained.
+    pub label: String,
+    /// The constrained properties, in the order written.
+    pub properties: Vec<String>,
+    /// What the constraint requires: `IS UNIQUE`, `IS NOT NULL`,
+    /// `IS NODE KEY`, or `IS :: TYPE` / `IS TYPED TYPE`.
+    pub kind: coordinode_core::schema::definition::ConstraintKind,
+}
+
+/// `DROP CONSTRAINT name [IF EXISTS]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropConstraintClause {
+    /// The constraint's name.
+    pub name: String,
+    /// `IF EXISTS`: a missing constraint is not an error.
+    pub if_exists: bool,
 }
 
 /// CREATE VECTOR INDEX clause (HNSW).

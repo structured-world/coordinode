@@ -464,6 +464,25 @@ pub enum LogicalOp {
     /// DROP INDEX: remove a B-tree index by name.
     DropIndex { name: String },
 
+    /// `CREATE CONSTRAINT`: a named constraint on the nodes of a label.
+    CreateConstraint {
+        /// The constraint's name; `None` lets the engine derive one.
+        name: Option<String>,
+        /// An equivalent constraint, or one of the same name, already in
+        /// place is not an error.
+        if_not_exists: bool,
+        label: String,
+        properties: Vec<String>,
+        kind: coordinode_core::schema::definition::ConstraintKind,
+    },
+
+    /// `DROP CONSTRAINT`: remove a constraint, and the index it owns.
+    DropConstraint {
+        name: String,
+        /// A missing constraint is not an error.
+        if_exists: bool,
+    },
+
     /// An explicit maintenance-profile transition of one B-tree index:
     /// `profile`, or the namespace default when `None`.
     AlterIndexMaintenance {
@@ -1213,6 +1232,8 @@ impl LogicalOp {
             | LogicalOp::DropEncryptedIndex { .. }
             | LogicalOp::CreateIndex { .. }
             | LogicalOp::DropIndex { .. }
+            | LogicalOp::CreateConstraint { .. }
+            | LogicalOp::DropConstraint { .. }
             | LogicalOp::AlterIndexMaintenance { .. }
             | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateVectorIndex { .. }
@@ -1854,6 +1875,8 @@ fn estimate_op_cost(
         | LogicalOp::DropEncryptedIndex { .. }
         | LogicalOp::CreateIndex { .. }
         | LogicalOp::DropIndex { .. }
+        | LogicalOp::CreateConstraint { .. }
+        | LogicalOp::DropConstraint { .. }
         | LogicalOp::AlterIndexMaintenance { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::CreateVectorIndex { .. }
@@ -2551,6 +2574,22 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             output.push_str(&format!(
                 "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str}{maintenance_str})\n"
             ));
+        }
+        LogicalOp::CreateConstraint {
+            name,
+            label,
+            properties,
+            kind,
+            ..
+        } => {
+            let name = name.as_deref().unwrap_or("<derived>");
+            let properties = properties.join(", ");
+            output.push_str(&format!(
+                "{prefix}CreateConstraint({name} ON :{label}({properties}) {kind})\n"
+            ));
+        }
+        LogicalOp::DropConstraint { name, .. } => {
+            output.push_str(&format!("{prefix}DropConstraint({name})\n"));
         }
         LogicalOp::DropIndex { name } => {
             output.push_str(&format!("{prefix}DropIndex({name})\n"));

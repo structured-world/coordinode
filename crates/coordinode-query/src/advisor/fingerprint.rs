@@ -359,6 +359,18 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str("DROP INDEX ");
             buf.push_str(&c.name);
         }
+        Clause::CreateConstraint(c) => {
+            buf.push_str("CREATE CONSTRAINT FOR :");
+            buf.push_str(&c.label);
+            buf.push('(');
+            buf.push_str(&c.properties.join(","));
+            buf.push_str(") ");
+            buf.push_str(&c.kind.to_string());
+        }
+        Clause::DropConstraint(c) => {
+            buf.push_str("DROP CONSTRAINT ");
+            buf.push_str(&c.name);
+        }
         Clause::AlterIndex(c) => {
             buf.push_str("ALTER INDEX ");
             buf.push_str(&c.name);

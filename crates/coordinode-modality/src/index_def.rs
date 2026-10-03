@@ -189,6 +189,11 @@ pub struct IndexDefinition {
     /// RESOLVED, inherited, epoch 0: what its entries have always been.
     #[serde(default)]
     pub maintenance: IndexMaintenance,
+    /// The constraint this index enforces, which creates and drops it; `None`
+    /// for an index of its own. A definition stored before the field existed
+    /// decodes as `None`.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// How a key-shaped index's entry effects travel with the data they index.
@@ -374,6 +379,7 @@ impl IndexDefinition {
             online_during_build: OnlineDuringBuild::Block,
             layout: ENTRY_LAYOUT,
             maintenance: IndexMaintenance::default(),
+            owner: None,
         }
     }
 
@@ -399,6 +405,7 @@ impl IndexDefinition {
             online_during_build: OnlineDuringBuild::Block,
             layout: ENTRY_LAYOUT,
             maintenance: IndexMaintenance::default(),
+            owner: None,
         }
     }
 
@@ -425,6 +432,7 @@ impl IndexDefinition {
             online_during_build: OnlineDuringBuild::Block,
             layout: ENTRY_LAYOUT,
             maintenance: IndexMaintenance::default(),
+            owner: None,
         }
     }
 
@@ -451,12 +459,19 @@ impl IndexDefinition {
             online_during_build: OnlineDuringBuild::Block,
             layout: ENTRY_LAYOUT,
             maintenance: IndexMaintenance::default(),
+            owner: None,
         }
     }
 
     /// Set unique constraint.
     pub fn unique(mut self) -> Self {
         self.unique = true;
+        self
+    }
+
+    /// Make this the index the constraint `constraint` enforces.
+    pub fn owned_by(mut self, constraint: impl Into<String>) -> Self {
+        self.owner = Some(constraint.into());
         self
     }
 
@@ -543,9 +558,14 @@ impl IndexDefinition {
 
     /// Schema storage key for this index definition.
     pub fn schema_key(&self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(10 + self.name.len());
+        Self::schema_key_of(&self.name)
+    }
+
+    /// The catalog key of the definition of the index `name`.
+    pub fn schema_key_of(name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(11 + name.len());
         key.extend_from_slice(b"schema:idx:");
-        key.extend_from_slice(self.name.as_bytes());
+        key.extend_from_slice(name.as_bytes());
         key
     }
 }

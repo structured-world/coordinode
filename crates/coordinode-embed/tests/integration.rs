@@ -14,6 +14,7 @@ mod integration {
     mod compound_queries;
     mod computed;
     mod concurrent;
+    mod constraints;
     mod crash;
     mod create_table;
     mod cross_match;

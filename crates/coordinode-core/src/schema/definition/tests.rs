@@ -527,3 +527,111 @@ fn plain_label_is_not_a_table_and_defaults_to_row() {
     assert_eq!(schema.storage_layout, StorageLayout::Row);
     assert_eq!(schema.table_key(), None);
 }
+
+fn constraint(name: &str, properties: &[&str], kind: ConstraintKind) -> NodeConstraint {
+    NodeConstraint {
+        name: name.to_string(),
+        properties: properties.iter().map(|p| p.to_string()).collect(),
+        kind,
+        state: ConstraintState::Active,
+    }
+}
+
+/// Constraints are part of the stored schema: every kind survives a round
+/// trip in order, and the accessors find and remove them by name.
+#[test]
+fn constraints_round_trip_and_are_found_by_name() {
+    let mut schema = LabelSchema::new_node_id("User");
+    schema.add_constraint(constraint("u_email", &["email"], ConstraintKind::Unique));
+    schema.add_constraint(constraint("u_name", &["name"], ConstraintKind::NotNull));
+    schema.add_constraint(constraint(
+        "u_key",
+        &["first", "last"],
+        ConstraintKind::NodeKey,
+    ));
+    schema.add_constraint(constraint(
+        "u_age",
+        &["age"],
+        ConstraintKind::Type(PropertyType::Int),
+    ));
+
+    let bytes = schema.to_msgpack().expect("serialize");
+    let mut restored = LabelSchema::from_msgpack(&bytes).expect("deserialize");
+    assert_eq!(restored, schema);
+    let names: Vec<&str> = restored
+        .constraints()
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["u_email", "u_name", "u_key", "u_age"]);
+    assert_eq!(
+        restored.constraint("u_key").map(|c| &c.kind),
+        Some(&ConstraintKind::NodeKey)
+    );
+
+    let removed = restored.remove_constraint("u_name").expect("present");
+    assert_eq!(removed.kind, ConstraintKind::NotNull);
+    assert!(restored.constraint("u_name").is_none());
+    assert!(restored.remove_constraint("u_name").is_none());
+
+    // A state change survives the round trip too: a validating constraint
+    // never reads back as active.
+    restored.constraint_mut("u_key").expect("present").state = ConstraintState::Validating;
+    let bytes = restored.to_msgpack().expect("serialize");
+    let again = LabelSchema::from_msgpack(&bytes).expect("deserialize");
+    assert_eq!(
+        again.constraint("u_key").map(|c| c.state),
+        Some(ConstraintState::Validating)
+    );
+}
+
+/// A schema stored before labels carried constraints decodes with none:
+/// the field is the last one of the record and defaults when absent.
+#[test]
+fn a_schema_record_without_constraints_decodes_with_none() {
+    let mut schema = LabelSchema::new_node_id("User");
+    schema.add_property(PropertyDef::new("name", PropertyType::String).not_null());
+    schema.add_constraint(constraint("u_name", &["name"], ConstraintKind::NotNull));
+    let bytes = schema.to_msgpack().expect("serialize");
+
+    let mut fields = rmpv::decode::read_value(&mut bytes.as_slice())
+        .expect("decode as a value")
+        .as_array()
+        .cloned()
+        .expect("a label schema is stored as an array of its fields");
+    fields.pop();
+    let mut older = Vec::new();
+    rmpv::encode::write_value(&mut older, &rmpv::Value::Array(fields)).expect("re-encode");
+
+    let restored = LabelSchema::from_msgpack(&older).expect("decode the older record");
+    assert!(restored.constraints().is_empty());
+    assert_eq!(restored.properties, schema.properties);
+}
+
+/// The kinds tell apart what each one checks: presence, per-node checking
+/// and index ownership.
+#[test]
+fn constraint_kinds_say_what_they_check() {
+    let unique = constraint("a", &["x"], ConstraintKind::Unique);
+    let not_null = constraint("b", &["x"], ConstraintKind::NotNull);
+    let key = constraint("c", &["x", "y"], ConstraintKind::NodeKey);
+    let typed = constraint("d", &["x"], ConstraintKind::Type(PropertyType::String));
+
+    assert!(unique.owns_index() && !unique.checks_each_node() && !unique.requires_presence());
+    assert!(!not_null.owns_index() && not_null.checks_each_node() && not_null.requires_presence());
+    assert!(key.owns_index() && key.checks_each_node() && key.requires_presence());
+    assert!(!typed.owns_index() && typed.checks_each_node() && !typed.requires_presence());
+
+    assert!(not_null.same_requirement(&constraint("other", &["x"], ConstraintKind::NotNull)));
+    assert!(!not_null.same_requirement(&constraint("b", &["y"], ConstraintKind::NotNull)));
+    assert!(!key.same_requirement(&constraint("c", &["y", "x"], ConstraintKind::NodeKey)));
+    assert_eq!(typed.kind.to_string(), "TYPE STRING");
+}
+
+#[test]
+fn constraint_name_key_encoding() {
+    assert_eq!(
+        encode_constraint_name_key("user_email"),
+        b"schema:constraint:user_email".to_vec()
+    );
+}

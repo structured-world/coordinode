@@ -304,6 +304,12 @@ pub struct Transaction<'a> {
     /// DERIVED index work: entries staged in the write buffer that the unit
     /// logs as sealed work rather than as mutations.
     derived: derived::DerivedLedger,
+    /// Key ranges this attempt removes, `(partition, start, end)`, applied in
+    /// the commit's unit ahead of its point writes ([`Self::remove_range`]).
+    range_removals: Vec<(Partition, Vec<u8>, Vec<u8>)>,
+    /// Node keys whose state as this attempt leaves them its writer checks
+    /// before the commit ([`Self::note_post_state_check`]).
+    post_state_checks: Vec<Vec<u8>>,
     /// Commits even while storage sheds writes under pressure
     /// ([`Self::exempt_from_write_pressure`]).
     pressure_exempt: bool,
@@ -345,6 +351,11 @@ pub struct TransactionState {
     open: Option<OpenTransaction>,
     /// Parked with the write buffer whose index entries it describes.
     derived: derived::DerivedLedger,
+    /// Parked with the write buffer: the removals commit with its writes.
+    range_removals: Vec<(Partition, Vec<u8>, Vec<u8>)>,
+    /// Parked: a node one statement wrote is checked as the last one leaves
+    /// it.
+    post_state_checks: Vec<Vec<u8>>,
 }
 
 /// One staged adjacency operand. Kept as a sequence rather than as two sets
@@ -496,6 +507,8 @@ impl<'a> Transaction<'a> {
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
             open: Some(engine.open_transaction()),
             derived: derived::DerivedLedger::default(),
+            range_removals: Vec::new(),
+            post_state_checks: Vec::new(),
             pressure_exempt: false,
         }
     }
@@ -557,6 +570,8 @@ impl<'a> Transaction<'a> {
             validate_from: self.validate_from,
             open: self.open,
             derived: self.derived,
+            range_removals: self.range_removals,
+            post_state_checks: self.post_state_checks,
         }
     }
 
@@ -586,6 +601,8 @@ impl<'a> Transaction<'a> {
             validate_from: self.validate_from,
             open: self.open.take(),
             derived: std::mem::take(&mut self.derived),
+            range_removals: std::mem::take(&mut self.range_removals),
+            post_state_checks: std::mem::take(&mut self.post_state_checks),
         }
     }
 
@@ -620,6 +637,8 @@ impl<'a> Transaction<'a> {
             validate_from: state.validate_from,
             open: state.open,
             derived: state.derived,
+            range_removals: state.range_removals,
+            post_state_checks: state.post_state_checks,
             pressure_exempt: false,
         }
     }
@@ -694,6 +713,39 @@ impl<'a> Transaction<'a> {
         } else {
             self.engine.delete(part, key)
         }
+    }
+
+    /// Remove every key in `[start, end)` of `part` with this attempt's
+    /// commit, in one unit with its other writes. Legacy mode removes
+    /// straight from the engine.
+    ///
+    /// For DDL that drops a whole key family together with the catalog
+    /// record that owns it. The attempt neither reads nor writes inside a
+    /// range it removes: its reads would still see the range as stored.
+    pub fn remove_range(&mut self, part: Partition, start: &[u8], end: &[u8]) -> StorageResult<()> {
+        if self.oracle.is_some() {
+            self.range_removals
+                .push((part, start.to_vec(), end.to_vec()));
+            Ok(())
+        } else {
+            self.engine.remove_range(part, start, end)
+        }
+    }
+
+    /// Record that the writer checks node `key` as this attempt leaves it
+    /// before the commit: a condition on the final state, which a check at
+    /// each intermediate write would refuse wrongly. Kept across the
+    /// statements of an interactive transaction. A key recorded twice is
+    /// recorded twice: the bulk write path pays a push, not a search.
+    pub fn note_post_state_check(&mut self, key: &[u8]) {
+        self.post_state_checks.push(key.to_vec());
+    }
+
+    /// The node keys recorded by [`Self::note_post_state_check`], taken by
+    /// the check that runs once, right before the commit; a key appears as
+    /// often as it was recorded.
+    pub fn take_post_state_checks(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.post_state_checks)
     }
 
     /// Read without OCC tracking: write buffer (read-your-own-writes) →
@@ -996,6 +1048,7 @@ impl<'a> Transaction<'a> {
     /// Whether this attempt stages anything the commit would write.
     fn stages_writes(&self) -> bool {
         !self.write_buffer.is_empty()
+            || !self.range_removals.is_empty()
             || !self.merge_adj_ops.is_empty()
             || !self.merge_node_deltas.is_empty()
             || !self.merge_counter_deltas.is_empty()
@@ -1037,6 +1090,13 @@ impl<'a> Transaction<'a> {
                 "the {part:?} partition is merge-composed: its rows are folded from \
                  operands, so a write cannot be conditioned on their version"
             )));
+        }
+        // Legacy mode applies each write as it is made, so a condition
+        // checked at the commit would see this attempt's own writes. It is
+        // decided now, before them; one that fails now is kept and refuses
+        // the commit as usual.
+        if self.oracle.is_none() && self.engine.record_version(part, key)? == expected {
+            return Ok(());
         }
         self.expected_versions.push((part, key.to_vec(), expected));
         Ok(())
@@ -1298,7 +1358,9 @@ impl<'a> Transaction<'a> {
         // relaxed atomic load; read-only commits are exempt (nothing to
         // admit), and the Raft apply path never goes through here, so
         // committed entries are never gated.
-        let has_writes = !self.write_buffer.is_empty() || self.has_pending_merges();
+        let has_writes = !self.write_buffer.is_empty()
+            || !self.range_removals.is_empty()
+            || self.has_pending_merges();
         if has_writes
             && !self.pressure_exempt
             && matches!(
@@ -1345,7 +1407,7 @@ impl<'a> Transaction<'a> {
         };
 
         let has_merge_ops = self.has_pending_merges();
-        if self.write_buffer.is_empty() && !has_merge_ops {
+        if self.write_buffer.is_empty() && self.range_removals.is_empty() && !has_merge_ops {
             // Read-only: nothing to admit or apply, but a condition the
             // caller stated is still the answer it asked for. Checked against
             // committed state now, which is where a commit with no writes
@@ -1532,6 +1594,9 @@ impl<'a> Transaction<'a> {
         // Drained entries preserve original commit_ts for CDC fidelity.
         if ctx.write_concern.is_volatile() {
             // Step 1: Apply locally for read visibility.
+            for (part, start, end) in &self.range_removals {
+                self.engine.remove_range(*part, start, end)?;
+            }
             for ((part, key), value) in &wb {
                 match value {
                     Some(v) => self.engine.put(*part, key, v)?,
@@ -1576,6 +1641,7 @@ impl<'a> Transaction<'a> {
             } else {
                 // No drain buffer — clear write buffers (local writes already applied).
                 wb.clear();
+                self.range_removals.clear();
                 self.merge_adj_ops.clear();
                 self.merge_node_deltas.clear();
                 self.merge_counter_deltas.clear();
@@ -1676,21 +1742,37 @@ impl<'a> Transaction<'a> {
     /// name positions of this final list.
     fn seal_unit(&mut self, wb: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>) -> Vec<Mutation> {
         let derived = std::mem::take(&mut self.derived);
-        let mut mutations: Vec<Mutation> = wb
+        debug_assert!(
+            self.range_removals.iter().all(|(rp, start, end)| {
+                !wb.keys().any(|(p, k)| {
+                    p == rp && k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice()
+                })
+            }),
+            "an attempt writes inside a range it removes"
+        );
+        let mut mutations: Vec<Mutation> = std::mem::take(&mut self.range_removals)
             .into_iter()
-            .filter(|((part, key), _)| !(*part == Partition::Idx && derived.owns(key)))
-            .map(|((part, key), value)| match value {
-                Some(v) => Mutation::Put {
-                    partition: partition_to_id(part),
-                    key,
-                    value: v,
-                },
-                None => Mutation::Delete {
-                    partition: partition_to_id(part),
-                    key,
-                },
+            .map(|(part, start, end)| Mutation::RemoveRange {
+                partition: partition_to_id(part),
+                start,
+                end,
             })
             .collect();
+        mutations.extend(
+            wb.into_iter()
+                .filter(|((part, key), _)| !(*part == Partition::Idx && derived.owns(key)))
+                .map(|((part, key), value)| match value {
+                    Some(v) => Mutation::Put {
+                        partition: partition_to_id(part),
+                        key,
+                        value: v,
+                    },
+                    None => Mutation::Delete {
+                        partition: partition_to_id(part),
+                        key,
+                    },
+                }),
+        );
 
         // Adj merge operands: bypass MVCC, raw keys, staged order kept.
         let staged = std::mem::take(&mut self.merge_adj_ops);

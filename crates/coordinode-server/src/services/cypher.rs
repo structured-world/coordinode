@@ -324,6 +324,27 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
+        DatabaseError::Execution(ExecutionError::ConstraintViolation {
+            constraint,
+            kind,
+            label,
+            property,
+            element_id,
+            ..
+        }) => {
+            return status_with_reason(
+                Code::FailedPrecondition,
+                rendered,
+                Reason::ConstraintViolation,
+                [
+                    ("constraint", constraint.clone()),
+                    ("kind", kind.to_string()),
+                    ("label", label.clone()),
+                    ("property", property.clone()),
+                    ("element_id", element_id.clone()),
+                ],
+            );
+        }
         DatabaseError::Execution(ExecutionError::KeyImmutable { table, column }) => {
             return status_with_reason(
                 Code::FailedPrecondition,

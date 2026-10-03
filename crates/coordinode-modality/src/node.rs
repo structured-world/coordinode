@@ -351,57 +351,67 @@ impl LocalNodeStore {
     /// apply every pending [`DocDelta`](coordinode_core::graph::doc_delta::DocDelta)
     /// for `node_key` against the current record and buffer the materialised
     /// result, so a subsequent read in the same transaction sees the update.
-    /// Drains the applied deltas (idempotent on a second call). A node-modality
-    /// concern that the modality-agnostic [`Transaction`] does not own.
+    /// Drains the applied deltas (idempotent on a second call). The deltas
+    /// are applied as the commit's merge applies them, so the read sees what
+    /// will be stored. A node-modality concern that the modality-agnostic
+    /// [`Transaction`] does not own.
     pub fn materialize_pending_deltas(txn: &mut Transaction, node_key: &[u8]) -> StoreResult<()> {
-        use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
-        use coordinode_core::graph::types::Value;
-
-        let matching: Vec<Vec<u8>> = txn
-            .node_deltas()
-            .iter()
-            .filter(|(k, _)| k == node_key)
-            .map(|(_, op)| op.clone())
-            .collect();
-        if matching.is_empty() {
+        if !txn.node_deltas().iter().any(|(k, _)| k == node_key) {
             return Ok(());
         }
-        // Remove materialised deltas from the buffer.
-        txn.node_deltas_mut().retain(|(k, _)| k != node_key);
-
-        // Current value via read-your-own-writes (untracked: this is an
-        // internal read-modify-write, not a user read joining the OCC set).
-        let current = txn.read_untracked(Partition::Node, node_key)?;
-        let mut record = match current {
-            Some(ref bytes) => NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
-                kind: "node record",
-                message: format!("RYOW decode: {e}"),
-            })?,
-            None => NodeRecord::new(""),
+        // The current value is read untracked: this is an internal
+        // read-modify-write, not a user read joining the OCC set.
+        let Some(record) = Self::post_state(txn, node_key)? else {
+            return Ok(());
         };
-        for operand in &matching {
-            if let Ok(delta) = DocDelta::decode(&operand[1..]) {
-                match delta.target() {
-                    PathTarget::PropField(field_id) => {
-                        let mut doc = match record.props.get(field_id) {
-                            Some(v) => v.to_rmpv(),
-                            None => rmpv::Value::Map(Vec::new()),
-                        };
-                        delta.apply(&mut doc);
-                        record.set(*field_id, Value::Document(doc));
-                    }
-                    PathTarget::Extra => {
-                        // Extra-targeted deltas handled by the merge function.
-                    }
-                }
-            }
-        }
+        txn.node_deltas_mut().retain(|(k, _)| k != node_key);
         let new_bytes = record.to_msgpack().map_err(|e| StoreError::Decode {
             kind: "node record",
             message: format!("RYOW encode: {e}"),
         })?;
         txn.put(Partition::Node, node_key, &new_bytes)?;
         Ok(())
+    }
+
+    /// The record at `node_key` as the transaction leaves it: its buffered
+    /// or stored record with the transaction's pending document deltas
+    /// applied, staging nothing. `None` for a record the transaction deletes
+    /// or that does not exist and has no pending deltas.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or a record or delta that does not decode.
+    pub fn post_state(txn: &Transaction, node_key: &[u8]) -> StoreResult<Option<NodeRecord>> {
+        use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
+
+        let mut deltas = Vec::new();
+        for (_, operand) in txn.node_deltas().iter().filter(|(k, _)| k == node_key) {
+            let decoded = match operand.split_first() {
+                Some((&PREFIX_DOC_DELTA, body)) => {
+                    DocDelta::decode(body).map_err(|e| StoreError::Decode {
+                        kind: "document delta",
+                        message: e.to_string(),
+                    })?
+                }
+                _ => {
+                    return Err(StoreError::Decode {
+                        kind: "document delta",
+                        message: "operand without the document-delta prefix".to_string(),
+                    });
+                }
+            };
+            deltas.push(decoded);
+        }
+        let mut record = match txn.read_untracked(Partition::Node, node_key)? {
+            Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| StoreError::Decode {
+                kind: "node record",
+                message: e.to_string(),
+            })?,
+            None if deltas.is_empty() => return Ok(None),
+            None => NodeRecord::new(""),
+        };
+        coordinode_storage::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
+        Ok(Some(record))
     }
 }
 

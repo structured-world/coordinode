@@ -101,6 +101,7 @@ fn make_test_ctx<'a>(
         foreach_scope: None,
         feedback_cache: None,
         schema_label_cache: std::collections::HashMap::new(),
+        label_schema_cache: std::collections::HashMap::new(),
         applied_watermark: None,
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),

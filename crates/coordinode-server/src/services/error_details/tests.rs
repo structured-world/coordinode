@@ -92,6 +92,7 @@ fn every_reason_has_a_distinct_wire_string() {
         Reason::InvalidWriteConcern,
         Reason::DuplicateKey,
         Reason::KeyImmutable,
+        Reason::ConstraintViolation,
         Reason::RetentionLost,
         Reason::ConsumerTerminated,
     ];

@@ -775,6 +775,17 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
         Clause::DropIndex(c) => Ok(LogicalOp::DropIndex {
             name: c.name.clone(),
         }),
+        Clause::CreateConstraint(c) => Ok(LogicalOp::CreateConstraint {
+            name: c.name.clone(),
+            if_not_exists: c.if_not_exists,
+            label: c.label.clone(),
+            properties: c.properties.clone(),
+            kind: c.kind.clone(),
+        }),
+        Clause::DropConstraint(c) => Ok(LogicalOp::DropConstraint {
+            name: c.name.clone(),
+            if_exists: c.if_exists,
+        }),
         Clause::AlterIndex(c) => Ok(LogicalOp::AlterIndexMaintenance {
             name: c.name.clone(),
             profile: match c.maintenance {

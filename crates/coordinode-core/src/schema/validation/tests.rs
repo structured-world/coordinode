@@ -1,6 +1,6 @@
 use super::*;
 use crate::graph::types::VectorMetric;
-use crate::schema::definition::SchemaMode;
+use crate::schema::definition::{ConstraintKind, ConstraintState, NodeConstraint, SchemaMode};
 
 fn make_field_names(pairs: &[(&str, u32)]) -> HashMap<u32, String> {
     pairs
@@ -458,4 +458,108 @@ fn computed_property_error_display() {
     assert!(msg.contains("COMPUTED"));
     assert!(msg.contains("relevance"));
     assert!(msg.contains("read-only"));
+}
+
+fn flexible_with(constraints: &[(&str, &[&str], ConstraintKind)]) -> LabelSchema {
+    let mut schema = LabelSchema::new_node_id("Log");
+    schema.set_mode(SchemaMode::Flexible);
+    for (name, properties, kind) in constraints {
+        schema.add_constraint(NodeConstraint {
+            name: (*name).to_string(),
+            properties: properties.iter().map(|p| p.to_string()).collect(),
+            kind: kind.clone(),
+            state: ConstraintState::Active,
+        });
+    }
+    schema
+}
+
+fn lookup<'a>(pairs: &'a [(&'a str, Value)]) -> impl Fn(&str) -> Option<Value> + 'a {
+    move |name| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone())
+    }
+}
+
+/// Presence constraints hold on a flexible label, whose properties the
+/// schema never declared: missing and null are both refused.
+#[test]
+fn presence_constraints_hold_without_declarations() {
+    let schema = flexible_with(&[("log_at", &["at"], ConstraintKind::NotNull)]);
+    assert!(check_node_constraints(&schema, &lookup(&[("at", Value::Int(1))])).is_ok());
+    for missing in [&[][..], &[("at", Value::Null)][..]] {
+        let err = check_node_constraints(&schema, &lookup(missing)).expect_err("missing");
+        assert_eq!(
+            err,
+            ValidationError::ConstraintViolation {
+                constraint: "log_at".into(),
+                kind: ConstraintKind::NotNull,
+                property: "at".into(),
+            }
+        );
+    }
+}
+
+/// A node key names the first of its properties that is missing.
+#[test]
+fn node_key_names_the_missing_property() {
+    let schema = flexible_with(&[("k", &["a", "b"], ConstraintKind::NodeKey)]);
+    let err =
+        check_node_constraints(&schema, &lookup(&[("a", Value::Int(1))])).expect_err("b missing");
+    assert!(
+        matches!(&err, ValidationError::ConstraintViolation { property, .. } if property == "b"),
+        "{err:?}"
+    );
+    assert!(
+        check_node_constraints(
+            &schema,
+            &lookup(&[("a", Value::Int(1)), ("b", Value::Int(2))])
+        )
+        .is_ok()
+    );
+}
+
+/// A type constraint checks a present value only, and a value of a close
+/// but different type is still another type.
+#[test]
+fn type_constraint_checks_present_values_only() {
+    let schema = flexible_with(&[("qty", &["qty"], ConstraintKind::Type(PropertyType::Int))]);
+    assert!(check_node_constraints(&schema, &lookup(&[])).is_ok());
+    assert!(check_node_constraints(&schema, &lookup(&[("qty", Value::Null)])).is_ok());
+    assert!(check_node_constraints(&schema, &lookup(&[("qty", Value::Int(3))])).is_ok());
+    let err = check_node_constraints(&schema, &lookup(&[("qty", Value::Float(3.0))]))
+        .expect_err("float is not int");
+    assert_eq!(
+        err.to_string(),
+        "constraint `qty` violated: 'qty' must be of type INT"
+    );
+}
+
+/// Uniqueness is decided across nodes by the constraint's index; one node on
+/// its own cannot break it.
+#[test]
+fn uniqueness_is_not_checked_per_node() {
+    let schema = flexible_with(&[("u", &["email"], ConstraintKind::Unique)]);
+    assert!(check_node_constraints(&schema, &lookup(&[])).is_ok());
+}
+
+/// The scan that enables a schema revision reports constraint violations
+/// in every mode, on properties outside the declarations.
+#[test]
+fn validate_properties_reports_constraints_in_flexible_mode() {
+    let schema = flexible_with(&[("log_at", &["at"], ConstraintKind::NotNull)]);
+    let field_names = make_field_names(&[("msg", 1), ("at", 2)]);
+    let mut props = HashMap::new();
+    props.insert(1, Value::String("x".into()));
+    let errors = validate_properties(&schema, &props, &field_names).expect_err("at missing");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::ConstraintViolation { constraint, .. } if constraint == "log_at")),
+        "{errors:?}"
+    );
+    props.insert(2, Value::Int(1));
+    assert!(validate_properties(&schema, &props, &field_names).is_ok());
 }
