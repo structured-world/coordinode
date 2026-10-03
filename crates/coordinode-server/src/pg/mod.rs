@@ -156,8 +156,11 @@ fn command_tag(query: &str) -> Tag {
 /// The SQLSTATE a PostgreSQL driver branches on for `error` (PostgreSQL
 /// documentation, Appendix A "PostgreSQL Error Codes"). A duplicate key is
 /// `23505 unique_violation`; changing a key column, which PostgreSQL permits
-/// and this server does not, is `42P10 invalid_column_reference`. Everything
-/// else stays `XX000 internal_error`.
+/// and this server does not, is `42P10 invalid_column_reference`. A write
+/// conflict is `40001 serialization_failure`, the class drivers retry the
+/// whole transaction on; write pressure is `53000 insufficient_resources`;
+/// a write that reached a follower is `25006 read_only_sql_transaction`, what
+/// a PostgreSQL standby answers. Everything else stays `XX000 internal_error`.
 fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
     use coordinode_embed::db::DatabaseError;
     use coordinode_query::executor::runner::ExecutionError;
@@ -166,6 +169,12 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
             ExecutionError::DuplicateKey { .. } | ExecutionError::UniqueViolation { .. },
         ) => "23505",
         DatabaseError::Execution(ExecutionError::KeyImmutable { .. }) => "42P10",
+        DatabaseError::TransactionConflict { .. }
+        | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
+        DatabaseError::WriteBackpressure
+        | DatabaseError::Execution(ExecutionError::Backpressure) => "53000",
+        DatabaseError::NotLeader { .. }
+        | DatabaseError::Execution(ExecutionError::NotLeader { .. }) => "25006",
         _ => "XX000",
     }
 }

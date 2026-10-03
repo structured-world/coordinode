@@ -169,6 +169,44 @@ async fn invalid_sql_returns_error_not_disconnect() {
 
 /// A driver sees a duplicate key as `23505 unique_violation`, the code it
 /// branches on for exactly this, and a key change as `42P10`.
+/// Refusals a client retries carry the SQLSTATE a PostgreSQL driver retries
+/// on, not `XX000`: a write conflict is `40001 serialization_failure` in both
+/// its interactive and auto-commit spellings, write pressure is `53000
+/// insufficient_resources`, and a write that reached a follower is `25006
+/// read_only_sql_transaction`, what a PostgreSQL standby answers.
+#[test]
+fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::ExecutionError;
+
+    let cases = [
+        (
+            DatabaseError::TransactionConflict {
+                id: 1,
+                source_message: "conflict".to_string(),
+            },
+            "40001",
+        ),
+        (
+            DatabaseError::Execution(ExecutionError::Conflict("conflict".to_string())),
+            "40001",
+        ),
+        (DatabaseError::WriteBackpressure, "53000"),
+        (
+            DatabaseError::Execution(ExecutionError::Backpressure),
+            "53000",
+        ),
+        (DatabaseError::NotLeader { leader_id: Some(2) }, "25006"),
+        (
+            DatabaseError::Execution(ExecutionError::NotLeader { leader_id: None }),
+            "25006",
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(super::sqlstate(&error), expected, "{error:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn key_errors_carry_their_sqlstate() {
     use tokio_postgres::error::SqlState;

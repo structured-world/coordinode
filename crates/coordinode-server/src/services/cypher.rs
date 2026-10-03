@@ -305,6 +305,14 @@ fn db_error_to_status(err: DatabaseError) -> Status {
                 [("transaction_id", id.to_string())],
             );
         }
+        // The auto-commit spelling of the same refusal: nothing was applied
+        // and the retry is the whole statement, so it is ABORTED too, with no
+        // transaction id to name.
+        DatabaseError::Execution(coordinode_query::executor::runner::ExecutionError::Conflict(
+            _,
+        )) => {
+            return status_with_reason(Code::Aborted, rendered, Reason::TransactionConflict, []);
+        }
         // Both spellings of one refusal: an interactive commit fails with the
         // typed variant, an auto-commit statement carries it inside the
         // execution error. ABORTED like a conflict (the retry is the whole

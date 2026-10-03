@@ -2573,6 +2573,30 @@ fn path_round_trips_with_its_type() {
 /// variant, while an auto-commit statement carries it inside the execution
 /// error, and a client must not have to tell those apart.
 #[test]
+fn an_auto_commit_write_conflict_is_aborted_like_an_interactive_one() {
+    use tonic_types::StatusExt;
+
+    // An auto-commit statement carries the conflict inside the execution
+    // error; it is the same retryable refusal as an interactive commit's,
+    // not an internal error of unknown outcome.
+    let status = db_error_to_status(DatabaseError::Execution(
+        coordinode_query::executor::runner::ExecutionError::Conflict(
+            "write conflict: a key in the Node partition is already being written by a \
+             transaction committing at 7. Nothing was applied; retry the whole transaction."
+                .to_string(),
+        ),
+    ));
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    let details = status.get_error_details();
+    let info = details.error_info().expect("must carry ErrorInfo");
+    assert_eq!(info.reason, "TRANSACTION_CONFLICT");
+    assert!(
+        !info.metadata.contains_key("transaction_id"),
+        "an auto-commit statement has no transaction id to name"
+    );
+}
+
+#[test]
 fn a_write_to_a_follower_is_a_redirect_with_the_leader_named() {
     use tonic_types::StatusExt;
 
