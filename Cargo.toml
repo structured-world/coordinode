@@ -47,7 +47,7 @@ publish = false
 # written), not the major: a consumer with its own lockfile otherwise keeps an
 # older 5.x that satisfies "5" and fails to build, to reopen a store, or to
 # keep a flushed tree across a power cut.
-lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.13", default-features = false }
+lsm-tree = { package = "coordinode-lsm-tree", version = "5.11.15", default-features = false }
 
 # Consensus
 openraft = { version = "0.10.0-alpha.36", features = ["serde"] }
