@@ -360,6 +360,50 @@ async fn log_store_purge_keeps_what_the_latest_checkpoint_lacks() {
 }
 
 #[tokio::test]
+async fn a_purge_below_what_is_already_purged_is_a_no_op() {
+    // A later checkpoint can lower the floor below what an earlier purge
+    // already removed. The purge must then remove nothing and succeed: an
+    // error from purge stops consensus on a node that has lost nothing.
+    // One entry per segment, so a purge really deletes the entries.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.oplog_segment_max_entries = 1;
+    let engine = Arc::new(StorageEngine::open(&config).expect("open"));
+    let mut store = LogStore::open(Arc::clone(&engine)).unwrap();
+    let entries = vec![
+        make_entry(1, 1, "a"),
+        make_entry(2, 1, "b"),
+        make_entry(3, 1, "c"),
+        make_entry(4, 1, "d"),
+        make_entry(5, 1, "e"),
+    ];
+    store.append(entries, IOFlushed::noop()).await.unwrap();
+    engine.reset_raft_coverage(6, &[]).unwrap();
+    store.purge(log_id(1, 3)).await.unwrap();
+
+    engine.set_raft_log_keep_from(2);
+    store
+        .purge(log_id(1, 5))
+        .await
+        .expect("a floor below the purged entries removes nothing");
+
+    let remaining = store.try_get_log_entries(0..=10).await.unwrap();
+    assert_eq!(
+        remaining.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+        vec![4, 5],
+        "nothing past the floor goes, nothing purged comes back"
+    );
+    let state = store.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(log_id(1, 3)));
+}
+
+#[tokio::test]
 async fn a_checkpoint_raft_floor_is_the_lowest_base_of_its_trees() {
     let (_dir, engine) = test_engine();
     engine.reset_raft_coverage(7, &[]).unwrap();

@@ -890,7 +890,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             .raft_durable_floor()
             .map_err(|e| io::Error::other(format!("raft coverage floor: {e}")))?;
         let below = floor.min(log_id.index + 1);
-        if below == 0 {
+        // A floor at or below what an earlier purge already removed (a later
+        // checkpoint can lower it) leaves nothing to remove: the purge point
+        // never moves back, and the entry below it is gone already.
+        let purged_below = self
+            .last_purged
+            .lock()
+            .map_err(|_| io::Error::other("last_purged mutex poisoned"))?
+            .map_or(0, |id| id.index + 1);
+        if below <= purged_below {
             return Ok(());
         }
         let purged_to = if below == log_id.index + 1 {
