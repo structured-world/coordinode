@@ -1941,6 +1941,45 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
     );
 }
 
+/// Through the RPC: the catalog listing answers, and a refused CALL reaches
+/// the client as INVALID_ARGUMENT with the reason and the procedure name.
+#[tokio::test]
+async fn execute_cypher_lists_procedures_and_refuses_an_unknown_one() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    let request = |query: &str| query::ExecuteCypherRequest {
+        query: query.to_string(),
+        parameters: std::collections::HashMap::new(),
+        read_preference: 0,
+        read_concern: None,
+        write_concern: None,
+        transaction_id: 0,
+    };
+
+    let listed = svc
+        .execute_cypher(Request::new(request(
+            "CALL dbms.procedures() YIELD name WHERE name = 'dbms.functions' RETURN name",
+        )))
+        .await
+        .expect("listing")
+        .into_inner();
+    assert_eq!(listed.rows.len(), 1);
+
+    let refused = svc
+        .execute_cypher(Request::new(request("CALL db.nosuch()")))
+        .await
+        .expect_err("unknown procedure");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    let details = refused.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "UNKNOWN_PROCEDURE");
+    assert_eq!(
+        info.metadata.get("procedure").map(String::as_str),
+        Some("db.nosuch")
+    );
+}
+
 /// Read queries in causal sessions do not require write_concern.
 ///
 /// The write-concern gate is skipped entirely for read-only queries; only
