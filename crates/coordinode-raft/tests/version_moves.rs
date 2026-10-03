@@ -279,6 +279,17 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
         assert_eq!((behind.own, behind.group), (pair(0), pair(1)));
         assert_eq!(behind.leader.map(|(id, _)| id), Some(new_leader.id));
 
+        // Its report says the same, and the new leader's shows the group
+        // writing at the new pair.
+        let old = m1.node().version_report();
+        assert_eq!(old.pair, pair(0));
+        assert!(old.read_only.as_ref().is_some_and(|r| r.behind));
+        let led = new_leader.node().version_report();
+        assert_eq!(led.group_pair.map(|r| r.pair), Some(pair(1)));
+        assert_eq!(led.majority_pair, Some(pair(1)));
+        assert_eq!(led.pause_ms, None);
+        assert!(led.read_only.is_none());
+
         // Updated last, it matches and catches up.
         m1.update(1).await;
         eventually("member 1 matches", || {

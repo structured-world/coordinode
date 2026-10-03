@@ -230,6 +230,40 @@ fn register_replication_metrics() {
         "coordinode_raft_rate_limiter_pending",
         "Available rate limiter permits (lower = more backpressure)"
     );
+
+    // Versions in the group
+    metrics::describe_gauge!(
+        "coordinode_version_engine_format",
+        "Engine format version this member runs"
+    );
+    metrics::describe_gauge!(
+        "coordinode_version_host_epoch",
+        "Host format epoch this member runs"
+    );
+    metrics::describe_gauge!(
+        "coordinode_version_group_engine_format",
+        "Engine format version the group last recorded"
+    );
+    metrics::describe_gauge!(
+        "coordinode_version_group_host_epoch",
+        "Host format epoch the group last recorded"
+    );
+    metrics::describe_gauge!(
+        "coordinode_version_read_only",
+        "1 while this member does not run the version its group runs"
+    );
+    metrics::describe_gauge!(
+        "coordinode_version_pause_seconds",
+        "How long the group has been unable to write during a version move, 0 while it writes"
+    );
+    metrics::describe_counter!(
+        "coordinode_version_refused_writes_total",
+        "Writes refused because this member does not run its group's version"
+    );
+    metrics::describe_counter!(
+        "coordinode_version_refused_calls_total",
+        "Inter-node calls refused because the caller runs another version or group"
+    );
 }
 
 fn register_network_metrics() {

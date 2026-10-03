@@ -78,6 +78,55 @@ struct View {
     reported: Option<RecordedPair>,
     leader: Option<(u64, String)>,
     peers: BTreeMap<u64, Handshake>,
+    /// When this member first saw no pair able to write: none held by a
+    /// majority of the voters, or the majority's pair not yet recorded.
+    paused_since: Option<std::time::Instant>,
+}
+
+/// What a member reports about versions: its own, its group's, whether it
+/// serves writes, and the pair each voter runs as far as it knows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VersionReport {
+    /// This member.
+    pub node_id: u64,
+    /// The pair it runs.
+    pub pair: VersionPair,
+    /// The pair its group runs, with the record that set it.
+    pub group_pair: Option<RecordedPair>,
+    /// Why it is read-only; `None` when it serves writes.
+    pub read_only: Option<ReadOnly>,
+    /// Every voter and the pair it last reported (this member's own for
+    /// itself); `None` for a voter not heard from.
+    pub voters: Vec<VoterPair>,
+    /// The pair a majority of the voters runs, if one does.
+    pub majority_pair: Option<VersionPair>,
+    /// How long no pair has been able to write, in milliseconds, while the
+    /// group is paused; `None` while it writes.
+    pub pause_ms: Option<u64>,
+}
+
+/// A read-only member's reason, as its refusals name it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReadOnly {
+    /// The group moved past this member; otherwise this member is ahead.
+    pub behind: bool,
+    /// The commit timestamp its reads are as of.
+    pub as_of: u64,
+    /// The leader to send writes to, when known.
+    pub leader_id: Option<u64>,
+    /// That leader's address, when known.
+    pub leader_addr: Option<String>,
+    /// The refusal, in words.
+    pub reason: String,
+}
+
+/// One voter's pair.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VoterPair {
+    /// The voter.
+    pub node_id: u64,
+    /// The pair it last reported.
+    pub pair: Option<VersionPair>,
 }
 
 impl VersionGate {
@@ -124,6 +173,59 @@ impl VersionGate {
                 as_of: self.applied_commit_ts.load(Ordering::Acquire),
             }),
             _ => MemberState::Matched,
+        }
+    }
+
+    /// The report of this member among `voters`, the group's voting members.
+    /// Also marks the start or end of a write pause, so the pause it reports
+    /// is measured from the first report or leadership change that saw it.
+    pub fn report(&self, voters: &[u64]) -> VersionReport {
+        let group_pair = self.group_pair();
+        let read_only = match self.state() {
+            MemberState::Matched => None,
+            MemberState::Mismatched(m) => Some(ReadOnly {
+                behind: m.behind,
+                as_of: m.as_of,
+                leader_id: m.leader.as_ref().map(|(id, _)| *id),
+                leader_addr: m.leader.as_ref().map(|(_, addr)| addr.clone()),
+                reason: m.to_string(),
+            }),
+        };
+        let mut view = self.view.lock();
+        let voters: Vec<VoterPair> = voters
+            .iter()
+            .map(|&node_id| VoterPair {
+                node_id,
+                pair: if node_id == self.node_id {
+                    Some(self.pair)
+                } else {
+                    view.peers.get(&node_id).map(|h| h.pair)
+                },
+            })
+            .collect();
+        let majority_pair = majority(&voters);
+        // The group writes when a majority runs one pair and that pair is the
+        // recorded one (or nothing is recorded yet, so its leader records it
+        // as its first entry).
+        let writes = majority_pair.is_some_and(|m| group_pair.is_none_or(|g| g.pair == m));
+        let pause_ms = if writes {
+            view.paused_since = None;
+            None
+        } else {
+            let since = *view
+                .paused_since
+                .get_or_insert_with(std::time::Instant::now);
+            // A pause measured in u64 milliseconds outlasts any process.
+            Some(u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX))
+        };
+        VersionReport {
+            node_id: self.node_id,
+            pair: self.pair,
+            group_pair,
+            read_only,
+            voters,
+            majority_pair,
+            pause_ms,
         }
     }
 
@@ -228,6 +330,21 @@ impl VersionGate {
             .iter()
             .any(|r| r.pair == self.pair && r.seq < seq)
     }
+}
+
+/// The pair more than half of `voters` run, if any.
+fn majority(voters: &[VoterPair]) -> Option<VersionPair> {
+    let mut counts: Vec<(VersionPair, usize)> = Vec::new();
+    for pair in voters.iter().filter_map(|v| v.pair) {
+        match counts.iter_mut().find(|(p, _)| *p == pair) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((pair, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .find(|(_, n)| *n > voters.len() / 2)
+        .map(|(p, _)| p)
 }
 
 fn later(a: Option<RecordedPair>, b: Option<RecordedPair>) -> Option<RecordedPair> {

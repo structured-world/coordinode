@@ -1454,6 +1454,22 @@ impl RaftNode {
         &self.version
     }
 
+    /// This member's version report: its pair, its group's, whether it
+    /// serves writes and why not, each voter's pair as far as it knows, and
+    /// how long the group has been unable to write while it is.
+    pub fn version_report(&self) -> version::VersionReport {
+        use openraft::rt::watch::WatchReceiver;
+        let voters: Vec<u64> = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        self.version.report(&voters)
+    }
+
     /// The frozen version exchange, for a caller that serves this node's
     /// [`RaftGrpcHandler`] on its own router: register both.
     pub fn handshake_service(

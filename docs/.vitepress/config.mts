@@ -23,6 +23,7 @@ const guideSidebar = [
       { text: "Binary", link: "/guide/binary" },
       { text: "Embedded (Rust)", link: "/guide/embedded" },
       { text: "Configuration", link: "/guide/configuration" },
+      { text: "Upgrading a Group", link: "/guide/upgrades" },
     ],
   },
   {

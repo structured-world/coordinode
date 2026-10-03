@@ -5,6 +5,8 @@
 //! - GET /ready: readiness check, 200 while the gRPC server serves, 503
 //!   before it starts and from the moment shutdown begins
 //! - GET /metrics: Prometheus OpenMetrics
+//! - GET /version: this member's version report (its pair, its group's, why
+//!   it is read-only if it is, each voter's pair, the current write pause)
 //!
 //! # Cluster-ready notes
 //! - Each CE node (3-node HA) has its own :7084.
@@ -45,13 +47,16 @@ impl Readiness {
 }
 
 /// Status line, content type and body for `path`; `metrics` renders the
-/// Prometheus text only when asked for.
+/// Prometheus text and `version` the version report, each only when asked
+/// for.
 fn respond(
     path: &str,
     ready: bool,
     metrics: impl FnOnce() -> String,
+    version: impl FnOnce() -> String,
 ) -> (&'static str, &'static str, String) {
     match path {
+        "/version" => ("200 OK", "application/json", version()),
         "/health" => (
             "200 OK",
             "application/json",
@@ -81,15 +86,20 @@ fn respond(
 /// between scrapes.
 pub(crate) type SampleGauges = Arc<dyn Fn() + Send + Sync>;
 
+/// Renders this member's version report as JSON, at request time.
+pub(crate) type VersionView = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// Start the operational HTTP server on `listener`, bound by the caller at
 /// startup so a busy port fails the start.
 ///
-/// Handles /health, /ready, /metrics; `/ready` follows `readiness`, and
-/// `/metrics` runs `sample` first. Runs until the process exits.
+/// Handles /health, /ready, /metrics, /version; `/ready` follows
+/// `readiness`, `/metrics` runs `sample` first, and `/version` renders
+/// `version`. Runs until the process exits.
 pub(crate) async fn start_ops_server(
     listener: TcpListener,
     readiness: Readiness,
     sample: SampleGauges,
+    version: VersionView,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install Prometheus metrics recorder
     let prometheus_handle = PrometheusBuilder::new()
@@ -114,6 +124,7 @@ pub(crate) async fn start_ops_server(
 
         let handle = prometheus_handle.clone();
         let sample = Arc::clone(&sample);
+        let version = Arc::clone(&version);
         let ready = readiness.get();
 
         tokio::spawn(async move {
@@ -132,10 +143,15 @@ pub(crate) async fn start_ops_server(
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or("/");
 
-            let (status, content_type, body) = respond(path, ready, || {
-                sample();
-                handle.render()
-            });
+            let (status, content_type, body) = respond(
+                path,
+                ready,
+                || {
+                    sample();
+                    handle.render()
+                },
+                || version(),
+            );
 
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

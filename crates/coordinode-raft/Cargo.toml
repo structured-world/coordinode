@@ -37,6 +37,8 @@ coordinode-test-fixtures = { workspace = true }
 # Crash tests flush one partition tree on its own through the tree API.
 lsm-tree = { workspace = true }
 tempfile = { workspace = true }
+# The version report's JSON form, as the server's ops surface renders it.
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Generate an in-memory CA + node certs for the inter-node mTLS integration test.

@@ -58,6 +58,8 @@ tower = "0.5"
 http = "1"
 pin-project-lite = "0.2"
 serde = { workspace = true }
+# The /version report on the ops port.
+serde_json = { workspace = true }
 serde_yaml_ng = "0.10"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

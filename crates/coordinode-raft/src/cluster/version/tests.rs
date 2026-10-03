@@ -159,6 +159,60 @@ fn a_stale_consensus_does_not_override_the_reported_leader() {
     assert_eq!(m.leader.map(|(id, _)| id), Some(2));
 }
 
+/// The report names each voter's pair, the pair a majority runs, and a
+/// pause while no majority runs the recorded pair; the pause ends once one
+/// does.
+#[test]
+fn the_report_follows_the_majority_and_the_pause() {
+    let rig = Rig::new();
+    rig.record(P);
+    let gate = rig.gate(1, P);
+    gate.observe(&peer(2, P, None));
+    let report = gate.report(&[1, 2, 3]);
+    assert_eq!(report.majority_pair, Some(P));
+    assert_eq!(report.pause_ms, None, "a majority runs the recorded pair");
+    assert_eq!(report.read_only, None);
+    assert_eq!(
+        report.voters.iter().map(|v| v.pair).collect::<Vec<_>>(),
+        vec![Some(P), Some(P), None],
+        "a voter not heard from is reported as unknown"
+    );
+
+    // Member 2 moves on: no pair holds a majority, writes pause.
+    gate.observe(&peer(2, P2, None));
+    gate.observe(&peer(3, P, None));
+    assert_eq!(gate.report(&[1, 2, 3]).majority_pair, Some(P));
+    gate.observe(&peer(3, P2, None));
+    let paused = gate.report(&[1, 2, 3]);
+    assert_eq!(paused.majority_pair, Some(P2));
+    assert!(
+        paused.pause_ms.is_some(),
+        "the new majority has not recorded its pair yet"
+    );
+
+    // The new side records its pair: this member is read-only, behind, and
+    // the group writes again.
+    gate.observe(&peer(2, P2, Some(RecordedPair { pair: P2, seq: 2 })));
+    let moved = gate.report(&[1, 2, 3]);
+    assert_eq!(moved.pause_ms, None);
+    let read_only = moved.read_only.expect("behind its group");
+    assert!(read_only.behind);
+    assert_eq!(read_only.leader_id, Some(2));
+    assert_eq!(read_only.as_of, 42);
+}
+
+#[test]
+fn a_report_serializes_for_the_ops_surface() {
+    let rig = Rig::new();
+    rig.record(P);
+    let gate = rig.gate(1, P);
+    let json = serde_json::to_value(gate.report(&[1])).expect("serialize");
+    assert_eq!(json["node_id"], 1);
+    assert_eq!(json["pair"]["engine"], P.engine);
+    assert_eq!(json["group_pair"]["seq"], 1);
+    assert!(json["read_only"].is_null());
+}
+
 /// An older report never replaces a later record.
 #[test]
 fn a_stale_report_changes_nothing() {

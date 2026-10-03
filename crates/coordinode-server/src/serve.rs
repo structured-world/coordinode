@@ -795,7 +795,25 @@ pub(crate) async fn serve(
     let sample_gauges: ops::SampleGauges = {
         let db_metrics = Arc::clone(&database);
         let engine_metrics = Arc::clone(&engine);
+        let version_node = Arc::clone(&raft_node);
         Arc::new(move || {
+            // This member's version, its group's, and whether it is
+            // read-only or its group paused: sampled per scrape.
+            {
+                let report = version_node.version_report();
+                metrics::gauge!("coordinode_version_engine_format").set(report.pair.engine as f64);
+                metrics::gauge!("coordinode_version_host_epoch").set(report.pair.host_epoch as f64);
+                if let Some(group) = report.group_pair {
+                    metrics::gauge!("coordinode_version_group_engine_format")
+                        .set(group.pair.engine as f64);
+                    metrics::gauge!("coordinode_version_group_host_epoch")
+                        .set(group.pair.host_epoch as f64);
+                }
+                metrics::gauge!("coordinode_version_read_only")
+                    .set(if report.read_only.is_some() { 1.0 } else { 0.0 });
+                metrics::gauge!("coordinode_version_pause_seconds")
+                    .set(report.pause_ms.map_or(0.0, |ms| ms as f64 / 1000.0));
+            }
             {
                 let committed = engine_metrics.snapshot();
                 let health = db_metrics.read().vector_index_registry().all_health();
@@ -1094,8 +1112,17 @@ pub(crate) async fn serve(
         });
     }
     let ops_readiness = readiness.clone();
+    let version_view: ops::VersionView = {
+        let node = Arc::clone(&raft_node);
+        Arc::new(move || {
+            serde_json::to_string(&node.version_report())
+                .unwrap_or_else(|e| format!(r#"{{"error":"version report: {e}"}}"#))
+        })
+    };
     tokio::spawn(async move {
-        if let Err(e) = ops::start_ops_server(ops_listener, ops_readiness, sample_gauges).await {
+        if let Err(e) =
+            ops::start_ops_server(ops_listener, ops_readiness, sample_gauges, version_view).await
+        {
             tracing::error!("ops server error: {e}");
         }
     });
