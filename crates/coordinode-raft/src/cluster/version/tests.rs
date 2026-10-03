@@ -204,6 +204,29 @@ fn the_report_follows_the_majority_and_the_pause() {
     assert_eq!(read_only.as_of, 42);
 }
 
+/// A member that comes back through an intermediate version, which its group
+/// never recorded, is behind a group that already runs a later one: the
+/// order of versions decides, not whether the group once ran this member's.
+#[test]
+fn a_member_at_an_intermediate_version_is_behind_a_later_group() {
+    const MID: VersionPair = VersionPair {
+        engine: 2,
+        host_epoch: 0,
+    };
+    const NEW: VersionPair = VersionPair {
+        engine: 3,
+        host_epoch: 0,
+    };
+    let rig = Rig::new();
+    rig.record(P);
+    let gate = rig.gate(1, MID);
+    gate.observe(&peer(2, NEW, Some(RecordedPair { pair: NEW, seq: 3 })));
+    match gate.state() {
+        MemberState::Mismatched(m) => assert!(m.behind, "the group runs a later version"),
+        MemberState::Matched => panic!("another version than the group's"),
+    }
+}
+
 /// A voter not heard from within the window is not counted toward a
 /// majority: the reachable members alone decide whether the group writes.
 /// Its last known pair is still reported.

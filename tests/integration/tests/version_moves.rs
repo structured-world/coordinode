@@ -330,6 +330,178 @@ async fn a_move_with_the_completing_member_killed_loses_no_acknowledged_write() 
     move_under_workload(true).await;
 }
 
+/// Take the reachable members 1 and 2 of a group from format bump `from` to
+/// `to`, member 2 first.
+async fn move_two(
+    m1: CoordinodeProcess,
+    m2: CoordinodeProcess,
+    ports: [u16; 3],
+    to: &str,
+) -> (CoordinodeProcess, CoordinodeProcess) {
+    let m2 = m2
+        .restart_member(2, &peers_of(ports, 1), &at(to), false)
+        .await;
+    let m1 = m1
+        .restart_member(1, &peers_of(ports, 0), &at(to), false)
+        .await;
+    (m1, m2)
+}
+
+/// Write `seq` on whichever of `ports` leads, within 40 s.
+async fn write_on_leader(ports: &[u16], seq: i64) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        for port in ports {
+            if write_seq(*port, seq).await {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "no member took write {seq}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn wait_holds(port: u16, seqs: &BTreeSet<i64>) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if local_seqs(port)
+            .await
+            .is_some_and(|held| seqs.is_subset(&held))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "member on {port} never caught up"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// A member away through two moves of its group comes back two formats
+/// behind: refused by name, it rejoins through the intermediate format
+/// (read-only and behind there, matched and caught up at the group's).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_two_formats_behind_rejoins_through_the_intermediate_format() {
+    let ([m1, m2, m3], ports) = group_of_three().await;
+    let base = engine_of(&m1);
+    write_on_leader(&ports[..2], 1).await;
+    let away = m3.stop_keeping_data().await;
+
+    let (m1, m2) = move_two(m1, m2, ports, "1").await;
+    write_on_leader(&ports[..2], 2).await;
+    let (m1, m2) = move_two(m1, m2, ports, "2").await;
+    write_on_leader(&ports[..2], 3).await;
+
+    let (status, printed) = start_cluster_member_expecting_refusal_with_env(
+        3,
+        ports[2],
+        &peers_of(ports, 2),
+        away.path(),
+        &at("2"),
+    )
+    .await;
+    assert!(!status.success(), "two formats behind refuses: {printed}");
+    assert!(
+        printed.contains(&format!("engine format {base}")),
+        "the refusal names the directory's format: {printed}"
+    );
+
+    let m3 = CoordinodeProcess::start_cluster_member_over(
+        3,
+        ports[2],
+        &peers_of(ports, 2),
+        away,
+        &at("1"),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = m3.version_report();
+        if report["read_only"]["behind"].as_bool() == Some(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never read-only behind: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let m3 = m3
+        .restart_member(3, &peers_of(ports, 2), &at("2"), false)
+        .await;
+    wait_holds(ports[2], &BTreeSet::from([1, 2, 3])).await;
+    let report = m3.version_report();
+    assert_eq!(engine_of(&m3), base + 2);
+    assert!(report["read_only"].is_null(), "{report}");
+    drop((m1, m2));
+}
+
+/// The other way back for a member two formats behind: removed while away,
+/// the removal committed first, its directory discarded after, and added
+/// again empty at the group's format.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_two_formats_behind_is_removed_and_re_added_empty() {
+    use coordinode_integration::proto::admin::DecommissionNodeRequest;
+
+    let ([m1, m2, m3], ports) = group_of_three().await;
+    write_on_leader(&ports[..2], 1).await;
+    let away = m3.stop_keeping_data().await;
+    let (m1, m2) = move_two(m1, m2, ports, "1").await;
+    let (m1, m2) = move_two(m1, m2, ports, "2").await;
+    write_on_leader(&ports[..2], 2).await;
+
+    // Removed through whichever member leads, then the directory goes.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let leader = loop {
+        let mut removed = None;
+        for member in [&m1, &m2] {
+            let decommission = member
+                .cluster_client()
+                .await
+                .decommission_node(DecommissionNodeRequest {
+                    node_id: 3,
+                    pruning: false,
+                    force: false,
+                    skip_confirmation: false,
+                })
+                .await;
+            if decommission.is_ok() {
+                removed = Some(member);
+                break;
+            }
+        }
+        if let Some(member) = removed {
+            break member;
+        }
+        assert!(Instant::now() < deadline, "the removal never committed");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let mut admin = leader.cluster_client().await;
+    wait_for_voters(&mut admin, 2).await;
+    drop(away);
+
+    let m3 = CoordinodeProcess::start_cluster_member_with_env(
+        3,
+        ports[2],
+        &peers_of(ports, 2),
+        &at("2"),
+    )
+    .await;
+    admin
+        .join_node(JoinNodeRequest {
+            node_id: 3,
+            address: m3.member_addr(),
+            pre_seeded: false,
+        })
+        .await
+        .expect("join 3 again");
+    wait_for_voters(&mut admin, 3).await;
+    wait_holds(ports[2], &BTreeSet::from([1, 2])).await;
+    assert!(m3.version_report()["read_only"].is_null());
+    drop((m1, m2));
+}
+
 /// A directory two engine formats behind is refused by name and left as it
 /// was; taken through the intermediate format it opens, holding its data.
 /// A single-member group is the case where that is the only way.

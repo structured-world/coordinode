@@ -57,6 +57,13 @@ impl VersionPair {
             host_epoch,
         }
     }
+
+    /// Whether this pair is a later version than `other`. Versions only move
+    /// forward: a release that changes the engine format is later whatever
+    /// the host's epoch, and at one engine format the higher host epoch is.
+    pub fn is_newer_than(&self, other: &Self) -> bool {
+        (self.engine, self.host_epoch) > (other.engine, other.host_epoch)
+    }
 }
 
 impl core::fmt::Display for VersionPair {

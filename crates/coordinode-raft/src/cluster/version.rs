@@ -175,7 +175,7 @@ impl VersionGate {
             Some(group) if group.pair != self.pair => MemberState::Mismatched(Mismatch {
                 own: self.pair,
                 group: group.pair,
-                behind: self.behind_at(group.seq),
+                behind: group.pair.is_newer_than(&self.pair),
                 leader: self.view.lock().leader.clone(),
                 as_of: self.applied_commit_ts.load(Ordering::Acquire),
             }),
@@ -342,18 +342,9 @@ impl VersionGate {
     pub fn pair_to_record(&self) -> Option<VersionPair> {
         match self.group_pair() {
             Some(group) if group.pair == self.pair => None,
-            Some(group) if self.behind_at(group.seq) => None,
+            Some(group) if group.pair.is_newer_than(&self.pair) => None,
             _ => Some(self.pair),
         }
-    }
-
-    /// Whether this member's pair was recorded before record `seq`: the
-    /// group ran it and moved on.
-    fn behind_at(&self, seq: u64) -> bool {
-        self.applied
-            .borrow()
-            .iter()
-            .any(|r| r.pair == self.pair && r.seq < seq)
     }
 }
 
