@@ -1075,22 +1075,21 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
     ) -> Result<Response<query::ExplainCypherResponse>, Status> {
         let req = request.into_inner();
 
-        let ast = coordinode_query::cypher::parse(&req.query)
-            .map_err(|e| Status::invalid_argument(format!("Cypher parse error: {e}")))?;
-
-        let plan = coordinode_query::planner::build_logical_plan(&ast)
-            .map_err(|e| Status::internal(format!("Plan error: {e}")))?;
-
-        // Compute storage stats for accurate cost estimation (TTL-cached, MVCC-aware)
-        let stats = super::blocking(|| self.database.read().compute_stats());
+        // The plan ExecuteCypher would run, index selection and push-down
+        // included, so what is explained is what executes.
+        let (plan, suggest_result, stats) = super::blocking(|| {
+            let db = self.database.read();
+            let stats = db.compute_stats();
+            let plan = db.explain_plan(&req.query, stats.as_ref())?;
+            let suggest = db.suggest_for(&plan, stats.as_ref());
+            Ok::<_, coordinode_embed::DatabaseError>((plan, suggest, stats))
+        })
+        .map_err(db_error_to_status)?;
         let stats_ref = stats
             .as_ref()
             .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
 
         let cost = coordinode_query::planner::estimate_cost_with_stats(&plan, stats_ref);
-
-        // Run suggestion detectors (EXPLAIN SUGGEST)
-        let suggest_result = plan.explain_suggest_with_stats(stats_ref, None);
 
         let mut details = std::collections::HashMap::new();
         details.insert("explain".to_string(), suggest_result.explain);

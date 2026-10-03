@@ -2518,37 +2518,10 @@ impl Database {
         };
         apply_session_vector_consistency(&mut plan, hinted, session.vector_consistency);
 
-        // Apply index selection optimizer: rewrite Filter(NodeScan) → IndexScan
-        // when a matching B-tree index is registered.
-        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
-
-        // Annotate VectorTopK nodes with the HNSW index name when an applicable
-        // index exists. This ensures the executor's VectorTopK operator carries
-        // the resolved index name at execution time, not just at EXPLAIN time.
-        plan.root = planner::annotate_vector_top_k(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
-
-        // Promote pure vector top-K to the HnswScan index access path:
-        // the index becomes the row source and only the k result nodes
-        // are fetched, instead of materialising the whole label before
-        // ranking. Filtered queries keep the VectorTopK path.
-        plan.root = planner::apply_hnsw_scan_access_path(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
-
-        // Apply graph-predicate push-down: for every VectorFilter preceded
-        // by a Traverse, annotate with strategy decision (graph_first /
-        // acorn_filtered / vector_first) from the push-down cost model. The
-        // invariant — no unfiltered VectorFilter after Traverse — is
-        // contract-tested in the planner regression suite. The statistics are
-        // computed only when such a decision is made: every write invalidates
-        // them, so computing them for each statement would put a storage read
-        // behind one shared lock on the write path.
+        // The statistics are computed only when a push-down decision needs
+        // them: every write invalidates them, so computing them for each
+        // statement would put a storage read behind one shared lock on the
+        // write path.
         let graph_stats = core::cell::OnceCell::new();
         let combined_stats = core::cell::OnceCell::new();
         let stats = || {
@@ -2565,7 +2538,7 @@ impl Database {
                 .as_ref()
                 .map(|c| c as &dyn coordinode_core::graph::stats::StorageStats)
         };
-        plan.root = planner::optimize_push_down_lazy(plan.root, &stats);
+        let mut plan = self.plan_for_execution(plan, &stats);
 
         // Bind parameters: replace $name references with literal values.
         if let Some(ref p) = params {
@@ -2827,11 +2800,45 @@ impl Database {
             .map_err(|e| DatabaseError::Execution(e.into()))
     }
 
-    /// Return EXPLAIN plan text for a Cypher query.
-    ///
-    /// Uses real storage statistics (node counts, fan-out) for
-    /// more accurate cost estimates than hardcoded defaults.
-    pub fn explain_cypher(&self, query: &str) -> Result<String, DatabaseError> {
+    /// Turn a lowered plan into the one that runs: B-tree index selection,
+    /// vector index annotation, the HNSW access path and graph-predicate
+    /// push-down. Execution and every EXPLAIN go through here, so EXPLAIN
+    /// shows the plan that runs.
+    fn plan_for_execution<'s>(
+        &self,
+        mut plan: planner::logical::LogicalPlan,
+        stats: &dyn Fn() -> Option<&'s dyn coordinode_core::graph::stats::StorageStats>,
+    ) -> planner::logical::LogicalPlan {
+        // Filter(NodeScan) becomes IndexScan when a matching B-tree index is
+        // registered.
+        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
+        // VectorTopK carries the resolved HNSW index name into execution.
+        plan.root = planner::annotate_vector_top_k(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
+        // Pure vector top-K reads through the index as its row source and
+        // fetches only the k result nodes; filtered queries keep VectorTopK.
+        plan.root = planner::apply_hnsw_scan_access_path(
+            plan.root,
+            &self.vector_index_registry,
+            plan.vector_consistency,
+        );
+        // Every VectorFilter after a Traverse gets its strategy (graph_first /
+        // acorn_filtered / vector_first) from the push-down cost model.
+        plan.root = planner::optimize_push_down_lazy(plan.root, stats);
+        plan
+    }
+
+    /// The plan a Cypher query runs as, with the session's vector
+    /// consistency applied, for EXPLAIN. `stats` are this database's
+    /// statistics from [`Self::compute_stats`], computed once by the caller.
+    pub fn explain_plan(
+        &self,
+        query: &str,
+        stats: Option<&coordinode_storage::engine::stats::StorageStatsComputer>,
+    ) -> Result<planner::logical::LogicalPlan, DatabaseError> {
         let parsed = CypherFrontend::new().parse(query)?;
         let mut plan = parsed.plan;
         apply_session_vector_consistency(
@@ -2839,31 +2846,25 @@ impl Database {
             parsed.vector_consistency_hinted,
             self.vector_consistency,
         );
-        // Apply index selection optimizer so EXPLAIN reflects the actual plan
-        // that would be executed (IndexScan instead of Filter+NodeScan when
-        // a matching B-tree index is registered).
-        plan.root = planner::optimize_index_selection(plan.root, &self.index_registry);
-        plan.root = planner::annotate_vector_top_k(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
-        // Same access-path promotion as the execute path so EXPLAIN
-        // shows the plan that actually runs.
-        plan.root = planner::apply_hnsw_scan_access_path(
-            plan.root,
-            &self.vector_index_registry,
-            plan.vector_consistency,
-        );
-        let stats = self.compute_stats();
-        let combined_for_push_down = stats.as_ref().map(|g| CombinedStats {
+        let combined = stats.map(|g| CombinedStats {
             graph: g,
             vector: &self.vector_index_registry,
         });
-        let stats_ref_for_push_down = combined_for_push_down
-            .as_ref()
-            .map(|c| c as &dyn coordinode_core::graph::stats::StorageStats);
-        plan.root = planner::optimize_push_down(plan.root, stats_ref_for_push_down);
+        let stats = || {
+            combined
+                .as_ref()
+                .map(|c| c as &dyn coordinode_core::graph::stats::StorageStats)
+        };
+        Ok(self.plan_for_execution(plan, &stats))
+    }
+
+    /// Return EXPLAIN plan text for a Cypher query.
+    ///
+    /// Uses real storage statistics (node counts, fan-out) for
+    /// more accurate cost estimates than hardcoded defaults.
+    pub fn explain_cypher(&self, query: &str) -> Result<String, DatabaseError> {
+        let stats = self.compute_stats();
+        let plan = self.explain_plan(query, stats.as_ref())?;
         let stats_ref = stats
             .as_ref()
             .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
@@ -2901,18 +2902,20 @@ impl Database {
         &self,
         query: &str,
     ) -> Result<coordinode_query::advisor::ExplainSuggestResult, DatabaseError> {
-        let parsed = CypherFrontend::new().parse(query)?;
-        let mut plan = parsed.plan;
-        apply_session_vector_consistency(
-            &mut plan,
-            parsed.vector_consistency_hinted,
-            self.vector_consistency,
-        );
         let stats = self.compute_stats();
-        let stats_ref = stats
-            .as_ref()
-            .map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
-        Ok(plan.explain_suggest_with_stats(stats_ref, Some(&self.index_registry)))
+        let plan = self.explain_plan(query, stats.as_ref())?;
+        Ok(self.suggest_for(&plan, stats.as_ref()))
+    }
+
+    /// EXPLAIN SUGGEST for a plan from [`Self::explain_plan`]: its text and
+    /// the suggestions for it, against `stats` and this database's indexes.
+    pub fn suggest_for(
+        &self,
+        plan: &planner::logical::LogicalPlan,
+        stats: Option<&coordinode_storage::engine::stats::StorageStatsComputer>,
+    ) -> coordinode_query::advisor::ExplainSuggestResult {
+        let stats_ref = stats.map(|s| s as &dyn coordinode_core::graph::stats::StorageStats);
+        plan.explain_suggest_with_stats(stats_ref, Some(&self.index_registry))
     }
 
     /// Compute storage statistics for the cost estimator (with TTL cache).

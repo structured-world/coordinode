@@ -823,6 +823,36 @@ async fn grpc_interactive_transaction_rollback() {
     );
 }
 
+/// EXPLAIN over gRPC shows the plan ExecuteCypher runs: an equality on an
+/// indexed property reads through the index, so the plan names an
+/// IndexScan rather than the label scan the query was written as.
+#[tokio::test]
+async fn grpc_explain_shows_the_plan_that_executes() {
+    let (svc, _dir) = test_service();
+    svc.execute_cypher(cypher_request("CREATE INDEX user_name ON :User(name)"))
+        .await
+        .expect("create index");
+    svc.execute_cypher(cypher_request("CREATE (:User {name: 'Alice'})"))
+        .await
+        .expect("seed");
+
+    let plan = svc
+        .explain_cypher(Request::new(query::ExplainCypherRequest {
+            query: "MATCH (n:User {name: 'Alice'}) RETURN n".to_string(),
+            parameters: Default::default(),
+        }))
+        .await
+        .expect("explain")
+        .into_inner()
+        .plan
+        .expect("a plan");
+    let text = plan.details.get("explain").expect("plan text");
+    assert!(
+        text.contains("IndexScan"),
+        "explain shows the index read: {text}"
+    );
+}
+
 /// gRPC execute_cypher creates a node and returns it.
 #[tokio::test]
 async fn grpc_execute_create_and_match() {
