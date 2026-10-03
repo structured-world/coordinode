@@ -36,12 +36,16 @@ impl Query {
     /// Write clauses: CREATE, MERGE, MERGE ALL, UPSERT, DELETE, SET, REMOVE,
     /// and DDL operations (CREATE INDEX / DROP INDEX / ALTER LABEL / etc.).
     ///
+    /// A `CALL` is a write when `procedure_writes` says so for its procedure
+    /// (its mode is WRITE or SCHEMA); the catalog lives with the database,
+    /// not in the parse tree.
+    ///
     /// Used by the CypherService handler to enforce write-concern validation
     /// in causal sessions: a write in a causal session requires
     /// `writeConcern >= majority` to avoid dangling `operationTime` references
     /// when the leader crashes before replicating.
-    pub fn is_write(&self) -> bool {
-        fn clause_is_write(c: &Clause) -> bool {
+    pub fn is_write(&self, procedure_writes: &dyn Fn(&str) -> bool) -> bool {
+        fn clause_is_write(c: &Clause, procedure_writes: &dyn Fn(&str) -> bool) -> bool {
             match c {
                 Clause::Create(_)
                 | Clause::Merge(_)
@@ -71,11 +75,15 @@ impl Query {
                 | Clause::DropTable(_)
                 | Clause::Foreach(_) => true,
                 // A subquery is a write iff its body contains a write clause.
-                Clause::CallSubquery(cs) => cs.body.iter().any(clause_is_write),
+                Clause::CallSubquery(cs) => {
+                    cs.body.iter().any(|c| clause_is_write(c, procedure_writes))
+                }
+                Clause::Call(cc) => procedure_writes(&cc.procedure),
                 _ => false,
             }
         }
-        let branch_is_write = |clauses: &[Clause]| clauses.iter().any(clause_is_write);
+        let branch_is_write =
+            |clauses: &[Clause]| clauses.iter().any(|c| clause_is_write(c, procedure_writes));
         branch_is_write(&self.clauses) || self.unions.iter().any(|b| branch_is_write(&b.clauses))
     }
 }
@@ -1172,9 +1180,22 @@ pub struct CallClause {
     pub procedure: String,
     /// Positional arguments.
     pub args: Vec<Expr>,
-    /// YIELD items: columns to select from the procedure output.
-    /// If empty, all columns are returned.
-    pub yield_items: Vec<YieldItem>,
+    /// The YIELD part; `None` when the call has none.
+    pub yields: Option<CallYield>,
+}
+
+/// What a `CALL ... YIELD` binds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallYield {
+    /// `YIELD *`: every output column under its own name.
+    All,
+    /// `YIELD a, b AS c [WHERE ...]`: the named columns, optionally filtered.
+    Items {
+        /// The columns, in YIELD order.
+        items: Vec<YieldItem>,
+        /// The WHERE predicate over the yielded variables.
+        filter: Option<Expr>,
+    },
 }
 
 /// A single item in a YIELD clause.
@@ -1184,6 +1205,13 @@ pub struct YieldItem {
     pub name: String,
     /// Optional alias (AS ...).
     pub alias: Option<String>,
+}
+
+impl YieldItem {
+    /// The variable the column binds: its alias, else its own name.
+    pub fn binding(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
 }
 
 // --- Write clause types ---

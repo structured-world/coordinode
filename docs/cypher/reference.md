@@ -567,16 +567,58 @@ Returns the logical plan for a query without executing it. Available via the `Cy
 
 ---
 
-### CALL (Procedures) ✅ partial
+### CALL (Procedures) ✅
 
-Calls a named procedure. Only `db.advisor.suggestions` is currently available.
+Calls a named procedure. Every procedure has a signature: typed arguments,
+some with defaults, and typed output columns. A call is checked against it
+before anything runs: an unknown procedure, a surplus or missing argument,
+an argument of the wrong type, or a YIELD of a column the procedure does not
+produce is refused. An integer passed where a float is declared is widened;
+`null` is accepted for any argument.
+
+A CALL that is the whole query may omit YIELD (or write `YIELD *`) to return
+every output column. Inside a larger query the call runs once per incoming
+row, with its arguments evaluated against that row, and must name the
+columns it binds with YIELD; `YIELD *` is refused there. A yielded column can
+be renamed with `AS` and the yielded rows filtered with `WHERE`. A yielded
+name may not reuse a variable already in scope.
 
 ```cypher
--- Run suggestions for last query in session (or pass query text as param)
-CALL db.advisor.suggestions() YIELD id, severity, kind, explanation, ddl
-RETURN id, severity, kind, explanation, ddl
-ORDER BY severity DESC
+-- Standalone: every output column
+CALL db.advisor.suggestions()
+
+-- Inside a query: per-row arguments, renamed and filtered outputs
+UNWIND ['0000000000000abc', '0000000000000def'] AS id
+CALL db.advisor.dismiss(id) YIELD id AS fingerprint, dismissed WHERE dismissed
+RETURN fingerprint
 ```
+
+Built-in procedures:
+
+| Procedure | Mode | Outputs |
+|-----------|------|---------|
+| `dbms.procedures()` | DBMS | `name`, `signature`, `description`, `mode` |
+| `dbms.functions()` | DBMS | `name`, `signature`, `category`, `description`, `aggregating` |
+| `db.advisor.suggestions()` | READ | `id`, `severity`, `kind`, `query`, `explanation`, `ddl`, `impact`, `sources` |
+| `db.advisor.queryStats()` | READ | `fingerprint`, `query`, `count`, `avgTime`, `p99Time`, `plan`, `shardsUsed`, `sources` |
+| `db.advisor.slowQueries(limit = 20, minTime = 100)` | READ | `query`, `p99Time`, `count`, `plan`, `sources` |
+| `db.advisor.dismiss(id)` | DBMS | `id`, `dismissed` |
+| `db.advisor.reset()` | DBMS | `status` |
+
+`dbms.procedures()` lists every procedure the server answers, with its full
+signature, for example
+`db.advisor.slowQueries(limit = 20 :: INTEGER, minTime = 100 :: INTEGER) :: (query :: STRING, ...)`.
+`dbms.functions()` lists every function an expression can call, the same
+table the evaluator dispatches from, so a listed function always exists.
+
+The mode says what a procedure touches: READ reads graph data, WRITE and
+SCHEMA change it, DBMS reads or changes server state. A statement that calls
+a WRITE or SCHEMA procedure is a write, including for the causal-session
+write-concern check.
+
+Over gRPC a refused call answers `INVALID_ARGUMENT` with reason
+`UNKNOWN_PROCEDURE` (metadata `procedure`) or `PROCEDURE_CALL` (metadata
+`procedure`, plus `argument` or `column` when one is at fault).
 
 ---
 

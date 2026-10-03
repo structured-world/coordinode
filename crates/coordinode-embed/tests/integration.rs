@@ -38,6 +38,7 @@ mod integration {
     mod oplog_segments;
     mod page_checksum;
     mod per_level_routing;
+    mod procedures;
     mod retention;
     mod schema;
     mod schema_publication;

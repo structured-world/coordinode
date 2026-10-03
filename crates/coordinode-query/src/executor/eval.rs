@@ -1,13 +1,14 @@
 //! Scalar value evaluation helpers shared by the neutral expression evaluator.
 //!
 //! Holds the Value-level operator implementations (`eval_binary_op`,
-//! `eval_unary_op`), the scalar-function dispatch table
-//! (`dispatch_scalar_function` and its list / string / math helpers), and the
-//! score-requirement analysis used by the Project / Sort executor guards.
+//! `eval_unary_op`), the scalar-function dispatch over the function catalog
+//! (`dispatch_scalar_function`), and the score-requirement analysis used by
+//! the Project / Sort executor guards.
 
 use coordinode_core::graph::types::Value;
 
 use super::row::Row;
+use crate::function::ScalarFn;
 use crate::plan::expr::{BinOp, UnOp};
 
 /// Classifies what cached row columns a projection / sort-key expression
@@ -433,36 +434,60 @@ fn coerce_to_multi_vector(val: Option<&Value>) -> Option<Vec<Vec<f32>>> {
 /// variable reference (entity-introspection functions like `type` / `labels` /
 /// `startNode` / `properties` resolve it against the row). Dialect-neutral, so
 /// the cypher and neutral expression evaluators share this dispatch.
+///
+/// The name resolves through the function catalog, the same table
+/// `dbms.functions()` lists, so a name is either listed and evaluated here or
+/// refused as unknown.
 pub(crate) fn dispatch_scalar_function(
     name: &str,
     evaluated: Vec<Value>,
     first_arg_var: Option<&str>,
     row: &Row,
 ) -> Result<Value, EvalError> {
-    Ok(match name {
-        "coalesce" => evaluated
+    let function =
+        ScalarFn::resolve(name).ok_or_else(|| EvalError::UnknownFunction(name.to_string()))?;
+    Ok(eval_scalar_function(
+        function,
+        evaluated,
+        first_arg_var,
+        row,
+    ))
+}
+
+/// Evaluate a resolved scalar function. Every catalog function has an arm, so
+/// adding one to the catalog without an implementation does not compile.
+fn eval_scalar_function(
+    function: ScalarFn,
+    evaluated: Vec<Value>,
+    first_arg_var: Option<&str>,
+    row: &Row,
+) -> Value {
+    let args = evaluated.as_slice();
+    match function {
+        ScalarFn::Coalesce => evaluated
             .into_iter()
             .find(|v| !v.is_null())
             .unwrap_or(Value::Null),
-        "toString" => match evaluated.first() {
+        ScalarFn::ToString => match args.first() {
             Some(Value::Int(n)) => Value::String(n.to_string()),
             Some(Value::Float(f)) => Value::String(f.to_string()),
             Some(Value::Bool(b)) => Value::String(b.to_string()),
             Some(Value::String(s)) => Value::String(s.clone()),
             _ => Value::Null,
         },
-        "size" => match evaluated.first() {
-            Some(Value::String(s)) => Value::Int(s.len() as i64),
+        // size(s) counts Unicode characters, size(list) elements.
+        ScalarFn::Size => match args.first() {
+            Some(Value::String(s)) => Value::Int(s.chars().count() as i64),
             Some(Value::Array(a)) => Value::Int(a.len() as i64),
             _ => Value::Null,
         },
         // length(p) → number of relationships in a path.
-        "length" => match evaluated.first() {
+        ScalarFn::Length => match args.first() {
             Some(Value::Path(p)) => Value::Int(p.rels.len() as i64),
             _ => Value::Null,
         },
         // nodes(p) → ordered list of node ids along the path.
-        "nodes" => match evaluated.first() {
+        ScalarFn::Nodes => match args.first() {
             Some(Value::Path(p)) => {
                 Value::Array(p.nodes.iter().map(|n| Value::Int(*n as i64)).collect())
             }
@@ -471,7 +496,7 @@ pub(crate) fn dispatch_scalar_function(
         // relationships(p) → ordered list of relationships, each a map of
         // {type, source, target}. A first-class relationship value can replace
         // the map once the path model carries relationship ids and properties.
-        "relationships" => match evaluated.first() {
+        ScalarFn::Relationships => match evaluated.first() {
             Some(Value::Path(p)) => Value::Array(
                 p.rels
                     .iter()
@@ -487,7 +512,7 @@ pub(crate) fn dispatch_scalar_function(
             ),
             _ => Value::Null,
         },
-        "type" => {
+        ScalarFn::Type => {
             // type(r) → relationship type string.
             // The executor stores edge type as `r.__type__` in the row.
             // Extract the variable name from the first argument, then look up
@@ -499,7 +524,7 @@ pub(crate) fn dispatch_scalar_function(
                 Value::Null
             }
         }
-        "elementId" => {
+        ScalarFn::ElementId => {
             // elementId(n) → 13-character Crockford base32 string derived
             // bijectively from the node's u64 NodeId. The variable binds to
             // Value::Int (the raw NodeId) for node patterns; for edge
@@ -517,7 +542,7 @@ pub(crate) fn dispatch_scalar_function(
                 Value::Null
             }
         }
-        "id" => {
+        ScalarFn::Id => {
             // id(n) → raw NodeId u64 (deprecated; prefer elementId).
             // Kept for Neo4j v4 driver compatibility.
             if let Some(var) = first_arg_var {
@@ -529,7 +554,7 @@ pub(crate) fn dispatch_scalar_function(
                 Value::Null
             }
         }
-        "labels" => {
+        ScalarFn::Labels => {
             // labels(n) → every label of the node. The executor binds a
             // multi-label node's labels as `n.__labels__` and every node's
             // primary label as `n.__label__`.
@@ -550,14 +575,14 @@ pub(crate) fn dispatch_scalar_function(
         // Relationship variables bind `<var>.__src__` / `<var>.__tgt__` in the
         // row (Value::Int node ids); we return the id, matching how `id()`
         // surfaces nodes as integers in this model.
-        "startNode" => match first_arg_var {
+        ScalarFn::StartNode => match first_arg_var {
             Some(var) => row
                 .get(&format!("{var}.__src__"))
                 .cloned()
                 .unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        "endNode" => match first_arg_var {
+        ScalarFn::EndNode => match first_arg_var {
             Some(var) => row
                 .get(&format!("{var}.__tgt__"))
                 .cloned()
@@ -568,7 +593,7 @@ pub(crate) fn dispatch_scalar_function(
         // row's `<var>.<prop>` columns, skipping internal `__…__` markers
         // (label, type, src/tgt). Returns NULL when the argument is not a bound
         // variable.
-        "properties" => match first_arg_var {
+        ScalarFn::Properties => match first_arg_var {
             Some(var) => {
                 let prefix = format!("{var}.");
                 let mut map: std::collections::BTreeMap<String, Value> =
@@ -588,7 +613,7 @@ pub(crate) fn dispatch_scalar_function(
         // keys of a map value. For a bound variable, collects `<var>.<prop>`
         // columns (skipping internal `__…__` markers); falls back to the keys
         // of a map-valued argument.
-        "keys" => {
+        ScalarFn::Keys => {
             let from_prefix = if let Some(var) = first_arg_var {
                 let prefix = format!("{var}.");
                 let ks: Vec<Value> = row
@@ -612,28 +637,28 @@ pub(crate) fn dispatch_scalar_function(
             }
         }
         // nullIf(v1, v2) → NULL if v1 == v2, otherwise v1.
-        "nullIf" => match (evaluated.first(), evaluated.get(1)) {
+        ScalarFn::NullIf => match (evaluated.first(), evaluated.get(1)) {
             (Some(a), Some(b)) if a == b => Value::Null,
             (Some(a), _) => a.clone(),
             _ => Value::Null,
         },
         // timestamp() → milliseconds since the Unix epoch (Cypher returns an
         // integer; `now()` above returns microseconds as a Timestamp value).
-        "timestamp" => Value::Int(
+        ScalarFn::Timestamp => Value::Int(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
         ),
         // randomUUID() → a random version-4 UUID string.
-        "randomUUID" => Value::String(random_uuid_v4()),
+        ScalarFn::RandomUuid => Value::String(random_uuid_v4()),
         // valueType(v) → the Cypher type name of the value.
-        "valueType" => Value::String(cypher_value_type(evaluated.first())),
+        ScalarFn::ValueType => Value::String(cypher_value_type(evaluated.first())),
         // temporal_active_at(r, t) → bool
         // True iff the temporal edge `r` was active at time `t` (epoch
         // microseconds), i.e. `r.valid_from <= t AND (r.valid_to IS NULL OR
         // r.valid_to > t)`.
-        "temporal_active_at" => Value::Bool(
+        ScalarFn::TemporalActiveAt => Value::Bool(
             match (
                 temporal_bounds(first_arg_var, row),
                 epoch_time(evaluated.get(1)),
@@ -645,7 +670,7 @@ pub(crate) fn dispatch_scalar_function(
         // temporal_overlaps(r, t_start, t_end) → bool
         // True iff the temporal edge's validity interval overlaps `[t_start, t_end)`,
         // i.e. `r.valid_from < t_end AND (r.valid_to IS NULL OR r.valid_to > t_start)`.
-        "temporal_overlaps" => Value::Bool(
+        ScalarFn::TemporalOverlaps => Value::Bool(
             match (
                 temporal_bounds(first_arg_var, row),
                 epoch_time(evaluated.get(1)),
@@ -657,7 +682,7 @@ pub(crate) fn dispatch_scalar_function(
                 _ => false,
             },
         ),
-        "now" => {
+        ScalarFn::Now => {
             // Return current timestamp in microseconds
             Value::Timestamp(
                 std::time::SystemTime::now()
@@ -667,7 +692,7 @@ pub(crate) fn dispatch_scalar_function(
             )
         }
         // Vector distance/similarity functions
-        "vector_distance" => {
+        ScalarFn::VectorDistance => {
             // vector_distance(a, b) → L2 distance
             let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
             match (a, b) {
@@ -677,7 +702,7 @@ pub(crate) fn dispatch_scalar_function(
                 _ => Value::Null,
             }
         }
-        "vector_similarity" => {
+        ScalarFn::VectorSimilarity => {
             // vector_similarity(a, b) → cosine similarity
             let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
             match (a, b) {
@@ -687,7 +712,7 @@ pub(crate) fn dispatch_scalar_function(
                 _ => Value::Null,
             }
         }
-        "vector_dot" => {
+        ScalarFn::VectorDot => {
             // vector_dot(a, b) → dot product
             let (a, b) = coerce_vector_pair(evaluated.first(), evaluated.get(1));
             match (a, b) {
@@ -697,7 +722,7 @@ pub(crate) fn dispatch_scalar_function(
                 _ => Value::Null,
             }
         }
-        "vector_manhattan" => {
+        ScalarFn::VectorManhattan => {
             // vector_manhattan(a, b) → L1 distance
             match (evaluated.first(), evaluated.get(1)) {
                 (Some(Value::Vector(a)), Some(Value::Vector(b))) if a.len() == b.len() => {
@@ -712,7 +737,7 @@ pub(crate) fn dispatch_scalar_function(
         // best dot-product against any doc token. Pre-normalise rows to
         // unit L2 norm if you want cosine semantics. Returns NULL when
         // either side is missing, dim-mismatched, or empty.
-        "maxsim_score" => {
+        ScalarFn::MaxsimScore => {
             let doc = coerce_to_multi_vector(evaluated.first());
             let query = coerce_to_multi_vector(evaluated.get(1));
             match (doc, query) {
@@ -725,7 +750,7 @@ pub(crate) fn dispatch_scalar_function(
         }
         // text_score(field, query) → retrieves pre-computed BM25 score from __text_score__ column.
         // The score is stored by TextFilter executor during WHERE evaluation.
-        "text_score" => {
+        ScalarFn::TextScore => {
             // Score was pre-stored in the row by execute_text_filter
             row.get("__text_score__")
                 .cloned()
@@ -747,7 +772,7 @@ pub(crate) fn dispatch_scalar_function(
         //   only vector cached, no text → returns the normalized vector score
         //   only text cached, no vector → returns text_score
         //   neither cached → caller error (caught by Project/Sort guards)
-        "hybrid_score" => {
+        ScalarFn::HybridScore => {
             let mut w_vec = 0.65_f64;
             let mut w_text = 0.35_f64;
             if let Some(Value::Map(weights)) = evaluated.get(2) {
@@ -806,14 +831,14 @@ pub(crate) fn dispatch_scalar_function(
         // the builder rewrote this FunctionCall to a Variable("__rrf_score__")
         // reference for well-formed plans, so this branch only runs as a
         // defensive fallback (guarded by Project/Sort checks).
-        "rrf_score" => row.get("__rrf_score__").cloned().unwrap_or(Value::Null),
+        ScalarFn::RrfScore => row.get("__rrf_score__").cloned().unwrap_or(Value::Null),
         // doc_score(doc, query [, α, β, γ]) → document-level aggregate cached
         // on the row by `DocScore`. Defensive lookup — well-formed plans get
         // the call rewritten to `Variable("__doc_score__")` before eval.
-        "doc_score" => row.get("__doc_score__").cloned().unwrap_or(Value::Null),
+        ScalarFn::DocScore => row.get("__doc_score__").cloned().unwrap_or(Value::Null),
         // text_match(field, query) → boolean. Used in WHERE clause.
         // When used in RETURN, checks if __text_score__ was set by TextFilter.
-        "text_match" => {
+        ScalarFn::TextMatch => {
             if row.contains_key("__text_score__") {
                 Value::Bool(true)
             } else {
@@ -823,9 +848,9 @@ pub(crate) fn dispatch_scalar_function(
         // encrypted_match(field, token) → boolean. Used in WHERE clause.
         // When used in RETURN, the row has already been filtered by EncryptedFilter,
         // so if the row is present, it matched. Always returns true for surviving rows.
-        "encrypted_match" => Value::Bool(true),
+        ScalarFn::EncryptedMatch => Value::Bool(true),
         // Spatial functions
-        "point" => {
+        ScalarFn::Point => {
             // point({latitude: X, longitude: Y}) → Geo(Point { lat, lon })
             // Accepts a map literal with latitude/longitude keys.
             match evaluated.first() {
@@ -850,7 +875,7 @@ pub(crate) fn dispatch_scalar_function(
                 _ => Value::Null,
             }
         }
-        "point.distance" => {
+        ScalarFn::PointDistance => {
             // point.distance(point1, point2) → distance in meters (Haversine)
             match (evaluated.first(), evaluated.get(1)) {
                 (
@@ -866,141 +891,80 @@ pub(crate) fn dispatch_scalar_function(
                 _ => Value::Null,
             }
         }
-        // String, math, and list functions (Cypher names are case-insensitive).
-        // Kept out of the exact-case arms above so existing functions stay
-        // untouched; each helper lowercases the name and returns None for
-        // anything it does not own.
-        //
-        // Reaching the end of this chain means no evaluator claims the name,
-        // which is the one place that knows it, so the error is raised here
-        // rather than against a list of names kept somewhere else. A second
-        // list would drift, and the direction it drifts in rejects working
-        // queries.
-        _ => eval_string_function(name, &evaluated)
-            .or_else(|| eval_math_function(name, &evaluated))
-            .or_else(|| eval_list_function(name, &evaluated))
-            .ok_or_else(|| EvalError::UnknownFunction(name.to_string()))?,
-    })
-}
-
-/// Cypher list functions over already-evaluated values (`head`, `last`, `tail`,
-/// `range`, `isEmpty`). The path/collection accessors `nodes`, `relationships`,
-/// `length`, and `keys` need row or path context and live in the main dispatch.
-///
-/// Case-insensitive; `None` for unowned names. `head`/`last` on an empty list
-/// yield `NULL`; `tail` of an empty list is the empty list. `isEmpty` also
-/// accepts strings and maps. `range(start, end [, step])` is inclusive of both
-/// ends (Cypher semantics) and yields an integer list.
-fn eval_list_function(name: &str, args: &[Value]) -> Option<Value> {
-    let as_int = |v: Option<&Value>| match v {
-        Some(Value::Int(n)) => Some(*n),
-        _ => None,
-    };
-
-    let result = match name.to_ascii_lowercase().as_str() {
-        "head" => match args.first() {
+        // List functions. `head` / `last` of an empty list are NULL; `tail` of
+        // an empty list is the empty list.
+        ScalarFn::Head => match args.first() {
             Some(Value::Array(a)) => a.first().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        "last" => match args.first() {
+        ScalarFn::Last => match args.first() {
             Some(Value::Array(a)) => a.last().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        "tail" => match args.first() {
+        ScalarFn::Tail => match args.first() {
             Some(Value::Array(a)) => Value::Array(a.iter().skip(1).cloned().collect()),
             _ => Value::Null,
         },
-        "isempty" => match args.first() {
+        ScalarFn::IsEmpty => match args.first() {
             Some(Value::Array(a)) => Value::Bool(a.is_empty()),
             Some(Value::String(s)) => Value::Bool(s.is_empty()),
             Some(Value::Map(m)) => Value::Bool(m.is_empty()),
             _ => Value::Null,
         },
         // range(start, end [, step]) — inclusive both ends; step defaults to 1.
-        "range" => match (as_int(args.first()), as_int(args.get(1))) {
-            (Some(start), Some(end)) => {
-                let step = as_int(args.get(2)).unwrap_or(1);
-                if step == 0 {
-                    return Some(Value::Null);
-                }
-                let mut out = Vec::new();
-                let mut i = start;
-                if step > 0 {
-                    while i <= end {
+        // A zero step has no answer (NULL); stepping past i64 ends the range.
+        ScalarFn::Range => match (arg_int(args.first()), arg_int(args.get(1))) {
+            (Some(start), Some(end)) => match arg_int(args.get(2)).unwrap_or(1) {
+                0 => Value::Null,
+                step => {
+                    let mut out = Vec::new();
+                    let mut i = start;
+                    while (step > 0 && i <= end) || (step < 0 && i >= end) {
                         out.push(Value::Int(i));
-                        i += step;
+                        match i.checked_add(step) {
+                            Some(next) => i = next,
+                            None => break,
+                        }
                     }
-                } else {
-                    while i >= end {
-                        out.push(Value::Int(i));
-                        i += step;
-                    }
+                    Value::Array(out)
                 }
-                Value::Array(out)
-            }
+            },
             _ => Value::Null,
         },
-        _ => return None,
-    };
-
-    Some(result)
-}
-
-/// Cypher string functions (`left`, `right`, `substring`, `toLower`/`lower`,
-/// `toUpper`/`upper`, `trim`/`ltrim`/`rtrim`/`btrim`, `replace`, `reverse`,
-/// `split`, `toStringOrNull`, `toStringList`, `normalize`, `charLength`).
-///
-/// `name` is matched case-insensitively (Cypher function names are
-/// case-insensitive). `args` are the already-evaluated argument values.
-/// Returns `None` for a name this helper does not handle so the caller can
-/// apply the unknown-function NULL contract. Per Cypher semantics, any string
-/// function applied to `NULL` returns `NULL`. Length / index arithmetic counts
-/// Unicode scalar values (`chars()`), not bytes, so multi-byte input behaves
-/// like Neo4j rather than splitting inside a codepoint.
-fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
-    let lname = name.to_ascii_lowercase();
-
-    // Helpers local to string dispatch.
-    let as_str = |v: Option<&Value>| match v {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    };
-    let as_len = |v: Option<&Value>| match v {
-        Some(Value::Int(n)) => Some(*n),
-        _ => None,
-    };
-
-    let result = match lname.as_str() {
-        "tolower" | "lower" => match args.first() {
+        // String functions. Any string function applied to NULL returns NULL.
+        // Length and index arithmetic counts Unicode scalar values, not bytes,
+        // so multi-byte input never splits inside a codepoint.
+        ScalarFn::ToLower => match args.first() {
             Some(Value::String(s)) => Value::String(s.to_lowercase()),
             _ => Value::Null,
         },
-        "toupper" | "upper" => match args.first() {
+        ScalarFn::ToUpper => match args.first() {
             Some(Value::String(s)) => Value::String(s.to_uppercase()),
             _ => Value::Null,
         },
-        "trim" | "btrim" => match args.first() {
+        ScalarFn::Trim => match args.first() {
             Some(Value::String(s)) => Value::String(s.trim().to_string()),
             _ => Value::Null,
         },
-        "ltrim" => match args.first() {
+        ScalarFn::LTrim => match args.first() {
             Some(Value::String(s)) => Value::String(s.trim_start().to_string()),
             _ => Value::Null,
         },
-        "rtrim" => match args.first() {
+        ScalarFn::RTrim => match args.first() {
             Some(Value::String(s)) => Value::String(s.trim_end().to_string()),
             _ => Value::Null,
         },
         // left(s, len): leftmost `len` Unicode chars. Negative len → NULL
         // (Neo4j raises; we follow the project's no-panic NULL contract).
-        "left" => match (as_str(args.first()), as_len(args.get(1))) {
+        ScalarFn::Left => match (arg_str(args.first()), arg_int(args.get(1))) {
             (Some(s), Some(len)) if len >= 0 => {
                 Value::String(s.chars().take(len as usize).collect())
             }
             _ => Value::Null,
         },
-        // right(s, len): rightmost `len` Unicode chars.
-        "right" => match (as_str(args.first()), as_len(args.get(1))) {
+        // right(s, len): rightmost `len` Unicode chars; a len past the end
+        // returns the whole string, hence the clamp at zero chars skipped.
+        ScalarFn::Right => match (arg_str(args.first()), arg_int(args.get(1))) {
             (Some(s), Some(len)) if len >= 0 => {
                 let total = s.chars().count();
                 let skip = total.saturating_sub(len as usize);
@@ -1010,10 +974,10 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
         },
         // substring(s, start[, len]): 0-indexed start in Unicode chars; omitted
         // len → to end. Out-of-range start → empty string (Neo4j behaviour).
-        "substring" => match (as_str(args.first()), as_len(args.get(1))) {
+        ScalarFn::Substring => match (arg_str(args.first()), arg_int(args.get(1))) {
             (Some(s), Some(start)) if start >= 0 => {
                 let chars = s.chars().skip(start as usize);
-                match as_len(args.get(2)) {
+                match arg_int(args.get(2)) {
                     Some(len) if len >= 0 => Value::String(chars.take(len as usize).collect()),
                     Some(_) => Value::Null, // negative length
                     None => Value::String(chars.collect()),
@@ -1022,29 +986,25 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
             _ => Value::Null,
         },
         // replace(original, search, replacement): replace every occurrence.
-        "replace" => match (
-            as_str(args.first()),
-            as_str(args.get(1)),
-            as_str(args.get(2)),
+        ScalarFn::Replace => match (
+            arg_str(args.first()),
+            arg_str(args.get(1)),
+            arg_str(args.get(2)),
         ) {
-            (Some(s), Some(search), Some(rep)) => Value::String(s.replace(&search, &rep)),
+            (Some(s), Some(search), Some(rep)) => Value::String(s.replace(search, rep)),
             _ => Value::Null,
         },
         // reverse(x): reverse a string (by Unicode chars) or a list.
-        "reverse" => match args.first() {
+        ScalarFn::Reverse => match args.first() {
             Some(Value::String(s)) => Value::String(s.chars().rev().collect()),
-            Some(Value::Array(a)) => {
-                let mut out = a.clone();
-                out.reverse();
-                Value::Array(out)
-            }
+            Some(Value::Array(a)) => Value::Array(a.iter().rev().cloned().collect()),
             _ => Value::Null,
         },
         // split(original, delimiter): returns a list of substrings. The
         // delimiter may be a single string or a list of strings (split on any).
-        "split" => match (as_str(args.first()), args.get(1)) {
+        ScalarFn::Split => match (arg_str(args.first()), args.get(1)) {
             (Some(s), Some(Value::String(delim))) => {
-                Value::Array(split_on(&s, std::slice::from_ref(delim)))
+                Value::Array(split_on(s, std::slice::from_ref(delim)))
             }
             (Some(s), Some(Value::Array(delims))) => {
                 let ds: Vec<String> = delims
@@ -1054,19 +1014,17 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
                         _ => None,
                     })
                     .collect();
-                Value::Array(split_on(&s, &ds))
+                Value::Array(split_on(s, &ds))
             }
             _ => Value::Null,
         },
-        // charLength(s): number of Unicode scalar values (vs `size`, which is
-        // byte length for strings).
-        "charlength" => match args.first() {
+        ScalarFn::CharLength => match args.first() {
             Some(Value::String(s)) => Value::Int(s.chars().count() as i64),
             _ => Value::Null,
         },
         // toStringOrNull(v): like toString but yields NULL for unconvertible
         // input instead of raising.
-        "tostringornull" => match args.first() {
+        ScalarFn::ToStringOrNull => match args.first() {
             Some(Value::String(s)) => Value::String(s.clone()),
             Some(Value::Int(n)) => Value::String(n.to_string()),
             Some(Value::Float(f)) => Value::String(f.to_string()),
@@ -1076,7 +1034,7 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
         // toStringList(list): convert each element via toString semantics;
         // unconvertible elements become NULL entries (Neo4j: toStringOrNull
         // per element).
-        "tostringlist" => match args.first() {
+        ScalarFn::ToStringList => match args.first() {
             Some(Value::Array(items)) => Value::Array(
                 items
                     .iter()
@@ -1092,7 +1050,7 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
             _ => Value::Null,
         },
         // normalize(s[, form]): Unicode normalization, default NFC.
-        "normalize" => match args.first() {
+        ScalarFn::Normalize => match args.first() {
             Some(Value::String(s)) => {
                 let form = match args.get(1) {
                     Some(Value::String(f)) => f.to_uppercase(),
@@ -1102,10 +1060,99 @@ fn eval_string_function(name: &str, args: &[Value]) -> Option<Value> {
             }
             _ => Value::Null,
         },
-        _ => return None,
-    };
+        // Math functions. Applied to NULL or a non-numeric value they return
+        // NULL. `ceil` / `floor` / `round` / `sqrt` / `exp` / `log` / `log10`
+        // return a Float as Neo4j does; `abs` keeps Int vs Float; `sign`
+        // returns an Int.
+        ScalarFn::Pi => Value::Float(std::f64::consts::PI),
+        ScalarFn::E => Value::Float(std::f64::consts::E),
+        ScalarFn::Rand => Value::Float(rand::random::<f64>()),
+        ScalarFn::Abs => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.abs()),
+            Some(Value::Float(f)) => Value::Float(f.abs()),
+            _ => Value::Null,
+        },
+        ScalarFn::Ceil => float_fn(args, f64::ceil),
+        ScalarFn::Floor => float_fn(args, f64::floor),
+        // Round half away from zero (Neo4j default), returning a Float.
+        ScalarFn::Round => float_fn(args, f64::round),
+        ScalarFn::Sign => match args.first() {
+            Some(Value::Int(n)) => Value::Int(n.signum()),
+            Some(Value::Float(f)) => Value::Int(if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            }),
+            _ => Value::Null,
+        },
+        ScalarFn::Sqrt => float_fn(args, f64::sqrt),
+        ScalarFn::Exp => float_fn(args, f64::exp),
+        ScalarFn::Log => float_fn(args, f64::ln),
+        ScalarFn::Log10 => float_fn(args, f64::log10),
+        ScalarFn::IsNaN => match args.first() {
+            Some(Value::Float(f)) => Value::Bool(f.is_nan()),
+            // Integers are never NaN; a present non-float numeric is `false`.
+            Some(Value::Int(_)) => Value::Bool(false),
+            _ => Value::Null,
+        },
+        ScalarFn::ToInteger => to_integer(args.first()),
+        ScalarFn::ToFloat => to_float(args.first()),
+        ScalarFn::ToBoolean => to_boolean(args.first()),
+        ScalarFn::ToIntegerList => map_list(args.first(), |v| to_integer(Some(v))),
+        ScalarFn::ToFloatList => map_list(args.first(), |v| to_float(Some(v))),
+        ScalarFn::ToBooleanList => map_list(args.first(), |v| to_boolean(Some(v))),
+        // Trigonometric functions take and return radians, except the
+        // degrees / radians conversions.
+        ScalarFn::Sin => float_fn(args, f64::sin),
+        ScalarFn::Cos => float_fn(args, f64::cos),
+        ScalarFn::Tan => float_fn(args, f64::tan),
+        // cot(x) = 1 / tan(x).
+        ScalarFn::Cot => float_fn(args, |x| 1.0 / x.tan()),
+        ScalarFn::Asin => float_fn(args, f64::asin),
+        ScalarFn::Acos => float_fn(args, f64::acos),
+        ScalarFn::Atan => float_fn(args, f64::atan),
+        // atan2(y, x): two-argument arctangent.
+        ScalarFn::Atan2 => match (arg_f64(args.first()), arg_f64(args.get(1))) {
+            (Some(y), Some(x)) => Value::Float(y.atan2(x)),
+            _ => Value::Null,
+        },
+        // haversin(x) = (1 - cos x) / 2.
+        ScalarFn::Haversin => float_fn(args, |x| (1.0 - x.cos()) / 2.0),
+        ScalarFn::Degrees => float_fn(args, f64::to_degrees),
+        ScalarFn::Radians => float_fn(args, f64::to_radians),
+    }
+}
 
-    Some(result)
+/// The first argument as a string, if it is one.
+fn arg_str(v: Option<&Value>) -> Option<&str> {
+    match v {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// The argument as an integer, if it is one.
+fn arg_int(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The argument as a float, widening an integer.
+fn arg_f64(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Float(f)) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Apply a float function to the first argument; NULL unless it is numeric.
+fn float_fn(args: &[Value], f: impl Fn(f64) -> f64) -> Value {
+    arg_f64(args.first()).map_or(Value::Null, |x| Value::Float(f(x)))
 }
 
 /// Split `s` on any of `delims`. An empty delimiter set (or all-empty
@@ -1137,102 +1184,6 @@ fn normalize_unicode(s: &str, form: &str) -> Option<String> {
         "NFKD" => Some(s.nfkd().collect()),
         _ => None,
     }
-}
-
-/// Cypher math and trigonometric functions (`abs`, `ceil`, `floor`, `round`,
-/// `sign`, `rand`, `e`, `pi`, `sqrt`, `exp`, `log`, `log10`, `isNaN`, the
-/// `toInteger` / `toFloat` / `toBoolean` conversions plus their `…OrNull` and
-/// `…List` variants; `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`,
-/// `atan2`, `haversin`, `degrees`, `radians`).
-///
-/// `name` is matched case-insensitively. Returns `None` for a name this helper
-/// does not own so the caller applies the unknown-function NULL contract. Per
-/// Cypher semantics a math function applied to `NULL` (or a non-numeric value)
-/// returns `NULL`. `ceil` / `floor` / `round` / `sqrt` / `exp` / `log` /
-/// `log10` follow Neo4j in returning a Float; `abs` preserves Int vs Float;
-/// `sign` returns an Int.
-fn eval_math_function(name: &str, args: &[Value]) -> Option<Value> {
-    let lname = name.to_ascii_lowercase();
-
-    // Coerce the first argument to f64 for the float-domain functions.
-    let as_f64 = |v: Option<&Value>| match v {
-        Some(Value::Int(n)) => Some(*n as f64),
-        Some(Value::Float(f)) => Some(*f),
-        _ => None,
-    };
-
-    // Nullary constants take no argument.
-    match lname.as_str() {
-        "pi" => return Some(Value::Float(std::f64::consts::PI)),
-        "e" => return Some(Value::Float(std::f64::consts::E)),
-        "rand" => return Some(Value::Float(rand::random::<f64>())),
-        _ => {}
-    }
-
-    let result = match lname.as_str() {
-        "abs" => match args.first() {
-            Some(Value::Int(n)) => Value::Int(n.abs()),
-            Some(Value::Float(f)) => Value::Float(f.abs()),
-            _ => Value::Null,
-        },
-        "ceil" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.ceil())),
-        "floor" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.floor())),
-        // Round half away from zero (Neo4j default), returning a Float.
-        "round" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.round())),
-        "sign" => match args.first() {
-            Some(Value::Int(n)) => Value::Int(n.signum()),
-            Some(Value::Float(f)) => {
-                if *f > 0.0 {
-                    Value::Int(1)
-                } else if *f < 0.0 {
-                    Value::Int(-1)
-                } else {
-                    Value::Int(0)
-                }
-            }
-            _ => Value::Null,
-        },
-        "sqrt" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.sqrt())),
-        "exp" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.exp())),
-        "log" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.ln())),
-        "log10" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.log10())),
-        "isnan" => match args.first() {
-            Some(Value::Float(f)) => Value::Bool(f.is_nan()),
-            // Integers are never NaN; a present non-float numeric is `false`.
-            Some(Value::Int(_)) => Value::Bool(false),
-            _ => Value::Null,
-        },
-        "tointeger" | "tointegerornull" => to_integer(args.first()),
-        "tofloat" | "tofloatornull" => to_float(args.first()),
-        "toboolean" | "tobooleanornull" => to_boolean(args.first()),
-        "tointegerlist" => map_list(args.first(), |v| to_integer(Some(v))),
-        "tofloatlist" => map_list(args.first(), |v| to_float(Some(v))),
-        "tobooleanlist" => map_list(args.first(), |v| to_boolean(Some(v))),
-        // Trigonometric functions (radians in/out except degrees/radians
-        // conversions). Single-argument forms map NULL/non-numeric to NULL.
-        "sin" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.sin())),
-        "cos" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.cos())),
-        "tan" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.tan())),
-        // cot(x) = 1 / tan(x).
-        "cot" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(1.0 / x.tan())),
-        "asin" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.asin())),
-        "acos" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.acos())),
-        "atan" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.atan())),
-        // atan2(y, x): two-argument arctangent.
-        "atan2" => match (as_f64(args.first()), as_f64(args.get(1))) {
-            (Some(y), Some(x)) => Value::Float(y.atan2(x)),
-            _ => Value::Null,
-        },
-        // haversin(x) = (1 - cos x) / 2.
-        "haversin" => {
-            as_f64(args.first()).map_or(Value::Null, |x| Value::Float((1.0 - x.cos()) / 2.0))
-        }
-        "degrees" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.to_degrees())),
-        "radians" => as_f64(args.first()).map_or(Value::Null, |x| Value::Float(x.to_radians())),
-        _ => return None,
-    };
-
-    Some(result)
 }
 
 /// `toInteger` conversion: Int passes through; Float truncates toward zero;

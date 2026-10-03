@@ -65,8 +65,8 @@ LIMIT 10
 | Document operations (doc_push, doc_pull, doc_add_to_set, doc_inc) | ✅ 🔷 |
 | AS OF TIMESTAMP time-travel reads | ✅ 🔷 |
 | EXPLAIN / EXPLAIN SUGGEST | ✅ 🔷 |
-| CALL procedures (db.advisor.suggestions) | ✅ partial |
+| CALL procedure YIELD (dbms.procedures, dbms.functions, db.advisor.*) | ✅ |
 | Bolt protocol (Neo4j wire) | 📋 v1.2 |
-| LOAD CSV | 📋 v1.2 |
-| FOREACH | 📋 v1.0 |
-| Scalar functions (toInteger, toLower, length, abs, …) | 📋 |
+| LOAD CSV (use `coordinode-import` instead) | ❌ |
+| FOREACH | ✅ |
+| Scalar functions (toInteger, toLower, length, abs, …) | ✅ |

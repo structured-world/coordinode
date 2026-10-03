@@ -1,28 +1,34 @@
 use super::*;
 
-fn make_ctx() -> ProcedureContext {
-    ProcedureContext {
+fn make_ctx() -> AdvisorContext {
+    AdvisorContext {
         registry: Arc::new(QueryRegistry::new()),
         nplus1: Arc::new(NPlus1Detector::new()),
         dismissed: Arc::new(DismissedSet::new()),
     }
 }
 
-/// Unknown procedure returns error.
-#[test]
-fn unknown_procedure_error() {
-    let ctx = make_ctx();
-    let result = execute_procedure("db.unknown.foo", &[], &ctx);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("unknown procedure"));
+/// The value of `column` in `row`, located through the procedure's signature.
+fn column(kind: Kind, row: &ProcedureRow, column: &str) -> Value {
+    let procedure = AdvisorProcedure::new(kind);
+    let index = procedure
+        .signature()
+        .output_index(column)
+        .unwrap_or_else(|| panic!("no output {column}"));
+    row[index].clone()
+}
+
+/// Every returned row has exactly one value per declared output.
+fn assert_shape(kind: Kind, rows: &[ProcedureRow]) {
+    let width = AdvisorProcedure::new(kind).signature().outputs.len();
+    assert!(rows.iter().all(|r| r.len() == width));
 }
 
 /// suggestions() returns empty when no queries recorded.
 #[test]
 fn suggestions_empty() {
     let ctx = make_ctx();
-    let rows = execute_procedure("db.advisor.suggestions", &[], &ctx).unwrap();
-    assert!(rows.is_empty());
+    assert!(suggestions(&ctx).is_empty());
 }
 
 /// suggestions() returns rows after recording queries.
@@ -34,18 +40,17 @@ fn suggestions_with_data() {
     ctx.registry
         .record(0xABC, "MATCH (n:User) RETURN n", 60_000);
 
-    let rows = execute_procedure("db.advisor.suggestions", &[], &ctx).unwrap();
+    let rows = suggestions(&ctx);
     assert!(!rows.is_empty(), "should have suggestions after recording");
-
-    // Check column names in first row
-    let first = &rows[0];
-    let col_names: Vec<&str> = first.iter().map(|(name, _)| name.as_str()).collect();
-    assert!(col_names.contains(&"id"));
-    assert!(col_names.contains(&"severity"));
-    assert!(col_names.contains(&"kind"));
-    assert!(col_names.contains(&"query"));
-    assert!(col_names.contains(&"explanation"));
-    assert!(col_names.contains(&"impact"));
+    assert_shape(Kind::Suggestions, &rows);
+    assert_eq!(
+        column(Kind::Suggestions, &rows[0], "id"),
+        Value::String("0000000000000abc".into())
+    );
+    assert_eq!(
+        column(Kind::Suggestions, &rows[0], "query"),
+        Value::String("MATCH (n:User) RETURN n".into())
+    );
 }
 
 /// queryStats() returns stats for recorded queries.
@@ -56,29 +61,17 @@ fn query_stats_with_data() {
     ctx.registry.record(0x222, "CREATE (b:X)", 200);
     ctx.registry.record(0x111, "MATCH (a) RETURN a", 150);
 
-    let rows = execute_procedure("db.advisor.queryStats", &[], &ctx).unwrap();
+    let rows = query_stats(&ctx);
     assert_eq!(rows.len(), 2, "two distinct fingerprints");
+    assert_shape(Kind::QueryStats, &rows);
 
     // First row should be the most frequently executed
-    let first_count = rows[0]
-        .iter()
-        .find(|(k, _)| k == "count")
-        .map(|(_, v)| v.clone());
-    assert_eq!(first_count, Some(Value::Int(2)));
-
-    // Verify plan and shardsUsed columns exist
-    let col_names: Vec<&str> = rows[0].iter().map(|(k, _)| k.as_str()).collect();
-    assert!(col_names.contains(&"plan"), "should have plan column");
-    assert!(
-        col_names.contains(&"shardsUsed"),
-        "should have shardsUsed column"
-    );
+    assert_eq!(column(Kind::QueryStats, &rows[0], "count"), Value::Int(2));
     // CE always returns shardsUsed=1
-    let shards = rows[0]
-        .iter()
-        .find(|(k, _)| k == "shardsUsed")
-        .map(|(_, v)| v.clone());
-    assert_eq!(shards, Some(Value::Int(1)));
+    assert_eq!(
+        column(Kind::QueryStats, &rows[0], "shardsUsed"),
+        Value::Int(1)
+    );
 }
 
 /// queryStats() includes plan when recorded with record_with_plan.
@@ -93,15 +86,11 @@ fn query_stats_includes_plan() {
         None,
     );
 
-    let rows = execute_procedure("db.advisor.queryStats", &[], &ctx).unwrap();
+    let rows = query_stats(&ctx);
     assert_eq!(rows.len(), 1);
-    let plan = rows[0]
-        .iter()
-        .find(|(k, _)| k == "plan")
-        .map(|(_, v)| v.clone());
     assert_eq!(
-        plan,
-        Some(Value::String("NodeScan (User)".to_string())),
+        column(Kind::QueryStats, &rows[0], "plan"),
+        Value::String("NodeScan (User)".to_string()),
         "plan should be stored and returned"
     );
 }
@@ -113,25 +102,32 @@ fn slow_queries_filter() {
     ctx.registry.record(0x111, "fast query", 10);
     ctx.registry.record(0x222, "slow query", 500_000);
 
-    let rows = execute_procedure(
-        "db.advisor.slowQueries",
-        &[Value::Int(10), Value::Int(1_000)],
-        &ctx,
-    )
-    .unwrap();
+    let rows = slow_queries(&ctx, &[Value::Int(10), Value::Int(1_000)]);
     assert_eq!(rows.len(), 1, "only the slow query above threshold");
+    assert_shape(Kind::SlowQueries, &rows);
+    assert_eq!(
+        column(Kind::SlowQueries, &rows[0], "query"),
+        Value::String("slow query".into())
+    );
 }
 
-/// slowQueries() with default args.
+/// slowQueries() with the defaults the signature fills in.
 #[test]
 fn slow_queries_defaults() {
     let ctx = make_ctx();
     ctx.registry.record(0x111, "query", 10);
 
-    let rows = execute_procedure("db.advisor.slowQueries", &[], &ctx).unwrap();
-    // 10μs is above default min 100μs? No — p99 of bucket containing 10 is 25μs < 100.
-    // So no results expected.
+    // The p99 of the bucket holding 10μs is 25μs, under the 100μs default.
+    let rows = slow_queries(&ctx, &[Value::Int(20), Value::Int(100)]);
     assert!(rows.is_empty());
+}
+
+/// A negative limit returns nothing instead of wrapping to a huge one.
+#[test]
+fn slow_queries_negative_limit_returns_nothing() {
+    let ctx = make_ctx();
+    ctx.registry.record(0x222, "slow query", 500_000);
+    assert!(slow_queries(&ctx, &[Value::Int(-1), Value::Int(0)]).is_empty());
 }
 
 /// dismiss() marks a fingerprint as dismissed.
@@ -140,22 +136,20 @@ fn dismiss_and_check() {
     let ctx = make_ctx();
     ctx.registry.record(0xABC, "MATCH (n) RETURN n", 50_000);
 
-    // Before dismiss: suggestions should include it
-    let before = execute_procedure("db.advisor.suggestions", &[], &ctx).unwrap();
-    assert!(!before.is_empty());
+    assert!(!suggestions(&ctx).is_empty());
 
-    // Dismiss
-    let result = execute_procedure(
-        "db.advisor.dismiss",
-        &[Value::String("0000000000000abc".to_string())],
-        &ctx,
-    )
-    .unwrap();
+    let result = dismiss(&ctx, &[Value::String("0000000000000abc".to_string())]).unwrap();
     assert_eq!(result.len(), 1);
+    assert_shape(Kind::Dismiss, &result);
+    assert_eq!(
+        column(Kind::Dismiss, &result[0], "dismissed"),
+        Value::Bool(true)
+    );
 
-    // After dismiss: suggestions should exclude it
-    let after = execute_procedure("db.advisor.suggestions", &[], &ctx).unwrap();
-    assert!(after.is_empty(), "dismissed fingerprint should be excluded");
+    assert!(
+        suggestions(&ctx).is_empty(),
+        "dismissed fingerprint should be excluded"
+    );
 }
 
 /// reset() clears everything.
@@ -165,40 +159,42 @@ fn reset_clears_all() {
     ctx.registry.record(0xABC, "query", 100);
     ctx.dismissed.dismiss(0xABC);
 
-    execute_procedure("db.advisor.reset", &[], &ctx).unwrap();
+    let rows = reset(&ctx);
+    assert_shape(Kind::Reset, &rows);
 
     assert_eq!(ctx.registry.fingerprint_count(), 0);
     assert!(!ctx.dismissed.is_dismissed(0xABC));
 }
 
-/// dismiss() with invalid hex returns error.
+/// dismiss() with invalid hex is refused, naming the argument.
 #[test]
 fn dismiss_invalid_hex() {
     let ctx = make_ctx();
-    let result = execute_procedure(
-        "db.advisor.dismiss",
-        &[Value::String("not-hex".to_string())],
-        &ctx,
-    );
-    assert!(result.is_err());
+    let err = dismiss(&ctx, &[Value::String("not-hex".to_string())]).unwrap_err();
+    assert!(matches!(
+        err,
+        ProcedureError::InvalidArgument { ref argument, .. } if argument == "id"
+    ));
 }
 
-/// dismiss() without args returns error.
+/// dismiss(null) is refused rather than dismissing nothing silently.
 #[test]
-fn dismiss_no_args() {
+fn dismiss_null_is_refused() {
     let ctx = make_ctx();
-    let result = execute_procedure("db.advisor.dismiss", &[], &ctx);
-    assert!(result.is_err());
+    assert!(dismiss(&ctx, &[Value::Null]).is_err());
 }
 
-/// slowQueries() with wrong arg type returns error.
+/// Each advisor procedure lists the mode that matches what it touches:
+/// reading the registry is READ, changing this node's advisor state is DBMS.
 #[test]
-fn slow_queries_wrong_type() {
-    let ctx = make_ctx();
-    let result = execute_procedure(
-        "db.advisor.slowQueries",
-        &[Value::String("not-a-number".to_string())],
-        &ctx,
-    );
-    assert!(result.is_err());
+fn advisor_modes() {
+    for (kind, mode) in [
+        (Kind::Suggestions, ProcedureMode::Read),
+        (Kind::QueryStats, ProcedureMode::Read),
+        (Kind::SlowQueries, ProcedureMode::Read),
+        (Kind::Dismiss, ProcedureMode::Dbms),
+        (Kind::Reset, ProcedureMode::Dbms),
+    ] {
+        assert_eq!(AdvisorProcedure::new(kind).signature().mode, mode);
+    }
 }

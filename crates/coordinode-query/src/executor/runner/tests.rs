@@ -389,7 +389,8 @@ fn make_ctx<'a>(
         vector_loader: None,
         mvcc_oracle: None,
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
-        procedure_ctx: None,
+        procedures: None,
+        advisor: None,
         txn: Transaction::new(
             engine,
             None,

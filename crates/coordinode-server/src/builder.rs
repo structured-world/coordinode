@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use coordinode_cluster::{ClusterTopology, ShardRouting};
 use coordinode_query::executor::runner::ExtensionHandler;
+use coordinode_query::procedure::Procedure;
 use tonic::service::RoutesBuilder;
 
 /// The live server, handed to everything registered on a [`ServerBuilder`].
@@ -162,6 +163,7 @@ pub trait ServeModeHandler: Send + Sync {
 pub struct ServerBuilder {
     pub(crate) grpc_services: Vec<Arc<dyn GrpcServiceProvider>>,
     pub(crate) query_extensions: Vec<(String, Arc<dyn ExtensionHandler>)>,
+    pub(crate) procedures: Vec<Arc<dyn Procedure>>,
     pub(crate) background_tasks: Vec<Arc<dyn BackgroundTask>>,
     pub(crate) serve_modes: BTreeMap<String, Arc<dyn ServeModeHandler>>,
     pub(crate) placement: Option<(Arc<dyn ShardRouting>, Arc<dyn ClusterTopology>)>,
@@ -190,6 +192,14 @@ impl ServerBuilder {
         handler: Arc<dyn ExtensionHandler>,
     ) -> Self {
         self.query_extensions.push((name.into(), handler));
+        self
+    }
+
+    /// Add a procedure to the catalog `CALL` dispatches to and
+    /// `dbms.procedures()` lists. A name already in the catalog, built-in or
+    /// registered, stops startup.
+    pub fn register_procedure(mut self, procedure: Arc<dyn Procedure>) -> Self {
+        self.procedures.push(procedure);
         self
     }
 

@@ -23,7 +23,7 @@ pub(crate) mod stats;
 pub mod suggest;
 
 pub use fingerprint::{fingerprint, normalize, normalize_and_fingerprint};
-pub use procedures::{DismissedSet, ProcedureContext, ProcedureRow, execute_procedure};
+pub use procedures::{AdvisorContext, DismissedSet};
 pub use registry::{QueryRegistry, QueryStats};
 pub use source::{
     SourceContext, SourceLocationSnapshot, extract_from_bolt_extra, extract_from_http_headers,

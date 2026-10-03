@@ -35,10 +35,10 @@ The Neo4j wire protocol (Bolt) is not yet implemented. In this release, use the 
 | `point()` / `point.distance()` | ✅ / 🔷 | point() is standard; Haversine implementation |
 | `EXPLAIN` (logical plan) | ✅ Supported | Via `CypherService.Explain` |
 | `EXPLAIN SUGGEST` | 🔷 Extension | Query advisor |
-| `CALL procedures` | ⚠️ Partial | Only `db.advisor.suggestions()` in this release |
-| `CALL {} subqueries` | 📋 Planned | |
-| `FOREACH` | 📋 Planned | v1.0 milestone |
-| `LOAD CSV` | 📋 Planned | v1.2 milestone |
+| `CALL procedure YIELD` | ✅ Supported | Standalone or inside a query; `YIELD *`, aliases and `YIELD ... WHERE`. Built-ins: `dbms.procedures()`, `dbms.functions()`, `db.advisor.*` |
+| `CALL {}` / `OPTIONAL CALL {}` subqueries | ✅ Supported | `CALL {} IN TRANSACTIONS` is not supported |
+| `FOREACH` | ✅ Supported | |
+| `LOAD CSV` | ❌ Not supported | The server never reads files for a query; use `coordinode-import` |
 
 ## Scalar Functions
 
@@ -53,7 +53,10 @@ The common Neo4j scalar surface is implemented. See the [functions reference](./
 | `trim`, `ltrim`, `rtrim`, `btrim`, `left`, `right`, `substring`, `replace`, `split`, `reverse`, `normalize`, `charLength`, `isEmpty` | ✅ Supported |
 | `head`, `tail`, `last`, `range`, `nodes`, `relationships` | ✅ Supported |
 | `id`, `elementId`, `properties`, `keys` | ✅ Supported |
-| `apoc.*`, `db.*`, `dbms.*` procedure libraries | ❌ Not supported |
+| Function names in any case (`COALESCE`, `toupper`) | ✅ Supported |
+| `dbms.procedures()`, `dbms.functions()`, `db.advisor.*` | ✅ Supported |
+| Other `db.*` / `dbms.*` built-in procedures | 📋 Planned |
+| `apoc.*` procedure library | ❌ Not supported |
 
 ## Data Types
 

@@ -55,6 +55,11 @@ pub enum SemanticError {
         left: Vec<String>,
         right: Vec<String>,
     },
+
+    /// `YIELD *` on a CALL that is not the whole query: the clauses around
+    /// it could not tell which variables it binds.
+    #[error("YIELD * is only allowed on a CALL that is the whole query; name the columns instead")]
+    YieldAllInQuery,
 }
 
 /// Provides schema information for semantic validation.
@@ -174,6 +179,10 @@ impl<'a> Analyzer<'a> {
     }
 
     fn analyze_query(&mut self, query: &Query) {
+        self.check_yield_all(&query.clauses);
+        for branch in &query.unions {
+            self.check_yield_all(&branch.clauses);
+        }
         for clause in &query.clauses {
             self.analyze_clause(clause);
         }
@@ -202,6 +211,19 @@ impl<'a> Analyzer<'a> {
                     });
                 }
             }
+        }
+    }
+
+    /// `YIELD *` is refused unless its CALL is the branch's only clause.
+    fn check_yield_all(&mut self, clauses: &[Clause]) {
+        let yields_all =
+            |c: &Clause| matches!(c, Clause::Call(cc) if matches!(cc.yields, Some(CallYield::All)));
+        let significant = clauses
+            .iter()
+            .filter(|c| !matches!(c, Clause::AsOfTimestamp(_)))
+            .count();
+        if significant > 1 && clauses.iter().any(yields_all) {
+            self.errors.push(SemanticError::YieldAllInQuery);
         }
     }
 
@@ -320,9 +342,27 @@ impl<'a> Analyzer<'a> {
                 }
             }
             Clause::Call(cc) => {
-                // Validate procedure arguments
                 for arg in &cc.args {
                     self.check_expr(arg);
+                }
+                // Yielded columns become variables; one already in scope, or
+                // yielded twice, would be declared twice.
+                if let Some(CallYield::Items { items, filter }) = &cc.yields {
+                    let mut yielded = std::collections::HashSet::new();
+                    for item in items {
+                        let name = item.binding();
+                        if self.scope.contains_key(name) || !yielded.insert(name) {
+                            self.errors.push(SemanticError::DuplicateVariable {
+                                name: name.to_string(),
+                            });
+                        }
+                    }
+                    for item in items {
+                        self.scope.insert(item.binding().to_string(), Vec::new());
+                    }
+                    if let Some(filter) = filter {
+                        self.check_expr(filter);
+                    }
                 }
             }
             Clause::AlterLabel(_)

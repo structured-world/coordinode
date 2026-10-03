@@ -352,7 +352,6 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::NodeScan { .. }
         | LogicalOp::HnswScan { .. }
         | LogicalOp::Empty
-        | LogicalOp::ProcedureCall { .. }
         | LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
@@ -396,6 +395,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::RankFuse { input, .. }
         | LogicalOp::DocScore { input, .. }
+        | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::MaxSimTopK { input, .. } => vec![input],
 
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {

@@ -8,6 +8,10 @@ Every function on this page is implemented. Where one returns `null` it does so
 for a documented reason, such as a conversion that cannot succeed on the given
 input, and the notes column says which.
 
+Function names are case-insensitive: `toUpper`, `TOUPPER` and `toupper` are
+the same function. `CALL dbms.functions()` lists every function with its
+signature, from the same table the evaluator dispatches from.
+
 ## Scalar Functions
 
 Functions that compute a single value from their arguments.
@@ -18,7 +22,7 @@ Functions that compute a single value from their arguments.
 |----------|-----------|---------|-------|
 | `coalesce` | `coalesce(expr, ...)` | first non-null | Any number of arguments |
 | `toString` | `toString(x)` | String | Converts Int, Float, Bool, String |
-| `size` | `size(x)` | Integer | String → **byte count** (UTF-8 bytes, not characters); Array → element count |
+| `size` | `size(x)` | Integer | String → character count (Unicode scalar values, as Neo4j); Array → element count |
 | `type` | `type(r)` | String | Relationship type (e.g. `"KNOWS"`) |
 | `labels` | `labels(n)` | List\<String\> | Returns list with one label string. Subscript access `labels(n)[0]` is supported |
 | `now` | `now()` | Timestamp | Current timestamp (microseconds since epoch) |
@@ -322,7 +326,7 @@ spellings apply the conversion to every element of a list.
 | `split` | `split(x, delimiter)` | List\<String\> | |
 | `reverse` | `reverse(x)` | String or List | Works on both |
 | `normalize` | `normalize(x [, form])` | String | Unicode normalisation; the form defaults to NFC |
-| `charLength` | `charLength(x)` | Integer | Character count, where `size()` counts UTF-8 bytes |
+| `char_length` | `char_length(x)` | Integer | Character count, the same as `size()` on a string; also spelled `character_length` and `charLength` |
 | `isEmpty` | `isEmpty(x)` | Boolean | Empty string, list or map |
 
 ### Math ✅

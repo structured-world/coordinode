@@ -42,6 +42,14 @@ pub enum Reason {
     /// A call to a function this server does not implement. The name is in
     /// the metadata under `function`.
     UnknownFunction,
+    /// A `CALL` of a procedure this server does not have. The name is in the
+    /// metadata under `procedure`. Terminal.
+    UnknownProcedure,
+    /// A `CALL` that does not match the procedure's signature: too many or
+    /// missing arguments, an argument of the wrong type or value, or a YIELD
+    /// of a column it does not produce. Nothing ran. Metadata carries
+    /// `procedure`, and `argument` or `column` when one is at fault. Terminal.
+    ProcedureCall,
     /// Division or modulo by an integer zero.
     DivideByZero,
     /// An integer operation whose exact result leaves the 64-bit range.
@@ -134,6 +142,8 @@ impl Reason {
             Reason::QuerySyntax => "QUERY_SYNTAX",
             Reason::QuerySemantics => "QUERY_SEMANTICS",
             Reason::UnknownFunction => "UNKNOWN_FUNCTION",
+            Reason::UnknownProcedure => "UNKNOWN_PROCEDURE",
+            Reason::ProcedureCall => "PROCEDURE_CALL",
             Reason::DivideByZero => "DIVIDE_BY_ZERO",
             Reason::LongOverflow => "LONG_OVERFLOW",
             Reason::UnknownTransaction => "UNKNOWN_TRANSACTION",

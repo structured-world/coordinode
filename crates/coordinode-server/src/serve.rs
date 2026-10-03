@@ -718,6 +718,13 @@ pub(crate) async fn serve(
             db.register_extension(name.clone(), Arc::clone(handler));
             info!(extension = %name, "query extension registered");
         }
+        // Procedures a downstream distribution adds to the CE catalog. A name
+        // clash stops startup: serving a different procedure than the one
+        // registered would be worse than not serving.
+        for procedure in &extensions.procedures {
+            db.register_procedure(Arc::clone(procedure))?;
+            info!(procedure = %procedure.signature().name, "procedure registered");
+        }
     }
 
     // Idle reaper: roll back interactive transactions left untouched past

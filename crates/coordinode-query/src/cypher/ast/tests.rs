@@ -129,7 +129,10 @@ fn is_write_read_only_queries() {
     ];
     for q in &read_queries {
         let ast = crate::cypher::parse(q).expect("parse");
-        assert!(!ast.is_write(), "MATCH query must NOT be write: {q}");
+        assert!(
+            !ast.is_write(&|_| false),
+            "MATCH query must NOT be write: {q}"
+        );
     }
 }
 
@@ -145,7 +148,10 @@ fn is_write_mutating_clauses() {
     ];
     for q in &write_queries {
         let ast = crate::cypher::parse(q).expect("parse");
-        assert!(ast.is_write(), "mutating query must be write: {q}");
+        assert!(
+            ast.is_write(&|_| false),
+            "mutating query must be write: {q}"
+        );
     }
 }
 
@@ -163,7 +169,7 @@ fn is_write_ddl_clauses() {
     ];
     for q in &ddl_queries {
         let ast = crate::cypher::parse(q).expect("parse");
-        assert!(ast.is_write(), "DDL query must be write: {q}");
+        assert!(ast.is_write(&|_| false), "DDL query must be write: {q}");
     }
 }
 
@@ -178,8 +184,25 @@ fn is_write_match_then_write() {
     for q in &queries {
         let ast = crate::cypher::parse(q).expect("parse");
         assert!(
-            ast.is_write(),
+            ast.is_write(&|_| false),
             "MATCH+write must be classified as write: {q}"
         );
     }
+}
+
+/// A CALL is a write exactly when its procedure writes, wherever the CALL
+/// sits: alone, after other clauses, or inside a subquery.
+#[test]
+fn is_write_follows_the_called_procedure() {
+    let writes = |name: &str| name == "app.write";
+    for q in [
+        "CALL app.write()",
+        "UNWIND [1] AS x CALL app.write() YIELD y RETURN y",
+        "MATCH (n) CALL { CALL app.write() YIELD y RETURN y } RETURN n",
+    ] {
+        let ast = crate::cypher::parse(q).expect("parse");
+        assert!(ast.is_write(&writes), "{q}");
+    }
+    let ast = crate::cypher::parse("CALL app.read() YIELD y RETURN y").expect("parse");
+    assert!(!ast.is_write(&writes));
 }

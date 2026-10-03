@@ -6,6 +6,7 @@
 
 use super::logical::*;
 use crate::cypher::ast::*;
+use crate::function::AggregateFn;
 use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 
 /// Error during logical plan construction.
@@ -107,7 +108,15 @@ fn build_branch_root(clauses: &[Clause]) -> Result<(LogicalOp, Option<Expr>), Pl
         current = Some(apply_clause(current, clause)?);
     }
 
-    let root = current.ok_or(PlanError::EmptyQuery)?;
+    let mut root = current.ok_or(PlanError::EmptyQuery)?;
+
+    // A CALL that is the root over nothing is the whole query.
+    if let LogicalOp::ProcedureCall {
+        input, standalone, ..
+    } = &mut root
+    {
+        *standalone = matches!(**input, LogicalOp::Empty);
+    }
 
     // Optimization pass: detect edge vector patterns and select strategy
     let root = optimize_edge_vector_search(root);
@@ -357,6 +366,7 @@ fn op_children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::MergeNodes { input, .. }
         | LogicalOp::CloneNode { input, .. }
         | LogicalOp::RedirectEdges { input, .. }
+        | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::CreateEdge { input, .. } => vec![input],
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             vec![left, right]
@@ -697,15 +707,37 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 optional: cs.optional,
             })
         }
-        Clause::Call(cc) => Ok(LogicalOp::ProcedureCall {
-            procedure: cc.procedure.clone(),
-            args: cc
-                .args
-                .iter()
-                .map(super::lower_expr)
-                .collect::<Result<Vec<_>, _>>()?,
-            yield_items: cc.yield_items.iter().map(|yi| yi.name.clone()).collect(),
-        }),
+        Clause::Call(cc) => {
+            let (yields, filter) = match &cc.yields {
+                None | Some(CallYield::All) => (None, None),
+                Some(CallYield::Items { items, filter }) => (
+                    Some(
+                        items
+                            .iter()
+                            .map(|item| YieldColumn {
+                                column: item.name.clone(),
+                                variable: item.binding().to_string(),
+                            })
+                            .collect(),
+                    ),
+                    filter.as_ref().map(super::lower_expr).transpose()?,
+                ),
+            };
+            Ok(LogicalOp::ProcedureCall {
+                input: Box::new(current.unwrap_or(LogicalOp::Empty)),
+                procedure: cc.procedure.clone(),
+                args: cc
+                    .args
+                    .iter()
+                    .map(super::lower_expr)
+                    .collect::<Result<Vec<_>, _>>()?,
+                yields,
+                filter,
+                // Settled once the whole branch is built: only a call
+                // nothing precedes or follows is the whole query.
+                standalone: false,
+            })
+        }
         Clause::AlterLabel(ac) => Ok(LogicalOp::AlterLabel {
             label: ac.label.clone(),
             mode: ac.mode.clone(),
@@ -1318,6 +1350,21 @@ pub fn optimize_index_selection(
             input: Box::new(optimize_index_selection(*input, registry)),
             expr,
             variable,
+        },
+        LogicalOp::ProcedureCall {
+            input,
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
+        } => LogicalOp::ProcedureCall {
+            input: Box::new(optimize_index_selection(*input, registry)),
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
         },
         LogicalOp::CreateNode {
             input,
@@ -2016,6 +2063,21 @@ fn promote_hnsw_scan(op: LogicalOp, registry: &crate::index::VectorIndexRegistry
             input: Box::new(promote_hnsw_scan(*input, registry)),
             expr,
             variable,
+        },
+        LogicalOp::ProcedureCall {
+            input,
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
+        } => LogicalOp::ProcedureCall {
+            input: Box::new(promote_hnsw_scan(*input, registry)),
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
         },
         LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
             left: Box::new(promote_hnsw_scan(*left, registry)),
@@ -2920,6 +2982,21 @@ fn descend_optimize_top_k(op: LogicalOp) -> LogicalOp {
             expr,
             variable,
         },
+        LogicalOp::ProcedureCall {
+            input,
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
+        } => LogicalOp::ProcedureCall {
+            input: Box::new(optimize_vector_top_k(*input)),
+            procedure,
+            args,
+            yields,
+            filter,
+            standalone,
+        },
         LogicalOp::CartesianProduct { left, right } => LogicalOp::CartesianProduct {
             left: Box::new(optimize_vector_top_k(*left)),
             right: Box::new(optimize_vector_top_k(*right)),
@@ -3549,12 +3626,11 @@ fn build_return_op(input: LogicalOp, rc: &ReturnClause) -> Result<LogicalOp, Pla
                     // For percentileCont/percentileDisc, store the second argument expression.
                     // Storing the raw Expr (not a pre-evaluated float) lets the executor resolve
                     // query parameters ($p) at runtime against the params map in ExecutionContext.
-                    let percentile_expr =
-                        if matches!(name.as_str(), "percentileCont" | "percentileDisc") {
-                            args.get(1).map(super::lower_expr).transpose()?
-                        } else {
-                            None
-                        };
+                    let percentile_expr = if takes_percentile(name) {
+                        args.get(1).map(super::lower_expr).transpose()?
+                    } else {
+                        None
+                    };
                     aggregates.push(AggregateItem {
                         function: name.clone(),
                         arg,
@@ -3630,12 +3706,11 @@ fn build_with_op(input: LogicalOp, wc: &WithClause) -> Result<LogicalOp, PlanErr
                         Some(a) => super::lower_expr(a)?,
                         None => crate::plan::expr::Expr::Star,
                     };
-                    let percentile_expr =
-                        if matches!(name.as_str(), "percentileCont" | "percentileDisc") {
-                            args.get(1).map(super::lower_expr).transpose()?
-                        } else {
-                            None
-                        };
+                    let percentile_expr = if takes_percentile(name) {
+                        args.get(1).map(super::lower_expr).transpose()?
+                    } else {
+                        None
+                    };
                     aggregates.push(AggregateItem {
                         function: name.clone(),
                         arg,
@@ -3783,15 +3858,19 @@ fn build_create_op(current: Option<LogicalOp>, cc: &CreateClause) -> Result<Logi
     Ok(result)
 }
 
-/// Check if an expression is an aggregation function call.
+/// Check if an expression is a call of a catalog aggregating function.
 fn is_aggregate_expr(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::FunctionCall { name, .. }
-            if matches!(name.as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
-                | "percentileCont" | "percentileDisc" | "stDev" | "stDevP"
-            )
+        Expr::FunctionCall { name, .. } if AggregateFn::resolve(name).is_some()
+    )
+}
+
+/// Whether an aggregate takes a percentile as its second argument.
+fn takes_percentile(name: &str) -> bool {
+    matches!(
+        AggregateFn::resolve(name),
+        Some(AggregateFn::PercentileCont | AggregateFn::PercentileDisc)
     )
 }
 
@@ -4087,6 +4166,11 @@ fn collect_op_variables(op: &LogicalOp) -> Vec<String> {
         } => {
             let mut vars = collect_op_variables(input);
             vars.push(variable.clone());
+            vars
+        }
+        LogicalOp::ProcedureCall { input, yields, .. } => {
+            let mut vars = collect_op_variables(input);
+            vars.extend(yields.iter().flatten().map(|y| y.variable.clone()));
             vars
         }
         _ => Vec::new(),
@@ -4897,6 +4981,7 @@ fn validate_rrf_placement(op: &LogicalOp) -> Result<(), PlanError> {
         | LogicalOp::RemoveOp { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::AttachDocument { input, .. } => validate_rrf_placement(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             validate_rrf_placement(left)?;
@@ -5314,6 +5399,7 @@ fn validate_doc_placement(op: &LogicalOp) -> Result<(), PlanError> {
         | LogicalOp::RemoveOp { input, .. }
         | LogicalOp::Delete { input, .. }
         | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::AttachDocument { input, .. } => validate_doc_placement(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             validate_doc_placement(left)?;

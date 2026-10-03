@@ -2883,6 +2883,39 @@ fn call_procedure_still_parses() {
     );
 }
 
+/// The YIELD part keeps columns, aliases, `*` and a WHERE apart, and a
+/// column may carry a reserved word as its name (`db.labels()` yields
+/// `label`).
+#[test]
+fn call_yield_forms_parse() {
+    let call = |query: &str| match parse_ok(query).clauses.into_iter().next() {
+        Some(Clause::Call(cc)) => cc,
+        other => panic!("expected a CALL, got {other:?}"),
+    };
+
+    assert_eq!(call("CALL db.test()").yields, None);
+    assert_eq!(call("CALL db.test() YIELD *").yields, Some(CallYield::All));
+
+    let Some(CallYield::Items { items, filter }) =
+        call("CALL db.labels() YIELD label AS l, count WHERE l <> 'x' RETURN l").yields
+    else {
+        panic!("expected yielded items");
+    };
+    assert_eq!(items[0].name, "label");
+    assert_eq!(items[0].binding(), "l");
+    assert_eq!(items[1].binding(), "count");
+    assert!(filter.is_some());
+}
+
+/// A parameter may be named like a keyword: `$skip`, `$limit`.
+#[test]
+fn keyword_named_parameters_parse() {
+    let q = parse_ok("MATCH (n) WHERE n.x = $skip RETURN n LIMIT $limit");
+    let tree = format!("{q:?}");
+    assert!(tree.contains("Parameter(\"skip\")"), "{tree}");
+    assert!(tree.contains("Parameter(\"limit\")"), "{tree}");
+}
+
 #[test]
 fn on_violation_skip_parsed() {
     // SET ... ON VIOLATION SKIP should set ViolationMode::Skip.

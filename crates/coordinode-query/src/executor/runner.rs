@@ -111,6 +111,11 @@ pub enum ExecutionError {
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 
+    /// A `CALL` refused before the procedure ran: an unknown name, arguments
+    /// that do not match the signature, or a YIELD of a column it lacks.
+    #[error("{0}")]
+    Procedure(#[from] crate::procedure::ProcedureError),
+
     #[error("write conflict: {0}")]
     Conflict(String),
 
@@ -704,9 +709,11 @@ pub struct ExecutionContext<'a> {
     /// still live on the executor and drive the transaction via its
     /// `pub(crate)` surface until they migrate too.
     pub txn: Transaction<'a>,
-    /// Procedure context for CALL statements. When set, enables
-    /// `db.advisor.*` procedures in the executor.
-    pub procedure_ctx: Option<crate::advisor::procedures::ProcedureContext>,
+    /// The procedures `CALL` dispatches to. `None` refuses every call.
+    pub procedures: Option<&'a crate::procedure::ProcedureRegistry>,
+    /// Advisor state the `db.advisor.*` procedures read and reset; `None`
+    /// makes them unavailable.
+    pub advisor: Option<crate::advisor::AdvisorContext>,
 
     /// Vector MVCC consistency mode. Controls how vector search interacts
     /// with snapshot isolation. Default: `Current` (no visibility filter).
@@ -3701,10 +3708,21 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         }
 
         LogicalOp::ProcedureCall {
+            input,
             procedure,
             args,
-            yield_items,
-        } => execute_procedure_call(procedure, args, yield_items, ctx),
+            yields,
+            filter,
+            standalone,
+        } => execute_procedure_call(
+            input,
+            procedure,
+            args,
+            yields.as_deref(),
+            filter.as_ref(),
+            *standalone,
+            ctx,
+        ),
 
         LogicalOp::AlterLabel { label, mode } => execute_alter_label(label, mode, ctx),
 
@@ -8157,8 +8175,11 @@ fn compute_aggregate(
     rows: &[&Row],
     params: &HashMap<String, coordinode_core::graph::types::Value>,
 ) -> Result<Value, EvalError> {
-    Ok(match agg.function.as_str() {
-        "count" => {
+    use crate::function::AggregateFn;
+    let function = AggregateFn::resolve(&agg.function)
+        .ok_or_else(|| EvalError::UnknownFunction(agg.function.clone()))?;
+    Ok(match function {
+        AggregateFn::Count => {
             if agg.arg == crate::plan::expr::Expr::Star {
                 // count(*) ignores DISTINCT — counts all rows
                 Value::Int(rows.len() as i64)
@@ -8167,7 +8188,7 @@ fn compute_aggregate(
                 Value::Int(values.len() as i64)
             }
         }
-        "sum" => {
+        AggregateFn::Sum => {
             let values = eval_aggregate_values(agg, rows)?;
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
@@ -8196,7 +8217,7 @@ fn compute_aggregate(
                 Value::Int(int_sum)
             }
         }
-        "avg" => {
+        AggregateFn::Avg => {
             let values = eval_aggregate_values(agg, rows)?;
             let mut sum = 0.0f64;
             let mut count = 0u64;
@@ -8219,7 +8240,7 @@ fn compute_aggregate(
                 Value::Null
             }
         }
-        "min" => {
+        AggregateFn::Min => {
             let values = eval_aggregate_values(agg, rows)?;
             values
                 .into_iter()
@@ -8232,7 +8253,7 @@ fn compute_aggregate(
                 })
                 .unwrap_or(Value::Null)
         }
-        "max" => {
+        AggregateFn::Max => {
             let values = eval_aggregate_values(agg, rows)?;
             values
                 .into_iter()
@@ -8245,11 +8266,11 @@ fn compute_aggregate(
                 })
                 .unwrap_or(Value::Null)
         }
-        "collect" => {
+        AggregateFn::Collect => {
             let values = eval_aggregate_values(agg, rows)?;
             Value::Array(values)
         }
-        "percentileCont" | "percentileDisc" => {
+        AggregateFn::PercentileCont | AggregateFn::PercentileDisc => {
             let agg_values = eval_aggregate_values(agg, rows)?;
             let mut values: Vec<f64> = agg_values
                 .iter()
@@ -8275,7 +8296,7 @@ fn compute_aggregate(
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0);
 
-            if agg.function == "percentileDisc" {
+            if function == AggregateFn::PercentileDisc {
                 // Nearest rank method: ceil(p * n) gives 1-based index; clamp to [0, n-1].
                 let idx = ((percentile * values.len() as f64).ceil() as usize)
                     .saturating_sub(1)
@@ -8295,7 +8316,7 @@ fn compute_aggregate(
                 }
             }
         }
-        "stDev" | "stDevP" => {
+        AggregateFn::StDev | AggregateFn::StDevP => {
             let agg_values = eval_aggregate_values(agg, rows)?;
             let values: Vec<f64> = agg_values
                 .iter()
@@ -8314,7 +8335,7 @@ fn compute_aggregate(
             let mean = values.iter().sum::<f64>() / n;
             let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>();
 
-            if agg.function == "stDevP" {
+            if function == AggregateFn::StDevP {
                 // Population standard deviation
                 Value::Float((variance / n).sqrt())
             } else {
@@ -8326,7 +8347,6 @@ fn compute_aggregate(
                 }
             }
         }
-        _ => Value::Null,
     })
 }
 
@@ -8556,6 +8576,10 @@ fn collect_bound_vars(op: &LogicalOp, out: &mut std::collections::HashSet<String
             collect_bound_vars(input, out);
             out.insert(variable.clone());
         }
+        LogicalOp::ProcedureCall { input, yields, .. } => {
+            collect_bound_vars(input, out);
+            out.extend(yields.iter().flatten().map(|y| y.variable.clone()));
+        }
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             collect_bound_vars(left, out);
             collect_bound_vars(right, out);
@@ -8595,6 +8619,19 @@ fn scan_filter_references_outside(
         | LogicalOp::Limit { input, .. }
         | LogicalOp::Skip { input, .. }
         | LogicalOp::Unwind { input, .. } => scan_filter_references_outside(input, bound),
+        // A call whose arguments read an outer variable runs per outer row.
+        LogicalOp::ProcedureCall {
+            input,
+            args,
+            filter,
+            ..
+        } => {
+            scan_filter_references_outside(input, bound)
+                || args.iter().any(|a| expr_references_outside(a, bound))
+                || filter
+                    .as_ref()
+                    .is_some_and(|f| expr_references_outside(f, bound))
+        }
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             scan_filter_references_outside(left, bound)
                 || scan_filter_references_outside(right, bound)
@@ -16929,44 +16966,67 @@ fn execute_drop_btree_index(
     Ok(vec![row])
 }
 
-/// Execute a procedure call: evaluate args, dispatch to the procedure registry,
-/// convert output rows to Row format.
+/// Execute a procedure call: once per input row, with the arguments evaluated
+/// against that row and checked against the signature; each output row
+/// extends the input row with the yielded variables. A procedure without
+/// outputs passes each input row through once.
 fn execute_procedure_call(
+    input: &LogicalOp,
     procedure: &str,
     args: &[crate::plan::expr::Expr],
-    yield_items: &[String],
+    yields: Option<&[crate::planner::logical::YieldColumn]>,
+    filter: Option<&crate::plan::expr::Expr>,
+    standalone: bool,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
-    let proc_ctx = ctx
-        .procedure_ctx
-        .as_ref()
-        .ok_or_else(|| ExecutionError::Unsupported("no procedure context available".into()))?;
+    use crate::procedure::{ProcedureError, bind_arguments, bind_yields};
 
-    // Evaluate arguments to values
-    let empty_row = Row::new();
-    let arg_values: Vec<Value> = args
-        .iter()
-        .map(|a| eval_neutral(a, &empty_row))
-        .collect::<Result<_, _>>()?;
+    let registry = ctx.procedures.ok_or_else(|| {
+        ExecutionError::Unsupported("no procedure catalog is available here".into())
+    })?;
+    let callee = registry
+        .get(procedure)
+        .ok_or_else(|| ProcedureError::Unknown {
+            procedure: procedure.to_string(),
+        })?;
+    let signature = callee.signature();
+    // Resolved before any row runs, so a bad YIELD fails without side effects.
+    let bindings = bind_yields(signature, yields, standalone)?;
 
-    // Dispatch to the procedure
-    let proc_rows = crate::advisor::procedures::execute_procedure(procedure, &arg_values, proc_ctx)
-        .map_err(ExecutionError::Unsupported)?;
-
-    // Convert procedure rows to Row format
-    let mut rows = Vec::with_capacity(proc_rows.len());
-    for proc_row in proc_rows {
-        let mut row = Row::new();
-        for (col_name, value) in proc_row {
-            // If yield_items is not empty, only include requested columns
-            if yield_items.is_empty() || yield_items.contains(&col_name) {
-                row.insert(col_name, value);
-            }
+    let input_rows = execute_op(input, ctx)?;
+    let mut out = Vec::new();
+    for row in input_rows {
+        let mut arg_values = Vec::with_capacity(args.len());
+        for arg in args {
+            arg_values.push(eval_neutral_with_storage(arg, &row, ctx)?);
         }
-        rows.push(row);
+        let results = callee.call(ctx, bind_arguments(signature, arg_values)?)?;
+        if signature.outputs.is_empty() {
+            out.push(row);
+            continue;
+        }
+        for result in results {
+            if result.len() != signature.outputs.len() {
+                return Err(ProcedureError::OutputShape {
+                    procedure: procedure.to_string(),
+                    declared: signature.outputs.len(),
+                    found: result.len(),
+                }
+                .into());
+            }
+            let mut joined = row.clone();
+            for (index, variable) in &bindings {
+                joined.insert(variable.clone(), result[*index].clone());
+            }
+            if let Some(filter) = filter {
+                if !is_truthy(&eval_neutral_with_storage(filter, &joined, ctx)?) {
+                    continue;
+                }
+            }
+            out.push(joined);
+        }
     }
-
-    Ok(rows)
+    Ok(out)
 }
 
 /// Map a Layer-3 [`CommitError`](coordinode_storage::engine::transaction::CommitError)

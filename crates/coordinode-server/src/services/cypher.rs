@@ -237,6 +237,51 @@ fn db_error_to_status(err: DatabaseError) -> Status {
             };
             return status_with_reason(Code::InvalidArgument, eval.to_string(), reason, metadata);
         }
+        // A CALL the catalog refused: a fault in the query, like a syntax
+        // error, with the procedure and the argument or column it names.
+        DatabaseError::Execution(ExecutionError::Procedure(refusal)) => {
+            use coordinode_query::procedure::ProcedureError as P;
+            let (reason, metadata): (Reason, Vec<(&str, String)>) = match refusal {
+                P::Unknown { procedure } => (
+                    Reason::UnknownProcedure,
+                    vec![("procedure", procedure.clone())],
+                ),
+                P::MissingArgument {
+                    procedure,
+                    argument,
+                }
+                | P::ArgumentType {
+                    procedure,
+                    argument,
+                    ..
+                }
+                | P::InvalidArgument {
+                    procedure,
+                    argument,
+                    ..
+                } => (
+                    Reason::ProcedureCall,
+                    vec![
+                        ("procedure", procedure.clone()),
+                        ("argument", argument.clone()),
+                    ],
+                ),
+                P::UnknownOutput { procedure, column } => (
+                    Reason::ProcedureCall,
+                    vec![("procedure", procedure.clone()), ("column", column.clone())],
+                ),
+                P::TooManyArguments { procedure, .. } | P::YieldRequired { procedure } => (
+                    Reason::ProcedureCall,
+                    vec![("procedure", procedure.clone())],
+                ),
+                // A procedure breaking its own signature, or a registration
+                // clash, is the server's fault, not the query's.
+                P::OutputShape { .. } | P::DuplicateName { .. } => {
+                    return Status::internal(rendered);
+                }
+            };
+            return status_with_reason(Code::InvalidArgument, rendered, reason, metadata);
+        }
         DatabaseError::Execution(ExecutionError::SchemaViolation(detail)) => {
             return status_with_reason(
                 Code::FailedPrecondition,
@@ -842,7 +887,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             // Parse the query to determine if it contains any mutating clauses.
             // On parse failure we let execution proceed and fail with a richer error.
             if let Ok(ast) = coordinode_query::cypher::parse(&req.query) {
-                if ast.is_write() {
+                let writes = {
+                    let db = self.database.read();
+                    ast.is_write(&|name| db.procedures().writes(name))
+                };
+                if writes {
                     // A request that names no concern gets the majority default
                     // and is as safe here as one that asks for it.
                     let concern = match req.write_concern.as_ref() {

@@ -159,9 +159,12 @@ call_subquery_clause = { kw_optional? ~ kw_call ~ "{" ~ clause+ ~ "}" }
 call_clause = { kw_call ~ procedure_name ~ "(" ~ procedure_args? ~ ")" ~ yield_clause? }
 procedure_name = { identifier ~ ("." ~ identifier)* }
 procedure_args = { expression ~ ("," ~ expression)* }
-yield_clause = { kw_yield ~ yield_items }
+// `YIELD *` binds every output column (a standalone CALL only); a list of
+// columns may be filtered by a trailing WHERE.
+yield_clause = { kw_yield ~ (yield_all | yield_items ~ where_clause?) }
+yield_all = { "*" }
 yield_items = { yield_item ~ ("," ~ yield_item)* }
-yield_item = { identifier ~ alias? }
+yield_item = { symbolic_name ~ alias? }
 
 // --- CREATE ---
 
@@ -823,7 +826,7 @@ map_projection_item = { map_projection_shorthand | map_projection_computed }
 map_projection_shorthand = { "." ~ identifier }
 map_projection_computed  = { identifier ~ ":" ~ expression }
 
-parameter = { "$" ~ identifier }
+parameter = { "$" ~ symbolic_name }
 
 // --- Literals ---
 
@@ -995,6 +998,13 @@ kw_namespace   = @{ ^"namespace" ~ !(ASCII_ALPHANUMERIC | "_") }
 variable   = { identifier }
 identifier = @{
     !reserved_word ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*
+  | "`" ~ (!"`" ~ ANY)+ ~ "`"
+}
+
+// A name in a position no keyword can occupy (after `$`, a YIELD column),
+// where reserved words are ordinary names.
+symbolic_name = @{
+    (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*
   | "`" ~ (!"`" ~ ANY)+ ~ "`"
 }
 

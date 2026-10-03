@@ -14,7 +14,7 @@ use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::txn::proposal::ProposalIdGenerator;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_query::advisor::nplus1::NPlus1Detector;
-use coordinode_query::advisor::{DismissedSet, ProcedureContext, QueryRegistry, SourceContext};
+use coordinode_query::advisor::{AdvisorContext, DismissedSet, QueryRegistry, SourceContext};
 use coordinode_query::cypher;
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::{
@@ -23,6 +23,7 @@ use coordinode_query::executor::runner::{
 };
 use coordinode_query::frontend::{CypherFrontend, QueryFrontend};
 use coordinode_query::planner;
+use coordinode_query::procedure::{Procedure, ProcedureError, ProcedureRegistry};
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
 use coordinode_storage::Guard;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
@@ -386,6 +387,9 @@ pub struct Database {
     /// or an integration test so extension operators (e.g. a sharded
     /// CREATE VECTOR INDEX) reach their handler.
     extension_registry: ExtensionRegistry,
+    /// The procedures `CALL` dispatches to: the CE built-ins plus whatever an
+    /// enterprise layer or embedder adds with [`Database::register_procedure`].
+    procedure_registry: ProcedureRegistry,
     /// Adaptive query plan configuration — controls parallel traversal thresholds.
     adaptive_config: AdaptiveConfig,
     /// Feedback cache for known super-node fan-out degrees.
@@ -1095,6 +1099,7 @@ impl Database {
             _vector_worker: vector_worker,
             text_index_registry,
             extension_registry: ExtensionRegistry::new(),
+            procedure_registry: ProcedureRegistry::with_builtins(),
             adaptive_config: AdaptiveConfig::default(),
             feedback_cache: FeedbackCache::default(),
             drain_buffer,
@@ -1638,10 +1643,6 @@ impl Database {
         .map(|(rows, _, _)| rows)
     }
 
-    /// Execute a Cypher query and return result rows.
-    ///
-    /// Automatically tracks query fingerprint and execution time in the
-    /// query advisor registry for performance analysis.
     /// Register an extension-op handler under `name`. An enterprise layer (or
     /// an integration test) calls this at setup so that extension operators
     /// (a trailing clause on CREATE VECTOR INDEX, etc.) dispatch to it; a plain
@@ -1655,6 +1656,29 @@ impl Database {
         self.extension_registry.register(name, handler);
     }
 
+    /// Add a procedure `CALL` can run and `dbms.procedures()` lists. Called at
+    /// setup by an enterprise layer or an embedder.
+    ///
+    /// # Errors
+    ///
+    /// [`ProcedureError::DuplicateName`] when a procedure of that name is
+    /// already registered, built-in or not; the existing one stays.
+    pub fn register_procedure(
+        &mut self,
+        procedure: Arc<dyn Procedure>,
+    ) -> Result<(), ProcedureError> {
+        self.procedure_registry.register(procedure)
+    }
+
+    /// The procedures `CALL` dispatches to.
+    pub fn procedures(&self) -> &ProcedureRegistry {
+        &self.procedure_registry
+    }
+
+    /// Execute a Cypher query and return result rows.
+    ///
+    /// Automatically tracks query fingerprint and execution time in the
+    /// query advisor registry for performance analysis.
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         if self.try_apply_session_set(query) {
             return Ok(Vec::new());
@@ -2682,7 +2706,8 @@ impl Database {
             vector_loader: Some(&vector_loader),
             mvcc_oracle: Some(&self.oracle),
             mvcc_read_ts: read_ts,
-            procedure_ctx: Some(ProcedureContext {
+            procedures: Some(&self.procedure_registry),
+            advisor: Some(AdvisorContext {
                 registry: Arc::clone(&self.query_registry),
                 nplus1: Arc::clone(&self.nplus1_detector),
                 dismissed: Arc::clone(&self.dismissed),

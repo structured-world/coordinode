@@ -740,14 +740,24 @@ pub enum LogicalOp {
         path_variable: String,
     },
 
-    /// Procedure call: CALL db.advisor.suggestions() YIELD ...
+    /// Procedure call: `CALL db.advisor.suggestions() YIELD ...`. Runs once
+    /// per input row, with the arguments evaluated against that row; each
+    /// output row extends the input row with the yielded variables.
     ProcedureCall {
+        /// Rows the call runs for; `Empty` when the call starts the query.
+        input: Box<LogicalOp>,
         /// Dotted procedure name.
         procedure: String,
-        /// Positional arguments (evaluated to Value).
+        /// Positional arguments, evaluated per input row.
         args: Vec<crate::plan::expr::Expr>,
-        /// YIELD column names (empty = all columns).
-        yield_items: Vec<String>,
+        /// The columns to bind and the variable each binds. `None` binds
+        /// every output column under its own name, which only a standalone
+        /// call may do unless the procedure has no outputs.
+        yields: Option<Vec<YieldColumn>>,
+        /// `YIELD ... WHERE` predicate over the yielded variables.
+        filter: Option<crate::plan::expr::Expr>,
+        /// Whether the call is the whole query.
+        standalone: bool,
     },
 
     /// Rank Fusion (Reciprocal Rank Fusion) operator — materializes the input
@@ -1123,9 +1133,18 @@ impl LogicalOp {
             LogicalOp::ShortestPath { input, .. } => {
                 input.substitute_params(params);
             }
-            LogicalOp::ProcedureCall { args, .. } => {
+            LogicalOp::ProcedureCall {
+                input,
+                args,
+                filter,
+                ..
+            } => {
+                input.substitute_params(params);
                 for arg in args {
                     arg.substitute_params(params);
+                }
+                if let Some(filter) = filter {
+                    filter.substitute_params(params);
                 }
             }
             LogicalOp::RankFuse {
@@ -1319,6 +1338,15 @@ pub struct AggregateItem {
     /// Accepts literal values (`0.9`) and query parameters (`$p`).
     /// `None` means the argument was absent or not a scalar expression — executor falls back to 0.5.
     pub percentile_expr: Option<crate::plan::expr::Expr>,
+}
+
+/// One column a `CALL ... YIELD` binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YieldColumn {
+    /// The procedure's output column.
+    pub column: String,
+    /// The variable it binds: the alias, else the column name.
+    pub variable: String,
 }
 
 /// Query cost estimation result.
@@ -1814,7 +1842,11 @@ fn estimate_op_cost(
             (input_cost + input_rows * per_row_cost, input_rows)
         }
 
-        LogicalOp::ProcedureCall { .. } => (1.0, 10.0),
+        // One call per input row, each yielding a handful of rows.
+        LogicalOp::ProcedureCall { input, .. } => {
+            let (input_cost, input_rows) = estimate_op_cost(input, defaults, stats, hints);
+            (input_cost + input_rows, input_rows * 10.0)
+        }
         LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }
         | LogicalOp::DropTextIndex { .. }
@@ -1953,6 +1985,7 @@ fn op_contains_vector_filter(op: &LogicalOp) -> bool {
         | LogicalOp::ShortestPath { input, .. }
         | LogicalOp::RankFuse { input, .. }
         | LogicalOp::DocScore { input, .. }
+        | LogicalOp::ProcedureCall { input, .. }
         | LogicalOp::MaxSimTopK { input, .. } => op_contains_vector_filter(input),
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             op_contains_vector_filter(left) || op_contains_vector_filter(right)
@@ -2398,12 +2431,18 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             explain_op(input, indent + 1, output);
         }
         LogicalOp::ProcedureCall {
-            procedure, args, ..
+            input,
+            procedure,
+            args,
+            ..
         } => {
             output.push_str(&format!(
                 "{prefix}ProcedureCall ({procedure}, {} args)\n",
                 args.len()
             ));
+            if !matches!(**input, LogicalOp::Empty) {
+                explain_op(input, indent + 1, output);
+            }
         }
         LogicalOp::RankFuse {
             input,

@@ -805,7 +805,7 @@ fn build_unwind_clause(pair: Pair<'_, Rule>) -> Result<UnwindClause, ParseError>
 fn build_call_clause(pair: Pair<'_, Rule>) -> Result<CallClause, ParseError> {
     let mut procedure = String::new();
     let mut args = Vec::new();
-    let mut yield_items = Vec::new();
+    let mut yields = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -825,34 +825,7 @@ fn build_call_clause(pair: Pair<'_, Rule>) -> Result<CallClause, ParseError> {
                     }
                 }
             }
-            Rule::yield_clause => {
-                for yield_inner in inner.into_inner() {
-                    if yield_inner.as_rule() == Rule::yield_items {
-                        for item in yield_inner.into_inner() {
-                            if item.as_rule() == Rule::yield_item {
-                                let mut name = String::new();
-                                let mut alias = None;
-                                for yi in item.into_inner() {
-                                    match yi.as_rule() {
-                                        Rule::identifier if name.is_empty() => {
-                                            name = extract_identifier(yi);
-                                        }
-                                        Rule::alias => {
-                                            for a in yi.into_inner() {
-                                                if a.as_rule() == Rule::identifier {
-                                                    alias = Some(extract_identifier(a));
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                yield_items.push(YieldItem { name, alias });
-                            }
-                        }
-                    }
-                }
-            }
+            Rule::yield_clause => yields = Some(build_call_yield(inner)?),
             _ => {}
         }
     }
@@ -864,8 +837,44 @@ fn build_call_clause(pair: Pair<'_, Rule>) -> Result<CallClause, ParseError> {
     Ok(CallClause {
         procedure,
         args,
-        yield_items,
+        yields,
     })
+}
+
+fn build_call_yield(pair: Pair<'_, Rule>) -> Result<CallYield, ParseError> {
+    let mut items = Vec::new();
+    let mut filter = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::yield_all => return Ok(CallYield::All),
+            Rule::yield_items => {
+                for item in inner.into_inner() {
+                    if item.as_rule() != Rule::yield_item {
+                        continue;
+                    }
+                    let mut name = String::new();
+                    let mut alias = None;
+                    for yi in item.into_inner() {
+                        match yi.as_rule() {
+                            Rule::symbolic_name => name = extract_identifier(yi),
+                            Rule::alias => {
+                                for a in yi.into_inner() {
+                                    if a.as_rule() == Rule::identifier {
+                                        alias = Some(extract_identifier(a));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    items.push(YieldItem { name, alias });
+                }
+            }
+            Rule::where_clause => filter = Some(find_expression(inner)?),
+            _ => {}
+        }
+    }
+    Ok(CallYield::Items { items, filter })
 }
 
 fn build_order_by(pair: Pair<'_, Rule>) -> Result<Vec<SortItem>, ParseError> {
@@ -3559,7 +3568,7 @@ fn build_map_projection(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
 fn build_parameter(pair: Pair<'_, Rule>) -> Result<Expr, ParseError> {
     let name = extract_identifier(
         pair.into_inner()
-            .find(|p| p.as_rule() == Rule::identifier)
+            .find(|p| p.as_rule() == Rule::symbolic_name)
             .ok_or_else(|| ParseError::Invalid("missing parameter name".into()))?,
     );
     Ok(Expr::Parameter(name))

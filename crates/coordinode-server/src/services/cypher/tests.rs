@@ -1280,6 +1280,65 @@ fn an_unknown_function_names_itself_in_the_metadata() {
     );
 }
 
+/// A refused CALL is the caller's error, with the procedure and the argument
+/// or column at fault as metadata; a procedure breaking its own signature is
+/// the server's.
+#[test]
+fn a_refused_call_names_the_procedure_and_the_part_at_fault() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use coordinode_query::procedure::ProcedureError;
+    use tonic_types::StatusExt;
+
+    let status = |refusal: ProcedureError| {
+        db_error_to_status(DatabaseError::Execution(ExecutionError::Procedure(refusal)))
+    };
+
+    let unknown = status(ProcedureError::Unknown {
+        procedure: "db.nosuch".into(),
+    });
+    assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
+    let details = unknown.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "UNKNOWN_PROCEDURE");
+    assert_eq!(
+        info.metadata.get("procedure").map(String::as_str),
+        Some("db.nosuch")
+    );
+
+    let bad_argument = status(ProcedureError::ArgumentType {
+        procedure: "db.advisor.slowQueries".into(),
+        argument: "limit".into(),
+        expected: "INTEGER".into(),
+        found: "STRING".into(),
+    });
+    assert_eq!(bad_argument.code(), tonic::Code::InvalidArgument);
+    let details = bad_argument.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "PROCEDURE_CALL");
+    assert_eq!(
+        info.metadata.get("argument").map(String::as_str),
+        Some("limit")
+    );
+
+    let bad_yield = status(ProcedureError::UnknownOutput {
+        procedure: "db.advisor.reset".into(),
+        column: "nosuch".into(),
+    });
+    let details = bad_yield.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(
+        info.metadata.get("column").map(String::as_str),
+        Some("nosuch")
+    );
+
+    let broken = status(ProcedureError::OutputShape {
+        procedure: "app.broken".into(),
+        declared: 2,
+        found: 1,
+    });
+    assert_eq!(broken.code(), tonic::Code::Internal);
+}
+
 /// Transaction lifecycle failures a client must tell apart to act correctly:
 /// a gone transaction needs no cleanup, a conflict wants the whole transaction
 /// re-run, and an oversized one will fail again unless the work is split.
@@ -1814,6 +1873,71 @@ async fn causal_write_with_majority_accepted() {
         result.is_ok(),
         "causal write with MAJORITY must succeed in standalone, got: {:?}",
         result.err()
+    );
+}
+
+/// A CALL of a procedure that writes is a write for the causal gate: under
+/// `w:1` it is refused like a CREATE, while a CALL of a read-only procedure
+/// passes. The gate reads the procedure's mode from the database's catalog.
+#[tokio::test]
+async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
+    use coordinode_query::executor::runner::{ExecutionContext, ExecutionError};
+    use coordinode_query::procedure::{Procedure, ProcedureMode, ProcedureSignature};
+
+    struct Touch(ProcedureSignature);
+    impl Procedure for Touch {
+        fn signature(&self) -> &ProcedureSignature {
+            &self.0
+        }
+        fn call(
+            &self,
+            _ctx: &mut ExecutionContext<'_>,
+            _args: Vec<Value>,
+        ) -> Result<Vec<Vec<Value>>, ExecutionError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let (svc, _dir) = test_service();
+    svc.database
+        .write()
+        .register_procedure(Arc::new(Touch(ProcedureSignature::new(
+            "app.touch",
+            ProcedureMode::Write,
+            "test",
+        ))))
+        .expect("register");
+
+    let call = |query: &str| query::ExecuteCypherRequest {
+        query: query.to_string(),
+        parameters: std::collections::HashMap::new(),
+        read_preference: 0,
+        read_concern: Some(crate::proto::replication::ReadConcern {
+            level: 2, // MAJORITY
+            after_index: 5,
+            at_timestamp: 0,
+        }),
+        write_concern: Some(crate::proto::replication::WriteConcern {
+            w: Some(replication::write_concern::W::Acks(1)),
+            journal: replication::Journal::Journal as i32,
+            timeout_ms: 0,
+        }),
+        transaction_id: 0,
+    };
+
+    let refused = svc
+        .execute_cypher(Request::new(call("CALL app.touch()")))
+        .await
+        .expect_err("a writing procedure is a write");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+
+    let read = svc
+        .execute_cypher(Request::new(call("CALL db.advisor.queryStats()")))
+        .await;
+    assert!(
+        read.is_ok(),
+        "a reading procedure is a read: {:?}",
+        read.err()
     );
 }
 
