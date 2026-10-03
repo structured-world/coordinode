@@ -3223,30 +3223,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         }
 
         LogicalOp::Filter { input, predicate } => {
-            // `WHERE t.key = v` over a keyed table: the key index names the
-            // one candidate row. The full predicate is still applied below.
-            let keyed = match input.as_ref() {
-                LogicalOp::NodeScan {
-                    variable,
-                    labels,
-                    property_filters,
-                } => {
-                    let mut key_filters = property_filters.clone();
-                    equality_filters(predicate, variable, &mut key_filters);
-                    scan_by_table_key(variable, labels, &key_filters, property_filters, ctx)?
-                }
-                _ => None,
-            };
             // `temporal_active_at(n, t)` names the instant the read binding
             // `n` (a scan, an index lookup, a traversal) projects temporal
             // timelines at; without it `n` is read at the statement's NOW
             // and the predicate could only reject.
             let scope = ctx.temporal_instants.len();
             named_instants(predicate, &mut ctx.temporal_instants);
-            let rows = match keyed {
-                Some(rows) => Ok(rows),
-                None => execute_op(input, ctx),
-            };
+            let rows = execute_filter_input(input, predicate, ctx);
             ctx.temporal_instants.truncate(scope);
             let rows = rows?;
             let corr = ctx.correlated_row.clone();
@@ -4767,6 +4750,112 @@ fn refuse_key_changes_in_remove(
         }
     }
     Ok(())
+}
+
+/// The rows a Filter's `input` gives for `predicate` to filter. A node scan
+/// that the predicate pins to one node id (`n = $id`, `id(n) = $id`) reads
+/// that node alone; one pinned to a keyed table row reads the row its key
+/// index names. Either way the full predicate is still applied by the caller.
+fn execute_filter_input(
+    input: &LogicalOp,
+    predicate: &crate::plan::expr::Expr,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    if let LogicalOp::NodeScan {
+        variable,
+        labels,
+        property_filters,
+    } = input
+    {
+        // A server-side cursor pages through the scan's own key order, and a
+        // COLUMNAR table keeps its rows outside the node records.
+        if ctx.scan_paging.is_none() {
+            if let Some(id) = node_id_filter(predicate, variable) {
+                let columnar = match labels.first() {
+                    Some(label) => ctx
+                        .load_current_label_schema(label)?
+                        .is_some_and(|s| s.is_columnar()),
+                    None => false,
+                };
+                if !columnar {
+                    return scan_by_node_id(variable, labels, id, property_filters, ctx);
+                }
+            }
+        }
+        let mut key_filters = property_filters.clone();
+        equality_filters(predicate, variable, &mut key_filters);
+        if let Some(rows) =
+            scan_by_table_key(variable, labels, &key_filters, property_filters, ctx)?
+        {
+            return Ok(rows);
+        }
+    }
+    execute_op(input, ctx)
+}
+
+/// The node id an `n = v` or `id(n) = v` conjunct of `predicate` pins node
+/// variable `n` to, when `v` is an integer that does not depend on the row.
+fn node_id_filter(predicate: &crate::plan::expr::Expr, variable: &str) -> Option<i64> {
+    use crate::plan::expr::{BinOp, Expr};
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    match op {
+        BinOp::And => node_id_filter(left, variable).or_else(|| node_id_filter(right, variable)),
+        BinOp::Eq => [(left, right), (right, left)]
+            .into_iter()
+            .find_map(|(side, value)| {
+                let names_node = match side.as_ref() {
+                    Expr::Variable(v) => v == variable,
+                    Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("id") => {
+                        matches!(args.as_slice(), [Expr::Variable(v)] if v == variable)
+                    }
+                    _ => false,
+                };
+                if !names_node {
+                    return None;
+                }
+                match eval_neutral(value, &Row::new()).ok()? {
+                    Value::Int(id) => Some(id),
+                    _ => None,
+                }
+            }),
+        _ => None,
+    }
+}
+
+/// Serve a node scan pinned to one node id with a point read: the node's
+/// record, or for a temporal node its state at the instant `variable` reads
+/// at, when it carries `labels` and passes `property_filters`.
+fn scan_by_node_id(
+    variable: &str,
+    labels: &[String],
+    id: i64,
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    // A negative value names no node.
+    let Ok(raw) = u64::try_from(id) else {
+        return Ok(Vec::new());
+    };
+    let node_id = NodeId::from_raw(raw);
+    let record = match ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+        Some(record) => Some(record),
+        None => {
+            let at = ctx.instant_for(variable);
+            ctx.temporal_node_state(node_id, at)?
+                .positive()
+                .map(|(_, record)| record)
+        }
+    };
+    let Some(record) = record else {
+        return Ok(Vec::new());
+    };
+    Ok(
+        node_row_if_matching(variable, labels, raw, &record, property_filters, ctx)?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// The `variable.column = value` conjuncts of `predicate`, as scan filters.

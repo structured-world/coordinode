@@ -34,6 +34,7 @@ mod integration {
     mod multi_label;
     mod mvcc;
     mod mvcc_snapshots;
+    mod node_id_lookup;
     mod oplog_placement;
     mod oplog_segments;
     mod page_checksum;
