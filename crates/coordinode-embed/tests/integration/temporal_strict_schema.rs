@@ -99,6 +99,81 @@ fn a_user_write_of_the_ingestion_timestamp_is_refused() {
     assert!(err.to_string().contains("__ingestion_ts__"), "{err}");
 }
 
+/// Inside an interactive transaction, a valid SET followed by a refused one
+/// leaves the transaction unable to commit, and neither the commit attempt
+/// nor a rollback leaves a new or partly closed version, also after a reopen.
+#[test]
+fn a_refused_set_in_a_transaction_leaves_no_version() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = open_strict(dir.path());
+    let t = now_us();
+    db.execute_cypher(&format!("CREATE (:Emp {{name: 'a', valid_from: {t}}})"))
+        .expect("create");
+    let before = temporal_versions(&db, "Emp");
+
+    for commit in [true, false] {
+        let tx = db.begin_transaction();
+        db.execute_in_transaction(tx, "MATCH (n:Emp {name: 'a'}) SET n.name = 'b'", None)
+            .expect("a declared property");
+        db.execute_in_transaction(tx, "MATCH (n:Emp) SET n.unknown = 1", None)
+            .expect_err("`unknown` is not declared on a STRICT label");
+        // A statement error aborts the transaction: its state is dropped and
+        // both a commit and a rollback find no transaction left.
+        let ended = if commit {
+            db.commit_transaction(tx).map(drop)
+        } else {
+            db.rollback_transaction(tx)
+        };
+        assert!(
+            matches!(ended, Err(coordinode_embed::DatabaseError::UnknownTransaction(id)) if id == tx),
+            "commit={commit}: {ended:?}"
+        );
+        assert_eq!(temporal_versions(&db, "Emp"), before, "commit={commit}");
+    }
+    drop(db);
+
+    let db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(temporal_versions(&db, "Emp"), before, "after a reopen");
+}
+
+/// The engine's temporal fields are refused as user input on a temporal
+/// label of every schema mode, in a CREATE and in a programmatic definition.
+#[test]
+fn the_engine_temporal_fields_are_refused_as_user_input() {
+    for mode in ["FLEXIBLE", "VALIDATED", "STRICT"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher(
+            "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, valid_from: INT, valid_to: INT)",
+        )
+        .expect("temporal label");
+        db.execute_cypher(&format!("ALTER LABEL Emp SET SCHEMA {mode}"))
+            .expect("mode");
+        let t = now_us();
+        for field in ["__ingestion_ts__", "__deleted__"] {
+            let err = db
+                .execute_cypher(&format!(
+                    "CREATE (:Emp {{name: 'a', valid_from: {t}, {field}: true}})"
+                ))
+                .expect_err(&format!("{mode}: {field} in CREATE"));
+            assert!(err.to_string().contains(field), "{mode}: {err}");
+        }
+        assert!(temporal_versions(&db, "Emp").is_empty(), "{mode}");
+
+        for field in ["__ingestion_ts__", "__deleted__"] {
+            let mut schema = emp_schema(&db);
+            schema.add_property(coordinode_core::schema::definition::PropertyDef::new(
+                field,
+                coordinode_core::schema::definition::PropertyType::Bool,
+            ));
+            let err = db
+                .create_label_schema(schema)
+                .expect_err(&format!("{mode}: {field} declared"));
+            assert!(err.to_string().contains(field), "{mode}: {err}");
+        }
+    }
+}
+
 /// A map SET carrying an undeclared key or the engine's metadata is refused
 /// on a STRICT temporal label, and writes no version.
 #[test]

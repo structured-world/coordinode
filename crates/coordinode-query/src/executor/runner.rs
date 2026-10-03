@@ -10245,19 +10245,19 @@ fn execute_create_node(
         .map(|s| s.mode)
         .unwrap_or(SchemaMode::Flexible);
 
-    // Reserved-name guard at CREATE time: `__ingestion_ts__` is
-    // engine-owned on temporal labels — populated automatically with the HLC
-    // commit timestamp, user-immutable. Rejecting user-supplied values up
+    // Reserved-name guard at CREATE time: the engine's temporal fields
+    // (`__ingestion_ts__`, `__deleted__`) are written by the engine into
+    // every version of a temporal node, user-immutable. Rejecting user-supplied values up
     // front prevents accidental shadowing and matches the symmetric DDL-time
     // reserved-name diagnostic in `execute_create_node_type`.
     for (prop_name, _) in properties {
-        if prop_name == "__ingestion_ts__" {
-            return Err(ExecutionError::Unsupported(
-                "property name '__ingestion_ts__' is reserved for engine-internal use \
-                 (auto-populated on temporal labels with the HLC commit timestamp); \
+        if coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&prop_name.as_str())
+        {
+            return Err(ExecutionError::Unsupported(format!(
+                "property name '{prop_name}' is reserved for engine-internal use \
+                 (the engine writes it into every version of a temporal node); \
                  it cannot be assigned in CREATE"
-                    .into(),
-            ));
+            )));
         }
     }
 
@@ -11343,21 +11343,14 @@ fn execute_update(
                     property,
                     expr,
                 } => {
-                    // Reserved-name guard at SET time: `__ingestion_ts__`
-                    // is engine-owned on temporal labels (auto-populated with
-                    // HLC commit-ts, user-immutable). Reject before any storage
-                    // mutation so the bitemporal contract cannot be subverted
-                    // via `SET n.__ingestion_ts__ = ...`. Edge metadata names
+                    // Reserved-name guard at SET time: the engine's temporal
+                    // fields are engine-owned on temporal labels (user-immutable).
+                    // Reject before any storage mutation so the bitemporal
+                    // contract cannot be subverted via `SET n.__ingestion_ts__
+                    // = ...`. Edge metadata names
                     // (`__src__`/`__tgt__`/`__type__`) are rejected separately
                     // in `update_edge_property` for the edge SET path.
-                    if property == "__ingestion_ts__" {
-                        return Err(ExecutionError::Unsupported(
-                            "SET on '__ingestion_ts__' is reserved: this field is \
-                             engine-managed on temporal labels and cannot be \
-                             assigned by SET"
-                                .into(),
-                        ));
-                    }
+                    refuse_engine_temporal_field(property)?;
 
                     // Map literals → Document for nested property storage.
                     let val = eval_neutral(expr, &out_row)?.map_to_document();

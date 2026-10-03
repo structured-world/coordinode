@@ -108,6 +108,15 @@ impl Database {
                 p.name, schema.name
             )));
         }
+        if let Some(p) = schema.properties.values().find(|p| {
+            coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&p.name.as_str())
+        }) {
+            return Err(refused(format!(
+                "property `{}` of :{} is reserved: the engine writes it into every version of a \
+                 temporal node",
+                p.name, schema.name
+            )));
+        }
         self.commit_catalog(|txn| self.stage_label_definition(txn, &mut schema, existing))?;
         Ok(schema.schema_revision)
     }
