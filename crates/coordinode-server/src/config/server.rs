@@ -23,8 +23,10 @@ use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use coordinode_storage::engine::config::{
-    Durability, EndpointConfig, EndpointConfigError, Media, StorageConfig, SyncMethod, Tier,
+    CompressionCodec, Durability, EndpointConfig, EndpointConfigError, Media, StorageConfig,
+    SyncMethod, Tier,
 };
+use coordinode_storage::engine::partition::Partition;
 use serde::Deserialize;
 
 /// Storage topology: the physical endpoints this node manages.
@@ -61,6 +63,114 @@ pub struct StorageTopology {
     /// segment rotation, retention and how an append is made durable.
     #[serde(default)]
     pub oplog: OplogSettings,
+    /// Block compression of the storage partitions' tables.
+    #[serde(default)]
+    pub compression: CompressionSettings,
+}
+
+/// Block compression of the storage partitions, from the config file; an
+/// unset key keeps the engine default (lz4 on the hot levels, zstd level 3
+/// from level 4 down). A table keeps the codec it was written with, so a
+/// change reaches existing data as compaction rewrites it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "CompressionFile")]
+pub struct CompressionSettings {
+    /// Codec of the levels above `cold_level_threshold`.
+    pub hot: Option<CompressionCodec>,
+    /// Codec of `cold_level_threshold` and the levels below it.
+    pub cold: Option<CompressionCodec>,
+    /// First level that takes the cold codec (`0..=7`).
+    pub cold_level_threshold: Option<u8>,
+    /// Partitions compressed with one codec at every level instead.
+    pub partitions: Vec<(Partition, CompressionCodec)>,
+}
+
+/// `storage.compression` as written in the file.
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct CompressionFile {
+    hot: Option<CodecFile>,
+    cold: Option<CodecFile>,
+    cold_level_threshold: Option<u8>,
+    partitions: BTreeMap<String, CodecFile>,
+}
+
+/// One codec as written in the file: `{ codec: zstd, level: 19 }`.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+struct CodecFile {
+    codec: CodecName,
+    level: Option<i32>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum CodecName {
+    None,
+    Lz4,
+    Zstd,
+}
+
+/// Zstd level when the file names zstd without one: the library's default.
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+impl CodecFile {
+    fn resolve(self, key: &str) -> Result<CompressionCodec, String> {
+        match (self.codec, self.level) {
+            (CodecName::None, None) => Ok(CompressionCodec::None),
+            (CodecName::Lz4, None) => Ok(CompressionCodec::Lz4),
+            (CodecName::Zstd, level) => CompressionCodec::zstd(level.unwrap_or(DEFAULT_ZSTD_LEVEL))
+                .map_err(|e| format!("{key}: {e}")),
+            (CodecName::None | CodecName::Lz4, Some(_)) => {
+                Err(format!("{key}: a level is only meaningful for zstd"))
+            }
+        }
+    }
+}
+
+impl TryFrom<CompressionFile> for CompressionSettings {
+    type Error = String;
+
+    fn try_from(file: CompressionFile) -> Result<Self, String> {
+        // Levels run 0..=6, so 7 puts every level on the hot codec.
+        if let Some(threshold) = file.cold_level_threshold {
+            if threshold > 7 {
+                return Err(format!(
+                    "storage.compression.cold_level_threshold: {threshold} is past the last level (7)"
+                ));
+            }
+        }
+        let mut partitions = Vec::with_capacity(file.partitions.len());
+        for (name, codec) in file.partitions {
+            let partition = Partition::all()
+                .iter()
+                .copied()
+                .find(|p| p.name() == name)
+                .ok_or_else(|| {
+                    let known: Vec<&str> = Partition::all().iter().map(|p| p.name()).collect();
+                    format!(
+                        "storage.compression.partitions: unknown partition '{name}' (known: {})",
+                        known.join(", ")
+                    )
+                })?;
+            partitions.push((
+                partition,
+                codec.resolve(&format!("storage.compression.partitions.{name}"))?,
+            ));
+        }
+        Ok(Self {
+            hot: file
+                .hot
+                .map(|c| c.resolve("storage.compression.hot"))
+                .transpose()?,
+            cold: file
+                .cold
+                .map(|c| c.resolve("storage.compression.cold"))
+                .transpose()?,
+            cold_level_threshold: file.cold_level_threshold,
+            partitions,
+        })
+    }
 }
 
 /// Oplog settings from the config file; an unset key keeps the engine default.
@@ -557,6 +667,19 @@ impl ServerConfig {
     pub fn resolve_storage_config(&self) -> Result<StorageConfig, EndpointConfigError> {
         let mut cfg = StorageConfig::try_with_endpoints(self.storage_endpoints())?;
         cfg.backpressure = self.storage.backpressure;
+        let compression = &self.storage.compression;
+        if let Some(codec) = compression.hot {
+            cfg.compression.hot_codec = codec;
+        }
+        if let Some(codec) = compression.cold {
+            cfg.compression.cold_codec = codec;
+        }
+        if let Some(threshold) = compression.cold_level_threshold {
+            cfg.compression.cold_level_threshold = threshold;
+        }
+        if !compression.partitions.is_empty() {
+            cfg.partition_compression = Some(compression.partitions.clone());
+        }
         let oplog = self.storage.oplog;
         if let Some(bytes) = oplog.segment_max_bytes {
             cfg.oplog_segment_max_bytes = bytes.get();

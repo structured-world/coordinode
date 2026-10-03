@@ -753,6 +753,88 @@ fn zstd_compressed_data_survives_flush_and_reopen() {
     }
 }
 
+/// The configured codecs are the ones the tables are really written with: a
+/// table flushed under zstd 22 on every level records zstd 22 for its data
+/// blocks, a partition override records its own codec, and both read back
+/// after a reopen.
+#[cfg(feature = "zstd")]
+#[test]
+fn configured_codecs_are_written_into_the_tables() {
+    use crate::engine::config::{CompressionCodec, CompressionConfig};
+
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    config.compression = CompressionConfig {
+        hot_codec: CompressionCodec::zstd(22).expect("level"),
+        cold_codec: CompressionCodec::zstd(22).expect("level"),
+        cold_level_threshold: 4,
+    };
+    config.partition_compression = Some(vec![(Partition::Idx, CompressionCodec::Lz4)]);
+    let value = |i: u32| format!("value_{i:06}_payload_with_some_extra_data_for_compression");
+
+    {
+        let engine = StorageEngine::open(&config).expect("open");
+        for part in [Partition::Node, Partition::Idx] {
+            for i in 0..200u32 {
+                engine
+                    .put(part, format!("key_{i:06}").as_bytes(), value(i).as_bytes())
+                    .expect("put");
+            }
+            engine
+                .tree(part)
+                .expect("tree")
+                .flush_active_memtable(0)
+                .expect("flush to a table");
+        }
+        engine.persist().expect("persist");
+    }
+
+    let codecs_of = |part: Partition| -> Vec<lsm_tree::CompressionType> {
+        let mut found = Vec::new();
+        let mut dirs = vec![dir.path().join(part.name())];
+        while let Some(at) = dirs.pop() {
+            for entry in std::fs::read_dir(&at).expect("read dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if let Ok(props) = lsm_tree::inspect::read_table_properties(&path) {
+                    found.push(props.data_block_compression);
+                }
+            }
+        }
+        found
+    };
+    let node = codecs_of(Partition::Node);
+    assert!(!node.is_empty(), "the node partition has a table");
+    assert!(
+        node.iter()
+            .all(|c| *c == lsm_tree::CompressionType::Zstd(22)),
+        "{node:?}"
+    );
+    let idx = codecs_of(Partition::Idx);
+    assert!(!idx.is_empty(), "the idx partition has a table");
+    assert!(
+        idx.iter().all(|c| *c == lsm_tree::CompressionType::Lz4),
+        "{idx:?}"
+    );
+
+    let engine = StorageEngine::open(&config).expect("reopen");
+    for part in [Partition::Node, Partition::Idx] {
+        for i in 0..200u32 {
+            let got = engine
+                .get(part, format!("key_{i:06}").as_bytes())
+                .expect("get");
+            assert_eq!(got.as_deref(), Some(value(i).as_bytes()), "{part:?} {i}");
+        }
+    }
+}
+
 /// A zstd level outside what the table format can store is refused when the
 /// configuration is built, not when the first block is written.
 #[cfg(feature = "zstd")]

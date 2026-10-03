@@ -460,6 +460,41 @@ change stream resuming at an entry the log has dropped is refused with
 `RETENTION_LOST` rather than resumed past the gap. Zero sizes and unknown keys
 are refused when the file is read.
 
+### Compression
+
+The storage tables compress their data blocks per LSM level: the levels above
+`cold_level_threshold` with the `hot` codec, that level and the ones below it
+with the `cold` codec. The settings sit under `storage.compression`; every key
+is optional and changing one requires a restart:
+
+```yaml
+storage:
+  compression:
+    hot: { codec: lz4 }               # default
+    cold: { codec: zstd, level: 3 }   # default
+    cold_level_threshold: 4           # default
+    partitions:                       # none by default
+      idx: { codec: lz4 }
+```
+
+| Key | Values | Meaning |
+|-----|--------|---------|
+| `hot`, `cold` | `{ codec: none \| lz4 \| zstd, level: N }` | `level` only for `zstd`: `1`-`22`, `0` for the library default, negative for the fast levels; omitted means `3`. |
+| `cold_level_threshold` | `0`-`7` | First level that takes the `cold` codec: `0` puts every level on `cold`, `7` every level on `hot`. |
+| `partitions` | partition name to codec | One codec at every level of that partition instead of the hot/cold split. Names: `node`, `adj`, `edgeprop`, `blob`, `blobref`, `schema`, `idx`, `raft`, `counter`, `vec`, `registry`. |
+
+For the smallest data on disk set both `hot` and `cold` to
+`{ codec: zstd, level: 22 }`; writes and compactions then spend far more CPU
+per byte, and reads decode zstd on every level.
+
+Each table records the codecs it was written with, so a database opens under
+any setting: a change applies to tables written from then on, and reaches
+existing data as compaction rewrites it. The settings cover the tables' data
+blocks; a table's own index blocks keep the storage engine's default, and the
+oplog is not compressed (for the inter-node wire, see `wire_compression_level`).
+An unknown codec, a level zstd cannot store, a threshold past `7`, an unknown
+partition and an unknown key are refused when the file is read.
+
 ## Storage topology
 
 By default a node uses a single storage endpoint: a durable HDD warm-tier

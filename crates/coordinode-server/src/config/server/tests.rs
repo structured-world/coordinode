@@ -604,6 +604,86 @@ fn oplog_settings_parse_and_reach_the_storage_config() {
     }
 }
 
+/// The compression section reaches the storage config: the hot and cold
+/// codecs with their zstd levels, the threshold and per-partition overrides;
+/// unset keys keep the engine defaults.
+#[test]
+fn compression_settings_parse_and_reach_the_storage_config() {
+    use coordinode_storage::engine::config::{CompressionCodec, CompressionConfig};
+    use coordinode_storage::engine::partition::Partition;
+
+    let defaults = ServerConfig::default()
+        .resolve_storage_config()
+        .expect("valid");
+    assert_eq!(defaults.compression, CompressionConfig::default());
+    assert!(defaults.partition_compression.is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "storage:\n  compression:\n    hot: { codec: zstd, level: 22 }\n    \
+         cold: { codec: zstd, level: 22 }\n    cold_level_threshold: 2\n    \
+         partitions:\n      idx: { codec: lz4 }\n      blob: { codec: none }\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    let sc = c.resolve_storage_config().expect("valid topology");
+    assert_eq!(sc.compression.hot_codec, CompressionCodec::Zstd(22));
+    assert_eq!(sc.compression.cold_codec, CompressionCodec::Zstd(22));
+    assert_eq!(sc.compression.cold_level_threshold, 2);
+    let mut overrides = sc.partition_compression.expect("overrides");
+    overrides.sort_by_key(|(p, _)| p.name());
+    assert_eq!(
+        overrides,
+        [
+            (Partition::Blob, CompressionCodec::None),
+            (Partition::Idx, CompressionCodec::Lz4),
+        ]
+    );
+
+    // A partial section changes only what it names; zstd without a level
+    // takes the library default.
+    std::fs::write(
+        &path,
+        "storage:\n  compression:\n    cold: { codec: zstd }\n",
+    )
+    .unwrap();
+    let sc = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .resolve_storage_config()
+        .expect("valid");
+    assert_eq!(sc.compression.cold_codec, CompressionCodec::Zstd(3));
+    assert_eq!(sc.compression.hot_codec, defaults.compression.hot_codec);
+    assert_eq!(
+        sc.compression.cold_level_threshold,
+        defaults.compression.cold_level_threshold
+    );
+}
+
+/// A codec, level, threshold or partition the engine cannot honour, and an
+/// unknown key, are refused when the file is read, not at engine open.
+#[test]
+fn bad_compression_settings_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    for body in [
+        "storage:\n  compression:\n    hot: { codec: brotli }\n",
+        "storage:\n  compression:\n    hot: { codec: zstd, level: 23 }\n",
+        "storage:\n  compression:\n    hot: { codec: lz4, level: 1 }\n",
+        "storage:\n  compression:\n    cold_level_threshold: 8\n",
+        "storage:\n  compression:\n    partitions:\n      nodes: { codec: lz4 }\n",
+        "storage:\n  compression:\n    hot: { codec: lz4, lvl: 1 }\n",
+        "storage:\n  compression:\n    warm: { codec: lz4 }\n",
+    ] {
+        std::fs::write(&path, body).unwrap();
+        assert!(
+            ServerConfig::load(Some(path.to_str().unwrap())).is_err(),
+            "accepted: {body}"
+        );
+    }
+}
+
 /// A sync method the engine does not have, a zero-sized segment and an
 /// unknown key are refused when the file is read, not met at the first write.
 #[test]
