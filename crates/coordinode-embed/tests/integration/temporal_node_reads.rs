@@ -285,17 +285,35 @@ fn a_unique_value_stays_reserved_after_a_rename() {
     db.execute_cypher("MATCH (n:Emp {name: 'ada'}) SET n.name = 'lovelace'")
         .expect("rename");
 
-    let taken = db.execute_cypher(&format!(
-        "CREATE (n:Emp {{name: 'ada', valid_from: {now}}})"
-    ));
-    assert!(taken.is_err(), "the old value stays reserved: {taken:?}");
-    let other = db.execute_cypher(&format!(
-        "CREATE (n:Emp {{name: 'lovelace', valid_from: {now}}})"
-    ));
-    assert!(other.is_err(), "the current value is held: {other:?}");
+    // Refused for the unique constraint, not for any other reason.
+    let refused_as_unique =
+        |result: Result<_, coordinode_embed::DatabaseError>, what: &str| match result {
+            Err(coordinode_embed::DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::UniqueViolation { .. },
+            )) => {}
+            other => panic!("{what}: expected a unique violation, got {other:?}"),
+        };
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'ada', valid_from: {now}}})"
+        )),
+        "the old value stays reserved",
+    );
+    refused_as_unique(
+        db.execute_cypher(&format!(
+            "CREATE (n:Emp {{name: 'lovelace', valid_from: {now}}})"
+        )),
+        "the current value is held",
+    );
+    // A free value is admitted, so the refusals above came from the index.
+    db.execute_cypher(&format!(
+        "CREATE (n:Emp {{name: 'babbage', valid_from: {now}}})"
+    ))
+    .expect("a free value is admitted");
     assert_eq!(
         names(&mut db, "MATCH (n:Emp) RETURN n.name AS name"),
-        ["lovelace"]
+        ["babbage", "lovelace"],
+        "the refused creates left nothing behind"
     );
 }
 
