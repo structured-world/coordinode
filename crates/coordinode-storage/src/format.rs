@@ -37,9 +37,16 @@ pub static MIGRATIONS: &[MigrationStep] = &[
         from: 0,
         migrate: no_change,
     },
+    // A test build runs up to two formats past this release's, so a suite
+    // can take a directory through an intermediate version.
     #[cfg(feature = "test-format-bump")]
     MigrationStep {
         from: coordinode_core::version::ENGINE_FORMAT_VERSION,
+        migrate: no_change,
+    },
+    #[cfg(feature = "test-format-bump")]
+    MigrationStep {
+        from: coordinode_core::version::ENGINE_FORMAT_VERSION + 1,
         migrate: no_change,
     },
 ];

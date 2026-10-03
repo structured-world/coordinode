@@ -936,7 +936,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
-        refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
+        refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
         let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -1054,7 +1054,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
-        refuse_join_with_local_data(&engine, &log_store, &state_machine)?;
+        refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
         let version = version_gate(node_id, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -2828,7 +2828,12 @@ pub enum RaftNodeError {
 /// into them: after a crash an acknowledged write may live only in the log.
 /// Both reads are cheap on the empty store a joining node is supposed to
 /// have: one key at most per partition, and a log with nothing to replay.
+///
+/// A store that already belongs to a member of a group (its membership,
+/// applied or still in its log, names `node_id` beside another node) is that
+/// member restarting, not a node joining: its data is the group's.
 fn refuse_join_with_local_data(
+    node_id: u64,
     engine: &StorageEngine,
     log_store: &LogStore,
     state_machine: &CoordinodeStateMachine,
@@ -2836,10 +2841,17 @@ fn refuse_join_with_local_data(
     fn init(e: impl std::fmt::Display) -> RaftNodeError {
         RaftNodeError::Init(e.to_string())
     }
+    let from = state_machine.next_to_apply().map_err(init)?;
+    if state_machine
+        .applied_membership_names(node_id)
+        .map_err(init)?
+        || log_store.names_member_from(from, node_id).map_err(init)?
+    {
+        return Ok(());
+    }
     if engine.holds_user_data().map_err(init)? {
         return Err(RaftNodeError::JoinWithLocalData);
     }
-    let from = state_machine.next_to_apply().map_err(init)?;
     if log_store.writes_user_data_from(from).map_err(init)? {
         return Err(RaftNodeError::JoinWithLocalData);
     }

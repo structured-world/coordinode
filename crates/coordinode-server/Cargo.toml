@@ -27,6 +27,10 @@ page_ecc = ["coordinode-storage/page_ecc"]
 # Use the io_uring storage backend on Linux (forwards to
 # coordinode-storage/io-uring). Default-off; no-op on non-Linux targets.
 io-uring = ["coordinode-storage/io-uring"]
+# Test builds only: COORDINODE_TEST_ENGINE_FORMAT_BUMP raises the engine
+# format version this binary runs, so a test suite can run two versions of
+# the server side by side. Never enabled in a release build.
+test-format-bump = ["coordinode-storage/test-format-bump"]
 
 [dependencies]
 coordinode-cluster = { workspace = true }

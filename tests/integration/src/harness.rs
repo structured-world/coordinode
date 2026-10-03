@@ -34,6 +34,8 @@ pub struct CoordinodeProcess {
     data_dir: Option<tempfile::TempDir>,
     /// The `--config` file the process runs with, carried over every restart.
     config: Option<tempfile::NamedTempFile>,
+    /// Environment variables set on the process.
+    env: Vec<(String, String)>,
 }
 
 impl CoordinodeProcess {
@@ -101,6 +103,7 @@ impl CoordinodeProcess {
                 rest_port,
                 data_dir: None,
                 config: None,
+                env: Vec::new(),
             };
             match proc.wait_until_ready(Duration::from_secs(15)).await {
                 Ok(()) => {
@@ -126,9 +129,36 @@ impl CoordinodeProcess {
     /// leader, so [`wait_for_leader`](Self::wait_for_leader) would never return
     /// for it.
     pub async fn start_cluster_member(node_id: u64, port: u16, peer_ports: &[u16]) -> Self {
+        Self::start_cluster_member_with_env(node_id, port, peer_ports, &[]).await
+    }
+
+    /// [`start_cluster_member`](Self::start_cluster_member) with `env` set on
+    /// the process and on every restart of it.
+    pub async fn start_cluster_member_with_env(
+        node_id: u64,
+        port: u16,
+        peer_ports: &[u16],
+        env: &[(&str, &str)],
+    ) -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
+        Self::start_cluster_member_over(node_id, port, peer_ports, data_dir, env).await
+    }
+
+    /// Start cluster member `node_id` over `data_dir`, which may already hold
+    /// a directory, with `env` set.
+    pub async fn start_cluster_member_over(
+        node_id: u64,
+        port: u16,
+        peer_ports: &[u16],
+        data_dir: tempfile::TempDir,
+        env: &[(&str, &str)],
+    ) -> Self {
         let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
         let (ops_port, rest_port) = (free_port(), free_port());
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         let child = spawn_cluster_binary(
             node_id,
             port,
@@ -136,6 +166,7 @@ impl CoordinodeProcess {
             rest_port,
             &peers,
             data_dir.path().to_path_buf(),
+            &env,
         );
         let mut proc = Self {
             child,
@@ -144,6 +175,7 @@ impl CoordinodeProcess {
             rest_port,
             data_dir: Some(data_dir),
             config: None,
+            env,
         };
         // The port is fixed by the caller (peers already name it), so a
         // process that lost it cannot move to another one.
@@ -151,6 +183,95 @@ impl CoordinodeProcess {
             panic!("cluster member {node_id} exited during startup on port {port}: {status}");
         }
         proc
+    }
+
+    /// Stop cluster member `node_id` (gracefully, or with SIGKILL when
+    /// `kill`) and start it again over the same directory, on the same port
+    /// its group records, with `env` replacing the variables it ran with.
+    /// Retries while the port is still held by the stopped process.
+    pub async fn restart_member(
+        mut self,
+        node_id: u64,
+        peer_ports: &[u16],
+        env: &[(&str, &str)],
+        kill: bool,
+    ) -> Self {
+        if kill {
+            force_reap(&mut self.child);
+        } else {
+            send_sigterm(&self.child);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline && !has_exited(&mut self.child) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            force_reap(&mut self.child);
+        }
+        let data_dir = self
+            .data_dir
+            .take()
+            .expect("data_dir missing: restart called twice?");
+        let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let port = self.port;
+        let mut last = None;
+        for _ in 0..20 {
+            let (ops_port, rest_port) = (free_port(), free_port());
+            let mut proc = Self {
+                child: spawn_cluster_binary(
+                    node_id,
+                    port,
+                    ops_port,
+                    rest_port,
+                    &peers,
+                    data_dir.path().to_path_buf(),
+                    &env,
+                ),
+                port,
+                ops_port,
+                rest_port,
+                data_dir: None,
+                config: None,
+                env: env.clone(),
+            };
+            match proc.wait_until_ready(Duration::from_secs(30)).await {
+                Ok(()) => {
+                    proc.data_dir = Some(data_dir);
+                    return proc;
+                }
+                Err(status) => {
+                    last = Some(status);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        panic!("member {node_id} did not start again on port {port}: {last:?}");
+    }
+
+    /// The member's version report, from `GET /version` on its ops port.
+    pub fn version_report(&self) -> serde_json::Value {
+        use std::io::{Read, Write};
+
+        let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, self.ops_port));
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .expect("connect to the ops port");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_else(|| panic!("no body in {response:?}"));
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("version report {body:?}: {e}"))
     }
 
     /// Crash the running process with SIGKILL then re-spawn against the same
@@ -236,10 +357,13 @@ impl CoordinodeProcess {
             .take()
             .expect("data_dir missing: restart called twice?");
         let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
-        Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
-            spawn_cluster_binary(node_id, port, ops_port, rest_port, &peers, data)
+        let env = std::mem::take(&mut self.env);
+        let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
+            spawn_cluster_binary(node_id, port, ops_port, rest_port, &peers, data, &env)
         })
-        .await
+        .await;
+        proc.env = env;
+        proc
     }
 
     /// gRPC endpoint URL for use with tonic.
@@ -424,9 +548,21 @@ pub async fn start_cluster_member_expecting_refusal(
     peer_ports: &[u16],
     data_dir: &std::path::Path,
 ) -> (std::process::ExitStatus, String) {
+    start_cluster_member_expecting_refusal_with_env(node_id, port, peer_ports, data_dir, &[]).await
+}
+
+/// [`start_cluster_member_expecting_refusal`] with `env` set on the process.
+pub async fn start_cluster_member_expecting_refusal_with_env(
+    node_id: u64,
+    port: u16,
+    peer_ports: &[u16],
+    data_dir: &std::path::Path,
+    env: &[(&str, &str)],
+) -> (std::process::ExitStatus, String) {
     let peers: Vec<String> = peer_ports.iter().map(|&p| member_addr(p)).collect();
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
+    cmd.envs(env.iter().copied());
     cmd.arg("serve")
         .arg("--node-id")
         .arg(node_id.to_string())
@@ -726,9 +862,11 @@ fn spawn_cluster_binary(
     rest_port: u16,
     peers: &[String],
     data_dir: PathBuf,
+    env: &[(String, String)],
 ) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     cmd.arg("serve")
         .arg("--node-id")
         .arg(node_id.to_string())

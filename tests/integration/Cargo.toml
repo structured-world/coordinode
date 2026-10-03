@@ -32,6 +32,15 @@ path = "tests/cypher.rs"
 name = "schema"
 path = "tests/schema.rs"
 
+[[test]]
+name = "version_moves"
+path = "tests/version_moves.rs"
+
+[features]
+# The version-move tests run a server binary built with its own
+# `test-format-bump` feature (a workspace build with --all-features).
+test-format-bump = []
+
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
@@ -40,6 +49,7 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
+serde_json = { workspace = true }
 coordinode-client = { path = "../../crates/coordinode-client" }
 coordinode-test-fixtures = { path = "../../crates/coordinode-test-fixtures" }
 

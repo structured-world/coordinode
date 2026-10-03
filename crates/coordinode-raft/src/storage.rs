@@ -624,6 +624,37 @@ impl LogStore {
         }
         Ok(false)
     }
+
+    /// Whether an entry of this log from index `from` on changes the
+    /// membership to one naming `node_id` beside another node: the log of a
+    /// member of a group whose membership was not applied yet.
+    pub fn names_member_from(&self, from: u64, node_id: u64) -> Result<bool, io::Error> {
+        use openraft::entry::RaftEntry as _;
+        let entries = self
+            .oplog
+            .lock()
+            .map_err(|_| io::Error::other("raft log mutex poisoned"))?
+            .read_range(from, u64::MAX)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        for oplog_entry in entries {
+            let entry = Self::oplog_to_entry(oplog_entry)?;
+            if entry
+                .get_membership()
+                .is_some_and(|m| names_beside_another(&m, node_id))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Whether `membership` names `node_id` and at least one other node.
+pub(crate) fn names_beside_another(
+    membership: &openraft::Membership<u64, openraft::impls::BasicNode>,
+    node_id: u64,
+) -> bool {
+    membership.nodes().any(|(id, _)| *id == node_id) && membership.nodes().count() > 1
 }
 
 impl RaftLogReader<TypeConfig> for LogStore {
@@ -1535,6 +1566,16 @@ impl CoordinodeStateMachine {
             .lock()
             .map_err(|_| io::Error::other("last_applied mutex poisoned"))?;
         Ok(last.map_or(0, |id| id.index + 1))
+    }
+
+    /// Whether the membership this state machine applied names `node_id`
+    /// beside another node: the store of a member of a group.
+    pub fn applied_membership_names(&self, node_id: u64) -> Result<bool, io::Error> {
+        let stored = self
+            .last_membership
+            .lock()
+            .map_err(|_| io::Error::other("last_membership mutex poisoned"))?;
+        Ok(names_beside_another(stored.membership(), node_id))
     }
 
     /// [`Self::apply_proposal_under`] with no partition installed ahead.

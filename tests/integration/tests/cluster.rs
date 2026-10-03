@@ -494,6 +494,95 @@ async fn a_server_killed_after_a_write_is_refused_as_a_joiner() {
     );
 }
 
+/// A member of a group that holds the group's data comes back as that member
+/// when its process restarts, whether it was stopped or killed: holding data
+/// refuses only a node that is not a member yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_restarts_into_its_group_with_its_data() {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2, p3]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1, p3]).await;
+    let n3 = CoordinodeProcess::start_cluster_member(3, p3, &[p1, p2]).await;
+    let mut leader = n1.cluster_client().await;
+    for (id, member) in [(2, &n2), (3, &n3)] {
+        leader
+            .join_node(JoinNodeRequest {
+                node_id: id,
+                address: member.member_addr(),
+                pre_seeded: false,
+            })
+            .await
+            .expect("JoinNode must be accepted");
+        wait_for_voters(
+            &mut leader,
+            usize::try_from(id).expect("small"),
+            Duration::from_secs(40),
+        )
+        .await;
+    }
+    cypher_on(&n1, "CREATE (:Restart {v: 'before'})")
+        .await
+        .expect("the leader writes");
+
+    let n2 = n2.restart_member(2, &[p1, p3], &[], false).await;
+    let n3 = n3.restart_member(3, &[p1, p2], &[], true).await;
+    // Leadership may have moved while members were away: whichever member
+    // leads takes the write.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut wrote = false;
+        for member in [&n1, &n2, &n3] {
+            if cypher_on(member, "CREATE (:Restart {v: 'after'})")
+                .await
+                .is_ok()
+            {
+                wrote = true;
+                break;
+            }
+        }
+        if wrote {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the group never wrote with its members back"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    for member in [&n2, &n3] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let rows = member
+                .cypher_client()
+                .await
+                .execute_cypher(ExecuteCypherRequest {
+                    query: "MATCH (n:Restart) RETURN n.v".to_string(),
+                    parameters: std::collections::HashMap::new(),
+                    read_preference: 5, // NEAREST
+                    read_concern: Some(ReadConcern {
+                        level: 1, // LOCAL
+                        after_index: 0,
+                        at_timestamp: 0,
+                    }),
+                    write_concern: None,
+                    transaction_id: 0,
+                })
+                .await
+                .map(|r| r.into_inner().rows.len());
+            if rows.as_ref().is_ok_and(|n| *n == 2) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "member on {} never caught up: {rows:?}",
+                member.port
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    wait_for_voters(&mut leader, 3, Duration::from_secs(10)).await;
+}
+
 /// Run `query` on `node` as a primary read or write.
 async fn cypher_on(
     node: &CoordinodeProcess,
