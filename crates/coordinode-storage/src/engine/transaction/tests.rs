@@ -1033,6 +1033,46 @@ fn prefix_scan_overlays_buffer_over_snapshot() {
     );
 }
 
+/// The scan returns stored and own rows interleaved in key order, as one
+/// view: readers group consecutive keys (one node's versions), so an own row
+/// out of place splits or reorders what belongs together. Many keys, so a
+/// hash-ordered buffer cannot pass by chance.
+#[test]
+fn prefix_scan_returns_stored_and_own_rows_in_key_order() {
+    let (engine, oracle, _d) = test_engine();
+    for i in (0..64u32).step_by(2) {
+        engine
+            .put(Partition::Node, format!("p:{i:03}").as_bytes(), b"stored")
+            .unwrap();
+    }
+    let mut txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    // Own rows between, on and after the stored ones.
+    for i in (1..64u32).step_by(2).chain([10, 20, 70, 71]) {
+        txn.put(Partition::Node, format!("p:{i:03}").as_bytes(), b"own")
+            .unwrap();
+    }
+    let got = txn.prefix_scan(Partition::Node, b"p:").unwrap();
+    let keys: Vec<&[u8]> = got.iter().map(|(k, _)| k.as_slice()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(keys, sorted, "one row per key, in key order");
+    assert_eq!(got.len(), 66, "32 stored + 32 own + 2 own past the end");
+    for (key, value) in &got {
+        let i: u32 = std::str::from_utf8(&key[2..]).unwrap().parse().unwrap();
+        let expected: &[u8] = if i.is_multiple_of(2) && i != 10 && i != 20 && i < 64 {
+            b"stored"
+        } else {
+            b"own"
+        };
+        assert_eq!(value.as_slice(), expected, "key {i}");
+    }
+}
+
 #[test]
 fn prefix_scan_buffered_tombstone_does_not_hide_storage_row() {
     // Behavioural parity with the executor: a buffered in-transaction

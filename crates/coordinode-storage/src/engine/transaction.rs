@@ -23,7 +23,7 @@
 //! write-concern-aware flush) still lives in the query engine, which drains
 //! these buffers via the `take_*` accessors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use coordinode_core::graph::edge::PostingList;
 use coordinode_core::txn::drain::{DrainBuffer, DrainEntry};
@@ -1740,9 +1740,10 @@ impl<'a> Transaction<'a> {
     }
 
     /// MVCC-aware prefix scan: snapshot results overlaid with buffered writes
-    /// (a buffered value replaces the storage row for that key). Snapshot keys
-    /// other than our own buffered writes are OCC-tracked. Legacy mode scans
-    /// the engine directly and overlays the (empty-in-legacy) buffer.
+    /// (a buffered value replaces the storage row for that key), in key
+    /// order. Snapshot keys other than our own buffered writes are
+    /// OCC-tracked. Legacy mode scans the engine directly and overlays the
+    /// (empty-in-legacy) buffer.
     ///
     /// Note: buffered tombstones (in-transaction deletes) do NOT hide a storage
     /// row from the scan — this matches the established executor semantics
@@ -1750,8 +1751,10 @@ impl<'a> Transaction<'a> {
     /// for keys without a buffered *value*). Preserved deliberately for
     /// behavioural parity.
     pub fn prefix_scan(&mut self, part: Partition, prefix: &[u8]) -> StorageResult<Vec<KvPair>> {
-        // Own writes (buffered values, NOT tombstones) that match the prefix.
-        let buffer_matches: Vec<KvPair> = self
+        // Own writes (buffered values, NOT tombstones) that match the prefix,
+        // in key order: the buffer is a hash map, so its iteration order is
+        // arbitrary, and readers group consecutive keys (a node's versions).
+        let mut buffer_matches: Vec<KvPair> = self
             .write_buffer
             .iter()
             .filter_map(|((p, k), v)| {
@@ -1762,39 +1765,30 @@ impl<'a> Transaction<'a> {
                 }
             })
             .collect();
+        buffer_matches.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        match self.snapshot {
-            Some(snap) => {
-                let mut results: Vec<KvPair> = self
-                    .engine
-                    .snapshot_prefix_scan(&snap, part, prefix)?
-                    .into_iter()
-                    .map(|(k, v)| (k, v.to_vec()))
-                    .collect();
-                // Scanned keys are not conflict-tracked: see `get` — the
-                // default level validates writes only, and FOR UPDATE is the
-                // opt-in that pins scanned rows into the scope.
-                let buffer_keys: HashSet<Vec<u8>> =
-                    buffer_matches.iter().map(|(k, _)| k.clone()).collect();
-                // Buffer takes priority: drop storage rows shadowed by a
-                // buffered value, then append the buffered values.
-                results.retain(|(k, _)| !buffer_keys.contains(k));
-                results.extend(buffer_matches);
-                Ok(results)
-            }
+        let stored: Vec<KvPair> = match self.snapshot {
+            // Scanned keys are not conflict-tracked: see `get` — the default
+            // level validates writes only, and FOR UPDATE is the opt-in that
+            // pins scanned rows into the scope.
+            Some(snap) => self
+                .engine
+                .snapshot_prefix_scan(&snap, part, prefix)?
+                .into_iter()
+                .map(|(k, v)| (k, v.to_vec()))
+                .collect(),
             None => {
                 // Legacy mode: writes apply straight to the engine, so the
                 // buffer is empty and `buffer_matches` overlays nothing.
-                let iter = self.engine.prefix_scan(part, prefix)?;
-                let mut results: Vec<KvPair> = Vec::new();
-                for guard in iter {
+                let mut rows = Vec::new();
+                for guard in self.engine.prefix_scan(part, prefix)? {
                     let (k, v) = guard.into_inner()?;
-                    results.push((k.to_vec(), v.to_vec()));
+                    rows.push((k.to_vec(), v.to_vec()));
                 }
-                results.extend(buffer_matches);
-                Ok(results)
+                rows
             }
-        }
+        };
+        Ok(merge_overlay(stored, buffer_matches))
     }
 
     /// Keyset-resumed page of a prefix scan, reading the transaction's pinned
@@ -1883,6 +1877,26 @@ fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     end.push(0xFF);
     end
+}
+
+/// `stored` rows overlaid with `overlay` rows, both in key order, into one
+/// list in key order: an overlay row replaces the stored row of its key.
+fn merge_overlay(stored: Vec<KvPair>, overlay: Vec<KvPair>) -> Vec<KvPair> {
+    if overlay.is_empty() {
+        return stored;
+    }
+    let mut out = Vec::with_capacity(stored.len() + overlay.len());
+    let mut stored = stored.into_iter().peekable();
+    for row in overlay {
+        while let Some(next) = stored.next_if(|(k, _)| *k < row.0) {
+            out.push(next);
+        }
+        // The stored row of the same key, if any, is shadowed.
+        stored.next_if(|(k, _)| *k == row.0);
+        out.push(row);
+    }
+    out.extend(stored);
+    out
 }
 
 mod derived;

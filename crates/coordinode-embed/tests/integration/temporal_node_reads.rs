@@ -394,6 +394,68 @@ fn a_pattern_predicate_sees_the_neighbour_state_valid_now() {
     );
 }
 
+/// A temporal node revised inside an interactive transaction is read in its
+/// new state by a later statement of the same transaction, every time: the
+/// transaction's own closed and opened versions are read as one timeline in
+/// key order, whatever order its write buffer holds them in.
+#[test]
+fn a_node_revised_in_a_transaction_is_found_later_in_it() {
+    let read = |db: &Database, txn: u64, query: &str| -> Vec<i64> {
+        db.execute_in_transaction(txn, query, None)
+            .expect("statement")
+            .iter()
+            .map(|r| match r.get("k") {
+                Some(Value::Int(k)) => *k,
+                other => panic!("k: {other:?}"),
+            })
+            .collect()
+    };
+    // The buffer's order varies run to run, so one run proves little.
+    for attempt in 0..50 {
+        let mut db = Database::open_in_memory().expect("open");
+        for ddl in [
+            "CREATE NODE TYPE T TEMPORAL",
+            "ALTER LABEL T SET SCHEMA FLEXIBLE",
+            "CREATE (:T {name: 'p', valid_from: 1, k: 1})",
+            "CREATE (:T {name: 'q', valid_from: 1, k: 1})",
+            "MATCH (a:T {name: 'p'}), (b:T {name: 'q'}) CREATE (a)-[:E]->(b)",
+        ] {
+            db.execute_cypher(ddl).expect("setup");
+        }
+
+        let txn = db.begin_transaction();
+        db.execute_in_transaction(txn, "MATCH (n:T {name: 'p'}) SET n.k = 2", None)
+            .expect("revise p");
+        db.execute_in_transaction(txn, "MATCH (n:T {name: 'q'}) SET n.k = 3", None)
+            .expect("revise q");
+        assert_eq!(
+            read(&db, txn, "MATCH (n:T {name: 'p'}) RETURN n.k AS k"),
+            [2],
+            "scan, attempt {attempt}"
+        );
+        assert_eq!(
+            read(&db, txn, "MATCH (n:T) WHERE n.name = 'p' RETURN n.k AS k"),
+            [2],
+            "filtered scan, attempt {attempt}"
+        );
+        assert_eq!(
+            read(
+                &db,
+                txn,
+                "MATCH (a:T {name: 'p'})-[:E]->(b:T) RETURN b.k AS k"
+            ),
+            [3],
+            "traversal, attempt {attempt}"
+        );
+        db.commit_transaction(txn).expect("commit");
+        assert_eq!(
+            names(&mut db, "MATCH (n:T) RETURN n.name AS name"),
+            ["p", "q"],
+            "one current row per node after commit, attempt {attempt}"
+        );
+    }
+}
+
 /// A traversal lands on the target's state valid now.
 #[test]
 fn a_traversal_lands_on_the_current_state_of_a_temporal_target() {
