@@ -647,6 +647,17 @@ impl NodeRecord {
         self.extra.as_ref()?.get(name)
     }
 
+    /// Remove an undeclared property from the extra overflow map. An emptied
+    /// map goes back to `None`, so the record encodes as one that never had it.
+    pub fn remove_extra(&mut self, name: &str) -> Option<PropertyValue> {
+        let extra = self.extra.as_mut()?;
+        let removed = extra.remove(name);
+        if extra.is_empty() {
+            self.extra = None;
+        }
+        removed
+    }
+
     /// Serialize to MessagePack bytes.
     pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
         rmp_serde::to_vec(self)

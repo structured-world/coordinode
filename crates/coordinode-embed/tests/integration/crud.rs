@@ -7480,3 +7480,188 @@ fn temporal_valid_from_is_microseconds_on_both_sides() {
          the contract is on another scale: {vfs:?}"
     );
 }
+
+/// A SET on a property a VALIDATED label does not declare is stored with the
+/// node: the next read returns the value the SET reported, not the one before.
+#[test]
+fn set_on_an_undeclared_property_of_a_validated_label_persists() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let mut db = open_db();
+    let mut head = LabelSchema::new_node_id("Head");
+    head.set_mode(SchemaMode::Validated);
+    head.add_property(PropertyDef::new("key", PropertyType::String).not_null());
+    db.create_label_schema(head).expect("create validated Head");
+    db.execute_cypher("CREATE UNIQUE INDEX head_key ON :Head(key)")
+        .expect("unique index on key");
+    db.execute_cypher("CREATE (h:Head {key: 'k', run: 'r', sequence: 0})")
+        .expect("seed head");
+
+    let set = db
+        .execute_cypher(
+            "MATCH (h:Head {key: 'k'}) WHERE h.sequence = 0 \
+             SET h.sequence = h.sequence + 1 RETURN h.sequence AS sequence",
+        )
+        .expect("increment");
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].get("sequence"), Some(&Value::Int(1)));
+
+    let read = db
+        .execute_cypher("MATCH (h:Head {key: 'k'}) RETURN h.sequence AS sequence")
+        .expect("read back");
+    assert_eq!(
+        read.first().and_then(|r| r.get("sequence")),
+        Some(&Value::Int(1)),
+        "the SET reported 1, so 1 is what is stored"
+    );
+}
+
+/// Every other write to an undeclared property of a VALIDATED label lands
+/// where the next read looks: a map merge, a map replace (which also drops
+/// the undeclared properties it does not name), a REMOVE, and a nested path
+/// SET on an undeclared document property. The declared key stays indexed.
+#[test]
+fn every_write_to_an_undeclared_property_of_a_validated_label_persists() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let mut db = open_db();
+    let mut head = LabelSchema::new_node_id("Head");
+    head.set_mode(SchemaMode::Validated);
+    head.add_property(PropertyDef::new("key", PropertyType::String).not_null());
+    db.create_label_schema(head).expect("create validated Head");
+    db.execute_cypher("CREATE UNIQUE INDEX head_key ON :Head(key)")
+        .expect("unique index on key");
+    db.execute_cypher("CREATE (h:Head {key: 'k', run: 'r', sequence: 0, meta: {a: 0, b: 'x'}})")
+        .expect("seed head");
+    let read = |db: &mut coordinode_embed::Database, column: &str| {
+        db.execute_cypher(&format!(
+            "MATCH (h:Head {{key: 'k'}}) RETURN h.{column} AS v"
+        ))
+        .expect("read")
+        .first()
+        .and_then(|r| r.get("v").cloned())
+    };
+
+    db.execute_cypher("MATCH (h:Head {key: 'k'}) SET h += {sequence: 2, note: 'n'}")
+        .expect("merge map");
+    assert_eq!(
+        read(&mut db, "sequence"),
+        Some(Value::Int(2)),
+        "SET += on an undeclared property"
+    );
+    assert_eq!(read(&mut db, "note"), Some(Value::String("n".into())));
+
+    db.execute_cypher("MATCH (h:Head {key: 'k'}) SET h.meta.a = 1")
+        .expect("nested path");
+    let meta_a = db
+        .execute_cypher("MATCH (h:Head {key: 'k'}) RETURN h.meta.a AS a, h.meta.b AS b")
+        .expect("read meta");
+    assert_eq!(
+        meta_a[0].get("a"),
+        Some(&Value::Int(1)),
+        "nested SET on an undeclared document"
+    );
+    assert_eq!(
+        meta_a[0].get("b"),
+        Some(&Value::String("x".into())),
+        "its siblings stay"
+    );
+
+    db.execute_cypher("MATCH (h:Head {key: 'k'}) REMOVE h.note")
+        .expect("remove");
+    assert_eq!(
+        read(&mut db, "note"),
+        Some(Value::Null),
+        "REMOVE of an undeclared property"
+    );
+
+    db.execute_cypher("MATCH (h:Head {key: 'k'}) SET h = {key: 'k', sequence: 3}")
+        .expect("replace map");
+    assert_eq!(
+        read(&mut db, "sequence"),
+        Some(Value::Int(3)),
+        "SET = on an undeclared property"
+    );
+    assert_eq!(
+        read(&mut db, "run"),
+        Some(Value::Null),
+        "SET = drops undeclared properties it does not name"
+    );
+    assert_eq!(read(&mut db, "meta"), Some(Value::Null));
+}
+
+/// A map SET moves the node's index entries like a single-property SET: the
+/// new value is found through the index, the old one no longer is, and a
+/// value another node holds under a unique index is refused.
+#[test]
+fn a_map_set_keeps_the_indexes_of_the_properties_it_changes() {
+    use coordinode_core::graph::types::Value;
+
+    let mut db = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX doc_key ON :Doc(key)")
+        .expect("unique index");
+    db.execute_cypher("CREATE (:Doc {key: 'a'}), (:Doc {key: 'b'})")
+        .expect("seed");
+
+    db.execute_cypher("MATCH (d:Doc {key: 'a'}) SET d += {key: 'c'}")
+        .expect("merge map");
+    let found = |db: &mut coordinode_embed::Database, key: &str| {
+        db.execute_cypher(&format!("MATCH (d:Doc {{key: '{key}'}}) RETURN d.key AS k"))
+            .expect("lookup")
+            .len()
+    };
+    assert_eq!(found(&mut db, "c"), 1, "the new value is indexed");
+    assert_eq!(found(&mut db, "a"), 0, "the old value is not");
+    assert!(
+        db.execute_cypher("MATCH (d:Doc {key: 'c'}) SET d += {key: 'b'}")
+            .is_err(),
+        "a merge onto a value another node holds is refused"
+    );
+
+    db.execute_cypher("MATCH (d:Doc {key: 'c'}) SET d = {key: 'e'}")
+        .expect("replace map");
+    assert_eq!(found(&mut db, "e"), 1);
+    assert_eq!(found(&mut db, "c"), 0);
+    assert!(
+        db.execute_cypher("MATCH (d:Doc {key: 'e'}) SET d = {key: 'b'}")
+            .is_err(),
+        "a replace onto a value another node holds is refused"
+    );
+    let keys = db
+        .execute_cypher("MATCH (d:Doc) RETURN d.key AS k ORDER BY k")
+        .expect("scan");
+    let keys: Vec<_> = keys.iter().filter_map(|r| r.get("k").cloned()).collect();
+    assert_eq!(
+        keys,
+        vec![Value::String("b".into()), Value::String("e".into())]
+    );
+}
+
+/// On a TEMPORAL VALIDATED label a SET opens a new version; an undeclared
+/// property set there is in the new version, not shadowed by the old value.
+#[test]
+fn set_on_an_undeclared_property_of_a_temporal_validated_label_persists() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef, PropertyType, SchemaMode};
+
+    let mut db = open_db();
+    let mut account = LabelSchema::new_node_id("Account");
+    account.set_mode(SchemaMode::Validated);
+    account.set_temporal(true);
+    account.add_property(PropertyDef::new("name", PropertyType::String));
+    account.add_property(PropertyDef::new("valid_from", PropertyType::Int));
+    account.add_property(PropertyDef::new("valid_to", PropertyType::Int));
+    db.create_label_schema(account)
+        .expect("temporal validated Account");
+    db.execute_cypher("CREATE (a:Account {name: 'a', valid_from: 1, balance: 10})")
+        .expect("seed");
+    db.execute_cypher("MATCH (a:Account) WHERE a.valid_to IS NULL SET a.balance = 11")
+        .expect("set undeclared");
+    let rows = db
+        .execute_cypher("MATCH (a:Account) WHERE a.valid_to IS NULL RETURN a.balance AS b")
+        .expect("read open version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("b"), Some(&Value::Int(11)));
+}

@@ -1400,6 +1400,53 @@ impl<'a> ExecutionContext<'a> {
             .map_err(index_write_error)
     }
 
+    /// Whether a node of `label` has B-tree index entries to keep, so a
+    /// write must know its record before the change.
+    pub fn indexes_label(&self, label: &str) -> bool {
+        self.btree_index_registry
+            .is_some_and(|registry| registry.has_btree_for(label))
+    }
+
+    /// Move the B-tree index entries of a node whose `properties` go from
+    /// their values in `before` to those in `after`, as a map SET changes
+    /// several at once. Called before the change is written; a unique value
+    /// another node holds refuses the write.
+    pub fn index_record_changed(
+        &mut self,
+        node_id: NodeId,
+        before: &NodeRecord,
+        after: &NodeRecord,
+        properties: &[&str],
+    ) -> Result<(), ExecutionError> {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(());
+        };
+        let label = before.primary_label();
+        if properties.is_empty() || !registry.has_btree_for(label) {
+            return Ok(());
+        }
+        self.sync_txn_state();
+        let interner: &FieldInterner = self.interner;
+        let before_of = crate::index::registry::record_lookup(before, interner);
+        let after_of = crate::index::registry::record_lookup(after, interner);
+        let field_of = |name: &str| interner.lookup(name);
+        registry
+            .on_property_changed(
+                self.engine,
+                &mut self.txn,
+                &crate::index::PropertyChange {
+                    node_id,
+                    label,
+                    properties,
+                    before: &before_of,
+                    after: &after_of,
+                },
+                &field_of,
+                &mut self.key_claims.indexes,
+            )
+            .map_err(index_write_error)
+    }
+
     /// Move the B-tree index entries of a node whose declared properties go
     /// from `old` to `new` (keyed by field id), as a node merge rewrites its
     /// target. A unique value another node holds refuses the write.
@@ -10264,6 +10311,7 @@ fn execute_update(
                         ))
                     })?;
                 let mut new_record = closing_record.clone();
+                let label_schema = ctx.load_current_label_schema(closing_record.primary_label())?;
 
                 // Step 2: apply each relevant SET item to the new record.
                 // Mark each item's index in `processed_temporal_items` so
@@ -10289,8 +10337,8 @@ fn execute_update(
                     match item {
                         crate::plan::SetItem::Property { property, expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?.map_to_document();
-                            let field_id = ctx.field_id(property)?;
-                            new_record.set(field_id, val);
+                            let by_name = stored_by_name(label_schema.as_ref(), property);
+                            store_node_property(&mut new_record, property, val, by_name, ctx)?;
                         }
                         crate::plan::SetItem::AddLabel { label, .. } => {
                             new_record.add_label(label.clone());
@@ -10298,25 +10346,37 @@ fn execute_update(
                         crate::plan::SetItem::ReplaceProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
-                                let names: Vec<&str> = map.keys().map(String::as_str).collect();
-                                let fids = ctx.field_ids(&names)?;
                                 // Clear existing user props, keep engine-managed
                                 // fields (__ingestion_ts__, valid_from, valid_to
                                 // are reapplied below).
                                 new_record.props.clear();
                                 new_record.extra = None;
-                                for (v, fid) in map.into_values().zip(fids) {
-                                    new_record.set(fid, v.map_to_document());
+                                register_stored_ids(label_schema.as_ref(), &map, ctx)?;
+                                for (name, v) in map {
+                                    let by_name = stored_by_name(label_schema.as_ref(), &name);
+                                    store_node_property(
+                                        &mut new_record,
+                                        &name,
+                                        v.map_to_document(),
+                                        by_name,
+                                        ctx,
+                                    )?;
                                 }
                             }
                         }
                         crate::plan::SetItem::MergeProperties { expr, .. } => {
                             let val = eval_neutral(expr, &out_row)?;
                             if let Value::Map(map) = val {
-                                let names: Vec<&str> = map.keys().map(String::as_str).collect();
-                                let fids = ctx.field_ids(&names)?;
-                                for (v, fid) in map.into_values().zip(fids) {
-                                    new_record.set(fid, v.map_to_document());
+                                register_stored_ids(label_schema.as_ref(), &map, ctx)?;
+                                for (name, v) in map {
+                                    let by_name = stored_by_name(label_schema.as_ref(), &name);
+                                    store_node_property(
+                                        &mut new_record,
+                                        &name,
+                                        v.map_to_document(),
+                                        by_name,
+                                        ctx,
+                                    )?;
                                 }
                             }
                         }
@@ -10332,12 +10392,10 @@ fn execute_update(
                                     "SET on temporal node `{var}`: empty property path"
                                 )));
                             }
-                            let field_id = ctx.field_id(&path[0])?;
-                            let sub_path = path[1..].to_vec();
+                            let (target, sub_path) =
+                                document_target(label_schema.as_ref(), path, ctx)?;
                             let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
-                                target: coordinode_core::graph::doc_delta::PathTarget::PropField(
-                                    field_id,
-                                ),
+                                target,
                                 path: sub_path,
                                 value: val.to_rmpv(),
                             };
@@ -10361,13 +10419,14 @@ fn execute_update(
                             // Same construction as the non-temporal path,
                             // but applied in-memory to `new_record`.
                             let val = eval_neutral(value_expr, &out_row)?;
-                            let (field_id, sub_path) = if path.is_empty() {
-                                (ctx.field_id(var)?, vec![])
+                            // A bare variable names a property of its own name.
+                            let full_path = if path.is_empty() {
+                                std::slice::from_ref(var)
                             } else {
-                                (ctx.field_id(&path[0])?, path[1..].to_vec())
+                                path.as_slice()
                             };
-                            let target =
-                                coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
+                            let (target, sub_path) =
+                                document_target(label_schema.as_ref(), full_path, ctx)?;
                             let delta = match function.as_str() {
                                 "doc_push" => {
                                     coordinode_core::graph::doc_delta::DocDelta::ArrayPush {
@@ -10786,14 +10845,13 @@ fn execute_update(
                             return Err(err);
                         }
 
-                        let field_id = ctx.field_id(property)?;
-
                         // Move the node's index entries from the old value to
                         // the new one before the record changes; a unique
                         // value another node holds refuses the write.
                         ctx.index_property_changed(node_id, &record, property, Some(&val))?;
 
-                        record.set(field_id, val.clone());
+                        let by_name = stored_by_name(label_schema.as_ref(), property);
+                        store_node_property(&mut record, property, val.clone(), by_name, ctx)?;
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                         ctx.write_stats.properties_set += 1;
@@ -10841,45 +10899,37 @@ fn execute_update(
                     // and is skipped when no schema exists (schemaless node) or mode = FLEXIBLE.
                     // schema_label_for_node caches the primary label per node per statement:
                     // SET n.a.x=1, n.a.y=2, n.a.z=3 on 100 nodes = 100 reads (not 300).
-                    let schema_err: Option<ExecutionError> = {
-                        if let Some(label) = ctx.schema_label_for_node(ctx.shard_id, node_id)? {
-                            match ctx.load_current_label_schema(&label)? {
-                                Some(ls) => {
-                                    let root = &path[0];
-                                    match ls.mode {
-                                        SchemaMode::Strict => match ls.get_property(root) {
-                                            None => Some(ExecutionError::SchemaViolation(format!(
-                                                "unknown property '{root}' for strict label '{label}'"
-                                            ))),
-                                            Some(def) if def.is_computed() => {
-                                                Some(ExecutionError::SchemaViolation(format!(
-                                                    "cannot SET computed property '{root}'"
-                                                )))
-                                            }
-                                            Some(_) => None,
-                                        },
-                                        SchemaMode::Validated => {
-                                            if let Some(def) = ls.get_property(root) {
-                                                if def.is_computed() {
-                                                    Some(ExecutionError::SchemaViolation(format!(
-                                                        "cannot SET computed property '{root}'"
-                                                    )))
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        SchemaMode::Flexible => None,
-                                    }
-                                }
-                                None => None,
-                            }
-                        } else {
-                            None
-                        }
+                    let label = ctx.schema_label_for_node(ctx.shard_id, node_id)?;
+                    let label_schema = match &label {
+                        Some(label) => ctx.load_current_label_schema(label)?,
+                        None => None,
                     };
+                    let schema_err: Option<ExecutionError> = label_schema.as_ref().and_then(|ls| {
+                        let root = &path[0];
+                        let label = label.as_deref().unwrap_or_default();
+                        match ls.mode {
+                            SchemaMode::Strict => match ls.get_property(root) {
+                                None => Some(ExecutionError::SchemaViolation(format!(
+                                    "unknown property '{root}' for strict label '{label}'"
+                                ))),
+                                Some(def) if def.is_computed() => {
+                                    Some(ExecutionError::SchemaViolation(format!(
+                                        "cannot SET computed property '{root}'"
+                                    )))
+                                }
+                                Some(_) => None,
+                            },
+                            SchemaMode::Validated => match ls.get_property(root) {
+                                Some(def) if def.is_computed() => {
+                                    Some(ExecutionError::SchemaViolation(format!(
+                                        "cannot SET computed property '{root}'"
+                                    )))
+                                }
+                                _ => None,
+                            },
+                            SchemaMode::Flexible => None,
+                        }
+                    });
                     if let Some(err) = schema_err {
                         if skip_on_violation {
                             continue 'row_loop;
@@ -10887,15 +10937,13 @@ fn execute_update(
                         return Err(err);
                     }
 
-                    // O(1) write via merge operand.
-                    // path[0] = property name → resolved to field_id via interner
-                    // path[1..] = nested path within the DOCUMENT value
-                    let field_id = ctx.field_id(&path[0])?;
-                    let sub_path = &path[1..];
-
+                    // O(1) write via merge operand: an overflow root by its
+                    // full path in the overflow map, any other by its id and
+                    // the path below it.
+                    let (target, sub_path) = document_target(label_schema.as_ref(), path, ctx)?;
                     let delta = coordinode_core::graph::doc_delta::DocDelta::SetPath {
-                        target: coordinode_core::graph::doc_delta::PathTarget::PropField(field_id),
-                        path: sub_path.to_vec(),
+                        target,
+                        path: sub_path,
                         value: val.to_rmpv(),
                     };
                     let operand = delta.encode().map_err(|e| {
@@ -10929,42 +10977,36 @@ fn execute_update(
                     };
                     // schema_label_for_node caches the primary label per node per statement —
                     // same invariant as PropertyPath: must not trigger RYOW materialization.
-                    let schema_err: Option<ExecutionError> = {
-                        if let Some(label) = ctx.schema_label_for_node(ctx.shard_id, node_id)? {
-                            match ctx.load_current_label_schema(&label)? {
-                                Some(ls) => match ls.mode {
-                                    SchemaMode::Strict => match ls.get_property(root_prop) {
-                                        None => Some(ExecutionError::SchemaViolation(format!(
-                                            "unknown property '{root_prop}' for strict label '{label}'"
-                                        ))),
-                                        Some(def) if def.is_computed() => {
-                                            Some(ExecutionError::SchemaViolation(format!(
-                                                "cannot SET computed property '{root_prop}'"
-                                            )))
-                                        }
-                                        Some(_) => None,
-                                    },
-                                    SchemaMode::Validated => {
-                                        if let Some(def) = ls.get_property(root_prop) {
-                                            if def.is_computed() {
-                                                Some(ExecutionError::SchemaViolation(format!(
-                                                    "cannot SET computed property '{root_prop}'"
-                                                )))
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    SchemaMode::Flexible => None,
-                                },
-                                None => None,
-                            }
-                        } else {
-                            None
-                        }
+                    let label = ctx.schema_label_for_node(ctx.shard_id, node_id)?;
+                    let label_schema = match &label {
+                        Some(label) => ctx.load_current_label_schema(label)?,
+                        None => None,
                     };
+                    let schema_err: Option<ExecutionError> = label_schema.as_ref().and_then(|ls| {
+                        let label = label.as_deref().unwrap_or_default();
+                        match ls.mode {
+                            SchemaMode::Strict => match ls.get_property(root_prop) {
+                                None => Some(ExecutionError::SchemaViolation(format!(
+                                    "unknown property '{root_prop}' for strict label '{label}'"
+                                ))),
+                                Some(def) if def.is_computed() => {
+                                    Some(ExecutionError::SchemaViolation(format!(
+                                        "cannot SET computed property '{root_prop}'"
+                                    )))
+                                }
+                                Some(_) => None,
+                            },
+                            SchemaMode::Validated => match ls.get_property(root_prop) {
+                                Some(def) if def.is_computed() => {
+                                    Some(ExecutionError::SchemaViolation(format!(
+                                        "cannot SET computed property '{root_prop}'"
+                                    )))
+                                }
+                                _ => None,
+                            },
+                            SchemaMode::Flexible => None,
+                        }
+                    });
                     if let Some(err) = schema_err {
                         if skip_on_violation {
                             continue 'row_loop;
@@ -10972,19 +11014,16 @@ fn execute_update(
                         return Err(err);
                     }
 
-                    // Resolve property name → field_id. For doc_* functions,
-                    // path[0] is the root property, path[1..] is the nested path.
-                    // If path is empty (bare variable, e.g. doc_push(n, "x")),
-                    // use the variable name as the property — unlikely but handled.
-                    let (field_id, sub_path) = if path.is_empty() {
-                        // Bare variable — treat variable as property name on itself.
-                        // This is an edge case; normally path has at least one element.
-                        (ctx.field_id(variable)?, vec![])
+                    // path[0] is the root property, path[1..] the nested path;
+                    // a bare variable (doc_push(n, "x")) names a property of
+                    // its own name.
+                    let full_path = if path.is_empty() {
+                        std::slice::from_ref(variable)
                     } else {
-                        (ctx.field_id(&path[0])?, path[1..].to_vec())
+                        path.as_slice()
                     };
-
-                    let target = coordinode_core::graph::doc_delta::PathTarget::PropField(field_id);
+                    let (target, sub_path) =
+                        document_target(label_schema.as_ref(), full_path, ctx)?;
 
                     let delta = match function.as_str() {
                         "doc_push" => coordinode_core::graph::doc_delta::DocDelta::ArrayPush {
@@ -11112,16 +11151,31 @@ fn execute_update(
                             }
                         }
 
-                        // Clear existing props and set new ones from map
+                        // Every property goes, the overflow ones too; the
+                        // map's are stored where the schema keeps each.
+                        let before = ctx
+                            .indexes_label(record.primary_label())
+                            .then(|| record.clone());
+                        record.props.clear();
+                        record.extra = None;
                         if let Value::Map(ref map) = map_val {
-                            let names: Vec<&str> = map.keys().map(String::as_str).collect();
-                            let field_ids = ctx.field_ids(&names)?;
-                            record.props.clear();
-                            for (v, field_id) in map.values().zip(field_ids) {
-                                record.set(field_id, v.clone());
+                            register_stored_ids(label_schema.as_ref(), map, ctx)?;
+                            for (name, v) in map {
+                                let by_name = stored_by_name(label_schema.as_ref(), name);
+                                store_node_property(&mut record, name, v.clone(), by_name, ctx)?;
                             }
-                        } else {
-                            record.props.clear();
+                        }
+                        if let Some(before) = before {
+                            // Every property the node had or now has may move
+                            // an index entry.
+                            let mut changed = property_names(&before, ctx.interner);
+                            if let Value::Map(ref map) = map_val {
+                                changed.extend(map.keys().cloned());
+                            }
+                            changed.sort_unstable();
+                            changed.dedup();
+                            let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+                            ctx.index_record_changed(node_id, &before, &record, &changed)?;
                         }
 
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
@@ -11249,10 +11303,17 @@ fn execute_update(
                         }
 
                         if let Value::Map(ref map) = map_val {
-                            let names: Vec<&str> = map.keys().map(String::as_str).collect();
-                            let field_ids = ctx.field_ids(&names)?;
-                            for (v, field_id) in map.values().zip(field_ids) {
-                                record.set(field_id, v.clone());
+                            let before = ctx
+                                .indexes_label(record.primary_label())
+                                .then(|| record.clone());
+                            register_stored_ids(label_schema.as_ref(), map, ctx)?;
+                            for (name, v) in map {
+                                let by_name = stored_by_name(label_schema.as_ref(), name);
+                                store_node_property(&mut record, name, v.clone(), by_name, ctx)?;
+                            }
+                            if let Some(before) = before {
+                                let changed: Vec<&str> = map.keys().map(String::as_str).collect();
+                                ctx.index_record_changed(node_id, &before, &record, &changed)?;
                             }
                         }
 
@@ -11522,6 +11583,8 @@ fn execute_remove(
                         ))
                     })?;
                 let mut new_record = closing_record.clone();
+                let remove_label_schema =
+                    ctx.load_current_label_schema(closing_record.primary_label())?;
 
                 for (item_idx, item) in items.iter().enumerate() {
                     let item_var = match item {
@@ -11534,9 +11597,7 @@ fn execute_remove(
                     }
                     match item {
                         crate::plan::RemoveItem::Property { property, .. } => {
-                            if let Some(field_id) = ctx.interner.lookup(property) {
-                                new_record.remove(field_id);
-                            }
+                            remove_node_property(&mut new_record, property, ctx.interner);
                             ctx.write_stats.properties_removed += 1;
                         }
                         crate::plan::RemoveItem::Label { label, .. } => {
@@ -11551,27 +11612,18 @@ fn execute_remove(
                                     "REMOVE on temporal node `{var}`: empty property path"
                                 )));
                             }
-                            // A name with no binding is on no record: nothing to
-                            // remove, and removing registers nothing.
-                            if let Some(field_id) = ctx.interner.lookup(&path[0]) {
-                                let sub_path = path[1..].to_vec();
-                                let target =
-                                    coordinode_core::graph::doc_delta::PathTarget::PropField(
-                                        field_id,
-                                    );
-                                let delta = if sub_path.is_empty() {
-                                    // Top-level prop removal: RemoveProperty
-                                    // (no sub-path traversal).
-                                    coordinode_core::graph::doc_delta::DocDelta::RemoveProperty {
-                                        target,
-                                        key: None,
-                                    }
-                                } else {
+                            if path.len() == 1 {
+                                remove_node_property(&mut new_record, &path[0], ctx.interner);
+                            } else if let Some((target, sub_path)) =
+                                removal_target(remove_label_schema.as_ref(), path, ctx.interner)
+                            {
+                                // A name with no binding is on no record:
+                                // nothing to remove, and nothing registered.
+                                let delta =
                                     coordinode_core::graph::doc_delta::DocDelta::DeletePath {
                                         target,
                                         path: sub_path,
-                                    }
-                                };
+                                    };
                                 coordinode_storage::engine::merge::apply_doc_deltas_to_record(
                                     &mut new_record,
                                     &[delta],
@@ -11649,13 +11701,18 @@ fn execute_remove(
                     };
 
                     if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                        if let Some(field_id) = ctx.interner.lookup(property) {
-                            let old_value: Option<Value> = record.props.get(&field_id).cloned();
-
+                        let stored = ctx
+                            .interner
+                            .lookup(property)
+                            .is_some_and(|field_id| record.props.contains_key(&field_id))
+                            || record.get_extra(property).is_some();
+                        if stored {
                             // The node's index entries move to the property's
                             // absence: the old value's entry goes, and an
                             // index that keeps missing values gets one.
                             ctx.index_property_changed(node_id, &record, property, None)?;
+                            let old_value =
+                                remove_node_property(&mut record, property, ctx.interner);
 
                             // Notify vector index if removing a vector property.
                             if let Some(registry) = ctx.vector_index_registry() {
@@ -11672,7 +11729,6 @@ fn execute_remove(
                                 let label = record.primary_label().to_string();
                                 registry.on_text_deleted(&label, node_id, property);
                             }
-                            record.remove(field_id);
                             ctx.write_stats.properties_removed += 1;
                         }
 
@@ -11687,15 +11743,19 @@ fn execute_remove(
                         _ => continue,
                     };
 
-                    // O(1) delete via merge operand, no read required. A name
-                    // with no binding is on no record, so there is nothing to
-                    // delete and nothing is registered.
-                    if let Some(field_id) = ctx.interner.lookup(&path[0]) {
+                    // O(1) delete via merge operand; the schema says where the
+                    // root is stored. A name with no binding is on no record,
+                    // so there is nothing to delete and nothing is registered.
+                    let label_schema = match ctx.schema_label_for_node(ctx.shard_id, node_id)? {
+                        Some(label) => ctx.load_current_label_schema(&label)?,
+                        None => None,
+                    };
+                    if let Some((target, sub_path)) =
+                        removal_target(label_schema.as_ref(), path, ctx.interner)
+                    {
                         let delta = coordinode_core::graph::doc_delta::DocDelta::DeletePath {
-                            target: coordinode_core::graph::doc_delta::PathTarget::PropField(
-                                field_id,
-                            ),
-                            path: path[1..].to_vec(),
+                            target,
+                            path: sub_path,
                         };
                         let operand = delta.encode().map_err(|e| {
                             ExecutionError::Serialization(format!("DocDelta encode: {e}"))
@@ -13690,13 +13750,15 @@ fn execute_detach_document(
                     },
                 }
             } else {
-                let target = match field_id_opt {
-                    Some(fid) => PathTarget::PropField(fid),
-                    None => PathTarget::Extra,
-                };
-                DocDelta::DeletePath {
-                    target,
-                    path: property_path[1..].to_vec(),
+                match field_id_opt {
+                    Some(fid) => DocDelta::DeletePath {
+                        target: PathTarget::PropField(fid),
+                        path: property_path[1..].to_vec(),
+                    },
+                    None => DocDelta::DeletePath {
+                        target: PathTarget::Extra,
+                        path: property_path.to_vec(),
+                    },
                 }
             };
             coordinode_storage::engine::merge::apply_doc_deltas_to_record(
@@ -13763,28 +13825,20 @@ fn resolve_document_property(
     interner: &FieldInterner,
 ) -> Result<(Option<u32>, rmpv::Value), ExecutionError> {
     let first = &path[0];
-    let (field_id, root): (Option<u32>, Value) = match interner.lookup(first) {
-        Some(fid) => match record.props.get(&fid) {
-            Some(v) => (Some(fid), v.clone()),
+    // A name can be interned for another label and still be stored in this
+    // node's overflow map, so both places are looked at.
+    let by_id = interner
+        .lookup(first)
+        .and_then(|fid| record.props.get(&fid).map(|v| (Some(fid), v.clone())));
+    let (field_id, root): (Option<u32>, Value) =
+        match by_id.or_else(|| record.get_extra(first).map(|v| (None, v.clone()))) {
+            Some(found) => found,
             None => {
                 return Err(ExecutionError::Unsupported(format!(
                     "DETACH DOCUMENT: property `{first}` not found on node"
                 )));
             }
-        },
-        None => {
-            // Try the overflow map.
-            let extra = record.extra.as_ref().and_then(|m| m.get(first));
-            match extra {
-                Some(v) => (None, v.clone()),
-                None => {
-                    return Err(ExecutionError::Unsupported(format!(
-                        "DETACH DOCUMENT: property `{first}` not found on node"
-                    )));
-                }
-            }
-        }
-    };
+        };
 
     // Descend remaining path segments (rmpv navigation).
     let mut current = value_to_rmpv(&root);
@@ -13947,18 +14001,18 @@ fn emit_property_removal(
             },
         }
     } else {
-        // Nested path: `DeletePath` on either an interned prop or extra key.
-        let target = match field_id_opt {
-            Some(fid) => PathTarget::PropField(fid),
-            None => PathTarget::Extra,
-        };
-        let sub = if field_id_opt.is_some() {
-            path[1..].to_vec()
-        } else {
-            // For extra: the first segment is the extra-map key; remaining are sub-path.
-            path[1..].to_vec()
-        };
-        DocDelta::DeletePath { target, path: sub }
+        // Nested path: an interned prop is addressed below its id; the
+        // overflow map is one document, addressed by the full path.
+        match field_id_opt {
+            Some(fid) => DocDelta::DeletePath {
+                target: PathTarget::PropField(fid),
+                path: path[1..].to_vec(),
+            },
+            None => DocDelta::DeletePath {
+                target: PathTarget::Extra,
+                path: path.to_vec(),
+            },
+        }
     };
 
     let operand = delta
@@ -14329,6 +14383,112 @@ fn execute_attach_document(
     }
 
     Ok(results)
+}
+
+/// Whether property `name` of a node under `schema` is stored by name in the
+/// overflow map: the undeclared properties of a VALIDATED label are, every
+/// other property is stored under its interned id.
+fn stored_by_name(schema: Option<&LabelSchema>, name: &str) -> bool {
+    schema
+        .is_some_and(|s| matches!(s.mode, SchemaMode::Validated) && s.get_property(name).is_none())
+}
+
+/// Set property `name` of `record` where its schema keeps it, dropping a copy
+/// left in the other place: a record holds one value per name, so no read
+/// can see an older one.
+fn store_node_property(
+    record: &mut NodeRecord,
+    name: &str,
+    value: Value,
+    by_name: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    if by_name {
+        if let Some(field_id) = ctx.interner.lookup(name) {
+            record.props.remove(&field_id);
+        }
+        record.set_extra(name, value);
+    } else {
+        let field_id = ctx.field_id(name)?;
+        record.remove_extra(name);
+        record.set(field_id, value);
+    }
+    Ok(())
+}
+
+/// Register in one batch the names of `map` stored under an id, so storing
+/// them one by one registers nothing more.
+fn register_stored_ids(
+    schema: Option<&LabelSchema>,
+    map: &std::collections::BTreeMap<String, Value>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    let names: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !stored_by_name(schema, name))
+        .collect();
+    ctx.field_ids(&names)?;
+    Ok(())
+}
+
+/// The names of every property `record` holds, under an id or by name.
+fn property_names(record: &NodeRecord, interner: &FieldInterner) -> Vec<String> {
+    record
+        .props
+        .keys()
+        .filter_map(|field_id| interner.resolve(*field_id).map(str::to_string))
+        .chain(record.extra.iter().flat_map(|extra| extra.keys().cloned()))
+        .collect()
+}
+
+/// Remove property `name` from `record` wherever it is stored, returning the
+/// value it had.
+fn remove_node_property(
+    record: &mut NodeRecord,
+    name: &str,
+    interner: &FieldInterner,
+) -> Option<Value> {
+    let by_id = interner
+        .lookup(name)
+        .and_then(|field_id| record.props.remove(&field_id));
+    record.remove_extra(name).or(by_id)
+}
+
+/// The merge target and in-target path of property path `path` of a node
+/// under `schema`: an overflow property is addressed by its full path inside
+/// the overflow map, any other by its id and the path below it.
+fn document_target(
+    schema: Option<&LabelSchema>,
+    path: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(coordinode_core::graph::doc_delta::PathTarget, Vec<String>), ExecutionError> {
+    use coordinode_core::graph::doc_delta::PathTarget;
+    if stored_by_name(schema, &path[0]) {
+        Ok((PathTarget::Extra, path.to_vec()))
+    } else {
+        Ok((
+            PathTarget::PropField(ctx.field_id(&path[0])?),
+            path[1..].to_vec(),
+        ))
+    }
+}
+
+/// The merge target and in-target path for deleting property path `path` of
+/// a node under `schema`, or `None` when the root has no id and so is stored
+/// on no record. Registers nothing.
+fn removal_target(
+    schema: Option<&LabelSchema>,
+    path: &[String],
+    interner: &FieldInterner,
+) -> Option<(coordinode_core::graph::doc_delta::PathTarget, Vec<String>)> {
+    use coordinode_core::graph::doc_delta::PathTarget;
+    if stored_by_name(schema, &path[0]) {
+        return Some((PathTarget::Extra, path.to_vec()));
+    }
+    interner
+        .lookup(&path[0])
+        .map(|field_id| (PathTarget::PropField(field_id), path[1..].to_vec()))
 }
 
 /// Check whether a property path is already present on a node record.
