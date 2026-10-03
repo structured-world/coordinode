@@ -866,8 +866,13 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
         heartbeat_window_ms: 100_000,
         eviction_interval_ms: 30,
     });
+    // The terminal record commits first and the floor moves after it (the
+    // floor never moves ahead of the record), so a reader can see the ended
+    // consumer before the new floor: wait for both.
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
-    while ended_for(&f.reg, "doomed").is_none() && tokio::time::Instant::now() < until {
+    while (ended_for(&f.reg, "doomed").is_none() || f.reg.shard_floor() != 500)
+        && tokio::time::Instant::now() < until
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
