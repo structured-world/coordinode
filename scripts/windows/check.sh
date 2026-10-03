@@ -41,8 +41,23 @@ commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'windows check snapshot'
 git -C "$repo" update-ref "$ref" "$commit"
 git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
 
+# A submodule's commit may exist only here, committed and not yet pushed, so
+# each submodule travels as a bundle of its checked-out history
+# (sub-<name>.bundle) and check.ps1 takes it from there rather than from the
+# submodule's upstream.
+rm -f "$out"/sub-*.bundle
+while read -r key path; do
+  name="${key#submodule.}"
+  name="${name%.path}"
+  git -C "$repo/$path" bundle create -q "$out/sub-$name.bundle" HEAD
+done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true)
+
 ssh "$host" "New-Item -ItemType Directory -Force -Path '$remote_root' | Out-Null"
 scp -q "$bundle" "$host:$remote_scp/tree.bundle"
+for sub in "$out"/sub-*.bundle; do
+  [ -e "$sub" ] || continue
+  scp -q "$sub" "$host:$remote_scp/$(basename "$sub")"
+done
 scp -q "$repo/scripts/windows/check.ps1" "$host:$remote_scp/check.ps1"
 
 # A failing step is reported through status.txt; the logs are fetched and

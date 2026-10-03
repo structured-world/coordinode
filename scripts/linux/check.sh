@@ -81,22 +81,42 @@ commit="$(git -C "$repo" commit-tree "$tree" -p HEAD -m 'linux check snapshot')"
 git -C "$repo" update-ref "$ref" "$commit"
 git -C "$repo" bundle create -q "$bundle" "$ref" HEAD
 
+# A submodule's commit may exist only here, committed and not yet pushed, so
+# each submodule travels as a bundle of its checked-out history and the host
+# takes it from there rather than from the submodule's upstream.
+rm -f "$out"/sub-*.bundle
+sub_names=''
+sub_urls=''
+while read -r key path; do
+  name="${key#submodule.}"
+  name="${name%.path}"
+  git -C "$repo/$path" bundle create -q "$out/sub-$name.bundle" HEAD
+  sub_names="$sub_names $name"
+  sub_urls="${sub_urls}git config submodule.$name.url '$remote_root/sub-$name.bundle'
+"
+done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true)
+checkout="git clone -q --no-checkout tree.bundle src
+cd src
+git fetch -q ../tree.bundle '$ref'
+git checkout -q --detach FETCH_HEAD
+git submodule init -q
+${sub_urls}git -c protocol.file.allow=always submodule update -q
+echo checkout=\$? > ../status.txt"
+
 if ! ssh "$host" "mkdir '$remote_root'"; then
   echo "another check holds $remote_root on $host; if no run is in progress, remove it with: ssh $host rm -rf $remote_root" >&2
   exit 1
 fi
 locked=1
 ssh "$host" "cat > '$remote_root/tree.bundle'" < "$bundle"
+for name in $sub_names; do
+  ssh "$host" "cat > '$remote_root/sub-$name.bundle'" < "$out/sub-$name.bundle"
+done
 
 if [ -n "$only_bench" ]; then
   ssh "$host" "set -u
 cd '$remote_root'
-git clone -q --no-checkout tree.bundle src
-cd src
-git fetch -q ../tree.bundle '$ref'
-git checkout -q --detach FETCH_HEAD
-git submodule update --init -q
-echo checkout=\$? > ../status.txt
+$checkout
 export CARGO_TARGET_DIR='$remote_root/target' $bench_env
 # Build first and let the compilation cache finish writing before the timed
 # run: its background uploads otherwise share the CPU with the measurement.
@@ -116,12 +136,7 @@ fi
 if [ -n "$only_nextest" ]; then
   ssh "$host" "set -u
 cd '$remote_root'
-git clone -q --no-checkout tree.bundle src
-cd src
-git fetch -q ../tree.bundle '$ref'
-git checkout -q --detach FETCH_HEAD
-git submodule update --init -q
-echo checkout=\$? > ../status.txt
+$checkout
 export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
 cargo nextest run --all-features --workspace --no-fail-fast --failure-output final $only_nextest > ../test.log 2>&1
 echo nextest=\$? >> ../status.txt
@@ -137,12 +152,7 @@ fi
 # ones after it, and the logs are fetched either way.
 ssh "$host" "set -u
 cd '$remote_root'
-git clone -q --no-checkout tree.bundle src
-cd src
-git fetch -q ../tree.bundle '$ref'
-git checkout -q --detach FETCH_HEAD
-git submodule update --init -q
-echo checkout=\$? > ../status.txt
+$checkout
 export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
 cargo clippy --workspace --all-targets --all-features -- -D warnings > ../clippy.log 2>&1
 echo clippy=\$? >> ../status.txt

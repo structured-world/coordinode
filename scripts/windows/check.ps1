@@ -31,11 +31,18 @@ Set-Location $src
 # A clone takes branches only; the snapshot lives on its own ref.
 git fetch -q $Bundle $Ref
 git checkout -q --detach FETCH_HEAD
-git submodule update --init -q
+# Each submodule comes from the bundle check.sh sent with the tree
+# (sub-<name>.bundle), which holds commits its upstream may not have yet.
+git submodule init -q
+Get-ChildItem $Root -Filter 'sub-*.bundle' | ForEach-Object {
+    $name = $_.BaseName.Substring(4)
+    git config "submodule.$name.url" $_.FullName
+}
+git -c protocol.file.allow=always submodule update -q
 "checkout=$LASTEXITCODE" | Out-File $status
 if ($LASTEXITCODE -ne 0) {
     Set-Location $Root
-    Remove-Item -Recurse -Force $src, $Bundle -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $src, $Bundle, (Join-Path $Root 'sub-*.bundle') -ErrorAction SilentlyContinue
     'done' | Out-File -Append $status
     exit 1
 }
