@@ -78,6 +78,8 @@ struct View {
     reported: Option<RecordedPair>,
     leader: Option<(u64, String)>,
     peers: BTreeMap<u64, Handshake>,
+    /// When each peer's record last arrived.
+    heard: BTreeMap<u64, std::time::Instant>,
     /// When this member first saw no pair able to write: none held by a
     /// majority of the voters, or the majority's pair not yet recorded.
     paused_since: Option<std::time::Instant>,
@@ -127,6 +129,11 @@ pub struct VoterPair {
     pub node_id: u64,
     /// The pair it last reported.
     pub pair: Option<VersionPair>,
+    /// Whether it counts as reachable: heard from within the report's window
+    /// when the report has one, heard from at all otherwise. Only such
+    /// voters count toward a majority: writes continue while the reachable
+    /// members that run one pair form a majority of the group.
+    pub live: bool,
 }
 
 impl VersionGate {
@@ -177,9 +184,17 @@ impl VersionGate {
     }
 
     /// The report of this member among `voters`, the group's voting members.
-    /// Also marks the start or end of a write pause, so the pause it reports
-    /// is measured from the first report or leadership change that saw it.
-    pub fn report(&self, voters: &[u64]) -> VersionReport {
+    /// With `live_within`, a peer counts toward a majority only when heard
+    /// from within it; a leader passes it, as it hears every reachable voter.
+    /// Without it every voter heard from at all counts: a follower hears only
+    /// its leader and would take the others for unreachable. Also marks the
+    /// start or end of a write pause, so the pause it reports is measured
+    /// from the first report or leadership change that saw it.
+    pub fn report(
+        &self,
+        voters: &[u64],
+        live_within: Option<std::time::Duration>,
+    ) -> VersionReport {
         let group_pair = self.group_pair();
         let read_only = match self.state() {
             MemberState::Matched => None,
@@ -194,13 +209,22 @@ impl VersionGate {
         let mut view = self.view.lock();
         let voters: Vec<VoterPair> = voters
             .iter()
-            .map(|&node_id| VoterPair {
-                node_id,
-                pair: if node_id == self.node_id {
-                    Some(self.pair)
-                } else {
-                    view.peers.get(&node_id).map(|h| h.pair)
-                },
+            .map(|&node_id| {
+                if node_id == self.node_id {
+                    return VoterPair {
+                        node_id,
+                        pair: Some(self.pair),
+                        live: true,
+                    };
+                }
+                VoterPair {
+                    node_id,
+                    pair: view.peers.get(&node_id).map(|h| h.pair),
+                    live: view
+                        .heard
+                        .get(&node_id)
+                        .is_some_and(|at| live_within.is_none_or(|w| at.elapsed() <= w)),
+                }
             })
             .collect();
         let majority_pair = majority(&voters);
@@ -277,6 +301,7 @@ impl VersionGate {
             }
         }
         view.peers.insert(peer.node_id, peer.clone());
+        view.heard.insert(peer.node_id, std::time::Instant::now());
     }
 
     /// Whether `peer` last reported the pair this member runs; `None` before
@@ -332,10 +357,11 @@ impl VersionGate {
     }
 }
 
-/// The pair more than half of `voters` run, if any.
+/// The pair that reachable voters making up more than half of `voters` run,
+/// if any.
 fn majority(voters: &[VoterPair]) -> Option<VersionPair> {
     let mut counts: Vec<(VersionPair, usize)> = Vec::new();
-    for pair in voters.iter().filter_map(|v| v.pair) {
+    for pair in voters.iter().filter(|v| v.live).filter_map(|v| v.pair) {
         match counts.iter_mut().find(|(p, _)| *p == pair) {
             Some((_, n)) => *n += 1,
             None => counts.push((pair, 1)),

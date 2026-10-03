@@ -345,3 +345,104 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
     .await;
     assert!(result.is_ok(), "TIMED OUT");
 }
+
+/// Write `key` on `node` off the runtime, giving up after `wait`: a write
+/// that cannot reach a majority neither commits nor fails at once.
+async fn try_write(
+    node: &RaftNode,
+    ids: &ProposalIdGenerator,
+    key: &str,
+    commit_ts: u64,
+    wait: Duration,
+) -> Option<Result<(), ProposalError>> {
+    let pipeline = node.pipeline();
+    let proposal = RaftProposal {
+        id: ids.next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: key.as_bytes().to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(commit_ts),
+        start_ts: Timestamp::from_raw(commit_ts - 1),
+        bypass_rate_limiter: false,
+    };
+    let task = tokio::task::spawn_blocking(move || pipeline.propose_and_wait(&proposal).map(drop));
+    tokio::time::timeout(wait, task)
+        .await
+        .ok()
+        .map(|joined| joined.expect("write task"))
+}
+
+/// With one member unreachable throughout, the group cannot write from the
+/// moment the first reachable member is updated until the second one is: the
+/// pause is reported while it lasts and ends once both reachable members run
+/// the new pair. The unreachable member, updated and back later, catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_with_one_member_unreachable_pauses_until_both_others_move() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let ids = ProposalIdGenerator::with_base(2u64 << 48);
+        let [mut m1, mut m2, mut m3] = group_of_three(0).await;
+        write(m1.node(), &ids, "node:before", 100).expect("write before the move");
+
+        // Member 3 is unreachable from here on.
+        m3.node
+            .take()
+            .expect("running")
+            .shutdown()
+            .await
+            .expect("shutdown 3");
+
+        m2.update(1).await;
+        let paused = try_write(m1.node(), &ids, "node:paused", 110, Duration::from_secs(3)).await;
+        assert!(
+            !matches!(paused, Some(Ok(()))),
+            "no majority runs one pair: {paused:?}"
+        );
+        eventually("the pause is reported", || {
+            m1.node().version_report().pause_ms.is_some()
+        })
+        .await;
+
+        let updated_at = std::time::Instant::now();
+        m1.update(1).await;
+        // Whichever of the two leads takes the write; the other refuses it.
+        let leader = loop {
+            if let Some(m) = [&m1, &m2].into_iter().find(|m| {
+                m.node().version().state() == MemberState::Matched
+                    && m.node().version().group_pair().map(|r| r.pair) == Some(pair(1))
+                    && write(m.node(), &ids, "node:after", 130).is_ok()
+            }) {
+                break m;
+            }
+            assert!(
+                updated_at.elapsed() < Duration::from_secs(60),
+                "the two reachable members never wrote at the new pair"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert!(holds(&leader.engine, "node:before"));
+        let resumed = updated_at.elapsed();
+        assert_eq!(leader.node().version_report().pause_ms, None, "it writes");
+        assert!(
+            resumed < Duration::from_secs(30),
+            "writes resumed {resumed:?} after the second member was updated"
+        );
+
+        // The unreachable member comes back updated and catches up.
+        m3.node = Some(reopen(3, &m3.engine, m3.port, 1).await);
+        eventually("member 3 matches", || {
+            m3.node().version().state() == MemberState::Matched
+        })
+        .await;
+        eventually("member 3 catches up", || holds(&m3.engine, "node:after")).await;
+
+        for m in [&mut m1, &mut m2, &mut m3] {
+            if let Some(node) = m.node.take() {
+                node.shutdown().await.expect("shutdown");
+            }
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "TIMED OUT");
+}

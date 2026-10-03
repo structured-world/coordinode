@@ -1507,15 +1507,15 @@ impl RaftNode {
     /// how long the group has been unable to write while it is.
     pub fn version_report(&self) -> version::VersionReport {
         use openraft::rt::watch::WatchReceiver;
-        let voters: Vec<u64> = self
-            .raft
-            .metrics()
-            .borrow_watched()
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
-        self.version.report(&voters)
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let voters: Vec<u64> = metrics.membership_config.membership().voter_ids().collect();
+        // A leader hears every reachable voter; one is reachable as long as a
+        // follower would keep its leader: heard from within an election
+        // timeout. A follower hears its leader alone and judges no one's
+        // reachability.
+        let live_within = (metrics.current_leader == Some(self.node_id))
+            .then(|| std::time::Duration::from_millis(self.raft.config().election_timeout_max));
+        self.version.report(&voters, live_within)
     }
 
     /// The frozen version exchange, for a caller that serves this node's

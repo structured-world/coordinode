@@ -14,6 +14,9 @@ const P2: VersionPair = VersionPair {
     host_epoch: 0,
 };
 
+/// A leader's window every peer a test observed falls within.
+const LIVE: Option<std::time::Duration> = Some(std::time::Duration::from_secs(3600));
+
 struct Rig {
     engine: Arc<StorageEngine>,
     oracle: Arc<TimestampOracle>,
@@ -168,7 +171,7 @@ fn the_report_follows_the_majority_and_the_pause() {
     rig.record(P);
     let gate = rig.gate(1, P);
     gate.observe(&peer(2, P, None));
-    let report = gate.report(&[1, 2, 3]);
+    let report = gate.report(&[1, 2, 3], LIVE);
     assert_eq!(report.majority_pair, Some(P));
     assert_eq!(report.pause_ms, None, "a majority runs the recorded pair");
     assert_eq!(report.read_only, None);
@@ -181,9 +184,9 @@ fn the_report_follows_the_majority_and_the_pause() {
     // Member 2 moves on: no pair holds a majority, writes pause.
     gate.observe(&peer(2, P2, None));
     gate.observe(&peer(3, P, None));
-    assert_eq!(gate.report(&[1, 2, 3]).majority_pair, Some(P));
+    assert_eq!(gate.report(&[1, 2, 3], LIVE).majority_pair, Some(P));
     gate.observe(&peer(3, P2, None));
-    let paused = gate.report(&[1, 2, 3]);
+    let paused = gate.report(&[1, 2, 3], LIVE);
     assert_eq!(paused.majority_pair, Some(P2));
     assert!(
         paused.pause_ms.is_some(),
@@ -193,7 +196,7 @@ fn the_report_follows_the_majority_and_the_pause() {
     // The new side records its pair: this member is read-only, behind, and
     // the group writes again.
     gate.observe(&peer(2, P2, Some(RecordedPair { pair: P2, seq: 2 })));
-    let moved = gate.report(&[1, 2, 3]);
+    let moved = gate.report(&[1, 2, 3], LIVE);
     assert_eq!(moved.pause_ms, None);
     let read_only = moved.read_only.expect("behind its group");
     assert!(read_only.behind);
@@ -201,12 +204,44 @@ fn the_report_follows_the_majority_and_the_pause() {
     assert_eq!(read_only.as_of, 42);
 }
 
+/// A voter not heard from within the window is not counted toward a
+/// majority: the reachable members alone decide whether the group writes.
+/// Its last known pair is still reported.
+#[test]
+fn an_unreachable_voter_counts_for_no_majority() {
+    let rig = Rig::new();
+    rig.record(P);
+    let gate = rig.gate(1, P);
+    gate.observe(&peer(2, P2, None));
+    gate.observe(&peer(3, P, None));
+    assert_eq!(gate.report(&[1, 2, 3], LIVE).majority_pair, Some(P));
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    gate.observe(&peer(2, P2, None));
+    let paused = gate.report(&[1, 2, 3], Some(std::time::Duration::from_millis(1)));
+    assert_eq!(paused.majority_pair, None, "member 3 is not reachable");
+    assert!(
+        paused.pause_ms.is_some(),
+        "no reachable majority runs one pair"
+    );
+    let three = paused
+        .voters
+        .iter()
+        .find(|v| v.node_id == 3)
+        .expect("voter 3");
+    assert_eq!(three.pair, Some(P), "its last known pair");
+    assert!(!three.live);
+
+    // Without a window (a follower's report) every voter heard from counts.
+    assert_eq!(gate.report(&[1, 2, 3], None).majority_pair, Some(P));
+}
+
 #[test]
 fn a_report_serializes_for_the_ops_surface() {
     let rig = Rig::new();
     rig.record(P);
     let gate = rig.gate(1, P);
-    let json = serde_json::to_value(gate.report(&[1])).expect("serialize");
+    let json = serde_json::to_value(gate.report(&[1], LIVE)).expect("serialize");
     assert_eq!(json["node_id"], 1);
     assert_eq!(json["pair"]["engine"], P.engine);
     assert_eq!(json["group_pair"]["seq"], 1);

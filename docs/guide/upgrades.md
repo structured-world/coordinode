@@ -76,9 +76,9 @@ member's version report as JSON:
   "group_pair": { "pair": { "engine": 2, "host_epoch": 0 }, "seq": 2 },
   "read_only": null,
   "voters": [
-    { "node_id": 1, "pair": { "engine": 1, "host_epoch": 0 } },
-    { "node_id": 2, "pair": { "engine": 2, "host_epoch": 0 } },
-    { "node_id": 3, "pair": { "engine": 2, "host_epoch": 0 } }
+    { "node_id": 1, "pair": { "engine": 1, "host_epoch": 0 }, "live": true },
+    { "node_id": 2, "pair": { "engine": 2, "host_epoch": 0 }, "live": true },
+    { "node_id": 3, "pair": { "engine": 2, "host_epoch": 0 }, "live": true }
   ],
   "majority_pair": { "engine": 2, "host_epoch": 0 },
   "pause_ms": null
@@ -86,7 +86,12 @@ member's version report as JSON:
 ```
 
 `read_only`, when set, gives the reason, `behind`, `as_of` and the leader.
-`pause_ms` counts the time no version has been able to write.
+`pause_ms` counts the time no version has been able to write. Writes continue
+while the reachable members that run one version form a majority, so only
+voters with `live` set count toward `majority_pair`. On the leader a voter is
+live when it answered within an election timeout; the leader's report is the
+one to watch during a move. A follower hears only its leader and counts every
+voter it has heard from, giving each its last known version.
 
 Prometheus metrics on `/metrics`:
 
