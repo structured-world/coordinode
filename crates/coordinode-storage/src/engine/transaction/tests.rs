@@ -1147,7 +1147,8 @@ fn prefix_scan_paged_exact_limit_reports_exhausted() {
 /// The write-admission gate at the single commit locus: when the engine's
 /// cached write pressure is `Stop`, a commit CARRYING WRITES is rejected
 /// with a retryable backpressure error and nothing is applied; a read-only
-/// commit passes untouched (there is nothing to admit).
+/// commit passes untouched (there is nothing to admit), and so does a commit
+/// marked exempt.
 #[test]
 fn commit_rejects_writes_under_stop_pressure() {
     // The compaction monitor overwrites the cached tier whenever a flush or a
@@ -1192,6 +1193,22 @@ fn commit_rejects_writes_under_stop_pressure() {
         "expected Backpressure, got {err:?}"
     );
     assert_eq!(engine.get(Partition::Node, b"bp:k").unwrap(), None);
+
+    // An exempt write (one that releases or records retention) commits under
+    // Stop: holding it back would keep the bytes that relieve the pressure.
+    let mut exempt = mvcc_txn(&engine, &oracle);
+    exempt.exempt_from_write_pressure();
+    exempt.put(Partition::Registry, b"bp:exempt", b"v").unwrap();
+    exempt
+        .commit(&ctx)
+        .expect("exempt write commits under Stop");
+    assert_eq!(
+        engine
+            .get(Partition::Registry, b"bp:exempt")
+            .unwrap()
+            .as_deref(),
+        Some(&b"v"[..])
+    );
 
     // Pressure clears: the same write commits.
     engine.force_write_pressure(0);

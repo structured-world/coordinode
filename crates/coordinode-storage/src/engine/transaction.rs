@@ -304,6 +304,9 @@ pub struct Transaction<'a> {
     /// DERIVED index work: entries staged in the write buffer that the unit
     /// logs as sealed work rather than as mutations.
     derived: derived::DerivedLedger,
+    /// Commits even while storage sheds writes under pressure
+    /// ([`Self::exempt_from_write_pressure`]).
+    pressure_exempt: bool,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -493,7 +496,17 @@ impl<'a> Transaction<'a> {
             validate_from: snapshot.map(|s| Self::first_unseen(engine, s)),
             open: Some(engine.open_transaction()),
             derived: derived::DerivedLedger::default(),
+            pressure_exempt: false,
         }
+    }
+
+    /// Let this transaction commit while storage sheds writes under pressure.
+    ///
+    /// For metadata whose change is what relieves the pressure, such as
+    /// ending a consumer registration that holds history back: refusing it
+    /// would keep the bytes the refusal is meant to free.
+    pub fn exempt_from_write_pressure(&mut self) {
+        self.pressure_exempt = true;
     }
 
     /// The first sequence number a view at `snapshot` may have missed writes
@@ -607,6 +620,7 @@ impl<'a> Transaction<'a> {
             validate_from: state.validate_from,
             open: state.open,
             derived: state.derived,
+            pressure_exempt: false,
         }
     }
 
@@ -1285,6 +1299,7 @@ impl<'a> Transaction<'a> {
         // committed entries are never gated.
         let has_writes = !self.write_buffer.is_empty() || self.has_pending_merges();
         if has_writes
+            && !self.pressure_exempt
             && matches!(
                 self.engine.write_pressure(),
                 crate::engine::core::WritePressure::Stop

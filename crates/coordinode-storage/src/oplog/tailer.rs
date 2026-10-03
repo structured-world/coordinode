@@ -286,29 +286,74 @@ impl OplogTailer {
 
     /// List the segment files in every oplog directory, sorted by first_index.
     fn list_segments(&self) -> StorageResult<Vec<(u64, PathBuf)>> {
-        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
-        for dir in &self.oplog_dirs {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(StorageError::Io(format!("list oplog dir {dir:?}: {e}")));
-                }
-            };
-            segments.extend(entries.filter_map(|e| e.ok()).filter_map(|e| {
-                let p = e.path();
-                let idx = p
-                    .file_stem()?
-                    .to_str()?
-                    .strip_prefix("oplog-")?
-                    .parse()
-                    .ok()?;
-                Some((idx, p))
-            }));
-        }
-        segments.sort_by_key(|&(idx, _)| idx);
-        Ok(segments)
+        list_segments(&self.oplog_dirs)
     }
+}
+
+/// Every segment in `oplog_dirs`, as `(first index, path)` ascending.
+fn list_segments(oplog_dirs: &[PathBuf]) -> StorageResult<Vec<(u64, PathBuf)>> {
+    let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+    for dir in oplog_dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(StorageError::Io(format!("list oplog dir {dir:?}: {e}")));
+            }
+        };
+        segments.extend(entries.filter_map(|e| e.ok()).filter_map(|e| {
+            let p = e.path();
+            let idx = p
+                .file_stem()?
+                .to_str()?
+                .strip_prefix("oplog-")?
+                .parse()
+                .ok()?;
+            Some((idx, p))
+        }));
+    }
+    segments.sort_by_key(|&(idx, _)| idx);
+    Ok(segments)
+}
+
+/// The first log index the segments in `oplog_dirs` hold, or `None` when
+/// there are no segments.
+///
+/// # Errors
+///
+/// An oplog directory cannot be listed.
+pub fn first_retained_index(oplog_dirs: &[PathBuf]) -> StorageResult<Option<u64>> {
+    Ok(list_segments(oplog_dirs)?.first().map(|&(first, _)| first))
+}
+
+/// Bytes of the segments a reader positioned at `position` still needs: the
+/// one holding `position` and every later one. Segments are named by their
+/// first index, so a segment is needed when the next one starts above
+/// `position`, and the newest always is.
+///
+/// # Errors
+///
+/// An oplog directory cannot be listed, or a segment's size cannot be read.
+pub fn bytes_needed_from(oplog_dirs: &[PathBuf], position: u64) -> StorageResult<u64> {
+    let segments = list_segments(oplog_dirs)?;
+    let mut bytes = 0u64;
+    for (i, (_, path)) in segments.iter().enumerate() {
+        let needed = segments
+            .get(i + 1)
+            .is_none_or(|&(next_first, _)| next_first > position);
+        if !needed {
+            continue;
+        }
+        let len = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            // Purged between the listing and this read: it holds nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(StorageError::Io(format!("size of {path:?}: {e}"))),
+        };
+        // A sum of file sizes on one machine stays far below u64::MAX.
+        bytes += len;
+    }
+    Ok(bytes)
 }
 
 // ── Filter logic ──────────────────────────────────────────────────────────────

@@ -163,7 +163,6 @@ pub(crate) async fn serve(
         node_shard: _,
         registry_heartbeat_ms,
         registry_eviction_ms,
-        cdc_consumer_ttl_secs,
         cdc_heartbeat_interval_ms,
         cdc_batch_size,
         interactive_txn_idle_timeout_secs,
@@ -220,11 +219,8 @@ pub(crate) async fn serve(
         std::process::exit(1);
     }
 
-    // Operator-tunable CDC consumer TTL (seconds → ms); saturating so an
-    // absurdly large window means "effectively never reclaim".
-    let cdc_ttl_ms = cdc_consumer_ttl_secs
-        .map(|s| s.saturating_mul(1000))
-        .unwrap_or(services::cdc::DEFAULT_CONSUMER_TTL_MS);
+    // A consumer's own liveness timeout is checked against the heartbeat
+    // interval when it registers; nothing is shared to check here.
     let cdc_tuning = {
         let default = services::cdc::CdcStreamTuning::default();
         services::cdc::CdcStreamTuning {
@@ -235,10 +231,6 @@ pub(crate) async fn serve(
             batch_size: cdc_batch_size.unwrap_or(default.batch_size),
         }
     };
-    if let Err(e) = cdc_tuning.check(cdc_ttl_ms) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
 
     logging::init_logging();
 
@@ -739,19 +731,28 @@ pub(crate) async fn serve(
         std::time::Duration::from_secs(1),
     );
 
-    // Per-shard consumer-retention registry. Once CDC / backup
-    // consumers register, it holds older MVCC versions / oplog segments
-    // back for them, on top of the engine's own time-travel window (which
-    // the engine enforces by itself from `retention_window_secs`). The
-    // background service runs batched heartbeats + TTL eviction. Both
-    // standalone and cluster modes drive it through the same Raft
-    // pipeline. Held for the process lifetime.
-    // Operator overrides for the background cadences arrive from the
-    // config file; `None` keeps the built-in defaults (1 s heartbeat
-    // window, 1 s between sweeps).
+    // Per-shard consumer-retention registry: every change-stream consumer is
+    // registered here with its retention policy, over the history this node
+    // holds (the Raft log, the MVCC store). The background service flushes
+    // heartbeats and ends a BOUNDED registration whose bound is crossed. Both
+    // standalone and cluster modes drive it through the same Raft pipeline.
+    // Held for the process lifetime. Operator overrides for the background
+    // cadences arrive from the config file; `None` keeps the built-in
+    // defaults (1 s heartbeat window, 1 s between sweeps).
+    let retention_source: Arc<dyn coordinode_replicate::RetentionSource> = {
+        let applied_node = Arc::clone(&raft_node);
+        Arc::new(registry::NodeRetentionSource::new(
+            Arc::clone(&engine),
+            coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
+                .map_err(|e| format!("oplog directories: {e}"))?
+                .all,
+            Arc::new(move || applied_node.applied_through()),
+        ))
+    };
     let (consumer_registry, _registry_bg) = registry::build_consumer_registry(
         Arc::clone(&engine),
         Arc::clone(&pipeline),
+        retention_source,
         registry::RegistryTuning {
             heartbeat_window_ms: registry_heartbeat_ms,
             eviction_interval_ms: registry_eviction_ms,
@@ -1018,13 +1019,11 @@ pub(crate) async fn serve(
             &database.read().engine_shared(),
             Arc::clone(rn),
             consumer_registry,
-            cdc_ttl_ms,
         )?,
         None => services::cdc::ChangeEventServiceImpl::new(
             0,
             Vec::new(),
             consumer_registry,
-            cdc_ttl_ms,
             Arc::new(|| 0),
             None,
         ),

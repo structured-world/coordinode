@@ -1,50 +1,109 @@
 //! The persisted registry record and its `Partition::Registry` keyspace codec.
 //!
-//! One [`RegistryEntry`] is stored per consumer at key `registry:<consumer_id>`
-//! and replicates through the shard's Raft group. `shard_floor` is
-//! `min(checkpoint_seqno)` over the decoded entries in this keyspace.
+//! One [`RegistryEntry`] is stored per consumer id at key
+//! `consumer:<consumer_id>` and replicates through the shard's ordering
+//! group. A terminated registration keeps its record: the incarnation it
+//! carries is what refuses the ended handle and numbers the next one.
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{ConsumerKind, TopologyScope};
+use super::source::RetentionSource;
+use super::types::{
+    ConsumerKind, ConsumerRetentionPolicy, RegistrationState, TerminalReason, TopologyScope,
+};
 
 /// Key prefix for every registry record within `Partition::Registry`.
-pub(crate) const REGISTRY_KEY_PREFIX: &[u8] = b"registry:";
+pub(crate) const REGISTRY_KEY_PREFIX: &[u8] = b"consumer:";
+
+/// Key prefix of records written before registrations carried a retention
+/// policy and an incarnation. Those were all short-lived change-stream
+/// registrations; a sweep deletes whatever is left of them.
+pub(crate) const LEGACY_KEY_PREFIX: &[u8] = b"registry:";
 
 /// The full replicated state of one registration on this shard.
-///
-/// Extends [`ConsumerRegistration`](super::ConsumerRegistration) with the
-/// mutable progress (`checkpoint_seqno`, `last_heartbeat_ts_ms`) and
-/// `scope_origin` (where the registration was originally placed, for ops
-/// clarity when a broader-scope consumer is seen on this shard).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistryEntry {
     pub consumer_id: String,
+    /// Counts the registrations this id has had on this shard, from 1.
+    pub incarnation: u64,
     pub kind: ConsumerKind,
     pub scope: TopologyScope,
     pub scope_origin: TopologyScope,
+    pub retention: ConsumerRetentionPolicy,
+    pub state: RegistrationState,
     pub checkpoint_seqno: u64,
     pub last_heartbeat_ts_ms: u64,
-    pub ttl_ms: u64,
 }
 
 impl RegistryEntry {
-    /// `true` when `now_ms - last_heartbeat_ts_ms > ttl_ms` and `ttl_ms != 0`.
-    /// `ttl_ms == 0` is a persistent registration that never auto-evicts.
-    pub(crate) fn is_expired(&self, now_ms: u64) -> bool {
-        self.ttl_ms != 0 && now_ms.saturating_sub(self.last_heartbeat_ts_ms) > self.ttl_ms
+    /// Whether this registration still holds its protection.
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self.state, RegistrationState::Live)
     }
 
-    /// The first instant (ms) at which [`Self::is_expired`] holds, or `None`
-    /// for a registration that never expires.
-    pub(crate) fn expires_at_ms(&self) -> Option<u64> {
-        if self.ttl_ms == 0 {
+    /// The reason a live BOUNDED registration must end at `now_ms`, or `None`
+    /// while every declared bound holds. STRICT, and an already ended
+    /// registration, never end here.
+    ///
+    /// Liveness is judged first: a consumer that stopped heartbeating is gone
+    /// whatever its progress was.
+    pub(crate) fn termination(
+        &self,
+        now_ms: u64,
+        source: &dyn RetentionSource,
+    ) -> Option<TerminalReason> {
+        if !self.is_live() {
             return None;
         }
-        // An instant past the clock's range is never reached.
-        self.last_heartbeat_ts_ms
-            .checked_add(self.ttl_ms)?
-            .checked_add(1)
+        let ConsumerRetentionPolicy::Bounded(bounds) = self.retention else {
+            return None;
+        };
+        if let Some(timeout) = bounds.liveness_timeout_ms() {
+            // A clock read before the stored heartbeat (another member's
+            // clock, or a step back) is no evidence of absence: no time has
+            // passed for this judgement.
+            if now_ms.saturating_sub(self.last_heartbeat_ts_ms) > timeout {
+                return Some(TerminalReason::LivenessExpired);
+            }
+        }
+        if self.checkpoint_seqno < source.head(self.kind) {
+            if let Some(produced) = source.produced_at_ms(self.kind, self.checkpoint_seqno) {
+                // Same clock rule as above: work stamped after `now_ms` has
+                // no age yet.
+                if now_ms.saturating_sub(produced) > bounds.max_progress_lag_ms() {
+                    return Some(TerminalReason::ProgressLagExceeded);
+                }
+            }
+        }
+        if let Some(bytes) = source.retained_bytes_from(self.kind, self.checkpoint_seqno) {
+            if bytes > bounds.max_retained_bytes() {
+                return Some(TerminalReason::RetainedBytesExceeded);
+            }
+        }
+        None
+    }
+
+    /// The earliest clock ms at which [`Self::termination`] can change its
+    /// answer without anything else happening, or `None` when only a change
+    /// to the source or the registry can.
+    pub(crate) fn next_deadline_ms(&self, source: &dyn RetentionSource) -> Option<u64> {
+        if !self.is_live() {
+            return None;
+        }
+        let ConsumerRetentionPolicy::Bounded(bounds) = self.retention else {
+            return None;
+        };
+        let liveness = bounds
+            .liveness_timeout_ms()
+            .and_then(|t| self.last_heartbeat_ts_ms.checked_add(t)?.checked_add(1));
+        let lag = (self.checkpoint_seqno < source.head(self.kind))
+            .then(|| source.produced_at_ms(self.kind, self.checkpoint_seqno))
+            .flatten()
+            .and_then(|at| at.checked_add(bounds.max_progress_lag_ms())?.checked_add(1));
+        match (liveness, lag) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Serialize to the replicated msgpack wire form.

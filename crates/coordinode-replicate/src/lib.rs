@@ -39,9 +39,10 @@ pub mod transfer;
 mod writer;
 
 pub use registry::{
-    BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerSnapshot, InitialSeqno,
-    RegisteredHandle, RegistryBackground, RegistryError, SeqnoConsumerRegistry,
-    ShardConsumerRegistry, SystemClock, TopologyScope,
+    BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy,
+    ConsumerSnapshot, InitialSeqno, RegisteredHandle, RegistrationState, RegistryBackground,
+    RegistryError, RetentionSource, SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock,
+    TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
 pub use segment_store::{RepairError, SegmentInstaller};
 pub use writer::ReplicatedWriter;

@@ -120,6 +120,11 @@ pub enum Reason {
     /// `first_retained_index` when the position is known. Terminal for that
     /// position: resubscribing from the same token is refused again.
     RetentionLost,
+    /// A change-stream consumer's registration has ended: cancelled, or a
+    /// BOUNDED bound was crossed. Metadata carries `incarnation`, `reason` and
+    /// `checkpoint` (the last position acknowledged). Terminal for that
+    /// incarnation: registering the id again starts a new one.
+    ConsumerTerminated,
 }
 
 impl Reason {
@@ -146,6 +151,7 @@ impl Reason {
             Reason::DuplicateKey => "DUPLICATE_KEY",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
             Reason::RetentionLost => "RETENTION_LOST",
+            Reason::ConsumerTerminated => "CONSUMER_TERMINATED",
         }
     }
 

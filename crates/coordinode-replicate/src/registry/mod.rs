@@ -1,80 +1,83 @@
-//! `SeqnoConsumerRegistry` — the single source of truth for "what is the
-//! oldest seqno still needed by any active consumer" on a shard.
+//! `SeqnoConsumerRegistry`: the per-shard record of which consumers need the
+//! shard's history, from where, and for how long.
 //!
-//! The registry unifies three previously-independent retention drivers (the
-//! lsm-tree compaction `gc_watermark`, oplog segment retention, and the EE
-//! tiering-DDL validator) behind one per-shard, Raft-replicated keyspace.
-//! Consumers `register`, then `heartbeat` to stay alive and `checkpoint` to
-//! advance their progress; the shard's effective retention floor is
-//! `min(checkpoint_seqno)` over every live registration.
+//! The registry feeds the retention of the history consumers read: the
+//! lsm-tree GC watermark (MVCC seqno space) and oplog segment retention
+//! (oplog index space). Each consumer registers with an explicit retention
+//! policy: STRICT keeps its protection until it is cancelled, BOUNDED until
+//! a declared bound is crossed. A shard's floor in each space is the minimum
+//! checkpoint over its live registrations.
 //!
-//! Public surface (types + trait) plus the Raft-backed
-//! [`ShardConsumerRegistry`] implementation: eager register / checkpoint /
-//! unregister proposals, batched heartbeats + TTL eviction
-//! ([`RegistryBackground`]), and the retention feeds — the consumer floor
-//! published to the engine GC watermark (feed a; the engine combines it by
-//! `min` with its own time-travel window and live snapshot pins) and the
-//! oplog retention floor (feed b). Floors are split by consumer space (MVCC
-//! seqno vs oplog Raft index); see [`ConsumerKind::is_seqno_space`].
+//! Public surface (types and trait) plus the replicated
+//! [`ShardConsumerRegistry`] implementation, whose every transition is a
+//! transaction conditioned on the record it read, and its background service
+//! ([`RegistryBackground`]): coalesced heartbeats and the sweep that ends a
+//! BOUNDED registration once its bound is crossed.
 
 mod entry;
 mod shard;
+mod source;
 mod types;
 
 pub use shard::{BackgroundConfig, Clock, RegistryBackground, ShardConsumerRegistry, SystemClock};
+pub use source::RetentionSource;
 pub use types::{
-    ConsumerKind, ConsumerRegistration, ConsumerSnapshot, InitialSeqno, RegisteredHandle,
-    RegistryError, TopologyScope,
+    ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
+    RegisteredHandle, RegistrationState, RegistryError, TerminalReason, TopologyScope,
+    ValidatedRetentionBounds,
 };
 
 /// Per-shard accounting of consumer retention checkpoints.
 ///
-/// `heartbeat` is the only high-frequency call (batched at the leader);
-/// `checkpoint` advances the consumer's progress and, transitively, the
-/// shard floor (eagerly persisted). `shard_floor` is the canonical retention
-/// bound the compaction filter, oplog manager, and tiering validator read.
+/// `heartbeat` is the only high-frequency call (batched); `checkpoint`
+/// advances the consumer's progress and, transitively, the shard floor.
+/// Every call made through a handle is refused once the incarnation it names
+/// has ended.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a `SeqnoConsumerRegistry`",
     label = "this type cannot account for consumer retention",
-    note = "use the Raft-backed registry in `coordinode-replicate`, or implement \
+    note = "use the replicated registry in `coordinode-replicate`, or implement \
             `SeqnoConsumerRegistry` for a custom retention source"
 )]
 pub trait SeqnoConsumerRegistry {
-    /// Register a consumer on this shard, returning a handle for subsequent
-    /// `checkpoint` / `heartbeat` / `unregister` calls.
+    /// Register a consumer on this shard, returning a handle to a new
+    /// incarnation.
     ///
     /// # Errors
-    /// [`RegistryError::EmptyConsumerId`] if `reg.consumer_id` is empty;
-    /// [`RegistryError::Replication`] if the registration proposal does not
-    /// commit.
+    /// [`RegistryError::EmptyConsumerId`], [`RegistryError::UnsupportedScope`],
+    /// [`RegistryError::InvalidRetention`] when the policy cannot be admitted,
+    /// [`RegistryError::RetentionLost`] when the starting position is no
+    /// longer held, [`RegistryError::AlreadyRegistered`] while another
+    /// incarnation of the id is live, and the commit failures.
     fn register(&self, reg: ConsumerRegistration) -> Result<RegisteredHandle, RegistryError>;
 
-    /// Advance the consumer's checkpoint to `seqno` (eagerly persisted).
+    /// Advance the consumer's checkpoint to `seqno`; a lower one is ignored.
     ///
     /// # Errors
-    /// [`RegistryError::UnknownConsumer`] if the handle has no live
-    /// registration; [`RegistryError::Replication`] on commit failure.
+    /// The handle refusals ([`RegistryError::UnknownConsumer`],
+    /// [`RegistryError::StaleIncarnation`], [`RegistryError::Terminated`]) and
+    /// the commit failures.
     fn checkpoint(&self, handle: &RegisteredHandle, seqno: u64) -> Result<(), RegistryError>;
 
-    /// Renew the consumer's liveness (batched at the leader).
+    /// Record that the consumer is alive. Proves liveness only: it never
+    /// moves the checkpoint or resets progress age.
     ///
     /// # Errors
-    /// [`RegistryError::UnknownConsumer`] if the handle has no live
-    /// registration.
+    /// The handle refusals when written at once; a buffered heartbeat of an
+    /// ended incarnation is dropped when flushed.
     fn heartbeat(&self, handle: &RegisteredHandle) -> Result<(), RegistryError>;
 
-    /// Remove the consumer's registration, freeing the retention it pinned.
+    /// Cancel the registration: its incarnation ends and stops holding the
+    /// source. The record stays, refusing the handle from now on.
     ///
     /// # Errors
-    /// [`RegistryError::UnknownConsumer`] if already removed;
-    /// [`RegistryError::Replication`] on commit failure.
+    /// The handle refusals and the commit failures.
     fn unregister(&self, handle: RegisteredHandle) -> Result<(), RegistryError>;
 
-    /// The canonical retention floor: `min(checkpoint_seqno)` over every live
-    /// registration on this shard. No live consumers → no floor constraint
-    /// (returns `u64::MAX`, i.e. "retain nothing on behalf of consumers").
+    /// The MVCC-space floor: `min(checkpoint_seqno)` over live MVCC-space
+    /// registrations, or `u64::MAX` when there is none.
     fn shard_floor(&self) -> u64;
 
-    /// Snapshot every live registration on this shard (ops / debugging).
+    /// Every registration on this shard, live or ended (ops / debugging).
     fn list_consumers(&self) -> Vec<ConsumerSnapshot>;
 }

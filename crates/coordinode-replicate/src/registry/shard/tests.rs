@@ -1,10 +1,11 @@
 use super::*;
-use crate::registry::types::ConsumerKind;
+use crate::registry::types::{ConsumerKind, ValidatedRetentionBounds};
+use coordinode_core::txn::proposal::RaftProposal;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::proposal::RaftProposalPipeline;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 
-/// Test clock the suite advances by hand for deterministic TTL expiry.
+/// Test clock the suite advances by hand.
 struct ManualClock(Mutex<u64>);
 impl ManualClock {
     fn new(start: u64) -> Self {
@@ -20,14 +21,72 @@ impl Clock for ManualClock {
     }
 }
 
-async fn registry_with_clock(
-    clock: Arc<dyn Clock>,
-) -> (
-    ShardConsumerRegistry,
-    Arc<StorageEngine>,
-    Arc<RaftNode>,
-    tempfile::TempDir,
-) {
+/// A source whose positions, ages and sizes the test sets. One space serves
+/// every kind.
+#[derive(Default)]
+struct FakeSource {
+    head: AtomicU64,
+    first: AtomicU64,
+    /// Clock ms each position was produced at.
+    produced: Mutex<HashMap<u64, u64>>,
+    /// Bytes required from any position.
+    bytes: AtomicU64,
+    unaccounted: AtomicBool,
+    /// Whether the source is out of room for new retention.
+    pressured: AtomicBool,
+}
+
+impl FakeSource {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    fn set_head(&self, head: u64) {
+        self.head.store(head, Ordering::Release);
+    }
+    fn set_first(&self, first: u64) {
+        self.first.store(first, Ordering::Release);
+    }
+    fn produced(&self, position: u64, at_ms: u64) {
+        self.produced.lock().insert(position, at_ms);
+    }
+    fn set_bytes(&self, bytes: u64) {
+        self.bytes.store(bytes, Ordering::Release);
+    }
+    fn set_pressured(&self, pressured: bool) {
+        self.pressured.store(pressured, Ordering::Release);
+    }
+}
+
+impl RetentionSource for FakeSource {
+    fn head(&self, _: ConsumerKind) -> u64 {
+        self.head.load(Ordering::Acquire)
+    }
+    fn first_retained(&self, _: ConsumerKind) -> u64 {
+        self.first.load(Ordering::Acquire)
+    }
+    fn accounts(&self, _: ConsumerKind) -> bool {
+        !self.unaccounted.load(Ordering::Acquire)
+    }
+    fn produced_at_ms(&self, _: ConsumerKind, position: u64) -> Option<u64> {
+        self.produced.lock().get(&position).copied()
+    }
+    fn retained_bytes_from(&self, _: ConsumerKind, _: u64) -> Option<u64> {
+        Some(self.bytes.load(Ordering::Acquire))
+    }
+    fn admits(&self, _: ConsumerKind) -> bool {
+        !self.pressured.load(Ordering::Acquire)
+    }
+}
+
+struct Fixture {
+    reg: ShardConsumerRegistry,
+    engine: Arc<StorageEngine>,
+    node: Arc<RaftNode>,
+    source: Arc<FakeSource>,
+    _dir: tempfile::TempDir,
+}
+
+async fn fixture(clock: Arc<dyn Clock>) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -45,749 +104,884 @@ async fn registry_with_clock(
             .await
             .expect("raft node"),
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let pipeline: Arc<dyn ProposalPipeline> =
-        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
-    let id_gen = Arc::new(ProposalIdGenerator::with_base(1u64 << 48));
-    let reg = ShardConsumerRegistry::new(Arc::clone(&engine), pipeline, id_gen, clock);
-    (reg, engine, node, dir)
-}
-
-/// Seqno-space registration (drives the GC watermark / `shard_floor`).
-fn registration(id: &str, scope: TopologyScope, ttl_ms: u64) -> ConsumerRegistration {
-    ConsumerRegistration {
-        consumer_id: id.to_string(),
-        kind: ConsumerKind::LsmStateDelta,
-        scope,
-        initial_seqno: InitialSeqno::At(0),
-        ttl_ms,
+    let source = FakeSource::new();
+    let reg = registry_over(&engine, &node, clock, Arc::clone(&source), 1);
+    Fixture {
+        reg,
+        engine,
+        node,
+        source,
+        _dir: dir,
     }
 }
 
+/// Another registry over the same replicated keyspace: another member, or
+/// this one after a restart.
+fn registry_over(
+    engine: &Arc<StorageEngine>,
+    node: &Arc<RaftNode>,
+    clock: Arc<dyn Clock>,
+    source: Arc<FakeSource>,
+    id_space: u64,
+) -> ShardConsumerRegistry {
+    let pipeline: Arc<dyn ProposalPipeline> =
+        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
+    ShardConsumerRegistry::new(
+        Arc::clone(engine),
+        pipeline,
+        Arc::new(ProposalIdGenerator::with_base(id_space << 48)),
+        clock,
+        source,
+    )
+}
+
+fn bounded(lag_ms: u64, bytes: u64, liveness_ms: Option<u64>) -> ConsumerRetentionPolicy {
+    ConsumerRetentionPolicy::Bounded(
+        ValidatedRetentionBounds::new(lag_ms, bytes, liveness_ms).expect("bounds"),
+    )
+}
+
+/// A seqno-space registration starting at `at`.
+fn registration(id: &str, at: u64, retention: ConsumerRetentionPolicy) -> ConsumerRegistration {
+    ConsumerRegistration {
+        consumer_id: id.to_string(),
+        kind: ConsumerKind::LsmStateDelta,
+        scope: TopologyScope::Cluster,
+        initial_seqno: InitialSeqno::At(at),
+        retention,
+    }
+}
+
+fn state_of(reg: &ShardConsumerRegistry, id: &str) -> RegistrationState {
+    reg.list_consumers()
+        .into_iter()
+        .find(|c| c.consumer_id == id)
+        .expect("listed")
+        .state
+}
+
+fn ended_for(reg: &ShardConsumerRegistry, id: &str) -> Option<TerminalReason> {
+    match state_of(reg, id) {
+        RegistrationState::Live => None,
+        RegistrationState::Terminated { reason, .. } => Some(reason),
+    }
+}
+
+/// The floor is the slowest live consumer; checkpoints only advance; a
+/// cancelled consumer stops holding the floor but keeps its record.
 #[tokio::test(flavor = "multi_thread")]
-async fn register_checkpoint_unregister_drive_floor() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
+async fn register_checkpoint_cancel_drive_floor() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    assert_eq!(f.reg.shard_floor(), u64::MAX);
 
-    assert_eq!(reg.shard_floor(), u64::MAX);
-
-    let h1 = reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(100),
-            ..registration("c1", TopologyScope::Cluster, 0)
-        })
+    let h1 = f
+        .reg
+        .register(registration("c1", 100, ConsumerRetentionPolicy::Strict))
         .expect("register c1");
-    let h2 = reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(250),
-            ..registration("c2", TopologyScope::Shard(0), 0)
-        })
+    let h2 = f
+        .reg
+        .register(registration("c2", 250, ConsumerRetentionPolicy::Strict))
         .expect("register c2");
-    assert_eq!(reg.shard_floor(), 100, "floor is the slowest consumer");
+    assert_eq!(f.reg.shard_floor(), 100, "floor is the slowest consumer");
+    assert_eq!((h1.incarnation(), h2.incarnation()), (1, 1));
 
-    reg.checkpoint(&h1, 300).expect("checkpoint c1");
-    assert_eq!(reg.shard_floor(), 250);
-
-    reg.checkpoint(&h2, 10).expect("stale checkpoint c2");
+    f.reg.checkpoint(&h1, 300).expect("checkpoint c1");
+    assert_eq!(f.reg.shard_floor(), 250);
+    f.reg.checkpoint(&h2, 10).expect("stale checkpoint c2");
     assert_eq!(
-        reg.shard_floor(),
+        f.reg.shard_floor(),
         250,
-        "stale checkpoint must not rewind floor"
+        "a stale checkpoint must not rewind the floor"
     );
 
-    reg.unregister(h2).expect("unregister c2");
-    assert_eq!(reg.shard_floor(), 300);
+    f.reg.unregister(h2).expect("cancel c2");
+    assert_eq!(
+        f.reg.shard_floor(),
+        300,
+        "a cancelled consumer holds nothing"
+    );
+    assert_eq!(ended_for(&f.reg, "c2"), Some(TerminalReason::Cancelled));
+    assert_eq!(ended_for(&f.reg, "c1"), None);
 
-    let listed = reg.list_consumers();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].consumer_id, "c1");
-    assert_eq!(listed[0].checkpoint_seqno, 300);
-
-    reg.unregister(h1).expect("unregister c1");
-    assert_eq!(reg.shard_floor(), u64::MAX, "no consumers → unconstrained");
-
-    node.shutdown().await.expect("shutdown");
+    f.reg.unregister(h1).expect("cancel c1");
+    assert_eq!(
+        f.reg.shard_floor(),
+        u64::MAX,
+        "no live consumer, no constraint"
+    );
+    f.node.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn empty_consumer_id_is_rejected() {
-    let clock = Arc::new(ManualClock::new(0));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock).await;
-    let err = reg
-        .register(registration("", TopologyScope::Cluster, 0))
-        .unwrap_err();
-    assert!(matches!(err, RegistryError::EmptyConsumerId));
-    node.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn ce_rejects_dc_and_rack_scopes() {
-    let clock = Arc::new(ManualClock::new(0));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock).await;
+async fn empty_id_and_ce_topology_scopes_are_refused() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    assert!(matches!(
+        f.reg
+            .register(registration("", 0, ConsumerRetentionPolicy::Strict))
+            .unwrap_err(),
+        RegistryError::EmptyConsumerId
+    ));
     for scope in [
         TopologyScope::Dc("eu".into()),
         TopologyScope::Rack("r1".into()),
     ] {
-        let err = reg.register(registration("c", scope, 0)).unwrap_err();
-        assert!(
-            matches!(err, RegistryError::UnsupportedScope(_)),
-            "CE must reject dc/rack, got {err:?}"
+        let err = f
+            .reg
+            .register(ConsumerRegistration {
+                scope,
+                ..registration("c", 0, ConsumerRetentionPolicy::Strict)
+            })
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::UnsupportedScope(_)), "{err:?}");
+    }
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// EE enable path: `with_topology_scopes()` accepts the scopes CE refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn ee_topology_scopes_accept_dc_and_rack() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    let reg = registry_over(
+        &f.engine,
+        &f.node,
+        Arc::new(ManualClock::new(0)),
+        Arc::clone(&f.source),
+        2,
+    )
+    .with_topology_scopes();
+    for (id, scope) in [
+        ("dc-sink", TopologyScope::Dc("eu".into())),
+        ("rack-sink", TopologyScope::Rack("r1".into())),
+    ] {
+        reg.register(ConsumerRegistration {
+            scope,
+            ..registration(id, 0, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("EE accepts the scope");
+    }
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A handle of an id never registered is refused, not treated as a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handle_of_an_unknown_consumer_is_refused() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    let phantom = RegisteredHandle::new("never-registered", 1);
+    assert!(matches!(
+        f.reg.checkpoint(&phantom, 5).unwrap_err(),
+        RegistryError::UnknownConsumer(_)
+    ));
+    assert!(matches!(
+        f.reg.heartbeat(&phantom).unwrap_err(),
+        RegistryError::UnknownConsumer(_)
+    ));
+    assert!(matches!(
+        f.reg.unregister(phantom).unwrap_err(),
+        RegistryError::UnknownConsumer(_)
+    ));
+    assert!(matches!(
+        f.reg.resume("never-registered", 1).unwrap_err(),
+        RegistryError::UnknownConsumer(_)
+    ));
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// STRICT has no automatic expiry: a consumer silent for any length of time,
+/// and far behind its source, keeps its protection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strict_consumer_survives_missing_heartbeats_and_any_lag() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let f = fixture(clock.clone()).await;
+    f.reg
+        .register(registration("strict", 5, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    f.source.set_head(1_000);
+    f.source.produced(5, 1_000);
+    f.source.set_bytes(u64::MAX / 2);
+
+    clock.set(1_000 + 365 * 24 * 3_600 * 1_000);
+    let swept = f.reg.core.sweep_evictions().expect("sweep");
+    assert_eq!(swept.evicted, 0);
+    assert_eq!(ended_for(&f.reg, "strict"), None);
+    assert_eq!(f.reg.shard_floor(), 5, "it still holds the floor");
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// BOUNDED liveness: a consumer silent past its timeout ends, durably, with
+/// that reason; the floor it held lifts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_bounded_consumer_ends_for_liveness() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let f = fixture(clock.clone()).await;
+    f.reg
+        .register(registration(
+            "silent",
+            50,
+            bounded(60_000, 1 << 30, Some(5_000)),
+        ))
+        .expect("register");
+    f.reg
+        .register(registration("strict", 900, ConsumerRetentionPolicy::Strict))
+        .expect("register strict");
+    assert_eq!(f.reg.shard_floor(), 50);
+
+    clock.set(6_000);
+    assert_eq!(
+        f.reg.core.sweep_evictions().expect("sweep").evicted,
+        0,
+        "at the boundary"
+    );
+    clock.set(6_001);
+    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    assert_eq!(
+        ended_for(&f.reg, "silent"),
+        Some(TerminalReason::LivenessExpired)
+    );
+    assert_eq!(
+        f.reg.shard_floor(),
+        900,
+        "the ended consumer no longer holds retention"
+    );
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// BOUNDED progress lag: the oldest unacknowledged work outgrowing the limit
+/// ends the registration, and heartbeats do not reset that age.
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_do_not_reset_progress_lag() {
+    let clock = Arc::new(ManualClock::new(10_000));
+    let f = fixture(clock.clone()).await;
+    let h = f
+        .reg
+        .register(registration(
+            "lagging",
+            7,
+            bounded(1_000, 1 << 30, Some(60_000)),
+        ))
+        .expect("register");
+    f.source.set_head(20);
+    f.source.produced(7, 10_000);
+
+    for t in [10_500, 10_900, 11_000] {
+        clock.set(t);
+        f.reg.heartbeat(&h).expect("heartbeat");
+        assert_eq!(
+            f.reg.core.sweep_evictions().expect("sweep").evicted,
+            0,
+            "at {t}"
         );
     }
-    node.shutdown().await.expect("shutdown");
+    clock.set(11_001);
+    f.reg.heartbeat(&h).expect("heartbeat");
+    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    assert_eq!(
+        ended_for(&f.reg, "lagging"),
+        Some(TerminalReason::ProgressLagExceeded)
+    );
+    f.node.shutdown().await.expect("shutdown");
 }
 
+/// An idle source leaves nothing unacknowledged: a consumer caught up with it
+/// is not lagging, however long ago its checkpoint last moved.
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_unknown_consumer_errors() {
+async fn a_caught_up_consumer_of_an_idle_source_is_not_lagging() {
     let clock = Arc::new(ManualClock::new(0));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock).await;
-    let phantom = RegisteredHandle::new("never-registered");
-    assert!(matches!(
-        reg.checkpoint(&phantom, 5).unwrap_err(),
-        RegistryError::UnknownConsumer(_)
-    ));
-    assert!(matches!(
-        reg.unregister(phantom).unwrap_err(),
-        RegistryError::UnknownConsumer(_)
-    ));
-    node.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn expired_registration_is_excluded_from_floor() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
-
-    reg.register(ConsumerRegistration {
-        initial_seqno: InitialSeqno::At(50),
-        ..registration("ttl-consumer", TopologyScope::Cluster, 5_000)
-    })
-    .expect("register ttl");
-    reg.register(ConsumerRegistration {
-        initial_seqno: InitialSeqno::At(900),
-        ..registration("persistent", TopologyScope::Cluster, 0)
-    })
-    .expect("register persistent");
-    assert_eq!(
-        reg.shard_floor(),
-        50,
-        "ttl consumer pins the floor while alive"
-    );
-
-    clock.set(7_000);
-    let floor = reg.core.recompute_floor().expect("recompute");
-    assert_eq!(floor, 900, "expired consumer no longer pins retention");
-    assert_eq!(
-        reg.list_consumers().len(),
-        1,
-        "expired excluded from listing"
-    );
-
-    node.shutdown().await.expect("shutdown");
-}
-
-/// With the background service running, heartbeats buffer and flush
-/// as a coalesced proposal; the persisted `last_heartbeat_ts` advances
-/// without a per-heartbeat Raft round-trip.
-#[tokio::test(flavor = "multi_thread")]
-async fn batched_heartbeats_flush_and_refresh_liveness() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
-    let h = reg
-        .register(registration("hb", TopologyScope::Cluster, 10_000))
+    let f = fixture(clock.clone()).await;
+    f.reg
+        .register(registration("idle", 42, bounded(1_000, 1 << 30, None)))
         .expect("register");
+    f.source.set_head(42);
+    f.source.produced(42, 0);
 
-    let bg = reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 30,
-        eviction_interval_ms: 100_000, // don't evict during this test
-    });
-
-    // Buffer several heartbeats at a later clock time; none hit Raft yet.
-    clock.set(4_000);
-    for _ in 0..5 {
-        reg.heartbeat(&h).expect("buffer heartbeat");
-    }
-
-    // The first buffered heartbeat opens a 30 ms window; the flush after it
-    // is a proposal, whose fsync can take longer than the window on a slow
-    // disk, so wait for the write rather than for a fixed time.
-    let until = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut listed = reg.list_consumers();
-    while listed.first().map(|c| c.last_heartbeat_ts_ms) != Some(4_000)
-        && tokio::time::Instant::now() < until
-    {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        listed = reg.list_consumers();
-    }
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed[0].last_heartbeat_ts_ms, 4_000,
-        "coalesced flush advanced last_heartbeat_ts to the buffered time"
-    );
-
-    bg.shutdown().await;
-    node.shutdown().await.expect("shutdown");
+    clock.set(1_000_000);
+    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 0);
+    assert_eq!(ended_for(&f.reg, "idle"), None);
+    f.node.shutdown().await.expect("shutdown");
 }
 
-/// Feed (a), combine B: a registered consumer holds the engine GC
-/// watermark back to its checkpoint (CockroachDB protected-timestamp /
-/// TiDB service-safe-point shape); with no consumers the watermark falls
-/// to the time-travel window, NOT `u64::MAX` (option A's bug that would
-/// GC the whole `AS OF TIMESTAMP` history).
+/// BOUNDED bytes: once the material the checkpoint requires exceeds the
+/// limit, the registration ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_requiring_too_many_bytes_ends() {
+    let clock = Arc::new(ManualClock::new(0));
+    let f = fixture(clock.clone()).await;
+    f.reg
+        .register(registration("heavy", 3, bounded(u64::MAX, 4_096, None)))
+        .expect("register");
+    f.source.set_bytes(4_096);
+    assert_eq!(
+        f.reg.core.sweep_evictions().expect("sweep").evicted,
+        0,
+        "at the limit"
+    );
+    f.source.set_bytes(4_097);
+    assert_eq!(f.reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    assert_eq!(
+        ended_for(&f.reg, "heavy"),
+        Some(TerminalReason::RetainedBytesExceeded)
+    );
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// An ended incarnation refuses every call made through its handle, with the
+/// reason and the last checkpoint; its checkpoint does not move.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_handle_is_refused_everywhere() {
+    let clock = Arc::new(ManualClock::new(0));
+    let f = fixture(clock).await;
+    let h = f
+        .reg
+        .register(registration("gone", 10, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    f.reg.checkpoint(&h, 12).expect("checkpoint");
+    f.reg.unregister(h.clone()).expect("cancel");
+
+    let is_ended = |e: RegistryError| {
+        matches!(
+            e,
+            RegistryError::Terminated {
+                incarnation: 1,
+                reason: TerminalReason::Cancelled,
+                checkpoint: 12,
+                ..
+            }
+        )
+    };
+    assert!(is_ended(f.reg.checkpoint(&h, 99).unwrap_err()));
+    assert!(is_ended(f.reg.heartbeat(&h).unwrap_err()));
+    assert!(is_ended(f.reg.check_retention(&h).unwrap_err()));
+    assert!(is_ended(f.reg.resume("gone", 1).unwrap_err()));
+    assert!(is_ended(f.reg.unregister(h).unwrap_err()));
+    assert_eq!(
+        f.reg
+            .list_consumers()
+            .iter()
+            .find(|c| c.consumer_id == "gone")
+            .map(|c| c.checkpoint_seqno),
+        Some(12),
+        "a refused checkpoint moved nothing"
+    );
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A live id cannot be registered over; once it has ended, registering it
+/// again starts a new incarnation and the old handle stays refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn reregistering_an_ended_id_starts_a_new_incarnation() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    let first = f
+        .reg
+        .register(registration("sink", 10, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    assert!(matches!(
+        f.reg
+            .register(registration("sink", 20, ConsumerRetentionPolicy::Strict))
+            .unwrap_err(),
+        RegistryError::AlreadyRegistered { incarnation: 1, .. }
+    ));
+
+    f.reg.unregister(first.clone()).expect("cancel");
+    let second = f
+        .reg
+        .register(registration("sink", 30, ConsumerRetentionPolicy::Strict))
+        .expect("register again");
+    assert_eq!(second.incarnation(), 2);
+    assert!(matches!(
+        f.reg.checkpoint(&first, 40).unwrap_err(),
+        RegistryError::StaleIncarnation {
+            handle: 1,
+            current: 2,
+            ..
+        }
+    ));
+    assert_eq!(f.reg.resume("sink", 2).expect("resume"), second);
+    assert_eq!(
+        f.reg.shard_floor(),
+        30,
+        "the new incarnation holds its own start"
+    );
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A heartbeat buffered by an ended incarnation is dropped when flushed: it
+/// is no sign of life of the incarnation registered after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_heartbeat_of_an_ended_incarnation_keeps_nothing_alive() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let f = fixture(clock.clone()).await;
+    let old = f
+        .reg
+        .register(registration("r", 0, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    f.reg.unregister(old.clone()).expect("cancel");
+    let new = f
+        .reg
+        .register(registration(
+            "r",
+            0,
+            bounded(u64::MAX, u64::MAX, Some(1_000)),
+        ))
+        .expect("register again");
+
+    f.reg.core.batching_on.store(true, Ordering::Release);
+    clock.set(5_000);
+    f.reg.heartbeat(&old).expect("buffered without validation");
+    f.reg.core.flush_pending_heartbeats().expect("flush");
+    assert!(
+        f.reg.core.pending_hb.lock().is_empty(),
+        "the stale heartbeat was dropped"
+    );
+    assert_eq!(
+        f.reg.core.sweep_evictions().expect("sweep").evicted,
+        1,
+        "the new incarnation, never heard from, ended for liveness"
+    );
+    assert!(matches!(
+        f.reg.resume("r", new.incarnation()).unwrap_err(),
+        RegistryError::Terminated {
+            reason: TerminalReason::LivenessExpired,
+            ..
+        }
+    ));
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A BOUNDED limit needs the source to measure what it bounds; one that
+/// cannot is refused, never admitted with an unjudgeable bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_is_refused_where_the_source_cannot_measure_it() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    f.source.unaccounted.store(true, Ordering::Release);
+    assert!(matches!(
+        f.reg
+            .register(registration("b", 0, bounded(1_000, 1_000, None)))
+            .unwrap_err(),
+        RegistryError::InvalidRetention(_)
+    ));
+    f.reg
+        .register(registration("s", 0, ConsumerRetentionPolicy::Strict))
+        .expect("STRICT needs no measure");
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A registration starting below what the source holds is refused: its
+/// protection would start over history already gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn registering_below_the_retained_source_is_refused() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    f.source.set_first(100);
+    assert!(matches!(
+        f.reg
+            .register(registration("late", 99, ConsumerRetentionPolicy::Strict))
+            .unwrap_err(),
+        RegistryError::RetentionLost {
+            checkpoint: 99,
+            floor: 100
+        }
+    ));
+    let h = f
+        .reg
+        .register(ConsumerRegistration {
+            initial_seqno: InitialSeqno::FromEarliestRetained,
+            ..registration("earliest", 0, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("from the earliest retained");
+    assert_eq!(f.reg.check_retention(&h).expect("held"), 100);
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// An acknowledgement and an expiry racing over one record: whichever lands
+/// second decides against what the first left. Here the acknowledgement
+/// lands after the sweep read the lagging record and before its terminal
+/// write; the write finds the record moved, the sweep reads again and finds a
+/// consumer no longer lagging.
+#[test]
+fn an_acknowledgement_racing_an_expiry_keeps_the_consumer() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    let h = reg
+        .register(registration("racer", 7, bounded(1_000, 1 << 30, None)))
+        .expect("register");
+    source.set_head(20);
+    source.produced(7, 0);
+    clock.set(5_000);
+
+    *reg.core.before_commit.lock() = Some(Box::new({
+        let (reg, h) = (reg.clone(), h.clone());
+        move || {
+            reg.checkpoint(&h, 20)
+                .expect("the acknowledgement lands first")
+        }
+    }));
+    let swept = reg.core.sweep_evictions().expect("sweep");
+    assert_eq!(swept.evicted, 0, "the sweep decided on a stale read");
+    assert_eq!(ended_for(&reg, "racer"), None);
+    assert_eq!(reg.shard_floor(), 20, "the acknowledgement stands");
+}
+
+/// The other order: the expiry lands first, and the acknowledgement that
+/// follows finds the incarnation ended and changes nothing.
+#[test]
+fn an_acknowledgement_after_an_expiry_is_refused() {
+    let (reg, clock, source, _pipeline, _dir) = hooked_registry();
+    let h = reg
+        .register(registration("late-ack", 7, bounded(1_000, 1 << 30, None)))
+        .expect("register");
+    source.set_head(20);
+    source.produced(7, 0);
+    clock.set(5_000);
+    assert_eq!(reg.core.sweep_evictions().expect("sweep").evicted, 1);
+    assert!(matches!(
+        reg.checkpoint(&h, 20).unwrap_err(),
+        RegistryError::Terminated {
+            reason: TerminalReason::ProgressLagExceeded,
+            checkpoint: 7,
+            ..
+        }
+    ));
+    assert_eq!(reg.shard_floor(), u64::MAX);
+}
+
+/// A registry reopened over the same store (a restart, a new leader) finds
+/// live registrations holding their floors and ended ones still refusing
+/// their handles: nothing is resurrected.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reopened_registry_keeps_floors_and_terminal_fences() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let f = fixture(clock.clone()).await;
+    let live = f
+        .reg
+        .register(registration("backup", 100, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    f.reg.checkpoint(&live, 300).expect("checkpoint");
+    f.reg
+        .register(ConsumerRegistration {
+            kind: ConsumerKind::OplogEvents,
+            ..registration("cdc", 50, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register oplog consumer");
+    let ended = f
+        .reg
+        .register(registration("ended", 1, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    f.reg.unregister(ended.clone()).expect("cancel");
+
+    let reopened = registry_over(&f.engine, &f.node, clock, Arc::clone(&f.source), 2);
+    assert_eq!(reopened.shard_floor(), 300, "seqno floor recovered");
+    assert_eq!(
+        reopened.oplog_retention_floor(),
+        50,
+        "oplog floor recovered"
+    );
+    assert!(matches!(
+        reopened.checkpoint(&ended, 5).unwrap_err(),
+        RegistryError::Terminated { .. }
+    ));
+    assert_eq!(reopened.resume("backup", 1).expect("resume"), live);
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// Floors are split by space: an oplog consumer never pulls the MVCC GC
+/// watermark into Raft-index space, nor the reverse.
+#[tokio::test(flavor = "multi_thread")]
+async fn floors_are_split_by_consumer_space() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let oplog_h = f
+        .reg
+        .register(ConsumerRegistration {
+            kind: ConsumerKind::OplogEvents,
+            ..registration("cdc-sink", 42, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register oplog consumer");
+    assert_eq!(f.reg.oplog_retention_floor(), 42);
+    assert_eq!(f.reg.shard_floor(), u64::MAX);
+    assert_ne!(f.engine.gc_watermark(), 42);
+
+    let seqno_h = f
+        .reg
+        .register(registration(
+            "backup",
+            1_000,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register seqno consumer");
+    assert_eq!(f.reg.shard_floor(), 1_000);
+    assert_eq!(f.engine.gc_watermark(), 1_000);
+    assert_eq!(f.reg.oplog_retention_floor(), 42);
+
+    f.reg.unregister(oplog_h).expect("cancel");
+    f.reg.unregister(seqno_h).expect("cancel");
+    assert_eq!(f.reg.oplog_retention_floor(), u64::MAX);
+    assert_eq!(f.reg.shard_floor(), u64::MAX);
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A seqno consumer holds the engine GC watermark at its checkpoint; with
+/// none, the engine's own window governs, never an unconstrained watermark.
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_floor_drives_engine_gc_watermark() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-
-    // A CDC consumer checkpointed far in the past pins the watermark there,
-    // overriding the (huge, ~now) live-pin / current-seqno default.
-    let h = reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(100),
-            ..registration("cdc", TopologyScope::Cluster, 0)
-        })
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let h = f
+        .reg
+        .register(registration("cdc", 100, ConsumerRetentionPolicy::Strict))
         .expect("register");
-    assert_eq!(
-        engine.gc_watermark(),
-        100,
-        "consumer checkpoint holds GC retention back to its seqno"
-    );
-
-    reg.checkpoint(&h, 500).expect("advance checkpoint");
-    assert_eq!(
-        engine.gc_watermark(),
-        500,
-        "advancing checkpoint lifts the floor"
-    );
-
-    // No consumers → the watermark falls to the retention window, which is
-    // a real seqno (≈ now - 7d), never u64::MAX and never below the window.
-    reg.unregister(h).expect("unregister");
-    let wm = engine.gc_watermark();
+    assert_eq!(f.engine.gc_watermark(), 100);
+    f.reg.checkpoint(&h, 500).expect("advance");
+    assert_eq!(f.engine.gc_watermark(), 500);
+    f.reg.unregister(h).expect("cancel");
+    let wm = f.engine.gc_watermark();
     assert_ne!(
         wm,
         u64::MAX,
-        "empty registry must NOT collapse to GC-everything"
+        "an empty registry must not collapse to GC-everything"
     );
-    assert!(
-        wm > 500,
-        "with no consumers the time-travel window governs, not the old checkpoint (got {wm})"
-    );
-
-    node.shutdown().await.expect("shutdown");
+    assert!(wm > 500, "the time-travel window governs, got {wm}");
+    f.node.shutdown().await.expect("shutdown");
 }
 
-/// Lagging-consumer guard: when the engine GC watermark advances past a
-/// consumer's checkpoint (operator-forced GC bump), `check_retention`
-/// returns `RetentionLost` rather than letting the read silently observe a
-/// gap. A protected consumer (checkpoint at/above the watermark) gets its
-/// safe checkpoint back.
+/// When the engine has collected past a consumer's checkpoint, its read is
+/// refused with RetentionLost; a protected consumer gets its checkpoint.
 #[tokio::test(flavor = "multi_thread")]
 async fn check_retention_surfaces_retention_lost() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-
-    let h = reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(100),
-            ..registration("cdc", TopologyScope::Cluster, 0)
-        })
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let h = f
+        .reg
+        .register(registration("cdc", 100, ConsumerRetentionPolicy::Strict))
         .expect("register");
-    // Registry pins the watermark at the consumer's checkpoint → protected.
-    assert_eq!(reg.check_retention(&h).expect("protected"), 100);
-
-    // Operator force-bumps GC retention above the lagging consumer.
-    engine.set_consumer_retention_floor(1_000);
-    let lost = reg.check_retention(&h);
+    assert_eq!(f.reg.check_retention(&h).expect("protected"), 100);
+    f.engine.set_consumer_retention_floor(1_000);
+    let lost = f.reg.check_retention(&h);
     assert!(
         matches!(
             lost,
             Err(RegistryError::RetentionLost { checkpoint: 100, floor }) if floor >= 1_000
         ),
-        "expected RetentionLost{{checkpoint:100, floor>=1000}}, got {lost:?}"
+        "got {lost:?}"
     );
-
-    // Unknown consumer → UnknownConsumer, not RetentionLost.
-    assert!(matches!(
-        reg.check_retention(&RegisteredHandle::new("ghost")),
-        Err(RegistryError::UnknownConsumer(_))
-    ));
-
-    node.shutdown().await.expect("shutdown");
+    f.node.shutdown().await.expect("shutdown");
 }
 
-/// Failover recovery: registry state lives in the Raft-replicated
-/// `Partition::Registry` keyspace, so a registry constructed fresh over an
-/// engine that already holds the replicated entries (the new leader after
-/// a failover) recovers both floors + the consumer list with no
-/// re-registration. Cross-node replication of the underlying proposals is
-/// covered by `coordinode-raft`'s `cluster_multiple_proposals_replicate`;
-/// this covers the new-leader-recovers half.
+/// The time-travel window belongs to the engine: with a tiny window and no
+/// consumer, the watermark sits exactly a window below the current seqno.
 #[tokio::test(flavor = "multi_thread")]
-async fn registry_recovers_floors_from_persisted_state() {
+async fn engine_window_governs_when_no_consumer_is_registered() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    f.engine.set_retention_window(Duration::from_millis(1));
+    let h = f
+        .reg
+        .register(registration("probe", 0, ConsumerRetentionPolicy::Strict))
+        .expect("register");
+    assert_eq!(f.engine.gc_watermark(), 0);
+    f.reg.unregister(h).expect("cancel");
+    assert_eq!(f.engine.gc_watermark(), f.engine.snapshot() - 1_000);
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// `FromNow` starts at the source head, `FromEarliestRetained` at the first
+/// retained position.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_positions_resolve_against_the_source() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    f.source.set_first(11);
+    f.source.set_head(77);
+    let earliest = f
+        .reg
+        .register(ConsumerRegistration {
+            initial_seqno: InitialSeqno::FromEarliestRetained,
+            ..registration("all", 0, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register");
+    let now = f
+        .reg
+        .register(ConsumerRegistration {
+            initial_seqno: InitialSeqno::FromNow,
+            ..registration("new-only", 0, ConsumerRetentionPolicy::Strict)
+        })
+        .expect("register");
+    assert_eq!(f.reg.check_retention(&earliest).expect("held"), 11);
+    assert_eq!(f.reg.check_retention(&now).expect("held"), 77);
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// With the background service, heartbeats buffer and flush in one
+/// coalesced write.
+#[tokio::test(flavor = "multi_thread")]
+async fn batched_heartbeats_flush_and_refresh_liveness() {
     let clock = Arc::new(ManualClock::new(1_000));
-    let (reg_a, engine, node, _dir) = registry_with_clock(clock.clone()).await;
-
-    // Seqno consumer (→ gc floor) + oplog consumer (→ oplog floor).
-    let h = reg_a
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(100),
-            ..registration("backup", TopologyScope::Cluster, 0)
-        })
-        .expect("register seqno consumer");
-    reg_a.checkpoint(&h, 300).expect("checkpoint");
-    reg_a
-        .register(ConsumerRegistration {
-            consumer_id: "cdc".into(),
-            kind: ConsumerKind::OplogEvents,
-            scope: TopologyScope::Cluster,
-            initial_seqno: InitialSeqno::At(50),
-            ttl_ms: 0,
-        })
-        .expect("register oplog consumer");
-    drop(reg_a); // old leader steps down
-
-    // New leader: a fresh registry over the same (replicated) engine.
-    let pipeline: Arc<dyn ProposalPipeline> =
-        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
-    let id_gen = Arc::new(ProposalIdGenerator::with_base(2u64 << 48));
-    let reg_b = ShardConsumerRegistry::new(Arc::clone(&engine), pipeline, id_gen, clock);
-
-    // Floors recovered from the keyspace by `new()`'s recompute, no
-    // re-registration needed.
-    assert_eq!(
-        reg_b.shard_floor(),
-        300,
-        "seqno floor recovered after failover"
-    );
-    assert_eq!(
-        reg_b.oplog_retention_floor(),
-        50,
-        "oplog floor recovered after failover"
-    );
-    let mut ids: Vec<String> = reg_b
-        .list_consumers()
-        .into_iter()
-        .map(|c| c.consumer_id)
-        .collect();
-    ids.sort();
-    assert_eq!(ids, vec!["backup".to_string(), "cdc".to_string()]);
-
-    node.shutdown().await.expect("shutdown");
-}
-
-/// Space split: an `OplogEvents` consumer (Raft-index space) feeds the
-/// oplog retention floor, NOT the MVCC GC watermark; a `LsmStateDelta`
-/// consumer (seqno space) feeds the GC watermark, NOT the oplog floor.
-/// Mixing them would compare a microsecond HLC against a Raft index.
-#[tokio::test(flavor = "multi_thread")]
-async fn floors_are_split_by_consumer_space() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-
-    // Oplog consumer at Raft index 42 → oplog floor, not the gc watermark.
-    let oplog_h = reg
-        .register(ConsumerRegistration {
-            consumer_id: "cdc-sink".into(),
-            kind: ConsumerKind::OplogEvents,
-            scope: TopologyScope::Cluster,
-            initial_seqno: InitialSeqno::At(42),
-            ttl_ms: 0,
-        })
-        .expect("register oplog consumer");
-    assert_eq!(
-        reg.oplog_retention_floor(),
-        42,
-        "oplog consumer drives oplog floor"
-    );
-    assert_eq!(
-        reg.shard_floor(),
-        u64::MAX,
-        "oplog consumer must NOT enter the seqno floor"
-    );
-    assert_ne!(
-        engine.gc_watermark(),
-        42,
-        "oplog index 42 must NOT pull the MVCC gc watermark into Raft-index space"
-    );
-
-    // Seqno consumer at 1000 → gc watermark + shard_floor, not oplog floor.
-    let seqno_h = reg
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(1_000),
-            ..registration("backup", TopologyScope::Cluster, 0)
-        })
-        .expect("register seqno consumer");
-    assert_eq!(reg.shard_floor(), 1_000);
-    assert_eq!(
-        engine.gc_watermark(),
-        1_000,
-        "seqno consumer drives gc watermark"
-    );
-    assert_eq!(
-        reg.oplog_retention_floor(),
-        42,
-        "oplog floor unchanged by seqno consumer"
-    );
-
-    reg.unregister(oplog_h).expect("unregister oplog");
-    reg.unregister(seqno_h).expect("unregister seqno");
-    assert_eq!(reg.oplog_retention_floor(), u64::MAX);
-    assert_eq!(reg.shard_floor(), u64::MAX);
-
-    node.shutdown().await.expect("shutdown");
-}
-
-/// The eviction sweep removes a registration past its TTL via a Raft
-/// proposal and lifts the floor it was pinning. Nothing but the TTL running
-/// out schedules that sweep: no write and no heartbeat arrive meanwhile.
-#[tokio::test(flavor = "multi_thread")]
-async fn eviction_sweep_removes_expired_and_lifts_floor() {
-    let (reg, _engine, node, _dir) = registry_with_clock(Arc::new(SystemClock)).await;
-
-    reg.register(ConsumerRegistration {
-        initial_seqno: InitialSeqno::At(10),
-        ..registration("doomed", TopologyScope::Cluster, 300)
-    })
-    .expect("register doomed");
-    reg.register(ConsumerRegistration {
-        initial_seqno: InitialSeqno::At(500),
-        ..registration("survivor", TopologyScope::Cluster, 0)
-    })
-    .expect("register survivor");
-    assert_eq!(reg.shard_floor(), 10);
-
-    let bg = reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 30,
+    let f = fixture(clock.clone()).await;
+    let h = f
+        .reg
+        .register(registration(
+            "hb",
+            0,
+            bounded(u64::MAX, u64::MAX, Some(10_000)),
+        ))
+        .expect("register");
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 30,
+        eviction_interval_ms: 100_000,
     });
-
-    // Past the doomed consumer's TTL, with a margin for a loaded machine.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-
-    let listed = reg.list_consumers();
-    assert_eq!(listed.len(), 1, "expired consumer was evicted");
-    assert_eq!(listed[0].consumer_id, "survivor");
-    assert_eq!(
-        reg.shard_floor(),
-        500,
-        "floor lifted to survivor after eviction"
-    );
-
-    bg.shutdown().await;
-    node.shutdown().await.expect("shutdown");
-}
-
-/// A registration written through another member's registry reaches this
-/// member's floor as it applies: the background service has no timer that
-/// would pick it up otherwise.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_registration_applied_from_elsewhere_moves_the_floor() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, engine, node, _dir) = registry_with_clock(clock.clone()).await;
-    let bg = reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000,
-        eviction_interval_ms: 30,
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(reg.shard_floor(), u64::MAX);
-
-    // Another member's registry: same replicated keyspace, its own handle.
-    let elsewhere = ShardConsumerRegistry::new(
-        Arc::clone(&engine),
-        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft()))),
-        Arc::new(ProposalIdGenerator::with_base(3u64 << 48)),
-        clock,
-    );
-    elsewhere
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::At(77),
-            ..registration("remote", TopologyScope::Cluster, 0)
-        })
-        .expect("register elsewhere");
-
+    clock.set(4_000);
+    for _ in 0..5 {
+        f.reg.heartbeat(&h).expect("buffer heartbeat");
+    }
     let until = tokio::time::Instant::now() + Duration::from_secs(5);
-    while reg.shard_floor() != 77 && tokio::time::Instant::now() < until {
+    let heard = || {
+        f.reg
+            .list_consumers()
+            .first()
+            .map(|c| c.last_heartbeat_ts_ms)
+    };
+    while heard() != Some(4_000) && tokio::time::Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        reg.shard_floor(),
-        77,
-        "a registration applied from elsewhere did not reach the floor"
+        heard(),
+        Some(4_000),
+        "the coalesced flush wrote the buffered time"
     );
-
     bg.shutdown().await;
-    node.shutdown().await.expect("shutdown");
+    f.node.shutdown().await.expect("shutdown");
 }
 
-/// A heartbeat that has not been flushed yet still counts: the sweep may run
-/// before the flush that would persist it, and a consumer that just proved it
-/// is alive must not be evicted for the flush's timing.
+/// The background sweep ends a BOUNDED consumer once its liveness runs out,
+/// with nothing but the clock to schedule it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_buffered_heartbeat_keeps_its_consumer_from_eviction() {
-    let clock = SystemClock;
-    let (reg, _engine, node, _dir) = registry_with_clock(Arc::new(clock)).await;
-    let ttl_ms = 400;
-    let h = reg
-        .register(registration("reader", TopologyScope::Cluster, ttl_ms))
-        .expect("register");
-    let registered_at = reg.list_consumers()[0].last_heartbeat_ts_ms;
-
-    let bg = reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 100_000, // the heartbeat stays buffered
+async fn the_background_sweep_ends_a_silent_bounded_consumer() {
+    let f = fixture(Arc::new(SystemClock)).await;
+    f.reg
+        .register(registration(
+            "doomed",
+            10,
+            bounded(u64::MAX, u64::MAX, Some(300)),
+        ))
+        .expect("register doomed");
+    f.reg
+        .register(registration(
+            "survivor",
+            500,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register survivor");
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
         eviction_interval_ms: 30,
     });
-
-    // Halfway through the TTL the reader heartbeats; the sweep due when the
-    // stored heartbeat runs out finds the buffered one.
-    tokio::time::sleep(Duration::from_millis(ttl_ms / 2)).await;
-    let beat_at = clock.now_ms();
-    reg.heartbeat(&h).expect("buffer heartbeat");
-    // Past the stored heartbeat's TTL, inside the buffered one's.
-    let until_ms = registered_at + ttl_ms + 100;
-    // Already past the point on a slow machine: wait for nothing.
-    let left = until_ms.saturating_sub(clock.now_ms());
-    tokio::time::sleep(Duration::from_millis(left)).await;
-
-    let listed = reg.list_consumers();
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    while ended_for(&f.reg, "doomed").is_none() && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
-        listed.len(),
-        1,
-        "a consumer with a fresh buffered heartbeat was evicted"
+        ended_for(&f.reg, "doomed"),
+        Some(TerminalReason::LivenessExpired)
     );
-    assert!(
-        listed[0].last_heartbeat_ts_ms >= beat_at,
-        "the sweep persisted the buffered heartbeat"
-    );
-
+    assert_eq!(f.reg.shard_floor(), 500);
     bg.shutdown().await;
-    node.shutdown().await.expect("shutdown");
+    f.node.shutdown().await.expect("shutdown");
 }
 
-/// A flush whose proposal fails keeps the heartbeats it took from the buffer.
-/// They were a consumer's sign of life; dropped with the failed write, the
-/// next sweep would evict a consumer that heartbeated in time.
+/// A registration written through another member's registry reaches this
+/// member's floor as it applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_applied_from_elsewhere_moves_the_floor() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let f = fixture(clock.clone()).await;
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
+        eviction_interval_ms: 30,
+    });
+    let elsewhere = registry_over(&f.engine, &f.node, clock, Arc::clone(&f.source), 3);
+    elsewhere
+        .register(registration("remote", 77, ConsumerRetentionPolicy::Strict))
+        .expect("register elsewhere");
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while f.reg.shard_floor() != 77 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(f.reg.shard_floor(), 77);
+    bg.shutdown().await;
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// A flush whose write fails keeps the heartbeats it took: they were a
+/// consumer's sign of life.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_flush_keeps_its_heartbeats_buffered() {
     let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
-    let h = reg
-        .register(registration("reader", TopologyScope::Cluster, 2_000))
+    let f = fixture(clock.clone()).await;
+    let h = f
+        .reg
+        .register(registration(
+            "reader",
+            0,
+            bounded(u64::MAX, u64::MAX, Some(2_000)),
+        ))
         .expect("register");
-    reg.core.batching_on.store(true, Ordering::Release);
+    f.reg.core.batching_on.store(true, Ordering::Release);
     clock.set(2_500);
-    reg.heartbeat(&h).expect("buffer heartbeat");
-
-    // The consensus is gone: the flush reads the entry and fails to write it.
-    node.shutdown().await.expect("shutdown");
-    assert!(
-        reg.core.flush_pending_heartbeats().is_err(),
-        "a flush with no consensus to write through must fail"
-    );
-
+    f.reg.heartbeat(&h).expect("buffer heartbeat");
+    f.node.shutdown().await.expect("shutdown");
+    assert!(f.reg.core.flush_pending_heartbeats().is_err());
     assert_eq!(
-        reg.core.pending_hb.lock().get("reader").copied(),
-        Some(2_500),
-        "the heartbeat of a failed flush is still buffered"
+        f.reg
+            .core
+            .pending_hb
+            .lock()
+            .get(&("reader".to_string(), 1))
+            .copied(),
+        Some(2_500)
     );
 }
 
-/// A pipeline that, once closed, holds each proposal until the test lets it
-/// through, reporting that it holds one.
-struct GatedPipeline {
-    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
-    closed: std::sync::atomic::AtomicBool,
-    held: std::sync::mpsc::SyncSender<()>,
-    release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-impl ProposalPipeline for GatedPipeline {
-    fn propose_and_wait(
-        &self,
-        proposal: &coordinode_core::txn::proposal::RaftProposal,
-    ) -> Result<
-        coordinode_core::txn::proposal::ProposalOutcome,
-        coordinode_core::txn::proposal::ProposalError,
-    > {
-        if self.closed.load(Ordering::Acquire) {
-            self.held
-                .send(())
-                .expect("the test waits for the held proposal");
-            self.release
-                .lock()
-                .recv()
-                .expect("the test releases the held proposal");
-        }
-        self.inner.propose_and_wait(proposal)
-    }
-}
-
-/// A heartbeat that is being written is still a sign of life: until the
-/// write lands, the consumer stays listed and its checkpoint keeps holding the
-/// retention floor, though neither the buffer nor the stored entry shows it.
+/// The sweep persists buffered heartbeats before judging liveness, and a
+/// heartbeat that arrives while that write is in flight still counts.
 #[test]
-fn a_heartbeat_in_flight_keeps_its_consumer_live() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine = Arc::new(
-        StorageEngine::open_with_oracle(
-            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]),
-            oracle,
-        )
-        .expect("open engine"),
-    );
-    let (held_tx, held) = std::sync::mpsc::sync_channel(1);
-    let (release, release_rx) = std::sync::mpsc::channel();
-    let pipeline = Arc::new(GatedPipeline {
-        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
-        closed: std::sync::atomic::AtomicBool::new(false),
-        held: held_tx,
-        release: parking_lot::Mutex::new(release_rx),
-    });
-    let clock = Arc::new(ManualClock::new(1_000));
-    let reg = ShardConsumerRegistry::new(
-        Arc::clone(&engine),
-        Arc::clone(&pipeline) as Arc<dyn ProposalPipeline>,
-        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
-        clock.clone(),
-    );
+fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
+    let (reg, clock, _source, pipeline, _dir) = hooked_registry();
+    clock.set(1_000);
     let h = reg
-        .register(registration("reader", TopologyScope::Cluster, 2_000))
+        .register(registration(
+            "reader",
+            0,
+            bounded(u64::MAX, u64::MAX, Some(400)),
+        ))
         .expect("register");
-    let floor = reg.shard_floor();
-    assert_ne!(floor, u64::MAX, "the reader holds the floor");
-
     reg.core.batching_on.store(true, Ordering::Release);
-    clock.set(2_500);
-    reg.heartbeat(&h).expect("buffer heartbeat");
-    pipeline.closed.store(true, Ordering::Release);
-    let flushing = {
-        let core = Arc::clone(&reg.core);
-        std::thread::spawn(move || core.flush_pending_heartbeats())
-    };
-    held.recv().expect("the flush proposes");
+    reg.heartbeat(&h).expect("heartbeat");
 
-    // Past the stored heartbeat's TTL (1000 + 2000), inside the one being
-    // written (2500 + 2000).
-    clock.set(4_000);
-    assert!(
-        reg.list_consumers()
-            .iter()
-            .any(|c| c.consumer_id == "reader"),
-        "a consumer whose heartbeat is being written was dropped from the list"
-    );
+    *pipeline.hook.lock() = Some(Box::new({
+        let (reg, h, clock) = (reg.clone(), h.clone(), Arc::clone(&clock));
+        move || {
+            clock.set(2_000);
+            reg.heartbeat(&h).expect("heartbeat during the flush");
+        }
+    }));
+    let swept = reg.core.sweep_evictions().expect("sweep");
     assert_eq!(
-        reg.core.recompute_floor().expect("floor"),
-        floor,
-        "a consumer whose heartbeat is being written stopped holding the floor"
+        swept.evicted, 0,
+        "a reader with a buffered heartbeat was ended"
     );
+    assert_eq!(swept.next_deadline_ms, Some(1_000 + 400 + 1));
+    assert_eq!(ended_for(&reg, "reader"), None);
+}
 
-    pipeline.closed.store(false, Ordering::Release);
-    release.send(()).expect("release");
-    flushing.join().expect("flush thread").expect("flush");
+/// Records of the format before retention policies are deleted by a sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_deletes_records_of_the_old_format() {
+    let f = fixture(Arc::new(ManualClock::new(0))).await;
+    let mut legacy_key = LEGACY_KEY_PREFIX.to_vec();
+    legacy_key.extend_from_slice(b"cdc-0-7");
+    f.engine
+        .put(Partition::Registry, &legacy_key, b"old")
+        .expect("seed a legacy record");
+    f.reg.core.sweep_evictions().expect("sweep");
     assert!(
-        reg.core.pending_hb.lock().is_empty(),
-        "a written heartbeat leaves the buffer"
+        f.engine
+            .get(Partition::Registry, &legacy_key)
+            .expect("read")
+            .is_none(),
+        "the legacy record is gone"
     );
-    assert_eq!(
-        reg.list_consumers()
-            .iter()
-            .find(|c| c.consumer_id == "reader")
-            .map(|c| c.last_heartbeat_ts_ms),
-        Some(2_500),
-        "the heartbeat was written"
-    );
-}
-
-/// A pipeline whose every proposal takes `delay`, as a slow fsync does.
-struct SlowPipeline {
-    inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
-    delay: Duration,
-}
-
-impl ProposalPipeline for SlowPipeline {
-    fn propose_and_wait(
-        &self,
-        proposal: &coordinode_core::txn::proposal::RaftProposal,
-    ) -> Result<
-        coordinode_core::txn::proposal::ProposalOutcome,
-        coordinode_core::txn::proposal::ProposalError,
-    > {
-        std::thread::sleep(self.delay);
-        self.inner.propose_and_wait(proposal)
-    }
-}
-
-/// A reader that keeps heartbeating stays registered when every registry
-/// write is slow and the background service shares a single-thread runtime
-/// with the reader's stream, as a change stream does.
-#[tokio::test]
-async fn a_slow_flush_does_not_starve_the_heartbeats_it_persists() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
-    let engine = Arc::new(
-        StorageEngine::open_with_oracle(
-            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
-                "default",
-                dir.path(),
-                Media::Hdd,
-                Durability::Durable,
-                Tier::Warm,
-            )]),
-            oracle,
-        )
-        .expect("open engine"),
-    );
-    let pipeline: Arc<dyn ProposalPipeline> = Arc::new(SlowPipeline {
-        inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
-        delay: Duration::from_millis(300),
-    });
-    let reg = ShardConsumerRegistry::new(
-        Arc::clone(&engine),
-        pipeline,
-        Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
-        Arc::new(SystemClock),
-    );
-    // Shorter than one write: the reader stays only by the heartbeats that
-    // reach the buffer while a write is in flight, which a service holding
-    // the runtime thread through the write never lets through. A heartbeat
-    // every 50 ms leaves several of them inside each 300 ms write, a margin
-    // that holds on a loaded machine.
-    let ttl_ms = 200;
-    let h = reg
-        .register(registration("reader", TopologyScope::Cluster, ttl_ms))
-        .expect("register");
-    let bg = reg.start_background(BackgroundConfig {
-        heartbeat_window_ms: 20,
-        eviction_interval_ms: 50,
-    });
-
-    // The reader's stream: a heartbeat every 50 ms for several TTLs.
-    let beating = {
-        let reg = reg.clone();
-        tokio::spawn(async move {
-            let until = tokio::time::Instant::now() + Duration::from_millis(3 * ttl_ms);
-            while tokio::time::Instant::now() < until {
-                reg.heartbeat(&h).expect("heartbeat");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    };
-    beating.await.expect("heartbeats");
-
-    assert!(
-        reg.list_consumers()
-            .iter()
-            .any(|c| c.consumer_id == "reader"),
-        "a reader that kept heartbeating was evicted"
-    );
-    bg.shutdown().await;
+    f.node.shutdown().await.expect("shutdown");
 }
 
 /// A pipeline that runs a one-shot hook inside the next proposal: what
@@ -795,16 +989,23 @@ async fn a_slow_flush_does_not_starve_the_heartbeats_it_persists() {
 struct HookPipeline {
     inner: coordinode_raft::proposal::OwnedLocalProposalPipeline,
     hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Refuse every proposal as a follower would, naming member 2 leader.
+    follower: AtomicBool,
 }
 
 impl ProposalPipeline for HookPipeline {
     fn propose_and_wait(
         &self,
-        proposal: &coordinode_core::txn::proposal::RaftProposal,
+        proposal: &RaftProposal,
     ) -> Result<
         coordinode_core::txn::proposal::ProposalOutcome,
         coordinode_core::txn::proposal::ProposalError,
     > {
+        if self.follower.load(Ordering::Acquire) {
+            return Err(coordinode_core::txn::proposal::ProposalError::NotLeader {
+                leader_id: Some(2),
+            });
+        }
         let hook = self.hook.lock().take();
         if let Some(hook) = hook {
             hook();
@@ -813,11 +1014,14 @@ impl ProposalPipeline for HookPipeline {
     }
 }
 
-/// The sweep persists buffered heartbeats before judging expiry, and that
-/// write can take longer than a TTL. A heartbeat that arrives meanwhile is
-/// still only in the buffer: the reader is alive and must not be evicted.
-#[test]
-fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
+/// A registry over a local engine whose next proposal can run a hook first.
+fn hooked_registry() -> (
+    ShardConsumerRegistry,
+    Arc<ManualClock>,
+    Arc<FakeSource>,
+    Arc<HookPipeline>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
     let engine = Arc::new(
@@ -836,159 +1040,109 @@ fn a_heartbeat_buffered_during_the_sweep_keeps_the_reader() {
     let pipeline = Arc::new(HookPipeline {
         inner: coordinode_raft::proposal::OwnedLocalProposalPipeline::new(&engine),
         hook: Mutex::new(None),
+        follower: AtomicBool::new(false),
     });
-    let clock = Arc::new(ManualClock::new(1_000));
+    let clock = Arc::new(ManualClock::new(0));
+    let source = FakeSource::new();
     let reg = ShardConsumerRegistry::new(
         Arc::clone(&engine),
         Arc::clone(&pipeline) as Arc<dyn ProposalPipeline>,
         Arc::new(ProposalIdGenerator::with_base(1u64 << 48)),
         Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&source) as Arc<dyn RetentionSource>,
     );
-    let h = reg
-        .register(registration("reader", TopologyScope::Cluster, 400))
-        .expect("register");
-    let pinned = reg.shard_floor();
-    reg.core.batching_on.store(true, Ordering::Release);
-    reg.heartbeat(&h).expect("heartbeat");
+    (reg, clock, source, pipeline, dir)
+}
 
-    // While the sweep's flush is being written, a TTL passes and the reader
-    // heartbeats again.
-    *pipeline.hook.lock() = Some(Box::new({
-        let (reg, h, clock) = (reg.clone(), h.clone(), Arc::clone(&clock));
-        move || {
-            clock.set(2_000);
-            reg.heartbeat(&h).expect("heartbeat during the flush");
-        }
-    }));
-    let swept = reg.core.sweep_evictions().expect("sweep");
+/// On a member that is not the leader the sweep decides nothing: the leader
+/// owns every transition. It still refreshes the floor the member publishes
+/// and keeps the next deadline, so it acts once it leads; heartbeats buffered
+/// here are dropped, since only the leader can record them.
+#[test]
+fn a_follower_sweep_leaves_transitions_to_the_leader() {
+    let (reg, clock, source, pipeline, _dir) = hooked_registry();
+    source.set_head(5);
+    reg.register(registration("idle", 5, bounded(60_000, 1 << 30, Some(400))))
+        .expect("register on the leader");
+    let handle = RegisteredHandle::new("idle", 1);
 
+    pipeline.follower.store(true, Ordering::Release);
+    reg.core
+        .pending_hb
+        .lock()
+        .insert(("idle".to_string(), 1), 100);
+    clock.set(10_000);
+    let swept = reg
+        .core
+        .sweep_evictions()
+        .expect("a follower sweep is not an error");
+    assert_eq!(swept.evicted, 0);
+    assert!(!swept.behind, "a follower schedules no periodic sweep");
     assert_eq!(
-        swept.evicted, 0,
-        "a reader with a buffered heartbeat was evicted"
+        swept.next_deadline_ms,
+        Some(401),
+        "the deadline stays for when this member leads"
     );
-    assert_eq!(
-        swept.next_expiry_ms,
-        Some(2_000 + 400 + 1),
-        "the next sweep is due when the buffered heartbeat runs out"
+    assert_eq!(ended_for(&reg, "idle"), None, "only the leader ends it");
+    assert!(
+        reg.core.pending_hb.lock().is_empty(),
+        "heartbeats only the leader can record are dropped"
     );
     assert!(
-        reg.core.read_entry("reader").expect("read").is_some(),
-        "the reader's registration is gone"
+        matches!(
+            reg.checkpoint(&handle, 5),
+            Err(RegistryError::NotLeader { leader_id: Some(2) })
+        ),
+        "a transition on a follower names the leader"
+    );
+
+    pipeline.follower.store(false, Ordering::Release);
+    assert_eq!(
+        reg.core.sweep_evictions().expect("sweep as leader").evicted,
+        1
     );
     assert_eq!(
-        reg.shard_floor(),
-        pinned,
-        "the live reader stopped pinning retention"
+        ended_for(&reg, "idle"),
+        Some(TerminalReason::LivenessExpired)
     );
 }
 
-/// EE enable path: `with_topology_scopes()` accepts `dc` / `rack` scopes
-/// that CE rejects (complements `ce_rejects_dc_and_rack_scopes`).
-#[tokio::test(flavor = "multi_thread")]
-async fn ee_topology_scopes_accept_dc_and_rack() {
-    let clock = Arc::new(ManualClock::new(0));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock).await;
-    let reg = reg.with_topology_scopes(); // EE
-    reg.register(registration("dc-sink", TopologyScope::Dc("eu".into()), 0))
-        .expect("EE accepts dc scope");
-    reg.register(registration(
-        "rack-sink",
-        TopologyScope::Rack("r1".into()),
-        0,
-    ))
-    .expect("EE accepts rack scope");
-    assert_eq!(reg.list_consumers().len(), 2);
-    node.shutdown().await.expect("shutdown");
-}
+/// While the source has no room for new retention, a registration is refused
+/// as retryable backpressure and records nothing; consumers already admitted
+/// still advance and cancel, since that holds no more than they held. Once
+/// the pressure eases the same id registers as if it had never been asked.
+#[test]
+fn a_registration_under_pressure_is_refused_and_admitted_ones_continue() {
+    let (reg, _clock, source, _pipeline, _dir) = hooked_registry();
+    source.set_head(50);
+    let admitted = reg
+        .register(registration(
+            "admitted",
+            10,
+            ConsumerRetentionPolicy::Strict,
+        ))
+        .expect("register before the pressure");
 
-/// The time-travel window belongs to the engine, and the registry never
-/// widens the watermark past it: with a tiny engine window and no
-/// consumers, the watermark sits exactly `window` below the current seqno
-/// after the registry republishes its (empty) consumer floor.
-#[tokio::test(flavor = "multi_thread")]
-async fn engine_window_governs_when_no_consumer_is_registered() {
-    let clock = Arc::new(ManualClock::new(0));
-    let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-    // 1 ms window. A consumer at 0 pins the watermark there; once it leaves,
-    // the registry republishes an empty floor (`u64::MAX`) and the engine's
-    // window is what remains: watermark = snapshot - 1_000 µs.
-    engine.set_retention_window(Duration::from_millis(1));
-    let h = reg
-        .register(registration("probe", TopologyScope::Cluster, 0))
-        .expect("register");
-    assert_eq!(engine.gc_watermark(), 0);
-    reg.unregister(h).expect("unregister");
-    assert_eq!(engine.gc_watermark(), engine.snapshot() - 1_000);
-    node.shutdown().await.expect("shutdown");
-}
-
-/// `InitialSeqno` resolution: `FromEarliestRetained` → 0 (replay all);
-/// `FromNow` → the current open seqno (only future changes).
-#[tokio::test(flavor = "multi_thread")]
-async fn initial_seqno_from_now_and_earliest_resolve_correctly() {
-    let clock = Arc::new(ManualClock::new(0));
-    let (reg, engine, node, _dir) = registry_with_clock(clock).await;
-
-    reg.register(ConsumerRegistration {
-        initial_seqno: InitialSeqno::FromEarliestRetained,
-        ..registration("replay-all", TopologyScope::Cluster, 0)
-    })
-    .expect("register earliest");
-    assert_eq!(
-        reg.shard_floor(),
-        0,
-        "FromEarliestRetained pins the floor at 0"
-    );
-
-    // FromNow on a second registry over the same engine: checkpoint = now.
-    let pipeline: Arc<dyn ProposalPipeline> =
-        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
-    let reg2 = ShardConsumerRegistry::new(
-        Arc::clone(&engine),
-        pipeline,
-        Arc::new(ProposalIdGenerator::with_base(9u64 << 48)),
-        Arc::new(ManualClock::new(0)),
-    );
-    let before = engine.snapshot();
-    let h = reg2
-        .register(ConsumerRegistration {
-            initial_seqno: InitialSeqno::FromNow,
-            ..registration("from-now", TopologyScope::Cluster, 0)
-        })
-        .expect("register from-now");
-    let cp = reg2.check_retention(&h).expect("recorded checkpoint");
+    source.set_pressured(true);
+    let refused = reg.register(registration("late", 10, ConsumerRetentionPolicy::Strict));
     assert!(
-        cp >= before,
-        "FromNow checkpoint ({cp}) starts at/after the open seqno at registration ({before})"
+        matches!(refused, Err(RegistryError::Backpressure)),
+        "got {refused:?}"
     );
-
-    node.shutdown().await.expect("shutdown");
-}
-
-/// Eager heartbeat path (no background service): `heartbeat` validates the
-/// consumer and writes `last_heartbeat_ts` immediately (no buffering).
-#[tokio::test(flavor = "multi_thread")]
-async fn eager_heartbeat_writes_immediately() {
-    let clock = Arc::new(ManualClock::new(1_000));
-    let (reg, _engine, node, _dir) = registry_with_clock(clock.clone()).await;
-    let h = reg
-        .register(registration("hb", TopologyScope::Cluster, 0))
-        .expect("register");
-
-    // No start_background → eager path. Advance clock, heartbeat, observe
-    // the persisted timestamp move with no flush window.
-    clock.set(9_000);
-    reg.heartbeat(&h).expect("eager heartbeat");
-    let listed = reg.list_consumers();
-    assert_eq!(
-        listed[0].last_heartbeat_ts_ms, 9_000,
-        "eager heartbeat persisted at once"
+    assert!(
+        reg.list_consumers().iter().all(|c| c.consumer_id != "late"),
+        "a refused registration left a record"
     );
+    reg.checkpoint(&admitted, 30)
+        .expect("an admitted consumer advances under pressure");
+    assert_eq!(reg.shard_floor(), 30);
+    reg.unregister(admitted)
+        .expect("an admitted consumer cancels under pressure");
+    assert_eq!(reg.shard_floor(), u64::MAX);
 
-    // Heartbeat on an unknown consumer errors (eager path validates).
-    assert!(matches!(
-        reg.heartbeat(&RegisteredHandle::new("ghost")),
-        Err(RegistryError::UnknownConsumer(_))
-    ));
-    node.shutdown().await.expect("shutdown");
+    source.set_pressured(false);
+    let late = reg
+        .register(registration("late", 10, ConsumerRetentionPolicy::Strict))
+        .expect("register once the pressure eases");
+    assert_eq!(late.incarnation(), 1, "the refusal used no incarnation");
 }

@@ -208,14 +208,10 @@ pub struct ServerConfig {
     /// Shortest gap between consumer-registry TTL-eviction sweeps in ms
     /// (`None` = 1000).
     pub registry_eviction_ms: Option<u64>,
-    /// CDC change-stream consumer TTL in seconds (`None` = 30). How long a
-    /// disconnected/crashed CDC reader's registration holds the oplog retention
-    /// floor before it is TTL-reclaimed; connected readers heartbeat while
-    /// they wait and are never evicted.
-    pub cdc_consumer_ttl_secs: Option<u64>,
     /// How often a waiting CDC change stream heartbeats its registration, in
-    /// ms (`None` = 10000). Must stay below `cdc_consumer_ttl_secs`. Delivery
-    /// does not wait on it: a caught-up stream wakes when an entry applies.
+    /// ms (`None` = 10000). A BOUNDED consumer's liveness timeout must exceed
+    /// it, which registration checks. Delivery does not wait on it: a
+    /// caught-up stream wakes when an entry applies.
     pub cdc_heartbeat_interval_ms: Option<NonZeroU64>,
     /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
@@ -333,7 +329,6 @@ impl Default for ServerConfig {
             node_shard: None,
             registry_heartbeat_ms: None,
             registry_eviction_ms: None,
-            cdc_consumer_ttl_secs: None,
             cdc_heartbeat_interval_ms: None,
             cdc_batch_size: None,
             interactive_txn_idle_timeout_secs: 30,
