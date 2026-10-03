@@ -272,6 +272,33 @@ fn moving_a_versions_end_moves_only_its_entry() {
     );
 }
 
+/// A UNIQUE index on a temporal label reserves a value for the node once
+/// any of its versions held it: after a rename, another node still cannot
+/// take the old value, and the node keeps its new one.
+#[test]
+fn a_unique_value_stays_reserved_after_a_rename() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE UNIQUE INDEX emp_name_u ON :Emp(name)")
+        .expect("unique index");
+    create(&mut db, "ada", now - YEAR, None);
+    db.execute_cypher("MATCH (n:Emp {name: 'ada'}) SET n.name = 'lovelace'")
+        .expect("rename");
+
+    let taken = db.execute_cypher(&format!(
+        "CREATE (n:Emp {{name: 'ada', valid_from: {now}}})"
+    ));
+    assert!(taken.is_err(), "the old value stays reserved: {taken:?}");
+    let other = db.execute_cypher(&format!(
+        "CREATE (n:Emp {{name: 'lovelace', valid_from: {now}}})"
+    ));
+    assert!(other.is_err(), "the current value is held: {other:?}");
+    assert_eq!(
+        names(&mut db, "MATCH (n:Emp) RETURN n.name AS name"),
+        ["lovelace"]
+    );
+}
+
 /// An index built over existing versions holds every version's values, as
 /// one the writes maintained does.
 #[test]

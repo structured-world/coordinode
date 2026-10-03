@@ -101,7 +101,9 @@ RETURN n.title
 
 The node is then projected at `t` instead of `NOW`, with the same rules: a deleted, not-yet-valid or gap state at `t` gives no row. An instant computed from another variable of the row does not select the projection; such a predicate filters the rows projected at `NOW`.
 
-Indexes on a temporal label hold every value any version of the node ever had, so a lookup by a past value still finds the node at a past instant, and a lookup by a value the node no longer holds finds nothing now.
+Indexes on a temporal label hold an entry for each version of the node, so a lookup by a past value still finds the node at a past instant, and a lookup by a value the node no longer holds finds nothing now.
+
+A `UNIQUE` index on a temporal label reserves a value for the node once any of its versions held it, and keeps it reserved after the node moves to another value: two nodes can never hold the same value, at any time. It does not yet express uniqueness at each instant of valid time (two nodes holding one value in non-overlapping intervals is refused).
 
 `AS OF TIMESTAMP <ts>` is a separate axis: it reads the database as it was committed at system time `<ts>`, and inside that snapshot the node is still projected at the valid-time `NOW` (or at the `temporal_active_at` instant). Combine both for "what did the database believe at `<ts>` about valid-time `t`".
 

@@ -302,8 +302,9 @@ CREATE EDGE TYPE KNOWS WITH (
 - `DELETE n` — positive bitemporal tombstone (`__deleted__: true` at `valid_from = NOW`); current open version closed; history preserved.
 - `DETACH DOCUMENT n.<path> AS (t:Target)-[:E]->(n)` — close+open on the source, property promoted to a new node (temporal-aware CREATE). `TRANSFER EDGES` on a temporal source: rejected.
 - `ATTACH (s:Source)-[:E]->(t:Temp) INTO t.<path>` — close+open on the target. Temporal source on ATTACH: rejected.
-- Traversal `MATCH (a)-[:E]->(b:Temp)` materialises every version of `b` (one row per version); pattern predicate `WHERE (a)-[:E]->(:Temp)` matches if any version carries the label.
-- Not yet supported on temporal labels: `MERGE`, `UPSERT ON CREATE`, B-tree index lookup, `AS OF VALID_TIME` clause (planned).
+- Reads (`MATCH (n:Temp)`, index lookups, traversal `MATCH (a)-[:E]->(b:Temp)`, pattern predicate `WHERE (a)-[:E]->(:Temp)`) see each node's state valid at the statement's `NOW`: at most one row per node, none for a deleted, ended or not-yet-valid node. `WHERE temporal_active_at(n, t)` reads the state at `t` instead. See [Temporal Edges → Reading temporal nodes](./temporal-edges.md#reading-temporal-nodes).
+- B-tree indexes on temporal labels hold an entry per version; a `UNIQUE` index there reserves a value for a node once any of its versions held it, so it is not uniqueness at each instant of valid time.
+- Not yet supported on temporal labels: `MERGE`, `UPSERT ON CREATE`, enumerating every version in one `MATCH`, the `AS OF VALID_TIME` clause.
 
 #### CREATE INDEX / DROP INDEX ✅
 
