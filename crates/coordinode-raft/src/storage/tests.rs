@@ -766,6 +766,119 @@ async fn install_cut_at(op: lsm_tree::fs::FaultOp, skip: u64) -> bool {
     stopped
 }
 
+/// A snapshot standing at entry 2 (`node:1:a` = `a1`, `node:1:b` = `b1`):
+/// its metadata and its bytes.
+async fn snapshot_image() -> (SnapshotMeta, Vec<u8>) {
+    use std::io::Seek;
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    apply_entries(
+        &mut sm,
+        vec![
+            node_key_entry(1, 1000, b"node:1:a", b"a1"),
+            node_key_entry(2, 2000, b"node:1:b", b"b1"),
+        ],
+    )
+    .await;
+    let mut builder = sm.get_snapshot_builder().await;
+    let mut snapshot = builder.build_snapshot().await.expect("build");
+    snapshot.snapshot.rewind().expect("rewind");
+    let mut bytes = Vec::new();
+    snapshot
+        .snapshot
+        .read_to_end(&mut bytes)
+        .expect("read the snapshot");
+    (snapshot.meta, bytes)
+}
+
+/// `bytes` staged as a received snapshot for `engine`.
+fn staged_snapshot(engine: &StorageEngine, bytes: &[u8]) -> SnapshotFile {
+    use std::io::Seek;
+    let mut file = empty_snapshot(engine);
+    file.write_all(bytes).expect("stage the snapshot");
+    file.rewind().expect("rewind");
+    file
+}
+
+/// Install the snapshot of [`snapshot_image`] over a store holding a row the
+/// snapshot lacks, with the disk refusing `op` after `skip` of them; cut the
+/// power, reopen and install it again. Returns whether the fault stopped the
+/// first install.
+async fn snapshot_install_cut_at(
+    op: lsm_tree::fs::FaultOp,
+    skip: u64,
+    meta: &SnapshotMeta,
+    bytes: &[u8],
+) -> bool {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let (engine, clock) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock.clone()))
+        .expect("open state machine");
+    apply_entries(
+        &mut sm,
+        vec![node_key_entry(
+            1,
+            clock.next().as_raw(),
+            b"node:1:stale",
+            b"x",
+        )],
+    )
+    .await;
+    engine.persist().expect("persist");
+    let snapshot = staged_snapshot(&engine, bytes);
+    rig.fail_from(op, skip);
+    let stopped = sm.install_snapshot(meta, snapshot).await.is_err();
+    drop(sm);
+    rig.cut(engine);
+
+    let (engine, clock) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock))
+        .expect("a store with an interrupted snapshot install opens");
+    sm.install_snapshot(meta, staged_snapshot(&engine, bytes))
+        .await
+        .expect("the snapshot installs again");
+    let read = |key: &[u8]| engine.get(Partition::Node, key).expect("get");
+    assert_eq!(
+        read(b"node:1:a").as_deref(),
+        Some(b"a1".as_slice()),
+        "{op:?} {skip}"
+    );
+    assert_eq!(
+        read(b"node:1:b").as_deref(),
+        Some(b"b1".as_slice()),
+        "{op:?} {skip}"
+    );
+    assert_eq!(
+        read(b"node:1:stale"),
+        None,
+        "{op:?} {skip}: exactly the snapshot"
+    );
+    assert!(engine.pending_rebuilds().expect("intents").is_empty());
+    assert_eq!(
+        engine
+            .raft_coverage()
+            .expect("coverage")
+            .resume_point()
+            .map(|(next, _)| next),
+        Some(3),
+        "{op:?} {skip}: every tree stands at the snapshot"
+    );
+    drop(sm);
+    stopped
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_power_cut_inside_a_snapshot_install_is_repaired_by_installing_again() {
+    use lsm_tree::fs::FaultOp;
+    let (meta, bytes) = snapshot_image().await;
+    for op in [FaultOp::Write, FaultOp::SyncAll, FaultOp::SyncData] {
+        let mut skip = 0;
+        while snapshot_install_cut_at(op, skip, &meta, &bytes).await {
+            skip += 1;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_power_cut_inside_a_partition_install_is_repaired_by_installing_again() {
     use lsm_tree::fs::FaultOp;
@@ -963,6 +1076,151 @@ async fn an_entry_after_the_snapshot_wins_over_the_installed_value() {
         Some(b"v2".as_slice()),
         "the follower must read the entry committed after the snapshot"
     );
+}
+
+/// An entry putting `value` under `key` in the Node partition at `ts`.
+fn node_key_entry(index: u64, ts: u64, key: &[u8], value: &[u8]) -> Entry {
+    use openraft::entry::RaftEntry;
+    Entry::new_normal(
+        log_id(1, index),
+        Request::single(RaftProposal {
+            id: coordinode_core::txn::proposal::ProposalId::from_raw(index),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts - 1),
+            bypass_rate_limiter: false,
+        }),
+    )
+}
+
+/// A state machine reopened after a snapshot was built stands at or past the
+/// snapshot: every tree held its entries when it was captured. Standing
+/// below it makes openraft install the snapshot over a store that already
+/// holds it and more.
+#[tokio::test]
+async fn a_reopened_state_machine_stands_at_or_past_its_snapshot() {
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    apply_entries(
+        &mut sm,
+        (1..=3)
+            .map(|i| node_key_entry(i, 1000 * i, format!("node:1:{i}").as_bytes(), b"v"))
+            .collect(),
+    )
+    .await;
+    let mut builder = sm.get_snapshot_builder().await;
+    let snapshot = builder.build_snapshot().await.expect("build");
+    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 3)));
+    drop(builder);
+    drop(sm);
+
+    let mut reopened = CoordinodeStateMachine::new(engine).expect("reopen");
+    let applied = reopened.applied_state().await.expect("applied").0;
+    assert!(
+        applied >= Some(log_id(1, 3)),
+        "the reopened state machine stands at {applied:?}, below the snapshot at 3"
+    );
+}
+
+/// A snapshot installed over a store that already applied entries past it,
+/// followed by those entries again (what openraft does when the applies
+/// stand below its snapshot), leaves the store at its latest state: a key the
+/// later entries created is there, and a key they changed holds the change.
+#[tokio::test]
+async fn entries_reapplied_after_a_snapshot_install_are_visible() {
+    let (_dir, engine) = test_engine();
+    let mut sm = CoordinodeStateMachine::new(Arc::clone(&engine)).expect("open");
+    let early = vec![
+        node_key_entry(1, 1000, b"node:1:a", b"a1"),
+        node_key_entry(2, 2000, b"node:1:b", b"b1"),
+    ];
+    let late = vec![
+        node_key_entry(3, 3000, b"node:1:a", b"a2"),
+        node_key_entry(4, 4000, b"node:1:c", b"c1"),
+    ];
+    apply_entries(&mut sm, early).await;
+    let mut builder = sm.get_snapshot_builder().await;
+    let snapshot = builder.build_snapshot().await.expect("build");
+    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 2)));
+    apply_entries(&mut sm, late.clone()).await;
+
+    sm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("install");
+    apply_entries(&mut sm, late).await;
+    engine.persist().expect("persist");
+    engine.major_compact(Partition::Node).expect("compact");
+
+    let read = |key: &[u8]| engine.get(Partition::Node, key).expect("get");
+    assert_eq!(
+        read(b"node:1:a").as_deref(),
+        Some(b"a2".as_slice()),
+        "changed"
+    );
+    assert_eq!(read(b"node:1:b").as_deref(), Some(b"b1".as_slice()), "kept");
+    assert_eq!(
+        read(b"node:1:c").as_deref(),
+        Some(b"c1".as_slice()),
+        "created"
+    );
+}
+
+/// The same after a restart: the store reopened with its seqno past every
+/// applied entry, the snapshot installed, the entries after it replayed at
+/// their own commit timestamps, which sit below that seqno.
+#[tokio::test]
+async fn entries_replayed_after_a_snapshot_install_on_reopen_are_visible() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let (engine, clock) = open_rig_engine(&rig);
+    let mut sm = CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock.clone()))
+        .expect("open");
+    let ts = || clock.next().as_raw();
+    let early = vec![
+        node_key_entry(1, ts(), b"node:1:a", b"a1"),
+        node_key_entry(2, ts(), b"node:1:b", b"b1"),
+    ];
+    let late = vec![
+        node_key_entry(3, ts(), b"node:1:a", b"a2"),
+        node_key_entry(4, ts(), b"node:1:c", b"c1"),
+    ];
+    apply_entries(&mut sm, early).await;
+    let mut builder = sm.get_snapshot_builder().await;
+    builder.build_snapshot().await.expect("build");
+    apply_entries(&mut sm, late.clone()).await;
+    drop(builder);
+    drop(sm);
+    // A clean stop: every applied entry is on disk, and the reopened seqno
+    // sits past all of them.
+    engine.persist().expect("persist");
+    drop(engine);
+
+    let (engine, clock) = open_rig_engine(&rig);
+    let mut sm =
+        CoordinodeStateMachine::with_oracle(Arc::clone(&engine), Some(clock)).expect("reopen");
+    let snapshot = sm
+        .get_current_snapshot()
+        .await
+        .expect("read the snapshot")
+        .expect("the built snapshot is current");
+    assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 2)));
+    sm.install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("install");
+    apply_entries(&mut sm, late).await;
+    // Merged on disk, the versions of a key are ordered by seqno alone; a
+    // read of the memtable first would hide a replay buried under a newer
+    // installed row until a compaction.
+    engine.persist().expect("persist");
+    engine.major_compact(Partition::Node).expect("compact");
+
+    let read = |key: &[u8]| engine.get(Partition::Node, key).expect("get");
+    assert_eq!(read(b"node:1:a").as_deref(), Some(b"a2".as_slice()));
+    assert_eq!(read(b"node:1:b").as_deref(), Some(b"b1".as_slice()));
+    assert_eq!(read(b"node:1:c").as_deref(), Some(b"c1".as_slice()));
 }
 
 /// A vote is durable once `save_vote` returns: openraft answers the

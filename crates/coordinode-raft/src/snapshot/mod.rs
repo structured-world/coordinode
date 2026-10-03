@@ -600,6 +600,40 @@ pub fn install_full_snapshot_from_reader(
     apply_full(engine, parsed)
 }
 
+/// Install a Raft snapshot standing at log position `next` (`payload` is the
+/// log id of entry `next - 1`) from a reader, as the store's complete data
+/// generation: every partition it carries is replaced, not written over, and
+/// every tree is bound to `next`. The entries after `next` then apply at
+/// their own commit timestamps over the installed rows, which a write over
+/// the old contents at this node's next seqno would hide.
+///
+/// # Errors
+///
+/// The snapshot fails its checksum or its field dictionary check, or the
+/// install fails.
+pub fn install_raft_snapshot_from_reader(
+    engine: &StorageEngine,
+    reader: &mut impl IoRead,
+    next: u64,
+    payload: &[u8],
+) -> io::Result<()> {
+    let parsed = parse_verified_stream(reader)?;
+    if reader.read(&mut [0u8; 1])? != 0 {
+        return Err(io::Error::other("snapshot has bytes past its checksum"));
+    }
+    verify_field_dictionary(&parsed)?;
+    engine.with_metadata_exclusive(|| {
+        let total_written: usize = parsed.partitions.iter().map(|(_, rows)| rows.len()).sum();
+        engine
+            .install_raft_image(&parsed.partitions, next, payload)
+            .map_err(|e| io::Error::other(format!("install the snapshot's partitions: {e}")))?;
+        let tables = install_tables(engine, parsed.tables)?;
+        engine.note_field_dictionary_change();
+        tracing::info!(total_written, tables, next, "snapshot installed");
+        Ok(())
+    })
+}
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 

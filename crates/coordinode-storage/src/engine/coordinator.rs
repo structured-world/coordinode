@@ -891,6 +891,20 @@ impl LocalMultiModalCoordinator {
         Ok(seqno)
     }
 
+    /// Write `key` at a caller-chosen `seqno` instead of the next one.
+    pub(crate) fn put_at(
+        &self,
+        part: Partition,
+        key: &[u8],
+        value: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        let tree = self.tree(part)?;
+        let (added, memtable) = tree.insert(key, value, seqno);
+        self.flush_trigger.wrote(added, memtable);
+        Ok(())
+    }
+
     /// Single-key tombstone. Stamps with the next seqno.
     pub(crate) fn delete(&self, part: Partition, key: &[u8]) -> StorageResult<lsm_tree::SeqNo> {
         let tree = self.tree(part)?;

@@ -26,6 +26,11 @@ use crate::placement::partition_wire_tag;
 /// One slot per partition wire tag.
 const FLOOR_SLOTS: usize = 16;
 
+/// The seqno a replaced partition's rows are written at: below every commit
+/// timestamp, so each entry applied after the replacement wins over the row
+/// it changes. The cleared tree holds no other version for the row to hide.
+pub const INSTALLED_ROW_SEQNO: lsm_tree::SeqNo = 0;
+
 /// Directory under the data dir where partitions are captured for a copy to
 /// another node. Nothing under it outlives the copy; the engine clears what
 /// a crash left behind when it opens.
@@ -388,6 +393,11 @@ impl StorageEngine {
     /// applied in between (with [`Self::apply_raft_proposal`]) record their
     /// markers. Call with the applies paused.
     ///
+    /// The rows land at [`INSTALLED_ROW_SEQNO`], below every commit
+    /// timestamp: the entries replayed or applied after the install write at
+    /// their own commit timestamp, which can sit below this node's next seqno,
+    /// and an installed row above them would hide them.
+    ///
     /// # Errors
     ///
     /// `partition` is the node-local Raft partition, the node-local rows
@@ -410,8 +420,39 @@ impl StorageEngine {
             .collect();
         self.begin_rebuild(partition)?;
         self.clear_partition(partition)?;
-        for (key, value) in keep.iter().chain(rows) {
+        for (key, value) in &keep {
             self.put(partition, key, value)?;
+        }
+        for (key, value) in rows {
+            self.coordinator
+                .put_at(partition, key, value, INSTALLED_ROW_SEQNO)?;
+        }
+        Ok(())
+    }
+
+    /// Replace each partition of `partitions` with its rows from a Raft
+    /// snapshot standing at `next` (`payload` is the log id of entry
+    /// `next - 1`), and bind every tree to that position. Every replaced
+    /// partition is under a rebuild intent from before its clear until every
+    /// tree's record is on disk, so a crash in between leaves an intent, never
+    /// a tree that claims entries it lost. Call with the applies paused.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::begin_partition_rebuild`] and
+    /// [`Self::reset_raft_coverage`], or an intent removal failure.
+    pub fn install_raft_image(
+        &self,
+        partitions: &[(Partition, Rows)],
+        next: u64,
+        payload: &[u8],
+    ) -> StorageResult<()> {
+        for (partition, rows) in partitions {
+            self.begin_partition_rebuild(*partition, rows)?;
+        }
+        self.reset_raft_coverage(next, payload)?;
+        for (partition, _) in partitions {
+            self.finish_rebuild(*partition)?;
         }
         Ok(())
     }

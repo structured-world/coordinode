@@ -1722,6 +1722,28 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         #[allow(clippy::unwrap_used)]
         let last_membership = self.last_membership.lock().unwrap().clone();
 
+        // Every tree holds the applied entries now, and the capture below
+        // flushes them together with this fold. A store reopened under the
+        // snapshot this build publishes therefore resumes at or past it;
+        // resuming below it would make openraft install the snapshot over a
+        // store that already holds it and the entries after it.
+        let folded = match last_applied {
+            Some(log_id) if log_id.index + 1 > self.folded => {
+                let next = log_id.index + 1;
+                let gate = self.gate.state.lock().await;
+                let fold = rmp_serde::to_vec(&log_id).map(|payload| {
+                    self.engine
+                        .fold_raft_coverage(self.folded, next, &payload, |part| {
+                            gate.applies.floor(part) >= next
+                        });
+                });
+                drop(gate);
+                fold.map(|()| self.folded = next)
+                    .map_err(|e| format!("encode the snapshot's coverage base: {e}"))
+            }
+            _ => Ok(()),
+        };
+
         // openraft builds the snapshot after this returns, while entries keep
         // applying, and the snapshot must hold exactly the entries up to
         // `last_applied`. No entry is applied while this runs, so a capture
@@ -1734,27 +1756,30 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let engine = Arc::clone(&self.engine);
         let target = dir.clone();
         let work = self.engine_work.start();
-        let capture = match tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            std::thread::sleep(std::time::Duration::from_millis(
-                CAPTURE_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
-            ));
-            let captured = match target.parent() {
-                Some(parent) => std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create {parent:?}: {e}"))
-                    .and_then(|()| engine.capture(&target).map_err(|e| e.to_string())),
-                None => engine.capture(&target).map_err(|e| e.to_string()),
-            };
-            // The engine is released before the work is counted done.
-            drop(engine);
-            drop(work);
-            captured
-        })
-        .await
-        {
-            Ok(Ok(_)) => Ok(dir),
-            Ok(Err(e)) => Err(format!("capture the store for a snapshot: {e}")),
-            Err(e) => Err(format!("capture task: {e}")),
+        let capture = match folded {
+            Err(e) => Err(e),
+            Ok(()) => match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                std::thread::sleep(std::time::Duration::from_millis(
+                    CAPTURE_DELAY_MS.load(core::sync::atomic::Ordering::Relaxed),
+                ));
+                let captured = match target.parent() {
+                    Some(parent) => std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create {parent:?}: {e}"))
+                        .and_then(|()| engine.capture(&target).map_err(|e| e.to_string())),
+                    None => engine.capture(&target).map_err(|e| e.to_string()),
+                };
+                // The engine is released before the work is counted done.
+                drop(engine);
+                drop(work);
+                captured
+            })
+            .await
+            {
+                Ok(Ok(_)) => Ok(dir),
+                Ok(Err(e)) => Err(format!("capture the store for a snapshot: {e}")),
+                Err(e) => Err(format!("capture task: {e}")),
+            },
         };
 
         CoordinodeSnapshotBuilder {
@@ -1780,6 +1805,18 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         let gate = Arc::clone(&self.gate);
         let mut gate = gate.state.lock().await;
 
+        // Every tree is left holding exactly the snapshot: the entries up to
+        // its last log id, nothing above. That position is recorded durably
+        // before openraft is told the install finished, together with the
+        // installed data it covers.
+        let (next, payload) = match meta.last_log_id {
+            Some(log_id) => (
+                log_id.index + 1,
+                rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
+            ),
+            None => (0, Vec::new()),
+        };
+
         // An empty snapshot carries metadata only and leaves the data as it
         // is. The parse reads the file as it goes, off the async runtime, as
         // does the size, which serializes a snapshot kept as a capture.
@@ -1795,26 +1832,28 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                 use std::io::Seek;
                 snapshot.rewind()?;
                 let mut reader = io::BufReader::with_capacity(1 << 20, &mut snapshot);
-                crate::snapshot::install_full_snapshot_from_reader(&engine, &mut reader)?;
+                crate::snapshot::install_raft_snapshot_from_reader(
+                    &engine,
+                    &mut reader,
+                    next,
+                    &payload,
+                )?;
+            } else {
+                engine.reset_raft_coverage(next, &payload).map_err(|e| {
+                    io::Error::other(format!("rebind raft coverage to snapshot: {e}"))
+                })?;
             }
             Ok::<_, io::Error>(snapshot)
         })
         .await
         .map_err(|e| io::Error::other(format!("snapshot install task: {e}")))??;
 
-        // Every tree now holds exactly the snapshot: the entries up to its
-        // last log id, nothing above. Recorded durably before openraft is told
-        // the install finished, together with the installed data it covers.
-        let (next, payload) = match meta.last_log_id {
-            Some(log_id) => (
-                log_id.index + 1,
-                rmp_serde::to_vec(&log_id).map_err(|e| io::Error::other(e.to_string()))?,
-            ),
-            None => (0, Vec::new()),
-        };
-        self.engine
-            .reset_raft_coverage(next, &payload)
-            .map_err(|e| io::Error::other(format!("rebind raft coverage to snapshot: {e}")))?;
+        // The proposals seen so far were applied to the store the snapshot
+        // replaced; the entries after it apply again, as on a fresh node.
+        self.dedup
+            .lock()
+            .map_err(|e| io::Error::other(format!("dedup mutex poisoned: {e}")))?
+            .clear();
         self.replay_skip = None;
         self.skip_until = 0;
         self.folded = next;

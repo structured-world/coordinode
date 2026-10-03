@@ -19,7 +19,7 @@ async fn a_server_that_exits_during_startup_is_restarted_on_another_port() {
                     .spawn()
                     .expect("spawn a failing start");
             }
-            spawn_binary(port, ops_port, rest_port, data)
+            spawn_binary(port, ops_port, rest_port, data, None)
         })
         .await;
 

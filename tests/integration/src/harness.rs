@@ -32,6 +32,8 @@ pub struct CoordinodeProcess {
     // Wrapped in Option so `restart()` can take it without needing unsafe.
     // Always `Some` except briefly during `restart()`.
     data_dir: Option<tempfile::TempDir>,
+    /// The `--config` file the process runs with, carried over every restart.
+    config: Option<tempfile::NamedTempFile>,
 }
 
 impl CoordinodeProcess {
@@ -39,11 +41,41 @@ impl CoordinodeProcess {
     ///
     /// Waits up to 15 seconds for the gRPC port to become available.
     pub async fn start() -> Self {
+        Self::start_configured(None).await
+    }
+
+    /// [`start`](Self::start) with `yaml` as the `--config` file; every
+    /// restart keeps it.
+    pub async fn start_with_config(yaml: &str) -> Self {
+        use std::io::Write as _;
+        let mut file = tempfile::Builder::new()
+            .suffix(".conf")
+            .tempfile()
+            .expect("config tempfile");
+        file.write_all(yaml.as_bytes()).expect("write the config");
+        Self::start_configured(Some(file)).await
+    }
+
+    async fn start_configured(config: Option<tempfile::NamedTempFile>) -> Self {
         let data_dir = tempfile::TempDir::new().expect("tempdir");
-        let proc = Self::spawn_on_free_port(data_dir, spawn_binary).await;
+        let proc = Self::spawn_standalone(data_dir, config).await;
         // A standalone server serves before it has elected itself; every
         // caller of `start` expects a node that takes writes.
         proc.wait_for_leader(Duration::from_secs(15)).await;
+        proc
+    }
+
+    /// Spawn a standalone server over `data_dir`, with `config` if given.
+    async fn spawn_standalone(
+        data_dir: tempfile::TempDir,
+        config: Option<tempfile::NamedTempFile>,
+    ) -> Self {
+        let path = config.as_ref().map(|f| f.path().to_path_buf());
+        let mut proc = Self::spawn_on_free_port(data_dir, |port, ops_port, rest_port, data| {
+            spawn_binary(port, ops_port, rest_port, data, path.as_deref())
+        })
+        .await;
+        proc.config = config;
         proc
     }
 
@@ -68,6 +100,7 @@ impl CoordinodeProcess {
                 ops_port,
                 rest_port,
                 data_dir: None,
+                config: None,
             };
             match proc.wait_until_ready(Duration::from_secs(15)).await {
                 Ok(()) => {
@@ -110,6 +143,7 @@ impl CoordinodeProcess {
             ops_port,
             rest_port,
             data_dir: Some(data_dir),
+            config: None,
         };
         // The port is fixed by the caller (peers already name it), so a
         // process that lost it cannot move to another one.
@@ -140,7 +174,7 @@ impl CoordinodeProcess {
             .expect("data_dir missing — restart called twice?");
 
         // `self` drops at the end of this call: child already waited, data_dir is None.
-        let proc = Self::spawn_on_free_port(data_dir, spawn_binary).await;
+        let proc = Self::spawn_standalone(data_dir, self.config.take()).await;
         // After SIGKILL the Raft node must re-elect itself as leader.
         // wait_for_leader retries PRIMARY reads until election completes.
         proc.wait_for_leader(Duration::from_secs(10)).await;
@@ -179,7 +213,7 @@ impl CoordinodeProcess {
 
         // A NEW port: the old one may still be in TIME_WAIT. `self` drops at
         // the end of this call: child is already killed, data_dir is None.
-        Self::spawn_on_free_port(data_dir, spawn_binary).await
+        Self::spawn_standalone(data_dir, self.config.take()).await
     }
 
     /// Stop the process and bring the SAME data directory back up as a cluster
@@ -628,17 +662,26 @@ fn answers_ready(port: u16) -> bool {
     stream.read_exact(&mut status_line).is_ok() && status_line.ends_with(b" 200")
 }
 
-/// Spawn `coordinode serve --addr [::1]:PORT --ops-addr [::1]:OPS_PORT
-/// --rest-addr [::1]:REST_PORT --data DATA_DIR`.
+/// Spawn `coordinode serve [--config FILE] --addr [::1]:PORT --ops-addr
+/// [::1]:OPS_PORT --rest-addr [::1]:REST_PORT --data DATA_DIR`.
 ///
 /// Every port is chosen by the harness, so a test can ask `/ready` and reach
 /// the REST surface; concurrent test servers would otherwise fight over the
 /// defaults (:7084, :7081), and a taken port fails the start.
-fn spawn_binary(port: u16, ops_port: u16, rest_port: u16, data_dir: PathBuf) -> Child {
+fn spawn_binary(
+    port: u16,
+    ops_port: u16,
+    rest_port: u16,
+    data_dir: PathBuf,
+    config: Option<&std::path::Path>,
+) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
-    cmd.arg("serve")
-        .arg("--addr")
+    cmd.arg("serve");
+    if let Some(config) = config {
+        cmd.arg("--config").arg(config);
+    }
+    cmd.arg("--addr")
         .arg(format!("[::1]:{port}"))
         .arg("--ops-addr")
         .arg(format!("[::1]:{ops_port}"))

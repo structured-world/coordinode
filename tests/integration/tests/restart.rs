@@ -685,3 +685,169 @@ async fn a_unique_constraint_survives_a_crash() {
         "a duplicate of a key written before the crash must be refused"
     );
 }
+
+// ── Acknowledged writes across restarts ───────────────────────────────────────
+
+/// A config that turns over everything a restart recovers from as fast as it
+/// can: a Raft snapshot (and the log purge after it) every few entries, small
+/// log segments, frequent checkpoints, and the slowest table codec, so flushes
+/// are long enough for a stop to land in the middle of one.
+const CHURN_CONFIG: &str = "\
+storage:
+  endpoints: []
+  compression:
+    hot: { codec: zstd, level: 22 }
+    cold: { codec: zstd, level: 22 }
+  oplog:
+    segment_max_entries: 16
+raft_snapshot_entries: 8
+raft_snapshot_interval_secs: 1
+checkpoint_interval_secs: 2
+";
+
+/// Write sequence number `seq` of `stream` at majority with the journal, the
+/// strongest acknowledgement a client can ask for.
+async fn write_acked(
+    client: &mut coordinode_integration::proto::query::cypher_service_client::CypherServiceClient<
+        tonic::transport::Channel,
+    >,
+    stream: &str,
+    seq: i64,
+) -> Result<(), tonic::Status> {
+    use coordinode_integration::proto::replication::{
+        Journal, WriteConcern, WriteConcernMode, write_concern::W,
+    };
+    let mut parameters = HashMap::new();
+    parameters.insert("stream".to_string(), pv_string(stream));
+    parameters.insert(
+        "seq".to_string(),
+        PropertyValue {
+            value: Some(PvKind::IntValue(seq)),
+        },
+    );
+    client
+        .execute_cypher(ExecuteCypherRequest {
+            query: "CREATE (:Acked {stream: $stream, seq: $seq})".to_string(),
+            parameters,
+            read_preference: 0,
+            read_concern: None,
+            write_concern: Some(WriteConcern {
+                w: Some(W::Mode(WriteConcernMode::Majority as i32)),
+                journal: Journal::Journal as i32,
+                timeout_ms: 0,
+            }),
+            transaction_id: 0,
+        })
+        .await
+        .map(drop)
+}
+
+/// The sequence numbers of `stream` the server holds, found by a label scan
+/// (no index can hide a node from it).
+async fn stored_seqs(proc: &CoordinodeProcess, stream: &str) -> std::collections::BTreeSet<i64> {
+    let mut params = HashMap::new();
+    params.insert("stream".to_string(), pv_string(stream));
+    cypher(
+        proc,
+        "MATCH (n:Acked) WITH n WHERE n.stream = $stream RETURN n.seq AS seq",
+        params,
+    )
+    .await
+    .expect("read the stream back")
+    .iter()
+    .map(|row| match row["seq"].value {
+        Some(PvKind::IntValue(seq)) => seq,
+        ref other => panic!("unexpected seq {other:?}"),
+    })
+    .collect()
+}
+
+/// Every acknowledged sequence number must be stored; a missing one is an
+/// acknowledged write the server lost.
+fn assert_all_stored(acked: &[i64], stored: &std::collections::BTreeSet<i64>, after: &str) {
+    let lost: Vec<i64> = acked
+        .iter()
+        .copied()
+        .filter(|seq| !stored.contains(seq))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "acknowledged writes lost after {after}: {lost:?} (acked {}, stored {})",
+        acked.len(),
+        stored.len()
+    );
+}
+
+/// Writes acknowledged at majority with the journal survive every way a
+/// server process stops: a clean stop, a kill between writes, and a kill
+/// while a write stream is in flight, with Raft snapshots, log purges and
+/// checkpoints turning over all the time. A stream observed to lose
+/// acknowledged sequence numbers across a container restart is what this
+/// guards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledged_writes_survive_every_kind_of_stop() {
+    let stream = "acked-stream";
+    let mut proc = CoordinodeProcess::start_with_config(CHURN_CONFIG).await;
+    let mut acked: Vec<i64> = Vec::new();
+    let mut next: i64 = 0;
+
+    // Writes between stops: clean stop, then a kill.
+    for (round, unclean) in [(0, false), (1, true)] {
+        let mut client = proc.cypher_client().await;
+        for _ in 0..30 {
+            write_acked(&mut client, stream, next)
+                .await
+                .unwrap_or_else(|e| panic!("write {next} in round {round}: {e}"));
+            acked.push(next);
+            next += 1;
+        }
+        drop(client);
+        proc = if unclean {
+            proc.restart_unclean().await
+        } else {
+            let proc = proc.restart().await;
+            proc.wait_for_leader(std::time::Duration::from_secs(15))
+                .await;
+            proc
+        };
+        let stored = stored_seqs(&proc, stream).await;
+        assert_all_stored(&acked, &stored, &format!("round {round}"));
+    }
+
+    // A kill while a stream is in flight: whatever was acknowledged before
+    // the kill must be there after it.
+    for round in 0..2 {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut client = proc.cypher_client().await;
+        let writer = {
+            let count = std::sync::Arc::clone(&count);
+            let first = next;
+            tokio::spawn(async move {
+                let mut written = Vec::new();
+                let mut seq = first;
+                while write_acked(&mut client, stream, seq).await.is_ok() {
+                    written.push(seq);
+                    count.store(written.len(), Ordering::Release);
+                    seq += 1;
+                }
+                written
+            })
+        };
+        while count.load(Ordering::Acquire) < 30 + round * 7 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        proc = proc.restart_unclean().await;
+        let written = writer.await.expect("the writer ends at the kill");
+        // The write in flight at the kill may have committed unacknowledged;
+        // the next round starts past its number.
+        next = written.last().map_or(next, |last| last + 1) + 1;
+        acked.extend(written);
+        let stored = stored_seqs(&proc, stream).await;
+        assert_all_stored(
+            &acked,
+            &stored,
+            &format!("an in-flight kill, round {round}"),
+        );
+    }
+}
