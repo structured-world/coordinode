@@ -64,9 +64,11 @@ Expected response:
 
 The image declares a Docker `HEALTHCHECK` that runs the binary's own probe,
 `/coordinode healthcheck`: it asks `/ready` on the ops port and exits 0 on
-`200`. `/ready` answers `503` until the server accepts requests and again from
-the moment it starts shutting down, so an orchestrator routes nothing to a node
-that is starting or draining. The probe needs no shell or HTTP client in the
+`200`. `/ready` answers `503` until the server accepts requests, again from
+the moment it starts shutting down, and for good once consensus has stopped on
+a fatal error (a storage failure), so an orchestrator routes nothing to a node
+that is starting, draining or can no longer commit, and the container shows as
+`unhealthy`. The probe needs no shell or HTTP client in the
 image. `docker compose ps` shows the container as `healthy` once it is ready.
 
 The check probes the ops address the server uses: the built-in default, or the

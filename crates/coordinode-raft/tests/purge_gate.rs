@@ -60,6 +60,28 @@ async fn apply(sm: &mut CoordinodeStateMachine, entries: Vec<Entry>) {
     sm.apply(stream).await.expect("apply");
 }
 
+/// A shutdown is not reported as a consensus failure: the server stops
+/// reporting ready only for a fatal stop, never at every orderly exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_is_not_reported_as_a_consensus_failure() {
+    use coordinode_raft::cluster::RaftNode;
+    use std::time::Duration;
+
+    let rig = PowerRig::new();
+    let (engine, _oracle) = open(&rig);
+    let node = RaftNode::open(1, Arc::clone(&engine))
+        .await
+        .expect("open node");
+    node.shutdown().await.expect("shutdown");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), node.consensus_stopped())
+            .await
+            .expect("a stopped core answers"),
+        None,
+        "a shutdown is not a failure"
+    );
+}
+
 #[tokio::test]
 async fn purge_keeps_entries_no_tree_has_flushed_and_replay_restores_them() {
     let rig = PowerRig::new();

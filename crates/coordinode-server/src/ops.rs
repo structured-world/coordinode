@@ -21,17 +21,26 @@ use tracing::{error, info};
 
 /// Whether the node serves requests: raised when the gRPC server starts,
 /// lowered when shutdown begins, so a balancer stops routing to a draining
-/// node before its connections close.
+/// node before its connections close; and down for good once consensus has
+/// stopped on a fatal error, since the node then commits nothing.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Readiness(Arc<AtomicBool>);
+pub(crate) struct Readiness {
+    serving: Arc<AtomicBool>,
+    consensus_failed: Arc<AtomicBool>,
+}
 
 impl Readiness {
     pub(crate) fn set(&self, ready: bool) {
-        self.0.store(ready, Ordering::Release);
+        self.serving.store(ready, Ordering::Release);
+    }
+
+    /// Consensus stopped on a fatal error: not ready, whatever `set` says.
+    pub(crate) fn consensus_failed(&self) {
+        self.consensus_failed.store(true, Ordering::Release);
     }
 
     pub(crate) fn get(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.serving.load(Ordering::Acquire) && !self.consensus_failed.load(Ordering::Acquire)
     }
 }
 

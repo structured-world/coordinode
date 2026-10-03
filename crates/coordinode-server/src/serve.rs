@@ -1050,6 +1050,17 @@ pub(crate) async fn serve(
 
     // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
     let readiness = ops::Readiness::default();
+    // Consensus that stopped on a fatal error commits nothing more: the node
+    // stops reporting ready, so a balancer and an operator see it.
+    if let Some(node) = raft_node_shared.clone() {
+        let consensus_readiness = readiness.clone();
+        tokio::spawn(async move {
+            if let Some(fatal) = node.consensus_stopped().await {
+                tracing::error!(%fatal, "consensus stopped; the node no longer reports ready");
+                consensus_readiness.consensus_failed();
+            }
+        });
+    }
     let ops_readiness = readiness.clone();
     tokio::spawn(async move {
         if let Err(e) = ops::start_ops_server(ops_listener, ops_readiness, sample_gauges).await {

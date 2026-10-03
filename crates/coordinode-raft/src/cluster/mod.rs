@@ -1562,6 +1562,26 @@ impl RaftNode {
         &self.raft
     }
 
+    /// Wait until this node's consensus stops on a fatal error (a log or
+    /// state-machine storage failure, a panic of the core) and return it:
+    /// from then on the node commits nothing. `None` when the core stops
+    /// without one, as on shutdown.
+    pub async fn consensus_stopped(&self) -> Option<String> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let mut metrics = self.raft.metrics();
+        loop {
+            match &metrics.borrow_watched().running_state {
+                Ok(()) => {}
+                // A shutdown is reported as `Stopped`: a normal end.
+                Err(openraft::error::Fatal::Stopped) => return None,
+                Err(fatal) => return Some(fatal.to_string()),
+            }
+            if metrics.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
     /// Transfer leadership to a specific peer node.
     ///
     /// Sends a `TimeoutNow` message to the target, triggering an immediate

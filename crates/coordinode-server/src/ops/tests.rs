@@ -20,6 +20,21 @@ fn ready_follows_the_flag() {
     assert_eq!(status, "503 Service Unavailable");
 }
 
+/// A node whose consensus stopped on a fatal error commits nothing: `/ready`
+/// answers 503 from then on, even when the server is (or later starts)
+/// serving.
+#[test]
+fn ready_stays_down_once_consensus_failed() {
+    let readiness = Readiness::default();
+    readiness.set(true);
+    readiness.consensus_failed();
+    let (status, _, _) = respond("/ready", readiness.get(), String::new);
+    assert_eq!(status, "503 Service Unavailable");
+
+    readiness.set(true);
+    assert!(!readiness.get(), "serving again does not lift the failure");
+}
+
 /// Liveness does not depend on readiness: a starting or draining process is
 /// alive and must not be restarted for it.
 #[test]
