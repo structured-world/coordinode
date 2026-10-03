@@ -10,7 +10,11 @@ fail-fast = false
 # brings up real Raft groups with gRPC and election timeouts, and one at a
 # time they hold the run for minutes; the default run stays fast. The set is
 # the same binaries as the raft-cluster group below.
-default-filter = "not (binary(raft_cluster) + binary(cluster) + binary(follower_reads) + binary(shutdown_without_quorum) + binary(derived_index) + binary(jepsen) + binary(standalone_growth) + binary(tls_cluster) + binary(cluster_vector_replication) + binary(restore_in_a_group) + binary(write_forwarding))"
+#
+# The power-cut sweeps run only when asked for too (`-P slow`): each one cuts
+# power at every write or sync of a workload and recovers, and takes minutes
+# on its own and ten under a loaded host.
+default-filter = "not (binary(raft_cluster) + binary(cluster) + binary(follower_reads) + binary(shutdown_without_quorum) + binary(derived_index) + binary(jepsen) + binary(standalone_growth) + binary(tls_cluster) + binary(cluster_vector_replication) + binary(restore_in_a_group) + binary(write_forwarding) + test(/a_power_cut_/))"
 # A leak is a child process still holding the test's stdout/stderr after the
 # test exits. Under a loaded run nextest itself can see the pipe close more
 # than the default 100ms after exit, which flags pure tests that spawn
@@ -76,6 +80,16 @@ default-filter = "binary(raft_cluster) + binary(cluster) + binary(follower_reads
 
 [profile.cluster.slow-timeout]
 period = "30s"
+
+# The power-cut sweeps, run explicitly:
+# `cargo nextest run -P slow --workspace --all-features`.
+[profile.slow]
+fail-fast = false
+leak-timeout = "1s"
+default-filter = "test(/a_power_cut_/)"
+
+[profile.slow.slow-timeout]
+period = "120s"
 
 # CI profile: inherits overrides via re-declaration + JUnit output
 [profile.ci]

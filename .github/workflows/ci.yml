@@ -166,6 +166,9 @@ jobs:
         env:
           COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS: "1"
         run: cargo nextest run -P cluster --all-features --workspace
+      - name: Run the power-cut sweeps (nextest)
+        # Minutes each, so outside the default profile as well.
+        run: cargo nextest run -P slow --all-features --workspace
       - name: Clean the build output
         if: always()
         run: cargo clean
