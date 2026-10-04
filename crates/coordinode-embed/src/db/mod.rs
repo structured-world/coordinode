@@ -964,6 +964,13 @@ impl Database {
         // worker's copy of them is a harmless upsert. The worker is also what
         // takes a committed deletion out of the graph.
         let applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
+        // A vector search waits for the worker to fold every entry applied
+        // before it.
+        let vector_readiness = Arc::new(coordinode_query::index::IndexReadiness::new(
+            coordinode_query::index::MaintainedIndex::Vector,
+            applied.position(),
+            coordinode_query::index::DEFAULT_INDEX_READY_WAIT,
+        ));
 
         // Load vector index definitions from schema: partition and rebuild
         // HNSW graphs from stored vectors (eager rebuild). The registry is
@@ -978,11 +985,13 @@ impl Database {
 
         // The rebuild above covered what the store held; the worker keeps the
         // indexes current with every entry applied from here on.
+        vector_index_registry.set_readiness(Arc::clone(&vector_readiness));
         let vector_worker = crate::vector_worker::VectorIndexWorker::spawn(
             Arc::clone(&engine),
             applied,
             Arc::clone(&vector_index_registry),
             Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
+            vector_readiness,
             1, /* shard_id */
         );
 
@@ -990,9 +999,10 @@ impl Database {
         // subscription opens before they are rebuilt from the store, so no
         // commit falls between the two, and searches wait for the worker.
         let text_applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
-        let text_readiness = Arc::new(coordinode_query::index::TextReadiness::new(
+        let text_readiness = Arc::new(coordinode_query::index::IndexReadiness::new(
+            coordinode_query::index::MaintainedIndex::Text,
             text_applied.position(),
-            coordinode_query::index::DEFAULT_TEXT_READY_WAIT,
+            coordinode_query::index::DEFAULT_INDEX_READY_WAIT,
         ));
         let text_index_base = path.join("text_indexes");
         let text_index_registry = Arc::new(Self::load_text_indexes(
@@ -2809,7 +2819,6 @@ impl Database {
             ),
             read_timeout: READ_TIMEOUT,
             params: std::collections::HashMap::new(),
-            pending_vector_writes: Vec::new(),
         };
 
         let start = Instant::now();
@@ -2820,10 +2829,6 @@ impl Database {
         } else {
             execute(&plan, &mut ctx)?
         };
-        // Flush HNSW writes accumulated during execute as a single
-        // batched insert per (label, property) — amortises the HNSW
-        // write-lock acquisition across the whole statement.
-        ctx.flush_pending_vector_writes();
         // Park the (uncommitted) transaction state so the caller can re-hold it
         // for the next statement of an interactive transaction. `take_state`
         // drains the buffers without consuming `ctx`, leaving it droppable.
@@ -3632,12 +3637,15 @@ impl Database {
         &self.text_index_registry
     }
 
-    /// Bound how long a full-text search waits for the text indexes to hold
-    /// every commit applied before it; past it the search fails with
-    /// [`coordinode_query::index::TextNotReady`]. Takes effect for the next
+    /// Bound how long a full-text or vector search waits for its indexes to
+    /// hold every commit applied before it; past it the search fails with
+    /// [`coordinode_query::index::IndexBehind`]. Takes effect for the next
     /// search.
-    pub fn set_text_ready_wait(&self, wait: Duration) {
+    pub fn set_index_ready_wait(&self, wait: Duration) {
         if let Some(readiness) = self.text_index_registry.readiness() {
+            readiness.set_wait(wait);
+        }
+        if let Some(readiness) = self.vector_index_registry.readiness() {
             readiness.set_wait(wait);
         }
     }

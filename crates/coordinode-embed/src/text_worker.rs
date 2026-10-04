@@ -14,7 +14,7 @@
 //! A partition replaced wholesale or a queue the worker fell behind on is
 //! answered with a rebuild of every index from the store. After each fold or
 //! rebuild the worker publishes how far it got, and a search waits on that
-//! (see [`coordinode_query::index::TextReadiness`]).
+//! (see [`coordinode_query::index::IndexReadiness`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,7 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_query::index::text_registry::stored_texts;
-use coordinode_query::index::{TextIndexRegistry, TextReadiness};
+use coordinode_query::index::{IndexReadiness, TextIndexRegistry};
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
 };
@@ -55,7 +55,7 @@ impl TextIndexWorker {
         applied: AppliedSubscription,
         registry: Arc<TextIndexRegistry>,
         fields: Arc<dyn FieldRegistrar>,
-        readiness: Arc<TextReadiness>,
+        readiness: Arc<IndexReadiness>,
         shard_id: u16,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -113,7 +113,7 @@ struct Worker {
     /// Read afresh for each fold: an entry can carry a property registered
     /// after the worker started.
     fields: Arc<dyn FieldRegistrar>,
-    readiness: Arc<TextReadiness>,
+    readiness: Arc<IndexReadiness>,
     shard_id: u16,
     stop: Arc<AtomicBool>,
 }

@@ -1330,8 +1330,10 @@ fn create_node_auto_inserts_into_hnsw() {
     db.execute_cypher("CREATE (b:Movie {title: 'Inception', embedding: [0.0, 1.0, 0.0, 0.0]})")
         .expect("create Inception");
 
-    // HNSW index should now contain 2 vectors automatically
+    // HNSW index should now contain 2 vectors automatically, once the
+    // worker has folded the commits (a search waits for that).
     let reg = db.vector_index_registry();
+    reg.await_covered().expect("the index catches up");
     let results = reg
         .search("Movie", "embedding", &[0.9, 0.1, 0.0, 0.0], 10)
         .expect("search");
@@ -1374,8 +1376,9 @@ fn set_vector_property_updates_hnsw() {
     db.execute_cypher("CREATE (a:Item {name: 'A', v: [0.0, 0.0, 0.0]})")
         .expect("create A");
 
-    // Verify it's in the index
+    // Verify it's in the index once the worker has folded the commit.
     let reg = db.vector_index_registry();
+    reg.await_covered().expect("the index catches up");
     let results = reg
         .search("Item", "v", &[0.0, 0.0, 0.0], 5)
         .expect("search");
@@ -1390,6 +1393,7 @@ fn set_vector_property_updates_hnsw() {
     // so the index should still contain 1 entry (or 2 if no dedup on update).
     // The important thing is that searching near [10, 10, 10] finds the node.
     let reg = db.vector_index_registry();
+    reg.await_covered().expect("the index catches up");
     let results = reg
         .search("Item", "v", &[10.0, 10.0, 10.0], 5)
         .expect("search near new vector");
@@ -1708,8 +1712,9 @@ fn hnsw_persists_across_restart() {
         )
         .expect("create Interstellar");
 
-        // Verify index works before close
+        // Verify index works before close, once the worker caught up.
         let reg = db.vector_index_registry();
+        reg.await_covered().expect("the index catches up");
         let results = reg
             .search("Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3)
             .expect("search pre-close");
@@ -1864,6 +1869,7 @@ fn new_vectors_indexed_after_reopen() {
             .expect("create B");
 
         let reg = db.vector_index_registry();
+        reg.await_covered().expect("the index catches up");
         let results = reg
             .search("Item", "v", &[0.0, 1.0, 0.0], 5)
             .expect("search after insert");
@@ -1981,8 +1987,9 @@ fn offloaded_hnsw_search_e2e_through_cypher() {
         db.execute_cypher(&query).expect("create item");
     }
 
-    // Verify the HNSW index has vectors
+    // Verify the HNSW index has vectors once the worker caught up.
     let reg = db.vector_index_registry();
+    reg.await_covered().expect("the index catches up");
     let handle = reg.get("Item", "embedding").expect("index should exist");
     let hnsw = handle.read().expect("read lock");
     assert_eq!(hnsw.len(), 10, "HNSW should have 10 vectors");
@@ -2057,9 +2064,11 @@ fn forced_offload_search_through_registry() {
         .expect("create widget");
     }
 
-    // Force SQ8 calibration + offloading on the HNSW index
+    // Force SQ8 calibration + offloading on the HNSW index, once the worker
+    // has folded every insert.
     {
         let reg = db.vector_index_registry();
+        reg.await_covered().expect("the index catches up");
         let handle = reg.get("Widget", "vec").expect("index exists");
         let mut hnsw = handle.write().expect("write lock");
 

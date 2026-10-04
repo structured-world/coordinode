@@ -2,10 +2,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
-use coordinode_query::index::TextReadiness;
+use coordinode_query::index::{IndexReadiness, MaintainedIndex};
+use coordinode_storage::engine::applied::AppliedSubscription;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
+
+/// The text indexes' coverage over `sub`, searches waiting at most `wait`.
+fn readiness(sub: &AppliedSubscription, wait: Duration) -> IndexReadiness {
+    IndexReadiness::new(MaintainedIndex::Text, sub.position(), wait)
+}
 
 fn engine(dir: &tempfile::TempDir) -> StorageEngine {
     StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -43,7 +49,7 @@ fn a_search_over_covered_indexes_does_not_wait() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
     let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = TextReadiness::new(sub.position(), Duration::from_secs(5));
+    let readiness = readiness(&sub, Duration::from_secs(5));
 
     let started = Instant::now();
     assert_eq!(readiness.await_covered(), Ok(()));
@@ -61,7 +67,7 @@ fn a_search_ahead_of_the_indexes_fails_after_its_wait() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
     let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = TextReadiness::new(sub.position(), Duration::from_millis(50));
+    let readiness = readiness(&sub, Duration::from_millis(50));
     apply(&engine, 1);
     apply(&engine, 2);
     readiness.advance(1);
@@ -69,7 +75,10 @@ fn a_search_ahead_of_the_indexes_fails_after_its_wait() {
     let err = readiness
         .await_covered()
         .expect_err("the indexes lack entry 2");
-    assert_eq!((err.folded, err.needed), (1, 2));
+    assert_eq!(
+        (err.kind, err.folded, err.needed),
+        (MaintainedIndex::Text, 1, 2)
+    );
     assert!(err.waited_ms >= 50, "{err:?}");
 }
 
@@ -80,7 +89,7 @@ fn a_waiting_search_goes_ahead_when_the_worker_catches_up() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
     let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = Arc::new(TextReadiness::new(sub.position(), Duration::from_secs(30)));
+    let readiness = Arc::new(readiness(&sub, Duration::from_secs(30)));
     apply(&engine, 1);
 
     let worker = {
@@ -103,7 +112,7 @@ fn the_wait_is_retunable_and_zero_refuses_at_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
     let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = TextReadiness::new(sub.position(), Duration::from_secs(30));
+    let readiness = readiness(&sub, Duration::from_secs(30));
     apply(&engine, 1);
     readiness.set_wait(Duration::ZERO);
 

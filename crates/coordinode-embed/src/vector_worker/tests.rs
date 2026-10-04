@@ -119,11 +119,19 @@ impl Fixture {
     }
 
     fn spawn(&self, capacity: usize) -> VectorIndexWorker {
+        let applied = self.engine.subscribe_applied(Partition::Node, capacity);
+        let readiness = Arc::new(coordinode_query::index::IndexReadiness::new(
+            coordinode_query::index::MaintainedIndex::Vector,
+            applied.position(),
+            coordinode_query::index::DEFAULT_INDEX_READY_WAIT,
+        ));
+        self.registry.set_readiness(Arc::clone(&readiness));
         VectorIndexWorker::spawn(
             Arc::clone(&self.engine),
-            self.engine.subscribe_applied(Partition::Node, capacity),
+            applied,
             Arc::clone(&self.registry),
             Arc::clone(&self.fields) as Arc<dyn FieldRegistrar>,
+            readiness,
             SHARD,
         )
     }

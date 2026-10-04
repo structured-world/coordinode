@@ -546,11 +546,11 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
-        // The text indexes have not caught up with the commits the read
-        // includes. UNAVAILABLE: the request is fine and will succeed once
-        // the indexes hold those commits.
-        DatabaseError::Execution(ExecutionError::TextNotReady(behind)) => {
-            return super::error_details::text_index_behind(behind);
+        // The full-text or vector indexes have not caught up with the
+        // commits the read includes. UNAVAILABLE: the request is fine and
+        // will succeed once the indexes hold those commits.
+        DatabaseError::Execution(ExecutionError::IndexBehind(behind)) => {
+            return super::error_details::index_behind(behind);
         }
         // The engine's own guard on a snapshot read below the watermark:
         // the same condition reached through a storage-level read.

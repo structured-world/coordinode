@@ -185,12 +185,12 @@ pub enum ExecutionError {
         leader_id: Option<u64>,
     },
 
-    /// A full-text search found the text indexes behind the commits its
+    /// A full-text or vector search found its indexes behind the commits its
     /// snapshot includes after its wait. Nothing was answered: an index
     /// lacking a committed write would miss or misrank rows. Retryable once
     /// the indexes catch up.
     #[error("{0}")]
-    TextNotReady(#[from] crate::index::TextNotReady),
+    IndexBehind(#[from] crate::index::IndexBehind),
 
     /// The write reached a member that does not run its group's version.
     /// Nothing was applied; the same write succeeds at the leader named in
@@ -1019,21 +1019,6 @@ pub struct ExecutionContext<'a> {
     /// functions such as `percentileCont(x, $p)` where `$p` is a bound parameter.
     /// Keys omit the `$` prefix (e.g., `"p"` for `$p`).
     pub params: HashMap<String, coordinode_core::graph::types::Value>,
-    /// Buffered HNSW inserts produced by CREATE operators in this
-    /// statement. Each entry is `(label, property, NodeId, vector)`.
-    /// Drained at the end of [`execute()`] via
-    /// [`Self::flush_pending_vector_writes`] which groups by
-    /// `(label, property)` and calls
-    /// `VectorIndexRegistry::on_vectors_written` once per group — so
-    /// a bulk INSERT (UNWIND … CREATE …) pays one HNSW write-lock
-    /// acquisition per index per batch instead of one per row.
-    ///
-    /// The non-batched single-row CREATE / SET / MERGE paths still
-    /// dispatch directly to `on_vector_written` for backward
-    /// compatibility; this buffer is only used by the CREATE-from-
-    /// CreateNode operator hot path (line ≈ 7290) which dominates
-    /// bulk loads.
-    pub pending_vector_writes: Vec<(String, String, NodeId, Vec<f32>)>,
 }
 
 /// Ids of the engine-managed fields a temporal version carries:
@@ -1096,40 +1081,6 @@ impl<'a> ExecutionContext<'a> {
     /// The vector index registry, when this context has vector indexes.
     pub fn vector_index_registry(&self) -> Option<&'a crate::index::VectorIndexRegistry> {
         self.vector_indexes.map(|v| v.registry)
-    }
-
-    /// Drain buffered HNSW inserts and apply them in one batched
-    /// write per (label, property) index. The CREATE-row hot path
-    /// inside `execute_create_node` appends to
-    /// `pending_vector_writes` instead of taking the HNSW write-lock
-    /// per insert; the caller (`execute_cypher_impl`) calls this
-    /// once after [`execute()`] returns to flush the batch.
-    ///
-    /// Safe to call repeatedly: a second call sees an empty buffer
-    /// and is a no-op.
-    pub fn flush_pending_vector_writes(&mut self) {
-        if self.pending_vector_writes.is_empty() {
-            return;
-        }
-        let Some(registry) = self.vector_index_registry() else {
-            self.pending_vector_writes.clear();
-            return;
-        };
-        let drained = std::mem::take(&mut self.pending_vector_writes);
-        // Group by (label, property) so each HNSW index gets one
-        // write-lock + one insert_batch call.
-        type VectorBatchKey = (String, String);
-        type VectorBatchItems = Vec<(NodeId, Vec<f32>)>;
-        let mut grouped: HashMap<VectorBatchKey, VectorBatchItems> = HashMap::new();
-        for (label, property, node_id, vector) in drained {
-            grouped
-                .entry((label, property))
-                .or_default()
-                .push((node_id, vector));
-        }
-        for ((label, property), items) in grouped {
-            registry.on_vectors_written(&label, &property, items);
-        }
     }
 
     /// L1+L2 cascade entry. Call before executing a trigger body.
@@ -5329,6 +5280,9 @@ fn execute_hnsw_scan(
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
     gate_vector_index_read(indexes, label, property)?;
+    // The index holds every commit applied before this search, or the
+    // search fails rather than miss one.
+    registry.await_covered()?;
 
     let qv_val = eval_neutral(query_vector, &Row::new())?;
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
@@ -6652,6 +6606,9 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     gate_vector_index_read(indexes, &label_str, &property_str)?;
+    // The index holds every commit applied before this search, or the
+    // search fails rather than miss one.
+    registry.await_covered()?;
 
     // ACORN-style filtered search: when the planner pushed a predicate down,
     // pass it as a visibility closure so the HNSW traversal prunes branches
@@ -10226,8 +10183,6 @@ fn gate_vector_index_read(
     }
 }
 
-use coordinode_core::graph::types::try_extract_vector;
-
 /// CREATE node: allocate ID, build record, write to storage.
 fn execute_create_node(
     input_rows: &[Row],
@@ -10526,33 +10481,6 @@ fn execute_create_node(
         ctx.write_stats.nodes_created += 1;
         ctx.stat_node_created(&record);
         ctx.write_stats.properties_set += properties.len() as u64;
-
-        // Buffer HNSW writes so they hit the index once per batch
-        // instead of once per row. The buffer is drained at the end
-        // of `execute()` by `ExecutionContext::flush_pending_vector_writes`
-        // which groups by (label, property) and calls
-        // `VectorIndexRegistry::on_vectors_written`. Existence of an
-        // index is still resolved here so we only buffer writes that
-        // would actually land somewhere — the registry lookup itself
-        // is cheap (RwLock::read on a HashMap).
-        if let Some(registry) = ctx.vector_index_registry() {
-            if let Some(primary_label) = labels.first() {
-                for (prop_name, expr) in properties {
-                    if !registry.has_index(primary_label, prop_name) {
-                        continue;
-                    }
-                    let val = eval_neutral(expr, input_row)?;
-                    if let Some(vec_data) = try_extract_vector(&val) {
-                        ctx.pending_vector_writes.push((
-                            primary_label.clone(),
-                            prop_name.clone(),
-                            node_id,
-                            vec_data,
-                        ));
-                    }
-                }
-            }
-        }
 
         // Fire BEFORE COMMIT triggers registered on any of the new node's
         // labels for the CREATE event. Triggers fire after the node write
@@ -11518,14 +11446,6 @@ fn execute_update(
                         ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
                         ctx.write_stats.properties_set += 1;
 
-                        // Notify vector index registry if setting a vector property.
-                        if let Some(registry) = ctx.vector_index_registry() {
-                            if let Some(vec_data) = try_extract_vector(&val) {
-                                let label = record.primary_label().to_string();
-                                registry.on_vector_written(&label, node_id, property, &vec_data);
-                            }
-                        }
-
                         // Reflect the new value in the output row only when the
                         // write was actually applied. If mvcc_get returned None
                         // (e.g. node was DELETEd earlier in the same query), the
@@ -11757,18 +11677,6 @@ fn execute_update(
                                 out_row.insert(format!("{variable}.{k}"), v.clone());
                             }
                         }
-
-                        // Notify vector index registry for any vector properties in the replacement map.
-                        if let Some(registry) = ctx.vector_index_registry() {
-                            let label = record.primary_label().to_string();
-                            if let Value::Map(ref map) = map_val {
-                                for (k, v) in map {
-                                    if let Some(vec_data) = try_extract_vector(v) {
-                                        registry.on_vector_written(&label, node_id, k, &vec_data);
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
                 crate::plan::SetItem::MergeProperties { variable, expr } => {
@@ -11831,18 +11739,6 @@ fn execute_update(
                         if let Value::Map(ref map) = map_val {
                             for (k, v) in map {
                                 out_row.insert(format!("{variable}.{k}"), v.clone());
-                            }
-                        }
-
-                        // Notify vector index registry for any vector properties in the merged map.
-                        if let Some(registry) = ctx.vector_index_registry() {
-                            let label = record.primary_label().to_string();
-                            if let Value::Map(ref map) = map_val {
-                                for (k, v) in map {
-                                    if let Some(vec_data) = try_extract_vector(v) {
-                                        registry.on_vector_written(&label, node_id, k, &vec_data);
-                                    }
-                                }
                             }
                         }
                     }
@@ -12205,19 +12101,7 @@ fn execute_remove(
                             // absence: the old value's entry goes, and an
                             // index that keeps missing values gets one.
                             ctx.index_property_changed(node_id, &record, property, None)?;
-                            let old_value =
-                                remove_node_property(&mut record, property, ctx.interner);
-
-                            // Notify vector index if removing a vector property.
-                            if let Some(registry) = ctx.vector_index_registry() {
-                                if old_value
-                                    .as_ref()
-                                    .is_some_and(|v| try_extract_vector(v).is_some())
-                                {
-                                    let label = record.primary_label().to_string();
-                                    registry.on_vector_deleted(&label, node_id, property);
-                                }
-                            }
+                            remove_node_property(&mut record, property, ctx.interner);
                             ctx.write_stats.properties_removed += 1;
                         }
 
@@ -12669,27 +12553,12 @@ fn execute_delete(
                 ctx.mvcc_get_node(ctx.shard_id, node_id)?
                     .map(|rec| snapshot_node_record(&rec, ctx));
 
-            let needs_index_cleanup =
-                ctx.btree_index_registry.is_some() || ctx.vector_indexes.is_some();
-            if needs_index_cleanup {
+            // The node's B-tree entries go with it, so its unique values are
+            // free for a new node. Vector and text indexes follow the
+            // committed deletion on their own.
+            if ctx.btree_index_registry.is_some() {
                 if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-                    {
-                        let label = record.primary_label().to_string();
-
-                        // The node's B-tree entries go with it, so its unique
-                        // values are free for a new node.
-                        ctx.index_node_deleted(node_id, &record)?;
-
-                        for (&field_id, value) in &record.props {
-                            if let Some(prop_name) = ctx.interner.resolve(field_id) {
-                                if let Some(registry) = ctx.vector_index_registry() {
-                                    if try_extract_vector(value).is_some() {
-                                        registry.on_vector_deleted(&label, node_id, prop_name);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    ctx.index_node_deleted(node_id, &record)?;
                 }
             }
             if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
@@ -13557,15 +13426,9 @@ fn apply_merge_nodes_set_item(
     Ok(())
 }
 
-/// Propagate property-level changes on the surviving target node to every
-/// index registry (B-tree / vector / text). Treats added/replaced properties
-/// as `delete(old) + insert(new)` so unique constraints, vector neighbour
-/// lists, and inverted indexes stay in sync.
-///
-/// `old` is the property map snapshotted BEFORE the merge; `new` is the same
-/// map after `merge_node_properties` ran. Properties that were dropped
-/// entirely (which the current merge strategies don't produce, but we handle
-/// for completeness) emit a delete with no follow-up insert.
+/// Move the B-tree entries of the surviving target node from its values
+/// before the merge (`old`) to those after it (`new`), so unique constraints
+/// stay in sync.
 fn notify_indexes_for_target_change(
     target_id: NodeId,
     label: &str,
@@ -13574,42 +13437,9 @@ fn notify_indexes_for_target_change(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
     // B-tree entries move from the old values to the new ones in one pass;
-    // a unique value another node holds refuses the merge.
-    ctx.index_fields_changed(target_id, label, old, new)?;
-
-    // Vector registry: old entries that changed or disappeared, then the new
-    // ones. Text indexes follow the committed record on their own.
-    for (field_id, old_val) in old {
-        let unchanged = new.get(field_id) == Some(old_val);
-        if unchanged {
-            continue;
-        }
-        let Some(name) = ctx.interner.resolve(*field_id) else {
-            continue;
-        };
-        let name = name.to_string();
-        if let Some(registry) = ctx.vector_index_registry() {
-            if try_extract_vector(old_val).is_some() {
-                registry.on_vector_deleted(label, target_id, &name);
-            }
-        }
-    }
-    for (field_id, new_val) in new {
-        let unchanged = old.get(field_id) == Some(new_val);
-        if unchanged {
-            continue;
-        }
-        let Some(name) = ctx.interner.resolve(*field_id) else {
-            continue;
-        };
-        let name = name.to_string();
-        if let Some(registry) = ctx.vector_index_registry() {
-            if let Some(vec_data) = try_extract_vector(new_val) {
-                registry.on_vector_written(label, target_id, &name, &vec_data);
-            }
-        }
-    }
-    Ok(())
+    // a unique value another node holds refuses the merge. Vector and text
+    // indexes follow the committed record on their own.
+    ctx.index_fields_changed(target_id, label, old, new)
 }
 
 /// Transfer every edge of `source_id` onto `target_id`.
@@ -13860,11 +13690,9 @@ fn detach_delete_node(
     node_id: NodeId,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    // Notify the B-tree and vector registries of the soon-to-be-deleted
-    // properties so their entries are cleaned up before primary storage drops
-    // the node. Without this, indexes leak: unique constraints would still
-    // reject re-creation with the same value, vector searches would return
-    // stale UIDs. Text indexes follow the committed deletion on their own.
+    // The node's B-tree entries go before primary storage drops the node, or
+    // unique constraints would still reject re-creation with the same value.
+    // Vector and text indexes follow the committed deletion on their own.
     // Snapshot pre-mutation node state once for trigger firing — re-used after
     // the node is deleted to populate `$before` for the BEFORE COMMIT DELETE
     // trigger. Mirrors the `execute_delete` / `cascade_delete_source_node`
@@ -13874,19 +13702,7 @@ fn detach_delete_node(
         .mvcc_get_node(ctx.shard_id, node_id)?
         .map(|rec| snapshot_node_record(&rec, ctx));
     if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
-        {
-            let label = record.primary_label().to_string();
-            ctx.index_node_deleted(node_id, &record)?;
-            for (&field_id, value) in &record.props {
-                if let Some(prop_name) = ctx.interner.resolve(field_id) {
-                    if let Some(registry) = ctx.vector_index_registry() {
-                        if try_extract_vector(value).is_some() {
-                            registry.on_vector_deleted(&label, node_id, prop_name);
-                        }
-                    }
-                }
-            }
-        }
+        ctx.index_node_deleted(node_id, &record)?;
     }
 
     let edge_types = ctx.list_edge_types()?;
@@ -15300,22 +15116,9 @@ fn cascade_delete_source_node(
     let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> = ctx
         .mvcc_get_node(ctx.shard_id, source_id)?
         .map(|rec| snapshot_node_record(&rec, ctx));
-    let needs_index_cleanup = ctx.btree_index_registry.is_some() || ctx.vector_indexes.is_some();
-    if needs_index_cleanup {
+    if ctx.btree_index_registry.is_some() {
         if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
-            {
-                let label = record.primary_label().to_string();
-                ctx.index_node_deleted(source_id, &record)?;
-                for (&fid, value) in &record.props {
-                    if let Some(prop_name) = ctx.interner.resolve(fid) {
-                        if let Some(registry) = ctx.vector_index_registry() {
-                            if try_extract_vector(value).is_some() {
-                                registry.on_vector_deleted(&label, source_id, prop_name);
-                            }
-                        }
-                    }
-                }
-            }
+            ctx.index_node_deleted(source_id, &record)?;
         }
     }
     if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {

@@ -22,8 +22,12 @@ use coordinode_core::graph::intern::FieldRegistrar;
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
-use coordinode_query::index::{BuildTarget, BuildToken, VectorBuild, VectorIndexRegistry};
-use coordinode_storage::engine::applied::{AppliedEvent, AppliedStop, AppliedSubscription};
+use coordinode_query::index::{
+    BuildTarget, BuildToken, IndexReadiness, VectorBuild, VectorIndexRegistry,
+};
+use coordinode_storage::engine::applied::{
+    AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
+};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use rustc_hash::FxHashSet;
@@ -51,15 +55,18 @@ impl VectorIndexWorker {
         applied: AppliedSubscription,
         registry: Arc<VectorIndexRegistry>,
         fields: Arc<dyn FieldRegistrar>,
+        readiness: Arc<IndexReadiness>,
         shard_id: u16,
     ) -> Self {
         let stop = registry.new_build_token();
         let applied_stop = applied.stopper();
         let worker = Worker {
             engine,
+            position: applied.position(),
             applied,
             registry,
             fields,
+            readiness,
             shard_id,
             stop: stop.clone(),
         };
@@ -101,10 +108,14 @@ impl Drop for VectorIndexWorker {
 struct Worker {
     engine: Arc<StorageEngine>,
     applied: AppliedSubscription,
+    /// How far the store's events were offered, read before a rebuild.
+    position: AppliedPosition,
     registry: Arc<VectorIndexRegistry>,
     /// Read afresh for each fold: an entry can carry a property registered
     /// after the worker started.
     fields: Arc<dyn FieldRegistrar>,
+    /// Where searches learn how far the indexes cover the store.
+    readiness: Arc<IndexReadiness>,
     shard_id: u16,
     /// Cancelled when the worker is asked to stop; also stops its rebuilds.
     stop: BuildToken,
@@ -121,16 +132,19 @@ impl Worker {
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
             let mut replaced = false;
             let mut max_ts = 0u64;
+            let mut last_seq = 0u64;
             let mut taken = 0usize;
             let mut event = Some(first);
             while let Some(current) = event {
                 match current {
                     AppliedEvent::Keys {
+                        seq,
                         commit_ts,
                         keys: written,
                         ..
                     } => {
                         max_ts = max_ts.max(commit_ts);
+                        last_seq = last_seq.max(seq);
                         keys.extend(written);
                     }
                     AppliedEvent::Replaced => replaced = true,
@@ -143,74 +157,81 @@ impl Worker {
                 };
             }
 
-            if replaced {
-                self.rebuild();
+            let covered = if replaced {
+                self.rebuild()
             } else {
-                self.fold(keys);
-            }
+                match self.fold(keys) {
+                    Ok(()) => Some(last_seq),
+                    Err(e) => {
+                        // The entries are applied and stay in the store;
+                        // reading them all again is the one way not to drop
+                        // these.
+                        tracing::warn!(error = %e, "vector index worker could not read applied nodes; rebuilding");
+                        self.rebuild()
+                    }
+                }
+            };
             // Every entry up to `max_ts` is now in the indexes, and so is
             // every write at or below it that these entries did not touch.
             if max_ts > 0 {
                 self.registry.advance_indexed_hlc_all(max_ts);
+            }
+            // A failed rebuild publishes nothing: searches then wait and fail
+            // explicitly rather than read an index missing commits.
+            if let Some(seq) = covered {
+                self.readiness.advance(seq);
             }
         }
         tracing::info!("vector index worker stopped");
     }
 
     /// Bring the nodes behind `keys` into every index that covers them.
-    fn fold(&self, keys: FxHashSet<Vec<u8>>) {
+    fn fold(&self, keys: FxHashSet<Vec<u8>>) -> Result<(), String> {
         // A store without vector indexes pays no read for its commits.
         let definitions = self.registry.all_definitions();
         if definitions.is_empty() {
-            return;
+            return Ok(());
         }
-        let ids: Vec<NodeId> = keys
+        let mut ids: Vec<NodeId> = keys
             .iter()
             .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
             .filter(|(shard, _)| *shard == self.shard_id)
             .map(|(_, id)| id)
             .collect();
         if ids.is_empty() {
-            return;
+            return Ok(());
         }
+        // In id order, which is creation order: the graph an insert order
+        // builds (and the quantizer it calibrates) is then the same on every
+        // member and every run, not the order a hash set happened to yield.
+        ids.sort_unstable();
         let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
-        let records = match LocalNodeStore.get_many(&read, self.shard_id, &ids) {
-            Ok(records) => records,
-            Err(e) => {
-                // The entries are applied and stay in the store; reading them
-                // all again is the one way not to drop these.
-                tracing::warn!(error = %e, nodes = ids.len(), "vector index worker could not read applied nodes; rebuilding");
-                drop(read);
-                self.rebuild();
-                return;
-            }
-        };
-        let interner = match self.fields.view() {
-            Ok(view) => view,
-            Err(e) => {
-                tracing::error!(error = %e, "vector index worker cannot read the field dictionary");
-                return;
-            }
-        };
-        for (node_id, record) in ids.into_iter().zip(records) {
-            // Every index is reconciled against the record as it stands: a
-            // member is upserted, and a node that left an index (deleted,
-            // relabelled, stripped of its vector) is removed from it. Node
-            // ids are never reused, and every later commit that touches the
-            // node is folded again, so acting on the committed record never
-            // leaves an index behind the data.
-            for def in &definitions {
-                let property = def.property();
+        let records = LocalNodeStore
+            .get_many(&read, self.shard_id, &ids)
+            .map_err(|e| format!("read {} applied nodes: {e}", ids.len()))?;
+        drop(read);
+        let interner = self
+            .fields
+            .view()
+            .map_err(|e| format!("read the field dictionary: {e}"))?;
+        // Every index is reconciled against the record as it stands: a member
+        // is upserted, and a node that left an index (deleted, relabelled,
+        // stripped of its vector) is removed from it. Node ids are never
+        // reused, and every later commit that touches the node is folded
+        // again, so acting on the committed record never leaves an index
+        // behind the data. The upserts of one index go in as one batch, which
+        // a bulk load fills with every node of a statement.
+        for def in &definitions {
+            let property = def.property();
+            let mut upserts: Vec<(NodeId, Vec<f32>)> = Vec::new();
+            for (node_id, record) in ids.iter().copied().zip(&records) {
                 let vector = record
                     .as_ref()
                     .filter(|r| r.primary_label() == def.label)
                     .and_then(|r| r.props.get(&interner.lookup(property)?))
                     .and_then(crate::db::try_extract_vector);
                 match vector {
-                    Some(vector) => {
-                        self.registry
-                            .on_vector_written(&def.label, node_id, property, &vector);
-                    }
+                    Some(vector) => upserts.push((node_id, vector)),
                     None if self.registry.holds(&def.label, property, node_id) => {
                         self.registry
                             .on_vector_removed(&def.label, property, node_id);
@@ -218,17 +239,24 @@ impl Worker {
                     None => {}
                 }
             }
+            self.registry
+                .on_vectors_written(&def.label, property, upserts);
         }
+        Ok(())
     }
 
-    /// Rebuild every index from the store: what changed is not known.
-    fn rebuild(&self) {
+    /// Rebuild every index from the store, since what changed is not known;
+    /// the event the rebuilt indexes cover, or `None` when the rebuild
+    /// failed.
+    fn rebuild(&self) -> Option<u64> {
+        // Every event numbered up to here is in the store the build reads.
+        let covered = self.position.delivered();
         let definitions = self.registry.all_definitions();
         let interner = match self.fields.view() {
             Ok(view) => view,
             Err(e) => {
                 tracing::error!(error = %e, "vector index worker cannot read the field dictionary");
-                return;
+                return None;
             }
         };
         let mut members = Vec::with_capacity(definitions.len());
@@ -244,7 +272,7 @@ impl Worker {
         }
         drop(interner);
         if members.is_empty() {
-            return;
+            return Some(covered);
         }
         for (_, _, health, _) in &members {
             // Incomplete until the build hands it over again.
@@ -271,12 +299,16 @@ impl Worker {
         }
         .run();
         match outcome {
-            Ok(outcome) => tracing::info!(?outcome, "vector index worker rebuild done"),
+            Ok(outcome) => {
+                tracing::info!(?outcome, "vector index worker rebuild done");
+                Some(covered)
+            }
             Err(reason) => {
                 tracing::warn!(%reason, "vector index worker rebuild failed");
                 for (_, _, health, _) in &members {
                     health.mark_offline(reason.clone());
                 }
+                None
             }
         }
     }

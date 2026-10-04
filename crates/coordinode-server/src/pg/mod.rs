@@ -202,7 +202,7 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         // same statement succeeds once it has.
         DatabaseError::WriteBackpressure
         | DatabaseError::Execution(ExecutionError::Backpressure)
-        | DatabaseError::Execution(ExecutionError::TextNotReady(_)) => "53000",
+        | DatabaseError::Execution(ExecutionError::IndexBehind(_)) => "53000",
         // disk_full: the disk is below its reserve, writes wait for space.
         DatabaseError::Storage(coordinode_storage::error::StorageError::OutOfSpace { .. })
         | DatabaseError::Execution(ExecutionError::Storage(

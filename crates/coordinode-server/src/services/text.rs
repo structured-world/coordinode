@@ -120,7 +120,7 @@ impl TextServiceImpl {
             let handle = match registry.read_handle(&req.label, property) {
                 Ok(Some(h)) => h,
                 Ok(None) => continue,
-                Err(behind) => return Err(super::error_details::text_index_behind(&behind)),
+                Err(behind) => return Err(super::error_details::index_behind(&behind)),
             };
 
             let idx_guard = handle

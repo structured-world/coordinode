@@ -1,27 +1,55 @@
-//! How far the text indexes cover the store, and the wait a search makes for
-//! them.
+//! How far an index maintained from the applied commits covers the store, and
+//! the wait a search makes for it.
 //!
-//! The text indexes are maintained from the entries applied to the store, by
-//! a worker that follows them. A search must not answer from an index that
-//! lacks a commit its snapshot includes, so before reading it waits until the
-//! worker has folded every entry applied before the search began, within a
-//! bound, and fails explicitly past it.
+//! The full-text and vector indexes are maintained from the entries applied
+//! to the store, each kind by a worker that follows them. A search must not
+//! answer from an index that lacks a commit its snapshot includes, so before
+//! reading it waits until the worker has folded every entry applied before
+//! the search began, within a bound, and fails explicitly past it.
 
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use coordinode_storage::engine::applied::AppliedPosition;
 
-/// Default bound on a search's wait for the text indexes to cover the store.
-pub const DEFAULT_TEXT_READY_WAIT: Duration = Duration::from_millis(2000);
+/// Default bound on a search's wait for its indexes to cover the store.
+pub const DEFAULT_INDEX_READY_WAIT: Duration = Duration::from_millis(2000);
 
-/// A search found the text indexes behind the store past its wait.
+/// The kind of index a worker maintains from the applied commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintainedIndex {
+    /// Full-text (Tantivy) indexes.
+    Text,
+    /// Vector (HNSW) indexes.
+    Vector,
+}
+
+impl MaintainedIndex {
+    /// The kind as an error metadata value names it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "full-text",
+            Self::Vector => "vector",
+        }
+    }
+}
+
+impl fmt::Display for MaintainedIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A search found its indexes behind the store past its wait.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "the text indexes have not caught up with the store within {waited_ms} ms \
+    "the {kind} indexes have not caught up with the store within {waited_ms} ms \
      (folded through event {folded}, the store holds event {needed})"
 )]
-pub struct TextNotReady {
+pub struct IndexBehind {
+    /// Which indexes.
+    pub kind: MaintainedIndex,
     /// The last applied event the indexes hold.
     pub folded: u64,
     /// The applied event the search needed them to hold.
@@ -30,12 +58,14 @@ pub struct TextNotReady {
     pub waited_ms: u64,
 }
 
-/// The coverage of the text indexes: what the store has applied, what the
+/// The coverage of one kind of index: what the store has applied, what its
 /// worker has folded, and the wait between the two.
 #[derive(Debug)]
-pub struct TextReadiness {
+pub struct IndexReadiness {
+    kind: MaintainedIndex,
     applied: AppliedPosition,
-    /// The number of the last applied event folded into every text index.
+    /// The number of the last applied event folded into every index of the
+    /// kind.
     folded: AtomicU64,
     /// Woken whenever `folded` advances.
     // no-std: spin-based wait or a caller-provided parking primitive.
@@ -44,11 +74,12 @@ pub struct TextReadiness {
     wait: AtomicU64,
 }
 
-impl TextReadiness {
-    /// Coverage of the worker following `applied`, with searches waiting at
-    /// most `wait`.
-    pub fn new(applied: AppliedPosition, wait: Duration) -> Self {
+impl IndexReadiness {
+    /// Coverage of the `kind` worker following `applied`, with searches
+    /// waiting at most `wait`.
+    pub fn new(kind: MaintainedIndex, applied: AppliedPosition, wait: Duration) -> Self {
         Self {
+            kind,
             applied,
             folded: AtomicU64::new(0),
             changed: parking_lot::Condvar::new(),
@@ -85,8 +116,8 @@ impl TextReadiness {
     ///
     /// # Errors
     ///
-    /// [`TextNotReady`] when the worker has not folded them in time.
-    pub fn await_covered(&self) -> Result<(), TextNotReady> {
+    /// [`IndexBehind`] when the worker has not folded them in time.
+    pub fn await_covered(&self) -> Result<(), IndexBehind> {
         let needed = self.applied.delivered();
         if self.folded() >= needed {
             return Ok(());
@@ -97,7 +128,8 @@ impl TextReadiness {
         let mut guard = self.lock.lock();
         while self.folded() < needed {
             if self.changed.wait_until(&mut guard, deadline).timed_out() && self.folded() < needed {
-                return Err(TextNotReady {
+                return Err(IndexBehind {
+                    kind: self.kind,
                     folded: self.folded(),
                     needed,
                     waited_ms: duration_ms(started.elapsed()),

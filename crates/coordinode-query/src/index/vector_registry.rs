@@ -20,6 +20,7 @@ use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 
 use super::definition::IndexDefinition;
+use super::readiness::{IndexBehind, IndexReadiness};
 
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
@@ -125,6 +126,10 @@ pub struct VectorIndexRegistry {
     /// Retired-memory budget each graph gets (see
     /// [`Self::set_retired_bytes_budget`]).
     retired_bytes_budget: AtomicUsize,
+    /// How far the indexes cover the applied store, when a worker maintains
+    /// them from the applied entries; a registry without one serves what it
+    /// holds.
+    readiness: RwLock<Option<Arc<IndexReadiness>>>,
 }
 
 /// A running backfill: the flag that stops it and the thread to join.
@@ -174,6 +179,7 @@ impl VectorIndexRegistry {
             tier_backend: None,
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
+            readiness: RwLock::new(None),
         }
     }
 
@@ -196,6 +202,34 @@ impl VectorIndexRegistry {
             tier_backend: Some(backend),
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
+            readiness: RwLock::new(None),
+        }
+    }
+
+    /// Make every index search wait for the indexes to cover the store as
+    /// `readiness` reports it.
+    pub fn set_readiness(&self, readiness: Arc<IndexReadiness>) {
+        *self.readiness.write().unwrap_or_else(|e| e.into_inner()) = Some(readiness);
+    }
+
+    /// The coverage searches wait on, if a worker maintains the indexes.
+    pub fn readiness(&self) -> Option<Arc<IndexReadiness>> {
+        self.readiness
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Wait until the indexes hold every commit applied before this call;
+    /// at once when no worker maintains them.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexBehind`] when they do not catch up within the wait.
+    pub fn await_covered(&self) -> Result<(), IndexBehind> {
+        match self.readiness() {
+            Some(readiness) => readiness.await_covered(),
+            None => Ok(()),
         }
     }
 

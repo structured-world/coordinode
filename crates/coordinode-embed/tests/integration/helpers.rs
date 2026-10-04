@@ -134,7 +134,6 @@ pub fn make_ctx_legacy<'a>(
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
-        pending_vector_writes: Vec::new(),
     }
 }
 
@@ -207,7 +206,6 @@ pub fn make_ctx_mvcc<'a>(
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
-        pending_vector_writes: Vec::new(),
     }
 }
 
@@ -281,6 +279,5 @@ pub fn make_ctx_with_pipeline<'a>(
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
         params: HashMap::new(),
-        pending_vector_writes: Vec::new(),
     }
 }

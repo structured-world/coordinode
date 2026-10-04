@@ -120,12 +120,13 @@ pub enum Reason {
     /// `timestamp`. Terminal for that query: a vector search can be asked
     /// with `vector_consistency('exact')` instead.
     IndexNotHistorical,
-    /// A full-text search found the text indexes behind the commits its read
-    /// includes, past its wait: answering would miss or misrank committed
-    /// writes. Nothing was answered. Metadata carries `folded` and `needed`
-    /// (applied-entry positions the indexes hold and the read needed) and
-    /// `waited_ms`. Retry after the advised delay.
-    TextIndexBehind,
+    /// A full-text or vector search found its indexes behind the commits its
+    /// read includes, past its wait: answering would miss or misrank
+    /// committed writes. Nothing was answered. Metadata carries `index_kind`
+    /// (`full-text` or `vector`), `folded` and `needed` (applied-entry
+    /// positions the indexes hold and the read needed) and `waited_ms`.
+    /// Retry after the advised delay.
+    IndexBehind,
     /// A write concern the server cannot honour: an unknown mode or journal
     /// value, a member count above the group's size, or a volatile journal
     /// level asked of more than one member. Terminal for that request; the
@@ -199,7 +200,7 @@ impl Reason {
             Reason::MemberReadOnly => "MEMBER_READ_ONLY",
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
             Reason::IndexNotHistorical => "INDEX_NOT_HISTORICAL",
-            Reason::TextIndexBehind => "TEXT_INDEX_BEHIND",
+            Reason::IndexBehind => "INDEX_BEHIND",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
             Reason::DuplicateKey => "DUPLICATE_KEY",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
@@ -247,9 +248,9 @@ impl Reason {
             | Reason::NotLeader
             | Reason::MemberReadOnly => Some(std::time::Duration::ZERO),
             Reason::WriteBackpressure => Some(std::time::Duration::from_millis(500)),
-            // The worker folds applied entries continuously; an index behind
+            // The workers fold applied entries continuously; an index behind
             // past a whole wait catches up in moments, not instantly.
-            Reason::TextIndexBehind => Some(std::time::Duration::from_millis(200)),
+            Reason::IndexBehind => Some(std::time::Duration::from_millis(200)),
             // Space comes back when someone frees it, not soon: a floor that
             // keeps clients from hammering a node that only serves reads.
             Reason::StorageFull => Some(std::time::Duration::from_secs(5)),
@@ -279,14 +280,15 @@ pub fn status_with_reason(
     Status::with_error_details(code, message, details)
 }
 
-/// `UNAVAILABLE` for a full-text search whose indexes did not catch up with
-/// the commits it needed within its wait.
-pub fn text_index_behind(behind: &coordinode_query::index::TextNotReady) -> Status {
+/// `UNAVAILABLE` for a full-text or vector search whose indexes did not catch
+/// up with the commits it needed within its wait.
+pub fn index_behind(behind: &coordinode_query::index::IndexBehind) -> Status {
     status_with_reason(
         Code::Unavailable,
         behind.to_string(),
-        Reason::TextIndexBehind,
+        Reason::IndexBehind,
         [
+            ("index_kind", behind.kind.as_str().to_string()),
             ("folded", behind.folded.to_string()),
             ("needed", behind.needed.to_string()),
             ("waited_ms", behind.waited_ms.to_string()),

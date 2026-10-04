@@ -25,6 +25,50 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+// ── Transactional maintenance ─────────────────────────────────────────
+
+/// A vector change in a transaction that rolls back never reaches the HNSW
+/// index: the nearest neighbour of the discarded vector is the node whose
+/// committed vector is nearest, not the node the rollback restored.
+#[test]
+fn a_rolled_back_vector_change_does_not_reach_the_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE VECTOR INDEX doc_emb ON :Doc(emb) OPTIONS {m: 8, ef_construction: 64, metric: \"l2\"}",
+    )
+    .expect("create vector index");
+    db.execute_cypher("CREATE (:Doc {name: 'x', emb: [1.0, 0.0, 0.0]})")
+        .expect("create x");
+    db.execute_cypher("CREATE (:Doc {name: 'y', emb: [0.0, 0.9, 0.1]})")
+        .expect("create y");
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        "MATCH (n:Doc {name: 'x'}) SET n.emb = [0.0, 1.0, 0.0]",
+        None,
+    )
+    .expect("set in transaction");
+    db.rollback_transaction(tx).expect("rollback");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Doc) \
+             WITH *, vector_distance(n.emb, [0.0, 1.0, 0.0]) AS d \
+             ORDER BY d ASC LIMIT 1 RETURN n.name AS name",
+        )
+        .expect("search");
+    assert_eq!(
+        rows.first().and_then(|r| r.get("name")),
+        Some(&Value::String("y".into())),
+        "the rolled-back vector answered the search: {rows:?}"
+    );
+    assert!(
+        db.vector_index_registry().get("Doc", "emb").is_some(),
+        "the index exists"
+    );
+}
+
 // ── Bulk-insert HNSW batching ─────────────────────────────────────────
 
 /// UNWIND-driven CREATE batches N vectors into the HNSW index. After
@@ -841,6 +885,9 @@ fn remove_property_removes_from_vector_index() {
 #[test]
 fn create_vector_index_with_rabitq_2bit_quantization() {
     let (mut db, _dir) = open_db();
+    // The search right after a bulk load waits for the worker to insert all
+    // of it; this test is about recall, so the wait is no bound on it.
+    db.set_index_ready_wait(std::time::Duration::from_secs(120));
 
     // d=64 is the smallest dim accepted by RaBitQ (multiple of 64).
     // calibration_threshold defaults to 1000 inside HnswIndex; we go
@@ -958,6 +1005,9 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
 #[test]
 fn create_vector_index_ef_search_option_recovers_adversarial_recall() {
     let (mut db, _dir) = open_db();
+    // The search right after a bulk load waits for the worker to insert all
+    // of it; this test is about recall, so the wait is no bound on it.
+    db.set_index_ready_wait(std::time::Duration::from_secs(120));
 
     // ef_search=5000 >> N forces a near-exhaustive candidate list, so the
     // 2-bit cheap-distance noise floor no longer traps the search in an

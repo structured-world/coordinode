@@ -106,7 +106,6 @@ fn make_test_ctx<'a>(
         read_consistency: coordinode_core::txn::read_consistency::ReadConsistencyMode::default(),
         read_timeout: std::time::Duration::from_millis(2000),
         params: std::collections::HashMap::new(),
-        pending_vector_writes: Vec::new(),
     }
 }
 

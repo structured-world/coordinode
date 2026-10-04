@@ -3,7 +3,7 @@
 //! Holds in-memory tantivy index instances keyed by (label, property).
 //! Indexes are built from stored node text and maintained from the entries
 //! applied to the store, never from a statement before it commits: a search
-//! waits for them to cover the store (see [`TextReadiness`]).
+//! waits for them to cover the store (see [`IndexReadiness`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use coordinode_search::tantivy::TextSearchResult;
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 
 use super::definition::{IndexDefinition, TextIndexConfig};
-use super::text_readiness::{TextNotReady, TextReadiness};
+use super::readiness::{IndexBehind, IndexReadiness};
 
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
@@ -37,7 +37,7 @@ pub struct TextIndexRegistry {
     /// How far the indexes cover the applied store, when a worker maintains
     /// them from the applied entries; a registry without one serves what it
     /// holds.
-    readiness: RwLock<Option<Arc<TextReadiness>>>,
+    readiness: RwLock<Option<Arc<IndexReadiness>>>,
 }
 
 impl TextIndexRegistry {
@@ -53,14 +53,14 @@ impl TextIndexRegistry {
 
     /// Make every search wait for the indexes to cover the store as
     /// `readiness` reports it.
-    pub fn set_readiness(&self, readiness: Arc<TextReadiness>) {
+    pub fn set_readiness(&self, readiness: Arc<IndexReadiness>) {
         if let Ok(mut slot) = self.readiness.write() {
             *slot = Some(readiness);
         }
     }
 
     /// The coverage searches wait on, if a worker maintains the indexes.
-    pub fn readiness(&self) -> Option<Arc<TextReadiness>> {
+    pub fn readiness(&self) -> Option<Arc<IndexReadiness>> {
         self.readiness.read().ok().and_then(|r| r.clone())
     }
 
@@ -70,12 +70,12 @@ impl TextIndexRegistry {
     ///
     /// # Errors
     ///
-    /// [`TextNotReady`] when the indexes do not catch up within the wait.
+    /// [`IndexBehind`] when the indexes do not catch up within the wait.
     pub fn read_handle(
         &self,
         label: &str,
         property: &str,
-    ) -> Result<Option<TextHandle>, TextNotReady> {
+    ) -> Result<Option<TextHandle>, IndexBehind> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
