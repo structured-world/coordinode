@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(cluster)* serve a read-only member's reads as of its last commit
+- schema claims, event-driven background work
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

@@ -2,6 +2,32 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* match group members by version and move a group by majority
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(query)* read temporal nodes at the statement's current time
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+
+### Documentation
+
+- state design reasons instead of citing other codebases
+- drop internal ids from core, modality, site theme and examples
+- *(core,embed)* replace leftover document stand-ins in comments
+- *(core)* drop internal ids and document paths
+
+### Fixed
+
+- *(cluster)* a member at an older version than its group is behind
+- *(schema)* hold a strict temporal label's schema on every version
+- *(query)* keep undeclared properties where reads find them
+- *(core)* draw proposal ids from a fresh range per process
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

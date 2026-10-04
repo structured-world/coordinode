@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+
 ## v0.6.0 - 2026-09-23
 
 ### Added
