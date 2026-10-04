@@ -149,10 +149,6 @@ impl Worker {
                 };
             }
 
-            eprintln!(
-                "DBG text worker batch: taken={taken} last_seq={last_seq} replaced={replaced} at {:?}",
-                std::time::Instant::now()
-            );
             let covered = if replaced {
                 self.rebuild()
             } else {
@@ -169,10 +165,6 @@ impl Worker {
             };
             // A failed rebuild publishes nothing: searches then wait and fail
             // explicitly rather than read an index missing commits.
-            eprintln!(
-                "DBG text worker covered={covered:?} at {:?}",
-                std::time::Instant::now()
-            );
             if let Some(seq) = covered {
                 self.readiness.advance(seq);
             }
