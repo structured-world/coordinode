@@ -1635,7 +1635,11 @@ fn lower_remove_item(item: &crate::cypher::ast::RemoveItem) -> crate::plan::Remo
 }
 
 /// Build an `IndexScan` for `(label, property) = value_expr` if a B-tree index
-/// is registered for that pair. Returns None when no index matches.
+/// holds every node of `label` by `property` alone. A compound index keys
+/// its entries by more columns and a partial one holds only the nodes its
+/// filter admits: a one-value lookup in either misses nodes, so neither
+/// qualifies. Of several that do, the name decides, so the plan does not
+/// depend on registration order.
 fn try_index_rewrite(
     variable: &str,
     label: &str,
@@ -1646,7 +1650,12 @@ fn try_index_rewrite(
     let idx = registry
         .indexes_for_property(label, property)
         .into_iter()
-        .next()?;
+        .filter(|idx| {
+            idx.index_type == crate::index::IndexType::BTree
+                && idx.properties.len() == 1
+                && idx.filter.is_none()
+        })
+        .min_by(|a, b| a.name.cmp(&b.name))?;
     Some(LogicalOp::IndexScan {
         variable: variable.to_string(),
         label: label.to_string(),

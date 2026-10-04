@@ -226,6 +226,54 @@ fn a_temporal_set_through_the_index_opens_the_next_version() {
     );
 }
 
+/// An equality on one property is looked up only in an index holding every
+/// node by exactly that property: a compound index keyed by more columns,
+/// or a partial one holding only the nodes its filter admits, would miss
+/// nodes. Reads and writes over such properties find every node.
+#[test]
+fn a_compound_or_partial_index_never_answers_a_one_property_lookup() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE CONSTRAINT person_key FOR (p:Person) REQUIRE (p.first, p.last) IS NODE KEY",
+    )
+    .expect("compound key");
+    db.execute_cypher("CREATE INDEX u_active ON :U(email) WHERE n.status = 'active'")
+        .expect("partial index");
+    db.execute_cypher("CREATE (:Person {first: 'Ada', last: 'Byron'})")
+        .expect("person");
+    db.execute_cypher("CREATE (:U {email: 'c@x', status: 'gone'})")
+        .expect("inactive user");
+
+    for (query, rows) in [
+        ("MATCH (p:Person {last: 'Byron'}) RETURN p.first AS v", 1),
+        (
+            "MATCH (p:Person) WHERE p.last = 'Byron' RETURN p.first AS v",
+            1,
+        ),
+        ("MATCH (u:U {email: 'c@x'}) RETURN u.status AS v", 1),
+        (
+            "MATCH (u:U {email: 'c@x'}) SET u.seen = 1 RETURN u.status AS v",
+            1,
+        ),
+    ] {
+        let explain = db.explain_cypher(query).expect("EXPLAIN");
+        assert!(
+            !explain.contains("IndexScan"),
+            "{query}\nno index holds every node by this property alone:\n{explain}"
+        );
+        let got = db.execute_cypher(query).expect("query").len();
+        assert_eq!(got, rows, "{query}");
+    }
+    db.execute_cypher("MATCH (u:U {email: 'c@x'}) DETACH DELETE u")
+        .expect("delete");
+    assert!(
+        db.execute_cypher("MATCH (u:U) RETURN u")
+            .expect("scan")
+            .is_empty(),
+        "the delete found its node"
+    );
+}
+
 /// A write whose MATCH finds its node by an indexed property looks it up in
 /// the index, as the same MATCH does for a read: a SET, REMOVE or DELETE
 /// over a label scan costs every node of the label on every statement. The
