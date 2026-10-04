@@ -951,6 +951,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-types",
  "windows-sys 0.61.2",
 ]
 

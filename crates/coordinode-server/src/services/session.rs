@@ -6,7 +6,13 @@
 //! bridge the one bidirectional stream to the core: a reader (proto frames ->
 //! neutral ops), the core itself ([`coordinode_session::Session::run`]), and a
 //! writer (neutral events -> proto frames). The core never sees a gRPC type.
+//!
+//! Change-stream subscriptions ride the same stream but are served here, not
+//! by the core: each reads through the change-stream service and writes its
+//! batches straight to the session's outbound frames, within the credit its
+//! client granted.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use coordinode_embed::Database;
@@ -22,6 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use self::engine::DatabaseCursorEngine;
+use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
 use super::cypher::{
     proto_to_value_pub, value_to_proto_pub, write_concern_from_proto, write_concern_to_proto,
 };
@@ -30,8 +37,9 @@ use crate::proto::replication;
 use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
-    Begun, ClientFrame, Committed, Configure, ConnectionStatus as ProtoConnectionStatus, CursorEnd,
-    CursorOpen, Ordering as ProtoOrdering, RowBatch, ServerFrame, SessionError, client_frame,
+    Acknowledged, Begun, ClientFrame, Committed, Configure,
+    ConnectionStatus as ProtoConnectionStatus, CursorEnd, CursorOpen, Ordering as ProtoOrdering,
+    RowBatch, ServerFrame, Subscribed, SubscriptionCancelled, client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that
@@ -42,6 +50,8 @@ const BUFFER: usize = 256;
 /// gRPC binding for the session core.
 pub struct SessionSvc {
     manager: SessionManager,
+    /// What subscriptions read through; without it a subscription is refused.
+    change_streams: Option<Arc<ChangeEventServiceImpl>>,
 }
 
 impl SessionSvc {
@@ -58,7 +68,15 @@ impl SessionSvc {
         let engine = Arc::new(DatabaseCursorEngine::new(database).with_version(version));
         Self {
             manager: SessionManager::new(engine, registry),
+            change_streams: None,
         }
+    }
+
+    /// Serve change-stream subscriptions on the session through `service`,
+    /// the same one that serves the change-stream RPCs.
+    pub fn with_change_streams(mut self, service: Arc<ChangeEventServiceImpl>) -> Self {
+        self.change_streams = Some(service);
+        self
     }
 
     /// Report connection state from the cluster this node belongs to.
@@ -138,12 +156,25 @@ impl SessionServiceTrait for SessionSvc {
         // one whose settings the server cannot honour, is a malformed request,
         // answered directly with an Error event.
         let err_tx = ev_tx;
+        let sub_frames = frame_tx.clone();
+        let change_streams = self.change_streams.clone();
         tokio::spawn(async move {
+            // This session's subscriptions, by the request id that opened them.
+            let mut subscriptions: HashMap<u64, Arc<Credit>> = HashMap::new();
             // Ends when the client half-closes (`Ok(None)`) or on a transport
             // error: both leave the `while let Ok(Some(_))`.
             while let Ok(Some(frame)) = inbound.message().await {
                 let request_id = frame.request_id;
-                match to_op(frame) {
+                let Some(op) = serve_subscription_op(
+                    frame.op,
+                    request_id,
+                    &mut subscriptions,
+                    change_streams.as_ref(),
+                    &sub_frames,
+                ) else {
+                    continue;
+                };
+                match to_op(op) {
                     Ok(op) => {
                         if op_tx.send((request_id, op)).await.is_err() {
                             break;
@@ -161,6 +192,11 @@ impl SessionServiceTrait for SessionSvc {
                             .await;
                     }
                 }
+            }
+            // The session is over: its subscriptions stop delivering, their
+            // registrations stay.
+            for credit in subscriptions.values() {
+                credit.cancel();
             }
         });
 
@@ -181,13 +217,129 @@ impl SessionServiceTrait for SessionSvc {
     }
 }
 
-/// Map a gRPC client frame to a neutral op. `Err` carries the message for the
+/// Serve `op` if it concerns a subscription, answering on `request_id`, and
+/// hand any other op back for the core. A Cancel naming a subscription of the
+/// session ends its delivery; any other Cancel goes to the core.
+fn serve_subscription_op(
+    op: Option<client_frame::Op>,
+    request_id: u64,
+    subscriptions: &mut HashMap<u64, Arc<Credit>>,
+    change_streams: Option<&Arc<ChangeEventServiceImpl>>,
+    frames: &mpsc::Sender<Result<ServerFrame, Status>>,
+) -> Option<Option<client_frame::Op>> {
+    let reply = move |event: Event| ServerFrame {
+        request_id,
+        event: Some(event),
+    };
+    let refuse = |status: Status| {
+        let frames = frames.clone();
+        tokio::spawn(async move {
+            let _ = frames
+                .send(Ok(ServerFrame {
+                    request_id,
+                    event: Some(Event::Error(session_error(&status))),
+                }))
+                .await;
+        });
+    };
+    let subscription_op = matches!(
+        op,
+        Some(
+            client_frame::Op::Subscribe(_)
+                | client_frame::Op::Credit(_)
+                | client_frame::Op::Acknowledge(_)
+                | client_frame::Op::CancelSubscription(_)
+        )
+    );
+    if subscription_op && change_streams.is_none() {
+        refuse(Status::failed_precondition(
+            "this node serves no change streams",
+        ));
+        return None;
+    }
+    match op {
+        Some(client_frame::Op::Subscribe(sub)) => {
+            let (Some(service), Some(request)) = (change_streams.cloned(), sub.request) else {
+                refuse(Status::invalid_argument("subscribe needs a request"));
+                return None;
+            };
+            // Nothing is sent before Subscribed: the credit opens after it.
+            let credit = Arc::new(Credit::new(0));
+            if let Some(earlier) = subscriptions.insert(request_id, Arc::clone(&credit)) {
+                earlier.cancel();
+            }
+            let frames = frames.clone();
+            tokio::spawn(async move {
+                let delivery = Delivery::Session {
+                    frames: frames.clone(),
+                    request_id,
+                    credit: Arc::clone(&credit),
+                };
+                let frame = match service.open(request, delivery).await {
+                    Ok(incarnation) => reply(Event::Subscribed(Subscribed { incarnation })),
+                    Err(status) => {
+                        credit.cancel();
+                        reply(Event::Error(session_error(&status)))
+                    }
+                };
+                let _ = frames.send(Ok(frame)).await;
+                credit.grant(u64::from(sub.credit));
+            });
+            None
+        }
+        Some(client_frame::Op::Credit(grant)) => {
+            match subscriptions.get(&grant.target_request_id) {
+                Some(_) if grant.events == 0 => {
+                    refuse(Status::invalid_argument("credit must be above zero"));
+                }
+                Some(credit) => credit.grant(u64::from(grant.events)),
+                None => refuse(Status::not_found(format!(
+                    "no subscription opened by request {} on this session",
+                    grant.target_request_id
+                ))),
+            }
+            None
+        }
+        Some(client_frame::Op::Acknowledge(ack)) => {
+            let (service, frames) = (change_streams.cloned()?, frames.clone());
+            tokio::spawn(async move {
+                let frame = match service.acknowledge(ack).await {
+                    Ok(()) => reply(Event::Acknowledged(Acknowledged {})),
+                    Err(status) => reply(Event::Error(session_error(&status))),
+                };
+                let _ = frames.send(Ok(frame)).await;
+            });
+            None
+        }
+        Some(client_frame::Op::CancelSubscription(cancel)) => {
+            let (service, frames) = (change_streams.cloned()?, frames.clone());
+            tokio::spawn(async move {
+                let frame = match service.cancel(cancel).await {
+                    Ok(()) => reply(Event::SubscriptionCancelled(SubscriptionCancelled {})),
+                    Err(status) => reply(Event::Error(session_error(&status))),
+                };
+                let _ = frames.send(Ok(frame)).await;
+            });
+            None
+        }
+        Some(client_frame::Op::Cancel(cancel)) => {
+            match subscriptions.remove(&cancel.target_request_id) {
+                Some(credit) => {
+                    credit.cancel();
+                    None
+                }
+                None => Some(Some(client_frame::Op::Cancel(cancel))),
+            }
+        }
+        other => Some(other),
+    }
+}
+
+/// Map a gRPC client op to a neutral one. `Err` carries the message for the
 /// INVALID_ARGUMENT answer: the frame has no op, or names a write concern the
 /// server cannot honour.
-fn to_op(frame: ClientFrame) -> Result<SessionOp, String> {
-    let op = frame
-        .op
-        .ok_or_else(|| "client frame had no op".to_string())?;
+fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, String> {
+    let op = op.ok_or_else(|| "client frame had no op".to_string())?;
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
             query: e.query,
@@ -217,6 +369,13 @@ fn to_op(frame: ClientFrame) -> Result<SessionOp, String> {
         },
         client_frame::Op::Configure(c) => {
             SessionOp::Configure(settings_from_proto(&c).map_err(|s| s.message().to_string())?)
+        }
+        // Served by `serve_subscription_op` before an op reaches here.
+        client_frame::Op::Subscribe(_)
+        | client_frame::Op::Credit(_)
+        | client_frame::Op::Acknowledge(_)
+        | client_frame::Op::CancelSubscription(_) => {
+            return Err("a subscription op is served by the session binding".to_string());
         }
     })
 }
@@ -285,10 +444,9 @@ fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
             applied_index: receipt.applied_index.unwrap_or(0),
             commit_ts: receipt.commit_ts.as_raw(),
         }),
-        SessionEvent::Error { code, message } => Event::Error(SessionError {
-            code: error_code(code) as u32,
-            message,
-        }),
+        SessionEvent::Error { code, message } => {
+            Event::Error(session_error(&Status::new(error_code(code), message)))
+        }
         SessionEvent::ConnectionStatus { state, settings } => {
             Event::ConnectionStatus(ProtoConnectionStatus {
                 writable: state.writable,

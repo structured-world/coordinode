@@ -299,7 +299,53 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let req = request.into_inner();
+        let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
+        let incarnation = self
+            .open(request.into_inner(), Delivery::Stream { tx })
+            .await?;
+        let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeEvent, Status>> + Send>> =
+            Box::pin(ReceiverStream::new(rx));
+        let mut response = Response::new(stream);
+        response.metadata_mut().insert(
+            INCARNATION_METADATA,
+            incarnation
+                .to_string()
+                .parse()
+                .map_err(|e| Status::internal(format!("incarnation metadata: {e}")))?,
+        );
+        Ok(response)
+    }
+
+    async fn cancel_subscription(
+        &self,
+        request: Request<CancelSubscriptionRequest>,
+    ) -> Result<Response<CancelSubscriptionResponse>, Status> {
+        self.cancel(request.into_inner()).await?;
+        Ok(Response::new(CancelSubscriptionResponse {}))
+    }
+
+    async fn acknowledge_subscription(
+        &self,
+        request: Request<AcknowledgeSubscriptionRequest>,
+    ) -> Result<Response<AcknowledgeSubscriptionResponse>, Status> {
+        self.acknowledge(request.into_inner()).await?;
+        Ok(Response::new(AcknowledgeSubscriptionResponse {}))
+    }
+}
+
+impl ChangeEventServiceImpl {
+    /// Register or resume the consumer `req` names and start delivering its
+    /// events to `delivery`. Returns the registration's incarnation.
+    ///
+    /// # Errors
+    ///
+    /// The request is malformed, the registry refuses it, or the log no
+    /// longer holds where it starts.
+    pub(crate) async fn open(
+        &self,
+        req: SubscribeRequest,
+        delivery: Delivery,
+    ) -> Result<u64, Status> {
         let shard_id = self.shard_id;
         if req.consumer_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -360,7 +406,6 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         let hub = self.hub()?;
         let reader = hub.reader(from);
 
-        let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
             shard_id,
@@ -373,44 +418,39 @@ impl ChangeStreamService for ChangeEventServiceImpl {
             own_tailer: None,
             oplog_dirs: self.oplog_dirs.clone(),
             filters,
-            tx,
+            delivery,
             applied: Arc::clone(&self.applied),
             applied_changes: self.applied_changes.clone(),
             tuning: self.tuning,
         }));
-
-        let stream: Pin<Box<dyn tokio_stream::Stream<Item = Result<ChangeEvent, Status>> + Send>> =
-            Box::pin(ReceiverStream::new(rx));
-        let mut response = Response::new(stream);
-        response.metadata_mut().insert(
-            INCARNATION_METADATA,
-            incarnation
-                .to_string()
-                .parse()
-                .map_err(|e| Status::internal(format!("incarnation metadata: {e}")))?,
-        );
-        Ok(response)
+        Ok(incarnation)
     }
 
-    async fn cancel_subscription(
-        &self,
-        request: Request<CancelSubscriptionRequest>,
-    ) -> Result<Response<CancelSubscriptionResponse>, Status> {
-        let req = request.into_inner();
+    /// End the registration `req` names.
+    ///
+    /// # Errors
+    ///
+    /// The request is malformed, or the registry refuses it.
+    pub(crate) async fn cancel(&self, req: CancelSubscriptionRequest) -> Result<(), Status> {
         if req.consumer_id.is_empty() {
             return Err(Status::invalid_argument("cancelling needs a consumer_id"));
         }
         let registry = self.registry.clone();
         let handle = RegisteredHandle::new(req.consumer_id, req.incarnation);
-        blocking(move || registry.unregister(handle)).await?;
-        Ok(Response::new(CancelSubscriptionResponse {}))
+        blocking(move || registry.unregister(handle)).await
     }
 
-    async fn acknowledge_subscription(
+    /// Record that the consumer `req` names holds its events before the
+    /// position it gives.
+    ///
+    /// # Errors
+    ///
+    /// The request is malformed, names a position this node has not applied,
+    /// or the registry refuses it.
+    pub(crate) async fn acknowledge(
         &self,
-        request: Request<AcknowledgeSubscriptionRequest>,
-    ) -> Result<Response<AcknowledgeSubscriptionResponse>, Status> {
-        let req = request.into_inner();
+        req: AcknowledgeSubscriptionRequest,
+    ) -> Result<(), Status> {
         if req.consumer_id.is_empty() {
             return Err(Status::invalid_argument(
                 "acknowledging needs a consumer_id",
@@ -444,8 +484,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         let handle = RegisteredHandle::new(req.consumer_id, req.incarnation);
         // Monotonic: an earlier position than one already acknowledged keeps
         // the later one.
-        blocking(move || registry.checkpoint(&handle, index)).await?;
-        Ok(Response::new(AcknowledgeSubscriptionResponse {}))
+        blocking(move || registry.checkpoint(&handle, index)).await
     }
 }
 
@@ -466,7 +505,8 @@ struct StreamState {
     own_tailer: Option<OplogTailer>,
     oplog_dirs: Vec<PathBuf>,
     filters: CdcFilters,
-    tx: mpsc::Sender<Result<ChangeEvent, Status>>,
+    /// Where the events go.
+    delivery: Delivery,
     applied: AppliedFrontier,
     applied_changes: AppliedSignal,
     tuning: CdcStreamTuning,
@@ -476,9 +516,9 @@ struct StreamState {
 /// ends, or the log no longer holds what the stream needs. Leaving does not
 /// end the registration: the client resumes it.
 async fn stream_consumer(mut s: StreamState) {
-    'stream: loop {
+    loop {
         // Client cancelled (channel closed).
-        if s.tx.is_closed() {
+        if s.delivery.is_closed() {
             break;
         }
         // Marked seen before the read: an entry applied after it wakes the
@@ -497,29 +537,46 @@ async fn stream_consumer(mut s: StreamState) {
                 blocking(move || registry.check_retention(&handle)).await
             };
             if let Err(status) = check {
-                let _ = s.tx.send(Err(status)).await;
+                s.delivery.fail(status).await;
                 break;
             }
         }
 
+        // What the client takes now: a session subscription waits here for
+        // credit. Reading no more than that keeps every batch, its progress
+        // event included, within it: a read stops right after the last entry
+        // it keeps, so a progress event only follows a short batch.
+        let Some(room) = s
+            .delivery
+            .room(
+                &s.registry,
+                &s.handle,
+                s.tuning.heartbeat_interval,
+                s.tuning.batch_size.get(),
+            )
+            .await
+        else {
+            break;
+        };
+
         let read_from = s.position;
         let until = (s.applied)();
-        let batch = match read_batch(&mut s, until) {
+        let batch = match read_batch(&mut s, until, room) {
             Ok(b) => b,
             Err(StorageError::RetentionLost {
                 requested,
                 first_retained,
             }) => {
-                let _ =
-                    s.tx.send(Err(registry_status(RegistryError::RetentionLost {
+                s.delivery
+                    .fail(registry_status(RegistryError::RetentionLost {
                         checkpoint: requested,
                         floor: first_retained,
-                    })))
+                    }))
                     .await;
                 break;
             }
             Err(e) => {
-                let _ = s.tx.send(Err(Status::internal(e.to_string()))).await;
+                s.delivery.fail(Status::internal(e.to_string())).await;
                 break;
             }
         };
@@ -529,26 +586,13 @@ async fn stream_consumer(mut s: StreamState) {
 
         // Where the client can resume and acknowledge after what was sent.
         let mut sent_to = read_from;
-        for shared in batch {
-            let (entry, token) = &*shared;
+        let mut events = Vec::with_capacity(batch.len() + 1);
+        for shared in &batch {
+            let (entry, token) = &**shared;
             if let Ok(next) = token.next_index() {
                 sent_to = sent_to.max(next);
             }
-            // A slow reader leaves no room in the channel; keep its
-            // registration alive while waiting, as an idle poll does.
-            let permit = loop {
-                match tokio::time::timeout(s.tuning.heartbeat_interval, s.tx.reserve()).await {
-                    Ok(Ok(permit)) => break permit,
-                    // Client disconnected mid-batch.
-                    Ok(Err(_)) => break 'stream,
-                    Err(_) => {
-                        if let Err(e) = s.registry.heartbeat(&s.handle) {
-                            tracing::warn!(error = %e, "change stream heartbeat failed");
-                        }
-                    }
-                }
-            };
-            permit.send(Ok(oplog_entry_to_proto(entry, token)));
+            events.push(oplog_entry_to_proto(entry, token));
         }
         // Sending is not delivery: the registration moves only when the
         // client acknowledges. Entries the filters dropped after the last
@@ -556,7 +600,7 @@ async fn stream_consumer(mut s: StreamState) {
         // filters match little can still acknowledge past them.
         let read_to = s.position;
         if read_to > sent_to {
-            let progress = ChangeEvent {
+            events.push(ChangeEvent {
                 ts: 0,
                 term: 0,
                 log_index: read_to - 1,
@@ -568,10 +612,15 @@ async fn stream_consumer(mut s: StreamState) {
                     segment_id: read_to,
                     entry_offset: 0,
                 }),
-            };
-            if s.tx.send(Ok(progress)).await.is_err() {
-                break;
-            }
+            });
+        }
+        if !events.is_empty()
+            && s.delivery
+                .send(events, &s.registry, &s.handle, s.tuning.heartbeat_interval)
+                .await
+                .is_err()
+        {
+            break;
         }
 
         if caught_up {
@@ -590,11 +639,11 @@ async fn stream_consumer(mut s: StreamState) {
                             s.applied_changes = None;
                         }
                     }
-                    () = s.tx.closed() => break,
+                    () = s.delivery.closed() => break,
                     () = heartbeat => {}
                 },
                 None => tokio::select! {
-                    () = s.tx.closed() => break,
+                    () = s.delivery.closed() => break,
                     () = heartbeat => {}
                 },
             }
@@ -604,9 +653,13 @@ async fn stream_consumer(mut s: StreamState) {
 
 /// The next entries for stream `s` below `until`: from the shard's hub, or
 /// from the log itself while the stream is behind what the hub holds. Moves
-/// `s.position` past every entry read, sent or filtered out.
-fn read_batch(s: &mut StreamState, until: u64) -> Result<Vec<SharedEntry>, StorageError> {
-    let max = s.tuning.batch_size.get();
+/// `s.position` past every entry read, sent or filtered out. At most `max`
+/// entries are kept, and the read stops right after the last one kept.
+fn read_batch(
+    s: &mut StreamState,
+    until: u64,
+    max: usize,
+) -> Result<Vec<SharedEntry>, StorageError> {
     match s.hub.read(&s.reader, s.position, max, until, &s.filters)? {
         HubRead::Entries { entries, next } => {
             s.own_tailer = None;
@@ -632,7 +685,9 @@ fn read_batch(s: &mut StreamState, until: u64) -> Result<Vec<SharedEntry>, Stora
     }
 }
 
+mod delivery;
 mod hub;
+pub(crate) use delivery::{Credit, Delivery, session_error};
 use hub::{CdcHub, HubRead, HubReader, SharedEntry};
 
 #[cfg(test)]

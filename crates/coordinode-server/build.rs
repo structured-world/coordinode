@@ -75,6 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_set)
+        // The canonical error model: the same `google.rpc.Status` tonic-types
+        // builds the grpc-status-details-bin trailer from, not a second copy.
+        .extern_path(".google.rpc", "::tonic_types::pb")
         .compile_protos(
             &[
                 format!("{proto_root_str}/coordinode/v1/admin/cluster.proto"),

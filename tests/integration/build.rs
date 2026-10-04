@@ -59,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)
+        // The canonical error model, decoded with tonic-types' own type.
+        .extern_path(".google.rpc", "::tonic_types::pb")
         .compile_protos(
             &[
                 format!("{proto_root_str}/coordinode/v2/graph/schema.proto"),

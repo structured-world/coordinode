@@ -36,6 +36,10 @@ path = "tests/schema.rs"
 name = "version_moves"
 path = "tests/version_moves.rs"
 
+[[test]]
+name = "session_subscriptions"
+path = "tests/session_subscriptions.rs"
+
 [features]
 # The version-move tests run a server binary built with its own
 # `test-format-bump` feature (a workspace build with --all-features).
@@ -44,6 +48,7 @@ test-format-bump = []
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
+tonic-types = { workspace = true }
 prost = "0.14"
 tokio = { workspace = true }
 tempfile = { workspace = true }

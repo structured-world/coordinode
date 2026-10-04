@@ -1074,22 +1074,25 @@ pub(crate) async fn serve(
     let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
     let health_service = services::health::HealthServiceImpl;
     // CDC service: tails the Raft log up to the entries this node applied.
-    // Empty stream in embedded mode: there is no Raft log.
-    let cdc_service = match raft_node_shared {
-        Some(ref rn) => services::cdc::ChangeEventServiceImpl::for_raft_node(
-            &database.read().engine_shared(),
-            Arc::clone(rn),
-            consumer_registry,
-        )?,
-        None => services::cdc::ChangeEventServiceImpl::new(
-            0,
-            Vec::new(),
-            consumer_registry,
-            Arc::new(|| 0),
-            None,
-        ),
-    }
-    .with_tuning(cdc_tuning);
+    // Empty stream in embedded mode: there is no Raft log. Shared with the
+    // session service, whose subscriptions read through it.
+    let cdc_service = Arc::new(
+        match raft_node_shared {
+            Some(ref rn) => services::cdc::ChangeEventServiceImpl::for_raft_node(
+                &database.read().engine_shared(),
+                Arc::clone(rn),
+                consumer_registry,
+            )?,
+            None => services::cdc::ChangeEventServiceImpl::new(
+                0,
+                Vec::new(),
+                consumer_registry,
+                Arc::new(|| 0),
+                None,
+            ),
+        }
+        .with_tuning(cdc_tuning),
+    );
 
     // ClusterService: cluster join/leave lifecycle.
     // Available only in cluster mode (requires a RaftNode).
@@ -1407,7 +1410,8 @@ pub(crate) async fn serve(
                     raft_node_shared
                         .as_ref()
                         .map(|raft| Arc::clone(raft.version())),
-                );
+                )
+                .with_change_streams(Arc::clone(&cdc_service));
                 // In a cluster, a session reports what its node can
                 // actually do: whether a leader is reachable, and so
                 // whether writes go through. Standalone keeps the
@@ -1436,7 +1440,7 @@ pub(crate) async fn serve(
                 .max_decoding_message_size(max_req_bytes),
         )
         .add_service(
-            proto::replication::cdc::change_stream_service_server::ChangeStreamServiceServer::new(
+            proto::replication::cdc::change_stream_service_server::ChangeStreamServiceServer::from_arc(
                 cdc_service,
             )
             .max_decoding_message_size(max_req_bytes),
