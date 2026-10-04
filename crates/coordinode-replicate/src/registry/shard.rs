@@ -261,6 +261,11 @@ impl RegistryCore {
                 Some((entry, version)) => (Some(entry), version),
                 None => (None, None),
             };
+            // What this record holds the floors at now, if anything.
+            let held = current
+                .as_ref()
+                .filter(|entry| entry.is_live())
+                .map(|entry| (entry.kind.is_seqno_space(), entry.checkpoint_seqno));
             match decide(current)? {
                 Step::Keep(answer) => return Ok(answer),
                 Step::Write(entry, answer) => {
@@ -272,8 +277,22 @@ impl RegistryCore {
                             hook();
                         }
                     }
+                    // A write that can lower a floor publishes it before
+                    // returning: history the new position needs must not be
+                    // collected meanwhile. One that can only raise it (an
+                    // acknowledgement, an end) leaves that to the background
+                    // sweep its applied write triggers; a floor published
+                    // late only keeps history longer. Without the background
+                    // service nothing else would publish it.
+                    let lowers = entry.is_live()
+                        && held.is_none_or(|(seqno_space, checkpoint)| {
+                            seqno_space != entry.kind.is_seqno_space()
+                                || entry.checkpoint_seqno < checkpoint
+                        });
                     if self.commit_writes(&[(entry, version)], &[])? {
-                        self.recompute_floor()?;
+                        if lowers || !self.batching_on.load(Ordering::Acquire) {
+                            self.recompute_floor()?;
+                        }
                         return Ok(answer);
                     }
                 }

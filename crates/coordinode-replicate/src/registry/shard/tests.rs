@@ -884,6 +884,54 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
     f.node.shutdown().await.expect("shutdown");
 }
 
+/// With the background service running, a registration that can lower the
+/// floor still publishes it before returning: the history its position
+/// needs must not be collected while a sweep is far away (100 s here).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lowering_registration_publishes_the_floor_before_returning() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
+        eviction_interval_ms: 100_000,
+    });
+    f.reg
+        .register(registration("late", 250, ConsumerRetentionPolicy::Strict))
+        .expect("register late");
+    assert_eq!(f.reg.shard_floor(), 250);
+    f.reg
+        .register(registration("early", 100, ConsumerRetentionPolicy::Strict))
+        .expect("register early");
+    assert_eq!(f.reg.shard_floor(), 100, "lowered before the call returned");
+    bg.shutdown().await;
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// With the background service running, an acknowledgement only raises the
+/// floor, so the sweep its applied write triggers publishes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgement_raises_the_floor_through_the_sweep() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
+        eviction_interval_ms: 30,
+    });
+    let early = f
+        .reg
+        .register(registration("early", 100, ConsumerRetentionPolicy::Strict))
+        .expect("register early");
+    f.reg
+        .register(registration("late", 250, ConsumerRetentionPolicy::Strict))
+        .expect("register late");
+    f.reg.checkpoint(&early, 300).expect("acknowledge");
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    while f.reg.shard_floor() != 250 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(f.reg.shard_floor(), 250);
+    bg.shutdown().await;
+    f.node.shutdown().await.expect("shutdown");
+}
+
 /// A registration written through another member's registry reaches this
 /// member's floor as it applies.
 #[tokio::test(flavor = "multi_thread")]
