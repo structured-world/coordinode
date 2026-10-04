@@ -684,10 +684,21 @@ fn cascade_eviction_of_primary_endpoint_is_data_motion_noop() {
         .major_compact(Partition::Node)
         .expect("initial major compact");
 
+    // Live tables on cold, counted with the engine closed and reopened: a
+    // table replaced by compaction stays listed until its last handle
+    // closes (on Windows the file cannot go before that), and the reopen
+    // sweeps whatever no manifest names.
     let cold_tables = cold.path().join(Partition::Node.name()).join("tables");
-    let cold_before = std::fs::read_dir(&cold_tables)
-        .expect("read cold dir")
-        .count();
+    let reopen_and_count = |engine: StorageEngine| {
+        drop(engine);
+        let engine = StorageEngine::open(&config).expect("reopen");
+        let live = std::fs::read_dir(&cold_tables)
+            .expect("read cold dir")
+            .count();
+        (engine, live)
+    };
+    let (engine, cold_before) = reopen_and_count(engine);
+    assert!(cold_before > 0, "the major compaction put data on cold");
 
     // Cascade-evict the PRIMARY (ep-hot). The call succeeds and reports
     // a compaction — but the cold endpoint's SST count does NOT
@@ -703,9 +714,7 @@ fn cascade_eviction_of_primary_endpoint_is_data_motion_noop() {
         report.compacted_partitions,
     );
 
-    let cold_after = std::fs::read_dir(&cold_tables)
-        .expect("read cold dir")
-        .count();
+    let (_engine, cold_after) = reopen_and_count(engine);
     assert_eq!(
         cold_after, cold_before,
         "cascade-evicting the primary endpoint cannot move further data \
