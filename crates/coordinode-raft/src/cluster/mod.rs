@@ -59,9 +59,11 @@ pub struct SnapshotTriggerConfig {
     /// Bytes the Raft log's segments grew by since the last snapshot
     /// (default 256 MiB).
     pub log_bytes: u64,
-    /// Longest time between snapshots while entries are applied (default
-    /// 60 s).
-    pub check_interval: std::time::Duration,
+    /// Shortest time between two snapshots either threshold asks for
+    /// (default 60 s). Time alone never asks for one: a snapshot captures
+    /// every table of the store, so it is taken when the log has grown, not
+    /// on a clock, and never more often than this however fast it grows.
+    pub min_interval: std::time::Duration,
 }
 
 impl Default for SnapshotTriggerConfig {
@@ -69,17 +71,18 @@ impl Default for SnapshotTriggerConfig {
         Self {
             logs_since_last: 10_000,
             log_bytes: 256 * 1024 * 1024,
-            check_interval: std::time::Duration::from_secs(60),
+            min_interval: std::time::Duration::from_secs(60),
         }
     }
 }
 
 impl SnapshotTriggerConfig {
-    /// The openraft configuration under this snapshot policy: the entry
-    /// count is openraft's own trigger; the other two are the trigger task's.
+    /// The openraft configuration under this snapshot policy. Both
+    /// thresholds are the trigger task's, so the minimum interval bounds
+    /// them alike; openraft builds a snapshot only when the task asks.
     fn raft_config(&self) -> openraft::Config {
         openraft::Config {
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(self.logs_since_last),
+            snapshot_policy: openraft::SnapshotPolicy::Never,
             ..default_raft_config()
         }
     }
@@ -2653,13 +2656,14 @@ impl RaftNode {
     }
 }
 
-/// Spawn a background task that periodically checks snapshot triggers.
+/// Spawn the background task that asks for snapshots.
 ///
-/// Complements openraft's own entry-count trigger with the other two of
-/// [`SnapshotTriggerConfig`]: the bytes the log grew by since the last
-/// snapshot, probed after an apply at most once a second, and the periodic
-/// timer. Neither fires while nothing was applied since the last snapshot,
-/// and the task sleeps until `applied_rx` moves.
+/// It owns both thresholds of [`SnapshotTriggerConfig`]: the entries
+/// applied and the bytes the log grew by since the last snapshot, probed
+/// after an apply at most once a second, and asks for a snapshot no sooner
+/// than the minimum interval after the last. Nothing fires while nothing
+/// was applied since the last snapshot, and the task sleeps until
+/// `applied_rx` moves.
 ///
 /// The task runs until the Raft instance is shut down (detected via `trigger()` error).
 fn spawn_snapshot_trigger(
@@ -2681,7 +2685,7 @@ fn spawn_snapshot_trigger(
 
         let engine = &held.engine;
 
-        let probe = config.check_interval.min(SNAPSHOT_SIZE_PROBE);
+        let probe = config.min_interval.min(SNAPSHOT_SIZE_PROBE);
         let metrics_rx = raft.metrics();
         let mut last = tokio::time::Instant::now();
         // Don't probe immediately on startup.
@@ -2722,15 +2726,17 @@ fn spawn_snapshot_trigger(
                 }
             };
             base = base.min(size);
-            let Some(reason) = snapshot_due(size - base, last.elapsed(), &config) else {
-                // Not due yet: the next apply or the interval decides.
-                tokio::select! {
-                    changed = applied_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    () = tokio::time::sleep_until(last + config.check_interval) => {}
+            let growth = LogGrowth {
+                entries: applied - snapped,
+                bytes: size - base,
+            };
+            let Some(reason) = snapshot_due(growth, last.elapsed(), &config) else {
+                // Not due yet. A log grown enough waits out the minimum
+                // interval; otherwise only the next apply can make it due.
+                if growth.reaches(&config) {
+                    tokio::time::sleep_until(last + config.min_interval).await;
+                } else if applied_rx.changed().await.is_err() {
+                    break;
                 }
                 continue;
             };
@@ -2772,17 +2778,36 @@ struct TriggerHold {
 /// How often the trigger task sizes the Raft log.
 const SNAPSHOT_SIZE_PROBE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Why a snapshot is due, given the bytes the log grew by and the time since
-/// the last one was asked for; `None` when neither threshold is reached.
+/// How far the log moved since the last snapshot.
+#[derive(Debug, Clone, Copy)]
+struct LogGrowth {
+    /// Entries applied since it.
+    entries: u64,
+    /// Bytes the log's segments grew by since it was asked for.
+    bytes: u64,
+}
+
+impl LogGrowth {
+    /// Whether either threshold of `config` is reached.
+    fn reaches(self, config: &SnapshotTriggerConfig) -> bool {
+        self.entries >= config.logs_since_last || self.bytes >= config.log_bytes
+    }
+}
+
+/// Why a snapshot is due, given how far the log moved and the time since
+/// the last one was asked for: a threshold is reached and the minimum
+/// interval has passed. `None` otherwise; time alone is no reason.
 fn snapshot_due(
-    grown: u64,
+    growth: LogGrowth,
     since_last: std::time::Duration,
     config: &SnapshotTriggerConfig,
 ) -> Option<&'static str> {
-    if grown >= config.log_bytes {
+    if since_last < config.min_interval {
+        None
+    } else if growth.bytes >= config.log_bytes {
         Some("log size")
-    } else if since_last >= config.check_interval {
-        Some("interval")
+    } else if growth.entries >= config.logs_since_last {
+        Some("entries")
     } else {
         None
     }

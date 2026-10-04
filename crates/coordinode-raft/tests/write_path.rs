@@ -322,7 +322,8 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
 /// A stopped node leaves its directory free for the next open in the same
 /// process. The snapshot trigger holds the engine while it sizes the log; a
 /// shutdown that only asked it to stop returned while it still did, and the
-/// reopen found the directory locked. A trigger probing every millisecond is
+/// reopen found the directory locked. A trigger probing every millisecond
+/// (a minimum interval that short shortens the probe period with it) is
 /// mid-probe at almost any shutdown.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_node_leaves_its_directory_free_while_the_trigger_probes() {
@@ -336,7 +337,7 @@ async fn a_stopped_node_leaves_its_directory_free_while_the_trigger_probes() {
             None,
             coordinode_raft::cluster::NodeOptions {
                 snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
-                    check_interval: Duration::from_millis(1),
+                    min_interval: Duration::from_millis(1),
                     ..Default::default()
                 },
                 ..Default::default()

@@ -701,7 +701,7 @@ storage:
   oplog:
     segment_max_entries: 16
 raft_snapshot_entries: 8
-raft_snapshot_interval_secs: 1
+raft_snapshot_min_interval_secs: 1
 checkpoint_interval_secs: 2
 ";
 

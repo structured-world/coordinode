@@ -99,7 +99,7 @@ the key is unset.
 | `join_timeout_secs` | `1800` | live, for joins started afterwards (`RaftNode::set_join_timeout`) | How long `admin node join` may take to catch the new member up before the join fails and reports it. Zero is refused. |
 | `raft_snapshot_entries` | `10000` | restart | Entries applied since the last Raft snapshot that trigger the next. A snapshot lets the log before it be dropped. Taking one pauses applying entries while every partition is flushed and hard-linked (no pass over the data; its bytes are produced only when a member far behind needs it sent), so a busy node snapshots every `entries / write rate` seconds: raise it to pause less often, at the cost of a longer log to keep and to replay after a restart. Zero is refused. |
 | `raft_snapshot_log_bytes` | `268435456` (256 MiB) | restart | Bytes the Raft log's segments grow by since the last snapshot that trigger the next, so a few large entries compact the log as a count of small ones would. Sized every second. Zero is refused. |
-| `raft_snapshot_interval_secs` | `60` | restart | Longest time between Raft snapshots while entries are applied. A node that applied nothing since its last snapshot takes none. Zero is refused. |
+| `raft_snapshot_min_interval_secs` | `60` | restart | Shortest time between two Raft snapshots the entry count or the log size asks for, however fast the log grows. Time alone never takes a snapshot: a node whose log stays below both thresholds takes none. Zero is refused. |
 | `planner_stats_ttl_secs` | `60` | restart (`Database::set_stats_ttl` in embedded mode) | How long the query planner reuses its storage statistics (node counts per label, edge fan-out) before reading them again. Shorter keeps estimates closer to fresh writes at the cost of a counter read and a bounded adjacency sample on each refresh. The statistics steer the choice of plan, never its result. When they cannot be read because a counter or an adjacency list is damaged, the failure is logged as an error naming the key and remembered for the same time, and queries plan with defaults until the next refresh. |
 | `vector_build_wait_ms` | `30000` | restart (`Database::set_vector_build_wait` or `SET vector_build_wait` in embedded mode) | How long a query waits for a vector index still being built, under the `block` online-during-build policy, before it is refused. It is the default for queries that name no bound: a query's own `/*+ vector_build_wait('5s') */` hint overrides it, so a query that can wait longer, or should not wait at all, says so itself. `0` refuses a building index at once. |
 | `vector_retired_bytes_budget` | `268435456` (256 MiB) | restart (`Database::set_vector_retired_bytes_budget` live in embedded mode) | Bytes of replaced neighbour lists each vector index lets wait for reclamation. Inserts, updates and removals publish a new list in place of an old one while searches run; a search keeps every list replaced after it began until it finishes, so a slow search holds that memory. Past the budget, a write holds off until running searches release it, and then goes ahead: writes are slowed, never dropped. Per `{label, property}` the server exports the held memory (`coordinode_vector_index_retired_bytes`, `coordinode_vector_index_retired_lists`), the age of the oldest running operation (`coordinode_vector_index_oldest_operation_seconds`), the writes held off and for how long (`coordinode_vector_index_admission_waits_total`, `coordinode_vector_index_admission_wait_microseconds_total`), publications recomputed after losing to a concurrent writer (`coordinode_vector_index_lost_cas_total`), and slot reuse (`coordinode_vector_index_retired_nodes`, `coordinode_vector_index_free_slots`). |
@@ -258,10 +258,11 @@ peers: []
 # Entries a joining member may lack when it is promoted, and how long a join may take.
 # join_readiness_lag_entries: 1000
 # join_timeout_secs: 1800
-# When a Raft snapshot is taken: entries, log growth (bytes), or time (s).
+# When a Raft snapshot is taken: entries or log growth (bytes), no sooner
+# than the minimum interval (s) after the last.
 # raft_snapshot_entries: 10000
 # raft_snapshot_log_bytes: 268435456
-# raft_snapshot_interval_secs: 60
+# raft_snapshot_min_interval_secs: 60
 # How long the planner reuses its storage statistics.
 # planner_stats_ttl_secs: 60
 # How long a query waits for a vector index still being built (ms).

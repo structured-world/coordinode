@@ -1434,8 +1434,9 @@ async fn cluster_snapshot_install_restores_data() {
     );
 }
 
-/// Background snapshot trigger: with short interval (1s), verify snapshot
-/// is automatically built WITHOUT explicit trigger() call.
+/// Background snapshot trigger: with a size threshold any growth reaches and
+/// a 1 s minimum interval, a snapshot is built WITHOUT explicit trigger()
+/// call.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_background_snapshot_trigger() {
     use coordinode_raft::cluster::SnapshotTriggerConfig;
@@ -1461,7 +1462,7 @@ async fn cluster_background_snapshot_trigger() {
         let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().expect("addr");
 
         let snap_config = SnapshotTriggerConfig {
-            check_interval: Duration::from_secs(1),
+            min_interval: Duration::from_secs(1),
             log_bytes: 0, // any growth is enough
             ..Default::default()
         };
@@ -1526,8 +1527,8 @@ async fn cluster_background_snapshot_trigger() {
 }
 
 /// A log that grows past the size threshold is snapshotted, with the entry
-/// count and the timer both out of reach: a few large entries compact the
-/// log as a count of small ones would.
+/// count out of reach and no minimum interval: a few large entries compact
+/// the log as a count of small ones would.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
     use coordinode_raft::cluster::SnapshotTriggerConfig;
@@ -1552,7 +1553,7 @@ async fn a_log_grown_past_its_size_threshold_is_snapshotted() {
                 snapshots: SnapshotTriggerConfig {
                     logs_since_last: u64::MAX,
                     log_bytes: 64 * 1024,
-                    check_interval: Duration::from_secs(3600),
+                    min_interval: Duration::ZERO,
                 },
                 ..Default::default()
             },
@@ -1625,7 +1626,7 @@ async fn cluster_snapshot_trigger_skips_when_no_new_entries() {
         let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{p1}").parse().expect("addr");
 
         let snap_config = SnapshotTriggerConfig {
-            check_interval: Duration::from_secs(1),
+            min_interval: Duration::from_secs(1),
             log_bytes: 0, // the size criterion is always satisfied
             ..Default::default()
         };
@@ -1755,8 +1756,8 @@ async fn cluster_snapshot_grpc_transfer_to_new_node() {
             .expect("open1"),
         );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
-            check_interval: Duration::from_secs(3600), // disable periodic
-            log_bytes: u64::MAX,                       // disable size-based
+            min_interval: Duration::from_secs(3600), // no snapshot of its own
+            log_bytes: u64::MAX,                     // disable size-based
             ..Default::default()
         };
 
@@ -2281,7 +2282,7 @@ async fn cluster_snapshot_multi_chunk_transfer() {
             .expect("open1"),
         );
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
-            check_interval: Duration::from_secs(3600),
+            min_interval: Duration::from_secs(3600),
             log_bytes: u64::MAX,
             ..Default::default()
         };
@@ -3113,7 +3114,7 @@ async fn cluster_snapshot_bootstrap_then_log_replay() {
         );
 
         let snap_config = coordinode_raft::cluster::SnapshotTriggerConfig {
-            check_interval: Duration::from_secs(3600),
+            min_interval: Duration::from_secs(3600),
             log_bytes: u64::MAX,
             ..Default::default()
         };
@@ -4998,7 +4999,7 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
             format!("http://127.0.0.1:{p1}"),
             NodeOptions {
                 snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
-                    check_interval: Duration::from_secs(3600),
+                    min_interval: Duration::from_secs(3600),
                     log_bytes: u64::MAX,
                     ..Default::default()
                 },

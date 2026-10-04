@@ -270,9 +270,9 @@ pub struct ServerConfig {
     /// Bytes the Raft log grows by since the last snapshot that trigger the
     /// next (`None` = 256 MiB).
     pub raft_snapshot_log_bytes: Option<NonZeroU64>,
-    /// Longest time between Raft snapshots while entries are applied, in
-    /// seconds (`None` = 60).
-    pub raft_snapshot_interval_secs: Option<NonZeroU64>,
+    /// Shortest time between two Raft snapshots the log size asks for, in
+    /// seconds (`None` = 60). Time alone never takes a snapshot.
+    pub raft_snapshot_min_interval_secs: Option<NonZeroU64>,
     /// How long the planner's storage statistics are reused before they are
     /// read again, in seconds (`None` = 60). A read that fails is remembered
     /// for the same time.
@@ -427,7 +427,7 @@ impl Default for ServerConfig {
             join_timeout_secs: None,
             raft_snapshot_entries: None,
             raft_snapshot_log_bytes: None,
-            raft_snapshot_interval_secs: None,
+            raft_snapshot_min_interval_secs: None,
             planner_stats_ttl_secs: None,
             vector_build_wait_ms: None,
             vector_retired_bytes_budget: None,

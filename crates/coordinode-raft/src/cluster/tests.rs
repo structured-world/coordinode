@@ -19,42 +19,52 @@ fn test_engine() -> (tempfile::TempDir, Arc<StorageEngine>) {
     (dir, engine)
 }
 
-/// The size threshold wins over the timer and fires on exactly the
-/// threshold; below both nothing is due, and a zero threshold makes any
-/// growth enough.
+/// A snapshot is due when the log moved by either threshold, entries or
+/// bytes, and the minimum interval since the last one has passed. Time
+/// alone never makes one due: a trickle of writes would otherwise capture
+/// the whole store every interval while the log stays small; and however
+/// fast the log grows, snapshots come no closer than the minimum interval.
 #[test]
-fn a_snapshot_is_due_on_log_growth_or_the_interval() {
+fn a_snapshot_is_due_on_log_growth_past_the_minimum_interval() {
     let config = SnapshotTriggerConfig {
         logs_since_last: 10,
         log_bytes: 1000,
-        check_interval: std::time::Duration::from_secs(60),
+        min_interval: std::time::Duration::from_secs(60),
     };
     let secs = std::time::Duration::from_secs;
-    assert_eq!(snapshot_due(1000, secs(0), &config), Some("log size"));
-    assert_eq!(snapshot_due(5000, secs(90), &config), Some("log size"));
-    assert_eq!(snapshot_due(999, secs(60), &config), Some("interval"));
-    assert_eq!(snapshot_due(999, secs(59), &config), None);
-    assert_eq!(snapshot_due(0, secs(0), &config), None);
-    let any_growth = SnapshotTriggerConfig {
-        log_bytes: 0,
-        ..config
-    };
-    assert_eq!(snapshot_due(0, secs(0), &any_growth), Some("log size"));
+    let moved = |entries, bytes| LogGrowth { entries, bytes };
+    assert_eq!(
+        snapshot_due(moved(0, 1000), secs(60), &config),
+        Some("log size")
+    );
+    assert_eq!(
+        snapshot_due(moved(10, 0), secs(60), &config),
+        Some("entries")
+    );
+    assert_eq!(
+        snapshot_due(moved(1_000_000, 5000), secs(59), &config),
+        None,
+        "not sooner than the minimum interval"
+    );
+    assert_eq!(
+        snapshot_due(moved(9, 999), secs(3600), &config),
+        None,
+        "time alone is not a reason"
+    );
+    assert_eq!(snapshot_due(moved(0, 0), secs(0), &config), None);
 }
 
-/// The entry-count threshold reaches openraft, which owns that trigger;
-/// the rest of the Raft configuration stays the node's default.
+/// openraft takes no snapshot on its own: both thresholds belong to the
+/// trigger task, under its minimum interval. The rest of the Raft
+/// configuration stays the node's default.
 #[test]
-fn the_entry_threshold_is_openrafts_snapshot_policy() {
+fn openraft_takes_no_snapshot_of_its_own() {
     let config = SnapshotTriggerConfig {
         logs_since_last: 1234,
         ..Default::default()
     }
     .raft_config();
-    assert_eq!(
-        config.snapshot_policy,
-        openraft::SnapshotPolicy::LogsSinceLast(1234)
-    );
+    assert_eq!(config.snapshot_policy, openraft::SnapshotPolicy::Never);
     assert_eq!(
         config.max_payload_entries,
         default_raft_config().max_payload_entries

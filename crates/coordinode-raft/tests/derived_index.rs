@@ -295,7 +295,7 @@ async fn a_member_joining_from_a_snapshot_derives_the_log_tail() {
             format!("http://127.0.0.1:{p1}"),
             coordinode_raft::cluster::NodeOptions {
                 snapshots: coordinode_raft::cluster::SnapshotTriggerConfig {
-                    check_interval: Duration::from_secs(3600),
+                    min_interval: Duration::from_secs(3600),
                     log_bytes: u64::MAX,
                     ..Default::default()
                 },

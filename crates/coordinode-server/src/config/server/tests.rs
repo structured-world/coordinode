@@ -129,13 +129,13 @@ fn raft_snapshot_settings_parse_from_the_config_file() {
     assert!(
         d.raft_snapshot_entries.is_none()
             && d.raft_snapshot_log_bytes.is_none()
-            && d.raft_snapshot_interval_secs.is_none()
+            && d.raft_snapshot_min_interval_secs.is_none()
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.yaml");
     std::fs::write(
         &path,
-        "raft_snapshot_entries: 500000\nraft_snapshot_log_bytes: 1073741824\nraft_snapshot_interval_secs: 300\n",
+        "raft_snapshot_entries: 500000\nraft_snapshot_log_bytes: 1073741824\nraft_snapshot_min_interval_secs: 300\n",
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
@@ -144,12 +144,15 @@ fn raft_snapshot_settings_parse_from_the_config_file() {
         c.raft_snapshot_log_bytes.map(|v| v.get()),
         Some(1_073_741_824)
     );
-    assert_eq!(c.raft_snapshot_interval_secs.map(|v| v.get()), Some(300));
+    assert_eq!(
+        c.raft_snapshot_min_interval_secs.map(|v| v.get()),
+        Some(300)
+    );
 
     for zero in [
         "raft_snapshot_entries: 0\n",
         "raft_snapshot_log_bytes: 0\n",
-        "raft_snapshot_interval_secs: 0\n",
+        "raft_snapshot_min_interval_secs: 0\n",
     ] {
         std::fs::write(&path, zero).unwrap();
         assert!(

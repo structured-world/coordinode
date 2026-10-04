@@ -190,7 +190,7 @@ pub(crate) async fn serve(
         join_timeout_secs,
         raft_snapshot_entries,
         raft_snapshot_log_bytes,
-        raft_snapshot_interval_secs,
+        raft_snapshot_min_interval_secs,
         planner_stats_ttl_secs,
         vector_build_wait_ms,
         vector_retired_bytes_budget,
@@ -622,7 +622,7 @@ pub(crate) async fn serve(
     let snapshots = coordinode_raft::cluster::SnapshotTriggerConfig {
         logs_since_last: raft_snapshot_entries.map_or(defaults.logs_since_last, |n| n.get()),
         log_bytes: raft_snapshot_log_bytes.map_or(defaults.log_bytes, |n| n.get()),
-        check_interval: raft_snapshot_interval_secs.map_or(defaults.check_interval, |n| {
+        min_interval: raft_snapshot_min_interval_secs.map_or(defaults.min_interval, |n| {
             std::time::Duration::from_secs(n.get())
         }),
     };
