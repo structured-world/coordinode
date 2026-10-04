@@ -286,18 +286,21 @@ async fn a_group_moves_by_majority_one_member_at_a_time() {
                 .any(|m| m.node().version().group_pair().map(|r| r.pair) == Some(pair(1)))
         })
         .await;
-        let new_leader = if m2.node().version().state() == MemberState::Matched
-            && write(m2.node(), &ids, "node:after", 130).is_ok()
-        {
-            &m2
-        } else {
-            eventually("member 3 matches", || {
-                m3.node().version().state() == MemberState::Matched
-            })
-            .await;
-            write(m3.node(), &ids, "node:after", 130).expect("the new side writes");
-            &m3
-        };
+        // Whichever of the two won the election takes the write; a write to
+        // the other is refused as NotLeader.
+        let mut leader = None;
+        eventually("one of the new side leads", || {
+            use openraft::async_runtime::watch::WatchReceiver as _;
+            leader = m2.node().raft().metrics().borrow_watched().current_leader;
+            matches!(leader, Some(2 | 3))
+        })
+        .await;
+        let new_leader = if leader == Some(2) { &m2 } else { &m3 };
+        eventually("the new leader matches", || {
+            new_leader.node().version().state() == MemberState::Matched
+        })
+        .await;
+        write(new_leader.node(), &ids, "node:after", 130).expect("the new side writes");
         for key in ["node:before", "node:during", "node:after"] {
             assert!(holds(&new_leader.engine, key), "the new side lost {key}");
         }

@@ -627,10 +627,12 @@ pub(crate) async fn serve(
         }),
     };
     // A server is not embedded in an application with a format of its own:
-    // its host epoch is zero.
+    // its host epoch is zero. It hosts the one group a deployment is formed
+    // with.
     let options = coordinode_raft::cluster::NodeOptions {
         snapshots,
         host_epoch: 0,
+        group: coordinode_raft::cluster::GroupId::FORMING,
     };
     let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
         let peer_count = peers_list.len();
@@ -1472,9 +1474,9 @@ pub(crate) async fn serve(
     // peers are configured.
     if let Some(handler) = raft_grpc_handler {
         use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
-        routes.add_service(RaftServiceServer::new(handler));
         // The frozen exchange a member of another version is answered with.
-        routes.add_service(raft_node.handshake_service());
+        routes.add_service(handler.handshake_service());
+        routes.add_service(RaftServiceServer::new(handler));
         info!(node_id, "RaftService registered on :7080 (shared port)");
 
         // SegmentTransferService: receive bulk segment pushes (replication

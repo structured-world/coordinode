@@ -66,7 +66,7 @@ impl Rig {
     fn gate(&self, node_id: u64, pair: VersionPair) -> VersionGate {
         VersionGate::new(
             node_id,
-            0,
+            GroupId::FORMING,
             pair,
             self.applied.subscribe(),
             Arc::new(AtomicU64::new(42)),
@@ -77,7 +77,7 @@ impl Rig {
 fn peer(node_id: u64, pair: VersionPair, group_pair: Option<RecordedPair>) -> Handshake {
     Handshake {
         node_id,
-        group_id: 0,
+        group_id: GroupId::FORMING,
         pair,
         group_pair,
         leader: Some((node_id, format!("10.0.0.{node_id}:7080"))),
@@ -306,13 +306,16 @@ fn calls_without_a_record_or_from_another_group_are_refused() {
         Err(Refusal::NoHandshake(_))
     ));
     let other = Handshake {
-        group_id: 9,
+        group_id: GroupId(9),
         ..peer(2, P, None)
     };
-    assert!(matches!(
+    assert_eq!(
         gate.admit(Ok(other)),
-        Err(Refusal::OtherGroup { theirs: 9, ours: 0 })
-    ));
+        Err(Refusal::OtherGroup {
+            theirs: GroupId(9),
+            ours: GroupId::FORMING
+        })
+    );
 }
 
 /// The record travels in call metadata and comes back unchanged; a call

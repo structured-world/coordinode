@@ -3,7 +3,7 @@ use super::*;
 fn full() -> Handshake {
     Handshake {
         node_id: 2,
-        group_id: 7,
+        group_id: GroupId(7),
         pair: VersionPair {
             engine: 3,
             host_epoch: 9,

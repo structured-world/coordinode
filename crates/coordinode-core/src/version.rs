@@ -8,6 +8,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::group::GroupId;
+
 /// The engine format version this build reads and writes.
 ///
 /// Raised by a release that changes anything one member sends another (log
@@ -173,7 +175,7 @@ pub struct Handshake {
     /// The sender's node id.
     pub node_id: u64,
     /// The consensus group the sender speaks for.
-    pub group_id: u64,
+    pub group_id: GroupId,
     /// The pair the sender runs.
     pub pair: VersionPair,
     /// The pair its group runs, as far as the sender knows.
@@ -218,7 +220,7 @@ impl Handshake {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&HANDSHAKE_MAGIC);
         out.extend_from_slice(&self.node_id.to_le_bytes());
-        out.extend_from_slice(&self.group_id.to_le_bytes());
+        out.extend_from_slice(&self.group_id.raw().to_le_bytes());
         put_pair(&mut out, self.pair);
         match &self.group_pair {
             Some(recorded) => {
@@ -254,7 +256,7 @@ impl Handshake {
             return Err(HandshakeError::BadMagic);
         }
         let node_id = r.u64()?;
-        let group_id = r.u64()?;
+        let group_id = GroupId(r.u64()?);
         let pair = r.pair()?;
         let group_pair = if r.flag()? {
             let pair = r.pair()?;

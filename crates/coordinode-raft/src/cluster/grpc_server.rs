@@ -1,24 +1,36 @@
 //! gRPC server handler for Raft inter-node RPCs.
 //!
-//! Implements `RaftService` tonic trait. Dispatches incoming RPCs to the
-//! local openraft instance. Uses msgpack for type serialization.
+//! Implements `RaftService` tonic trait. A server hosts replicas of several
+//! consensus groups behind one service: every request names its group and is
+//! dispatched to this server's replica of it. Uses msgpack for type
+//! serialization.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use coordinode_core::group::GroupId;
 use futures_util::{Stream, StreamExt};
+use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
+use tonic_types::{ErrorDetails, StatusExt};
 
-use super::version::{VersionGate, read_handshake, refusal_status, write_handshake};
+use super::version::{
+    HandshakeService, VersionGate, read_handshake, refusal_status, write_handshake,
+};
 use crate::proto::replication::raft_service_server::RaftService;
 use crate::proto::replication::{RaftEmpty, RaftPayload};
 use crate::storage::{CoordinodeStateMachine, TypeConfig};
 
 type RaftInstance = openraft::Raft<TypeConfig, CoordinodeStateMachine>;
 
-/// gRPC server handler for Raft consensus RPCs.
-pub struct RaftGrpcHandler {
+/// `ErrorInfo.reason` of a request for a group the server hosts no replica
+/// of; `metadata.group` names the group.
+pub const GROUP_NOT_HOSTED: &str = "GROUP_NOT_HOSTED";
+
+/// This server's replica of one consensus group.
+pub struct GroupReplica {
     raft: Arc<RaftInstance>,
     /// The node's snapshot directory, where a received snapshot is staged so
     /// the install publishes it in place.
@@ -33,22 +45,9 @@ pub struct RaftGrpcHandler {
     space: Arc<coordinode_storage::engine::space::SpaceGuard>,
 }
 
-impl RaftGrpcHandler {
-    /// A handler for `raft`, staging received snapshots in `snapshot_dir`
-    /// (see [`crate::snapshot::snapshot_dir`]), admitting calls through
-    /// `gate` and taking writes only while `space` has room.
-    pub fn new(
-        raft: Arc<RaftInstance>,
-        snapshot_dir: PathBuf,
-        gate: Arc<VersionGate>,
-        space: Arc<coordinode_storage::engine::space::SpaceGuard>,
-    ) -> Self {
-        Self {
-            raft,
-            snapshot_dir,
-            gate,
-            space,
-        }
+impl GroupReplica {
+    fn group(&self) -> GroupId {
+        self.gate.group()
     }
 
     /// Refuse a call that would write the log or install a snapshot while
@@ -60,10 +59,12 @@ impl RaftGrpcHandler {
             .map_err(|e| Status::unavailable(e.to_string()))
     }
 
-    /// Admit a call by its version record, or the status refusing it.
-    fn admit<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    /// Admit a call by the version record in its metadata, or the status
+    /// refusing it. A record naming another group than this replica's is
+    /// refused like a record of another version.
+    fn admit(&self, metadata: &MetadataMap) -> Result<(), Status> {
         self.gate
-            .admit(read_handshake(request.metadata()))
+            .admit(read_handshake(metadata))
             .map_err(|refusal| {
                 metrics::counter!("coordinode_version_refused_calls_total").increment(1);
                 refusal_status(&refusal, &self.gate.local_handshake())
@@ -76,6 +77,178 @@ impl RaftGrpcHandler {
         write_handshake(response.metadata_mut(), &self.gate.local_handshake());
         response
     }
+
+    /// `data` as a payload of this replica's group.
+    fn payload(&self, data: Vec<u8>) -> RaftPayload {
+        RaftPayload {
+            data,
+            group: self.group().raw(),
+        }
+    }
+}
+
+/// Why a replica could not be added to a server.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HostError {
+    /// The server already hosts a replica of the group.
+    #[error("this server already hosts a replica of {0}")]
+    AlreadyHosted(GroupId),
+}
+
+/// The consensus groups a server hosts a replica of, by group.
+#[derive(Default)]
+pub struct HostedGroups {
+    // no-std: spin::RwLock; read once per inter-node call, written when a
+    // replica is added or removed.
+    replicas: parking_lot::RwLock<BTreeMap<GroupId, Arc<GroupReplica>>>,
+}
+
+impl HostedGroups {
+    /// The groups hosted, in order.
+    pub fn groups(&self) -> Vec<GroupId> {
+        self.replicas.read().keys().copied().collect()
+    }
+
+    /// Stop serving `group`; whether it was hosted. Requests for it are
+    /// refused from then on.
+    pub fn remove(&self, group: GroupId) -> bool {
+        self.replicas.write().remove(&group).is_some()
+    }
+
+    fn insert(&self, replica: Arc<GroupReplica>) -> Result<(), HostError> {
+        let group = replica.group();
+        let mut replicas = self.replicas.write();
+        if replicas.contains_key(&group) {
+            return Err(HostError::AlreadyHosted(group));
+        }
+        replicas.insert(group, replica);
+        Ok(())
+    }
+
+    /// This server's replica of `group`, or NOT_FOUND naming it.
+    fn replica(&self, group: GroupId) -> Result<Arc<GroupReplica>, Status> {
+        self.replicas
+            .read()
+            .get(&group)
+            .cloned()
+            .ok_or_else(|| not_hosted(group))
+    }
+
+    /// The replica a call is for by the group its version record names. A
+    /// call without a readable record is answered by the only replica when
+    /// there is one, whose admission then refuses it for the missing record.
+    fn replica_by_record(&self, metadata: &MetadataMap) -> Result<Arc<GroupReplica>, Status> {
+        match read_handshake(metadata) {
+            Ok(peer) => self.replica(peer.group_id),
+            Err(refusal) => {
+                let replicas = self.replicas.read();
+                match (replicas.len(), replicas.values().next()) {
+                    (1, Some(sole)) => Ok(Arc::clone(sole)),
+                    _ => Err(Status::failed_precondition(format!(
+                        "version mismatch: {refusal}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// The version gate of this server's member of `group`.
+    pub(crate) fn gate(&self, group: GroupId) -> Result<Arc<VersionGate>, Status> {
+        self.replica(group).map(|r| Arc::clone(&r.gate))
+    }
+
+    /// The version gate of the only group hosted, if exactly one is.
+    pub(crate) fn sole_gate(&self) -> Option<Arc<VersionGate>> {
+        let replicas = self.replicas.read();
+        match (replicas.len(), replicas.values().next()) {
+            (1, Some(sole)) => Some(Arc::clone(&sole.gate)),
+            _ => None,
+        }
+    }
+}
+
+/// NOT_FOUND for a request naming a group this server does not host.
+fn not_hosted(group: GroupId) -> Status {
+    let details = ErrorDetails::with_error_info(
+        GROUP_NOT_HOSTED,
+        coordinode_core::ERROR_DOMAIN,
+        [("group".to_string(), group.raw().to_string())],
+    );
+    Status::with_error_details(
+        tonic::Code::NotFound,
+        format!("this server hosts no replica of {group}"),
+        details,
+    )
+}
+
+/// gRPC server handler for Raft consensus RPCs of every group the server
+/// hosts. Clones share the hosted groups, so a replica added through one is
+/// served by all.
+#[derive(Clone)]
+pub struct RaftGrpcHandler {
+    groups: Arc<HostedGroups>,
+}
+
+impl RaftGrpcHandler {
+    /// A handler hosting `raft`, the replica of the group `gate` speaks for,
+    /// staging received snapshots in `snapshot_dir` (see
+    /// [`crate::snapshot::snapshot_dir`]), admitting calls through `gate`
+    /// and taking writes only while `space` has room.
+    pub fn new(
+        raft: Arc<RaftInstance>,
+        snapshot_dir: PathBuf,
+        gate: Arc<VersionGate>,
+        space: Arc<coordinode_storage::engine::space::SpaceGuard>,
+    ) -> Self {
+        let groups = HostedGroups::default();
+        let mut replicas = groups.replicas.write();
+        let replica = GroupReplica {
+            raft,
+            snapshot_dir,
+            gate,
+            space,
+        };
+        replicas.insert(replica.group(), Arc::new(replica));
+        drop(replicas);
+        Self {
+            groups: Arc::new(groups),
+        }
+    }
+
+    /// Serve the replicas of `other` from this handler too, so one server
+    /// hosts the groups of both. Nothing is added when any of them is hosted
+    /// here already.
+    pub fn host(&self, other: &RaftGrpcHandler) -> Result<(), HostError> {
+        let incoming: Vec<Arc<GroupReplica>> =
+            other.groups.replicas.read().values().cloned().collect();
+        if let Some(taken) = incoming
+            .iter()
+            .map(|r| r.group())
+            .find(|g| self.groups.replicas.read().contains_key(g))
+        {
+            return Err(HostError::AlreadyHosted(taken));
+        }
+        for replica in incoming {
+            self.groups.insert(replica)?;
+        }
+        Ok(())
+    }
+
+    /// The groups this handler serves.
+    pub fn hosted(&self) -> &Arc<HostedGroups> {
+        &self.groups
+    }
+
+    /// The frozen version exchange for the groups this handler serves, to
+    /// register beside it on the same router.
+    pub fn handshake_service(
+        &self,
+    ) -> crate::proto::internode::version_handshake_server::VersionHandshakeServer<HandshakeService>
+    {
+        crate::proto::internode::version_handshake_server::VersionHandshakeServer::new(
+            HandshakeService::new(Arc::clone(&self.groups)),
+        )
+    }
 }
 
 fn ser<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Status> {
@@ -87,42 +260,51 @@ fn de<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, Status> {
         .map_err(|e| Status::invalid_argument(format!("msgpack deserialize: {e}")))
 }
 
+/// A unary request's replica, admitted, with its payload.
+fn admitted(
+    groups: &HostedGroups,
+    request: Request<RaftPayload>,
+) -> Result<(Arc<GroupReplica>, Vec<u8>), Status> {
+    let (metadata, _, payload) = request.into_parts();
+    let replica = groups.replica(GroupId(payload.group))?;
+    replica.admit(&metadata)?;
+    Ok((replica, payload.data))
+}
+
 #[tonic::async_trait]
 impl RaftService for RaftGrpcHandler {
     async fn vote(&self, request: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
-        self.admit(&request)?;
-        let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&request.into_inner().data)?;
+        let (replica, data) = admitted(&self.groups, request)?;
+        let vote_req: openraft::raft::VoteRequest<TypeConfig> = de(&data)?;
 
-        let vote_resp = self
+        let vote_resp = replica
             .raft
             .vote(vote_req)
             .await
             .map_err(|e| Status::internal(format!("vote: {e}")))?;
 
-        Ok(self.answer(RaftPayload {
-            data: ser(&vote_resp)?,
-        }))
+        Ok(replica.answer(replica.payload(ser(&vote_resp)?)))
     }
 
     async fn append_entries(
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
-        self.admit(&request)?;
-        let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&request.into_inner().data)?;
+        let (replica, data) = admitted(&self.groups, request)?;
+        let req: openraft::raft::AppendEntriesRequest<TypeConfig> = de(&data)?;
         // A heartbeat writes nothing and keeps this member following its
         // leader; only entries wait for space.
         if !req.entries.is_empty() {
-            self.admit_write()?;
+            replica.admit_write()?;
         }
 
-        let resp = self
+        let resp = replica
             .raft
             .append_entries(req)
             .await
             .map_err(|e| Status::internal(format!("append_entries: {e}")))?;
 
-        Ok(self.answer(RaftPayload { data: ser(&resp)? }))
+        Ok(replica.answer(replica.payload(ser(&resp)?)))
     }
 
     type StreamAppendStream = Pin<Box<dyn Stream<Item = Result<RaftPayload, Status>> + Send>>;
@@ -131,8 +313,25 @@ impl RaftService for RaftGrpcHandler {
         &self,
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<Self::StreamAppendStream>, Status> {
-        self.admit(&request)?;
-        let input = request.into_inner();
+        // The stream is routed by its version record, before any message
+        // arrives; every message must name the same group, and the first one
+        // that does not ends the stream.
+        let (metadata, _, input) = request.into_parts();
+        let replica = self.groups.replica_by_record(&metadata)?;
+        replica.admit(&metadata)?;
+        let group = replica.group();
+
+        let foreign = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let foreign_in = Arc::clone(&foreign);
+        let input = input.take_while(move |result| {
+            let pass = result
+                .as_ref()
+                .map_or(true, |payload| GroupId(payload.group) == group);
+            if !pass {
+                foreign_in.store(true, core::sync::atomic::Ordering::Release);
+            }
+            futures_util::future::ready(pass)
+        });
 
         // Deserialize incoming RaftPayload stream → AppendEntriesRequest stream
         let input_stream = input.filter_map(|result| async move {
@@ -157,7 +356,7 @@ impl RaftService for RaftGrpcHandler {
         // Heartbeats pass while the disk is below its reserve; the first
         // request carrying entries then ends the stream, and the reply stream
         // ends with UNAVAILABLE so the leader backs off and sends again later.
-        let space = Arc::clone(&self.space);
+        let space = Arc::clone(&replica.space);
         let cut = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let cut_in = Arc::clone(&cut);
         let input_stream = input_stream.take_while(move |req| {
@@ -178,16 +377,29 @@ impl RaftService for RaftGrpcHandler {
                     ))
                 })
             });
+        let wrong_group = futures_util::stream::once(async move {
+            foreign.load(core::sync::atomic::Ordering::Acquire)
+        })
+        .filter_map(move |foreign| async move {
+            foreign.then(|| {
+                Err(Status::invalid_argument(format!(
+                    "a message of another group in a stream of {group}"
+                )))
+            })
+        });
 
         // Feed to openraft's stream_append — it handles everything
-        let output = self.raft.stream_append(input_stream);
+        let output = replica.raft.stream_append(input_stream);
 
         // Serialize output stream: StreamAppendResult → RaftPayload
-        let output_stream = output.map(|result| match result {
+        let output_stream = output.map(move |result| match result {
             Ok(stream_result) => {
                 let data = rmp_serde::to_vec(&stream_result)
                     .map_err(|e| Status::internal(format!("serialize: {e}")))?;
-                Ok(RaftPayload { data })
+                Ok(RaftPayload {
+                    data,
+                    group: group.raw(),
+                })
             }
             Err(fatal) => Err(Status::internal(format!("fatal: {fatal}"))),
         });
@@ -199,7 +411,7 @@ impl RaftService for RaftGrpcHandler {
         // ends with an error that makes the leader reconnect. The stop is
         // already in the metrics by then: the core publishes it before it
         // drops the queue whose closing ended the stream.
-        let raft = Arc::clone(&self.raft);
+        let raft = Arc::clone(&replica.raft);
         let stopped = futures_util::stream::once(async move {
             use openraft::async_runtime::watch::WatchReceiver;
             raft.metrics().borrow_watched().running_state.clone().err()
@@ -208,32 +420,38 @@ impl RaftService for RaftGrpcHandler {
             fatal.map(|fatal| Err(Status::unavailable(format!("raft stopped: {fatal}"))))
         });
 
-        Ok(self.answer(
-            Box::pin(output_stream.chain(stopped).chain(no_space)) as Self::StreamAppendStream
-        ))
+        Ok(replica.answer(Box::pin(
+            output_stream
+                .chain(stopped)
+                .chain(no_space)
+                .chain(wrong_group),
+        ) as Self::StreamAppendStream))
     }
 
     async fn snapshot(
         &self,
         request: Request<Streaming<RaftPayload>>,
     ) -> Result<Response<RaftPayload>, Status> {
-        self.admit(&request)?;
-        self.admit_write()?;
-        let mut stream = request.into_inner();
+        let (metadata, _, mut stream) = request.into_parts();
 
         // ── Chunked snapshot protocol ──────────────────────────────
         // Message 1: SnapshotChunkMessage::Header (metadata)
         // Messages 2..N: SnapshotChunkMessage::DataChunk (CNSN bytes)
         //
-        // Data chunks go into a staged file in the snapshot directory,
-        // which the install reads and then publishes in place.
+        // The first message names the group and routes the transfer; its
+        // payload is read only once the replica admitted the call. Data
+        // chunks go into a staged file in the snapshot directory, which the
+        // install reads and then publishes in place.
 
-        // Read first message — must be Header
         let first = stream
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?
             .map_err(|e| Status::internal(format!("snapshot stream error: {e}")))?;
+        let replica = self.groups.replica(GroupId(first.group))?;
+        replica.admit(&metadata)?;
+        replica.admit_write()?;
+        let group = replica.group();
 
         let first_msg: crate::snapshot::SnapshotChunkMessage = rmp_serde::from_slice(&first.data)
             .map_err(|e| {
@@ -252,13 +470,14 @@ impl RaftService for RaftGrpcHandler {
         let expected_data_size = header.data_size;
 
         tracing::info!(
+            %group,
             data_size = expected_data_size,
             last_log_index = header.meta.last_log_id.map(|id| id.index),
             "receiving chunked snapshot from leader"
         );
 
         // A staged file is removed if the transfer or the install fails.
-        let mut staged = crate::snapshot::SnapshotFile::stage(&self.snapshot_dir)
+        let mut staged = crate::snapshot::SnapshotFile::stage(&replica.snapshot_dir)
             .map_err(|e| Status::internal(format!("stage the snapshot file: {e}")))?;
         let mut writer = tokio::fs::File::from_std(
             staged
@@ -271,6 +490,11 @@ impl RaftService for RaftGrpcHandler {
         while let Some(result) = stream.next().await {
             let payload =
                 result.map_err(|e| Status::internal(format!("snapshot chunk receive: {e}")))?;
+            if GroupId(payload.group) != group {
+                return Err(Status::invalid_argument(format!(
+                    "a chunk of another group in a snapshot of {group}"
+                )));
+            }
 
             let chunk_msg: crate::snapshot::SnapshotChunkMessage =
                 rmp_serde::from_slice(&payload.data).map_err(|e| {
@@ -313,6 +537,7 @@ impl RaftService for RaftGrpcHandler {
         drop(writer);
 
         tracing::info!(
+            %group,
             received_bytes,
             chunk_count,
             "snapshot chunks received, installing"
@@ -328,7 +553,7 @@ impl RaftService for RaftGrpcHandler {
         // follower's current vote — NOT the leader's vote from the transfer.
         // This is important: the leader uses the response vote to detect
         // if the follower has seen a higher term (split-brain prevention).
-        let response = self
+        let response = replica
             .raft
             .install_full_snapshot(header.vote, snapshot)
             .await
@@ -336,28 +561,28 @@ impl RaftService for RaftGrpcHandler {
 
         let resp_bytes = ser(&response)?;
 
-        tracing::info!(chunk_count, "chunked snapshot installation complete");
-        Ok(self.answer(RaftPayload { data: resp_bytes }))
+        tracing::info!(%group, chunk_count, "chunked snapshot installation complete");
+        Ok(replica.answer(replica.payload(resp_bytes)))
     }
 
     async fn transfer_leader(
         &self,
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftEmpty>, Status> {
-        self.admit(&request)?;
-        let req: openraft::raft::TransferLeaderRequest<TypeConfig> =
-            de(&request.into_inner().data)?;
+        let (replica, data) = admitted(&self.groups, request)?;
+        let req: openraft::raft::TransferLeaderRequest<TypeConfig> = de(&data)?;
 
         // alpha.25 splits the result: outer = Fatal (engine error), inner =
         // TransferLeaderError (the transfer was rejected, e.g. not leader). Both
         // surface to the caller as a gRPC Status so the client's network layer
         // maps them to an RPCError.
-        self.raft
+        replica
+            .raft
             .handle_transfer_leader(req)
             .await
             .map_err(|e| Status::internal(format!("transfer_leader: {e}")))?
             .map_err(|e| Status::internal(format!("transfer_leader rejected: {e}")))?;
 
-        Ok(self.answer(RaftEmpty {}))
+        Ok(replica.answer(RaftEmpty {}))
     }
 }

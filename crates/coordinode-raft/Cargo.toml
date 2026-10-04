@@ -26,6 +26,8 @@ futures-util = { workspace = true }
 # (pure-Rust rustls-rustcrypto, installed at startup) is used instead.
 tonic = { workspace = true, features = ["tls-webpki-roots"] }
 tonic-prost = "0.14"
+# google.rpc.ErrorInfo on refusals a peer branches on.
+tonic-types = { workspace = true }
 prost = { workspace = true }
 # Inter-node gRPC transport compression codec (pure-Rust zstd, shared with the
 # other inter-node services); wired into RaftService stubs via codec_path.

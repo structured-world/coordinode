@@ -24,6 +24,7 @@ pub mod version;
 
 use std::sync::Arc;
 
+pub use coordinode_core::group::GroupId;
 use coordinode_storage::engine::core::StorageEngine;
 
 use crate::proposal::{RaftProposalPipeline, RateLimiter};
@@ -34,7 +35,7 @@ use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 pub use grpc_server::RaftGrpcHandler;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
-use version::{HandshakeService, VersionGate};
+use version::VersionGate;
 
 use crate::proto::replication::raft_service_server::RaftServiceServer;
 
@@ -96,36 +97,27 @@ pub struct NodeOptions {
     /// The embedding application's format epoch, half of the version pair
     /// members are matched on. A server runs zero.
     pub host_epoch: u64,
+    /// The consensus group this node is a member of. Every consensus message
+    /// it sends names it, and a server hosting several groups dispatches by
+    /// it.
+    pub group: GroupId,
 }
 
-/// The consensus group a node's handshake speaks for: one group per node
-/// today.
-const GROUP_ID: u64 = 0;
-
-/// The version gate of member `node_id`, over its state machine's record
-/// of the group's pair.
+/// The version gate of member `node_id` of `group`, over its state
+/// machine's record of the group's pair.
 fn version_gate(
     node_id: u64,
+    group: GroupId,
     state_machine: &CoordinodeStateMachine,
     host_epoch: u64,
 ) -> Arc<VersionGate> {
     Arc::new(VersionGate::new(
         node_id,
-        GROUP_ID,
+        group,
         coordinode_core::version::VersionPair::current(host_epoch),
         state_machine.subscribe_group_pair(),
         state_machine.applied_commit_ts_handle(),
     ))
-}
-
-/// The frozen version exchange of the member `gate` speaks for, to serve
-/// beside its consensus service.
-fn handshake_server(
-    gate: &Arc<VersionGate>,
-) -> crate::proto::internode::version_handshake_server::VersionHandshakeServer<HandshakeService> {
-    crate::proto::internode::version_handshake_server::VersionHandshakeServer::new(
-        HandshakeService::new(Arc::clone(gate)),
-    )
 }
 
 /// Keep the gate's view of the leader current, and while this node leads,
@@ -416,6 +408,7 @@ impl RaftNode {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
+            group,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -432,7 +425,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), oracle.clone())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
-        let version = version_gate(node_id, &state_machine, host_epoch);
+        let version = version_gate(node_id, group, &state_machine, host_epoch);
 
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
@@ -597,6 +590,7 @@ impl RaftNode {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
+            group,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -614,7 +608,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
-        let version = version_gate(node_id, &state_machine, host_epoch);
+        let version = version_gate(node_id, group, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -682,8 +676,8 @@ impl RaftNode {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(handler))
-            .add_service(handshake_server(&version));
+            .add_service(handler.handshake_service())
+            .add_service(RaftServiceServer::new(handler));
 
         let grpc_task = tokio::spawn(async move {
             let graceful = server.serve_with_incoming_shutdown(incoming, async {
@@ -783,6 +777,7 @@ impl RaftNode {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
+            group,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -800,7 +795,7 @@ impl RaftNode {
             CoordinodeStateMachine::with_oracle(Arc::clone(&engine), engine.oracle())
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
-        let version = version_gate(node_id, &state_machine, host_epoch);
+        let version = version_gate(node_id, group, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -922,6 +917,7 @@ impl RaftNode {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
+            group,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -940,7 +936,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
         refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
-        let version = version_gate(node_id, &state_machine, host_epoch);
+        let version = version_gate(node_id, group, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -1040,6 +1036,7 @@ impl RaftNode {
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
+            group,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -1058,7 +1055,7 @@ impl RaftNode {
                 .map_err(|e| RaftNodeError::Init(e.to_string()))?
                 .with_engine_work(log_store.engine_work());
         refuse_join_with_local_data(node_id, &engine, &log_store, &state_machine)?;
-        let version = version_gate(node_id, &state_machine, host_epoch);
+        let version = version_gate(node_id, group, &state_machine, host_epoch);
         let applied_rx = state_machine.subscribe_applied();
         let snapshot_builds = state_machine.snapshot_builds_handle();
         let engine_work = state_machine.engine_work_handle();
@@ -1097,8 +1094,8 @@ impl RaftNode {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server = tonic::transport::Server::builder()
-            .add_service(RaftServiceServer::new(handler))
-            .add_service(handshake_server(&version));
+            .add_service(handler.handshake_service())
+            .add_service(RaftServiceServer::new(handler));
 
         let grpc_task = tokio::spawn(async move {
             let graceful = server.serve_with_incoming_shutdown(incoming, async {
@@ -1519,15 +1516,6 @@ impl RaftNode {
         let live_within = (metrics.current_leader == Some(self.node_id))
             .then(|| std::time::Duration::from_millis(self.raft.config().election_timeout_max));
         self.version.report(&voters, live_within)
-    }
-
-    /// The frozen version exchange, for a caller that serves this node's
-    /// [`RaftGrpcHandler`] on its own router: register both.
-    pub fn handshake_service(
-        &self,
-    ) -> crate::proto::internode::version_handshake_server::VersionHandshakeServer<HandshakeService>
-    {
-        handshake_server(&self.version)
     }
 
     /// The log store's local-append notifier, so a pipeline built elsewhere

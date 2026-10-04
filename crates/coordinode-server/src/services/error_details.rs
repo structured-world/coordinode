@@ -25,7 +25,7 @@ use tonic_types::{ErrorDetails, StatusExt};
 /// Reasons are only unique within a domain, so a client matching on one
 /// without checking the domain can collide with another service's error when
 /// both sit behind the same gateway.
-pub const ERROR_DOMAIN: &str = "coordinode.sw.foundation";
+pub const ERROR_DOMAIN: &str = coordinode_core::ERROR_DOMAIN;
 
 /// Why a request failed, in terms a program can act on.
 ///

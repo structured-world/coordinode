@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use coordinode_core::group::GroupId;
 use coordinode_core::version::{Handshake, RecordedPair, VersionPair};
 
 use crate::storage::GroupPairs;
@@ -39,12 +40,12 @@ pub enum Refusal {
     #[error("the caller sent no version handshake: {0}")]
     NoHandshake(String),
     /// The caller speaks for another consensus group.
-    #[error("the caller belongs to group {theirs}, this member to group {ours}")]
+    #[error("the caller belongs to {theirs}, this member to {ours}")]
     OtherGroup {
         /// The caller's group.
-        theirs: u64,
+        theirs: GroupId,
         /// This member's group.
-        ours: u64,
+        ours: GroupId,
     },
     /// The two members run different pairs.
     #[error("the caller runs {theirs}, this member runs {ours}")]
@@ -63,7 +64,7 @@ pub enum Refusal {
 /// and what each peer last reported.
 pub struct VersionGate {
     node_id: u64,
-    group_id: u64,
+    group_id: GroupId,
     pair: VersionPair,
     /// The group's pair records as this member applied them.
     applied: tokio::sync::watch::Receiver<GroupPairs>,
@@ -141,7 +142,7 @@ impl VersionGate {
     /// over the applied record stream of its state machine.
     pub fn new(
         node_id: u64,
-        group_id: u64,
+        group_id: GroupId,
         pair: VersionPair,
         applied: tokio::sync::watch::Receiver<GroupPairs>,
         applied_commit_ts: Arc<AtomicU64>,
@@ -154,6 +155,11 @@ impl VersionGate {
             applied_commit_ts,
             view: parking_lot::Mutex::new(View::default()),
         }
+    }
+
+    /// The group this member belongs to.
+    pub fn group(&self) -> GroupId {
+        self.group_id
     }
 
     /// The pair this member runs.
@@ -402,16 +408,17 @@ pub fn refusal_status(refusal: &Refusal, local: &Handshake) -> tonic::Status {
     )
 }
 
-/// Serves the frozen exchange: learns the caller's record and answers with
-/// this member's, whether or not they match.
+/// Serves the frozen exchange for every group the server hosts: learns the
+/// caller's record in the member of the group it names and answers with that
+/// member's record, whether or not they match.
 pub struct HandshakeService {
-    gate: Arc<VersionGate>,
+    groups: Arc<super::grpc_server::HostedGroups>,
 }
 
 impl HandshakeService {
-    /// The exchange of `gate`'s member.
-    pub fn new(gate: Arc<VersionGate>) -> Self {
-        Self { gate }
+    /// The exchange of the members in `groups`.
+    pub fn new(groups: Arc<super::grpc_server::HostedGroups>) -> Self {
+        Self { groups }
     }
 }
 
@@ -421,13 +428,27 @@ impl crate::proto::internode::version_handshake_server::VersionHandshake for Han
         &self,
         request: tonic::Request<crate::proto::internode::HandshakeRecord>,
     ) -> Result<tonic::Response<crate::proto::internode::HandshakeRecord>, tonic::Status> {
-        match Handshake::decode(&request.into_inner().record) {
-            Ok(peer) => self.gate.observe(&peer),
-            Err(e) => tracing::debug!(%e, "an undecodable version handshake"),
-        }
+        let gate = match Handshake::decode(&request.into_inner().record) {
+            Ok(peer) => {
+                let gate = self.groups.gate(peer.group_id)?;
+                gate.observe(&peer);
+                gate
+            }
+            // A record of no group the caller can be answered by: the only
+            // group, when the server hosts one, so the caller still learns
+            // what this member runs.
+            Err(e) => {
+                tracing::debug!(%e, "an undecodable version handshake");
+                self.groups.sole_gate().ok_or_else(|| {
+                    tonic::Status::invalid_argument(format!(
+                        "an undecodable version handshake names no group: {e}"
+                    ))
+                })?
+            }
+        };
         Ok(tonic::Response::new(
             crate::proto::internode::HandshakeRecord {
-                record: self.gate.local_handshake().encode(),
+                record: gate.local_handshake().encode(),
             },
         ))
     }

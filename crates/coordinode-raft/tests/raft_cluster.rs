@@ -16,7 +16,7 @@ use coordinode_core::txn::proposal::{
     RaftProposal,
 };
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_raft::cluster::{NodeOptions, RaftNode, RaftNodeError};
+use coordinode_raft::cluster::{GroupId, NodeOptions, RaftNode, RaftNodeError};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::metadata::{field_frontier, load_field_dictionary};
@@ -2219,6 +2219,10 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
                 .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
         );
 
+        // A peer of the same version: a call without a record is refused
+        // before the stream opens, which is not what this test is about.
+        let mut record = node.version().local_handshake();
+        record.node_id = 2;
         node.shutdown().await.expect("shutdown");
 
         let mut client = RaftServiceClient::connect(format!("http://{addr}"))
@@ -2232,9 +2236,12 @@ async fn append_stream_to_stopped_node_ends_with_an_error() {
         };
         let payload = RaftPayload {
             data: rmp_serde::to_vec(&request).expect("encode"),
+            group: GroupId::FORMING.raw(),
         };
+        let mut request = tonic::Request::new(futures_util::stream::iter([payload]));
+        coordinode_raft::cluster::version::write_handshake(request.metadata_mut(), &record);
         let mut replies = client
-            .stream_append(futures_util::stream::iter([payload]))
+            .stream_append(request)
             .await
             .expect("the stream opens")
             .into_inner();

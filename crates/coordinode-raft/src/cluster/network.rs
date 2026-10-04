@@ -147,6 +147,7 @@ impl RaftNetworkFactory<C> for GrpcNetworkFactory {
         node: &openraft::impls::BasicNode,
     ) -> Self::Network {
         GrpcNetwork {
+            group: self.gate.group().raw(),
             local_node_id: self.local_node_id,
             target_node_id: target,
             addr: node.addr.clone(),
@@ -177,6 +178,9 @@ impl RaftNetworkFactory<C> for StubNetworkFactory {
 
 /// gRPC connection to a single Raft peer. Lazily connects on first use.
 pub struct GrpcNetwork {
+    /// The consensus group every message to the peer names, so a server
+    /// hosting several groups dispatches it to its replica of this one.
+    group: u64,
     /// Source node id (this node), for the test-only partition nemesis gate.
     local_node_id: u64,
     /// Target peer node id, for the test-only partition nemesis gate.
@@ -325,6 +329,7 @@ impl NetVote<C> for GrpcNetwork {
                 &gate,
                 RaftPayload {
                     data: serialize(&rpc)?,
+                    group: self.group,
                 },
             );
             let client = self.get_client().await?;
@@ -353,6 +358,7 @@ impl NetStreamAppend<C> for GrpcNetwork {
     {
         let partition = self.partitioned();
         let (local, target) = (self.local_node_id, self.target_node_id);
+        let group = self.group;
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
@@ -368,9 +374,9 @@ impl NetStreamAppend<C> for GrpcNetwork {
                 .take_while(move |_| {
                     futures_util::future::ready(!super::nemesis::is_blocked(local, target))
                 })
-                .map(|req| {
+                .map(move |req| {
                     let data = rmp_serde::to_vec(&req).unwrap_or_default();
-                    RaftPayload { data }
+                    RaftPayload { data, group }
                 });
 
             // Call bidi streaming RPC
@@ -440,6 +446,7 @@ impl NetSnapshot<C> for GrpcNetwork {
         let target_addr = self.addr.clone();
         let closing = self.closing.clone();
         let gate = Arc::clone(&self.gate);
+        let group = self.group;
         let client = self.get_client().await.map_err(|e| {
             let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e.to_string());
             openraft::error::StreamingError::Unreachable(Unreachable::new(&io_err))
@@ -488,8 +495,9 @@ impl NetSnapshot<C> for GrpcNetwork {
 
         // A read or encode failure ends the stream early; the receiver then
         // refuses the transfer for its short size and the RPC fails.
-        let chunks =
-            futures_util::stream::unfold((reader, data_size), |(mut reader, left)| async move {
+        let chunks = futures_util::stream::unfold(
+            (reader, data_size),
+            move |(mut reader, left)| async move {
                 use tokio::io::AsyncReadExt;
                 if left == 0 {
                     return None;
@@ -503,16 +511,21 @@ impl NetSnapshot<C> for GrpcNetwork {
                 }
                 let message = crate::snapshot::SnapshotChunkMessage::DataChunk(chunk);
                 match rmp_serde::to_vec(&message) {
-                    Ok(data) => Some((RaftPayload { data }, (reader, left - len as u64))),
+                    Ok(data) => Some((RaftPayload { data, group }, (reader, left - len as u64))),
                     Err(e) => {
                         tracing::warn!(%e, "encoding a snapshot chunk");
                         None
                     }
                 }
-            });
-        let request_stream =
-            futures_util::stream::once(async move { RaftPayload { data: header_bytes } })
-                .chain(chunks);
+            },
+        );
+        let request_stream = futures_util::stream::once(async move {
+            RaftPayload {
+                data: header_bytes,
+                group,
+            }
+        })
+        .chain(chunks);
 
         // Race the gRPC call against openraft's cancel signal.
         // If replication is cancelled (leader steps down, follower removed),
@@ -579,6 +592,7 @@ impl NetTransferLeader<C> for GrpcNetwork {
                 &gate,
                 RaftPayload {
                     data: serialize(&req)?,
+                    group: self.group,
                 },
             );
             let client = self.get_client().await?;
