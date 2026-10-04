@@ -95,17 +95,20 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler (skip if present)
-        # `protoc` is preinstalled on the self-hosted runner (Fedora,
-        # uses dnf — apt-get would not exist there and `sudo apt-get`
-        # would prompt for a password the workflow can't supply).
-        # GH-hosted ubuntu-latest still needs the install.
+      - name: Check protobuf compiler and well-known types
+        # The self-hosted runner gets its packages from
+        # scripts/linux/provision.sh; the job cannot install them (dnf, and
+        # sudo would ask for a password). The protos import
+        # google/protobuf/*.proto, which ship with the headers package, not
+        # with protoc itself.
         run: |
-          if command -v protoc >/dev/null 2>&1; then
-            echo "protoc already installed: $(protoc --version)"
-          else
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          if ! command -v protoc >/dev/null 2>&1 \
+            || { [ ! -f /usr/include/google/protobuf/empty.proto ] \
+              && [ ! -f /usr/local/include/google/protobuf/empty.proto ]; }; then
+            echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
           fi
+          echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -149,13 +152,16 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler (skip if present)
+      - name: Check protobuf compiler and well-known types
+        # See the `test` job: the runner is provisioned, not the job.
         run: |
-          if command -v protoc >/dev/null 2>&1; then
-            echo "protoc already installed: $(protoc --version)"
-          else
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          if ! command -v protoc >/dev/null 2>&1 \
+            || { [ ! -f /usr/include/google/protobuf/empty.proto ] \
+              && [ ! -f /usr/local/include/google/protobuf/empty.proto ]; }; then
+            echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
           fi
+          echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -260,17 +266,16 @@ jobs:
             echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler (skip if present)
-        # `protoc` is preinstalled on the self-hosted runner (Fedora,
-        # uses dnf — apt-get would not exist there and `sudo apt-get`
-        # would prompt for a password the workflow can't supply).
-        # GH-hosted ubuntu-latest still needs the install.
+      - name: Check protobuf compiler and well-known types
+        # See the `test` job: the runner is provisioned, not the job.
         run: |
-          if command -v protoc >/dev/null 2>&1; then
-            echo "protoc already installed: $(protoc --version)"
-          else
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          if ! command -v protoc >/dev/null 2>&1 \
+            || { [ ! -f /usr/include/google/protobuf/empty.proto ] \
+              && [ ! -f /usr/local/include/google/protobuf/empty.proto ]; }; then
+            echo "::error::protoc or the protobuf well-known types are missing on this runner; run scripts/linux/provision.sh against it"
+            exit 1
           fi
+          echo "protoc: $(protoc --version)"
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release --all-features
