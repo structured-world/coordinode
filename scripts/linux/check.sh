@@ -7,7 +7,8 @@
 #
 # With COORDINODE_CHECK_NEXTEST set, only nextest runs, with those arguments
 # added (a filter and a stress count to chase a flaky test, for example:
-# COORDINODE_CHECK_NEXTEST='-E test(name) --stress-count 20').
+# COORDINODE_CHECK_NEXTEST="-E 'test(name)' --stress-count 20"; the host's
+# shell parses the arguments again, so a filter keeps its own quotes).
 # The multi-node cluster schemes are left out of the default run; they run
 # with COORDINODE_CHECK_NEXTEST='-P cluster'.
 #
@@ -20,7 +21,8 @@
 # (scripts/linux/provision.sh installs them); the run stops before uploading
 # anything when one is missing. Logs and the status file land in
 # target/linux-check/ locally; the run's directory on the host, build output
-# included, is removed afterwards.
+# included, is removed afterwards. The exit code is 0 only when the run got to
+# its end and every step in the status file passed.
 set -euo pipefail
 
 host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of the Linux machine}"
@@ -59,6 +61,10 @@ fi
 
 out="$repo/target/linux-check"
 mkdir -p "$out"
+# shellcheck source=../check-verdict.sh
+. "$repo/scripts/check-verdict.sh"
+# A log this run did not write must not be read as its result.
+rm -f "$out"/status.txt "$out"/*.log
 bundle="$out/tree.bundle"
 
 # Snapshot the working tree as a commit on a private ref, through a scratch
@@ -129,8 +135,8 @@ echo done >> ../status.txt" || true
   for f in status.txt bench-build.log bench.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
-  cat "$out/status.txt"
-  exit 0
+  check_verdict "$out/status.txt"
+  exit
 fi
 
 if [ -n "$only_nextest" ]; then
@@ -144,8 +150,8 @@ echo done >> ../status.txt" || true
   for f in status.txt test.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
   done
-  cat "$out/status.txt"
-  exit 0
+  check_verdict "$out/status.txt"
+  exit
 fi
 
 # Each step's exit code goes to status.txt; a failing step does not stop the
@@ -168,4 +174,4 @@ for f in status.txt clippy.log build.log test.log doctest.log; do
   ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
 done
 
-cat "$out/status.txt"
+check_verdict "$out/status.txt"

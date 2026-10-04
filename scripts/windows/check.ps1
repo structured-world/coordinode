@@ -19,6 +19,10 @@ Add-Type -Namespace Win32 -Name Power -MemberDefinition @'
 '@
 [Win32.Power]::SetThreadExecutionState([uint32]2147483649) | Out-Null
 
+# Windows PowerShell writes UTF-16 by default; check.sh reads status.txt as
+# plain text.
+$PSDefaultParameterValues['Out-File:Encoding'] = 'ascii'
+
 $src = Join-Path $Root 'src'
 $target = Join-Path $Root 'target'
 $status = Join-Path $Root 'status.txt'

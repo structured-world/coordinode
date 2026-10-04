@@ -13,7 +13,8 @@
 #
 # The host needs git, a Rust toolchain, cargo-nextest and protoc, and an
 # OpenSSH server whose default shell is PowerShell. Logs and the status file
-# land in target/windows-check/ locally; nothing stays on the host.
+# land in target/windows-check/ locally; nothing stays on the host. The exit
+# code is 0 only when the run got to its end and every step passed.
 set -euo pipefail
 
 host="${COORDINODE_WINDOWS_HOST:?set COORDINODE_WINDOWS_HOST to the ssh target of the Windows machine}"
@@ -27,6 +28,8 @@ ref='refs/check/windows'
 repo="$(git rev-parse --show-toplevel)"
 out="$repo/target/windows-check"
 mkdir -p "$out"
+# shellcheck source=../check-verdict.sh
+. "$repo/scripts/check-verdict.sh"
 bundle="$out/tree.bundle"
 
 # Snapshot the working tree as a commit on a private ref, through a scratch
@@ -79,4 +82,4 @@ for f in status.txt clippy.log build.log test.log doctest.log; do
 done
 ssh "$host" "Remove-Item -Recurse -Force '$remote_root' -ErrorAction SilentlyContinue"
 
-cat "$out/status.txt"
+check_verdict "$out/status.txt"
