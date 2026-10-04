@@ -1,19 +1,18 @@
 //! Integration tests: reads at a named timestamp through vector and full-text
 //! indexes.
 //!
-//! A vector or full-text index on a label that keeps no history holds only the
-//! current state, so it cannot say what matched at an earlier timestamp. A
-//! read at a named timestamp (`AS OF TIMESTAMP`, `ReadConcern.at_timestamp`)
-//! that would be answered by such an index is refused. Vector search has an
-//! exact alternative, `vector_consistency('exact')`, which evaluates every
-//! vector of the named snapshot and needs no index.
+//! A vector or full-text index holds the current state. A read at a named
+//! timestamp (`AS OF TIMESTAMP`, `ReadConcern.at_timestamp`) is answered from
+//! it for every node unchanged since that timestamp, and the nodes written
+//! after it are read from the store at the timestamp and evaluated exactly, so
+//! the answer is the one the named snapshot gives, the same as the exact path
+//! (`vector_consistency('exact')`) that evaluates every vector.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::read_concern::{ReadConcern, ReadConcernLevel};
-use coordinode_embed::{Database, DatabaseError};
-use coordinode_query::executor::runner::{ExecutionError, HistoricalIndexKind};
+use coordinode_embed::Database;
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -68,45 +67,31 @@ fn top2(hint: &str, as_of: Option<u64>) -> String {
     )
 }
 
-fn assert_refused(err: DatabaseError, kind: HistoricalIndexKind) {
-    match err {
-        DatabaseError::Execution(ExecutionError::IndexNotHistorical {
-            kind: got, label, ..
-        }) => {
-            assert_eq!(got, kind, "refusal names the index kind");
-            assert_eq!(
-                label,
-                if kind == HistoricalIndexKind::Vector {
-                    "Item"
-                } else {
-                    "Article"
-                }
-            );
-        }
-        other => panic!("expected IndexNotHistorical({kind:?}), got {other:?}"),
-    }
-}
-
-/// `AS OF TIMESTAMP` over a current-only vector index is refused rather than
-/// answered from today's index, which no longer holds `a` and ranks `c`, a
-/// node that did not exist yet, first.
+/// `AS OF TIMESTAMP` through the index answers as the named snapshot: `a` is
+/// back, `c` does not exist yet, and `b` ranks by the vector it had then.
 #[test]
-fn as_of_vector_top_k_on_a_current_only_index_is_refused() {
+fn as_of_vector_top_k_through_the_index_answers_the_snapshot() {
     let (mut db, _dir) = open_db();
     let before = vector_history(&mut db);
-    let err = db
-        .execute_cypher(&top2("", Some(before)))
-        .expect_err("a current-only index cannot answer a past timestamp");
-    assert_refused(err, HistoricalIndexKind::Vector);
+    let query = top2("", Some(before));
+    let plan = db.explain_cypher(&query).expect("explain");
+    assert!(
+        plan.contains("HnswScan"),
+        "the index path is taken:\n{plan}"
+    );
+    let rows = db
+        .execute_cypher(&query)
+        .expect("read at the named timestamp");
+    assert_eq!(names(&rows), ["a", "b"]);
 }
 
-/// `ReadConcern.at_timestamp` names a timestamp as well, so the same rule
-/// holds on that path.
+/// `ReadConcern.at_timestamp` names a timestamp as well, and is answered the
+/// same way.
 #[test]
-fn read_concern_at_timestamp_vector_top_k_is_refused() {
+fn read_concern_at_timestamp_vector_top_k_answers_the_snapshot() {
     let (mut db, _dir) = open_db();
     let before = vector_history(&mut db);
-    let err = db
+    let rows = db
         .execute_cypher_full(
             &top2("", None),
             None,
@@ -118,13 +103,12 @@ fn read_concern_at_timestamp_vector_top_k_is_refused() {
             }),
             None,
         )
-        .expect_err("a current-only index cannot answer a named timestamp");
-    assert_refused(err, HistoricalIndexKind::Vector);
+        .expect("read at the named timestamp");
+    assert_eq!(names(&rows.rows), ["a", "b"]);
 }
 
-/// `vector_consistency('exact')` answers the same read from the named
-/// snapshot: `a` is back, `c` does not exist yet, and `b` ranks by the
-/// vector it had then.
+/// `vector_consistency('exact')` reads the named snapshot without the index
+/// and agrees with the index path.
 #[test]
 fn exact_answers_an_as_of_vector_top_k_from_the_named_snapshot() {
     let (mut db, _dir) = open_db();
@@ -149,18 +133,22 @@ fn session_exact_answers_an_as_of_vector_top_k() {
 }
 
 /// A per-query hint wins over the session setting: `current` asked of one
-/// query is honoured while the session says `exact`, and the read at a past
-/// timestamp is then refused again.
+/// query takes the index path while the session says `exact`, and answers
+/// the past timestamp all the same.
 #[test]
 fn a_query_hint_overrides_the_session_setting() {
     let (mut db, _dir) = open_db();
     let before = vector_history(&mut db);
     db.execute_cypher("SET vector_consistency = 'exact'")
         .expect("set session mode");
-    let err = db
-        .execute_cypher(&top2(" /*+ vector_consistency('current') */", Some(before)))
-        .expect_err("the hint selects the index path, which cannot answer the past");
-    assert_refused(err, HistoricalIndexKind::Vector);
+    let query = top2(" /*+ vector_consistency('current') */", Some(before));
+    let plan = db.explain_cypher(&query).expect("explain");
+    assert!(
+        plan.contains("HnswScan"),
+        "the hint selects the index:\n{plan}"
+    );
+    let rows = db.execute_cypher(&query).expect("index read at the past");
+    assert_eq!(names(&rows), ["a", "b"]);
 }
 
 /// An explicit `exact` is not overridden by the index access path: the plan
@@ -192,10 +180,9 @@ fn a_current_read_still_uses_the_index() {
 }
 
 /// A filtered top-k keeps the scan-then-rank path, which also consults the
-/// index; the rule does not depend on which access path the planner took or
-/// on how many rows the filter leaves.
+/// index; it answers the past timestamp as the exact path does.
 #[test]
-fn a_filtered_as_of_vector_top_k_is_refused_and_answered_exactly() {
+fn a_filtered_as_of_vector_top_k_answers_the_snapshot() {
     let (mut db, _dir) = open_db();
     let before = vector_history(&mut db);
     let filtered = |hint: &str| {
@@ -205,10 +192,10 @@ fn a_filtered_as_of_vector_top_k_is_refused_and_answered_exactly() {
              ORDER BY d LIMIT 2 RETURN n.name AS name{hint} AS OF TIMESTAMP {before}"
         )
     };
-    let err = db
+    let rows = db
         .execute_cypher(&filtered(""))
-        .expect_err("the index path cannot answer the past");
-    assert_refused(err, HistoricalIndexKind::Vector);
+        .expect("index-path evaluation");
+    assert_eq!(names(&rows), ["a", "b"]);
     let rows = db
         .execute_cypher(&filtered(" /*+ vector_consistency('exact') */"))
         .expect("exact evaluation");
@@ -216,7 +203,7 @@ fn a_filtered_as_of_vector_top_k_is_refused_and_answered_exactly() {
 }
 
 /// A label without a vector index is always evaluated exactly, so a past
-/// timestamp is answered, not refused.
+/// timestamp is answered.
 #[test]
 fn as_of_vector_top_k_without_an_index_is_answered() {
     let (mut db, _dir) = open_db();
@@ -232,32 +219,48 @@ fn as_of_vector_top_k_without_an_index_is_answered() {
     assert_eq!(names(&rows), ["a", "b"]);
 }
 
-/// A full-text index matches today's text, so `text_match` at a past
-/// timestamp is refused; there is no exact alternative for full-text yet.
+/// `text_match` at a past timestamp matches the text each node held then: a
+/// node rewritten since is found by its old words and not its new ones, a
+/// node deleted since is found, one created since is not; scores rank as the
+/// snapshot's corpus does.
 #[test]
-fn as_of_text_match_on_a_current_only_index_is_refused() {
+fn as_of_text_match_answers_the_snapshot() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
         .expect("create text index");
-    let before = commit(
+    commit(
         &mut db,
         "CREATE (:Article {name: 'x', body: 'rust storage'})",
+    );
+    let before = commit(
+        &mut db,
+        "CREATE (:Article {name: 'y', body: 'rust engines'})",
     );
     commit(
         &mut db,
         "MATCH (n:Article {name: 'x'}) SET n.body = 'golang services'",
     );
-    let current = db
-        .execute_cypher(
-            "MATCH (n:Article) WHERE text_match(n.body, 'golang') RETURN n.name AS name",
-        )
-        .expect("current full-text read");
-    assert_eq!(names(&current), ["x"]);
-    let err = db
-        .execute_cypher(&format!(
-            "MATCH (n:Article) WHERE text_match(n.body, 'rust') RETURN n.name AS name \
-             AS OF TIMESTAMP {before}"
-        ))
-        .expect_err("a current-only text index cannot answer a past timestamp");
-    assert_refused(err, HistoricalIndexKind::FullText);
+    commit(&mut db, "MATCH (n:Article {name: 'y'}) DETACH DELETE n");
+    commit(
+        &mut db,
+        "CREATE (:Article {name: 'z', body: 'rust newcomer'})",
+    );
+
+    let at = |db: &mut Database, words: &str, as_of: Option<u64>| -> Vec<String> {
+        let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+        let mut found = names(
+            &db.execute_cypher(&format!(
+                "MATCH (n:Article) WHERE text_match(n.body, '{words}') \
+                 RETURN n.name AS name{as_of}"
+            ))
+            .expect("full-text read"),
+        );
+        found.sort();
+        found
+    };
+    assert_eq!(at(&mut db, "rust", None), ["z"]);
+    assert_eq!(at(&mut db, "golang", None), ["x"]);
+    assert_eq!(at(&mut db, "rust", Some(before)), ["x", "y"]);
+    assert!(at(&mut db, "golang", Some(before)).is_empty());
+    assert!(at(&mut db, "newcomer", Some(before)).is_empty());
 }

@@ -304,6 +304,18 @@ pub trait NodeStore {
         engine: &StorageEngine,
     ) -> StoreResult<(coordinode_storage::engine::tap::WriteTap, lsm_tree::SeqNo)>;
 
+    /// The nodes of `shard_id` written (created, changed, merged or deleted)
+    /// at or after storage seqno `since`, found from the stored version
+    /// history in time proportional to those writes. A read at timestamp T
+    /// passes T + 1: the result is every node whose state differs from the
+    /// snapshot at T, complete for any T still readable.
+    fn written_since(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        since: u64,
+    ) -> StoreResult<Vec<NodeId>>;
+
     /// Iterate every non-temporal node record in a shard, latest
     /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
     /// order. Materialised into a `Vec` — callers walking very large
@@ -763,6 +775,21 @@ impl NodeStore for LocalNodeStore {
         engine: &StorageEngine,
     ) -> StoreResult<(coordinode_storage::engine::tap::WriteTap, lsm_tree::SeqNo)> {
         Ok(engine.tap_writes(Partition::Node)?)
+    }
+
+    fn written_since(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        since: u64,
+    ) -> StoreResult<Vec<NodeId>> {
+        Ok(engine
+            .changed_keys_since(Partition::Node, since)?
+            .iter()
+            .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+            .filter(|(shard, _)| *shard == shard_id)
+            .map(|(_, id)| id)
+            .collect())
     }
 
     fn for_each_in_shard(

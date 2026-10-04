@@ -44,36 +44,6 @@ const DEFAULT_MAX_HOPS: u64 = 10;
 /// Key-value pair returned by MVCC prefix scan: (user_key, value).
 type KvPair = (Vec<u8>, Vec<u8>);
 
-/// The kind of index a refused read at a named timestamp would have used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoricalIndexKind {
-    /// An HNSW vector index.
-    Vector,
-    /// A full-text index.
-    FullText,
-}
-
-impl HistoricalIndexKind {
-    /// What the caller can do instead.
-    const fn remedy(self) -> &'static str {
-        match self {
-            Self::Vector => {
-                "evaluate it exactly at that timestamp with /*+ vector_consistency('exact') */"
-            }
-            Self::FullText => "full-text search reads the current state only",
-        }
-    }
-}
-
-impl std::fmt::Display for HistoricalIndexKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Vector => "vector",
-            Self::FullText => "full-text",
-        })
-    }
-}
-
 /// The kind of a named catalog object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogObject {
@@ -206,28 +176,6 @@ pub enum ExecutionError {
         requested: i64,
         /// The oldest timestamp still readable when the query ran.
         oldest_readable: u64,
-    },
-
-    /// A read at a caller-named timestamp (`AS OF TIMESTAMP`,
-    /// `ReadConcern.at_timestamp`) would be answered by an index that holds
-    /// only the current state. Such an index cannot say what matched at that
-    /// timestamp: it no longer holds what was deleted since, and it matches
-    /// and ranks by today's values. The read is refused rather than answered
-    /// from today's contents.
-    #[error(
-        "{kind} index on :{label}({property}) holds only the current state and cannot \
-         answer a read at timestamp {at}; {}",
-        kind.remedy()
-    )]
-    IndexNotHistorical {
-        /// Which kind of index would have answered.
-        kind: HistoricalIndexKind,
-        /// The indexed label.
-        label: String,
-        /// The indexed property.
-        property: String,
-        /// The timestamp the read named.
-        at: i64,
     },
 
     /// Schema mode violation: STRICT label rejected an undeclared property, or
@@ -5216,24 +5164,28 @@ fn execute_btree_index_scan(
     Ok(results)
 }
 
-/// Refuse a read at a caller-named timestamp that an index holding only the
-/// current state would answer. Every vector and full-text index holds the
-/// current state only: it matches and ranks by today's values, and what was
-/// written after the named timestamp shapes its answer.
-fn refuse_current_only_index(
+/// The nodes a read through an index of the current state answers itself,
+/// beyond `pending` (what the index's worker has not folded): on a read at a
+/// named timestamp T, every node written after T, whose state then the index
+/// no longer holds; on a current read, the transaction's own uncommitted
+/// writes. Each is evaluated exactly from the store as the statement reads it.
+fn read_delta(
+    pending: IndexDelta,
     ctx: &ExecutionContext<'_>,
-    kind: HistoricalIndexKind,
-    label: &str,
-    property: &str,
-) -> Result<(), ExecutionError> {
+) -> Result<IndexDelta, ExecutionError> {
     match ctx.snapshot_ts {
-        Some(at) => Err(ExecutionError::IndexNotHistorical {
-            kind,
-            label: label.to_string(),
-            property: property.to_string(),
-            at,
-        }),
-        None => Ok(()),
+        Some(at) => {
+            // A read at T sees the commits at or below T: the nodes changed
+            // since are those written from seqno T + 1 on.
+            let since = u64::try_from(at)
+                .ok()
+                .and_then(|at| at.checked_add(1))
+                .ok_or_else(|| {
+                    ExecutionError::Unsupported("AS OF TIMESTAMP value out of range".into())
+                })?;
+            Ok(pending.union(IndexDelta::written_since(ctx.engine, ctx.shard_id, since)?))
+        }
+        None => Ok(pending.with_nodes(own_written_nodes(ctx))),
     }
 }
 
@@ -5270,7 +5222,6 @@ fn execute_hnsw_scan(
         )));
     };
     let registry = indexes.registry;
-    refuse_current_only_index(ctx, HistoricalIndexKind::Vector, label, property)?;
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
     gate_vector_index_read(indexes, label, property)?;
@@ -5285,13 +5236,12 @@ fn execute_hnsw_scan(
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
 
-    // The commits the index has not folded yet and the transaction's own
-    // uncommitted writes are answered from the store as this statement sees
-    // it; the index answers for every other node.
+    // The commits the index has not folded yet, and the transaction's own
+    // writes or (at a named timestamp) the nodes written since, are answered
+    // from the store as this statement reads it; the index answers for every
+    // other node.
     materialize_own_node_writes(ctx)?;
-    let delta = registry
-        .delta(ctx.shard_id)
-        .with_nodes(own_written_nodes(ctx));
+    let delta = read_delta(registry.delta(ctx.shard_id), ctx)?;
     // (node, record, index score, exact score of the ORDER BY function)
     let mut candidates: Vec<(u64, NodeRecord, f32, Option<f64>)> = Vec::new();
     if delta != IndexDelta::Unknown {
@@ -6680,8 +6630,6 @@ fn try_hnsw_vector_top_k(
 
     // Refused before the size threshold below, so whether a read at a named
     // timestamp is answered does not depend on how many rows it sees.
-    refuse_current_only_index(ctx, HistoricalIndexKind::Vector, &label_str, &property_str)?;
-
     // Small input: brute force is cheaper than HNSW + intersection overhead.
     // This covers the typical hybrid_search case where traversal narrows the
     // candidate set to a handful of nodes per query.
@@ -6706,13 +6654,11 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     gate_vector_index_read(indexes, &label_str, &property_str)?;
-    // The commits the index has not folded yet and the transaction's own
-    // uncommitted writes are answered from the rows, which hold this
-    // statement's view of every node; with no record of which nodes the
-    // commits touched, the rows are ranked exactly.
-    let delta = registry
-        .delta(ctx.shard_id)
-        .with_nodes(own_written_nodes(ctx));
+    // The commits the index has not folded yet, and the transaction's own
+    // writes or (at a named timestamp) the nodes written since, are answered
+    // from the rows, which hold this statement's view of every node; with no
+    // record of which nodes the commits touched, the rows are ranked exactly.
+    let delta = read_delta(registry.delta(ctx.shard_id), ctx)?;
     if delta == IndexDelta::Unknown {
         return Ok(None);
     }
@@ -7461,7 +7407,6 @@ fn score_text_method(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Option<usize>>, ExecutionError> {
     let _ = method_expr; // kept for symmetry + future column inspection
-    refuse_current_only_index(ctx, HistoricalIndexKind::FullText, label, property)?;
     let registry = ctx.text_index_registry.ok_or_else(|| {
         ExecutionError::Unsupported(
             "rrf_score(): text method requires a TextIndexRegistry; \
@@ -7592,7 +7537,6 @@ fn raw_scores_text_method(
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Option<f64>>, ExecutionError> {
     let _ = method_expr;
-    refuse_current_only_index(ctx, HistoricalIndexKind::FullText, label, property)?;
     let registry = ctx.text_index_registry.ok_or_else(|| {
         ExecutionError::Unsupported(
             "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
@@ -8078,8 +8022,11 @@ fn own_written_nodes(ctx: &ExecutionContext<'_>) -> Vec<NodeId> {
 
 /// Every node the text index of `(label, property)` matches for `query`
 /// (tokenized by `language`, the index's default when `None`) with its BM25
-/// score, the writes the index has not folded yet answered from this
-/// statement's view of them. `Ok(None)` when there is no such index.
+/// score, as this statement reads the store: the writes the index has not
+/// folded, the transaction's own (fold them first with
+/// [`materialize_own_node_writes`]) and at a named timestamp the nodes
+/// written since are evaluated from it. `Ok(None)` when there is no such
+/// index.
 fn text_index_matches(
     registry: &crate::index::TextIndexRegistry,
     label: &str,
@@ -8091,8 +8038,8 @@ fn text_index_matches(
     use coordinode_search::tantivy::multi_lang::TextRequest;
     use coordinode_search::tantivy::pending::Matches;
 
-    let own = own_written_nodes(ctx);
-    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner, &own)?
+    let also = read_delta(IndexDelta::Nodes(Default::default()), ctx).map_err(|e| e.to_string())?;
+    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner, also)?
     else {
         return Ok(None);
     };
@@ -8157,12 +8104,6 @@ fn execute_text_filter(
         _ => None,
     };
     let label = label_owned.as_deref();
-    refuse_current_only_index(
-        ctx,
-        HistoricalIndexKind::FullText,
-        label.unwrap_or("?"),
-        property.unwrap_or("?"),
-    )?;
 
     let search_results: Vec<coordinode_search::tantivy::TextSearchResult> = if let Some(registry) =
         ctx.text_index_registry

@@ -8,7 +8,9 @@
 //! exactly, from the store at its own snapshot.
 
 use coordinode_core::graph::node::NodeId;
+use coordinode_modality::StoreError;
 use coordinode_storage::engine::applied::{AppliedPosition, PendingKeys};
+use coordinode_storage::engine::core::StorageEngine;
 use rustc_hash::FxHashSet;
 
 /// The writes an index does not hold yet, as one search sees them.
@@ -40,6 +42,38 @@ impl IndexDelta {
             }
             Self::Unknown => Self::Unknown,
         }
+    }
+
+    /// Both deltas: unknown when either is.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        match other {
+            Self::Nodes(nodes) => self.with_nodes(nodes),
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    /// The nodes of `shard_id` written at or after storage seqno `since`: for
+    /// a read at timestamp T (`since` = T + 1), the nodes whose state then an
+    /// index of the current state does not hold. The store keeps every
+    /// version a readable snapshot can see, so the set is complete for any
+    /// readable T.
+    ///
+    /// # Errors
+    ///
+    /// The store could not list the changed keys.
+    pub fn written_since(
+        engine: &StorageEngine,
+        shard_id: u16,
+        since: u64,
+    ) -> Result<Self, StoreError> {
+        use coordinode_modality::NodeStore as _;
+        Ok(Self::Nodes(
+            coordinode_modality::LocalNodeStore
+                .written_since(engine, shard_id, since)?
+                .into_iter()
+                .collect(),
+        ))
     }
 
     /// Whether the index's entry for `node` cannot be trusted.

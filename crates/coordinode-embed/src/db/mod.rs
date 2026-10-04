@@ -3656,7 +3656,14 @@ impl Database {
             None,
         );
         self.text_index_registry
-            .view(label, property, &read, self.shard_id, &interner, &[])
+            .view(
+                label,
+                property,
+                &read,
+                self.shard_id,
+                &interner,
+                coordinode_query::index::IndexDelta::Nodes(Default::default()),
+            )
             .map_err(DatabaseError::Other)
     }
 

@@ -390,17 +390,16 @@ The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns rea
 
 **Retention:** 7 days by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
 
-**Vector and full-text search at a timestamp.** A vector or full-text index holds the current state only: it no longer contains what was deleted since the timestamp, and it matches and ranks by today's values. A time-travel query that such an index would answer is therefore refused with `FAILED_PRECONDITION` (reason `INDEX_NOT_HISTORICAL`, metadata `index_kind`, `label`, `property`, `timestamp`); the embedded API returns `ExecutionError::IndexNotHistorical`. The same applies to `ReadConcern.at_timestamp`.
+**Vector and full-text search at a timestamp.** A vector or full-text index holds the current state, and a time-travel query is still answered through it: every node written after the timestamp (found from the stored version history) is left out of the index's answer and read from the snapshot instead, its text matched or its vector ranked as it was then, and full-text scores use the corpus as it stood at the timestamp. The answer is the snapshot's, at any timestamp in the retention window; the cost grows with the number of nodes written since the timestamp. The same applies to `ReadConcern.at_timestamp`.
 
-- **Vector search** has an exact alternative that reads the snapshot itself and needs no index: ask for it with `/*+ vector_consistency('exact') */` (or `SET vector_consistency = 'exact'` for the session). It evaluates every vector of the label at that timestamp, so its cost grows with the label.
-- **Full-text search** has no exact alternative; read without the timestamp, or without text search.
-- A vector top-k over a label **without** a vector index is always evaluated exactly and is answered at any timestamp in the retention window.
+- `/*+ vector_consistency('exact') */` (or `SET vector_consistency = 'exact'` for the session) evaluates every vector of the label at the timestamp without the index; it gives the same nodes for a vector top-k, with a cost that grows with the label instead.
+- A vector top-k over a label **without** a vector index is always evaluated exactly.
 
 ```cypher
 MATCH (d:Doc)
 WITH d, vector_distance(d.embedding, $q) AS dist
 ORDER BY dist LIMIT 10
-RETURN d.title /*+ vector_consistency('exact') */
+RETURN d.title
 AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 ```
 

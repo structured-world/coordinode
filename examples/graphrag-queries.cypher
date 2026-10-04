@@ -239,13 +239,12 @@ LIMIT 30;
 // ============================================================================
 // GQ-9. TEMPORAL RAG: Search across document versions (time-travel)
 // "What did the contract say about liability BEFORE the amendment?"
-// A full-text index holds only the current state, so a time-travel read
-// filters the snapshot directly instead of scoring through the index.
+// Full-text search at a timestamp matches each chunk's text as it was then.
 // The timestamp must fall inside the retention window (7 days by default).
 // ============================================================================
 
 MATCH (d:Document {title: "Service Agreement v2"})-[:HAS_CHUNK]->(c:Chunk)
-WHERE toLower(c.text) CONTAINS 'liability'
+WHERE text_match(c.text, 'liability')
 RETURN c.text, c.position
 ORDER BY c.position
 AS OF TIMESTAMP '2026-03-15T10:00:00Z';

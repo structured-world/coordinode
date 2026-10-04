@@ -604,6 +604,43 @@ fn read_raw_at_snapshot_latest_round_trip() {
     );
 }
 
+/// The nodes written at or after a seqno are those changed, created or
+/// deleted since, on the asked shard only; earlier writes are not among them.
+#[test]
+fn written_since_lists_the_nodes_changed_after_a_seqno() {
+    let db = open();
+    db.write(|s, t| {
+        s.put(t, 1, NodeId::from_raw(1), &rec("User")).expect("put");
+        s.put(t, 1, NodeId::from_raw(2), &rec("User")).expect("put");
+        s.put(t, 1, NodeId::from_raw(3), &rec("User")).expect("put");
+    });
+    // Every write applied so far is below the engine's current seqno and the
+    // next one lands at it.
+    let since = db.engine.current_seqno();
+    db.write(|s, t| {
+        s.put(t, 1, NodeId::from_raw(2), &rec("Changed"))
+            .expect("change");
+        s.delete(t, 1, NodeId::from_raw(3)).expect("delete");
+        s.put(t, 1, NodeId::from_raw(4), &rec("New"))
+            .expect("create");
+        s.put(t, 2, NodeId::from_raw(9), &rec("Other"))
+            .expect("other shard");
+    });
+
+    let mut written = LocalNodeStore
+        .written_since(&db.engine, 1, since)
+        .expect("written since");
+    written.sort_unstable();
+    assert_eq!(
+        written,
+        [
+            NodeId::from_raw(2),
+            NodeId::from_raw(3),
+            NodeId::from_raw(4)
+        ]
+    );
+}
+
 #[test]
 fn for_each_in_shard_at_snapshot_visits_in_key_order_and_breaks_early() {
     let db = open();

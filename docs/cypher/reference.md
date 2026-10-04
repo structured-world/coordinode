@@ -619,7 +619,7 @@ AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
 The bound is inclusive: `AS OF TIMESTAMP T` sees every transaction with `commit_ts <= T` and nothing committed later. Every mutation of a transaction is applied at its single commit timestamp, so a read never observes a partially applied transaction. The `commit_ts` returned by an interactive transaction's commit receipt (embedded `CommitReceipt`, gRPC `CommitTransactionResponse`) is therefore the exact anchor for its own write: `AS OF TIMESTAMP <commit_ts>` sees it, `<commit_ts> - 1` does not. An integer literal is the raw HLC value in microseconds; negative literals are rejected. A string literal must be an RFC 3339 timestamp with a zone offset (`'2026-03-15T10:00:00Z'`, `'2026-03-15T13:00:00+03:00'`); anything else is refused.
 
-Vector and full-text indexes hold the current state only, so a time-travel query they would answer is refused with `INDEX_NOT_HISTORICAL`; a vector search can use `/*+ vector_consistency('exact') */` instead. See [Time-Travel Queries](./extensions#time-travel-queries).
+Vector and full-text searches answer a time-travel query as the snapshot does: the nodes written after the timestamp are read from the snapshot instead of the current index. See [Time-Travel Queries](./extensions#time-travel-queries).
 
 ---
 
