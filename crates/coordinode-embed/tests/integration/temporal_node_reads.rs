@@ -272,6 +272,75 @@ fn moving_a_versions_end_moves_only_its_entry() {
     );
 }
 
+/// A correction that keeps a version's `valid_from`, here its end moved in
+/// place to the past, reads alike through the index and through a scan:
+/// the current snapshot sees the corrected timeline (no state now, the old
+/// state inside the shortened interval), and a snapshot taken before the
+/// correction still sees the version as it was, current until its old end.
+#[test]
+fn a_correction_keeping_valid_from_reads_alike_through_index_and_scan() {
+    let mut db = open_db();
+    let now = now_us();
+    db.execute_cypher("CREATE INDEX emp_end ON :Emp(valid_to)")
+        .expect("index");
+    let (end, corrected) = (now + YEAR, now - YEAR / 2);
+    create(&mut db, "ada", now - YEAR, Some(end));
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        &format!("MATCH (n:Emp {{name: 'ada'}}) SET n.valid_to = {corrected}"),
+        None,
+    )
+    .expect("correct the end");
+    let corrected_at = db
+        .commit_transaction(tx)
+        .expect("commit")
+        .commit_ts
+        .as_raw();
+    let before = format!(" AS OF TIMESTAMP {}", corrected_at - 1);
+
+    // The same selection twice: `{valid_to: e}` is answered by the index,
+    // `valid_to + 0 = e` by a scan of the label.
+    let read = |db: &mut Database, e: i64, instant: Option<i64>, as_of: &str| {
+        let at = instant.map_or(String::new(), |t| {
+            format!(" WHERE temporal_active_at(n, {t})")
+        });
+        let indexed = format!("MATCH (n:Emp {{valid_to: {e}}}){at} RETURN n.name AS name{as_of}");
+        let scan_at = instant.map_or(String::new(), |t| {
+            format!(" AND temporal_active_at(n, {t})")
+        });
+        let scanned = format!(
+            "MATCH (n:Emp) WHERE n.valid_to + 0 = {e}{scan_at} RETURN n.name AS name{as_of}"
+        );
+        assert_index_plan(db, &indexed);
+        let plan = db.explain_cypher(&scanned).expect("explain");
+        assert!(!plan.contains("IndexScan"), "not a scan:\n{plan}");
+        let (by_index, by_scan) = (names(db, &indexed), names(db, &scanned));
+        assert_eq!(by_index, by_scan, "{indexed}");
+        by_index
+    };
+
+    let inside = now - 3 * YEAR / 4;
+    assert!(
+        read(&mut db, corrected, None, "").is_empty(),
+        "ended before now"
+    );
+    assert!(
+        read(&mut db, end, None, "").is_empty(),
+        "the old end is gone"
+    );
+    assert_eq!(read(&mut db, corrected, Some(inside), ""), ["ada"]);
+    assert!(read(&mut db, end, Some(inside), "").is_empty());
+
+    assert_eq!(
+        read(&mut db, end, None, &before),
+        ["ada"],
+        "current before it"
+    );
+    assert!(read(&mut db, corrected, None, &before).is_empty());
+}
+
 /// A UNIQUE index on a temporal label reserves a value for the node once
 /// any of its versions held it: after a rename, another node still cannot
 /// take the old value, and the node keeps its new one.

@@ -95,6 +95,39 @@ fn unregistered_fields_mean_open_live_versions() {
     assert!(matches!(state, StateAt::Positive { valid_from: 10, .. }));
 }
 
+/// Valid time is signed: instants before the epoch order and bound like any
+/// other, down to the smallest value.
+#[test]
+fn instants_before_the_epoch_bound_like_any_other() {
+    let timeline = || {
+        vec![
+            (i64::MIN, version("first", Some(-20))),
+            (-20, version("second", Some(0))),
+        ]
+    };
+    assert_eq!(name_at(timeline(), i64::MIN).as_deref(), Some("first"));
+    assert_eq!(name_at(timeline(), -21).as_deref(), Some("first"));
+    assert_eq!(name_at(timeline(), -20).as_deref(), Some("second"));
+    assert_eq!(name_at(timeline(), 0), None, "the end is outside");
+}
+
+/// An end stored as a timestamp value ends the version as an integer does.
+#[test]
+fn a_timestamp_end_ends_the_version() {
+    let mut record = version("a", None);
+    record.set(VALID_TO, Value::Timestamp(20));
+    assert_eq!(state_at(vec![(10, record)], 20, FIELDS), StateAt::Absent);
+}
+
+/// Stored versions whose intervals overlap still give one state per
+/// instant: the one starting later, never both.
+#[test]
+fn overlapping_versions_give_one_state() {
+    let timeline = vec![(10, version("a", Some(40))), (20, version("b", None))];
+    assert_eq!(name_at(timeline.clone(), 15).as_deref(), Some("a"));
+    assert_eq!(name_at(timeline, 25).as_deref(), Some("b"));
+}
+
 /// An empty timeline has no state at any instant.
 #[test]
 fn an_empty_timeline_is_absent() {
