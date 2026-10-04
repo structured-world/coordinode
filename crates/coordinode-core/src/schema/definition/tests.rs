@@ -279,16 +279,6 @@ fn chunk_assignments_key_encoding() {
 }
 
 #[test]
-fn ce_single_shard_chunk_table_roundtrip() {
-    let table = ChunkAssignmentTable::ce_single_shard("Order");
-    let bytes = table.to_msgpack().expect("encode");
-    let decoded = ChunkAssignmentTable::from_msgpack(&bytes).expect("decode");
-    assert_eq!(decoded.label, "Order");
-    assert_eq!(decoded.ranges, vec![(0, 1)]);
-    assert_eq!(decoded.revision, 1);
-}
-
-#[test]
 fn edge_type_schema_default_placement_is_colocate_with_source() {
     let schema = EdgeTypeSchema::new("WORKS_AT");
     assert_eq!(schema.placement, EdgePlacement::ColocateWithSource);
@@ -374,22 +364,6 @@ fn migration_state_entry_legacy_and_migrated_states_roundtrip() {
         let decoded: MigrationStateEntry = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, entry);
     }
-}
-
-#[test]
-fn chunk_assignment_table_multi_range_roundtrip() {
-    // Real EE deployments will carry multiple range/shard pairs —
-    // verify multi-entry ranges survive msgpack.
-    let table = ChunkAssignmentTable {
-        label: "Event".to_string(),
-        ranges: vec![(0, 3), (1_000_000, 5), (5_000_000, 8)],
-        revision: 12,
-    };
-    let bytes = table.to_msgpack().expect("encode");
-    let decoded = ChunkAssignmentTable::from_msgpack(&bytes).expect("decode");
-    assert_eq!(decoded.label, "Event");
-    assert_eq!(decoded.ranges, vec![(0, 3), (1_000_000, 5), (5_000_000, 8)]);
-    assert_eq!(decoded.revision, 12);
 }
 
 #[test]

@@ -11,7 +11,7 @@ use thiserror::Error;
 pub enum TopologyError {
     /// Caller asked for a shard that does not exist in the cluster.
     /// In CE single-shard deployments this only happens when the
-    /// caller passed an id other than [`ShardId::ZERO`].
+    /// caller passed an id other than [`ShardId::FIRST`].
     #[error("shard {0} not in topology")]
     ShardNotFound(ShardId),
 

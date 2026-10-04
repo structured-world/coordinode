@@ -73,7 +73,7 @@ proptest! {
             .collect();
         let topo = SingleNodeTopology::from_tree(TopologyTree { endpoints: leaves });
         prop_assert_eq!(topo.shards().len(), 1);
-        prop_assert_eq!(topo.shards()[0].id, ShardId::ZERO);
+        prop_assert_eq!(topo.shards()[0].id, ShardId::FIRST);
     }
 
     /// `SingleShardRouting::shard_for_key` is a constant function —
@@ -84,6 +84,6 @@ proptest! {
         key in prop::collection::vec(any::<u8>(), 0..256),
     ) {
         let r = SingleShardRouting::new();
-        prop_assert_eq!(r.shard_for_key(&key), ShardId::ZERO);
+        prop_assert_eq!(r.shard_for_key(&key), ShardId::FIRST);
     }
 }

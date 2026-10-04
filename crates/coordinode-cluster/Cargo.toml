@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 coordinode-storage = { workspace = true }
 serde = { workspace = true }
+# The chunk table's stored form.
+rmp-serde = { workspace = true }
 smallvec = "1.16"
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -21,7 +23,6 @@ coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-h
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
-rmp-serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 

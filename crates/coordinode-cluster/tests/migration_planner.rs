@@ -114,7 +114,7 @@ fn planner_picks_remote_endpoint_when_source_fills_up() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload,
         costs,
         online_policy_override: None,
@@ -187,7 +187,7 @@ fn online_during_rebuild_policy_flows_through_planner() {
     let planner_default = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx_default = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload,
         costs,
         online_policy_override: None,
@@ -216,7 +216,7 @@ fn online_during_rebuild_policy_flows_through_planner() {
     // resulting plan carries Offline.
     let ctx_offline = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload,
         costs,
         online_policy_override: Some(OnlineDuringRebuild::Offline),

@@ -41,7 +41,7 @@ fn three_tier_config() -> StorageConfig {
 fn from_storage_builds_one_shard_per_cluster() {
     let topology = SingleNodeTopology::from_storage(&three_tier_config());
     assert_eq!(topology.shards().len(), 1);
-    assert_eq!(topology.shards()[0].id, ShardId::ZERO);
+    assert_eq!(topology.shards()[0].id, ShardId::FIRST);
     assert_eq!(topology.shards()[0].leader.server, "local");
     // Single-node has RF=1; the leader is the sole replica.
     assert_eq!(topology.shards()[0].replicas.len(), 1);
@@ -66,9 +66,9 @@ fn from_storage_lifts_every_endpoint_into_tree() {
 }
 
 #[test]
-fn shard_leader_resolves_zero_returns_local() {
+fn shard_leader_resolves_the_first_shard_to_local() {
     let topology = SingleNodeTopology::from_storage(&three_tier_config());
-    let leader = topology.shard_leader(ShardId::ZERO).unwrap();
+    let leader = topology.shard_leader(ShardId::FIRST).unwrap();
     assert_eq!(leader, NodeAddr::local());
 }
 
@@ -138,18 +138,21 @@ fn from_tree_supports_custom_shape_for_testing() {
 }
 
 #[test]
-fn single_shard_routing_collapses_every_key_to_zero() {
+fn single_shard_routing_collapses_every_key_to_the_first_shard() {
     let routing = SingleShardRouting::new();
-    assert_eq!(routing.shard_for_key(b""), ShardId::ZERO);
-    assert_eq!(routing.shard_for_key(b"alice"), ShardId::ZERO);
-    assert_eq!(routing.shard_for_key(&[0u8; 1024]), ShardId::ZERO);
-    assert_eq!(routing.shard_ids(), vec![ShardId::ZERO]);
+    assert_eq!(routing.shard_for_key(b""), ShardId::FIRST);
+    assert_eq!(routing.shard_for_key(b"alice"), ShardId::FIRST);
+    assert_eq!(routing.shard_for_key(&[0u8; 1024]), ShardId::FIRST);
+    assert_eq!(routing.shard_ids(), vec![ShardId::FIRST]);
 }
 
+/// The first shard resolves to the local node; 0 is the NodeId hint
+/// sentinel, not a shard, and resolves to nothing.
 #[test]
-fn single_shard_routing_resolve_zero_returns_local() {
+fn single_shard_routing_resolves_the_first_shard_and_not_the_sentinel() {
     let routing = SingleShardRouting::new();
-    assert_eq!(routing.resolve(ShardId::ZERO).unwrap(), NodeAddr::local());
+    assert_eq!(routing.resolve(ShardId::FIRST).unwrap(), NodeAddr::local());
+    assert!(routing.resolve(ShardId(0)).is_err());
 }
 
 #[test]
@@ -246,7 +249,7 @@ fn shard_id_total_ordering_and_display() {
     ids.sort();
     assert_eq!(ids[0], ShardId(1));
     assert_eq!(format!("{}", ShardId(42)), "shard-42");
-    assert_eq!(ShardId::ZERO.raw(), 0);
+    assert_eq!(ShardId::FIRST.raw(), 1);
 }
 
 #[test]
@@ -402,7 +405,7 @@ fn topology_can_be_arc_shared_across_threads() {
                 let _ = t.shards();
                 let _ =
                     t.placement_candidates(&CrushRule::local_tier(), Modality::Node, Tier::Warm);
-                let _ = t.shard_leader(ShardId::ZERO);
+                let _ = t.shard_leader(ShardId::FIRST);
             })
         })
         .collect();

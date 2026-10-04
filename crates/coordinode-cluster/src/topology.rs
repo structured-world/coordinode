@@ -39,7 +39,7 @@ pub trait ClusterTopology: Send + Sync {
     fn topology_tree(&self) -> &TopologyTree;
 
     /// Every shard in the cluster, in id order. CE returns a single
-    /// `[ShardDescriptor]` with id [`ShardId::ZERO`].
+    /// `[ShardDescriptor]` with id [`ShardId::FIRST`].
     ///
     /// # Examples
     ///
@@ -49,7 +49,7 @@ pub trait ClusterTopology: Send + Sync {
     /// let topo = SingleNodeTopology::from_tree(
     ///     TopologyTree::single_endpoint("ep", Tier::Warm),
     /// );
-    /// assert_eq!(topo.shards()[0].id, ShardId::ZERO);
+    /// assert_eq!(topo.shards()[0].id, ShardId::FIRST);
     /// ```
     fn shards(&self) -> &[ShardDescriptor];
 
@@ -69,7 +69,7 @@ pub trait ClusterTopology: Send + Sync {
     /// let topo = SingleNodeTopology::from_tree(
     ///     TopologyTree::single_endpoint("ep", Tier::Warm),
     /// );
-    /// assert_eq!(topo.shard_leader(ShardId::ZERO)?, NodeAddr::local());
+    /// assert_eq!(topo.shard_leader(ShardId::FIRST)?, NodeAddr::local());
     /// # Ok::<_, coordinode_cluster::TopologyError>(())
     /// ```
     fn shard_leader(&self, shard: ShardId) -> TopologyResult<NodeAddr>;
@@ -146,7 +146,7 @@ impl SingleNodeTopology {
         let tree = TopologyTree { endpoints: leaves };
         let leader = NodeAddr::local();
         let shards = vec![ShardDescriptor {
-            id: ShardId::ZERO,
+            id: ShardId::FIRST,
             leader: leader.clone(),
             replicas: vec![leader],
         }];
@@ -170,7 +170,7 @@ impl SingleNodeTopology {
     pub fn from_tree(tree: TopologyTree) -> Self {
         let leader = NodeAddr::local();
         let shards = vec![ShardDescriptor {
-            id: ShardId::ZERO,
+            id: ShardId::FIRST,
             leader: leader.clone(),
             replicas: vec![leader],
         }];

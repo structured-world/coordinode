@@ -23,15 +23,16 @@ pub type EndpointId = String;
 /// single-node server in CE deployments.
 pub type ServerId = String;
 
-/// Numeric shard identifier — assigned monotonically by the topology
-/// layer. CE single-shard deployments expose exactly one shard with
-/// id `0`.
+/// Numeric shard identifier, the shard number of the storage keys
+/// (`node:<shard>:<id>`). Shards are numbered from 1: 0 is the NodeId hint
+/// meaning "consult the routing layer" and names no shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ShardId(pub u32);
 
 impl ShardId {
-    /// Shard 0 — the only shard in CE single-shard deployments.
-    pub const ZERO: Self = Self(0);
+    /// Shard 1: the first shard, and the only one of a single-shard
+    /// deployment.
+    pub const FIRST: Self = Self(1);
 
     /// Raw u32 accessor.
     ///
@@ -39,7 +40,7 @@ impl ShardId {
     ///
     /// ```
     /// use coordinode_cluster::ShardId;
-    /// assert_eq!(ShardId::ZERO.raw(), 0);
+    /// assert_eq!(ShardId::FIRST.raw(), 1);
     /// assert_eq!(ShardId(42).raw(), 42);
     /// ```
     pub fn raw(self) -> u32 {

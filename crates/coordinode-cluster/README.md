@@ -34,7 +34,7 @@ let topology = SingleNodeTopology::from_storage(&cfg);
 
 // One shard, leader is the local node.
 assert_eq!(topology.shards().len(), 1);
-let leader = topology.shard_leader(ShardId::ZERO).unwrap();
+let leader = topology.shard_leader(ShardId::FIRST).unwrap();
 assert_eq!(leader.server, "local");
 
 // Warm-tier candidates are the warm endpoints on the local server.

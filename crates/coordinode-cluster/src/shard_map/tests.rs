@@ -11,20 +11,26 @@ fn chunk(start: u64, end: u64, shard: u32) -> ChunkAssignment {
     }
 }
 
+fn table(chunks: Vec<ChunkAssignment>) -> Result<ChunkAssignmentTable, ChunkTableError> {
+    ChunkAssignmentTable::from_chunks("Order", 1, chunks)
+}
+
 #[test]
 fn single_shard_covers_whole_keyspace() {
-    let t = ChunkAssignmentTable::single_shard(ShardId::ZERO);
+    let t = ChunkAssignmentTable::single_shard("Order", 1, ShardId::FIRST);
     assert!(t.is_single_shard());
-    assert_eq!(t.shard_for(0), ShardId::ZERO);
-    assert_eq!(t.shard_for(42), ShardId::ZERO);
-    assert_eq!(t.shard_for(u64::MAX), ShardId::ZERO, "max key is covered");
-    assert_eq!(t.shards(), vec![ShardId::ZERO]);
+    assert_eq!(t.shard_for(0), ShardId::FIRST);
+    assert_eq!(t.shard_for(42), ShardId::FIRST);
+    assert_eq!(t.shard_for(u64::MAX), ShardId::FIRST, "max key is covered");
+    assert_eq!(t.shards(), vec![ShardId::FIRST]);
+    assert_eq!(t.label(), "Order");
+    assert_eq!(t.revision(), 1);
 }
 
 #[test]
 fn multi_chunk_routes_by_range() {
     // [0,100)->s1, [100,1000)->s2, [1000,MAX]->s3.
-    let t = ChunkAssignmentTable::from_chunks(vec![
+    let t = table(vec![
         chunk(0, 100, 1),
         chunk(100, 1000, 2),
         chunk(1000, u64::MAX, 3),
@@ -43,41 +49,68 @@ fn multi_chunk_routes_by_range() {
 
 #[test]
 fn rejects_gap() {
-    // [0,100) then [200,MAX] — gap [100,200) -> invalid.
-    assert!(
-        ChunkAssignmentTable::from_chunks(vec![chunk(0, 100, 1), chunk(200, u64::MAX, 2)])
-            .is_none()
+    assert_eq!(
+        table(vec![chunk(0, 100, 1), chunk(200, u64::MAX, 2)]),
+        Err(ChunkTableError::NotContiguous {
+            previous_end: 100,
+            start: 200
+        })
     );
 }
 
 #[test]
 fn rejects_overlap() {
-    // [0,150) and [100,MAX] overlap.
-    assert!(
-        ChunkAssignmentTable::from_chunks(vec![chunk(0, 150, 1), chunk(100, u64::MAX, 2)])
-            .is_none()
+    assert_eq!(
+        table(vec![chunk(0, 150, 1), chunk(100, u64::MAX, 2)]),
+        Err(ChunkTableError::NotContiguous {
+            previous_end: 150,
+            start: 100
+        })
     );
 }
 
 #[test]
 fn rejects_not_starting_at_zero() {
-    assert!(ChunkAssignmentTable::from_chunks(vec![chunk(1, u64::MAX, 1)]).is_none());
+    assert_eq!(
+        table(vec![chunk(1, u64::MAX, 1)]),
+        Err(ChunkTableError::FirstNotAtZero(1))
+    );
 }
 
 #[test]
 fn rejects_not_ending_at_max() {
-    assert!(ChunkAssignmentTable::from_chunks(vec![chunk(0, 1000, 1)]).is_none());
+    assert_eq!(
+        table(vec![chunk(0, 1000, 1)]),
+        Err(ChunkTableError::LastNotAtMax(1000))
+    );
 }
 
 #[test]
 fn rejects_empty() {
-    assert!(ChunkAssignmentTable::from_chunks(vec![]).is_none());
+    assert_eq!(table(vec![]), Err(ChunkTableError::Empty));
+}
+
+#[test]
+fn rejects_an_empty_chunk() {
+    assert_eq!(
+        table(vec![chunk(0, 0, 1), chunk(0, u64::MAX, 2)]),
+        Err(ChunkTableError::EmptyRange { start: 0, end: 0 })
+    );
+}
+
+/// Shard 0 is the NodeId hint sentinel; a chunk naming it would route keys
+/// to no shard.
+#[test]
+fn rejects_the_sentinel_shard() {
+    assert_eq!(
+        table(vec![chunk(0, u64::MAX, 0)]),
+        Err(ChunkTableError::SentinelShard)
+    );
 }
 
 #[test]
 fn shards_are_deduped_and_sorted() {
-    // Two chunks owned by the same shard, plus another — dedup + sort.
-    let t = ChunkAssignmentTable::from_chunks(vec![
+    let t = table(vec![
         chunk(0, 100, 5),
         chunk(100, 200, 2),
         chunk(200, u64::MAX, 5),
@@ -88,9 +121,29 @@ fn shards_are_deduped_and_sorted() {
 
 #[test]
 fn roundtrips_through_messagepack() {
-    let t = ChunkAssignmentTable::from_chunks(vec![chunk(0, 100, 1), chunk(100, u64::MAX, 2)])
-        .expect("valid");
-    let bytes = rmp_serde::to_vec(&t).expect("encode");
-    let decoded: ChunkAssignmentTable = rmp_serde::from_slice(&bytes).expect("decode");
-    assert_eq!(t, decoded);
+    let t = ChunkAssignmentTable::from_chunks(
+        "Event",
+        12,
+        vec![chunk(0, 100, 1), chunk(100, u64::MAX, 2)],
+    )
+    .expect("valid");
+    let decoded =
+        ChunkAssignmentTable::from_msgpack(&t.to_msgpack().expect("encode")).expect("decode");
+    assert_eq!(decoded, t);
+    assert_eq!(decoded.label(), "Event");
+    assert_eq!(decoded.revision(), 12);
+}
+
+/// Stored bytes that do not tile the keyspace are refused on decode, so a
+/// table read back from storage routes every key.
+#[test]
+fn decoding_refuses_chunks_that_do_not_tile_the_keyspace() {
+    let stored = ChunkTableRecord {
+        label: "Order".to_string(),
+        revision: 3,
+        chunks: vec![chunk(0, 100, 1)],
+    };
+    let bytes = rmp_serde::to_vec(&stored).expect("encode");
+    let err = ChunkAssignmentTable::from_msgpack(&bytes).expect_err("a gap at the end");
+    assert!(err.to_string().contains("last chunk ends at 100"), "{err}");
 }

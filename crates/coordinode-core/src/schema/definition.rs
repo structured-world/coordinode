@@ -693,43 +693,6 @@ pub enum MigrationDocState {
     Migrated,
 }
 
-/// Chunk-assignment table stored under `schema:chunks:<label>` — maps key
-/// ranges to shard ids for a given label.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChunkAssignmentTable {
-    /// Label this table belongs to.
-    pub label: String,
-    /// Sorted list of `(range_start, shard_id)` entries. A key with hash `H`
-    /// is routed to the shard of the largest entry whose `range_start <= H`.
-    /// CE single-shard deployments carry `[(0, 1)]`.
-    pub ranges: Vec<(u64, u32)>,
-    /// Schema revision corresponding to the LabelSchema that produced this
-    /// table; advances together with `ALTER LABEL SHARD BY` and is reversible
-    /// via `RESTORE_KEY(<revision>)`.
-    pub revision: u64,
-}
-
-impl ChunkAssignmentTable {
-    /// Build the trivial CE table: every key routes to shard 1.
-    pub fn ce_single_shard(label: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            ranges: vec![(0, 1)],
-            revision: 1,
-        }
-    }
-
-    /// Serialize to MessagePack.
-    pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-        rmp_serde::to_vec(self)
-    }
-
-    /// Deserialize from MessagePack.
-    pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
-        rmp_serde::from_slice(data)
-    }
-}
-
 /// Schema definition for an edge type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeTypeSchema {
@@ -895,12 +858,9 @@ pub fn encode_migration_state_key(label: &str, node_id: u64) -> Vec<u8> {
 }
 
 /// Encode the chunk-assignment table key for a label:
-/// `schema:chunks:<label>`. Value: MessagePack `ChunkAssignmentTable`.
-///
-/// In CE this is a trivial single-entry table `{primary_shard: 1,
-/// ranges: [(0, u64::MAX)]}`. In EE the table tracks per-chunk shard
-/// assignments and is mutated by the coordinator on rebalance / move /
-/// `ALTER LABEL SHARD BY` operations.
+/// `schema:chunks:<label>`. Value: the MessagePack chunk-assignment table of
+/// the cluster layer, one chunk on shard 1 in a single-shard deployment,
+/// per-chunk assignments once the label is sharded.
 pub fn encode_chunk_assignments_key(label: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(14 + label.len());
     key.extend_from_slice(b"schema:chunks:");

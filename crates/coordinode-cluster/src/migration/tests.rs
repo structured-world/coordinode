@@ -78,7 +78,7 @@ fn migration_plan_roundtrips_through_serde() {
     let plan = MigrationPlan {
         source: "ep-a".to_string(),
         target: "ep-b".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         recommended_mode: TransferMode::RebuildFromData,
         cost_breakdown: sample_cost_breakdown(),
@@ -94,7 +94,7 @@ fn migration_plan_roundtrips_through_serde() {
 fn planner_context_roundtrips_through_serde() {
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -231,7 +231,7 @@ fn planner_returns_no_candidates_on_single_node_topology() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-only".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -255,7 +255,7 @@ fn planner_picks_lowest_cost_other_endpoint_on_three_endpoint_topology() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -287,7 +287,7 @@ fn planner_rejects_source_not_in_topology() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-not-here".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -319,7 +319,7 @@ fn planner_filters_by_tier() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Hot, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-hot-1".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -351,7 +351,7 @@ fn migration_plan_explain_format_is_stable() {
     let plan = MigrationPlan {
         source: "ep-a".to_string(),
         target: "ep-b".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         recommended_mode: TransferMode::RebuildFromData,
         cost_breakdown: MigrationCost {
@@ -365,7 +365,7 @@ fn migration_plan_explain_format_is_stable() {
     let line = plan.explain();
     assert_eq!(
         line,
-        "migration plan: ep-a -> ep-b shard=0 mode=rebuild_from_data \
+        "migration plan: ep-a -> ep-b shard=1 mode=rebuild_from_data \
              policy=partial_recall total=2.345s"
     );
 }
@@ -384,7 +384,7 @@ fn default_planner_emits_enum_default_policy() {
     let planner = LocalMigrationPlanner::new(topology, Tier::Warm, Modality::Vector);
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -409,7 +409,7 @@ fn planner_default_override_writes_into_plan() {
     assert_eq!(planner.default_online_policy(), OnlineDuringRebuild::Block);
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: None,
@@ -433,7 +433,7 @@ fn context_override_beats_planner_default() {
         .with_online_policy(OnlineDuringRebuild::Block);
     let ctx = PlannerContext {
         source: "ep-a".to_string(),
-        shard: ShardId::ZERO,
+        shard: ShardId::FIRST,
         payload: sample_payload(),
         costs: sample_costs(),
         online_policy_override: Some(OnlineDuringRebuild::Offline),

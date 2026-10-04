@@ -51,7 +51,7 @@ pub struct MigrationPlan {
     /// Endpoint that should take over.
     pub target: EndpointId,
     /// Shard being moved. CE single-shard plans always carry
-    /// [`ShardId::ZERO`]; the field stays in the type so that the
+    /// [`ShardId::FIRST`]; the field stays in the type so that the
     /// multi-shard impl can plug in without a breaking API change.
     pub shard: ShardId,
     /// Bytes-on-disk and HNSW-node-count summary of the shard.
@@ -258,7 +258,7 @@ pub struct PlannerContext {
     /// nominated) and is the source of the migration.
     pub source: EndpointId,
     /// Shard whose home should change. Single-shard CE always passes
-    /// [`ShardId::ZERO`].
+    /// [`ShardId::FIRST`].
     pub shard: ShardId,
     /// Estimated payload size and HNSW node count for the shard.
     pub payload: PayloadEstimate,

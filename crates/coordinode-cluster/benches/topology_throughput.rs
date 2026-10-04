@@ -46,8 +46,8 @@ fn bench_shard_leader(c: &mut Criterion) {
     let mut group = c.benchmark_group("topology_shard_leader");
     group.sample_size(50);
     let topo = topology_with_n(10);
-    group.bench_function("zero", |b| {
-        b.iter(|| topo.shard_leader(ShardId::ZERO).unwrap())
+    group.bench_function("first", |b| {
+        b.iter(|| topo.shard_leader(ShardId::FIRST).unwrap())
     });
     group.finish();
 }

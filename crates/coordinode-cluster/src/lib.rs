@@ -16,7 +16,7 @@
 //! - [`SingleNodeTopology`] — degenerate `srv-only` tree, one shard,
 //!   placement candidates from the local endpoint set.
 //! - [`SingleShardRouting`] — every key lands at
-//!   [`ShardId::ZERO`].
+//!   [`ShardId::FIRST`].
 //!
 //! Multi-node CE adds a `Multi*` impl of the same trait; EE adds
 //! `CrushTopology` / `MultiShardRouting` with full CRUSH placement
@@ -72,7 +72,7 @@
 //! // shard payload and the link cost inputs.
 //! let ctx = PlannerContext {
 //!     source: "ep-a".to_string(),
-//!     shard: ShardId::ZERO,
+//!     shard: ShardId::FIRST,
 //!     payload: PayloadEstimate {
 //!         bytes: 4_000_000,
 //!         node_count: 10_000,
@@ -133,7 +133,7 @@
 //! // context does not override.
 //! let plan = planner.plan(&PlannerContext {
 //!     source: "ep-a".to_string(),
-//!     shard: ShardId::ZERO,
+//!     shard: ShardId::FIRST,
 //!     payload: PayloadEstimate { bytes: 1_000, node_count: 100, ef_construction: 200 },
 //!     costs: CostInputs {
 //!         bandwidth_bytes_per_sec: 1.0e8,
@@ -147,7 +147,7 @@
 //! // Per-context override beats the planner default.
 //! let plan = planner.plan(&PlannerContext {
 //!     source: "ep-a".to_string(),
-//!     shard: ShardId::ZERO,
+//!     shard: ShardId::FIRST,
 //!     payload: PayloadEstimate { bytes: 1_000, node_count: 100, ef_construction: 200 },
 //!     costs: CostInputs {
 //!         bandwidth_bytes_per_sec: 1.0e8,
@@ -183,7 +183,7 @@
 //!
 //! // One shard, leader is the local node.
 //! assert_eq!(topology.shards().len(), 1);
-//! assert_eq!(topology.shard_leader(ShardId::ZERO).unwrap().server, "local");
+//! assert_eq!(topology.shard_leader(ShardId::FIRST).unwrap().server, "local");
 //!
 //! // Hot-tier candidates only contain the NVMe endpoint.
 //! let candidates = topology
@@ -210,7 +210,7 @@ pub use migration::{
     estimate_cost, pick_recommended_mode,
 };
 pub use routing::{ShardRouting, SingleShardRouting};
-pub use shard_map::{ChunkAssignment, ChunkAssignmentTable, ChunkRange};
+pub use shard_map::{ChunkAssignment, ChunkAssignmentTable, ChunkRange, ChunkTableError};
 pub use state_machine::{
     BackendError, ContextId, HealthEvent, OperationFilter, OperationId, OperationState,
     OperationStatus, OperationSummary, Progress, StateLabel, StateMachineBackend,
