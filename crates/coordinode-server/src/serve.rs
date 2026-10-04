@@ -927,42 +927,13 @@ pub(crate) async fn serve(
     // after this point.
     let _ = raft_slot.set(Arc::clone(&raft_node));
 
-    // Bring vector and text index definitions live as their entries apply: a
-    // replica's copy of a leader's CREATE VECTOR INDEX, and on a single
-    // node the definitions the log replays after the database opened. The
-    // field dictionary needs no such task: each statement refreshes its
-    // view whenever a binding has applied.
-    {
-        let mut applied_rx = raft_node.subscribe_applied();
-        let db = Arc::clone(&database);
-        tokio::spawn(async move {
-            while applied_rx.changed().await.is_ok() {
-                crate::services::blocking(|| {
-                    // Register + local HNSW rebuild (the graph itself is never
-                    // replicated).
-                    match db.read().refresh_vector_indexes() {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
-                        Err(e) => tracing::warn!(%e, "vector index refresh failed"),
-                    }
-                    // Text index definitions another member created or
-                    // dropped: registered and rebuilt from the store here;
-                    // the text worker keeps them current from then on.
-                    match db.read().refresh_text_indexes() {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(n, "text indexes brought in line from apply"),
-                        Err(e) => tracing::warn!(%e, "text index refresh failed"),
-                    }
-                    // B-tree definitions another member created or dropped:
-                    // their entries arrive in the log, the definitions tell
-                    // this member to maintain and use them.
-                    if let Err(e) = db.read().refresh_btree_indexes() {
-                        tracing::warn!(%e, "B-tree index refresh failed");
-                    }
-                });
-            }
-        });
-    }
+    // Bring index definitions live as their entries apply: a replica's copy of
+    // a leader's CREATE / DROP INDEX, and on a single node the definitions the
+    // log replays after the database opened. Woken only by applied Schema
+    // entries that write an index definition (or replace the partition), so
+    // an ordinary write costs nothing here. The field dictionary needs no such
+    // follower: each statement refreshes its view whenever a binding applied.
+    let index_definitions = IndexDefinitionFollower::spawn(&engine, Arc::downgrade(&database));
 
     // Drive AFTER COMMIT trigger dispatch on the Raft leader. The event
     // queue (`trigger_pending:`) is Raft-replicated, so every node sees the
@@ -1527,8 +1498,101 @@ pub(crate) async fn serve(
     router
         .serve_with_incoming_shutdown(grpc_incoming, shutdown)
         .await?;
+    drop(index_definitions);
 
     Ok(())
+}
+
+/// Brings this member's B-tree, vector and text indexes in line with the
+/// index definitions as their entries apply.
+struct IndexDefinitionFollower {
+    stop: coordinode_storage::engine::applied::AppliedStop,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Queue of applied Schema events the follower may fall behind on; a full
+/// queue arrives as "replaced" and costs one refresh, never a missed one.
+const INDEX_DEFINITION_QUEUE: usize = 1024;
+
+impl IndexDefinitionFollower {
+    fn spawn(
+        engine: &Arc<coordinode_storage::engine::core::StorageEngine>,
+        database: std::sync::Weak<parking_lot::RwLock<coordinode_embed::Database>>,
+    ) -> Self {
+        use coordinode_storage::engine::applied::AppliedEvent;
+        let applied = engine.subscribe_applied(
+            coordinode_storage::engine::partition::Partition::Schema,
+            INDEX_DEFINITION_QUEUE,
+        );
+        let stop = applied.stopper();
+        let thread = std::thread::Builder::new()
+            .name("index-def-follower".to_string())
+            .spawn(move || {
+                // Asleep until a Schema entry applies; `None` once stopped.
+                while let Some(first) = applied.next(None) {
+                    let mut event = Some(first);
+                    let mut definitions_changed = false;
+                    while let Some(current) = event {
+                        definitions_changed |= match current {
+                            AppliedEvent::Keys { keys, .. } => {
+                                keys.iter().any(|k| k.starts_with(b"schema:idx:"))
+                            }
+                            // A command or a replaced partition: which keys
+                            // changed is not known.
+                            AppliedEvent::Replaced => true,
+                        };
+                        event = applied.try_next();
+                    }
+                    if !definitions_changed {
+                        continue;
+                    }
+                    let Some(db) = database.upgrade() else {
+                        break;
+                    };
+                    refresh_index_definitions(&db.read());
+                }
+            })
+            .map_err(|e| tracing::error!(%e, "could not start the index definition follower"))
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+/// Stopped on every way out of `serve`, an early error included.
+impl Drop for IndexDefinitionFollower {
+    fn drop(&mut self) {
+        self.stop.stop();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("the index definition follower panicked");
+            }
+        }
+    }
+}
+
+/// Register, rebuild or drop this member's indexes to match the stored
+/// definitions.
+fn refresh_index_definitions(db: &coordinode_embed::Database) {
+    // Register + local HNSW rebuild (the graph itself is never replicated).
+    match db.refresh_vector_indexes() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
+        Err(e) => tracing::warn!(%e, "vector index refresh failed"),
+    }
+    // Text index definitions another member created or dropped: registered
+    // and rebuilt from the store here; the text worker keeps them current
+    // from then on.
+    match db.refresh_text_indexes() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(n, "text indexes brought in line from apply"),
+        Err(e) => tracing::warn!(%e, "text index refresh failed"),
+    }
+    // B-tree definitions another member created or dropped: their entries
+    // arrive in the log, the definitions tell this member to maintain and use
+    // them.
+    if let Err(e) = db.refresh_btree_indexes() {
+        tracing::warn!(%e, "B-tree index refresh failed");
+    }
 }
 
 /// Wall-clock microseconds since the Unix epoch, the clock the AFTER COMMIT

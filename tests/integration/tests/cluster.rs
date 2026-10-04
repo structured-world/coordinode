@@ -18,6 +18,7 @@
 //! | `a_server_that_still_holds_data_is_refused_as_a_joiner` | serve | The same machine started as a joiner refuses at startup and names the empty directory as the fix |
 //! | `a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor` | JoinNode, DecommissionNode | A machine with data grows to three and back to two with its data on both members; the step to one is refused naming the rule |
 //! | `a_new_leader_never_reissues_a_node_id` | ExecuteCypher | After the leader goes away the member that takes over creates a node beside the old ones, never over one |
+//! | `a_text_index_created_on_the_leader_serves_searches_on_a_follower` | ExecuteCypher | A text index defined on the leader registers on the follower when it applies there and answers searches from the follower's own index |
 //! | `constraints_held_before_the_cluster_bind_every_member_after_a_leader_change` | ExecuteCypher, ListConstraints | Constraints that reached the members through the base snapshot are listed active on the new leader and refuse the writes that break them |
 //!
 //! ## Running
@@ -759,6 +760,65 @@ async fn a_unique_index_holds_across_a_leader_change() {
         matches!(rows[0].values[0].value, Some(Pv::IntValue(1))),
         "the indexed row is found once: {rows:?}"
     );
+}
+
+/// A text index created on the leader is registered on a follower when the
+/// definition applies there, and that follower answers `text_match()` from its
+/// own index with the documents written before and after the definition.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_index_created_on_the_leader_serves_searches_on_a_follower() {
+    let (p1, p2) = (free_port(), free_port());
+    let n1 = CoordinodeProcess::start_cluster_member(1, p1, &[p2]).await;
+    let n2 = CoordinodeProcess::start_cluster_member(2, p2, &[p1]).await;
+    let mut leader = n1.cluster_client().await;
+    leader
+        .join_node(JoinNodeRequest {
+            node_id: 2,
+            address: n2.member_addr(),
+            pre_seeded: false,
+        })
+        .await
+        .expect("JoinNode(2) must be accepted");
+    wait_for_voters(&mut leader, 2, Duration::from_secs(40)).await;
+
+    for statement in [
+        "CREATE (:Article {body: 'rust before the index'})",
+        "CREATE TEXT INDEX article_body ON :Article(body)",
+        "CREATE (:Article {body: 'rust after the index'})",
+    ] {
+        cypher_on(&n1, statement)
+            .await
+            .unwrap_or_else(|e| panic!("the leader runs {statement:?}: {e}"));
+    }
+
+    let mut follower = n2.cypher_client().await;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let found = follower
+            .execute_cypher(ExecuteCypherRequest {
+                query: "MATCH (a:Article) WHERE text_match(a.body, 'rust') RETURN a.body"
+                    .to_string(),
+                parameters: std::collections::HashMap::new(),
+                read_preference: 3, // SECONDARY
+                read_concern: Some(ReadConcern {
+                    level: 1, // LOCAL
+                    after_index: 0,
+                    at_timestamp: 0,
+                }),
+                write_concern: None,
+                transaction_id: 0,
+            })
+            .await
+            .map(|r| r.into_inner().rows.len());
+        if matches!(found, Ok(2)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower never served the replicated text index: {found:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// Constraints a standalone machine held before it became a cluster reach the
