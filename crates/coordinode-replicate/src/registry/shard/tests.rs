@@ -884,6 +884,50 @@ async fn the_background_sweep_ends_a_silent_bounded_consumer() {
     f.node.shutdown().await.expect("shutdown");
 }
 
+/// A reader watching its registration hears of writes to its own record as
+/// they apply (here, its cancellation) and not of writes to others'.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watch_hears_of_its_own_record_only() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    let bg = f.reg.start_background(BackgroundConfig {
+        heartbeat_window_ms: 100_000,
+        eviction_interval_ms: 100_000,
+    });
+    let mine = f
+        .reg
+        .register(registration("mine", 10, ConsumerRetentionPolicy::Strict))
+        .expect("register mine");
+    let other = f
+        .reg
+        .register(registration("other", 10, ConsumerRetentionPolicy::Strict))
+        .expect("register other");
+    let mut watch = f.reg.watch(&mine);
+    assert!(watch.changed(), "the first call");
+
+    f.reg.checkpoint(&other, 20).expect("acknowledge other");
+    // The other record's write applies and is relayed before this one.
+    f.reg.unregister(mine).expect("cancel mine");
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut heard = false;
+    while !heard && tokio::time::Instant::now() < until {
+        heard = watch.changed();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(heard, "the cancellation was relayed");
+    assert!(!watch.changed(), "nothing more applied to it");
+    f.reg
+        .checkpoint(&other, 30)
+        .expect("acknowledge other again");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !watch.changed(),
+        "another record's write does not concern it"
+    );
+    bg.shutdown().await;
+    assert!(watch.changed(), "without the relay every call is a change");
+    f.node.shutdown().await.expect("shutdown");
+}
+
 /// With the background service running, a registration that can lower the
 /// floor still publishes it before returning: the history its position
 /// needs must not be collected while a sweep is far away (100 s here).

@@ -18,6 +18,7 @@ mod entry;
 mod shard;
 mod source;
 mod types;
+mod watch;
 
 pub use shard::{BackgroundConfig, Clock, RegistryBackground, ShardConsumerRegistry, SystemClock};
 pub use source::RetentionSource;
@@ -26,6 +27,7 @@ pub use types::{
     RegisteredHandle, RegistrationState, RegistryError, TerminalReason, TopologyScope,
     ValidatedRetentionBounds,
 };
+pub use watch::RegistrationWatch;
 
 /// Per-shard accounting of consumer retention checkpoints.
 ///

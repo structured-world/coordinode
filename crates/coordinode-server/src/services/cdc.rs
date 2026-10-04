@@ -31,7 +31,7 @@ use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::storage::raft_oplog_dirs;
 use coordinode_replicate::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, InitialSeqno, RegisteredHandle,
-    RegistryError, SeqnoConsumerRegistry, ShardConsumerRegistry, TopologyScope,
+    RegistrationWatch, RegistryError, SeqnoConsumerRegistry, ShardConsumerRegistry, TopologyScope,
     ValidatedRetentionBounds,
 };
 use coordinode_storage::engine::core::StorageEngine;
@@ -364,6 +364,7 @@ impl ChangeStreamService for ChangeEventServiceImpl {
         let incarnation = handle.incarnation();
         tokio::spawn(stream_consumer(StreamState {
             shard_id,
+            watch: registry.watch(&handle),
             registry,
             handle,
             hub,
@@ -453,6 +454,9 @@ struct StreamState {
     shard_id: u32,
     registry: ShardConsumerRegistry,
     handle: RegisteredHandle,
+    /// Tells when a write to the registration applied, the only time it
+    /// can have ended.
+    watch: RegistrationWatch,
     /// The shard's shared reader of the log.
     hub: Arc<CdcHub>,
     reader: HubReader,
@@ -483,15 +487,19 @@ async fn stream_consumer(mut s: StreamState) {
             changes.borrow_and_update();
         }
 
-        // An ended registration, or history the log no longer holds, is a
-        // clean refusal rather than a silent gap.
-        let check = {
-            let (registry, handle) = (s.registry.clone(), s.handle.clone());
-            blocking(move || registry.check_retention(&handle)).await
-        };
-        if let Err(status) = check {
-            let _ = s.tx.send(Err(status)).await;
-            break;
+        // An ended registration is a clean refusal rather than a silent gap.
+        // It ends only through a write to its record, so the record is read
+        // again only after one applied; history the log no longer holds is
+        // refused by the read itself.
+        if s.watch.changed() {
+            let check = {
+                let (registry, handle) = (s.registry.clone(), s.handle.clone());
+                blocking(move || registry.check_retention(&handle)).await
+            };
+            if let Err(status) = check {
+                let _ = s.tx.send(Err(status)).await;
+                break;
+            }
         }
 
         let read_from = s.position;

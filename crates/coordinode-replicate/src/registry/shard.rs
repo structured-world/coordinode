@@ -47,6 +47,8 @@ use super::types::{
     ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy, ConsumerSnapshot, InitialSeqno,
     RegisteredHandle, RegistrationState, RegistryError, TerminalReason, TopologyScope,
 };
+use super::watch::{RegistrationWatch, Watches};
+use coordinode_storage::engine::applied::AppliedEvent;
 
 /// Attempts at one transition before contention is reported. Each attempt
 /// reads afresh, so only writers landing between every read and its commit
@@ -141,6 +143,8 @@ struct RegistryCore {
     pending_hb: Mutex<HashMap<(String, u64), u64>>,
     /// Notified when a heartbeat is buffered, opening a flush window.
     hb_buffered: tokio::sync::Notify,
+    /// Readers' notices of writes to the records they watch.
+    watches: Arc<Watches>,
     /// Runs once between a transition's read and its commit: what another
     /// writer does in that window.
     #[cfg(test)]
@@ -625,6 +629,7 @@ impl ShardConsumerRegistry {
             batching_on: AtomicBool::new(false),
             pending_hb: Mutex::new(HashMap::new()),
             hb_buffered: tokio::sync::Notify::new(),
+            watches: Arc::new(Watches::default()),
             #[cfg(test)]
             before_commit: Mutex::new(None),
         });
@@ -707,6 +712,17 @@ impl ShardConsumerRegistry {
         Ok(entry.checkpoint_seqno)
     }
 
+    /// Notices of writes to `handle`'s record, so a reader that must know
+    /// whether its registration still stands calls
+    /// [`check_retention`](Self::check_retention) only after one: an end, a
+    /// newer incarnation, an acknowledgement. Its own reads detect history
+    /// the source no longer holds.
+    pub fn watch(&self, handle: &RegisteredHandle) -> RegistrationWatch {
+        self.core
+            .watches
+            .watch(encode_registry_key(handle.consumer_id()))
+    }
+
     /// Start the background service: coalesced heartbeat flush and the
     /// bound sweep. Switches `heartbeat` to buffered mode. Returns a handle
     /// whose [`shutdown`](RegistryBackground::shutdown) does a final flush.
@@ -742,21 +758,30 @@ impl ShardConsumerRegistry {
 
         // A registration another member wrote changes the floor this member
         // publishes, so a write applied to the registry keyspace asks for a
-        // sweep. The feed is a blocking subscription; one parked thread
-        // relays it.
+        // sweep, and tells the readers watching that record. The feed is a
+        // blocking subscription; one parked thread relays it.
         let changed = Arc::new(tokio::sync::Notify::new());
         let applied = self.core.engine.subscribe_applied(Partition::Registry, 16);
         let applied_stop = applied.stopper();
         let relay = Arc::clone(&changed);
+        let watches = Arc::clone(&self.core.watches);
+        let relay_watches = Arc::clone(&watches);
         let relay_thread = std::thread::Builder::new()
             .name("registry-applied".to_string())
             .spawn(move || {
-                while applied.next(None).is_some() {
+                while let Some(event) = applied.next(None) {
+                    match event {
+                        AppliedEvent::Keys { keys, .. } => relay_watches.applied(&keys),
+                        AppliedEvent::Replaced => relay_watches.applied_unknown(),
+                    }
                     relay.notify_one();
                 }
             })
             .map_err(|e| tracing::error!(error = %e, "registry apply relay did not start"))
             .ok();
+        // Subscribed before this, so no write applied from here on goes
+        // unrelayed.
+        watches.set_relayed(relay_thread.is_some());
 
         let window = Duration::from_millis(cfg.heartbeat_window_ms);
         let gap = Duration::from_millis(cfg.eviction_interval_ms);
@@ -817,6 +842,7 @@ impl ShardConsumerRegistry {
             handle: Some(handle),
             applied_stop,
             relay_thread,
+            watches,
             config: cfg,
         }
     }
@@ -838,6 +864,8 @@ pub struct RegistryBackground {
     /// Ends the thread relaying registry applies.
     applied_stop: AppliedStop,
     relay_thread: Option<std::thread::JoinHandle<()>>,
+    /// Told the relay stopped, so watches stop relying on it.
+    watches: Arc<Watches>,
     config: BackgroundConfig,
 }
 
@@ -850,6 +878,7 @@ impl RegistryBackground {
     /// Stop the service after a final heartbeat flush, awaiting the task.
     pub async fn shutdown(mut self) {
         self.shutdown.notify_one();
+        self.watches.set_relayed(false);
         self.applied_stop.stop();
         let relay = self.relay_thread.take();
         if let Some(relay) = relay {
@@ -864,6 +893,7 @@ impl RegistryBackground {
 
 impl Drop for RegistryBackground {
     fn drop(&mut self) {
+        self.watches.set_relayed(false);
         // A parked relay thread would outlive the service otherwise.
         self.applied_stop.stop();
     }

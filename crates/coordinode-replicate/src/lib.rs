@@ -40,9 +40,9 @@ mod writer;
 
 pub use registry::{
     BackgroundConfig, Clock, ConsumerKind, ConsumerRegistration, ConsumerRetentionPolicy,
-    ConsumerSnapshot, InitialSeqno, RegisteredHandle, RegistrationState, RegistryBackground,
-    RegistryError, RetentionSource, SeqnoConsumerRegistry, ShardConsumerRegistry, SystemClock,
-    TerminalReason, TopologyScope, ValidatedRetentionBounds,
+    ConsumerSnapshot, InitialSeqno, RegisteredHandle, RegistrationState, RegistrationWatch,
+    RegistryBackground, RegistryError, RetentionSource, SeqnoConsumerRegistry,
+    ShardConsumerRegistry, SystemClock, TerminalReason, TopologyScope, ValidatedRetentionBounds,
 };
 pub use segment_store::{RepairError, SegmentInstaller};
 pub use writer::ReplicatedWriter;
