@@ -1235,6 +1235,46 @@ impl Database {
         Ok(new_defs.len())
     }
 
+    /// Bring this member's text indexes in line with the definitions the
+    /// Schema partition holds: register and rebuild from the store each one
+    /// replicated after the database opened (a follower applying a leader's
+    /// CREATE TEXT INDEX), and drop each one whose definition is gone.
+    /// Returns how many indexes it registered or dropped. Cluster
+    /// deployments call this whenever the applied index advances, beside
+    /// [`Self::refresh_vector_indexes`].
+    pub fn refresh_text_indexes(&self) -> Result<usize, DatabaseError> {
+        use coordinode_query::index::IndexType;
+        let stored: Vec<_> = coordinode_query::index::ops::list_index_definitions(&self.engine)?
+            .into_iter()
+            .filter(|d| d.index_type == IndexType::Text && d.text_config.is_some())
+            .collect();
+        let registered = self.text_index_registry.definitions();
+
+        let mut changed = 0usize;
+        for def in &registered {
+            if !stored.iter().any(|d| d.name == def.name) {
+                self.text_index_registry
+                    .unregister(&def.label, def.property());
+                changed += 1;
+            }
+        }
+        let new_defs: Vec<_> = stored
+            .into_iter()
+            .filter(|d| !registered.iter().any(|r| r.name == d.name))
+            .collect();
+        if !new_defs.is_empty() {
+            Self::populate_text_indexes(
+                &self.text_index_registry,
+                &self.engine,
+                &self.fields.current()?,
+                self.shard_id,
+                &new_defs,
+            );
+            changed += new_defs.len();
+        }
+        Ok(changed)
+    }
+
     /// Register the given HNSW definitions in `registry` and build them
     /// beside whatever writes are landing (shared by the open-time loader
     /// and the cluster refresh path).

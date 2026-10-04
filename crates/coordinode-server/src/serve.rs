@@ -927,7 +927,7 @@ pub(crate) async fn serve(
     // after this point.
     let _ = raft_slot.set(Arc::clone(&raft_node));
 
-    // Bring vector index definitions live as their entries apply: a
+    // Bring vector and text index definitions live as their entries apply: a
     // replica's copy of a leader's CREATE VECTOR INDEX, and on a single
     // node the definitions the log replays after the database opened. The
     // field dictionary needs no such task: each statement refreshes its
@@ -944,6 +944,14 @@ pub(crate) async fn serve(
                         Ok(0) => {}
                         Ok(n) => tracing::info!(n, "vector indexes brought live from apply"),
                         Err(e) => tracing::warn!(%e, "vector index refresh failed"),
+                    }
+                    // Text index definitions another member created or
+                    // dropped: registered and rebuilt from the store here;
+                    // the text worker keeps them current from then on.
+                    match db.read().refresh_text_indexes() {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(n, "text indexes brought in line from apply"),
+                        Err(e) => tracing::warn!(%e, "text index refresh failed"),
                     }
                     // B-tree definitions another member created or dropped:
                     // their entries arrive in the log, the definitions tell

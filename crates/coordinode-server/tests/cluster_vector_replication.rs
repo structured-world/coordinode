@@ -506,3 +506,84 @@ async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
     }
     panic!("after-commit trigger effect never replicated to the follower");
 }
+
+/// Titles a text search on `db` finds for `words`.
+fn text_hits(db: &mut Database, words: &str) -> Vec<String> {
+    let mut titles: Vec<String> = db
+        .execute_cypher(&format!(
+            "MATCH (n:Article) WHERE text_match(n.body, '{words}') RETURN n.title AS t"
+        ))
+        .unwrap()
+        .iter()
+        .filter_map(|row| row.get("t").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    titles.sort();
+    titles
+}
+
+/// A follower's full-text search sees what the leader committed, including
+/// a later change of the text, and nothing a leader transaction rolled
+/// back. The follower never runs those statements: its text indexes follow
+/// the entries it applies. Before, it updated them only for statements it
+/// ran itself, so every leader write after it opened was missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_text_search_follows_leader_commits() {
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+    let mut n1 = open_node(1, p1, true).await;
+    let mut n2 = open_node(2, p2, false).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1._node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    n1._node.change_membership(vec![1, 2]).await.unwrap();
+
+    n1.db
+        .execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .unwrap();
+    n1.db
+        .execute_cypher("CREATE (:Article {title: 'a', body: 'replicated words'})")
+        .unwrap();
+    n1.db
+        .execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'revised words'")
+        .unwrap();
+    let tx = n1.db.begin_transaction();
+    n1.db
+        .execute_in_transaction(
+            tx,
+            "CREATE (:Article {title: 'b', body: 'abandoned words'})",
+            None,
+        )
+        .unwrap();
+    n1.db.rollback_transaction(tx).unwrap();
+
+    // The server brings replicated text index definitions live on every
+    // applied entry; this poll stands in for that task at the Database level.
+    let mut last = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        n2.db.refresh_text_indexes().unwrap();
+        if !n2.db.text_index_registry().has_index("Article", "body") {
+            continue;
+        }
+        last = text_hits(&mut n2.db, "revised");
+        if last == ["a"] {
+            break;
+        }
+    }
+    assert_eq!(
+        last,
+        ["a"],
+        "the follower misses the leader's committed text"
+    );
+    assert!(
+        text_hits(&mut n2.db, "replicated").is_empty(),
+        "the follower still finds the text the leader replaced"
+    );
+    assert!(
+        text_hits(&mut n2.db, "abandoned").is_empty(),
+        "the follower finds text of a rolled-back transaction"
+    );
+}
