@@ -707,13 +707,23 @@ async fn vector_top_k_large_hnsw_matches_brute_force() {
     let (svc_hnsw, _dir_h) = test_service_with_index("Large", "vec", 4);
     let (svc_brute, _dir_b) = test_service();
 
-    // Deterministic dataset: 1100 nodes with embeddings derived from index.
-    // Spread across 4D hypercube so distances vary non-trivially.
+    // Deterministic dataset: 1100 nodes whose coordinates are independent
+    // uniform draws (splitmix64). Coordinates derived from one parameter of
+    // the index lie on a curve, where an approximate index misses
+    // neighbours depending on the order of its parallel inserts, so the
+    // quality asserts below would test the data, not the index.
     const N: usize = 1100;
-    let vectors: Vec<[f64; 4]> = (0..N)
+    let vectors: Vec<[f64; 4]> = (0..N as u64)
         .map(|i| {
-            let f = i as f64 / N as f64;
-            [f, (1.0 - f), (f * 2.3 + 0.1) % 1.0, (f * 3.7 + 0.3) % 1.0]
+            let mut v = [0.0; 4];
+            for (d, c) in (0u64..).zip(v.iter_mut()) {
+                let mut z = (i * 4 + d).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                *c = ((z >> 11) as f64 / (1u64 << 53) as f64 * 1e6).round() / 1e6;
+            }
+            v
         })
         .collect();
 
