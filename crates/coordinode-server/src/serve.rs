@@ -633,6 +633,7 @@ pub(crate) async fn serve(
         snapshots,
         host_epoch: 0,
         group: coordinode_raft::cluster::GroupId::FORMING,
+        connections: Default::default(),
     };
     let (raft_node, raft_grpc_handler) = if let Some(ref peers_list) = peers {
         let peer_count = peers_list.len();

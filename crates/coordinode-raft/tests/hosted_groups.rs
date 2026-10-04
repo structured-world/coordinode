@@ -7,6 +7,7 @@
 //! host, or one whose parts name different groups, is refused by name.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use coordinode_core::txn::proposal::{
@@ -15,7 +16,7 @@ use coordinode_core::txn::proposal::{
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_raft::cluster::grpc_server::{GROUP_NOT_HOSTED, HostError};
 use coordinode_raft::cluster::version::write_handshake;
-use coordinode_raft::cluster::{GroupId, NodeOptions, RaftGrpcHandler, RaftNode};
+use coordinode_raft::cluster::{GroupId, NodeOptions, PeerConnections, RaftGrpcHandler, RaftNode};
 use coordinode_raft::proto::replication::RaftPayload;
 use coordinode_raft::proto::replication::raft_service_client::RaftServiceClient;
 use coordinode_raft::proto::replication::raft_service_server::RaftServiceServer;
@@ -48,20 +49,23 @@ fn engine() -> (Arc<StorageEngine>, tempfile::TempDir) {
     (Arc::new(StorageEngine::open(&config).expect("open")), dir)
 }
 
-fn options(group: GroupId) -> NodeOptions {
+fn options(group: GroupId, connections: &Arc<PeerConnections>) -> NodeOptions {
     NodeOptions {
         group,
+        connections: Arc::clone(connections),
         ..NodeOptions::default()
     }
 }
 
 /// Server `node_id`'s replica of `group`: the group's founding member when
-/// `forms`, a member waiting to be added otherwise.
+/// `forms`, a member waiting to be added otherwise. The server's groups share
+/// `connections`.
 async fn replica(
     node_id: u64,
     group: GroupId,
     port: u16,
     forms: bool,
+    connections: &Arc<PeerConnections>,
 ) -> (Replica, RaftGrpcHandler) {
     let (engine, dir) = engine();
     let (node, handler) = if forms {
@@ -69,14 +73,18 @@ async fn replica(
             node_id,
             Arc::clone(&engine),
             format!("http://127.0.0.1:{port}"),
-            options(group),
+            options(group, connections),
         )
         .await
         .expect("open the forming member")
     } else {
-        RaftNode::open_joining_embedded_with_options(node_id, Arc::clone(&engine), options(group))
-            .await
-            .expect("open a joining member")
+        RaftNode::open_joining_embedded_with_options(
+            node_id,
+            Arc::clone(&engine),
+            options(group, connections),
+        )
+        .await
+        .expect("open a joining member")
     };
     (
         Replica {
@@ -90,12 +98,32 @@ async fn replica(
 
 /// Serve `handler`, and every group it hosts, on `port`.
 fn serve(handler: RaftGrpcHandler, port: u16) -> tokio::task::JoinHandle<()> {
+    serve_counting(handler, port, Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`serve`], counting the connections the server accepts in `accepted`.
+fn serve_counting(
+    handler: RaftGrpcHandler,
+    port: u16,
+    accepted: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+        let incoming = futures_util::stream::unfold(listener, move |listener| {
+            let accepted = Arc::clone(&accepted);
+            async move {
+                let next = listener.accept().await.map(|(stream, _)| {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    stream
+                });
+                Some((next, listener))
+            }
+        });
         tonic::transport::Server::builder()
             .add_service(handler.handshake_service())
             .add_service(RaftServiceServer::new(handler))
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
             .expect("serve");
     })
@@ -173,8 +201,9 @@ async fn two_groups_on_the_same_three_servers_replicate_independently() {
         let mut servers = Vec::new();
         for (i, port) in ports.iter().copied().enumerate() {
             let id = i as u64 + 1;
-            let (ra, ha) = replica(id, a, port, id == 1).await;
-            let (rb, hb) = replica(id, b, port, id == 2).await;
+            let connections = Arc::new(PeerConnections::default());
+            let (ra, ha) = replica(id, a, port, id == 1, &connections).await;
+            let (rb, hb) = replica(id, b, port, id == 2, &connections).await;
             ha.host(&hb).expect("host both groups on one server");
             assert_eq!(ha.hosted().groups(), vec![a, b]);
             servers.push(serve(ha, port));
@@ -242,6 +271,79 @@ async fn two_groups_on_the_same_three_servers_replicate_independently() {
     );
 }
 
+/// Two groups led from the same server reach each follower server over one
+/// connection: every group, and every client openraft makes for a peer,
+/// shares the server's connection to that peer. Before, each group, and each
+/// replication restart within one, opened a connection of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn groups_led_from_one_server_share_its_connection_to_each_peer() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let a = GroupId::FORMING;
+        let b = GroupId(1);
+        let ports = [alloc_port(), alloc_port(), alloc_port()];
+
+        let mut replicas = Vec::new();
+        let mut servers = Vec::new();
+        let mut accepted = Vec::new();
+        let mut pools = Vec::new();
+        for (i, port) in ports.iter().copied().enumerate() {
+            let id = i as u64 + 1;
+            let connections = Arc::new(PeerConnections::default());
+            // Both groups form on server 1, so it leads both.
+            let (ra, ha) = replica(id, a, port, id == 1, &connections).await;
+            let (rb, hb) = replica(id, b, port, id == 1, &connections).await;
+            ha.host(&hb).expect("host both groups on one server");
+            let count = Arc::new(AtomicUsize::new(0));
+            servers.push(serve_counting(ha, port, Arc::clone(&count)));
+            accepted.push(count);
+            pools.push(connections);
+            replicas.push((ra, rb));
+        }
+
+        let peers = [(2, ports[1]), (3, ports[2])];
+        form_group(&replicas[0].0.node, peers).await;
+        form_group(&replicas[0].1.node, peers).await;
+        for (group, leader) in [(a, &replicas[0].0), (b, &replicas[0].1)] {
+            let key = format!("node:1:{}", group.raw());
+            leader
+                .node
+                .pipeline()
+                .propose_and_wait(&put(key.as_bytes(), b"v"))
+                .expect("write");
+        }
+        for (ra, rb) in &replicas {
+            assert!(await_value(&ra.engine, b"node:1:0", b"v").await);
+            assert!(await_value(&rb.engine, b"node:1:1", b"v").await);
+        }
+
+        // Server 1 dialled each peer once for both groups.
+        assert_eq!(pools[0].len(), 2, "one connection per peer of server 1");
+        assert!(replicas[0].0.node.is_leader().await);
+        assert!(replicas[0].1.node.is_leader().await);
+        for (server, count) in accepted.iter().enumerate().skip(1) {
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "server {} accepted more than the one connection from its leader",
+                server + 1
+            );
+        }
+
+        for (ra, rb) in &replicas {
+            ra.node.shutdown().await.expect("shutdown");
+            rb.node.shutdown().await.expect("shutdown");
+        }
+        for s in servers {
+            s.abort();
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: groups_led_from_one_server_share_its_connection_to_each_peer"
+    );
+}
+
 fn vote_request() -> Vec<u8> {
     let request = openraft::raft::VoteRequest::<TypeConfig> {
         vote: openraft::type_config::alias::VoteOf::<TypeConfig>::new(1, 9),
@@ -254,7 +356,7 @@ fn vote_request() -> Vec<u8> {
 /// One server hosting the forming group only, and its member.
 async fn one_group_server() -> (Replica, u16, tokio::task::JoinHandle<()>) {
     let port = alloc_port();
-    let (r, handler) = replica(1, GroupId::FORMING, port, true).await;
+    let (r, handler) = replica(1, GroupId::FORMING, port, true, &Arc::default()).await;
     let server = serve(handler, port);
     await_leadership(&r.node).await;
     (r, port, server)
@@ -391,8 +493,9 @@ async fn a_stream_message_of_another_group_ends_the_stream() {
 async fn a_second_replica_of_a_hosted_group_is_refused() {
     let result = tokio::time::timeout(TEST_TIMEOUT, async {
         let port = alloc_port();
-        let (first, handler) = replica(1, GroupId::FORMING, port, true).await;
-        let (second, other) = replica(1, GroupId::FORMING, alloc_port(), true).await;
+        let (first, handler) = replica(1, GroupId::FORMING, port, true, &Arc::default()).await;
+        let (second, other) =
+            replica(1, GroupId::FORMING, alloc_port(), true, &Arc::default()).await;
 
         assert_eq!(
             handler.host(&other),

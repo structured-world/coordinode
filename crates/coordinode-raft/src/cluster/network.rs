@@ -124,6 +124,56 @@ async fn unless_closing<T>(
     }
 }
 
+// ── Peer connections ───────────────────────────────────────────────
+
+/// The connections from this server to its peers, one per peer address,
+/// shared by every group the server hosts and by every client openraft makes
+/// for a peer. All groups two servers share travel over one HTTP/2
+/// connection between them, so connections grow with peer pairs, not with
+/// groups or with replication restarts.
+#[derive(Default)]
+pub struct PeerConnections {
+    // no-std: spin::Mutex; taken once per new peer client, never per call.
+    channels: parking_lot::Mutex<std::collections::HashMap<String, tonic::transport::Channel>>,
+}
+
+impl PeerConnections {
+    /// The connection to the peer at `addr`, made on first use. A channel
+    /// connects lazily and reconnects after a drop, so the one kept here
+    /// serves the peer for the life of the server.
+    fn channel(&self, addr: &str) -> Result<tonic::transport::Channel, RPCError<C>> {
+        let mut channels = self.channels.lock();
+        if let Some(channel) = channels.get(addr) {
+            return Ok(channel.clone());
+        }
+        let endpoint = coordinode_wire::peer_endpoint(addr)
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("peer address '{addr}': {e}"),
+                )))
+            })?
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30));
+        // connect_lazy() returns at once and connects on the first call;
+        // connect().await would make a one-shot connection that never
+        // recovers once it drops.
+        let channel = endpoint.connect_lazy();
+        channels.insert(addr.to_string(), channel.clone());
+        Ok(channel)
+    }
+
+    /// How many peers this server holds a connection to.
+    pub fn len(&self) -> usize {
+        self.channels.lock().len()
+    }
+
+    /// Whether this server holds no peer connection yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 // ── Network Factory ────────────────────────────────────────────────
 
 /// gRPC-based network factory for multi-node cluster.
@@ -136,6 +186,8 @@ pub struct GrpcNetworkFactory {
     /// This member's version view: stamps every call, learns from every
     /// answer.
     pub(crate) gate: Arc<VersionGate>,
+    /// The server's connections to its peers, shared with its other groups.
+    pub(crate) connections: Arc<PeerConnections>,
 }
 
 impl RaftNetworkFactory<C> for GrpcNetworkFactory {
@@ -151,7 +203,7 @@ impl RaftNetworkFactory<C> for GrpcNetworkFactory {
             local_node_id: self.local_node_id,
             target_node_id: target,
             addr: node.addr.clone(),
-            channel: None,
+            connections: Arc::clone(&self.connections),
             client: None,
             closing: self.closing.clone(),
             gate: Arc::clone(&self.gate),
@@ -186,9 +238,9 @@ pub struct GrpcNetwork {
     /// Target peer node id, for the test-only partition nemesis gate.
     target_node_id: u64,
     addr: String,
-    /// The one channel to the peer, shared by the consensus client and the
-    /// version exchange.
-    channel: Option<tonic::transport::Channel>,
+    /// The server's connections; the one to this peer carries the consensus
+    /// client and the version exchange of every group.
+    connections: Arc<PeerConnections>,
     client: Option<RaftServiceClient<tonic::transport::Channel>>,
     /// Fails this peer's calls once this node shuts down.
     closing: Closing,
@@ -217,16 +269,10 @@ impl GrpcNetwork {
 }
 
 impl GrpcNetwork {
-    /// Get or create the gRPC client for this peer.
-    ///
-    /// Uses `connect_lazy()` which creates a Channel with built-in
-    /// reconnection. If the peer is temporarily down, the Channel
-    /// automatically reconnects on the next RPC attempt. Combined with
-    /// openraft's `NetBackoff` (200ms infinite retry), this provides
-    /// transparent recovery from network partitions and node restarts.
-    ///
-    /// `connect().await` is not used: it creates a one-shot connection,
-    /// and once that drops every subsequent RPC fails permanently.
+    /// Get or create the gRPC client for this peer, over the server's shared
+    /// connection to it. The connection reconnects on its own after a drop;
+    /// with openraft's `NetBackoff` (200ms infinite retry) this recovers from
+    /// network partitions and peer restarts.
     async fn get_client(
         &mut self,
     ) -> Result<&mut RaftServiceClient<tonic::transport::Channel>, RPCError<C>> {
@@ -277,31 +323,9 @@ impl GrpcNetwork {
         )))
     }
 
-    fn get_channel(&mut self) -> Result<tonic::transport::Channel, RPCError<C>> {
-        if self.channel.is_none() {
-            let endpoint = coordinode_wire::peer_endpoint(&self.addr)
-                .map_err(|e| {
-                    RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("peer address '{}': {e}", self.addr),
-                    )))
-                })?
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(30));
-
-            // connect_lazy() returns immediately without establishing a TCP
-            // connection. The underlying hyper Channel will connect on first
-            // RPC and automatically reconnect if the connection drops.
-            // This replaces the previous connect().await which created a
-            // one-shot connection that couldn't recover from network drops.
-            self.channel = Some(endpoint.connect_lazy());
-        }
-        // A channel is a cheap handle onto the one connection.
-        self.channel.clone().ok_or_else(|| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                "channel initialization failed",
-            )))
-        })
+    /// A handle onto the server's one connection to this peer.
+    fn get_channel(&self) -> Result<tonic::transport::Channel, RPCError<C>> {
+        self.connections.channel(&self.addr)
     }
 }
 

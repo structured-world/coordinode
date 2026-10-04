@@ -34,6 +34,7 @@ use crate::storage::{
 use crate::wait_majority::{BatchConfig, WaitForMajorityService};
 
 pub use grpc_server::RaftGrpcHandler;
+pub use network::PeerConnections;
 use network::{GrpcNetworkFactory, StubNetworkFactory};
 use version::VersionGate;
 
@@ -101,6 +102,10 @@ pub struct NodeOptions {
     /// it sends names it, and a server hosting several groups dispatches by
     /// it.
     pub group: GroupId,
+    /// The server's connections to its peers. The nodes of every group one
+    /// server hosts are opened with the same set, so the groups two servers
+    /// share travel over one connection between them.
+    pub connections: Arc<PeerConnections>,
 }
 
 /// The version gate of member `node_id` of `group`, over its state
@@ -405,10 +410,12 @@ impl RaftNode {
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
         options: NodeOptions,
     ) -> Result<Self, RaftNodeError> {
+        // A single-node group talks to no peer.
         let NodeOptions {
             snapshots: snap_config,
             host_epoch,
             group,
+            connections: _,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -591,6 +598,7 @@ impl RaftNode {
             snapshots: snap_config,
             host_epoch,
             group,
+            connections,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -618,6 +626,7 @@ impl RaftNode {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
             gate: Arc::clone(&version),
+            connections,
         };
 
         let raft: RaftInstance =
@@ -778,6 +787,7 @@ impl RaftNode {
             snapshots: snap_config,
             host_epoch,
             group,
+            connections,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -805,6 +815,7 @@ impl RaftNode {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
             gate: Arc::clone(&version),
+            connections,
         };
 
         let raft: RaftInstance =
@@ -918,6 +929,7 @@ impl RaftNode {
             snapshots: snap_config,
             host_epoch,
             group,
+            connections,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -946,6 +958,7 @@ impl RaftNode {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
             gate: Arc::clone(&version),
+            connections,
         };
 
         let raft: RaftInstance =
@@ -1037,6 +1050,7 @@ impl RaftNode {
             snapshots: snap_config,
             host_epoch,
             group,
+            connections,
         } = options;
         let config = Arc::new(snap_config.raft_config());
         let log_store =
@@ -1065,6 +1079,7 @@ impl RaftNode {
             local_node_id: node_id,
             closing: network::Closing::new(closing_rx),
             gate: Arc::clone(&version),
+            connections,
         };
 
         let raft: RaftInstance =
