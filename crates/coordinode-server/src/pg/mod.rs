@@ -198,11 +198,10 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         DatabaseError::Execution(ExecutionError::KeyImmutable { .. }) => "42P10",
         DatabaseError::TransactionConflict { .. }
         | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
-        // insufficient_resources: both are the server catching up, and the
-        // same statement succeeds once it has.
+        // insufficient_resources: the server catching up, and the same
+        // statement succeeds once it has.
         DatabaseError::WriteBackpressure
-        | DatabaseError::Execution(ExecutionError::Backpressure)
-        | DatabaseError::Execution(ExecutionError::IndexBehind(_)) => "53000",
+        | DatabaseError::Execution(ExecutionError::Backpressure) => "53000",
         // disk_full: the disk is below its reserve, writes wait for space.
         DatabaseError::Storage(coordinode_storage::error::StorageError::OutOfSpace { .. })
         | DatabaseError::Execution(ExecutionError::Storage(

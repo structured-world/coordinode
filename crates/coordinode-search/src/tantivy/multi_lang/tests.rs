@@ -483,3 +483,152 @@ fn replace_all_drops_documents_not_listed() {
     assert!(idx.search("deleted", 10).unwrap().is_empty());
     assert_eq!(idx.search("stays", 10).unwrap().len(), 1);
 }
+
+fn terms(query: &str) -> TextRequest<'_> {
+    TextRequest::Terms {
+        query,
+        language: None,
+        snippets: false,
+    }
+}
+
+fn found(idx: &MultiLanguageTextIndex, query: &str, pending: &PendingDocuments) -> Vec<u64> {
+    let mut ids: Vec<u64> = idx
+        .find(terms(query), Matches::All, pending)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.node_id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A node written since the index's position is answered from its current
+/// document: the stale indexed text no longer matches, the new one does, and
+/// a node removed since matches nothing; the index answers for every other
+/// node.
+#[test]
+fn pending_documents_stand_in_for_the_index_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_nodes_batch(&[
+        (1, props(&[("body", "stale words about graphs")])),
+        (2, props(&[("body", "removed words about graphs")])),
+        (3, props(&[("body", "untouched words about graphs")])),
+    ])
+    .unwrap();
+
+    // Node 1 now holds other text, node 2 was deleted, node 4 is new.
+    let pending = idx
+        .pending(
+            Some(&[1, 2, 4]),
+            &[
+                (1, props(&[("body", "fresh words about vectors")])),
+                (4, props(&[("body", "brand new graphs")])),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(found(&idx, "graphs", &pending), [3, 4]);
+    assert_eq!(found(&idx, "vectors", &pending), [1]);
+    assert_eq!(found(&idx, "stale", &pending), Vec::<u64>::new());
+    assert_eq!(found(&idx, "removed", &pending), Vec::<u64>::new());
+    // Nothing pending: the index alone, stale text included.
+    assert_eq!(found(&idx, "graphs", &PendingDocuments::none()), [1, 2, 3]);
+}
+
+/// When which nodes changed is not known, the index answers for none of them
+/// and the pending documents are the whole answer.
+#[test]
+fn unknown_superseded_nodes_leave_the_index_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_node(1, &props(&[("body", "graphs in the index")]))
+        .unwrap();
+
+    let pending = idx
+        .pending(None, &[(5, props(&[("body", "graphs in the store")]))])
+        .unwrap();
+
+    assert_eq!(found(&idx, "graphs", &pending), [5]);
+}
+
+/// A pending document is scored with the index's corpus statistics, so the
+/// same text ranks the same whether the index or the pending segment holds
+/// it, and the merged list is in one score order.
+#[test]
+fn pending_documents_score_on_the_index_scale() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_nodes_batch(&[
+        (1, props(&[("body", "rust graph engine")])),
+        (2, props(&[("body", "python scripts")])),
+        (3, props(&[("body", "java beans")])),
+    ])
+    .unwrap();
+
+    let pending = idx
+        .pending(Some(&[9]), &[(9, props(&[("body", "rust graph engine")]))])
+        .unwrap();
+    let hits = idx.find(terms("rust"), Matches::All, &pending).unwrap();
+
+    assert_eq!(hits.len(), 2);
+    assert!(
+        (hits[0].score - hits[1].score).abs() < 1e-6,
+        "identical text scores alike in the index and the pending segment: {hits:?}"
+    );
+}
+
+/// `Matches::Top` keeps the best `n` of the merged list; `Matches::All`
+/// keeps every match, as a membership filter needs.
+#[test]
+fn matches_bound_the_merged_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_nodes_batch(&[
+        (1, props(&[("body", "graph")])),
+        (2, props(&[("body", "graph graph graph")])),
+    ])
+    .unwrap();
+    let pending = idx
+        .pending(Some(&[3]), &[(3, props(&[("body", "graph graph")]))])
+        .unwrap();
+
+    let top = idx.find(terms("graph"), Matches::Top(2), &pending).unwrap();
+    assert_eq!(top.len(), 2);
+    assert!(top[0].score >= top[1].score, "best first: {top:?}");
+    assert_eq!(found(&idx, "graph", &pending), [1, 2, 3]);
+}
+
+/// Snippets of a pending document come from its current text.
+#[test]
+fn pending_documents_carry_snippets() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    let pending = idx
+        .pending(Some(&[1]), &[(1, props(&[("body", "a fresh graph")]))])
+        .unwrap();
+
+    let hits = idx
+        .find(
+            TextRequest::Terms {
+                query: "graph",
+                language: None,
+                snippets: true,
+            },
+            Matches::Top(10),
+            &pending,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].snippet_html.contains("<b>graph</b>"),
+        "{:?}",
+        hits[0].snippet_html
+    );
+}

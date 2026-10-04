@@ -19,8 +19,8 @@ use coordinode_vector::hnsw::{
 use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 
+use super::coverage::{IndexCoverage, IndexDelta};
 use super::definition::IndexDefinition;
-use super::readiness::{IndexBehind, IndexReadiness};
 
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
@@ -126,10 +126,9 @@ pub struct VectorIndexRegistry {
     /// Retired-memory budget each graph gets (see
     /// [`Self::set_retired_bytes_budget`]).
     retired_bytes_budget: AtomicUsize,
-    /// How far the indexes cover the applied store, when a worker maintains
-    /// them from the applied entries; a registry without one serves what it
-    /// holds.
-    readiness: RwLock<Option<Arc<IndexReadiness>>>,
+    /// The writes the indexes have not folded, when a worker maintains them
+    /// from the applied entries; a registry without one serves what it holds.
+    coverage: RwLock<Option<Arc<IndexCoverage>>>,
 }
 
 /// A running backfill: the flag that stops it and the thread to join.
@@ -179,7 +178,7 @@ impl VectorIndexRegistry {
             tier_backend: None,
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
-            readiness: RwLock::new(None),
+            coverage: RwLock::new(None),
         }
     }
 
@@ -202,34 +201,31 @@ impl VectorIndexRegistry {
             tier_backend: Some(backend),
             builds: Mutex::new(HashMap::new()),
             retired_bytes_budget: AtomicUsize::new(DEFAULT_RETIRED_BYTES_BUDGET),
-            readiness: RwLock::new(None),
+            coverage: RwLock::new(None),
         }
     }
 
-    /// Make every index search wait for the indexes to cover the store as
-    /// `readiness` reports it.
-    pub fn set_readiness(&self, readiness: Arc<IndexReadiness>) {
-        *self.readiness.write().unwrap_or_else(|e| e.into_inner()) = Some(readiness);
+    /// Learn from `coverage` which writes the indexes have not folded, so a
+    /// search answers for them itself.
+    pub fn set_coverage(&self, coverage: Arc<IndexCoverage>) {
+        *self.coverage.write().unwrap_or_else(|e| e.into_inner()) = Some(coverage);
     }
 
-    /// The coverage searches wait on, if a worker maintains the indexes.
-    pub fn readiness(&self) -> Option<Arc<IndexReadiness>> {
-        self.readiness
+    /// Where searches learn the writes the indexes have not folded, if a
+    /// worker maintains them.
+    pub fn coverage(&self) -> Option<Arc<IndexCoverage>> {
+        self.coverage
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    /// Wait until the indexes hold every commit applied before this call;
-    /// at once when no worker maintains them.
-    ///
-    /// # Errors
-    ///
-    /// [`IndexBehind`] when they do not catch up within the wait.
-    pub fn await_covered(&self) -> Result<(), IndexBehind> {
-        match self.readiness() {
-            Some(readiness) => readiness.await_covered(),
-            None => Ok(()),
+    /// The nodes of `shard_id` written by commits applied before this call
+    /// that the indexes may not hold yet; none when no worker maintains them.
+    pub fn delta(&self, shard_id: u16) -> IndexDelta {
+        match self.coverage() {
+            Some(coverage) => coverage.delta(shard_id),
+            None => IndexDelta::Nodes(Default::default()),
         }
     }
 

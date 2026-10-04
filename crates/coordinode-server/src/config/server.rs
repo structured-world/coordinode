@@ -281,11 +281,6 @@ pub struct ServerConfig {
     /// the `block` policy, when it names no bound of its own, in milliseconds
     /// (`None` = 30000). A query's `vector_build_wait` hint overrides it.
     pub vector_build_wait_ms: Option<u64>,
-    /// How long a full-text or vector search waits for its indexes to hold
-    /// every commit applied before it, in milliseconds (`None` = 2000). Past
-    /// it the search fails with `INDEX_BEHIND` instead of answering without
-    /// those commits.
-    pub index_ready_wait_ms: Option<u64>,
     /// Bytes of replaced neighbour lists each vector index lets wait for
     /// reclamation before its writers hold off until running searches finish
     /// (`None` = 256 MiB).
@@ -435,7 +430,6 @@ impl Default for ServerConfig {
             raft_snapshot_min_interval_secs: None,
             planner_stats_ttl_secs: None,
             vector_build_wait_ms: None,
-            index_ready_wait_ms: None,
             vector_retired_bytes_budget: None,
             nofile: None,
             max_connections: None,

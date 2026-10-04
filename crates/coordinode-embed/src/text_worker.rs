@@ -13,8 +13,9 @@
 //! carried, so a merge, a later write or a delete all reconcile the same way.
 //! A partition replaced wholesale or a queue the worker fell behind on is
 //! answered with a rebuild of every index from the store. After each fold or
-//! rebuild the worker publishes how far it got, and a search waits on that
-//! (see [`coordinode_query::index::IndexReadiness`]).
+//! rebuild the worker releases the events it covered; a search answers the
+//! nodes of the events not released yet from the store (see
+//! [`coordinode_query::index::IndexCoverage`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,7 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_query::index::text_registry::stored_texts;
-use coordinode_query::index::{IndexReadiness, TextIndexRegistry};
+use coordinode_query::index::{IndexCoverage, TextIndexRegistry};
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
 };
@@ -46,16 +47,17 @@ pub struct TextIndexWorker {
 }
 
 impl TextIndexWorker {
-    /// Spawn the worker on `applied`, a subscription to the Node partition
-    /// opened before the indexes were last built from the store, so no
-    /// applied entry falls between the two. It publishes its progress to
-    /// `readiness`. `shard_id` is the shard whose node rows the indexes hold.
+    /// Spawn the worker on `applied`, a retained subscription to the Node
+    /// partition opened before the indexes were last built from the store, so
+    /// no applied entry falls between the two. It releases the events it has
+    /// folded through `coverage`. `shard_id` is the shard whose node rows the
+    /// indexes hold.
     pub fn spawn(
         engine: Arc<StorageEngine>,
         applied: AppliedSubscription,
         registry: Arc<TextIndexRegistry>,
         fields: Arc<dyn FieldRegistrar>,
-        readiness: Arc<IndexReadiness>,
+        coverage: Arc<IndexCoverage>,
         shard_id: u16,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -66,7 +68,7 @@ impl TextIndexWorker {
             applied,
             registry,
             fields,
-            readiness,
+            coverage,
             shard_id,
             stop: Arc::clone(&stop),
         };
@@ -113,7 +115,7 @@ struct Worker {
     /// Read afresh for each fold: an entry can carry a property registered
     /// after the worker started.
     fields: Arc<dyn FieldRegistrar>,
-    readiness: Arc<IndexReadiness>,
+    coverage: Arc<IndexCoverage>,
     shard_id: u16,
     stop: Arc<AtomicBool>,
 }
@@ -137,7 +139,7 @@ impl Worker {
                         seq, keys: written, ..
                     } => {
                         last_seq = last_seq.max(seq);
-                        keys.extend(written);
+                        keys.extend(written.iter().cloned());
                     }
                     AppliedEvent::Replaced => replaced = true,
                 }
@@ -163,10 +165,11 @@ impl Worker {
                     }
                 }
             };
-            // A failed rebuild publishes nothing: searches then wait and fail
-            // explicitly rather than read an index missing commits.
+            // A failed rebuild releases nothing: searches keep answering those
+            // nodes from the store, and the full queue that follows brings
+            // the rebuild round again.
             if let Some(seq) = covered {
-                self.readiness.advance(seq);
+                self.coverage.release(seq);
             }
         }
         tracing::info!("text index worker stopped");

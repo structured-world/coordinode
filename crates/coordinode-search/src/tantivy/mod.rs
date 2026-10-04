@@ -10,6 +10,7 @@
 //! Segment merging happens asynchronously in tantivy's background thread.
 
 pub mod multi_lang;
+pub mod pending;
 pub mod scratch_dir;
 pub mod segment_registry;
 pub mod tokenize;
@@ -29,6 +30,7 @@ use tantivy::tokenizer::{
 };
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, doc};
 
+use self::pending::{Matches, PendingDocuments};
 use self::segment_registry::SegmentRegistry;
 
 /// Fast-field name storing each document's originating Raft proposal commit_ts.
@@ -557,28 +559,13 @@ impl TextIndex {
         query_str: &str,
         limit: usize,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
-        let searcher = self.reader.searcher();
         let query = self.build_query_fuzzy(query_str, None)?;
-
-        let top_docs = searcher.search(&*query, &TopDocs::with_limit(limit).order_by_score())?;
-        let snippet_gen = SnippetGenerator::create(&searcher, &*query, self.body_field)?;
-
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    let snippet = snippet_gen.snippet_from_doc(&doc);
-                    results.push(HighlightedResult {
-                        node_id,
-                        score,
-                        snippet_html: snippet.to_html(),
-                    });
-                }
-            }
-        }
-
-        Ok(results)
+        self.collect(
+            &*query,
+            Matches::Top(limit),
+            &PendingDocuments::none(),
+            true,
+        )
     }
 
     /// Search with highlighted snippets of matching text.
@@ -809,18 +796,35 @@ impl TextIndex {
         limit: usize,
         language: &str,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
+        let Some(query) = self.language_query(query_str, language) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .collect(
+                &query,
+                Matches::Top(limit),
+                &PendingDocuments::none(),
+                false,
+            )?
+            .into_iter()
+            .map(|hit| TextSearchResult {
+                node_id: hit.node_id,
+                score: hit.score,
+            })
+            .collect())
+    }
+
+    /// The query of a language search: `query_str` tokenized by `language`'s
+    /// pipeline, its terms OR-ed together, `word*` terms as phrase prefixes;
+    /// `None` when it leaves nothing to search for.
+    fn language_query(&self, query_str: &str, language: &str) -> Option<BooleanQuery> {
         use tantivy::query::PhrasePrefixQuery;
 
         let (prefix_terms, remainder) = extract_prefix_terms(query_str);
-
-        // Tokenize the non-prefix remainder with language pipeline.
         let tokens = tokenize::tokenize_text(remainder.trim(), language);
-
         if tokens.is_empty() && prefix_terms.is_empty() {
-            return Ok(Vec::new());
+            return None;
         }
-
-        // Build sub-queries: OR-combined term queries + Must prefix queries.
         let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
             .into_iter()
             .map(|tok| {
@@ -832,28 +836,12 @@ impl TextIndex {
                 )
             })
             .collect();
-
         for prefix in &prefix_terms {
             let term = tantivy::Term::from_field_text(self.body_field, prefix);
             let pq = PhrasePrefixQuery::new(vec![term]);
             subqueries.push((Occur::Should, Box::new(pq)));
         }
-
-        let query = BooleanQuery::new(subqueries);
-        let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
-
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    results.push(TextSearchResult { node_id, score });
-                }
-            }
-        }
-
-        Ok(results)
+        Some(BooleanQuery::new(subqueries))
     }
 
     /// Search with highlighted snippets using language-aware tokenization.
@@ -870,54 +858,10 @@ impl TextIndex {
         limit: usize,
         language: &str,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
-        use tantivy::query::PhrasePrefixQuery;
-
-        let (prefix_terms, remainder) = extract_prefix_terms(query_str);
-        let tokens = tokenize::tokenize_text(remainder.trim(), language);
-
-        if tokens.is_empty() && prefix_terms.is_empty() {
+        let Some(query) = self.language_query(query_str, language) else {
             return Ok(Vec::new());
-        }
-
-        let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
-            .into_iter()
-            .map(|tok| {
-                let term = tantivy::Term::from_field_text(self.body_field, &tok.text);
-                let tq = TermQuery::new(term, IndexRecordOption::WithFreqs);
-                (
-                    Occur::Should,
-                    Box::new(tq) as Box<dyn tantivy::query::Query>,
-                )
-            })
-            .collect();
-
-        for prefix in &prefix_terms {
-            let term = tantivy::Term::from_field_text(self.body_field, prefix);
-            let pq = PhrasePrefixQuery::new(vec![term]);
-            subqueries.push((Occur::Should, Box::new(pq)));
-        }
-
-        let query = BooleanQuery::new(subqueries);
-        let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
-        let snippet_gen = SnippetGenerator::create(&searcher, &query, self.body_field)?;
-
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(node_id_val) = doc.get_first(self.node_id_field) {
-                if let Some(node_id) = node_id_val.as_u64() {
-                    let snippet = snippet_gen.snippet_from_doc(&doc);
-                    results.push(HighlightedResult {
-                        node_id,
-                        score,
-                        snippet_html: snippet.to_html(),
-                    });
-                }
-            }
-        }
-
-        Ok(results)
+        };
+        self.collect(&query, Matches::Top(limit), &PendingDocuments::none(), true)
     }
 
     /// MVCC snapshot search: returns only documents whose originating Raft

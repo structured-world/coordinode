@@ -963,13 +963,11 @@ impl Database {
         // Commits arriving during the rebuild are the rebuild's to fold; the
         // worker's copy of them is a harmless upsert. The worker is also what
         // takes a committed deletion out of the graph.
-        let applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
-        // A vector search waits for the worker to fold every entry applied
-        // before it.
-        let vector_readiness = Arc::new(coordinode_query::index::IndexReadiness::new(
-            coordinode_query::index::MaintainedIndex::Vector,
+        // The events stay until the worker has folded them: a vector search
+        // answers the nodes they wrote from the store instead of waiting.
+        let applied = engine.subscribe_applied_retained(Partition::Node, APPLIED_QUEUE_CAPACITY);
+        let vector_coverage = Arc::new(coordinode_query::index::IndexCoverage::new(
             applied.position(),
-            coordinode_query::index::DEFAULT_INDEX_READY_WAIT,
         ));
 
         // Load vector index definitions from schema: partition and rebuild
@@ -985,24 +983,24 @@ impl Database {
 
         // The rebuild above covered what the store held; the worker keeps the
         // indexes current with every entry applied from here on.
-        vector_index_registry.set_readiness(Arc::clone(&vector_readiness));
+        vector_index_registry.set_coverage(Arc::clone(&vector_coverage));
         let vector_worker = crate::vector_worker::VectorIndexWorker::spawn(
             Arc::clone(&engine),
             applied,
             Arc::clone(&vector_index_registry),
             Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
-            vector_readiness,
+            vector_coverage,
             1, /* shard_id */
         );
 
         // The text indexes follow the applied commits the same way: the
         // subscription opens before they are rebuilt from the store, so no
-        // commit falls between the two, and searches wait for the worker.
-        let text_applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
-        let text_readiness = Arc::new(coordinode_query::index::IndexReadiness::new(
-            coordinode_query::index::MaintainedIndex::Text,
+        // commit falls between the two, and searches answer the writes the
+        // worker has not folded from the store.
+        let text_applied =
+            engine.subscribe_applied_retained(Partition::Node, APPLIED_QUEUE_CAPACITY);
+        let text_coverage = Arc::new(coordinode_query::index::IndexCoverage::new(
             text_applied.position(),
-            coordinode_query::index::DEFAULT_INDEX_READY_WAIT,
         ));
         let text_index_base = path.join("text_indexes");
         let text_index_registry = Arc::new(Self::load_text_indexes(
@@ -1011,13 +1009,13 @@ impl Database {
             1, /* shard_id */
             &text_index_base,
         ));
-        text_index_registry.set_readiness(Arc::clone(&text_readiness));
+        text_index_registry.set_coverage(Arc::clone(&text_coverage));
         let text_worker = crate::text_worker::TextIndexWorker::spawn(
             Arc::clone(&engine),
             text_applied,
             Arc::clone(&text_index_registry),
             Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
-            text_readiness,
+            text_coverage,
             1, /* shard_id */
         );
 
@@ -3637,17 +3635,29 @@ impl Database {
         &self.text_index_registry
     }
 
-    /// Bound how long a full-text or vector search waits for its indexes to
-    /// hold every commit applied before it; past it the search fails with
-    /// [`coordinode_query::index::IndexBehind`]. Takes effect for the next
-    /// search.
-    pub fn set_index_ready_wait(&self, wait: Duration) {
-        if let Some(readiness) = self.text_index_registry.readiness() {
-            readiness.set_wait(wait);
-        }
-        if let Some(readiness) = self.vector_index_registry.readiness() {
-            readiness.set_wait(wait);
-        }
+    /// What a search of the text index of `(label, property)` reads now: the
+    /// index together with the committed writes it has not folded yet, read
+    /// from the store. `Ok(None)` when there is no such index.
+    ///
+    /// # Errors
+    ///
+    /// The field dictionary or the written nodes could not be read.
+    pub fn text_view(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<coordinode_query::index::text_registry::TextView>, DatabaseError> {
+        let interner = self.fields.current()?;
+        // The latest applied state, as the text worker reads it.
+        let read = coordinode_storage::engine::transaction::Transaction::new(
+            &self.engine,
+            None,
+            Timestamp::ZERO,
+            None,
+        );
+        self.text_index_registry
+            .view(label, property, &read, self.shard_id, &interner)
+            .map_err(DatabaseError::Other)
     }
 
     /// The verified field dictionary as it stands: every binding applied so

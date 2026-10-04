@@ -152,7 +152,7 @@ fn an_applied_entry_reports_its_keys_in_the_partition() {
             seq: 1,
             index: 7,
             commit_ts: 42,
-            keys: vec![b"a".to_vec(), b"b".to_vec()],
+            keys: vec![b"a".to_vec(), b"b".to_vec()].into(),
         })
     );
     assert_eq!(sub.try_next(), None, "entry 8 wrote nothing in Node");
@@ -264,6 +264,115 @@ fn a_full_queue_is_reported_as_replaced_without_blocking_the_applies() {
         sub.next(NO_WAIT),
         Some(AppliedEvent::Keys { index: 4, .. })
     ));
+}
+
+fn pending_keys(position: &super::AppliedPosition) -> Option<Vec<Vec<u8>>> {
+    match position.pending() {
+        super::PendingKeys::Known(events) => Some(
+            events
+                .iter()
+                .flat_map(|keys| keys.iter().cloned())
+                .collect(),
+        ),
+        super::PendingKeys::Unknown => None,
+    }
+}
+
+/// A retained subscription keeps every event it handed out until the
+/// consumer releases it: a reader sees the keys of the events taken but not
+/// yet folded as well as those still queued, and a release drops only what
+/// it covers.
+#[test]
+fn a_retained_subscription_reports_unreleased_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let sub = engine.subscribe_applied_retained(Partition::Node, 16);
+    let position = sub.position();
+
+    for (index, key) in [(1u64, b"a"), (2, b"b"), (3, b"c")] {
+        engine
+            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
+                false
+            })
+            .expect("apply");
+    }
+    let all = || Some(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    assert_eq!(pending_keys(&position), all(), "nothing taken yet");
+
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys { seq: 1, .. })
+    ));
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys { seq: 2, .. })
+    ));
+    assert_eq!(
+        pending_keys(&position),
+        all(),
+        "taken but not folded is still pending"
+    );
+
+    position.release(1);
+    assert_eq!(
+        pending_keys(&position),
+        Some(vec![b"b".to_vec(), b"c".to_vec()])
+    );
+    // Event 3 is not handed out yet: releasing past it keeps it for the
+    // consumer, which takes it next.
+    position.release(3);
+    assert_eq!(pending_keys(&position), Some(vec![b"c".to_vec()]));
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys { seq: 3, .. })
+    ));
+    position.release(3);
+    assert_eq!(pending_keys(&position), Some(Vec::new()));
+}
+
+/// Unreleased events count toward the capacity, and an event dropped for
+/// lack of room makes the pending keys unknown until the consumer releases
+/// past it, as it does once a rebuild from the store covers it.
+#[test]
+fn a_dropped_event_makes_the_pending_keys_unknown_until_released() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let sub = engine.subscribe_applied_retained(Partition::Node, 1);
+    let position = sub.position();
+
+    for (index, key) in [(1u64, b"a"), (2, b"b")] {
+        engine
+            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
+                false
+            })
+            .expect("apply");
+    }
+    assert_eq!(pending_keys(&position), None, "event 2 was dropped");
+    assert_eq!(sub.try_next(), Some(AppliedEvent::Replaced));
+    // The rebuild the consumer answers with reads every event offered.
+    let covered = position.delivered();
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys { seq: 1, .. })
+    ));
+    position.release(covered);
+    assert_eq!(pending_keys(&position), Some(Vec::new()));
+}
+
+/// A partition replaced wholesale leaves the pending keys unknown until the
+/// consumer's rebuild covers the replacement.
+#[test]
+fn a_replacement_makes_the_pending_keys_unknown_until_released() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let sub = engine.subscribe_applied_retained(Partition::Node, 16);
+    let position = sub.position();
+
+    engine.reset_raft_coverage(10, &[]).expect("reset");
+    assert_eq!(pending_keys(&position), None);
+    assert_eq!(sub.try_next(), Some(AppliedEvent::Replaced));
+    position.release(position.delivered());
+    assert_eq!(pending_keys(&position), Some(Vec::new()));
 }
 
 /// A dropped subscription stops receiving, and the applies go back to one

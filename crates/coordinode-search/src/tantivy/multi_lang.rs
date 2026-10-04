@@ -14,8 +14,25 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::pending::{Matches, PendingDocuments};
 use super::tokenize;
 use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
+
+/// What a search looks for.
+#[derive(Debug, Clone, Copy)]
+pub enum TextRequest<'a> {
+    /// The terms of `query` tokenized by `language` (the index's default
+    /// when `None`), any of them matching, `word*` as a prefix; with
+    /// highlighted snippets when `snippets` is set.
+    Terms {
+        query: &'a str,
+        language: Option<&'a str>,
+        snippets: bool,
+    },
+    /// `query` in the query syntax with each term widened to its edit-1
+    /// neighbourhood, over the index's stored tokens.
+    Fuzzy { query: &'a str, snippets: bool },
+}
 
 /// Configuration for a multi-language text index.
 #[derive(Debug, Clone)]
@@ -225,6 +242,24 @@ impl MultiLanguageTextIndex {
         node_id: u64,
         properties: &HashMap<String, String>,
     ) -> Result<bool, TextSearchError> {
+        let Some(doc) = self.document(node_id, properties) else {
+            return Ok(false);
+        };
+        self.inner.writer.delete_term(tantivy::Term::from_field_u64(
+            self.inner.node_id_field,
+            node_id,
+        ));
+        self.inner.writer.add_document(doc)?;
+        Ok(true)
+    }
+
+    /// `node_id`'s document built from `properties`, each field tokenized by
+    /// the language the cascade resolves; `None` when there is no text.
+    fn document(
+        &self,
+        node_id: u64,
+        properties: &HashMap<String, String>,
+    ) -> Option<tantivy::TantivyDocument> {
         // Extract the language override from the node properties (level 2)
         let node_language_override = properties
             .get(&self.config.language_override_property)
@@ -274,12 +309,8 @@ impl MultiLanguageTextIndex {
         }
 
         if all_tokens.is_empty() && all_text.is_empty() {
-            return Ok(false);
+            return None;
         }
-
-        // Use the inner TextIndex's PreTokenizedString path
-        let node_id_term = tantivy::Term::from_field_u64(self.inner.node_id_field, node_id);
-        self.inner.writer.delete_term(node_id_term);
 
         let pretokenized = tantivy::tokenizer::PreTokenizedString {
             text: all_text,
@@ -299,8 +330,49 @@ impl MultiLanguageTextIndex {
             self.inner.commit_ts_field,
             &tantivy::schema::OwnedValue::U64(0),
         );
-        self.inner.writer.add_document(doc)?;
-        Ok(true)
+        Some(doc)
+    }
+
+    /// What a search reads in place of the index's own documents of the nodes
+    /// written since the index's position: `superseded` lists those nodes
+    /// (`None`: any node may have changed, so the index answers for none), and
+    /// `documents` holds their current text, tokenized as the index would.
+    pub fn pending(
+        &self,
+        superseded: Option<&[u64]>,
+        documents: &[(u64, HashMap<String, String>)],
+    ) -> Result<PendingDocuments, TextSearchError> {
+        let documents = documents
+            .iter()
+            .filter_map(|(node_id, properties)| self.document(*node_id, properties))
+            .collect();
+        self.inner.pending(superseded, documents)
+    }
+
+    /// Run `request` over the index and `pending`, best score first.
+    pub fn find(
+        &self,
+        request: TextRequest<'_>,
+        matches: Matches,
+        pending: &PendingDocuments,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        match request {
+            TextRequest::Terms {
+                query,
+                language,
+                snippets,
+            } => {
+                let language = language.unwrap_or(&self.config.default_language);
+                match self.inner.language_query(query, language) {
+                    Some(query) => self.inner.collect(&query, matches, pending, snippets),
+                    None => Ok(Vec::new()),
+                }
+            }
+            TextRequest::Fuzzy { query, snippets } => {
+                let query = self.inner.build_query_fuzzy(query, None)?;
+                self.inner.collect(&*query, matches, pending, snippets)
+            }
+        }
     }
 
     /// Commit the staged changes and make them visible to readers.

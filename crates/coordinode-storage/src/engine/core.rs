@@ -3233,7 +3233,21 @@ impl StorageEngine {
         partition: Partition,
         capacity: usize,
     ) -> crate::engine::applied::AppliedSubscription {
-        self.applied_feed.subscribe(partition, capacity)
+        self.applied_feed.subscribe(partition, capacity, false)
+    }
+
+    /// [`Self::subscribe_applied`] whose events stay after they are handed
+    /// out until the consumer releases them
+    /// ([`crate::engine::applied::AppliedPosition::release`]), counting
+    /// toward `capacity` meanwhile: readers of the consumer's state learn
+    /// which keys it has not folded yet from
+    /// [`crate::engine::applied::AppliedPosition::pending`].
+    pub fn subscribe_applied_retained(
+        &self,
+        partition: Partition,
+        capacity: usize,
+    ) -> crate::engine::applied::AppliedSubscription {
+        self.applied_feed.subscribe(partition, capacity, true)
     }
 
     /// Start `tap` over after it reported

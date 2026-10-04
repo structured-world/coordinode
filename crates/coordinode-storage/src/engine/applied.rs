@@ -16,9 +16,14 @@
 //! the events it missed carried. A store replaced wholesale (a snapshot
 //! installed, a partition installed from a peer, a range removed) cannot be
 //! listed key by key and arrives as [`AppliedEvent::Replaced`].
+//!
+//! A retained subscription keeps each event after handing it out, until the
+//! consumer releases it: readers then see which keys the consumer has not
+//! folded yet ([`AppliedPosition::pending`]) and answer for those themselves
+//! instead of waiting for it.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -43,8 +48,9 @@ pub enum AppliedEvent {
         index: u64,
         /// The commit timestamp the entry applied at.
         commit_ts: u64,
-        /// The keys the entry wrote in the subscribed partition.
-        keys: Vec<Vec<u8>>,
+        /// The keys the entry wrote in the subscribed partition, shared with
+        /// the copy a retained subscription keeps.
+        keys: Arc<[Vec<u8>]>,
     },
     /// The partition was replaced wholesale, or events were dropped: the
     /// keys that changed are not known, so the subscriber reads the store
@@ -64,17 +70,18 @@ pub(crate) struct AppliedFeed {
 #[derive(Debug)]
 struct Subscriber {
     partition: Partition,
+    /// Whether events stay after they are handed out.
+    retained: bool,
+    /// Most events the queue holds, handed out and retained ones included.
+    capacity: usize,
     /// The number of the last event offered (queued or dropped). Written
-    /// under `sending`, so numbers enter the queue in order.
+    /// under `queue`, so numbers enter the queue in order.
     delivered: AtomicU64,
-    /// Serializes numbering an event with queueing it: local commits apply
-    /// concurrently, and a later number queued ahead of an earlier one would
-    /// let the consumer claim the earlier one folded.
+    /// Numbering an event and queueing it happen under this lock: local
+    /// commits apply concurrently, and a later number queued ahead of an
+    /// earlier one would let the consumer claim the earlier one folded.
     // no-std: spin::Mutex; held for one counter bump and one queue push.
-    sending: parking_lot::Mutex<()>,
-    tx: SyncSender<AppliedEvent>,
-    /// Set when an event could not be queued; cleared by the subscriber.
-    lost: AtomicBool,
+    queue: parking_lot::Mutex<Queue>,
     /// Notified on every event queued or lost, so a waiting subscriber sleeps
     /// until there is something to take.
     wake: Wake,
@@ -82,10 +89,26 @@ struct Subscriber {
     stopped: AtomicBool,
 }
 
+#[derive(Debug, Default)]
+struct Queue {
+    /// Numbered events, oldest first: the ones not handed out yet and, on a
+    /// retained subscription, the ones handed out and not released.
+    events: VecDeque<(u64, AppliedEvent)>,
+    /// How many events at the front were handed out.
+    taken: usize,
+    /// An event could not be queued: handed out as
+    /// [`AppliedEvent::Replaced`] before the events queued after it.
+    lost: bool,
+    /// The last event whose keys are not known: one dropped, or a
+    /// replacement.
+    unknown_through: u64,
+    /// The last event the consumer released.
+    released: u64,
+}
+
 /// An open subscription. Closes when dropped.
 #[derive(Debug)]
 pub struct AppliedSubscription {
-    rx: Receiver<AppliedEvent>,
     subscriber: Arc<Subscriber>,
     feed: Weak<AppliedFeed>,
 }
@@ -95,6 +118,18 @@ pub struct AppliedSubscription {
 #[derive(Debug, Clone)]
 pub struct AppliedPosition(Arc<Subscriber>);
 
+/// The keys a retained subscription's consumer has not released yet.
+#[derive(Debug, Clone)]
+pub enum PendingKeys {
+    /// The keys of every unreleased event, one slice per event; every entry
+    /// applied before [`AppliedPosition::pending`] was called is either
+    /// released or here.
+    Known(Vec<Arc<[Vec<u8>]>>),
+    /// An unreleased event's keys are not known (it was dropped, or the
+    /// partition was replaced): any key may have changed.
+    Unknown,
+}
+
 impl AppliedPosition {
     /// The number of the last event offered to the subscription. Every entry
     /// whose event is numbered at or below it is already in the store, so a
@@ -102,6 +137,40 @@ impl AppliedPosition {
     /// before this call.
     pub fn delivered(&self) -> u64 {
         self.0.delivered.load(Ordering::Acquire)
+    }
+
+    /// The keys written by the events the consumer has not released: what a
+    /// reader evaluates itself, since the consumer's state may not hold them
+    /// yet. Only a retained subscription keeps events after handing them out.
+    pub fn pending(&self) -> PendingKeys {
+        let queue = self.0.queue.lock();
+        if queue.unknown_through > queue.released {
+            return PendingKeys::Unknown;
+        }
+        PendingKeys::Known(
+            queue
+                .events
+                .iter()
+                .filter_map(|(_, event)| match event {
+                    AppliedEvent::Keys { keys, .. } => Some(Arc::clone(keys)),
+                    AppliedEvent::Replaced => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// Record that the consumer's state holds every event numbered up to
+    /// `seq`: the ones handed out are dropped, and a gap at or below `seq` is
+    /// known again.
+    pub fn release(&self, seq: u64) {
+        let mut queue = self.0.queue.lock();
+        queue.released = queue.released.max(seq);
+        // Only handed-out events: one still queued is the consumer's to take,
+        // and taking it twice costs a repeated fold, never a missed one.
+        while queue.taken > 0 && queue.events.front().is_some_and(|(s, _)| *s <= seq) {
+            queue.events.pop_front();
+            queue.taken -= 1;
+        }
     }
 }
 
@@ -164,10 +233,18 @@ impl AppliedSubscription {
 
     /// An event already queued, without waiting.
     pub fn try_next(&self) -> Option<AppliedEvent> {
-        if self.subscriber.lost.swap(false, Ordering::AcqRel) {
+        let mut queue = self.subscriber.queue.lock();
+        if queue.lost {
+            queue.lost = false;
             return Some(AppliedEvent::Replaced);
         }
-        self.rx.try_recv().ok()
+        if !self.subscriber.retained {
+            return queue.events.pop_front().map(|(_, event)| event);
+        }
+        let index = queue.taken;
+        let event = queue.events.get(index).map(|(_, event)| event.clone())?;
+        queue.taken += 1;
+        Some(event)
     }
 
     /// The partition this subscription follows.
@@ -194,19 +271,20 @@ impl AppliedFeed {
     }
 
     /// Subscribe to the entries applied to `partition` from now on, queueing
-    /// at most `capacity` of them.
+    /// at most `capacity` of them; `retained` keeps each event after it is
+    /// handed out until [`AppliedPosition::release`] passes it.
     pub(crate) fn subscribe(
         self: &Arc<Self>,
         partition: Partition,
         capacity: usize,
+        retained: bool,
     ) -> AppliedSubscription {
-        let (tx, rx) = sync_channel(capacity.max(1));
         let subscriber = Arc::new(Subscriber {
             partition,
+            retained,
+            capacity: capacity.max(1),
             delivered: AtomicU64::new(0),
-            sending: parking_lot::Mutex::new(()),
-            tx,
-            lost: AtomicBool::new(false),
+            queue: parking_lot::Mutex::new(Queue::default()),
             wake: Wake::default(),
             stopped: AtomicBool::new(false),
         });
@@ -216,7 +294,6 @@ impl AppliedFeed {
             self.open.store(subscribers.len(), Ordering::Release);
         }
         AppliedSubscription {
-            rx,
             subscriber,
             feed: Arc::downgrade(self),
         }
@@ -284,6 +361,7 @@ impl AppliedFeed {
             if replaced {
                 send(subscriber, |_| AppliedEvent::Replaced);
             } else if !keys.is_empty() {
+                let keys: Arc<[Vec<u8>]> = keys.into();
                 send(subscriber, |seq| AppliedEvent::Keys {
                     seq,
                     index,
@@ -298,27 +376,25 @@ impl AppliedFeed {
 /// Number the event `make` builds and queue it without waiting; a full
 /// queue marks the subscription lost.
 fn send(subscriber: &Subscriber, make: impl FnOnce(u64) -> AppliedEvent) {
-    let _order = subscriber.sending.lock();
-    // Under `sending`: one writer at a time, so a plain add cannot overflow
+    let mut queue = subscriber.queue.lock();
+    // Under `queue`: one writer at a time, so a plain add cannot overflow
     // before 2^64 events.
     let seq = subscriber.delivered.load(Ordering::Relaxed) + 1;
-    let result = subscriber.tx.try_send(make(seq));
-    // Published after the event is queued: a reader that sees `seq` finds
-    // the event queued or the subscription marked lost.
-    match result {
-        Ok(()) => {
-            subscriber.delivered.store(seq, Ordering::Release);
-            subscriber.wake.notify();
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            subscriber.delivered.store(seq, Ordering::Release);
-        }
-        Err(TrySendError::Full(_)) => {
-            subscriber.lost.store(true, Ordering::Release);
-            subscriber.delivered.store(seq, Ordering::Release);
-            subscriber.wake.notify();
-        }
+    let event = make(seq);
+    if matches!(event, AppliedEvent::Replaced) {
+        queue.unknown_through = seq;
     }
+    if queue.events.len() < subscriber.capacity {
+        queue.events.push_back((seq, event));
+    } else {
+        queue.lost = true;
+        queue.unknown_through = seq;
+    }
+    // Published with the event queued or the subscription marked lost, so a
+    // reader that sees `seq` finds one or the other.
+    subscriber.delivered.store(seq, Ordering::Release);
+    drop(queue);
+    subscriber.wake.notify();
 }
 
 #[cfg(test)]

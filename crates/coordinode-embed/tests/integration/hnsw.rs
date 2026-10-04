@@ -14,6 +14,21 @@ fn config(metric: VectorMetric) -> HnswConfig {
     }
 }
 
+/// Wait until the vector worker has folded every applied commit into the
+/// graph. Tests that read the graph itself need this; a search does not wait,
+/// it answers the unfolded commits from the store.
+fn await_folded(registry: &coordinode_query::index::VectorIndexRegistry) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // The embedded database keeps its nodes on shard 1.
+    while !registry.delta(1).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the vector worker did not fold the applied commits within 60 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 // ── Index lifecycle ─────────────────────────────────────────────────
 
 #[test]
@@ -1132,7 +1147,6 @@ fn hnsw_search_with_visibility_integration() {
 /// answer. Acceleration belongs to the top-k operators.
 #[test]
 fn vector_threshold_query_is_unaffected_by_index_presence() {
-    use coordinode_core::graph::node::NodeId;
     use coordinode_query::index::VectorIndexConfig;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1159,32 +1173,10 @@ fn vector_threshold_query_is_unaffected_by_index_presence() {
     db.execute_cypher("CREATE (m:Movie {title: 'Tenet', embedding: [0.9, 0.1, 0.0]})")
         .expect("create Tenet");
 
-    // Read back node IDs and vectors to populate the HNSW index.
-    // In production, this would be done automatically by the write path.
-    let nodes = db
-        .execute_cypher("MATCH (m:Movie) RETURN m, m.embedding")
-        .expect("read nodes");
-
+    // The vector worker inserts the committed vectors; the graph itself is
+    // read below, so wait for it.
     let registry = db.vector_index_registry();
-    for row in &nodes {
-        let node_id = row.get("m").and_then(|v| v.as_int()).expect("node id") as u64;
-        // Embedding may be stored as Vector or Array (Cypher array literal).
-        let vec_f32: Option<Vec<f32>> = row.get("m.embedding").and_then(|v| match v {
-            coordinode_core::graph::types::Value::Vector(v) => Some(v.clone()),
-            coordinode_core::graph::types::Value::Array(arr) => arr
-                .iter()
-                .map(|item| match item {
-                    coordinode_core::graph::types::Value::Float(f) => Some(*f as f32),
-                    coordinode_core::graph::types::Value::Int(i) => Some(*i as f32),
-                    _ => None,
-                })
-                .collect(),
-            _ => None,
-        });
-        if let Some(vec) = vec_f32 {
-            registry.on_vector_written("Movie", NodeId::from_raw(node_id), "embedding", &vec);
-        }
-    }
+    await_folded(registry);
 
     // Verify HNSW index has 3 vectors.
     let hnsw_results = registry
@@ -1331,9 +1323,9 @@ fn create_node_auto_inserts_into_hnsw() {
         .expect("create Inception");
 
     // HNSW index should now contain 2 vectors automatically, once the
-    // worker has folded the commits (a search waits for that).
+    // worker has folded the commits.
     let reg = db.vector_index_registry();
-    reg.await_covered().expect("the index catches up");
+    await_folded(reg);
     let results = reg
         .search("Movie", "embedding", &[0.9, 0.1, 0.0, 0.0], 10)
         .expect("search");
@@ -1378,7 +1370,7 @@ fn set_vector_property_updates_hnsw() {
 
     // Verify it's in the index once the worker has folded the commit.
     let reg = db.vector_index_registry();
-    reg.await_covered().expect("the index catches up");
+    await_folded(reg);
     let results = reg
         .search("Item", "v", &[0.0, 0.0, 0.0], 5)
         .expect("search");
@@ -1393,7 +1385,7 @@ fn set_vector_property_updates_hnsw() {
     // so the index should still contain 1 entry (or 2 if no dedup on update).
     // The important thing is that searching near [10, 10, 10] finds the node.
     let reg = db.vector_index_registry();
-    reg.await_covered().expect("the index catches up");
+    await_folded(reg);
     let results = reg
         .search("Item", "v", &[10.0, 10.0, 10.0], 5)
         .expect("search near new vector");
@@ -1714,7 +1706,7 @@ fn hnsw_persists_across_restart() {
 
         // Verify index works before close, once the worker caught up.
         let reg = db.vector_index_registry();
-        reg.await_covered().expect("the index catches up");
+        await_folded(reg);
         let results = reg
             .search("Movie", "embedding", &[1.0, 0.0, 0.0, 0.0], 3)
             .expect("search pre-close");
@@ -1869,7 +1861,7 @@ fn new_vectors_indexed_after_reopen() {
             .expect("create B");
 
         let reg = db.vector_index_registry();
-        reg.await_covered().expect("the index catches up");
+        await_folded(reg);
         let results = reg
             .search("Item", "v", &[0.0, 1.0, 0.0], 5)
             .expect("search after insert");
@@ -1989,7 +1981,7 @@ fn offloaded_hnsw_search_e2e_through_cypher() {
 
     // Verify the HNSW index has vectors once the worker caught up.
     let reg = db.vector_index_registry();
-    reg.await_covered().expect("the index catches up");
+    await_folded(reg);
     let handle = reg.get("Item", "embedding").expect("index should exist");
     let hnsw = handle.read().expect("read lock");
     assert_eq!(hnsw.len(), 10, "HNSW should have 10 vectors");
@@ -2068,7 +2060,7 @@ fn forced_offload_search_through_registry() {
     // has folded every insert.
     {
         let reg = db.vector_index_registry();
-        reg.await_covered().expect("the index catches up");
+        await_folded(reg);
         let handle = reg.get("Widget", "vec").expect("index exists");
         let mut hnsw = handle.write().expect("write lock");
 

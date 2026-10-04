@@ -104,6 +104,159 @@ fn a_relabelled_node_follows_its_label_in_the_index() {
     assert_eq!(rows.len(), 1, "a node that gained the label is not indexed");
 }
 
+// ── Writes the index has not folded ────────────────────────────────
+
+fn node_id(db: &mut Database, title: &str) -> u64 {
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:Article {{title: '{title}'}}) RETURN id(n) AS id"
+        ))
+        .expect("id");
+    match rows[0].get("id") {
+        Some(Value::Int(id)) => *id as u64,
+        other => panic!("no id for {title}: {other:?}"),
+    }
+}
+
+fn titles(db: &mut Database, words: &str) -> Vec<String> {
+    let mut found: Vec<String> = db
+        .execute_cypher(&format!(
+            "MATCH (n:Article) WHERE text_match(n.body, '{words}') RETURN n.title AS t"
+        ))
+        .expect("search")
+        .into_iter()
+        .filter_map(|row| match row.get("t") {
+            Some(Value::String(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Hold the text indexes' coverage on a subscription whose events are never
+/// released, as a worker that has folded nothing since this call would; the
+/// worker's own folds go on, and are waited out so they cannot overwrite what
+/// the test plants in the index afterwards.
+struct HeldCoverage {
+    _held: coordinode_storage::engine::applied::AppliedSubscription,
+    worker: std::sync::Arc<coordinode_query::index::IndexCoverage>,
+}
+
+impl HeldCoverage {
+    fn hold(db: &Database, capacity: usize) -> Self {
+        let registry = db.text_index_registry();
+        let worker = registry.coverage().expect("the worker's coverage");
+        let held = db.engine().subscribe_applied_retained(
+            coordinode_storage::engine::partition::Partition::Node,
+            capacity,
+        );
+        registry.set_coverage(std::sync::Arc::new(
+            coordinode_query::index::IndexCoverage::new(held.position()),
+        ));
+        Self {
+            _held: held,
+            worker,
+        }
+    }
+
+    fn await_worker(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !self.worker.delta(1).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never folded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// A search never waits for the text worker: the nodes written by commits it
+/// has not folded are read from the store and searched in place of the
+/// index's own documents of them. The index here holds stale text for each
+/// of them, as a lagging worker leaves it: a rewritten node, a deleted one,
+/// and none for a new one.
+#[test]
+fn a_search_answers_unfolded_writes_from_the_store() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'stale rust words'})")
+        .expect("create a");
+    db.execute_cypher("CREATE (:Article {title: 'b', body: 'doomed rust words'})")
+        .expect("create b");
+    db.execute_cypher("CREATE (:Article {title: 'u', body: 'untouched rust words'})")
+        .expect("create u");
+    let (a, b) = (node_id(&mut db, "a"), node_id(&mut db, "b"));
+
+    let held = HeldCoverage::hold(&db, 1024);
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'fresh golang words'")
+        .expect("rewrite a");
+    db.execute_cypher("MATCH (n:Article {title: 'b'}) DETACH DELETE n")
+        .expect("delete b");
+    db.execute_cypher("CREATE (:Article {title: 'c', body: 'brand new rust'})")
+        .expect("create c");
+    held.await_worker();
+    db.text_index_registry()
+        .apply_changes(
+            "Article",
+            "body",
+            &[
+                (
+                    coordinode_core::graph::node::NodeId::from_raw(a),
+                    "stale rust words".into(),
+                ),
+                (
+                    coordinode_core::graph::node::NodeId::from_raw(b),
+                    "doomed rust words".into(),
+                ),
+            ],
+            &[],
+        )
+        .expect("plant stale text");
+
+    assert_eq!(titles(&mut db, "rust"), ["c", "u"]);
+    assert_eq!(titles(&mut db, "golang"), ["a"]);
+    assert!(titles(&mut db, "stale").is_empty());
+    assert!(titles(&mut db, "doomed").is_empty());
+}
+
+/// When the writes the index lacks are not known (an event was dropped), a
+/// search reads every node of the label from the store instead of trusting
+/// the index for any of them.
+#[test]
+fn an_unknown_delta_answers_from_the_store_alone() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'stale rust words'})")
+        .expect("create a");
+    let a = node_id(&mut db, "a");
+
+    // A queue of one: the second write is dropped, so the delta is unknown.
+    let held = HeldCoverage::hold(&db, 1);
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'fresh golang words'")
+        .expect("rewrite a");
+    db.execute_cypher("CREATE (:Article {title: 'c', body: 'brand new rust'})")
+        .expect("create c");
+    held.await_worker();
+    db.text_index_registry()
+        .apply_changes(
+            "Article",
+            "body",
+            &[(
+                coordinode_core::graph::node::NodeId::from_raw(a),
+                "stale rust words".into(),
+            )],
+            &[],
+        )
+        .expect("plant stale text");
+
+    assert_eq!(titles(&mut db, "rust"), ["c"]);
+    assert_eq!(titles(&mut db, "golang"), ["a"]);
+}
+
 // ── CREATE TEXT INDEX DDL ──────────────────────────────────────────
 
 /// CREATE TEXT INDEX creates an index and returns metadata.

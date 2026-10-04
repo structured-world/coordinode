@@ -32,7 +32,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use super::eval::{EvalError, eval_binary_op, eval_unary_op, is_truthy};
 use super::eval_neutral::eval_neutral;
 use super::row::Row;
-use crate::index::{IndexState, OnlineDuringBuild};
+use crate::index::{IndexDelta, IndexState, OnlineDuringBuild};
 use crate::plan::ViolationMode;
 use crate::plan::{Direction, LengthBound, Pattern, PatternElement};
 use crate::planner::logical::*;
@@ -184,13 +184,6 @@ pub enum ExecutionError {
         /// election is in flight.
         leader_id: Option<u64>,
     },
-
-    /// A full-text or vector search found its indexes behind the commits its
-    /// snapshot includes after its wait. Nothing was answered: an index
-    /// lacking a committed write would miss or misrank rows. Retryable once
-    /// the indexes catch up.
-    #[error("{0}")]
-    IndexBehind(#[from] crate::index::IndexBehind),
 
     /// The write reached a member that does not run its group's version.
     /// Nothing was applied; the same write succeeds at the leader named in
@@ -5280,9 +5273,6 @@ fn execute_hnsw_scan(
     // Honour the online-during-build policy exactly like the
     // scan-then-rank path does.
     gate_vector_index_read(indexes, label, property)?;
-    // The index holds every commit applied before this search, or the
-    // search fails rather than miss one.
-    registry.await_covered()?;
 
     let qv_val = eval_neutral(query_vector, &Row::new())?;
     let Some(qv) = coerce_value_to_vec(&qv_val) else {
@@ -5294,48 +5284,92 @@ fn execute_hnsw_scan(
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
 
-    // A deleted node stays in the graph until a rebuild, so some hits do not
-    // hydrate. Ask for more until k of them do or the index runs out, instead
-    // of answering LIMIT k with fewer rows than exist.
-    let mut want = k;
-    let (hits, records) = loop {
-        let Some(hits) = registry.search(label, property, &qv, want) else {
-            // Index disappeared between planning and execution (concurrent
-            // DROP). Empty result keeps the read path total; the planner
-            // will not pick HnswScan on the next statement.
-            return Ok(Vec::new());
+    // The commits the index has not folded yet are answered from the store at
+    // this statement's snapshot; the index answers for every other node.
+    let delta = registry.delta(ctx.shard_id);
+    // (node, record, index score, exact score of the ORDER BY function)
+    let mut candidates: Vec<(u64, NodeRecord, f32, Option<f64>)> = Vec::new();
+    if delta != IndexDelta::Unknown {
+        let superseded = match &delta {
+            IndexDelta::Nodes(nodes) => nodes.len(),
+            IndexDelta::Unknown => 0,
         };
-        // Hydrate the hit set in one batched multi_get; the input order is
-        // preserved, so the rows stay in similarity order.
-        let ids: Vec<NodeId> = hits.iter().map(|h| NodeId::from_raw(h.id)).collect();
-        let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
-        let visible = records
-            .iter()
-            .filter(|r| r.as_ref().is_some_and(|r| r.has_label(label)))
-            .count();
-        if visible >= k || hits.len() < want {
-            break (hits, records);
-        }
-        want = want.checked_mul(2).ok_or_else(|| {
+        // A deleted node stays in the graph until a rebuild and a hit of a
+        // node the delta names is answered from the store, so some hits do
+        // not count. Ask for more until k of them do or the index runs out,
+        // instead of answering LIMIT k with fewer rows than exist.
+        let mut want = k.checked_add(superseded).ok_or_else(|| {
             ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
         })?;
-    };
-    let mut results = Vec::with_capacity(k);
-
-    for (hit, record_opt) in hits.into_iter().zip(records) {
-        if results.len() == k {
-            break;
+        loop {
+            let Some(hits) = registry.search(label, property, &qv, want) else {
+                // Index disappeared between planning and execution (concurrent
+                // DROP). Empty result keeps the read path total; the planner
+                // will not pick HnswScan on the next statement.
+                return Ok(Vec::new());
+            };
+            let kept: Vec<_> = hits
+                .iter()
+                .filter(|h| !delta.contains(NodeId::from_raw(h.id)))
+                .collect();
+            // Hydrate the kept hits in one batched multi_get; the input order
+            // is preserved, so the rows stay in similarity order.
+            let ids: Vec<NodeId> = kept.iter().map(|h| NodeId::from_raw(h.id)).collect();
+            let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+            let found: Vec<_> = kept
+                .iter()
+                .zip(records)
+                .filter_map(|(hit, record)| {
+                    let record = record?;
+                    record
+                        .has_label(label)
+                        .then_some((hit.id, record, hit.score, None))
+                })
+                .collect();
+            if found.len() >= k || hits.len() < want {
+                candidates = found;
+                break;
+            }
+            want = want.checked_mul(2).ok_or_else(|| {
+                ExecutionError::Unsupported(format!("HnswScan({index_name}): k={k} is too large"))
+            })?;
         }
-        let Some(record) = record_opt else {
-            // Node deleted after the index entry was written — skip.
-            continue;
-        };
-        if !record.has_label(label) {
-            continue;
-        }
+    }
+    if !delta.is_empty() {
+        // One scale for the index's hits and the written nodes: the function
+        // the query orders by, computed exactly on each vector.
+        let field = ctx.interner.lookup(property);
+        candidates.extend(
+            written_vector_nodes(&delta, label, field, qv.len(), ctx)?
+                .into_iter()
+                .map(|(id, record)| (id, record, f32::NAN, None)),
+        );
+        let mut scored: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|(id, record, index_score, _)| {
+                let vector = record_vector(&record, field?)?;
+                let exact = vector_function_score(function, &qv, &vector)?;
+                Some((id, record, index_score, Some(exact)))
+            })
+            .collect();
+        let ascending = vector_function_ascending(function);
+        scored.sort_by(|a, b| {
+            let (x, y) = (a.3.unwrap_or(f64::NAN), b.3.unwrap_or(f64::NAN));
+            let order = if ascending {
+                x.total_cmp(&y)
+            } else {
+                y.total_cmp(&x)
+            };
+            order.then(a.0.cmp(&b.0))
+        });
+        candidates = scored;
+    }
+    candidates.truncate(k);
+    let mut results = Vec::with_capacity(candidates.len());
 
+    for (id, record, index_score, exact) in candidates {
         let mut row = Row::new();
-        row.insert(binding.to_string(), Value::Int(hit.id as i64));
+        row.insert(binding.to_string(), Value::Int(id as i64));
         for (field_id, value) in &record.props {
             if let Some(field_name) = ctx.interner.resolve(*field_id) {
                 row.insert(format!("{binding}.{field_name}"), value.clone());
@@ -5350,30 +5384,91 @@ fn execute_hnsw_scan(
         inject_computed_properties(&mut row, binding, &primary_label, ctx);
 
         if let Some(alias) = distance_alias {
-            let node_vec = row
-                .get(&format!("{binding}.{property}"))
-                .and_then(coerce_value_to_vec);
-            let score = match node_vec {
-                Some(nv) => match function {
-                    "vector_distance" => {
-                        coordinode_vector::metrics::euclidean_distance(&qv, &nv) as f64
-                    }
-                    "vector_similarity" => {
-                        coordinode_vector::metrics::cosine_similarity(&qv, &nv) as f64
-                    }
-                    "vector_dot" => coordinode_vector::metrics::dot_product(&qv, &nv) as f64,
-                    "vector_manhattan" => {
-                        coordinode_vector::metrics::manhattan_distance(&qv, &nv) as f64
-                    }
-                    _ => hit.score as f64,
-                },
-                None => hit.score as f64,
-            };
-            row.insert(alias.to_string(), Value::Float(score));
+            let score = exact.or_else(|| {
+                let node_vec = row
+                    .get(&format!("{binding}.{property}"))
+                    .and_then(coerce_value_to_vec)?;
+                vector_function_score(function, &qv, &node_vec)
+            });
+            row.insert(
+                alias.to_string(),
+                Value::Float(score.unwrap_or(index_score as f64)),
+            );
         }
         results.push(row);
     }
     Ok(results)
+}
+
+/// The scalar a vector ORDER BY function computes for `a` against `b`;
+/// `None` for an unknown function or vectors of different widths.
+fn vector_function_score(function: &str, a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    Some(match function {
+        "vector_distance" => coordinode_vector::metrics::euclidean_distance(a, b) as f64,
+        "vector_similarity" => coordinode_vector::metrics::cosine_similarity(a, b) as f64,
+        "vector_dot" => coordinode_vector::metrics::dot_product(a, b) as f64,
+        "vector_manhattan" => coordinode_vector::metrics::manhattan_distance(a, b) as f64,
+        _ => return None,
+    })
+}
+
+/// Whether a lower value of `function` ranks first (distances) rather than a
+/// higher one (similarities).
+fn vector_function_ascending(function: &str) -> bool {
+    matches!(function, "vector_distance" | "vector_manhattan")
+}
+
+/// The vector `record` holds in `field`.
+fn record_vector(record: &NodeRecord, field: u32) -> Option<Vec<f32>> {
+    coerce_value_to_vec(record.props.get(&field)?)
+}
+
+/// The nodes `delta` names whose primary label is `label` (what a vector
+/// index of `label` holds) and that carry a `dims`-wide vector in `field`,
+/// as this statement reads them; every such node of the shard when the delta
+/// is unknown.
+fn written_vector_nodes(
+    delta: &IndexDelta,
+    label: &str,
+    field: Option<u32>,
+    dims: usize,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<(u64, NodeRecord)>, ExecutionError> {
+    use coordinode_modality::NodeStore as _;
+    let Some(field) = field else {
+        // No node has ever carried the property.
+        return Ok(Vec::new());
+    };
+    let indexed = |record: &NodeRecord| {
+        record.primary_label() == label
+            && record_vector(record, field).is_some_and(|v| v.len() == dims)
+    };
+    let nodes = coordinode_modality::LocalNodeStore;
+    let mut written = Vec::new();
+    match delta {
+        IndexDelta::Nodes(ids) => {
+            let mut ids: Vec<NodeId> = ids.iter().copied().collect();
+            ids.sort_unstable();
+            let records = nodes.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+            for (id, record) in ids.into_iter().zip(records) {
+                if let Some(record) = record.filter(|r| indexed(r)) {
+                    written.push((id.as_raw(), record));
+                }
+            }
+        }
+        IndexDelta::Unknown => {
+            nodes.for_each_in_shard(&ctx.txn, ctx.shard_id, &mut |id, record| {
+                if indexed(&record) {
+                    written.push((id.as_raw(), record));
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(written)
 }
 
 /// Edge binding a traversal uses for an anonymous relationship that carries an
@@ -6606,9 +6701,13 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     gate_vector_index_read(indexes, &label_str, &property_str)?;
-    // The index holds every commit applied before this search, or the
-    // search fails rather than miss one.
-    registry.await_covered()?;
+    // The commits the index has not folded yet are answered from the rows,
+    // which hold this statement's view of every node; with no record of which
+    // nodes they touched, the rows are ranked exactly.
+    let delta = registry.delta(ctx.shard_id);
+    if delta == IndexDelta::Unknown {
+        return Ok(None);
+    }
 
     // ACORN-style filtered search: when the planner pushed a predicate down,
     // pass it as a visibility closure so the HNSW traversal prunes branches
@@ -6676,10 +6775,21 @@ fn try_hnsw_vector_top_k(
     // For `vector_distance` (lower is better), HNSW already returns in that
     // order. For `vector_similarity`/`vector_dot` (higher is better), we recompute
     // the score for the requested function when writing distance_alias.
+    // A hit of a node the delta names is replaced by that node's row below.
     let mut intersected: Vec<(f32, &Row)> = Vec::new();
     for result in &search_results {
+        if delta.contains(NodeId::from_raw(result.id)) {
+            continue;
+        }
         if let Some(row) = row_by_id.get(&result.id) {
             intersected.push((result.score, row));
+        }
+    }
+    if let IndexDelta::Nodes(written) = &delta {
+        for id in written {
+            if let Some(row) = row_by_id.get(&id.as_raw()) {
+                intersected.push((f32::NAN, row));
+            }
         }
     }
 
@@ -6688,6 +6798,34 @@ fn try_hnsw_vector_top_k(
     // the upstream filter was very restrictive and our overfetch was too small.
     if intersected.len() < k.min(rows.len()) {
         return Ok(None);
+    }
+
+    if !delta.is_empty() {
+        // The written nodes have no index score: rank everything by the
+        // function the query orders by, computed exactly on each row.
+        let mut scored = Vec::with_capacity(intersected.len());
+        for (_, row) in intersected {
+            if let Some(exact) = recompute_score_for_row(vector_expr, &query_vec, function, row)? {
+                scored.push((exact, row));
+            }
+        }
+        let ascending = vector_function_ascending(function);
+        scored.sort_by(|a, b| {
+            if ascending {
+                a.0.total_cmp(&b.0)
+            } else {
+                b.0.total_cmp(&a.0)
+            }
+        });
+        let mut result_rows = Vec::with_capacity(k);
+        for (exact, row) in scored.into_iter().take(k) {
+            let mut cloned = row.clone();
+            if let Some(alias) = distance_alias {
+                cloned.insert(alias.to_string(), Value::Float(exact));
+            }
+            result_rows.push(cloned);
+        }
+        return Ok(Some(result_rows));
     }
 
     // For distance functions, HNSW order is already correct (ascending).
@@ -7321,24 +7459,14 @@ fn score_text_method(
                 .to_string(),
         )
     })?;
-    let handle = registry.read_handle(label, property)?.ok_or_else(|| {
-        ExecutionError::Unsupported(format!(
-            "rrf_score(): text method {variable}.{property} on :{label} requires a \
-             full-text index; create one with `CREATE TEXT INDEX … ON :{label}({property})`"
-        ))
-    })?;
-    let idx = handle
-        .read()
-        .map_err(|_| ExecutionError::Unsupported("rrf_score(): text index lock poisoned".into()))?;
-    // Overfetch 3× to catch boundary matches; at least 1000.
-    let limit = (rows.len() * 3).max(1000);
-    let results = idx
-        .search(query_text, limit)
-        .map_err(|e| ExecutionError::Unsupported(format!("rrf_score(): text search error: {e}")))?;
-    drop(idx);
-
-    let scores: std::collections::HashMap<u64, f32> =
-        results.into_iter().map(|r| (r.node_id, r.score)).collect();
+    let scores = text_index_matches(registry, label, property, query_text, None, ctx)
+        .map_err(|e| ExecutionError::Unsupported(format!("rrf_score(): text search error: {e}")))?
+        .ok_or_else(|| {
+            ExecutionError::Unsupported(format!(
+                "rrf_score(): text method {variable}.{property} on :{label} requires a \
+                 full-text index; create one with `CREATE TEXT INDEX … ON :{label}({property})`"
+            ))
+        })?;
 
     let mut scored: Vec<(usize, f64, u64)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
@@ -7460,22 +7588,13 @@ fn raw_scores_text_method(
             "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
         )
     })?;
-    let handle = registry.read_handle(label, property)?.ok_or_else(|| {
-        ExecutionError::Unsupported(format!(
-            "hybrid fusion: no text index on :{label}({property})"
-        ))
-    })?;
-    let idx = handle.read().map_err(|_| {
-        ExecutionError::Unsupported("hybrid fusion: text index lock poisoned".into())
-    })?;
-    let limit = (rows.len() * 3).max(1000);
-    let results = idx
-        .search(query_text, limit)
-        .map_err(|e| ExecutionError::Unsupported(format!("hybrid fusion: text search: {e}")))?;
-    drop(idx);
-
-    let scores: std::collections::HashMap<u64, f32> =
-        results.into_iter().map(|r| (r.node_id, r.score)).collect();
+    let scores = text_index_matches(registry, label, property, query_text, None, ctx)
+        .map_err(|e| ExecutionError::Unsupported(format!("hybrid fusion: text search: {e}")))?
+        .ok_or_else(|| {
+            ExecutionError::Unsupported(format!(
+                "hybrid fusion: no text index on :{label}({property})"
+            ))
+        })?;
 
     let mut out: Vec<Option<f64>> = vec![None; rows.len()];
     for (i, row) in rows.iter().enumerate() {
@@ -7908,6 +8027,39 @@ fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -
     ExecutionError::Unsupported(msg)
 }
 
+/// Every node the text index of `(label, property)` matches for `query`
+/// (tokenized by `language`, the index's default when `None`) with its BM25
+/// score, the writes the index has not folded yet answered from this
+/// statement's view of them. `Ok(None)` when there is no such index.
+fn text_index_matches(
+    registry: &crate::index::TextIndexRegistry,
+    label: &str,
+    property: &str,
+    query: &str,
+    language: Option<&str>,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<HashMap<u64, f32>>, String> {
+    use coordinode_search::tantivy::multi_lang::TextRequest;
+    use coordinode_search::tantivy::pending::Matches;
+
+    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner)? else {
+        return Ok(None);
+    };
+    let hits = view.find(
+        TextRequest::Terms {
+            query,
+            language,
+            snippets: false,
+        },
+        Matches::All,
+    )?;
+    Ok(Some(
+        hits.into_iter()
+            .map(|hit| (hit.node_id, hit.score))
+            .collect(),
+    ))
+}
+
 /// TextFilter: search TextIndex for matching documents, filter rows.
 ///
 /// For each row, evaluates `text_expr` to get the text content of a node field,
@@ -7928,7 +8080,14 @@ fn execute_text_filter(
     }
     // Try text_index_registry first (automatic mode), fallback to legacy text_index.
     // The registry is keyed by (label, property) — extract property from text_expr.
-    let limit = rows.len().max(1000);
+    // A legacy index is asked for as many matches as it holds documents: the
+    // predicate is membership, which a top-K cutoff would truncate.
+    let limit = ctx
+        .text_index
+        .map_or(1, |index| {
+            usize::try_from(index.num_docs()).unwrap_or(usize::MAX)
+        })
+        .max(1);
     // Extract property name from text_expr (PropertyAccess { var, property }).
     let property = match text_expr {
         crate::plan::expr::Expr::Property { key, .. } => Some(key.as_str()),
@@ -7954,26 +8113,26 @@ fn execute_text_filter(
         property.unwrap_or("?"),
     )?;
 
-    let search_results = if let Some(registry) = ctx.text_index_registry {
+    let search_results: Vec<coordinode_search::tantivy::TextSearchResult> = if let Some(registry) =
+        ctx.text_index_registry
+    {
         if let (Some(l), Some(p)) = (label, property) {
-            if let Some(handle) = registry.read_handle(l, p)? {
-                let idx = handle
-                    .read()
-                    .map_err(|_| ExecutionError::Unsupported("text index lock poisoned".into()))?;
-                if let Some(lang) = language {
-                    idx.search_with_language(query_string, limit, lang)
-                        .map_err(|e| {
-                            ExecutionError::Unsupported(format!("text search error: {e}"))
-                        })?
-                } else {
-                    idx.search(query_string, limit).map_err(|e| {
-                        ExecutionError::Unsupported(format!("text search error: {e}"))
-                    })?
-                }
-            } else {
+            // Every match, not a top-K: the predicate is membership.
+            match text_index_matches(registry, l, p, query_string, language, ctx)
+                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+            {
+                Some(matches) => matches
+                    .into_iter()
+                    .map(
+                        |(node_id, score)| coordinode_search::tantivy::TextSearchResult {
+                            node_id,
+                            score,
+                        },
+                    )
+                    .collect(),
                 // Registry is wired but has no index for (label, property) —
                 // hard-fail, don't silently pass every row through.
-                return Err(text_match_missing_index_error(Some(l), Some(p)));
+                None => return Err(text_match_missing_index_error(Some(l), Some(p))),
             }
         } else if let Some(text_index) = ctx.text_index {
             // Registry present but we couldn't determine (label, property) from

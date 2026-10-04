@@ -20,6 +20,8 @@ use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use coordinode_embed::Database;
+use coordinode_search::tantivy::multi_lang::TextRequest;
+use coordinode_search::tantivy::pending::Matches;
 
 use crate::proto::query;
 
@@ -113,107 +115,63 @@ impl TextServiceImpl {
         // node_id → HTML snippet from the property with the highest score.
         let mut node_snippets: HashMap<u64, String> = HashMap::new();
 
+        // Search path selection:
+        //
+        // A. Non-fuzzy + default language → the index's language pipeline
+        //    (stemming at query time matches index time), with snippets.
+        //
+        // B. Fuzzy → QueryParser with Levenshtein-1 expansion of every term
+        //    (`set_field_fuzzy`, not `~1`, which is phrase slop). The parser
+        //    uses the schema-level "none" tokenizer, so for stemmed languages
+        //    the typo must be within edit-1 of the stemmed term.
+        //
+        // C. Explicit language (non-fuzzy) → that language's pipeline; no
+        //    snippets for an explicit-language search.
+        let request = if req.fuzzy {
+            TextRequest::Fuzzy {
+                query: &effective_query,
+                snippets: true,
+            }
+        } else if req.language.is_empty() {
+            TextRequest::Terms {
+                query: &effective_query,
+                language: None,
+                snippets: true,
+            }
+        } else {
+            TextRequest::Terms {
+                query: &effective_query,
+                language: Some(&req.language),
+                snippets: false,
+            }
+        };
+
         for property in &indexed_properties {
-            // Waits for the index to hold every commit applied before the
-            // search; past the wait the search fails rather than answer
-            // without them.
-            let handle = match registry.read_handle(&req.label, property) {
-                Ok(Some(h)) => h,
+            // The index together with the committed writes it has not folded
+            // yet, which are read from the store: nothing waits on the index.
+            let view = match db.text_view(&req.label, property) {
+                Ok(Some(view)) => view,
                 Ok(None) => continue,
-                Err(behind) => return Err(super::error_details::index_behind(&behind)),
+                Err(e) => return Err(Status::internal(format!("text_search: {e}"))),
             };
-
-            let idx_guard = handle
-                .read()
-                .map_err(|_| Status::internal("text index read lock poisoned"))?;
-
-            // Search path selection:
-            //
-            // A. Non-fuzzy + default language → language-aware highlights path.
-            //    Uses the MultiLanguageTextIndex language pipeline for correct
-            //    stemming consistency (index time == query time).
-            //
-            // B. Fuzzy → QueryParser path (via inner().search_with_highlights).
-            //    tantivy's `term~1` syntax is a QueryParser feature; our language-
-            //    aware tokenizers do not understand it. The QueryParser uses the
-            //    schema-level "none" tokenizer (whitespace + lowercase), so fuzzy
-            //    expansion works on the unstemmed indexed forms. Note: for stemmed
-            //    languages (e.g. English), the fuzzy typo must be within edit-1 of
-            //    the stemmed term, not the original word.
-            //
-            // C. Explicit language (non-fuzzy) → language-specific search path.
-            //    Uses the requested language for correct stemming; no snippets.
-            if !req.fuzzy && req.language.is_empty() {
-                // Path A: non-fuzzy default language — correct stemming + snippets.
-                match idx_guard.search_with_highlights(&effective_query, per_property_limit) {
-                    Ok(results) => {
-                        for r in results {
-                            let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
-                            if r.score > *current {
-                                *current = r.score;
+            match view.find(request, Matches::Top(per_property_limit)) {
+                Ok(results) => {
+                    for r in results {
+                        let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
+                        if r.score > *current {
+                            *current = r.score;
+                            if !r.snippet_html.is_empty() {
                                 node_snippets.insert(r.node_id, r.snippet_html);
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            label = %req.label,
-                            property = %property,
-                            "text_search highlight error: {e}"
-                        );
-                    }
                 }
-            } else if req.fuzzy {
-                // Path B: fuzzy via QueryParser set_field_fuzzy.
-                // Uses search_with_highlights_fuzzy which enables Levenshtein-1 expansion
-                // at the QueryParser level (NOT via `~1` suffix which is phrase slop).
-                match idx_guard
-                    .inner()
-                    .search_with_highlights_fuzzy(&effective_query, per_property_limit)
-                {
-                    Ok(results) => {
-                        for r in results {
-                            let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
-                            if r.score > *current {
-                                *current = r.score;
-                                node_snippets.insert(r.node_id, r.snippet_html);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            label = %req.label,
-                            property = %property,
-                            "text_search fuzzy error: {e}"
-                        );
-                    }
-                }
-            } else {
-                // Path C: explicit language, non-fuzzy — correct per-language stemming.
-                // Snippets not available (language-specific path uses direct TermQuery
-                // construction, not tantivy QueryParser, so SnippetGenerator cannot
-                // be used with the same query object).
-                match idx_guard.search_with_language(
-                    &effective_query,
-                    per_property_limit,
-                    &req.language,
-                ) {
-                    Ok(results) => {
-                        for r in results {
-                            let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
-                            if r.score > *current {
-                                *current = r.score;
-                                // Snippet stays empty for explicit-language searches.
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            label = %req.label,
-                            property = %property,
-                            "text_search language search error: {e}"
-                        );
-                    }
+                Err(e) => {
+                    tracing::warn!(
+                        label = %req.label,
+                        property = %property,
+                        "text_search error: {e}"
+                    );
                 }
             }
         }

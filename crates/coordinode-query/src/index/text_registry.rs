@@ -2,19 +2,26 @@
 //!
 //! Holds in-memory tantivy index instances keyed by (label, property).
 //! Indexes are built from stored node text and maintained from the entries
-//! applied to the store, never from a statement before it commits: a search
-//! waits for them to cover the store (see [`IndexReadiness`]).
+//! applied to the store, never from a statement before it commits; a search
+//! reads each index together with the writes it has not folded yet (see
+//! [`IndexCoverage`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use coordinode_core::graph::node::NodeId;
-use coordinode_search::tantivy::TextSearchResult;
-use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
+use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_search::tantivy::multi_lang::{
+    MultiLangConfig, MultiLanguageTextIndex, TextRequest,
+};
+use coordinode_search::tantivy::pending::{Matches, PendingDocuments};
+use coordinode_search::tantivy::{HighlightedResult, TextSearchResult};
+use coordinode_storage::engine::transaction::Transaction;
 
+use super::coverage::{IndexCoverage, IndexDelta};
 use super::definition::{IndexDefinition, TextIndexConfig};
-use super::readiness::{IndexBehind, IndexReadiness};
 
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
@@ -34,10 +41,35 @@ pub struct TextIndexRegistry {
     definitions: RwLock<HashMap<TextIndexKey, IndexDefinition>>,
     /// Base directory for tantivy index data. Each index gets a subdirectory.
     base_dir: PathBuf,
-    /// How far the indexes cover the applied store, when a worker maintains
-    /// them from the applied entries; a registry without one serves what it
-    /// holds.
-    readiness: RwLock<Option<Arc<IndexReadiness>>>,
+    /// The writes the indexes have not folded, when a worker maintains them
+    /// from the applied entries; a registry without one serves what it holds.
+    coverage: RwLock<Option<Arc<IndexCoverage>>>,
+}
+
+/// One search's reading of a text index: the index, and the current
+/// documents of the nodes it has not caught up with in place of its own.
+pub struct TextView {
+    handle: TextHandle,
+    pending: PendingDocuments,
+}
+
+impl TextView {
+    /// Run `request`, best score first, keeping `matches`.
+    ///
+    /// # Errors
+    ///
+    /// The query could not be parsed or run.
+    pub fn find(
+        &self,
+        request: TextRequest<'_>,
+        matches: Matches,
+    ) -> Result<Vec<HighlightedResult>, String> {
+        self.handle
+            .read()
+            .map_err(|_| "text index lock poisoned".to_string())?
+            .find(request, matches, &self.pending)
+            .map_err(|e| e.to_string())
+    }
 }
 
 impl TextIndexRegistry {
@@ -47,42 +79,94 @@ impl TextIndexRegistry {
             indexes: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
             base_dir: base_dir.into(),
-            readiness: RwLock::new(None),
+            coverage: RwLock::new(None),
         }
     }
 
-    /// Make every search wait for the indexes to cover the store as
-    /// `readiness` reports it.
-    pub fn set_readiness(&self, readiness: Arc<IndexReadiness>) {
-        if let Ok(mut slot) = self.readiness.write() {
-            *slot = Some(readiness);
+    /// Learn from `coverage` which writes the indexes have not folded, so a
+    /// search answers for them itself.
+    pub fn set_coverage(&self, coverage: Arc<IndexCoverage>) {
+        if let Ok(mut slot) = self.coverage.write() {
+            *slot = Some(coverage);
         }
     }
 
-    /// The coverage searches wait on, if a worker maintains the indexes.
-    pub fn readiness(&self) -> Option<Arc<IndexReadiness>> {
-        self.readiness.read().ok().and_then(|r| r.clone())
+    /// Where searches learn the writes the indexes have not folded, if a
+    /// worker maintains them.
+    pub fn coverage(&self) -> Option<Arc<IndexCoverage>> {
+        self.coverage.read().ok().and_then(|r| r.clone())
     }
 
-    /// The index of `(label, property)` to search, once it holds every
-    /// commit applied before this call; `Ok(None)` when there is no such
+    /// What a search of `(label, property)` on `shard_id` reads: the index,
+    /// and in place of its documents of the nodes written since its position,
+    /// their documents as `read` sees them. `Ok(None)` when there is no such
     /// index.
     ///
     /// # Errors
     ///
-    /// [`IndexBehind`] when the indexes do not catch up within the wait.
-    pub fn read_handle(
+    /// The nodes could not be read, or the pending documents not built.
+    pub fn view(
         &self,
         label: &str,
         property: &str,
-    ) -> Result<Option<TextHandle>, IndexBehind> {
+        read: &Transaction<'_>,
+        shard_id: u16,
+        interner: &FieldInterner,
+    ) -> Result<Option<TextView>, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
-        if let Some(readiness) = self.readiness() {
-            readiness.await_covered()?;
+        let delta = match self.coverage() {
+            Some(coverage) => coverage.delta(shard_id),
+            None => IndexDelta::Nodes(Default::default()),
+        };
+        if delta.is_empty() {
+            return Ok(Some(TextView {
+                handle,
+                pending: PendingDocuments::none(),
+            }));
         }
-        Ok(Some(handle))
+        let field_id = interner.lookup(property);
+        // The text a node holds for this index, as the worker reads it.
+        let text = |record: &NodeRecord| -> Option<String> {
+            (record.primary_label() == label)
+                .then(|| record.props.get(&field_id?)?.as_str().map(str::to_string))
+                .flatten()
+        };
+        let (superseded, texts): (Option<Vec<u64>>, Vec<(NodeId, String)>) = match &delta {
+            IndexDelta::Nodes(nodes) => {
+                let mut ids: Vec<NodeId> = nodes.iter().copied().collect();
+                ids.sort_unstable();
+                let records = LocalNodeStore
+                    .get_many(read, shard_id, &ids)
+                    .map_err(|e| format!("read {} written nodes: {e}", ids.len()))?;
+                let texts = ids
+                    .iter()
+                    .zip(&records)
+                    .filter_map(|(id, record)| Some((*id, text(record.as_ref()?)?)))
+                    .collect();
+                (Some(ids.iter().map(|id| id.as_raw()).collect()), texts)
+            }
+            IndexDelta::Unknown => {
+                let mut texts = Vec::new();
+                LocalNodeStore
+                    .for_each_in_shard(read, shard_id, &mut |id, record| {
+                        if let Some(text) = text(&record) {
+                            texts.push((id, text));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| format!("scan the nodes of :{label}: {e}"))?;
+                (None, texts)
+            }
+        };
+        let documents = single_property_documents(property, &texts);
+        let pending = handle
+            .read()
+            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?
+            .pending(superseded.as_deref(), &documents)
+            .map_err(|e| format!("text index :{label}({property}): {e}"))?;
+        Ok(Some(TextView { handle, pending }))
     }
 
     /// Apply one batch of changes to the index of `(label, property)` in one

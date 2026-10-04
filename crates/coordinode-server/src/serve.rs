@@ -193,7 +193,6 @@ pub(crate) async fn serve(
         raft_snapshot_min_interval_secs,
         planner_stats_ttl_secs,
         vector_build_wait_ms,
-        index_ready_wait_ms,
         vector_retired_bytes_budget,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
@@ -707,9 +706,6 @@ pub(crate) async fn serve(
     }
     if let Some(ms) = vector_build_wait_ms {
         database.set_vector_build_wait(std::time::Duration::from_millis(ms));
-    }
-    if let Some(ms) = index_ready_wait_ms {
-        database.set_index_ready_wait(std::time::Duration::from_millis(ms));
     }
     if let Some(bytes) = vector_retired_bytes_budget {
         // A budget past the address space is no bound at all, which is what

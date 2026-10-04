@@ -23,7 +23,7 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::timestamp::Timestamp;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_query::index::{
-    BuildTarget, BuildToken, IndexReadiness, VectorBuild, VectorIndexRegistry,
+    BuildTarget, BuildToken, IndexCoverage, VectorBuild, VectorIndexRegistry,
 };
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
@@ -46,16 +46,17 @@ pub struct VectorIndexWorker {
 }
 
 impl VectorIndexWorker {
-    /// Spawn the worker on `applied`, a subscription to the Node partition
-    /// opened before the indexes were last built from the store, so no
-    /// applied entry falls between the two. `shard_id` is the shard whose
-    /// node rows the indexes hold.
+    /// Spawn the worker on `applied`, a retained subscription to the Node
+    /// partition opened before the indexes were last built from the store,
+    /// so no applied entry falls between the two. It releases the events it
+    /// has folded through `coverage`. `shard_id` is the shard whose node rows
+    /// the indexes hold.
     pub fn spawn(
         engine: Arc<StorageEngine>,
         applied: AppliedSubscription,
         registry: Arc<VectorIndexRegistry>,
         fields: Arc<dyn FieldRegistrar>,
-        readiness: Arc<IndexReadiness>,
+        coverage: Arc<IndexCoverage>,
         shard_id: u16,
     ) -> Self {
         let stop = registry.new_build_token();
@@ -66,7 +67,7 @@ impl VectorIndexWorker {
             applied,
             registry,
             fields,
-            readiness,
+            coverage,
             shard_id,
             stop: stop.clone(),
         };
@@ -114,8 +115,9 @@ struct Worker {
     /// Read afresh for each fold: an entry can carry a property registered
     /// after the worker started.
     fields: Arc<dyn FieldRegistrar>,
-    /// Where searches learn how far the indexes cover the store.
-    readiness: Arc<IndexReadiness>,
+    /// Where the events the indexes hold are released, so searches stop
+    /// answering their nodes from the store.
+    coverage: Arc<IndexCoverage>,
     shard_id: u16,
     /// Cancelled when the worker is asked to stop; also stops its rebuilds.
     stop: BuildToken,
@@ -145,7 +147,7 @@ impl Worker {
                     } => {
                         max_ts = max_ts.max(commit_ts);
                         last_seq = last_seq.max(seq);
-                        keys.extend(written);
+                        keys.extend(written.iter().cloned());
                     }
                     AppliedEvent::Replaced => replaced = true,
                 }
@@ -176,10 +178,11 @@ impl Worker {
             if max_ts > 0 {
                 self.registry.advance_indexed_hlc_all(max_ts);
             }
-            // A failed rebuild publishes nothing: searches then wait and fail
-            // explicitly rather than read an index missing commits.
+            // A failed rebuild releases nothing: searches keep answering those
+            // nodes from the store, and the full queue that follows brings
+            // the rebuild round again.
             if let Some(seq) = covered {
-                self.readiness.advance(seq);
+                self.coverage.release(seq);
             }
         }
         tracing::info!("vector index worker stopped");

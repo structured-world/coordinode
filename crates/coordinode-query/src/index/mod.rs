@@ -11,15 +11,15 @@ pub mod ttl_reaper;
 pub mod vector_build;
 pub mod vector_registry;
 
-pub mod readiness;
+pub mod coverage;
 pub mod text_registry;
 
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
+pub use coverage::{IndexCoverage, IndexDelta};
 pub use definition::{
     IndexDefinition, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
     OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
-pub use readiness::{DEFAULT_INDEX_READY_WAIT, IndexBehind, IndexReadiness, MaintainedIndex};
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };

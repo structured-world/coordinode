@@ -25,6 +25,226 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+/// Wait until the vector worker has folded every applied commit into the
+/// graph, for a test whose subject is the graph itself: a search does not
+/// wait, it answers the unfolded commits from the store exactly.
+fn await_folded(db: &Database) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    // The embedded database keeps its nodes on shard 1.
+    while !db.vector_index_registry().delta(1).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the vector worker did not fold the applied commits within 120 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+// ── Writes the index has not folded ──────────────────────────────────
+
+/// Hold the vector indexes' coverage on a subscription whose events are
+/// never released, as a worker that has folded nothing since this call
+/// would; the real worker's folds are waited out so they cannot overwrite
+/// what a test plants in the graph afterwards.
+struct HeldCoverage {
+    _held: coordinode_storage::engine::applied::AppliedSubscription,
+    worker: std::sync::Arc<coordinode_query::index::IndexCoverage>,
+}
+
+impl HeldCoverage {
+    fn hold(db: &Database, capacity: usize) -> Self {
+        let registry = db.vector_index_registry();
+        let worker = registry.coverage().expect("the worker's coverage");
+        let held = db.engine().subscribe_applied_retained(
+            coordinode_storage::engine::partition::Partition::Node,
+            capacity,
+        );
+        registry.set_coverage(std::sync::Arc::new(
+            coordinode_query::index::IndexCoverage::new(held.position()),
+        ));
+        Self {
+            _held: held,
+            worker,
+        }
+    }
+
+    fn await_worker(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !self.worker.delta(1).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never folded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+fn embed_id(db: &mut Database, name: &str) -> coordinode_core::graph::node::NodeId {
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:Embed {{name: '{name}'}}) RETURN id(n) AS id"
+        ))
+        .expect("id");
+    match rows[0].get("id") {
+        Some(Value::Int(id)) => coordinode_core::graph::node::NodeId::from_raw(*id as u64),
+        other => panic!("no id for {name}: {other:?}"),
+    }
+}
+
+/// The nearest names to `[1, 0, 0]` by the index's access path, with the
+/// distance the query computed.
+fn nearest(db: &mut Database, k: usize) -> Vec<(String, f64)> {
+    let query = format!(
+        "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+         ORDER BY d LIMIT {k} RETURN n.name AS name, d"
+    );
+    let plan = db.explain_cypher(&query).expect("explain");
+    assert!(plan.contains("HnswScan("), "not the index path:\n{plan}");
+    db.execute_cypher(&query)
+        .expect("search")
+        .into_iter()
+        .map(|row| {
+            let name = match row.get("name") {
+                Some(Value::String(s)) => s.clone(),
+                other => panic!("name: {other:?}"),
+            };
+            let d = match row.get("d") {
+                Some(Value::Float(d)) => *d,
+                other => panic!("distance: {other:?}"),
+            };
+            (name, d)
+        })
+        .collect()
+}
+
+fn names(found: &[(String, f64)]) -> Vec<&str> {
+    found.iter().map(|(n, _)| n.as_str()).collect()
+}
+
+/// An index search never waits for the vector worker: the nodes written by
+/// commits it has not folded are read from the store and ranked by their
+/// exact distance beside the index's hits, their index entries left out. The
+/// graph here holds stale vectors for each of them, as a lagging worker
+/// leaves it: a moved node, a deleted one, and none for a new one.
+#[test]
+fn an_index_search_answers_unfolded_writes_from_the_store() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    for (name, v) in [
+        ("moved", "[1.0, 0.0, 0.0]"),
+        ("doomed", "[0.95, 0.05, 0.0]"),
+        ("stay", "[0.5, 0.5, 0.0]"),
+    ] {
+        db.execute_cypher(&format!("CREATE (:Embed {{name: '{name}', vec: {v}}})"))
+            .expect("create");
+    }
+    let (moved, doomed) = (embed_id(&mut db, "moved"), embed_id(&mut db, "doomed"));
+
+    let held = HeldCoverage::hold(&db, 1024);
+    db.execute_cypher("MATCH (n:Embed {name: 'moved'}) SET n.vec = [0.0, 0.0, 1.0]")
+        .expect("move");
+    db.execute_cypher("MATCH (n:Embed {name: 'doomed'}) DETACH DELETE n")
+        .expect("delete");
+    db.execute_cypher("CREATE (:Embed {name: 'fresh', vec: [0.9, 0.0, 0.0]})")
+        .expect("create fresh");
+    held.await_worker();
+    db.vector_index_registry().on_vectors_written(
+        "Embed",
+        "vec",
+        vec![
+            (moved, vec![1.0, 0.0, 0.0]),
+            (doomed, vec![0.95, 0.05, 0.0]),
+        ],
+    );
+
+    let found = nearest(&mut db, 3);
+    assert_eq!(names(&found), ["fresh", "stay", "moved"], "{found:?}");
+    assert!((found[0].1 - 0.1).abs() < 1e-6, "{found:?}");
+    assert!(
+        (found[2].1 - 2f64.sqrt()).abs() < 1e-6,
+        "moved is ranked where it is now"
+    );
+}
+
+/// A filtered top-k over enough rows to use the index answers the rows of
+/// nodes written since the index's position by their exact distance, not by
+/// what the graph holds for them.
+#[test]
+fn a_filtered_top_k_ranks_unfolded_writes_by_their_rows() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    // Enough far-away rows that the filtered top-k takes the index path.
+    db.execute_cypher(
+        "UNWIND range(1, 1000) AS i \
+         CREATE (:Embed {name: 'far' + toString(i), kind: 'k', vec: [0.0, 5.0 + i * 0.001, 0.0]})",
+    )
+    .expect("bulk create");
+    db.execute_cypher("CREATE (:Embed {name: 'moved', kind: 'k', vec: [1.0, 0.0, 0.0]})")
+        .expect("create moved");
+    let moved = embed_id(&mut db, "moved");
+    let held = HeldCoverage::hold(&db, 4096);
+    db.execute_cypher("MATCH (n:Embed {name: 'moved'}) SET n.vec = [0.0, 0.0, 1.0]")
+        .expect("move");
+    db.execute_cypher("CREATE (:Embed {name: 'fresh', kind: 'k', vec: [0.9, 0.0, 0.0]})")
+        .expect("create fresh");
+    held.await_worker();
+    db.vector_index_registry().on_vectors_written(
+        "Embed",
+        "vec",
+        vec![(moved, vec![1.0, 0.0, 0.0])],
+    );
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Embed) WHERE n.kind = 'k' \
+             WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+             ORDER BY d LIMIT 3 RETURN n.name AS name",
+        )
+        .expect("search");
+    let found: Vec<String> = rows
+        .into_iter()
+        .filter_map(|row| match row.get("name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    // The graph still places `moved` at distance 0; its row says 1.414,
+    // behind the new node and ahead of the nearest index hit (5.1).
+    assert_eq!(found, ["fresh", "moved", "far1"]);
+}
+
+/// When the writes the graph lacks are not known (an event was dropped), an
+/// index search ranks every node of the label from the store.
+#[test]
+fn an_unknown_delta_ranks_from_the_store_alone() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    db.execute_cypher("CREATE (:Embed {name: 'moved', vec: [1.0, 0.0, 0.0]})")
+        .expect("create moved");
+    db.execute_cypher("CREATE (:Embed {name: 'stay', vec: [0.5, 0.5, 0.0]})")
+        .expect("create stay");
+    let moved = embed_id(&mut db, "moved");
+
+    // A queue of one: the second write is dropped, so the delta is unknown.
+    let held = HeldCoverage::hold(&db, 1);
+    db.execute_cypher("MATCH (n:Embed {name: 'moved'}) SET n.vec = [0.0, 0.0, 1.0]")
+        .expect("move");
+    db.execute_cypher("CREATE (:Embed {name: 'fresh', vec: [0.9, 0.0, 0.0]})")
+        .expect("create fresh");
+    held.await_worker();
+    db.vector_index_registry().on_vectors_written(
+        "Embed",
+        "vec",
+        vec![(moved, vec![1.0, 0.0, 0.0])],
+    );
+
+    assert_eq!(names(&nearest(&mut db, 3)), ["fresh", "stay", "moved"]);
+}
+
 // ── Transactional maintenance ─────────────────────────────────────────
 
 /// A vector change in a transaction that rolls back never reaches the HNSW
@@ -885,9 +1105,6 @@ fn remove_property_removes_from_vector_index() {
 #[test]
 fn create_vector_index_with_rabitq_2bit_quantization() {
     let (mut db, _dir) = open_db();
-    // The search right after a bulk load waits for the worker to insert all
-    // of it; this test is about recall, so the wait is no bound on it.
-    db.set_index_ready_wait(std::time::Duration::from_secs(120));
 
     // d=64 is the smallest dim accepted by RaBitQ (multiple of 64).
     // calibration_threshold defaults to 1000 inside HnswIndex; we go
@@ -950,6 +1167,8 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
     let create_query = format!("UNWIND {rows} AS r CREATE (m:Doc) SET m = r RETURN m");
     let created = db.execute_cypher(&create_query).expect("bulk create");
     assert_eq!(created.len(), N, "bulk create returned wrong row count");
+    // The codec is what is under test: search the graph, not the store.
+    await_folded(&db);
 
     // Query = cluster-0 centroid (matches noisy nodes with i % K == 0).
     let query_centroid = cluster_centroid(0);
@@ -1005,9 +1224,6 @@ fn create_vector_index_with_rabitq_2bit_quantization() {
 #[test]
 fn create_vector_index_ef_search_option_recovers_adversarial_recall() {
     let (mut db, _dir) = open_db();
-    // The search right after a bulk load waits for the worker to insert all
-    // of it; this test is about recall, so the wait is no bound on it.
-    db.set_index_ready_wait(std::time::Duration::from_secs(120));
 
     // ef_search=5000 >> N forces a near-exhaustive candidate list, so the
     // 2-bit cheap-distance noise floor no longer traps the search in an
@@ -1047,6 +1263,9 @@ fn create_vector_index_ef_search_option_recovers_adversarial_recall() {
         ))
         .expect("bulk create adversarial vectors");
     assert_eq!(created.len(), N, "bulk create returned wrong row count");
+    // The index's recall is what is under test: search the graph, not the
+    // store.
+    await_folded(&db);
 
     // Query e_0 (non-zero at dim 0 only).
     let mut q = String::from("[1.0");

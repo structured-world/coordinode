@@ -1,17 +1,9 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
+use coordinode_core::graph::node::{NodeId, encode_node_key};
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
-use coordinode_query::index::{IndexReadiness, MaintainedIndex};
-use coordinode_storage::engine::applied::AppliedSubscription;
+use coordinode_query::index::{IndexCoverage, IndexDelta};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
-
-/// The text indexes' coverage over `sub`, searches waiting at most `wait`.
-fn readiness(sub: &AppliedSubscription, wait: Duration) -> IndexReadiness {
-    IndexReadiness::new(MaintainedIndex::Text, sub.position(), wait)
-}
 
 fn engine(dir: &tempfile::TempDir) -> StorageEngine {
     StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
@@ -24,14 +16,13 @@ fn engine(dir: &tempfile::TempDir) -> StorageEngine {
     .expect("open")
 }
 
-/// Apply one Node write as entry `index`, so the subscription is offered
-/// one more event.
-fn apply(engine: &StorageEngine, index: u64) {
+/// Apply a write of node `id` on `shard` as entry `index`.
+fn apply(engine: &StorageEngine, index: u64, shard: u16, id: u64) {
     engine
         .apply_raft_proposal(
             &[Mutation::Put {
                 partition: PartitionId::Node,
-                key: format!("node:k{index}").into_bytes(),
+                key: encode_node_key(shard, NodeId::from_raw(id)),
                 value: b"v".to_vec(),
             }],
             10 + index,
@@ -42,81 +33,59 @@ fn apply(engine: &StorageEngine, index: u64) {
         .expect("apply");
 }
 
-/// With nothing applied, or everything applied folded, a search goes ahead
-/// at once.
-#[test]
-fn a_search_over_covered_indexes_does_not_wait() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = engine(&dir);
-    let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = readiness(&sub, Duration::from_secs(5));
-
-    let started = Instant::now();
-    assert_eq!(readiness.await_covered(), Ok(()));
-    apply(&engine, 1);
-    readiness.advance(1);
-    assert_eq!(readiness.await_covered(), Ok(()));
-    assert!(started.elapsed() < Duration::from_secs(1));
+fn nodes(ids: &[u64]) -> IndexDelta {
+    IndexDelta::Nodes(ids.iter().map(|id| NodeId::from_raw(*id)).collect())
 }
 
-/// An applied entry the worker has not folded keeps a search waiting; past
-/// the wait it fails naming what the indexes hold and what it needed,
-/// instead of answering without the entry.
+/// A search learns the nodes of its shard written by entries the worker has
+/// not released, whether the worker has taken them or not, and stops seeing
+/// them once they are released.
 #[test]
-fn a_search_ahead_of_the_indexes_fails_after_its_wait() {
+fn the_delta_names_the_nodes_of_unreleased_entries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
-    let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = readiness(&sub, Duration::from_millis(50));
-    apply(&engine, 1);
-    apply(&engine, 2);
-    readiness.advance(1);
+    let sub = engine.subscribe_applied_retained(Partition::Node, 16);
+    let coverage = IndexCoverage::new(sub.position());
+    assert_eq!(coverage.delta(1), nodes(&[]));
 
-    let err = readiness
-        .await_covered()
-        .expect_err("the indexes lack entry 2");
+    apply(&engine, 1, 1, 7);
+    apply(&engine, 2, 2, 8);
+    apply(&engine, 3, 1, 9);
     assert_eq!(
-        (err.kind, err.folded, err.needed),
-        (MaintainedIndex::Text, 1, 2)
+        coverage.delta(1),
+        nodes(&[7, 9]),
+        "shard 2's node is not ours"
     );
-    assert!(err.waited_ms >= 50, "{err:?}");
+
+    // Taken but not folded: still the search's to answer.
+    let _ = sub.try_next();
+    assert_eq!(coverage.delta(1), nodes(&[7, 9]));
+    coverage.release(1);
+    assert_eq!(coverage.delta(1), nodes(&[9]));
+    let _ = sub.try_next();
+    let _ = sub.try_next();
+    coverage.release(3);
+    assert!(coverage.delta(1).is_empty());
 }
 
-/// A search waiting on the indexes goes ahead as soon as the worker folds
-/// what it needs, without waiting out its bound.
+/// A write dropped from a full queue leaves the delta unknown, so a search
+/// answers every node from the store, until the rebuild that follows is
+/// released.
 #[test]
-fn a_waiting_search_goes_ahead_when_the_worker_catches_up() {
+fn a_dropped_write_makes_the_delta_unknown_until_the_rebuild_is_released() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = engine(&dir);
-    let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = Arc::new(readiness(&sub, Duration::from_secs(30)));
-    apply(&engine, 1);
+    let sub = engine.subscribe_applied_retained(Partition::Node, 1);
+    let coverage = IndexCoverage::new(sub.position());
 
-    let worker = {
-        let readiness = Arc::clone(&readiness);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            readiness.advance(1);
-        })
-    };
-    let started = Instant::now();
-    assert_eq!(readiness.await_covered(), Ok(()));
-    assert!(started.elapsed() < Duration::from_secs(10));
-    worker.join().expect("worker");
-}
+    apply(&engine, 1, 1, 7);
+    apply(&engine, 2, 1, 8);
+    assert_eq!(coverage.delta(1), IndexDelta::Unknown);
+    assert!(coverage.delta(1).contains(NodeId::from_raw(12345)));
 
-/// The wait can be changed on a live readiness; zero refuses a search ahead
-/// of the indexes at once.
-#[test]
-fn the_wait_is_retunable_and_zero_refuses_at_once() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = engine(&dir);
-    let sub = engine.subscribe_applied(Partition::Node, 16);
-    let readiness = readiness(&sub, Duration::from_secs(30));
-    apply(&engine, 1);
-    readiness.set_wait(Duration::ZERO);
-
-    let started = Instant::now();
-    assert!(readiness.await_covered().is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let covered = sub.position().delivered();
+    let _ = sub.try_next();
+    let _ = sub.try_next();
+    coverage.release(covered);
+    assert!(coverage.delta(1).is_empty());
 }
