@@ -930,6 +930,95 @@ pub enum LogicalOp {
 }
 
 impl LogicalOp {
+    /// Replace every child operator this one reads rows from with `f(child)`,
+    /// leaving the operator itself as it is: a rewrite pass applies itself to
+    /// the whole tree through this, so no operator's input escapes it. The
+    /// pattern of MERGE and UPSERT is not a child: it is the template their
+    /// execution matches and creates from, read in its written shape.
+    #[must_use]
+    pub fn map_inputs(mut self, mut f: impl FnMut(LogicalOp) -> LogicalOp) -> LogicalOp {
+        let mut apply = |child: &mut LogicalOp| {
+            let taken = std::mem::replace(child, LogicalOp::Empty);
+            *child = f(taken);
+        };
+        match &mut self {
+            LogicalOp::Traverse { input, .. }
+            | LogicalOp::Filter { input, .. }
+            | LogicalOp::Project { input, .. }
+            | LogicalOp::Aggregate { input, .. }
+            | LogicalOp::Sort { input, .. }
+            | LogicalOp::Limit { input, .. }
+            | LogicalOp::Skip { input, .. }
+            | LogicalOp::CreateEdge { input, .. }
+            | LogicalOp::Update { input, .. }
+            | LogicalOp::RemoveOp { input, .. }
+            | LogicalOp::Delete { input, .. }
+            | LogicalOp::AttachDocument { input, .. }
+            | LogicalOp::DetachDocument { input, .. }
+            | LogicalOp::MergeNodes { input, .. }
+            | LogicalOp::CloneNode { input, .. }
+            | LogicalOp::RedirectEdges { input, .. }
+            | LogicalOp::Unwind { input, .. }
+            | LogicalOp::VectorFilter { input, .. }
+            | LogicalOp::EdgeVectorSearch { input, .. }
+            | LogicalOp::VectorTopK { input, .. }
+            | LogicalOp::TextFilter { input, .. }
+            | LogicalOp::EncryptedFilter { input, .. }
+            | LogicalOp::ShortestPath { input, .. }
+            | LogicalOp::ProcedureCall { input, .. }
+            | LogicalOp::RankFuse { input, .. }
+            | LogicalOp::DocScore { input, .. }
+            | LogicalOp::MaxSimTopK { input, .. } => apply(input),
+            LogicalOp::CartesianProduct { left, right }
+            | LogicalOp::LeftOuterJoin { left, right } => {
+                apply(left);
+                apply(right);
+            }
+            LogicalOp::Foreach { input, body, .. }
+            | LogicalOp::CallSubquery { input, body, .. } => {
+                apply(input);
+                apply(body);
+            }
+            LogicalOp::CreateNode { input, .. } => {
+                if let Some(input) = input {
+                    apply(input);
+                }
+            }
+            LogicalOp::Union { inputs, .. } => inputs.iter_mut().for_each(&mut apply),
+            LogicalOp::Merge { .. }
+            | LogicalOp::Upsert { .. }
+            | LogicalOp::Extension { .. }
+            | LogicalOp::NodeScan { .. }
+            | LogicalOp::IndexScan { .. }
+            | LogicalOp::HnswScan { .. }
+            | LogicalOp::Empty
+            | LogicalOp::AlterLabel { .. }
+            | LogicalOp::CreateTextIndex { .. }
+            | LogicalOp::DropTextIndex { .. }
+            | LogicalOp::CreateEncryptedIndex { .. }
+            | LogicalOp::DropEncryptedIndex { .. }
+            | LogicalOp::CreateIndex { .. }
+            | LogicalOp::DropIndex { .. }
+            | LogicalOp::CreateConstraint { .. }
+            | LogicalOp::DropConstraint { .. }
+            | LogicalOp::AlterIndexMaintenance { .. }
+            | LogicalOp::SetNamespaceIndexDefault { .. }
+            | LogicalOp::CreateVectorIndex { .. }
+            | LogicalOp::DropVectorIndex { .. }
+            | LogicalOp::CreateEdgeType { .. }
+            | LogicalOp::CreateNodeType { .. }
+            | LogicalOp::CreateTable { .. }
+            | LogicalOp::CreateTrigger { .. }
+            | LogicalOp::DropTrigger { .. }
+            | LogicalOp::DropTable { .. }
+            | LogicalOp::ShowTriggers
+            | LogicalOp::ShowSessions
+            | LogicalOp::ShowTransactions
+            | LogicalOp::AlterTrigger { .. } => {}
+        }
+        self
+    }
+
     /// Replace all `Expr::Parameter` nodes in this operator tree with literal values.
     pub fn substitute_params(&mut self, params: &HashMap<String, Value>) {
         match self {

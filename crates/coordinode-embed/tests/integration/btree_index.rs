@@ -116,6 +116,144 @@ fn drop_nonexistent_index_returns_error() {
 
 // ── EXPLAIN regression: IndexScan after CREATE INDEX ─────────────────
 
+/// Writes that find their node through the index change exactly that node:
+/// a guarded heartbeat SET, a REMOVE and a DETACH DELETE, each leaving the
+/// other nodes of the label as they were.
+#[test]
+fn writes_through_the_index_change_only_their_node() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX agent_session ON :Agent(session_id)")
+        .expect("CREATE INDEX");
+    for (sid, seen) in [("s1", 10), ("s2", 10), ("s3", 10)] {
+        db.execute_cypher(&format!(
+            "CREATE (:Agent {{session_id: '{sid}', fingerprint: 'f', last_seen_at_ms: {seen}}})"
+        ))
+        .expect("create");
+    }
+    let mut params = std::collections::HashMap::new();
+    params.insert("sid".to_string(), Value::String("s2".into()));
+    params.insert("fp".to_string(), Value::String("f".into()));
+    params.insert("now".to_string(), Value::Int(20));
+    let rows = db
+        .execute_cypher_with_params(
+            "MATCH (a:Agent {session_id: $sid}) WHERE a.fingerprint = $fp AND a.last_seen_at_ms <= $now \
+             SET a.last_seen_at_ms = $now RETURN a.session_id AS sid",
+            params.clone(),
+        )
+        .expect("heartbeat");
+    assert_eq!(rows.len(), 1);
+    // The guard holds back a stale heartbeat.
+    params.insert("now".to_string(), Value::Int(15));
+    let stale = db
+        .execute_cypher_with_params(
+            "MATCH (a:Agent {session_id: $sid}) WHERE a.fingerprint = $fp AND a.last_seen_at_ms <= $now \
+             SET a.last_seen_at_ms = $now RETURN a.session_id AS sid",
+            params,
+        )
+        .expect("stale heartbeat");
+    assert!(stale.is_empty(), "the guard refused it: {stale:?}");
+    db.execute_cypher("MATCH (a:Agent {session_id: 's1'}) REMOVE a.fingerprint")
+        .expect("remove");
+    db.execute_cypher("MATCH (a:Agent {session_id: 's3'}) DETACH DELETE a")
+        .expect("delete");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (a:Agent) RETURN a.session_id AS sid, a.last_seen_at_ms AS seen, \
+             a.fingerprint AS fp ORDER BY sid",
+        )
+        .expect("read back");
+    let got: Vec<(Value, Value, Value)> = rows
+        .iter()
+        .map(|r| (r["sid"].clone(), r["seen"].clone(), r["fp"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Value::String("s1".into()), Value::Int(10), Value::Null),
+            (
+                Value::String("s2".into()),
+                Value::Int(20),
+                Value::String("f".into())
+            ),
+        ]
+    );
+}
+
+/// A SET on a temporal label found through the index opens the next version
+/// of exactly that node.
+#[test]
+fn a_temporal_set_through_the_index_opens_the_next_version() {
+    use coordinode_core::graph::types::Value;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (code: STRING, name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    db.execute_cypher("CREATE INDEX emp_code ON :Emp(code)")
+        .expect("CREATE INDEX");
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64
+        - 1_000_000;
+    for code in ["a", "b"] {
+        db.execute_cypher(&format!(
+            "CREATE (:Emp {{code: '{code}', name: 'old', valid_from: {t}}})"
+        ))
+        .expect("create");
+    }
+    let explain = db
+        .explain_cypher("MATCH (n:Emp {code: 'a'}) SET n.name = 'new'")
+        .expect("EXPLAIN");
+    assert!(explain.contains("IndexScan"), "{explain}");
+    db.execute_cypher("MATCH (n:Emp {code: 'a'}) SET n.name = 'new'")
+        .expect("set");
+    let rows = db
+        .execute_cypher("MATCH (n:Emp) RETURN n.code AS code, n.name AS name ORDER BY code")
+        .expect("read back");
+    let got: Vec<(Value, Value)> = rows
+        .iter()
+        .map(|r| (r["code"].clone(), r["name"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Value::String("a".into()), Value::String("new".into())),
+            (Value::String("b".into()), Value::String("old".into())),
+        ]
+    );
+}
+
+/// A write whose MATCH finds its node by an indexed property looks it up in
+/// the index, as the same MATCH does for a read: a SET, REMOVE or DELETE
+/// over a label scan costs every node of the label on every statement. The
+/// first shape is a heartbeat: an inline key plus residual conditions.
+#[test]
+fn a_write_finds_its_node_through_the_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX agent_session ON :Agent(session_id)")
+        .expect("CREATE INDEX");
+    for query in [
+        "MATCH (a:Agent {session_id: $sid}) WHERE a.fingerprint = $fp AND a.last_seen_at_ms <= $now \
+         SET a.last_seen_at_ms = $now RETURN a.session_id",
+        "MATCH (a:Agent) WHERE a.session_id = 's1' SET a.seen = 1",
+        "MATCH (a:Agent {session_id: 's1'}) REMOVE a.seen",
+        "MATCH (a:Agent {session_id: 's1'}) DELETE a",
+        "MATCH (a:Agent {session_id: 's1'}) DETACH DELETE a",
+        "MATCH (a:Agent {session_id: 's1'}) SET a += {seen: 1}",
+        "MATCH (a:Agent {session_id: 's1'}) FOREACH (x IN [1] | SET a.seen = x)",
+    ] {
+        let explain = db.explain_cypher(query).expect("EXPLAIN");
+        assert!(
+            explain.contains("IndexScan(a:Agent ON agent_session(session_id))")
+                && !explain.contains("NodeScan"),
+            "{query}\nmust find its node through the index, got:\n{explain}"
+        );
+    }
+}
+
 #[test]
 fn explain_shows_index_scan_after_create_index_via_cypher() {
     // Regression test: after CREATE INDEX, EXPLAIN for a matching
