@@ -1125,6 +1125,7 @@ impl Database {
         if !follow_raft_applies {
             db.rebuild_legacy_btree_indexes()?;
             db.resume_interrupted_index_builds()?;
+            db.adopt_unowned_unique_indexes()?;
         }
         Ok(db)
     }
@@ -3420,6 +3421,128 @@ impl Database {
             }
         }
         Ok(finished)
+    }
+
+    /// Make every unique B-tree index that no constraint owns the uniqueness
+    /// constraint of the same name, owning it. An earlier release kept
+    /// uniqueness as an index of its own and a flag on the property; the
+    /// catalog holds it as a constraint, and an index alone must not enforce
+    /// a uniqueness the constraint catalog does not show.
+    ///
+    /// One catalog commit per index adds the constraint, active, claims its
+    /// name, clears the property flags and records the index's owner. The
+    /// index is neither rebuilt nor dropped, so uniqueness holds throughout.
+    /// An index whose label already has an equivalent constraint, or whose
+    /// name a constraint of another label holds, is left as it is and
+    /// reported. A partial index stays: a constraint has no filter. Returns
+    /// how many indexes became constraints.
+    ///
+    /// # Errors
+    ///
+    /// Publishing through the log failed (this member is not the leader).
+    pub fn adopt_unowned_unique_indexes(&self) -> Result<usize, DatabaseError> {
+        use coordinode_core::schema::definition::{
+            ConstraintKind, ConstraintState, LabelSchema, NodeConstraint, SchemaMode,
+        };
+        use coordinode_modality::{
+            ENTRY_LAYOUT, IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _,
+        };
+        use coordinode_query::index::{IndexState, IndexType};
+        let unowned: Vec<_> = self
+            .index_registry
+            .all()
+            .into_iter()
+            .filter(|d| {
+                d.index_type == IndexType::BTree
+                    && d.unique
+                    && d.owner.is_none()
+                    && d.filter.is_none()
+                    && d.layout == ENTRY_LAYOUT
+                    && d.state == IndexState::Ready
+            })
+            .collect();
+        if unowned.is_empty() {
+            return Ok(0);
+        }
+        let indexes = LocalIndexStore::new(&self.engine);
+        let schemas = LocalSchemaStore::new(&self.engine);
+        let mut adopted = 0;
+        for def in unowned {
+            let constraint = NodeConstraint {
+                name: def.name.clone(),
+                properties: def.properties.clone(),
+                kind: ConstraintKind::Unique,
+                state: ConstraintState::Active,
+            };
+            let version = indexes.definition_version(&def.name)?;
+            let mut skipped = None;
+            self.commit_catalog(|txn| -> Result<(), DatabaseError> {
+                if let Some(holder) = schemas.constraint_label_txn(txn, &def.name)? {
+                    skipped = Some(format!(
+                        "constraint '{}' of :{holder} holds the name",
+                        def.name
+                    ));
+                    return Ok(());
+                }
+                let mut schema = match schemas.load_label_for_update_txn(txn, &def.label)? {
+                    Some(s) => s,
+                    // A label without a schema is enforced as FLEXIBLE; the
+                    // schema the constraint creates keeps that.
+                    None => {
+                        let mut s = LabelSchema::new_node_id(&def.label);
+                        s.set_mode(SchemaMode::Flexible);
+                        s
+                    }
+                };
+                if let Some(existing) = schema
+                    .constraints()
+                    .iter()
+                    .find(|c| c.same_requirement(&constraint))
+                {
+                    skipped = Some(format!(
+                        "constraint '{}' already requires the same of :{}",
+                        existing.name, def.label
+                    ));
+                    return Ok(());
+                }
+                for property in &def.properties {
+                    if let Some(p) = schema.properties.get_mut(property) {
+                        p.unique = false;
+                    }
+                }
+                schema.add_constraint(constraint.clone());
+                schema.schema_revision =
+                    schema.schema_revision.checked_add(1).ok_or_else(|| {
+                        DatabaseError::Other(format!(
+                            "label '{}' has no schema revision left",
+                            def.label
+                        ))
+                    })?;
+                // The index already enforces what the constraint requires, so
+                // every stored node satisfies the new revision.
+                schemas.save_label_admitting_txn(txn, &schema)?;
+                schemas.claim_constraint_name_txn(txn, &def.name, &def.label)?;
+                let owned = def.clone().owned_by(&def.name);
+                indexes.expect_definition_txn(txn, &def.name, version)?;
+                indexes.put_definition_txn(txn, &owned)?;
+                Ok(())
+            })?;
+            match skipped {
+                Some(reason) => tracing::warn!(
+                    index = %def.name,
+                    reason,
+                    "a unique index no constraint owns stays as it is"
+                ),
+                None => {
+                    adopted += 1;
+                    tracing::info!(index = %def.name, "a unique index became the constraint owning it");
+                }
+            }
+        }
+        if adopted > 0 {
+            self.refresh_btree_indexes()?;
+        }
+        Ok(adopted)
     }
 
     /// Reload the index definitions from the schema partition, so a member

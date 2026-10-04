@@ -880,7 +880,17 @@ fn a_refused_withdrawal_keeps_the_published_index_enforced() {
     expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'new'})"));
 
     refuse.store(false, Ordering::SeqCst);
-    db.execute_cypher("DROP INDEX user_email").expect("drop");
+    let err = db
+        .execute_cypher("DROP INDEX user_email")
+        .expect_err("the index belongs to its constraint");
+    assert!(
+        err.to_string()
+            .contains("index 'user_email' belongs to constraint 'user_email'"),
+        "{err}"
+    );
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'new'})"));
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop");
     db.execute_cypher("CREATE (:User {email: 'new'})")
         .expect("withdrawn now");
 }
@@ -1139,4 +1149,279 @@ fn constraint_ddl_survives_a_kill_and_replay() {
         .expect("the dropped uniqueness holds no more");
     db.execute_cypher("DROP CONSTRAINT user_email")
         .expect("the name survived the replay");
+}
+
+// ── Uniqueness held by an index alone ────────────────────────────────
+
+/// The unique indexes on `label`, by name.
+fn unique_indexes_on(db: &Database, label: &str) -> Vec<String> {
+    use coordinode_query::index::ops::list_index_definitions;
+    let mut names: Vec<String> = list_index_definitions(db.engine())
+        .expect("list indexes")
+        .into_iter()
+        .filter(|d| d.label == label && d.unique)
+        .map(|d| d.name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Leave in `db` what an earlier release kept for a property declared
+/// unique: the flag on the property of `label`'s schema (when `flag`) and
+/// a unique index `index` over it that no constraint owns, in the entry
+/// layout the next open rebuilds.
+fn plant_earlier_uniqueness(db: &Database, label: &str, property: &str, index: &str, flag: bool) {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef};
+    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::ops::save_index_definition;
+    if flag {
+        let mut schema = LabelSchema::new_node_id(label);
+        let mut p = PropertyDef::new(property, PropertyType::String);
+        p.unique = true;
+        schema.add_property(p);
+        LocalSchemaStore::new(db.engine())
+            .save_label(&schema)
+            .expect("plant the earlier schema");
+    }
+    let mut legacy = IndexDefinition::btree(index, label, property).unique();
+    legacy.layout = 0;
+    save_index_definition(db.engine(), &legacy).expect("plant the earlier index");
+}
+
+/// The owner recorded on index `name`.
+fn index_owner(db: &Database, name: &str) -> Option<String> {
+    coordinode_query::index::ops::load_index_definition(db.engine(), name)
+        .expect("load")
+        .expect("the index is defined")
+        .owner
+}
+
+/// A store written before uniqueness became a constraint holds it as a
+/// unique index of its own and a flag on the property. Opened now, that
+/// index becomes the constraint of the same name, owning it: listed as
+/// active, still enforcing, the flag gone, and a constraint asked for again
+/// over the same property finds it instead of building a second index.
+#[test]
+fn a_unique_index_of_its_own_becomes_the_constraint_owning_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:User {email: 'a@x'})")
+            .expect("a");
+        db.execute_cypher("CREATE (:User {email: 'b@x'})")
+            .expect("b");
+        plant_earlier_uniqueness(&db, "User", "email", "user_email", true);
+    }
+
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].constraint.name, "user_email");
+    assert_eq!(listed[0].constraint.kind, ConstraintKind::Unique);
+    assert_eq!(listed[0].constraint.properties, ["email"]);
+    assert_eq!(listed[0].constraint.state, ConstraintState::Active);
+    assert_eq!(listed[0].backing_index.as_deref(), Some("user_email"));
+    assert_eq!(
+        index_owner(&db, "user_email").as_deref(),
+        Some("user_email")
+    );
+    let stored = LocalSchemaStore::new(db.engine())
+        .load_label("User")
+        .expect("load")
+        .expect("the schema is kept");
+    assert!(
+        stored.properties.values().all(|p| !p.unique),
+        "the property flag is gone"
+    );
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+
+    let again = db
+        .execute_cypher("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("an equivalent constraint is found");
+    assert_eq!(
+        again[0].get("constraint"),
+        Some(&Value::String("user_email".into()))
+    );
+    assert_eq!(
+        unique_indexes_on(&db, "User"),
+        ["user_email"],
+        "no second index"
+    );
+
+    // Opening again changes nothing.
+    drop(db);
+    let db = Database::open(dir.path()).expect("third open");
+    assert_eq!(db.constraints().expect("constraints").len(), 1);
+}
+
+/// `CREATE UNIQUE INDEX` declares the same invariant a uniqueness
+/// constraint does: it is listed as a constraint owning the index, and a
+/// constraint asked for over the same property finds it.
+#[test]
+fn create_unique_index_declares_a_constraint_owning_it() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX user_email ON :User(email)")
+        .expect("unique index");
+
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].constraint.name, "user_email");
+    assert_eq!(listed[0].constraint.state, ConstraintState::Active);
+    assert_eq!(listed[0].backing_index.as_deref(), Some("user_email"));
+
+    db.execute_cypher("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("an equivalent constraint is found");
+    assert_eq!(
+        unique_indexes_on(&db, "User"),
+        ["user_email"],
+        "no second index"
+    );
+    db.execute_cypher("CREATE (:User {email: 'a@x'})")
+        .expect("first");
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+}
+
+/// The options a `CREATE UNIQUE INDEX` states shape the index its
+/// constraint owns: SPARSE leaves nodes without the value out, and a stated
+/// maintenance profile is the index's.
+#[test]
+fn create_unique_index_keeps_its_stated_options() {
+    use coordinode_query::index::IndexProfile;
+    let (mut db, _dir) = open_db();
+    let rows = db
+        .execute_cypher(
+            "CREATE UNIQUE SPARSE INDEX user_email ON :User(email) \
+             OPTIONS {maintenance: 'derived'}",
+        )
+        .expect("unique index");
+    assert_eq!(rows[0].get("unique"), Some(&Value::Bool(true)));
+    assert_eq!(rows[0].get("sparse"), Some(&Value::Bool(true)));
+    assert_eq!(
+        rows[0].get("maintenance"),
+        Some(&Value::String("DERIVED".into()))
+    );
+    let def = coordinode_query::index::ops::load_index_definition(db.engine(), "user_email")
+        .expect("load")
+        .expect("defined");
+    assert!(def.sparse && def.unique);
+    assert_eq!(def.maintenance.profile, IndexProfile::Derived);
+    assert_eq!(def.owner.as_deref(), Some("user_email"));
+}
+
+/// A unique index over the same property as an existing constraint
+/// requires nothing that constraint does not: it is not made a second
+/// constraint, stays as it is, and uniqueness is enforced as before.
+#[test]
+fn an_index_duplicating_a_constraint_is_left_as_it_is() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher(
+            "CREATE CONSTRAINT user_email_unique FOR (u:User) REQUIRE u.email IS UNIQUE",
+        )
+        .expect("constraint");
+        db.execute_cypher("CREATE (:User {email: 'a@x'})")
+            .expect("a");
+        plant_earlier_uniqueness(&db, "User", "email", "user_email", false);
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].constraint.name, "user_email_unique");
+    assert_eq!(index_owner(&db, "user_email"), None);
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+}
+
+/// An index whose name a constraint of another label already holds cannot
+/// become a constraint of that name: it is left as it is, the other
+/// constraint untouched, uniqueness still enforced.
+#[test]
+fn an_index_whose_name_another_constraint_holds_is_left_as_it_is() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE CONSTRAINT shared FOR (o:Org) REQUIRE o.code IS NOT NULL")
+            .expect("constraint");
+        db.execute_cypher("CREATE (:User {email: 'a@x'})")
+            .expect("a");
+        plant_earlier_uniqueness(&db, "User", "email", "shared", false);
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].label, "Org");
+    assert_eq!(listed[0].constraint.kind, ConstraintKind::NotNull);
+    assert_eq!(index_owner(&db, "shared"), None);
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
+}
+
+/// An earlier index the stored data breaks (duplicates it let in) is not
+/// enforcing anything once rebuilt: it is not made an active constraint.
+#[test]
+fn an_index_the_stored_data_breaks_does_not_become_a_constraint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:User {email: 'same'}), (:User {email: 'same'})")
+            .expect("duplicates");
+        plant_earlier_uniqueness(&db, "User", "email", "user_email", true);
+    }
+    let db = Database::open(dir.path()).expect("reopen");
+    assert!(db.constraints().expect("constraints").is_empty());
+    let def = coordinode_query::index::ops::load_index_definition(db.engine(), "user_email")
+        .expect("load")
+        .expect("kept, failed");
+    assert!(
+        matches!(
+            def.state,
+            coordinode_query::index::IndexState::Failed { .. }
+        ),
+        "{:?}",
+        def.state
+    );
+    assert_eq!(def.owner, None);
+}
+
+/// A partial unique index requires uniqueness only among the nodes its
+/// filter admits, which a constraint cannot state: it stays an index.
+#[test]
+fn a_partial_unique_index_stays_an_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX active_email ON :User(email) WHERE n.active = true")
+        .expect("partial unique index");
+    assert!(db.constraints().expect("constraints").is_empty());
+    assert_eq!(index_owner(&db, "active_email"), None);
+    db.execute_cypher("CREATE (:User {email: 'a@x', active: true})")
+        .expect("first active");
+    db.execute_cypher("CREATE (:User {email: 'a@x', active: false})")
+        .expect("an inactive node is outside the filter");
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x', active: true})"));
+}
+
+/// A label with no schema of its own gets one when its index becomes a
+/// constraint, enforced as FLEXIBLE as before: undeclared properties stay
+/// writable.
+#[test]
+fn an_index_on_a_label_without_a_schema_becomes_a_constraint_of_a_flexible_one() {
+    use coordinode_core::schema::definition::SchemaMode;
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:User {email: 'a@x'})")
+            .expect("a");
+        plant_earlier_uniqueness(&db, "User", "email", "user_email", false);
+    }
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let schema = LocalSchemaStore::new(db.engine())
+        .load_label("User")
+        .expect("load")
+        .expect("the constraint created a schema");
+    assert_eq!(schema.mode, SchemaMode::Flexible);
+    assert_eq!(
+        schema.constraint("user_email").map(|c| c.state),
+        Some(ConstraintState::Active)
+    );
+    db.execute_cypher("CREATE (:User {email: 'b@x', anything: 1})")
+        .expect("undeclared properties stay writable");
+    expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
 }

@@ -146,7 +146,8 @@ backed by an index the table always has.
 CoordiNode maintains indexes when you create them:
 
 ```cypher
--- Exact property index (B-tree); UNIQUE enforces one node per value
+-- Exact property index (B-tree); UNIQUE enforces one node per value and is
+-- the uniqueness constraint person_email, owning the index
 CREATE UNIQUE INDEX person_email ON :Person(email)
 
 -- Full-text index (Tantivy)

@@ -4167,6 +4167,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             label,
             properties,
             kind,
+            OwnedIndexShape::default(),
             ctx,
         ),
 
@@ -17310,6 +17311,40 @@ fn execute_create_btree_index(
             name: name.to_string(),
         });
     }
+    // A unique index declares the invariant a uniqueness constraint does, so
+    // it is that constraint, owning the index: the constraint catalog shows
+    // every uniqueness the engine enforces, and a constraint declared later
+    // over the same property finds it. A partial index stays an index: a
+    // constraint has no filter.
+    if unique && filter.is_none() {
+        let constrained = execute_create_constraint(
+            Some(name),
+            false,
+            label,
+            &[property.to_string()],
+            &coordinode_core::schema::definition::ConstraintKind::Unique,
+            OwnedIndexShape {
+                sparse: Some(sparse),
+                maintenance,
+            },
+            ctx,
+        )?;
+        let indexed = constrained
+            .first()
+            .and_then(|r| r.get("nodes_indexed").cloned())
+            .unwrap_or(Value::Int(0));
+        let mut row = Row::new();
+        row.insert("index".to_string(), Value::String(name.to_string()));
+        row.insert("label".to_string(), Value::String(label.to_string()));
+        row.insert("property".to_string(), Value::String(property.to_string()));
+        row.insert("unique".to_string(), Value::Bool(true));
+        row.insert("sparse".to_string(), Value::Bool(sparse));
+        row.insert("nodes_indexed".to_string(), indexed);
+        if let Some(def) = ctx.btree_index_registry.and_then(|r| r.get(name)) {
+            insert_maintenance(&mut row, &def.maintenance);
+        }
+        return Ok(vec![row]);
+    }
     let mut def = crate::index::IndexDefinition::btree(name, label, property);
     if unique {
         def = def.unique();
@@ -17699,12 +17734,24 @@ fn constraint_row(
 /// both active. Stored duplicates withdraw both in one commit. A build
 /// interrupted in between leaves the constraint validating, enforced, and
 /// reported as unfinished until it is dropped.
+/// How the index a uniqueness or key constraint owns is built, when the
+/// statement declaring it says so (`CREATE UNIQUE INDEX`).
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnedIndexShape {
+    /// Leave nodes missing a value out of the index; `None` takes the
+    /// constraint kind's own choice.
+    sparse: Option<bool>,
+    /// The index's maintenance profile; `None` takes the namespace default.
+    maintenance: Option<crate::index::IndexProfile>,
+}
+
 fn execute_create_constraint(
     name: Option<&str>,
     if_not_exists: bool,
     label: &str,
     properties: &[String],
     kind: &coordinode_core::schema::definition::ConstraintKind,
+    shape: OwnedIndexShape,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     use coordinode_core::schema::definition::{ConstraintKind, ConstraintState, NodeConstraint};
@@ -17863,10 +17910,13 @@ fn execute_create_constraint(
             .owned_by(&constraint.name);
     // A node missing a value is not constrained by uniqueness; a key
     // requires the values, which its per-node part enforces.
-    if constraint.kind == ConstraintKind::Unique {
+    if shape
+        .sparse
+        .unwrap_or(constraint.kind == ConstraintKind::Unique)
+    {
         def = def.sparse();
     }
-    let build = publish_index_build(def, None, ctx, &mut stage_constraint);
+    let build = publish_index_build(def, shape.maintenance, ctx, &mut stage_constraint);
     ctx.label_schema_cache.remove(label);
     let build = build?;
 

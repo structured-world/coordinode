@@ -1828,3 +1828,55 @@ async fn schema_label_cache_multiple_doc_functions_same_node() {
         "q.metrics must be set after doc_push"
     );
 }
+
+/// A store holding uniqueness as a unique index of its own, as an earlier
+/// release left it, lists that uniqueness through ListConstraints once
+/// opened: an active constraint of the index's name, backed by that index.
+/// A CreateConstraint with if_not_exists over the same property returns it,
+/// building no second index.
+#[tokio::test]
+async fn an_earlier_unique_index_is_listed_and_found_as_a_constraint() {
+    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::ops::{list_index_definitions, save_index_definition};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:Customer {email: 'a@x'})")
+            .expect("a");
+        let mut legacy = IndexDefinition::btree("customer_email", "Customer", "email").unique();
+        legacy.layout = 0;
+        save_index_definition(db.engine(), &legacy).expect("plant the earlier index");
+    }
+    let svc = SchemaServiceImpl::new(Arc::new(RwLock::new(
+        Database::open(dir.path()).expect("reopen"),
+    )));
+
+    let listed = svc
+        .list_constraints(Request::new(schema::ListConstraintsRequest::default()))
+        .await
+        .expect("list")
+        .into_inner()
+        .constraints;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].name, "customer_email");
+    assert_eq!(listed[0].kind, schema::ConstraintKind::Unique as i32);
+    assert_eq!(listed[0].state, schema::ConstraintState::Active as i32);
+    assert_eq!(listed[0].backing_index, "customer_email");
+
+    let mut again = unique("", "Customer", "email");
+    again.if_not_exists = true;
+    let found = svc
+        .create_constraint(Request::new(again))
+        .await
+        .expect("an equivalent constraint is found")
+        .into_inner();
+    assert_eq!(found.name, "customer_email");
+    let db = svc.database.read();
+    let unique_indexes = list_index_definitions(db.engine())
+        .expect("indexes")
+        .into_iter()
+        .filter(|d| d.label == "Customer" && d.unique)
+        .count();
+    assert_eq!(unique_indexes, 1, "no second index");
+}

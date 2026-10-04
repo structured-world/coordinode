@@ -312,10 +312,11 @@ B-tree index on a single property. Optional: `UNIQUE`, `SPARSE` (skip nulls), `W
 
 ```cypher
 CREATE INDEX user_email ON :User(email)
-CREATE UNIQUE INDEX user_email ON :User(email)
+CREATE UNIQUE INDEX user_handle ON :User(handle)
 CREATE SPARSE INDEX article_deleted ON :Article(deleted_at)
 CREATE INDEX active_users ON :User(name) WHERE active = true
 DROP INDEX user_email
+DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
 ```
 
 - **Entries commit with the data.** An index entry is written by the same
@@ -329,6 +330,14 @@ DROP INDEX user_email
   PostgreSQL wire). Two concurrent writers of one value: exactly one commits.
   A node without the property holds NULL, and NULL is a value, so a unique
   index allows one such node; declare it `SPARSE` to skip them.
+- **A unique index is a constraint.** `CREATE UNIQUE INDEX name ...` creates
+  the uniqueness constraint `name`, owning the index of the same name, as
+  `CREATE CONSTRAINT name ... IS UNIQUE` does, keeping the `SPARSE` and
+  maintenance options the statement states. It is listed with the other
+  constraints, a `CREATE CONSTRAINT ... IF NOT EXISTS` over the same property
+  finds it instead of building a second index, `DROP INDEX` refuses it and
+  `DROP CONSTRAINT` removes both. A partial unique index (`WHERE`) stays an
+  index of its own, since a constraint has no filter.
 - **Building.** `CREATE INDEX` indexes the nodes already stored before it
   returns, and serves lookups once built. `CREATE UNIQUE INDEX` over data that
   already has a duplicate fails and leaves no index.

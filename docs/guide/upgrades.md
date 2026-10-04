@@ -64,6 +64,24 @@ two or more formats behind, or written by a newer release, is refused by name
 and left untouched: take it through the intermediate release first, or remove
 the member from its group and add it back empty.
 
+## Uniqueness from earlier releases
+
+Earlier releases kept a unique property as a flag on the label's property and
+a unique index of its own, named `<label>_<property>` in lower case. On open
+(in a cluster, on the leader once it leads) each such index that is built
+becomes the uniqueness constraint of the same name, owning that index: one
+catalog change adds the constraint as active and clears the property flag.
+The index is neither rebuilt nor dropped, so uniqueness is enforced
+throughout, and the constraint is listed like any other (gRPC
+`ListConstraints`, the embedded `Database::constraints`). An index left as it
+is, and reported in the log:
+
+- one whose label already has an equivalent constraint,
+- one whose name a constraint of another label holds,
+- one the stored data breaks (duplicates it let in): it stays failed until the
+  data is fixed and the uniqueness is created again,
+- a partial index (`WHERE`), which a constraint cannot state.
+
 ## Watching a move
 
 `GET /version` on the operational port (`7084` by default) returns the

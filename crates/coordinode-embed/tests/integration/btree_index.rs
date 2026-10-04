@@ -448,9 +448,11 @@ fn unique_index_rejects_duplicate_insert() {
     );
 }
 
+/// A unique index is the constraint of the same name, owning it: DROP INDEX
+/// refuses it and leaves uniqueness enforced, DROP CONSTRAINT lifts it and
+/// takes the index with it.
 #[test]
-fn drop_index_then_duplicate_insert_succeeds() {
-    // After DROP INDEX, the unique constraint is lifted and duplicates are allowed.
+fn a_unique_index_is_dropped_through_its_constraint() {
     let (mut db, _dir) = open_db();
 
     db.execute_cypher("CREATE UNIQUE INDEX u_code ON :Item(code)")
@@ -458,16 +460,25 @@ fn drop_index_then_duplicate_insert_succeeds() {
     db.execute_cypher("CREATE (:Item {code: 'X1'})")
         .expect("first insert");
 
-    // Drop the unique index.
-    db.execute_cypher("DROP INDEX u_code").expect("DROP INDEX");
-
-    // Now duplicate should be allowed.
-    let result = db.execute_cypher("CREATE (:Item {code: 'X1'})");
+    let err = db
+        .execute_cypher("DROP INDEX u_code")
+        .expect_err("the index belongs to its constraint");
     assert!(
-        result.is_ok(),
-        "after DROP INDEX, duplicate insert must succeed, got: {:?}",
-        result.err()
+        err.to_string()
+            .contains("index 'u_code' belongs to constraint 'u_code'"),
+        "{err}"
     );
+    assert!(
+        db.execute_cypher("CREATE (:Item {code: 'X1'})").is_err(),
+        "a refused DROP INDEX leaves uniqueness enforced"
+    );
+
+    db.execute_cypher("DROP CONSTRAINT u_code")
+        .expect("DROP CONSTRAINT");
+    db.execute_cypher("CREATE (:Item {code: 'X1'})")
+        .expect("uniqueness lifted with the constraint");
+    db.execute_cypher("CREATE INDEX u_code ON :Item(code)")
+        .expect("the index went with the constraint, its name is free");
 }
 
 // ── DETACH DELETE index cleanup regression ────────────────────────────
