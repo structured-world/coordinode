@@ -49,6 +49,55 @@ fn a_waiting_subscriber_wakes_on_an_apply() {
     ));
 }
 
+/// Events are numbered from 1 in the order they are offered, a dropped one
+/// takes its number too, and the position reports the last number offered:
+/// a consumer that folded up to that number covers every entry in the store.
+#[test]
+fn events_are_numbered_and_the_position_counts_dropped_ones() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let sub = engine.subscribe_applied(Partition::Node, 1);
+    let position = sub.position();
+    assert_eq!(position.delivered(), 0);
+
+    for (i, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
+        let index = i as u64 + 1;
+        engine
+            .apply_raft_proposal(&[put(PartitionId::Node, key)], 10 + index, index, 0, |_| {
+                false
+            })
+            .expect("apply");
+    }
+    // A queue of one held the first event; the next two were dropped.
+    assert_eq!(position.delivered(), 3);
+    assert_eq!(
+        sub.try_next(),
+        Some(AppliedEvent::Replaced),
+        "the drop is reported before the queued events"
+    );
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys {
+            seq: 1,
+            index: 1,
+            ..
+        })
+    ));
+
+    engine
+        .apply_raft_proposal(&[put(PartitionId::Node, b"d")], 20, 4, 0, |_| false)
+        .expect("apply");
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys {
+            seq: 4,
+            index: 4,
+            ..
+        })
+    ));
+    assert_eq!(position.delivered(), 4);
+}
+
 /// A stop ends a wait that has no deadline, and every later wait returns at
 /// once: the consumer's shutdown never waits for an apply.
 #[test]
@@ -100,6 +149,7 @@ fn an_applied_entry_reports_its_keys_in_the_partition() {
     assert_eq!(
         sub.next(NO_WAIT),
         Some(AppliedEvent::Keys {
+            seq: 1,
             index: 7,
             commit_ts: 42,
             keys: vec![b"a".to_vec(), b"b".to_vec()],

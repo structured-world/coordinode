@@ -1,8 +1,9 @@
 //! Text index registry: tracks active tantivy text indexes for full-text search.
 //!
 //! Holds in-memory tantivy index instances keyed by (label, property).
-//! Indexes are populated from stored node text on `Database::open()` and
-//! maintained incrementally on node create/update/delete.
+//! Indexes are built from stored node text and maintained from the entries
+//! applied to the store, never from a statement before it commits: a search
+//! waits for them to cover the store (see [`TextReadiness`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use coordinode_search::tantivy::TextSearchResult;
 use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
 
 use super::definition::{IndexDefinition, TextIndexConfig};
+use super::text_readiness::{TextNotReady, TextReadiness};
 
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
@@ -32,6 +34,10 @@ pub struct TextIndexRegistry {
     definitions: RwLock<HashMap<TextIndexKey, IndexDefinition>>,
     /// Base directory for tantivy index data. Each index gets a subdirectory.
     base_dir: PathBuf,
+    /// How far the indexes cover the applied store, when a worker maintains
+    /// them from the applied entries; a registry without one serves what it
+    /// holds.
+    readiness: RwLock<Option<Arc<TextReadiness>>>,
 }
 
 impl TextIndexRegistry {
@@ -41,7 +47,88 @@ impl TextIndexRegistry {
             indexes: RwLock::new(HashMap::new()),
             definitions: RwLock::new(HashMap::new()),
             base_dir: base_dir.into(),
+            readiness: RwLock::new(None),
         }
+    }
+
+    /// Make every search wait for the indexes to cover the store as
+    /// `readiness` reports it.
+    pub fn set_readiness(&self, readiness: Arc<TextReadiness>) {
+        if let Ok(mut slot) = self.readiness.write() {
+            *slot = Some(readiness);
+        }
+    }
+
+    /// The coverage searches wait on, if a worker maintains the indexes.
+    pub fn readiness(&self) -> Option<Arc<TextReadiness>> {
+        self.readiness.read().ok().and_then(|r| r.clone())
+    }
+
+    /// The index of `(label, property)` to search, once it holds every
+    /// commit applied before this call; `Ok(None)` when there is no such
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// [`TextNotReady`] when the indexes do not catch up within the wait.
+    pub fn read_handle(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<TextHandle>, TextNotReady> {
+        let Some(handle) = self.get(label, property) else {
+            return Ok(None);
+        };
+        if let Some(readiness) = self.readiness() {
+            readiness.await_covered()?;
+        }
+        Ok(Some(handle))
+    }
+
+    /// Apply one batch of changes to the index of `(label, property)` in one
+    /// commit: `upserts` replace a node's text, `removals` take a node out.
+    pub fn apply_changes(
+        &self,
+        label: &str,
+        property: &str,
+        upserts: &[(NodeId, String)],
+        removals: &[NodeId],
+    ) -> Result<(), String> {
+        let Some(handle) = self.get(label, property) else {
+            return Ok(());
+        };
+        let upserts = single_property_documents(property, upserts);
+        let removals: Vec<u64> = removals.iter().map(|id| id.as_raw()).collect();
+        let mut idx = handle
+            .write()
+            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
+        idx.apply_changes(&upserts, &removals)
+            .map_err(|e| format!("text index :{label}({property}): {e}"))
+    }
+
+    /// Rebuild the index of `(label, property)` from `scan`, the nodes'
+    /// texts as the store holds them; how many documents it then holds.
+    ///
+    /// The index stays locked from before the scan until the rebuilt
+    /// contents are committed, so a change folded in meanwhile lands after
+    /// the rebuild rather than under it: the scan reads every commit applied
+    /// before it started, and the worker folds every one after.
+    pub fn rebuild_index(
+        &self,
+        label: &str,
+        property: &str,
+        scan: impl FnOnce() -> Result<Vec<(NodeId, String)>, String>,
+    ) -> Result<usize, String> {
+        let Some(handle) = self.get(label, property) else {
+            return Ok(0);
+        };
+        let mut idx = handle
+            .write()
+            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
+        let documents = single_property_documents(property, &scan()?);
+        idx.replace_all(&documents)
+            .map_err(|e| format!("text index :{label}({property}): {e}"))?;
+        Ok(documents.len())
     }
 
     /// Convert a `TextIndexConfig` to `MultiLangConfig`.
@@ -92,9 +179,32 @@ impl TextIndexRegistry {
                 Self::to_multi_lang_config(config)
             };
 
-            let text_index =
-                MultiLanguageTextIndex::open_or_create(&idx_dir, 15_000_000, per_field_config)
-                    .map_err(|e| format!("failed to create text index for {prop}: {e}"))?;
+            // Every registration is followed by a rebuild from the store (on
+            // open, on CREATE TEXT INDEX, after a restore), so the index starts
+            // empty and its files need no durability: a crash loses nothing
+            // the next rebuild does not restore.
+            let text_index = match MultiLanguageTextIndex::create_scratch(
+                &idx_dir,
+                15_000_000,
+                per_field_config.clone(),
+            ) {
+                Ok(index) => index,
+                // An index replaced in this process may still have its files
+                // mapped by a reader finishing a search, and Windows refuses
+                // to remove a mapped file: the new one starts in a fresh
+                // directory beside it instead.
+                Err(first) => {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or_default();
+                    let fresh = idx_dir.with_extension(nanos.to_string());
+                    MultiLanguageTextIndex::create_scratch(&fresh, 15_000_000, per_field_config)
+                        .map_err(|e| {
+                            format!("failed to create text index for {prop}: {first}; {e}")
+                        })?
+                }
+            };
 
             let key = (def.label.clone(), prop.clone());
             if let Ok(mut indexes) = self.indexes.write() {
@@ -224,6 +334,56 @@ impl TextIndexRegistry {
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
+}
+
+/// The text of `property` on every node of `label` stored on `shard_id`, as
+/// the store holds it now: what a text index of `(label, property)` holds
+/// when it covers the store.
+///
+/// # Errors
+///
+/// The scan of the node partition failed.
+pub fn stored_texts(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard_id: u16,
+    interner: &coordinode_core::graph::intern::FieldInterner,
+    label: &str,
+    property: &str,
+) -> Result<Vec<(NodeId, String)>, String> {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+
+    // No binding: no stored node carries the property.
+    let Some(field_id) = interner.lookup(property) else {
+        return Ok(Vec::new());
+    };
+    let mut texts = Vec::new();
+    LocalNodeStore
+        .for_each_in_shard_at_snapshot(engine, None, shard_id, &mut |node_id, _key, record| {
+            if record.primary_label() == label {
+                if let Some(text) = record.props.get(&field_id).and_then(|v| v.as_str()) {
+                    texts.push((node_id, text.to_string()));
+                }
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
+        .map_err(|e| format!("scan the nodes of :{label} for its text index: {e}"))?;
+    Ok(texts)
+}
+
+/// `(node, text)` pairs as the per-node property maps the index takes, so
+/// each is tokenized by the property's analyzer.
+fn single_property_documents(
+    property: &str,
+    texts: &[(NodeId, String)],
+) -> Vec<(u64, HashMap<String, String>)> {
+    texts
+        .iter()
+        .map(|(id, text)| {
+            let mut props = HashMap::with_capacity(1);
+            props.insert(property.to_string(), text.clone());
+            (id.as_raw(), props)
+        })
+        .collect()
 }
 
 impl Default for TextIndexRegistry {

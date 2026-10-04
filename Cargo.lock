@@ -1021,6 +1021,7 @@ dependencies = [
  "coordinode-vector",
  "coordinode-workspace-hack",
  "criterion",
+ "parking_lot",
  "pest",
  "pest_derive",
  "rand 0.10.3",

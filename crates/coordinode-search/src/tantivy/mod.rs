@@ -10,6 +10,7 @@
 //! Segment merging happens asynchronously in tantivy's background thread.
 
 pub mod multi_lang;
+pub mod scratch_dir;
 pub mod segment_registry;
 pub mod tokenize;
 
@@ -164,17 +165,17 @@ pub struct TextIndex {
     registry: RwLock<SegmentRegistry>,
 }
 
-impl TextIndex {
-    /// Open or create a text index at the given directory path.
-    ///
-    /// `heap_size_bytes`: IndexWriter memory budget (default: 50MB).
-    /// `language`: Optional language for stemming (e.g. "english", "russian", "ukrainian").
-    ///   If None, uses simple tokenizer without stemming.
-    pub fn open_or_create(
-        dir: &Path,
-        heap_size_bytes: usize,
-        language: Option<&str>,
-    ) -> Result<Self, TextSearchError> {
+/// The schema of a text index and the fields the index reads by handle.
+struct Layout {
+    tokenizer_name: String,
+    schema: Schema,
+    node_id_field: Field,
+    body_field: Field,
+    commit_ts_field: Field,
+}
+
+impl Layout {
+    fn new(language: Option<&str>) -> Self {
         let tokenizer_name = language
             .map(|l| format!("coordinode_{l}"))
             .unwrap_or_else(|| "default".to_string());
@@ -196,15 +197,79 @@ impl TextIndex {
         // every snapshot reader (0 ≤ any T).
         let commit_ts_opts = NumericOptions::default().set_fast().set_stored();
         let commit_ts_field = schema_builder.add_u64_field(COMMIT_TS_FIELD, commit_ts_opts);
-        let schema = schema_builder.build();
+        Self {
+            tokenizer_name,
+            schema: schema_builder.build(),
+            node_id_field,
+            body_field,
+            commit_ts_field,
+        }
+    }
+}
 
+impl TextIndex {
+    /// Open or create a text index at the given directory path.
+    ///
+    /// `heap_size_bytes`: IndexWriter memory budget (default: 50MB).
+    /// `language`: Optional language for stemming (e.g. "english", "russian", "ukrainian").
+    ///   If None, uses simple tokenizer without stemming.
+    pub fn open_or_create(
+        dir: &Path,
+        heap_size_bytes: usize,
+        language: Option<&str>,
+    ) -> Result<Self, TextSearchError> {
+        let layout = Layout::new(language);
         let index = if dir.join("meta.json").exists() {
             Index::open_in_dir(dir)?
         } else {
             std::fs::create_dir_all(dir)
                 .map_err(|e| TextSearchError::IndexCorrupted(format!("cannot create dir: {e}")))?;
-            Index::create_in_dir(dir, schema.clone())?
+            Index::create_in_dir(dir, layout.schema.clone())?
         };
+        Self::over(index, layout, heap_size_bytes, language)
+    }
+
+    /// Create an empty index at `dir`, replacing whatever the directory
+    /// held, whose files are written without syncing them (see
+    /// [`scratch_dir::ScratchDirectory`]). Only for an index the caller
+    /// rebuilds from its source every time it creates it.
+    pub fn create_scratch(
+        dir: &Path,
+        heap_size_bytes: usize,
+        language: Option<&str>,
+    ) -> Result<Self, TextSearchError> {
+        let layout = Layout::new(language);
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|e| {
+                TextSearchError::IndexCorrupted(format!("clear {}: {e}", dir.display()))
+            })?;
+        }
+        std::fs::create_dir_all(dir)
+            .map_err(|e| TextSearchError::IndexCorrupted(format!("cannot create dir: {e}")))?;
+        let directory = scratch_dir::ScratchDirectory::open(dir)
+            .map_err(|e| TextSearchError::IndexCorrupted(format!("open {}: {e}", dir.display())))?;
+        let index = Index::create(
+            directory,
+            layout.schema.clone(),
+            tantivy::IndexSettings::default(),
+        )?;
+        Self::over(index, layout, heap_size_bytes, language)
+    }
+
+    /// The text index over `index`, laid out as `layout`.
+    fn over(
+        index: Index,
+        layout: Layout,
+        heap_size_bytes: usize,
+        language: Option<&str>,
+    ) -> Result<Self, TextSearchError> {
+        let Layout {
+            tokenizer_name,
+            schema,
+            node_id_field,
+            body_field,
+            commit_ts_field,
+        } = layout;
 
         // Register language-specific tokenizer.
         // - "none" → whitespace + lowercase, no stemming/stop words

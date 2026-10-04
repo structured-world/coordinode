@@ -104,6 +104,20 @@ impl MultiLanguageTextIndex {
         Ok(Self { inner, config })
     }
 
+    /// Create an empty index at `dir`, replacing whatever it held, with files
+    /// written unsynced (see [`TextIndex::create_scratch`]): for an index the
+    /// caller rebuilds from its source every time it creates it.
+    pub fn create_scratch(
+        dir: &Path,
+        heap_size_bytes: usize,
+        config: MultiLangConfig,
+    ) -> Result<Self, TextSearchError> {
+        // Tokenization happens per document via PreTokenizedString, as in
+        // `open_or_create`.
+        let inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"))?;
+        Ok(Self { inner, config })
+    }
+
     /// Wrap an existing `TextIndex` with multi-language support.
     ///
     /// Useful for tests and migration from single-language to multi-language.
@@ -125,6 +139,92 @@ impl MultiLanguageTextIndex {
         node_id: u64,
         properties: &HashMap<String, String>,
     ) -> Result<(), TextSearchError> {
+        if !self.stage_node(node_id, properties)? {
+            return Ok(());
+        }
+        self.publish()
+    }
+
+    /// Add multiple nodes in a single batch commit.
+    pub fn add_nodes_batch(
+        &mut self,
+        nodes: &[(u64, HashMap<String, String>)],
+    ) -> Result<(), TextSearchError> {
+        for (node_id, properties) in nodes {
+            self.stage_node(*node_id, properties)?;
+        }
+        self.publish()
+    }
+
+    /// Replace the documents of `upserts` and remove those of `removals`, in
+    /// one commit: a reader sees all of the changes or none. A node listed in
+    /// both ends up as its upsert. A removal of a node the index does not
+    /// hold costs no commit, so writes outside the index leave it untouched.
+    pub fn apply_changes(
+        &mut self,
+        upserts: &[(u64, HashMap<String, String>)],
+        removals: &[u64],
+    ) -> Result<(), TextSearchError> {
+        let mut changed = false;
+        for node_id in removals {
+            if self.contains(*node_id)? {
+                self.inner.writer.delete_term(tantivy::Term::from_field_u64(
+                    self.inner.node_id_field,
+                    *node_id,
+                ));
+                changed = true;
+            }
+        }
+        for (node_id, properties) in upserts {
+            // A node whose text tokenizes to nothing is left out, as removed.
+            if !self.stage_node(*node_id, properties)? {
+                self.inner.writer.delete_term(tantivy::Term::from_field_u64(
+                    self.inner.node_id_field,
+                    *node_id,
+                ));
+            }
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        self.publish()
+    }
+
+    /// Whether the index holds a live document of `node_id`.
+    pub fn contains(&self, node_id: u64) -> Result<bool, TextSearchError> {
+        let term = tantivy::Term::from_field_u64(self.inner.node_id_field, node_id);
+        let query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        let live = self
+            .inner
+            .reader
+            .searcher()
+            .search(&query, &tantivy::collector::Count)?;
+        Ok(live > 0)
+    }
+
+    /// Replace the whole index with `documents`, in one commit: a document
+    /// of a node not listed is gone, and a reader sees the old set or the new
+    /// one, never a mix.
+    pub fn replace_all(
+        &mut self,
+        documents: &[(u64, HashMap<String, String>)],
+    ) -> Result<(), TextSearchError> {
+        self.inner.writer.delete_all_documents()?;
+        for (node_id, properties) in documents {
+            self.stage_node(*node_id, properties)?;
+        }
+        self.publish()
+    }
+
+    /// Queue `node_id`'s document built from `properties`, replacing any
+    /// earlier one; whether there was text to index. Nothing is visible to
+    /// readers until [`Self::publish`].
+    fn stage_node(
+        &mut self,
+        node_id: u64,
+        properties: &HashMap<String, String>,
+    ) -> Result<bool, TextSearchError> {
         // Extract the language override from the node properties (level 2)
         let node_language_override = properties
             .get(&self.config.language_override_property)
@@ -174,7 +274,7 @@ impl MultiLanguageTextIndex {
         }
 
         if all_tokens.is_empty() && all_text.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         // Use the inner TextIndex's PreTokenizedString path
@@ -200,89 +300,11 @@ impl MultiLanguageTextIndex {
             &tantivy::schema::OwnedValue::U64(0),
         );
         self.inner.writer.add_document(doc)?;
-
-        self.inner.writer.commit()?;
-        self.inner.reader.reload()?;
-        self.inner.reconcile_registry()?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Add multiple nodes in a single batch commit.
-    pub fn add_nodes_batch(
-        &mut self,
-        nodes: &[(u64, HashMap<String, String>)],
-    ) -> Result<(), TextSearchError> {
-        for (node_id, properties) in nodes {
-            let node_language_override = properties
-                .get(&self.config.language_override_property)
-                .map(|s| s.as_str());
-
-            let mut all_tokens = Vec::new();
-            let mut all_text = String::new();
-            let mut position_offset = 0;
-
-            for (field_name, field_value) in properties {
-                if field_name == &self.config.language_override_property {
-                    continue;
-                }
-                if !self.config.field_analyzers.is_empty()
-                    && !self.config.field_analyzers.contains_key(field_name)
-                {
-                    continue;
-                }
-
-                let language =
-                    self.resolve_language(field_name, field_value, node_language_override);
-
-                let byte_offset = all_text.len();
-                if !all_text.is_empty() {
-                    all_text.push(' ');
-                }
-                all_text.push_str(field_value);
-
-                let mut tokens = tokenize::tokenize_text(field_value, &language);
-                let text_start = if byte_offset > 0 {
-                    byte_offset + 1
-                } else {
-                    byte_offset
-                };
-                for tok in &mut tokens {
-                    tok.offset_from += text_start;
-                    tok.offset_to += text_start;
-                    tok.position += position_offset;
-                }
-                position_offset += tokens.len();
-                all_tokens.extend(tokens);
-            }
-
-            if all_tokens.is_empty() && all_text.is_empty() {
-                continue;
-            }
-
-            let node_id_term = tantivy::Term::from_field_u64(self.inner.node_id_field, *node_id);
-            self.inner.writer.delete_term(node_id_term);
-
-            let pretokenized = tantivy::tokenizer::PreTokenizedString {
-                text: all_text,
-                tokens: all_tokens,
-            };
-
-            let mut doc = tantivy::TantivyDocument::new();
-            doc.add_field_value(
-                self.inner.node_id_field,
-                &tantivy::schema::OwnedValue::U64(*node_id),
-            );
-            doc.add_field_value(
-                self.inner.body_field,
-                &tantivy::schema::OwnedValue::PreTokStr(pretokenized),
-            );
-            doc.add_field_value(
-                self.inner.commit_ts_field,
-                &tantivy::schema::OwnedValue::U64(0),
-            );
-            self.inner.writer.add_document(doc)?;
-        }
-
+    /// Commit the staged changes and make them visible to readers.
+    fn publish(&mut self) -> Result<(), TextSearchError> {
         self.inner.writer.commit()?;
         self.inner.reader.reload()?;
         self.inner.reconcile_registry()?;

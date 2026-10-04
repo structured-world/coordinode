@@ -12,6 +12,7 @@ pub mod api;
 pub mod backup;
 pub mod db;
 pub mod repair;
+pub mod text_worker;
 pub mod vector_worker;
 
 pub use coordinode_core::txn::transaction::CommitReceipt;

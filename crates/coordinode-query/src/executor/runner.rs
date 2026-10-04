@@ -185,6 +185,13 @@ pub enum ExecutionError {
         leader_id: Option<u64>,
     },
 
+    /// A full-text search found the text indexes behind the commits its
+    /// snapshot includes after its wait. Nothing was answered: an index
+    /// lacking a committed write would miss or misrank rows. Retryable once
+    /// the indexes catch up.
+    #[error("{0}")]
+    TextNotReady(#[from] crate::index::TextNotReady),
+
     /// The write reached a member that does not run its group's version.
     /// Nothing was applied; the same write succeeds at the leader named in
     /// the refusal, when one is known.
@@ -829,7 +836,8 @@ pub struct ExecutionContext<'a> {
     pub text_index: Option<&'a coordinode_search::tantivy::multi_lang::MultiLanguageTextIndex>,
     /// Text index registry for automatic full-text index management.
     /// When set, `execute_text_filter` resolves the text index by (label, property).
-    /// Write operations auto-maintain text indexes via `on_text_written`/`on_text_deleted`.
+    /// Writes do not touch it: the text indexes follow the committed records,
+    /// and a search waits for them to cover the store.
     pub text_index_registry: Option<&'a crate::index::TextIndexRegistry>,
     /// Vector indexes for HNSW-accelerated vector search and `CREATE VECTOR
     /// INDEX`. When set, VectorFilter checks for applicable HNSW indexes
@@ -7049,7 +7057,7 @@ fn resolve_rank_fuse_method(
             }
         }
         if let Some(reg) = ctx.text_index_registry {
-            if reg.get(label, &property).is_some() {
+            if reg.has_index(label, &property) {
                 return Ok(RankFuseMethodKind::TextBm25 {
                     label: label.to_string(),
                     property,
@@ -7356,7 +7364,7 @@ fn score_text_method(
                 .to_string(),
         )
     })?;
-    let handle = registry.get(label, property).ok_or_else(|| {
+    let handle = registry.read_handle(label, property)?.ok_or_else(|| {
         ExecutionError::Unsupported(format!(
             "rrf_score(): text method {variable}.{property} on :{label} requires a \
              full-text index; create one with `CREATE TEXT INDEX … ON :{label}({property})`"
@@ -7495,7 +7503,7 @@ fn raw_scores_text_method(
             "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
         )
     })?;
-    let handle = registry.get(label, property).ok_or_else(|| {
+    let handle = registry.read_handle(label, property)?.ok_or_else(|| {
         ExecutionError::Unsupported(format!(
             "hybrid fusion: no text index on :{label}({property})"
         ))
@@ -7991,7 +7999,7 @@ fn execute_text_filter(
 
     let search_results = if let Some(registry) = ctx.text_index_registry {
         if let (Some(l), Some(p)) = (label, property) {
-            if let Some(handle) = registry.get(l, p) {
+            if let Some(handle) = registry.read_handle(l, p)? {
                 let idx = handle
                     .read()
                     .map_err(|_| ExecutionError::Unsupported("text index lock poisoned".into()))?;
@@ -10546,18 +10554,6 @@ fn execute_create_node(
             }
         }
 
-        // Notify text index registry of any text properties.
-        if let Some(registry) = ctx.text_index_registry {
-            if let Some(primary_label) = labels.first() {
-                for (prop_name, expr) in properties {
-                    let val = eval_neutral(expr, input_row)?;
-                    if let Some(text) = val.as_str() {
-                        registry.on_text_written(primary_label, node_id, prop_name, text);
-                    }
-                }
-            }
-        }
-
         // Fire BEFORE COMMIT triggers registered on any of the new node's
         // labels for the CREATE event. Triggers fire after the node write
         // is staged in the MVCC buffer so a trigger body can MATCH the new
@@ -11530,14 +11526,6 @@ fn execute_update(
                             }
                         }
 
-                        // Notify text index registry if setting a text property.
-                        if let Some(registry) = ctx.text_index_registry {
-                            if let Some(text) = val.as_str() {
-                                let label = record.primary_label().to_string();
-                                registry.on_text_written(&label, node_id, property, text);
-                            }
-                        }
-
                         // Reflect the new value in the output row only when the
                         // write was actually applied. If mvcc_get returned None
                         // (e.g. node was DELETEd earlier in the same query), the
@@ -11781,18 +11769,6 @@ fn execute_update(
                                 }
                             }
                         }
-
-                        // Notify text index registry for any text properties in the replacement map.
-                        if let Some(registry) = ctx.text_index_registry {
-                            let label = record.primary_label().to_string();
-                            if let Value::Map(ref map) = map_val {
-                                for (k, v) in map {
-                                    if let Some(text) = v.as_str() {
-                                        registry.on_text_written(&label, node_id, k, text);
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
                 crate::plan::SetItem::MergeProperties { variable, expr } => {
@@ -11865,18 +11841,6 @@ fn execute_update(
                                 for (k, v) in map {
                                     if let Some(vec_data) = try_extract_vector(v) {
                                         registry.on_vector_written(&label, node_id, k, &vec_data);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Notify text index registry for any text properties in the merged map.
-                        if let Some(registry) = ctx.text_index_registry {
-                            let label = record.primary_label().to_string();
-                            if let Value::Map(ref map) = map_val {
-                                for (k, v) in map {
-                                    if let Some(text) = v.as_str() {
-                                        registry.on_text_written(&label, node_id, k, text);
                                     }
                                 }
                             }
@@ -12253,11 +12217,6 @@ fn execute_remove(
                                     let label = record.primary_label().to_string();
                                     registry.on_vector_deleted(&label, node_id, property);
                                 }
-                            }
-                            // Notify text index if removing a text property.
-                            if let Some(registry) = ctx.text_index_registry {
-                                let label = record.primary_label().to_string();
-                                registry.on_text_deleted(&label, node_id, property);
                             }
                             ctx.write_stats.properties_removed += 1;
                         }
@@ -12710,9 +12669,8 @@ fn execute_delete(
                 ctx.mvcc_get_node(ctx.shard_id, node_id)?
                     .map(|rec| snapshot_node_record(&rec, ctx));
 
-            let needs_index_cleanup = ctx.btree_index_registry.is_some()
-                || ctx.vector_indexes.is_some()
-                || ctx.text_index_registry.is_some();
+            let needs_index_cleanup =
+                ctx.btree_index_registry.is_some() || ctx.vector_indexes.is_some();
             if needs_index_cleanup {
                 if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
                     {
@@ -12727,11 +12685,6 @@ fn execute_delete(
                                 if let Some(registry) = ctx.vector_index_registry() {
                                     if try_extract_vector(value).is_some() {
                                         registry.on_vector_deleted(&label, node_id, prop_name);
-                                    }
-                                }
-                                if let Some(registry) = ctx.text_index_registry {
-                                    if value.as_str().is_some() {
-                                        registry.on_text_deleted(&label, node_id, prop_name);
                                     }
                                 }
                             }
@@ -13624,8 +13577,8 @@ fn notify_indexes_for_target_change(
     // a unique value another node holds refuses the merge.
     ctx.index_fields_changed(target_id, label, old, new)?;
 
-    // Vector and text registries: old entries that changed or disappeared,
-    // then the new ones.
+    // Vector registry: old entries that changed or disappeared, then the new
+    // ones. Text indexes follow the committed record on their own.
     for (field_id, old_val) in old {
         let unchanged = new.get(field_id) == Some(old_val);
         if unchanged {
@@ -13638,11 +13591,6 @@ fn notify_indexes_for_target_change(
         if let Some(registry) = ctx.vector_index_registry() {
             if try_extract_vector(old_val).is_some() {
                 registry.on_vector_deleted(label, target_id, &name);
-            }
-        }
-        if let Some(registry) = ctx.text_index_registry {
-            if old_val.as_str().is_some() {
-                registry.on_text_deleted(label, target_id, &name);
             }
         }
     }
@@ -13658,11 +13606,6 @@ fn notify_indexes_for_target_change(
         if let Some(registry) = ctx.vector_index_registry() {
             if let Some(vec_data) = try_extract_vector(new_val) {
                 registry.on_vector_written(label, target_id, &name, &vec_data);
-            }
-        }
-        if let Some(registry) = ctx.text_index_registry {
-            if let Some(text) = new_val.as_str() {
-                registry.on_text_written(label, target_id, &name, text);
             }
         }
     }
@@ -13917,11 +13860,11 @@ fn detach_delete_node(
     node_id: NodeId,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<(), ExecutionError> {
-    // Notify all index registries (B-tree, vector, text) of the soon-to-be-deleted
+    // Notify the B-tree and vector registries of the soon-to-be-deleted
     // properties so their entries are cleaned up before primary storage drops
     // the node. Without this, indexes leak: unique constraints would still
-    // reject re-creation with the same value, vector/text searches would
-    // return stale UIDs.
+    // reject re-creation with the same value, vector searches would return
+    // stale UIDs. Text indexes follow the committed deletion on their own.
     // Snapshot pre-mutation node state once for trigger firing — re-used after
     // the node is deleted to populate `$before` for the BEFORE COMMIT DELETE
     // trigger. Mirrors the `execute_delete` / `cascade_delete_source_node`
@@ -13939,11 +13882,6 @@ fn detach_delete_node(
                     if let Some(registry) = ctx.vector_index_registry() {
                         if try_extract_vector(value).is_some() {
                             registry.on_vector_deleted(&label, node_id, prop_name);
-                        }
-                    }
-                    if let Some(registry) = ctx.text_index_registry {
-                        if value.as_str().is_some() {
-                            registry.on_text_deleted(&label, node_id, prop_name);
                         }
                     }
                 }
@@ -15353,8 +15291,8 @@ fn cascade_delete_source_node(
         ctx.write_stats.edges_deleted += 1;
     }
 
-    // Delete the node record itself (B-tree / vector / text indexes left to
-    // the standard delete path; ATTACH DOCUMENT's source is typically a
+    // Delete the node record itself (B-tree / vector indexes left to the
+    // standard delete path; ATTACH DOCUMENT's source is typically a
     // short-lived node so we keep this tight — cleanup mirrors DETACH DELETE
     // behaviour in `execute_delete`).
     // Snapshot the pre-mutation node record once: re-used for both the
@@ -15362,9 +15300,7 @@ fn cascade_delete_source_node(
     let pre_snapshot: Option<(Vec<String>, std::collections::BTreeMap<String, Value>)> = ctx
         .mvcc_get_node(ctx.shard_id, source_id)?
         .map(|rec| snapshot_node_record(&rec, ctx));
-    let needs_index_cleanup = ctx.btree_index_registry.is_some()
-        || ctx.vector_indexes.is_some()
-        || ctx.text_index_registry.is_some();
+    let needs_index_cleanup = ctx.btree_index_registry.is_some() || ctx.vector_indexes.is_some();
     if needs_index_cleanup {
         if let Some(record) = ctx.mvcc_get_node(ctx.shard_id, source_id)? {
             {
@@ -15375,11 +15311,6 @@ fn cascade_delete_source_node(
                         if let Some(registry) = ctx.vector_index_registry() {
                             if try_extract_vector(value).is_some() {
                                 registry.on_vector_deleted(&label, source_id, prop_name);
-                            }
-                        }
-                        if let Some(registry) = ctx.text_index_registry {
-                            if value.as_str().is_some() {
-                                registry.on_text_deleted(&label, source_id, prop_name);
                             }
                         }
                     }
@@ -16894,37 +16825,25 @@ fn execute_create_text_index(
         .register(def)
         .map_err(|e| ExecutionError::Unsupported(format!("register text index: {e}")))?;
 
-    // Backfill: scan existing nodes with this label and any indexed property
-    // through the node store (it owns the partition + key encoding).
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    // Backfill each property's index from the store. The index is registered
+    // above, so a commit after the scan starts reaches it through the text
+    // worker, and the rebuild holds the index while it scans, so that commit
+    // lands after the backfill rather than under it.
     let shard_id = ctx.shard_id;
     let interner = &*ctx.interner;
-    let mut count = 0u64;
-    let _ = LocalNodeStore.for_each_in_shard_at_snapshot(
-        ctx.engine,
-        None,
-        shard_id,
-        &mut |node_id, _key, record| {
-            if record.primary_label() == label {
-                // Index all matching properties for this node.
-                let mut indexed = false;
-                for prop in &properties {
-                    if let Some(field_id) = interner.lookup(prop) {
-                        if let Some(val) = record.props.get(&field_id) {
-                            if let Some(text) = val.as_str() {
-                                registry.on_text_written(label, node_id, prop, text);
-                                indexed = true;
-                            }
-                        }
-                    }
-                }
-                if indexed {
-                    count += 1;
-                }
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        },
-    );
+    let mut indexed_nodes: rustc_hash::FxHashSet<NodeId> = rustc_hash::FxHashSet::default();
+    for prop in &properties {
+        registry
+            .rebuild_index(label, prop, || {
+                let texts = crate::index::text_registry::stored_texts(
+                    ctx.engine, shard_id, interner, label, prop,
+                )?;
+                indexed_nodes.extend(texts.iter().map(|(id, _)| *id));
+                Ok(texts)
+            })
+            .map_err(|e| ExecutionError::Unsupported(format!("backfill text index: {e}")))?;
+    }
+    let count = indexed_nodes.len();
 
     let props_str = properties.join(", ");
     let mut row = Row::new();

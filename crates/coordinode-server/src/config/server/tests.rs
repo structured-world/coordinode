@@ -187,6 +187,19 @@ fn vector_build_wait_parses_from_the_config_file() {
     assert_eq!(c.vector_build_wait_ms, Some(1500));
 }
 
+/// The full-text search's wait for the text indexes is a config-file
+/// setting: unset it leaves the database default, set it carries the
+/// milliseconds given.
+#[test]
+fn text_ready_wait_parses_from_the_config_file() {
+    assert!(ServerConfig::default().text_ready_wait_ms.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "text_ready_wait_ms: 750\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.text_ready_wait_ms, Some(750));
+}
+
 /// The vector indexes' retired-memory budget is a config-file setting: unset
 /// it leaves the index default, set it carries the bytes given.
 #[test]

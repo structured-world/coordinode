@@ -11,6 +11,7 @@ pub mod ttl_reaper;
 pub mod vector_build;
 pub mod vector_registry;
 
+pub mod text_readiness;
 pub mod text_registry;
 
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
@@ -21,6 +22,7 @@ pub use definition::{
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };
+pub use text_readiness::{DEFAULT_TEXT_READY_WAIT, TextNotReady, TextReadiness};
 pub use text_registry::TextIndexRegistry;
 pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};
 pub use vector_registry::{BuildToken, VectorIndexRegistry};

@@ -18,6 +18,92 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+// ── Transactional maintenance ──────────────────────────────────────
+
+/// A text change in a transaction that rolls back is never searchable: the
+/// node keeps its committed text, and a search for the discarded words
+/// finds nothing, while a search for the committed words still finds it.
+#[test]
+fn a_rolled_back_text_change_is_not_searchable() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'committed words'})")
+        .expect("create");
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        "MATCH (n:Article {title: 'a'}) SET n.body = 'discarded secret'",
+        None,
+    )
+    .expect("set in transaction");
+    db.rollback_transaction(tx).expect("rollback");
+
+    let found = |db: &mut Database, words: &str| {
+        db.execute_cypher(&format!(
+            "MATCH (n:Article) WHERE text_match(n.body, '{words}') RETURN n.title AS t"
+        ))
+        .expect("search")
+        .len()
+    };
+    assert_eq!(found(&mut db, "secret"), 0, "the rolled-back text leaked");
+    assert_eq!(found(&mut db, "committed"), 1, "the committed text is gone");
+}
+
+/// A node whose indexed property stops being text leaves the index: its old
+/// words no longer find it. The index follows the committed record, so a
+/// value of another type takes the node out as a removal would.
+#[test]
+fn a_property_set_to_a_non_text_value_leaves_the_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'vanishing words'})")
+        .expect("create");
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 42")
+        .expect("set a number");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Article) WHERE text_match(n.body, 'vanishing') RETURN n.title AS t",
+        )
+        .expect("search");
+    assert!(
+        rows.is_empty(),
+        "the old text still finds the node: {rows:?}"
+    );
+}
+
+/// A node that loses the indexed label leaves that label's index, and one
+/// that gains it is added, as the committed record says.
+#[test]
+fn a_relabelled_node_follows_its_label_in_the_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'wandering words'})")
+        .expect("create");
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) REMOVE n:Article SET n:Note")
+        .expect("relabel");
+
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Article) WHERE text_match(n.body, 'wandering') RETURN n.title AS t",
+        )
+        .expect("search");
+    assert!(rows.is_empty(), "a node without the label is still indexed");
+
+    db.execute_cypher("MATCH (n:Note {title: 'a'}) REMOVE n:Note SET n:Article")
+        .expect("relabel back");
+    let rows = db
+        .execute_cypher(
+            "MATCH (n:Article) WHERE text_match(n.body, 'wandering') RETURN n.title AS t",
+        )
+        .expect("search");
+    assert_eq!(rows.len(), 1, "a node that gained the label is not indexed");
+}
+
 // ── CREATE TEXT INDEX DDL ──────────────────────────────────────────
 
 /// CREATE TEXT INDEX creates an index and returns metadata.

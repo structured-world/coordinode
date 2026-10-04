@@ -363,7 +363,10 @@ pub struct Database {
     /// Held for its Drop (stops the thread when the Database closes).
     _vector_worker: crate::vector_worker::VectorIndexWorker,
     /// Text index registry — holds live tantivy indexes for full-text search.
-    text_index_registry: coordinode_query::index::TextIndexRegistry,
+    text_index_registry: Arc<coordinode_query::index::TextIndexRegistry>,
+    /// Background follower of the applied commits keeping the text indexes
+    /// current with them (see [`crate::text_worker`]). Held for its Drop.
+    _text_worker: crate::text_worker::TextIndexWorker,
     /// Extension-op handler registry threaded into every ExecutionContext.
     /// Empty for a plain CE Database (no extension ops dispatchable);
     /// populated via [`Database::register_extension`] by an enterprise layer
@@ -983,13 +986,29 @@ impl Database {
             1, /* shard_id */
         );
 
-        // Load text index definitions and rebuild tantivy indexes from stored nodes.
+        // The text indexes follow the applied commits the same way: the
+        // subscription opens before they are rebuilt from the store, so no
+        // commit falls between the two, and searches wait for the worker.
+        let text_applied = engine.subscribe_applied(Partition::Node, APPLIED_QUEUE_CAPACITY);
+        let text_readiness = Arc::new(coordinode_query::index::TextReadiness::new(
+            text_applied.position(),
+            coordinode_query::index::DEFAULT_TEXT_READY_WAIT,
+        ));
         let text_index_base = path.join("text_indexes");
-        let text_index_registry = Self::load_text_indexes(
+        let text_index_registry = Arc::new(Self::load_text_indexes(
             &engine,
             &opened_view,
             1, /* shard_id */
             &text_index_base,
+        ));
+        text_index_registry.set_readiness(Arc::clone(&text_readiness));
+        let text_worker = crate::text_worker::TextIndexWorker::spawn(
+            Arc::clone(&engine),
+            text_applied,
+            Arc::clone(&text_index_registry),
+            Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
+            text_readiness,
+            1, /* shard_id */
         );
 
         // Every NodeId comes from a lease the log granted, taken on the first
@@ -1098,6 +1117,7 @@ impl Database {
             vector_index_registry,
             _vector_worker: vector_worker,
             text_index_registry,
+            _text_worker: text_worker,
             extension_registry: ExtensionRegistry::new(),
             procedure_registry: ProcedureRegistry::with_builtins(),
             adaptive_config: AdaptiveConfig::default(),
@@ -1466,8 +1486,10 @@ impl Database {
         registry
     }
 
-    /// Register `text_defs` in `registry` and fill them from the nodes stored
-    /// on `shard_id`, one scan for all of them.
+    /// Register `text_defs` in `registry` and rebuild each from the nodes
+    /// stored on `shard_id`. A rebuild replaces what the index held, so a
+    /// document of a node deleted while the process was down does not
+    /// survive it.
     fn populate_text_indexes(
         registry: &coordinode_query::index::TextIndexRegistry,
         engine: &StorageEngine,
@@ -1475,78 +1497,27 @@ impl Database {
         shard_id: u16,
         text_defs: &[coordinode_query::index::IndexDefinition],
     ) {
-        use coordinode_core::graph::node::NodeRecord;
-
-        if text_defs.is_empty() {
-            return;
-        }
-
-        // Step 2: Register all definitions (creates empty tantivy indexes).
+        let mut total_docs = 0usize;
         for def in text_defs {
             if let Err(e) = registry.register(def.clone()) {
                 tracing::warn!("failed to register text index {}: {e}", def.name);
+                continue;
             }
-        }
-
-        // Step 3: Scan node: partition once, populating all text indexes.
-        let mut label_props: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for def in text_defs {
-            let entry = label_props.entry(def.label.clone()).or_default();
-            for prop in &def.properties {
-                if !entry.contains(prop) {
-                    entry.push(prop.clone());
+            for property in &def.properties {
+                let rebuilt = registry.rebuild_index(&def.label, property, || {
+                    coordinode_query::index::text_registry::stored_texts(
+                        engine, shard_id, interner, &def.label, property,
+                    )
+                });
+                match rebuilt {
+                    Ok(docs) => total_docs += docs,
+                    Err(e) => tracing::warn!(
+                        "failed to rebuild text index {} on {property}: {e}",
+                        def.name
+                    ),
                 }
             }
         }
-
-        let node_prefix = {
-            let mut p = Vec::with_capacity(5 + 2 + 1);
-            p.extend_from_slice(b"node:");
-            p.extend_from_slice(&shard_id.to_be_bytes());
-            p.push(b':');
-            p
-        };
-
-        let node_iter = match engine.prefix_scan(Partition::Node, &node_prefix) {
-            Ok(it) => it,
-            Err(e) => {
-                tracing::warn!("failed to scan nodes for text index rebuild: {e}");
-                return;
-            }
-        };
-
-        let mut total_docs = 0usize;
-        for guard in node_iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-
-            let primary_label = record.primary_label();
-            let Some(props) = label_props.get(primary_label) else {
-                continue;
-            };
-
-            let node_id = match coordinode_core::graph::node::decode_node_key(&_key) {
-                Some((_shard, nid)) => nid,
-                None => continue,
-            };
-
-            for prop_name in props {
-                if let Some(field_id) = interner.lookup(prop_name) {
-                    if let Some(value) = record.props.get(&field_id) {
-                        if let Some(text) = value.as_str() {
-                            registry.on_text_written(primary_label, node_id, prop_name, text);
-                            total_docs += 1;
-                        }
-                    }
-                }
-            }
-        }
-
         if total_docs > 0 {
             tracing::info!(
                 "rebuilt {} text index(es) with {total_docs} document(s)",
@@ -3592,47 +3563,23 @@ impl Database {
             .register(def)
             .map_err(DatabaseError::Other)?;
 
-        // Backfill existing nodes with this label and property.
-        let shard_id = self.shard_id;
-        let node_prefix = {
-            let mut p = Vec::with_capacity(5 + 2 + 1);
-            p.extend_from_slice(b"node:");
-            p.extend_from_slice(&shard_id.to_be_bytes());
-            p.push(b':');
-            p
-        };
-
-        let mut count = 0usize;
-        // No binding: no stored node carries the property yet.
-        let field_id = self.fields.current()?.lookup(&property);
-        let iter = self.engine.prefix_scan(Partition::Node, &node_prefix)?;
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            let Ok(record) = coordinode_core::graph::node::NodeRecord::from_msgpack(&value) else {
-                continue;
-            };
-
-            if record.primary_label() != label {
-                continue;
-            }
-
-            let node_id = match coordinode_core::graph::node::decode_node_key(&_key) {
-                Some((_shard, nid)) => nid,
-                None => continue,
-            };
-
-            if let Some(field_id) = field_id {
-                if let Some(val) = record.props.get(&field_id) {
-                    if let Some(text) = val.as_str() {
-                        self.text_index_registry
-                            .on_text_written(&label, node_id, &property, text);
-                        count += 1;
-                    }
-                }
-            }
-        }
+        // Backfill from the store. The index is registered above, so a commit
+        // after the scan starts reaches it through the text worker, and the
+        // rebuild holds the index while it scans, so that commit lands after
+        // the backfill rather than under it.
+        let interner = self.fields.current()?;
+        let count = self
+            .text_index_registry
+            .rebuild_index(&label, &property, || {
+                coordinode_query::index::text_registry::stored_texts(
+                    &self.engine,
+                    self.shard_id,
+                    &interner,
+                    &label,
+                    &property,
+                )
+            })
+            .map_err(DatabaseError::Other)?;
 
         if count > 0 {
             tracing::info!("backfilled text index with {count} document(s)");
@@ -3645,9 +3592,14 @@ impl Database {
         &self.text_index_registry
     }
 
-    /// Get a mutable reference to the text index registry.
-    pub fn text_index_registry_mut(&mut self) -> &mut coordinode_query::index::TextIndexRegistry {
-        &mut self.text_index_registry
+    /// Bound how long a full-text search waits for the text indexes to hold
+    /// every commit applied before it; past it the search fails with
+    /// [`coordinode_query::index::TextNotReady`]. Takes effect for the next
+    /// search.
+    pub fn set_text_ready_wait(&self, wait: Duration) {
+        if let Some(readiness) = self.text_index_registry.readiness() {
+            readiness.set_wait(wait);
+        }
     }
 
     /// The verified field dictionary as it stands: every binding applied so

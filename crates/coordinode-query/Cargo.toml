@@ -29,6 +29,8 @@ rmpv = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The wait of a full-text search for the indexes to cover the store.
+parking_lot = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 rand = { workspace = true }

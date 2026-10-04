@@ -114,9 +114,13 @@ impl TextServiceImpl {
         let mut node_snippets: HashMap<u64, String> = HashMap::new();
 
         for property in &indexed_properties {
-            let handle = match registry.get(&req.label, property) {
-                Some(h) => h,
-                None => continue,
+            // Waits for the index to hold every commit applied before the
+            // search; past the wait the search fails rather than answer
+            // without them.
+            let handle = match registry.read_handle(&req.label, property) {
+                Ok(Some(h)) => h,
+                Ok(None) => continue,
+                Err(behind) => return Err(super::error_details::text_index_behind(&behind)),
             };
 
             let idx_guard = handle

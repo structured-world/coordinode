@@ -418,3 +418,68 @@ fn empty_properties_skipped() {
     idx.add_node(1, &props(&[])).unwrap();
     assert_eq!(idx.num_docs(), 0, "empty node should not be indexed");
 }
+
+/// One batch replaces the upserted documents and takes out the removed ones
+/// together; a removal of a node the index does not hold changes nothing.
+#[test]
+fn a_batch_upserts_and_removes_in_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_nodes_batch(&[
+        (1, props(&[("body", "old words")])),
+        (2, props(&[("body", "doomed text")])),
+    ])
+    .unwrap();
+
+    idx.apply_changes(&[(1, props(&[("body", "fresh words")]))], &[2, 99])
+        .unwrap();
+
+    assert_eq!(idx.num_docs(), 1);
+    assert!(idx.contains(1).unwrap());
+    assert!(!idx.contains(2).unwrap(), "the removed node is gone");
+    assert!(
+        idx.search("old", 10).unwrap().is_empty(),
+        "the old text is replaced"
+    );
+    assert_eq!(idx.search("fresh", 10).unwrap().len(), 1);
+    assert!(idx.search("doomed", 10).unwrap().is_empty());
+}
+
+/// A batch whose removals name only nodes the index does not hold leaves
+/// the index exactly as it was.
+#[test]
+fn removing_nodes_the_index_does_not_hold_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_node(1, &props(&[("body", "kept")])).unwrap();
+
+    idx.apply_changes(&[], &[7, 8]).unwrap();
+
+    assert_eq!(idx.num_docs(), 1);
+    assert!(idx.contains(1).unwrap());
+    assert!(!idx.contains(7).unwrap());
+}
+
+/// Replacing the whole index drops every document not listed, so a rebuild
+/// from the store leaves nothing of a node deleted meanwhile.
+#[test]
+fn replace_all_drops_documents_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    idx.add_nodes_batch(&[
+        (1, props(&[("body", "stays here")])),
+        (2, props(&[("body", "deleted meanwhile")])),
+    ])
+    .unwrap();
+
+    idx.replace_all(&[(1, props(&[("body", "stays here")]))])
+        .unwrap();
+
+    assert_eq!(idx.num_docs(), 1);
+    assert!(!idx.contains(2).unwrap());
+    assert!(idx.search("deleted", 10).unwrap().is_empty());
+    assert_eq!(idx.search("stays", 10).unwrap().len(), 1);
+}
