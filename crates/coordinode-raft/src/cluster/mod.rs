@@ -1589,6 +1589,17 @@ impl RaftNode {
         .map_err(|e| RaftNodeError::Init(e.to_string()))
     }
 
+    /// Where this node's Raft log starts on disk, kept current by the log as
+    /// its segments are purged or rewritten.
+    pub fn retained_floor(&self) -> coordinode_storage::oplog::RetainedFloor {
+        // A poisoned lock still guards a manager whose floor handle is sound:
+        // the handle is only cloned here.
+        self.oplog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_floor()
+    }
+
     /// Number of full snapshot builds this node has performed. Every
     /// build serializes ALL partitions, so an unexpectedly growing
     /// count (without new applied entries) indicates a misfiring

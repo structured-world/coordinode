@@ -7,7 +7,9 @@
 //! - Purge segments whose HLC timestamps fall outside the retention window
 //! - Verify checksums of all sealed segments
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::engine::config::SyncMethod;
 use crate::error::{StorageError, StorageResult};
@@ -30,6 +32,39 @@ fn parse_first_index(path: &Path) -> Option<u64> {
     idx_str.parse().ok()
 }
 
+// ── RetainedFloor ─────────────────────────────────────────────────────────────
+
+/// Stored when no segment exists; no log index takes this value.
+const NO_SEGMENT: u64 = u64::MAX;
+
+/// The first log index the segments of an [`OplogManager`] hold, published by
+/// the manager on every change to them, so a reader learns where the log
+/// starts without listing its directories.
+///
+/// A segment is published once its file exists and unpublished once it is
+/// removed, so between the two a reader can see a floor lower than the disk
+/// holds, never a higher one.
+#[derive(Clone, Debug)]
+pub struct RetainedFloor(Arc<AtomicU64>);
+
+impl RetainedFloor {
+    fn new(first: Option<u64>) -> Self {
+        Self(Arc::new(AtomicU64::new(first.unwrap_or(NO_SEGMENT))))
+    }
+
+    /// The first index the log holds; `None` when it holds no segment.
+    pub fn get(&self) -> Option<u64> {
+        match self.0.load(Ordering::Acquire) {
+            NO_SEGMENT => None,
+            first => Some(first),
+        }
+    }
+
+    fn set(&self, first: Option<u64>) {
+        self.0.store(first.unwrap_or(NO_SEGMENT), Ordering::Release);
+    }
+}
+
 // ── OplogManager ──────────────────────────────────────────────────────────────
 
 /// Manages the oplog segment lifecycle for one shard.
@@ -45,10 +80,14 @@ pub struct OplogManager {
     retention_secs: u64,
     /// Currently-open writer. `None` between rotations.
     current: Option<SegmentWriter>,
+    /// The first index of `current`'s segment, named after it.
+    current_first: Option<u64>,
     /// `(first_index, path)` of sealed segments, sorted by first_index.
     pub(crate) sealed: Vec<(u64, PathBuf)>,
     /// How appends to new segments are made durable.
     sync: SyncMethod,
+    /// Where the segments start, for readers outside the manager.
+    floor: RetainedFloor,
 }
 
 impl OplogManager {
@@ -169,9 +208,27 @@ impl OplogManager {
             max_entries,
             retention_secs,
             current: None,
+            current_first: None,
+            floor: RetainedFloor::new(paths.first().map(|&(first, _)| first)),
             sealed: paths,
             sync: SyncMethod::default(),
         })
+    }
+
+    /// Where this manager's segments start, kept current as they change.
+    pub fn retained_floor(&self) -> RetainedFloor {
+        self.floor.clone()
+    }
+
+    /// Publish where the segments start now. Sealed segments all lie below
+    /// the active one, which `append` enforces.
+    fn publish_floor(&self) {
+        self.floor.set(
+            self.sealed
+                .first()
+                .map(|&(first, _)| first)
+                .or(self.current_first),
+        );
     }
 
     /// Make appends durable under `sync` from the next segment on; the
@@ -221,6 +278,8 @@ impl OplogManager {
             // twice.
             self.sealed.retain(|(_, sealed_path)| sealed_path != &path);
             self.current = Some(writer);
+            self.current_first = Some(entry.index);
+            self.publish_floor();
         }
 
         let writer = self
@@ -268,11 +327,19 @@ impl OplogManager {
         let Some(writer) = self.current.take() else {
             return Ok(());
         };
-        let path = writer.seal()?;
+        self.current_first = None;
+        let path = match writer.seal() {
+            Ok(path) => path,
+            Err(e) => {
+                self.publish_floor();
+                return Err(e);
+            }
+        };
         if let Some(idx) = parse_first_index(&path) {
             self.sealed.push((idx, path));
             self.sealed.sort_by_key(|&(idx, _)| idx);
         }
+        self.publish_floor();
         Ok(())
     }
 
@@ -381,10 +448,19 @@ impl OplogManager {
         let cutoff_hlc = cutoff_ms << 18;
 
         let mut purged = 0usize;
-        let mut remaining = Vec::new();
+        let mut remaining = Vec::with_capacity(self.sealed.len());
+        let mut failed = None;
 
-        for (first_idx, path) in self.sealed.drain(..) {
-            let reader = SegmentReader::open(&path)?;
+        let mut segments = std::mem::take(&mut self.sealed).into_iter();
+        for (first_idx, path) in segments.by_ref() {
+            let reader = match SegmentReader::open(&path) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    remaining.push((first_idx, path));
+                    failed = Some(e);
+                    break;
+                }
+            };
             let within_window = reader.footer.last_ts >= cutoff_hlc;
             // last_index = first_idx + entry_count - 1; a segment with at least
             // one entry whose last index reaches the floor is still needed.
@@ -398,16 +474,27 @@ impl OplogManager {
                 && reader.entries().iter().any(|e| !is_durable(e));
             if within_window || needed_by_consumer || holds_non_durable {
                 remaining.push((first_idx, path));
+            } else if let Err(e) = std::fs::remove_file(&path) {
+                failed = Some(StorageError::Io(format!(
+                    "remove expired segment {:?}: {e}",
+                    path
+                )));
+                remaining.push((first_idx, path));
+                break;
             } else {
-                std::fs::remove_file(&path).map_err(|e| {
-                    StorageError::Io(format!("remove expired segment {:?}: {e}", path))
-                })?;
                 purged += 1;
             }
         }
 
+        // A failure keeps every segment not yet removed, so the list still
+        // matches the disk.
+        remaining.extend(segments);
         self.sealed = remaining;
-        Ok(purged)
+        self.publish_floor();
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(purged),
+        }
     }
 
     /// `true` if any segments (sealed or partial) are present on disk.
@@ -502,10 +589,12 @@ impl OplogManager {
                 let message = format!("remove purged segment {:?}: {e}", path);
                 // Forget only what is gone, so the list still matches the disk.
                 self.sealed.drain(..removed);
+                self.publish_floor();
                 return Err(StorageError::Io(message));
             }
         }
         self.sealed.drain(..purgeable);
+        self.publish_floor();
         Ok(purgeable)
     }
 
@@ -521,14 +610,18 @@ impl OplogManager {
         if self.current.is_some() {
             self.rotate()?;
         }
-        for (_, path) in self.sealed.drain(..) {
-            std::fs::remove_file(&path).map_err(|e| {
-                StorageError::Io(format!(
-                    "remove segment during truncate_all {:?}: {e}",
-                    path
-                ))
-            })?;
+        for removed in 0..self.sealed.len() {
+            let path = &self.sealed[removed].1;
+            if let Err(e) = std::fs::remove_file(path) {
+                let message = format!("remove segment during truncate_all {:?}: {e}", path);
+                // Forget only what is gone, so the list still matches the disk.
+                self.sealed.drain(..removed);
+                self.publish_floor();
+                return Err(StorageError::Io(message));
+            }
         }
+        self.sealed.clear();
+        self.publish_floor();
         Ok(())
     }
 }

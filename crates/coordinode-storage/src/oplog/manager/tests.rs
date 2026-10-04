@@ -777,6 +777,106 @@ fn reopen_after_crash_mid_seal_recovers_the_segment() {
     assert_eq!(indexes_of(&entries), vec![0, 1, 2, 3]);
 }
 
+/// A purge that fails on one segment keeps every segment it has not removed:
+/// the manager used to empty its list before the failure and then forgot
+/// segments still on disk, so later reads and purges skipped them.
+#[test]
+fn a_failed_purge_keeps_the_segments_it_did_not_remove() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 5, 86400).expect("open");
+    for i in 0..15u64 {
+        mgr.append(&make_entry(i, 1000 + i)).expect("append");
+    }
+    mgr.rotate().expect("rotate");
+    assert_eq!(mgr.sealed.len(), 3);
+    // Corrupt the middle segment so opening it fails.
+    let middle = segment_path(dir.path(), 5);
+    let mut bytes = std::fs::read(&middle).expect("read segment");
+    let target = usize::try_from(crate::oplog::segment::HEADER_SIZE).expect("small") + 3;
+    bytes[target] ^= 0xFF;
+    std::fs::write(&middle, &bytes).expect("write corrupted segment");
+
+    // Everything is outside the window and below no consumer floor.
+    assert!(
+        mgr.purge_with_floor(86_400 + 1, u64::MAX, &|_| true)
+            .is_err()
+    );
+    assert_eq!(
+        mgr.sealed
+            .iter()
+            .map(|&(first, _)| first)
+            .collect::<Vec<_>>(),
+        vec![5, 10],
+        "the first segment was removed; the corrupt one and the one after it are still on disk"
+    );
+    assert_eq!(mgr.retained_floor().get(), Some(5));
+}
+
+/// The floor the manager publishes is what a listing of its directory finds,
+/// after every change to the segments: readers take it instead of listing the
+/// directory, so it must never claim history the disk no longer holds, and
+/// never miss history it still does.
+#[test]
+fn the_published_floor_follows_the_segments_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let on_disk = || {
+        crate::oplog::tailer::first_retained_index(&[dir.path().to_path_buf()])
+            .expect("list segments")
+    };
+    let mut mgr = OplogManager::open(dir.path(), 0, 64 * 1024 * 1024, 5, 86400).expect("open");
+    let floor = mgr.retained_floor();
+    assert_eq!(floor.get(), None, "an empty log holds nothing");
+
+    mgr.append(&make_entry(3, 1003)).expect("append");
+    assert_eq!(
+        (floor.get(), on_disk()),
+        (Some(3), Some(3)),
+        "the active segment"
+    );
+    for i in 4..13u64 {
+        mgr.append(&make_entry(i, 1000 + i)).expect("append");
+    }
+    mgr.rotate().expect("rotate");
+    assert_eq!(
+        (floor.get(), on_disk()),
+        (Some(3), Some(3)),
+        "sealed segments"
+    );
+
+    assert_eq!(mgr.purge_before(8).expect("purge_before"), 1);
+    assert_eq!(
+        (floor.get(), on_disk()),
+        (Some(8), Some(8)),
+        "after purge_before"
+    );
+
+    // A second past the window: every entry's timestamp is older.
+    let now_secs = 86_400 + 1;
+    assert_eq!(
+        mgr.purge_with_floor(now_secs, u64::MAX, &|_| true)
+            .expect("purge"),
+        1
+    );
+    assert_eq!(
+        (floor.get(), on_disk()),
+        (None, None),
+        "after purging everything"
+    );
+
+    mgr.append(&make_entry(13, 1013)).expect("append");
+    mgr.truncate_all().expect("truncate_all");
+    assert_eq!((floor.get(), on_disk()), (None, None), "after truncate_all");
+
+    drop(mgr);
+    crash_after_appending(dir.path(), 20..22);
+    let reopened = test_manager(dir.path());
+    assert_eq!(
+        (reopened.retained_floor().get(), on_disk()),
+        (Some(20), Some(20)),
+        "after reopening"
+    );
+}
+
 /// Recovery is for the tail a crash can leave, and only for it. A segment
 /// that was sealed (valid footer) and later lost an entry to corruption is
 /// damage, not an interrupted write: it stays an error rather than being

@@ -33,11 +33,20 @@ fn pipeline_for(engine: &Arc<StorageEngine>) -> Arc<dyn ProposalPipeline> {
     Arc::new(OwnedLocalProposalPipeline::new(engine))
 }
 
+/// The floor of a log that holds no segment.
+fn empty_floor() -> RetainedFloor {
+    let dir = tempfile::tempdir().expect("tempdir");
+    OplogManager::open(dir.path(), 0, 1 << 20, 1_000, 3_600)
+        .expect("open oplog")
+        .retained_floor()
+}
+
 /// A source over `engine` with no log segments and nothing applied.
 fn empty_source(engine: &Arc<StorageEngine>) -> Arc<dyn RetentionSource> {
     Arc::new(NodeRetentionSource::new(
         Arc::clone(engine),
         Vec::new(),
+        empty_floor(),
         Arc::new(|| 0),
     ))
 }
@@ -160,6 +169,7 @@ fn node_source_measures_the_oplog_it_holds() {
     let source = NodeRetentionSource::new(
         Arc::clone(&engine),
         vec![log_dir.path().to_path_buf()],
+        mgr.retained_floor(),
         Arc::new(|| 9),
     );
     let kind = ConsumerKind::OplogEvents;
@@ -189,9 +199,11 @@ fn node_source_measures_the_oplog_it_holds() {
 fn node_source_without_segments_retains_nothing_below_the_head() {
     let (engine, _engine_dir) = open_engine(None);
     let log_dir = tempfile::tempdir().expect("log dir");
+    let mgr = OplogManager::open(log_dir.path(), 0, 1 << 20, 1_000, 3_600).expect("open oplog");
     let source = NodeRetentionSource::new(
         Arc::clone(&engine),
         vec![log_dir.path().to_path_buf()],
+        mgr.retained_floor(),
         Arc::new(|| 4),
     );
     assert_eq!(source.first_retained(ConsumerKind::OplogEvents), 4);
@@ -203,7 +215,12 @@ fn node_source_without_segments_retains_nothing_below_the_head() {
 #[test]
 fn node_source_does_not_account_mvcc_consumers() {
     let (engine, _engine_dir) = open_engine(None);
-    let source = NodeRetentionSource::new(Arc::clone(&engine), Vec::new(), Arc::new(|| 0));
+    let source = NodeRetentionSource::new(
+        Arc::clone(&engine),
+        Vec::new(),
+        empty_floor(),
+        Arc::new(|| 0),
+    );
     let kind = ConsumerKind::LsmStateDelta;
     assert!(kind.is_seqno_space());
     assert!(!source.accounts(kind));

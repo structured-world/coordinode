@@ -791,6 +791,7 @@ pub(crate) async fn serve(
             coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
                 .map_err(|e| format!("oplog directories: {e}"))?
                 .all,
+            raft_node.retained_floor(),
             Arc::new(move || applied_node.applied_through()),
         ))
     };

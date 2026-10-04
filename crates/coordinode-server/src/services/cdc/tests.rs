@@ -15,7 +15,7 @@ use coordinode_replicate::{
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::oplog::entry::{OplogEntry, OplogOp};
-use coordinode_storage::oplog::manager::OplogManager;
+use coordinode_storage::oplog::manager::{OplogManager, RetainedFloor};
 use tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 use tonic_types::StatusExt;
@@ -55,6 +55,7 @@ struct Fixture {
 
 fn fixture(
     dirs: Vec<PathBuf>,
+    floor: RetainedFloor,
     applied: AppliedFrontier,
     signal: AppliedSignal,
     tuning: RegistryTuning,
@@ -65,6 +66,7 @@ fn fixture(
     let source = Arc::new(NodeRetentionSource::new(
         Arc::clone(&engine),
         dirs.clone(),
+        floor,
         Arc::clone(&applied),
     ));
     let (registry, bg) = build_consumer_registry(engine, pipeline, source, tuning);
@@ -120,9 +122,17 @@ fn state_of(registry: &ShardConsumerRegistry, id: &str) -> Option<RegistrationSt
         .map(|c| c.state)
 }
 
+/// The floor of the log in `dir`, which holds no segment yet.
+fn empty_log(dir: &std::path::Path) -> RetainedFloor {
+    OplogManager::open(dir, 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600)
+        .expect("open oplog")
+        .retained_floor()
+}
+
 /// Write `count` node-write entries as oplog segments into `dir`, stamped
 /// with the current wall clock so a progress-lag bound sees fresh entries.
-fn write_oplog(dir: &std::path::Path, count: u64) {
+/// Returns where the log starts.
+fn write_oplog(dir: &std::path::Path, count: u64) -> RetainedFloor {
     let mut mgr =
         OplogManager::open(dir, 0, 64 * 1024 * 1024, 50_000, 7 * 24 * 3600).expect("open oplog");
     let now_us = std::time::SystemTime::now()
@@ -146,6 +156,7 @@ fn write_oplog(dir: &std::path::Path, count: u64) {
         .expect("append");
     }
     mgr.flush().expect("flush");
+    mgr.retained_floor()
 }
 
 async fn next_index(
@@ -167,6 +178,7 @@ async fn a_stream_registers_a_consumer_that_outlives_the_connection() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
         Arc::new(|| 0),
         None,
         RegistryTuning::default(),
@@ -207,6 +219,7 @@ async fn subscribe_refuses_requests_it_cannot_serve() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
         Arc::new(|| 0),
         None,
         RegistryTuning::default(),
@@ -298,6 +311,7 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
     assert_eq!(mgr.purge_before(5).expect("purge"), 1);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        mgr.retained_floor(),
         Arc::new(|| 10),
         None,
         RegistryTuning::default(),
@@ -349,9 +363,10 @@ async fn registering_below_the_retained_log_is_refused_with_retention_lost() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_bounded_reader_is_not_ended_for_liveness() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 300);
+    let floor = write_oplog(oplog_dir.path(), 300);
     let mut f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(|| 300),
         None,
         RegistryTuning {
@@ -395,12 +410,13 @@ async fn a_slow_bounded_reader_is_not_ended_for_liveness() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_sends_only_applied_entries() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 5);
+    let floor = write_oplog(oplog_dir.path(), 5);
     let applied = Arc::new(AtomicU64::new(3));
     let frontier = Arc::clone(&applied);
     let (applies, changes) = tokio::sync::watch::channel(0u64);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(move || frontier.load(Ordering::Acquire)),
         Some(changes),
         RegistryTuning::default(),
@@ -475,9 +491,10 @@ fn ack(
 #[tokio::test(flavor = "multi_thread")]
 async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 5);
+    let floor = write_oplog(oplog_dir.path(), 5);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(|| 5),
         None,
         RegistryTuning::default(),
@@ -525,9 +542,10 @@ async fn filtered_stream_reports_progress_the_client_can_acknowledge() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_dropped_unread_is_sent_again_on_resume() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 5);
+    let floor = write_oplog(oplog_dir.path(), 5);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(|| 5),
         None,
         RegistryTuning::default(),
@@ -569,9 +587,10 @@ async fn a_batch_dropped_unread_is_sent_again_on_resume() {
 #[tokio::test(flavor = "multi_thread")]
 async fn acknowledgements_release_only_what_was_received() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 5);
+    let floor = write_oplog(oplog_dir.path(), 5);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(|| 3),
         None,
         RegistryTuning::default(),
@@ -639,12 +658,13 @@ async fn acknowledgements_release_only_what_was_received() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_resumed_stream_continues_where_its_registration_stands() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
-    write_oplog(oplog_dir.path(), 8);
+    let floor = write_oplog(oplog_dir.path(), 8);
     let applied = Arc::new(AtomicU64::new(5));
     let frontier = Arc::clone(&applied);
     let (applies, changes) = tokio::sync::watch::channel(0u64);
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        floor,
         Arc::new(move || frontier.load(Ordering::Acquire)),
         Some(changes),
         RegistryTuning::default(),
@@ -693,6 +713,7 @@ async fn a_second_registration_of_a_live_id_is_refused() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
         Arc::new(|| 0),
         None,
         RegistryTuning::default(),
@@ -722,6 +743,7 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     let oplog_dir = tempfile::tempdir().expect("oplog dir");
     let mut f = fixture(
         vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
         Arc::new(|| 0),
         None,
         RegistryTuning::default(),
@@ -838,6 +860,7 @@ async fn stream_follows_a_raft_node() {
         coordinode_raft::storage::raft_oplog_dirs(&engine, 0)
             .expect("dirs")
             .all,
+        node.retained_floor(),
         Arc::new(move || applied_node.applied_through()),
     ));
     let (registry, _bg) = build_consumer_registry(

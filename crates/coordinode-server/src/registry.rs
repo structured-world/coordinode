@@ -19,9 +19,8 @@ use coordinode_replicate::{
     SystemClock,
 };
 use coordinode_storage::engine::core::{StorageEngine, WritePressure};
-use coordinode_storage::oplog::tailer::{
-    CdcFilters, OplogTailer, ResumeToken, bytes_needed_from, first_retained_index,
-};
+use coordinode_storage::oplog::RetainedFloor;
+use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken, bytes_needed_from};
 
 /// The history this node holds for its consumers: the Raft log for oplog
 /// consumers, the MVCC store for the others.
@@ -29,21 +28,26 @@ pub(crate) struct NodeRetentionSource {
     engine: Arc<StorageEngine>,
     /// Every directory holding segments of the shard's Raft log.
     oplog_dirs: Vec<PathBuf>,
+    /// Where the log's segments start, published by the log itself: every
+    /// change stream asks on each wake, so it must not list the directories.
+    floor: RetainedFloor,
     /// One past the last log entry this node has applied.
     applied: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl NodeRetentionSource {
-    /// A source over `engine`, the log segments in `oplog_dirs`, and the
-    /// applied frontier `applied` reports.
+    /// A source over `engine`, the log segments in `oplog_dirs` starting at
+    /// `floor`, and the applied frontier `applied` reports.
     pub(crate) fn new(
         engine: Arc<StorageEngine>,
         oplog_dirs: Vec<PathBuf>,
+        floor: RetainedFloor,
         applied: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         Self {
             engine,
             oplog_dirs,
+            floor,
             applied,
         }
     }
@@ -62,16 +66,10 @@ impl RetentionSource for NodeRetentionSource {
         if kind.is_seqno_space() {
             return self.engine.gc_watermark();
         }
-        match first_retained_index(&self.oplog_dirs) {
-            Ok(Some(first)) => first,
+        match self.floor.get() {
+            Some(first) => first,
             // No segment holds anything: nothing below the head is kept.
-            Ok(None) => self.head(kind),
-            Err(e) => {
-                // Unknown coverage admits the registration; the reader's own
-                // check refuses a position the log does not hold.
-                tracing::warn!(error = %e, "registry: oplog coverage unreadable");
-                0
-            }
+            None => self.head(kind),
         }
     }
 
