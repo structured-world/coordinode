@@ -214,14 +214,31 @@ struct FramePrefix {
 }
 
 fn read_frame_prefix(data: &[u8]) -> FramePrefix {
-    let mut cursor = Cursor::new(data);
-    cursor.set_position(HEADER_SIZE);
     let mut prefix = FramePrefix {
         entries: Vec::new(),
         end: HEADER_SIZE,
         first_ts: 0,
         last_ts: 0,
     };
+    for (entry, end) in parse_frames(data, HEADER_SIZE) {
+        if prefix.entries.is_empty() {
+            prefix.first_ts = entry.ts;
+        }
+        prefix.last_ts = entry.ts;
+        prefix.entries.push(entry);
+        prefix.end = end;
+    }
+    prefix
+}
+
+/// The complete frames of `data` from offset `start` on, each with the
+/// offset just past it; parsing stops at the first frame that is incomplete,
+/// fails its checksum or does not decode (a write in progress, or the footer
+/// of a sealed segment).
+fn parse_frames(data: &[u8], start: u64) -> Vec<(OplogEntry, u64)> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(start);
+    let mut frames = Vec::new();
     let total_len = data.len() as u64;
     while let Ok(payload_len) = decode_varint(&mut cursor) {
         let payload_start = cursor.position();
@@ -250,15 +267,46 @@ fn read_frame_prefix(data: &[u8]) -> FramePrefix {
         let Ok(entry) = OplogEntry::decode(payload) else {
             break;
         };
-        if prefix.entries.is_empty() {
-            prefix.first_ts = entry.ts;
-        }
-        prefix.last_ts = entry.ts;
-        prefix.entries.push(entry);
-        prefix.end = frame_end;
+        frames.push((entry, frame_end));
         cursor.set_position(frame_end);
     }
-    prefix
+    frames
+}
+
+/// The complete frames of the segment at `path` from byte `offset` on (at
+/// least [`HEADER_SIZE`], the first frame), each with the offset just past
+/// it. Only the bytes from `offset` are read, so a reader that follows a
+/// growing segment pays for what was appended, not for the whole file.
+///
+/// # Errors
+///
+/// The file cannot be opened or read, or (when reading from the first frame)
+/// its header is not a segment header of this format.
+pub fn read_frames_from(path: &Path, offset: u64) -> StorageResult<Vec<(OplogEntry, u64)>> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
+    let offset = offset.max(HEADER_SIZE);
+    if offset == HEADER_SIZE {
+        let mut header = [0u8; HEADER_SIZE as usize];
+        file.read_exact(&mut header)
+            .map_err(|e| StorageError::Io(format!("read segment header {path:?}: {e}")))?;
+        let header = read_header(&mut Cursor::new(&header[..]))?;
+        if header.version != FORMAT_VERSION {
+            return Err(StorageError::Io(format!(
+                "unsupported oplog version {} in {path:?}",
+                header.version
+            )));
+        }
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| StorageError::Io(format!("seek segment {path:?}: {e}")))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)
+        .map_err(|e| StorageError::Io(format!("read segment {path:?}: {e}")))?;
+    Ok(parse_frames(&tail, 0)
+        .into_iter()
+        .map(|(entry, end)| (entry, offset + end))
+        .collect())
 }
 
 /// Decode `count` consecutive frames filling `data` exactly.

@@ -63,7 +63,7 @@ use std::path::PathBuf;
 use crate::error::{StorageError, StorageResult};
 use crate::oplog::convert::expand_units;
 use crate::oplog::entry::{OplogEntry, OplogOp, ShardId};
-use crate::oplog::segment::SegmentReader;
+use crate::oplog::segment::{HEADER_SIZE, read_frames_from};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -142,6 +142,20 @@ pub struct OplogTailer {
     /// entry already read) rather than "the oldest available". A held
     /// position below the retained log is a gap, never a place to skip from.
     held: bool,
+    /// Where the frame of `next` is believed to start, so a read takes only
+    /// the bytes appended since the last one. A hint: every frame read
+    /// through it must carry the index expected next, and a segment that no
+    /// longer matches is located again by index.
+    cursor: Option<SegmentCursor>,
+}
+
+/// A segment and a byte offset inside it.
+struct SegmentCursor {
+    /// The segment's first log index (its name).
+    first_index: u64,
+    path: PathBuf,
+    /// Offset of the next frame to read.
+    offset: u64,
 }
 
 impl OplogTailer {
@@ -160,6 +174,7 @@ impl OplogTailer {
             shard_id: token.shard_id,
             next: token.next_index()?,
             held: !token.is_start(),
+            cursor: None,
         })
     }
 
@@ -189,100 +204,134 @@ impl OplogTailer {
         filters: &CdcFilters,
         until: u64,
     ) -> StorageResult<Vec<(OplogEntry, ResumeToken)>> {
+        let mut result = Vec::new();
+        // A cursor that reaches nothing is located afresh, once per call.
+        let mut located = false;
+        while result.len() < max_entries && self.next < until {
+            if self.cursor.is_none() {
+                if !self.locate()? {
+                    break;
+                }
+                located = true;
+            }
+            let Some(cursor) = self.cursor.as_mut() else {
+                break;
+            };
+            // Only the bytes past the cursor: a segment being written is read
+            // up to its last complete frame, the crc framing makes that safe.
+            let frames = match read_frames_from(&cursor.path, cursor.offset) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    // Rewritten by a truncation, or purged, since the cursor
+                    // was set: resolve the position again rather than skip.
+                    tracing::debug!(
+                        segment = %cursor.path.display(),
+                        error = %e,
+                        "segment not readable; the read resumes here"
+                    );
+                    self.cursor = None;
+                    if located {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let mut reached = false;
+            let mut stale = false;
+            let mut full = false;
+            for (entry, end) in frames {
+                if entry.index < self.next {
+                    cursor.offset = end;
+                    continue;
+                }
+                if entry.index > self.next {
+                    // The segment does not continue where the cursor expects:
+                    // it was rewritten.
+                    stale = true;
+                    break;
+                }
+                if entry.index >= until || result.len() >= max_entries {
+                    full = true;
+                    break;
+                }
+                cursor.offset = end;
+                self.next = entry.index + 1;
+                self.held = true;
+                reached = true;
+                // A reader sees the operations a unit frame encodes.
+                let ops = expand_units(&entry.ops)?.into_owned();
+                if passes_filter(&entry, &ops, filters) {
+                    let token = ResumeToken {
+                        shard_id: self.shard_id,
+                        segment_id: cursor.first_index,
+                        entry_offset: self.next - cursor.first_index,
+                    };
+                    result.push((OplogEntry { ops, ..entry }, token));
+                }
+            }
+            if full {
+                break;
+            }
+            if reached {
+                // Progress since the last locate: the next one may be needed
+                // for the following segment.
+                located = false;
+            }
+            if stale || !reached {
+                // `next` is applied, so some segment holds it: the log moved
+                // on to a newer segment, or this one was rewritten.
+                self.cursor = None;
+                if located {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    // ── private ───────────────────────────────────────────────────────────────
+
+    /// Point the cursor at the start of the segment holding `next`; `false`
+    /// when there are no segments.
+    ///
+    /// # Errors
+    ///
+    /// The directories cannot be listed, or the reader holds a position the
+    /// log no longer retains.
+    fn locate(&mut self) -> StorageResult<bool> {
         let segments = self.list_segments()?;
         // Segments are purged as a prefix and named by their first index, so
         // the oldest one says where the retained log begins. A reader holding
         // a position below it would otherwise read on from there and never
         // learn of the entries in between.
-        if let Some(&(first_retained, _)) = segments.first() {
-            if self.held && first_retained > self.next {
+        let Some(&(first_retained, _)) = segments.first() else {
+            return Ok(false);
+        };
+        if first_retained > self.next {
+            if self.held {
                 return Err(StorageError::RetentionLost {
                     requested: self.next,
                     first_retained,
                 });
             }
+            // "From the oldest available": that is where reading starts.
+            self.next = first_retained;
         }
-        let mut result = Vec::new();
-
-        for (position, (seg_first_index, seg_path)) in segments.iter().enumerate() {
-            if result.len() >= max_entries || self.next >= until {
-                break;
-            }
-            // A segment the cursor has passed ends where the next one begins.
-            if segments
-                .get(position + 1)
-                .is_some_and(|(next_first, _)| *next_first <= self.next)
-            {
-                continue;
-            }
-
-            let is_last = position + 1 == segments.len();
-            let reader = match SegmentReader::open(seg_path) {
-                Ok(r) => r,
-                // The newest segment is usually still being written (no
-                // footer yet). Read its complete-entry prefix so live
-                // consumers see entries without waiting up to a full
-                // rotation for the seal; the per-entry crc framing makes
-                // the prefix read safe.
-                Err(_) if is_last => match SegmentReader::open_active(seg_path) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(
-                            segment = %seg_path.display(),
-                            error = %e,
-                            "active segment not yet readable"
-                        );
-                        break;
-                    }
-                },
-                Err(e) => {
-                    // Rewritten by a truncation since the listing, or not
-                    // readable yet: stop here and resolve the position again
-                    // on the next call rather than skip what it holds.
-                    tracing::debug!(
-                        segment = %seg_path.display(),
-                        error = %e,
-                        "segment not readable; the read resumes here"
-                    );
-                    break;
-                }
-            };
-
-            for entry in reader.entries() {
-                if entry.index < self.next {
-                    continue;
-                }
-                if entry.index >= until || result.len() >= max_entries {
-                    return Ok(result);
-                }
-                self.next = entry.index + 1;
-                self.held = true;
-                // A reader sees the operations a unit frame encodes.
-                let ops = expand_units(&entry.ops)?;
-                if passes_filter(entry, &ops, filters) {
-                    let token = ResumeToken {
-                        shard_id: self.shard_id,
-                        segment_id: *seg_first_index,
-                        entry_offset: self.next - seg_first_index,
-                    };
-                    let entry = OplogEntry {
-                        ts: entry.ts,
-                        term: entry.term,
-                        index: entry.index,
-                        shard: entry.shard,
-                        ops: ops.into_owned(),
-                        is_migration: entry.is_migration,
-                        pre_images: entry.pre_images.clone(),
-                    };
-                    result.push((entry, token));
-                }
-            }
-        }
-
-        Ok(result)
+        let Some((first_index, path)) = segments
+            .iter()
+            .rev()
+            .find(|(first, _)| *first <= self.next)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.cursor = Some(SegmentCursor {
+            first_index,
+            path,
+            offset: HEADER_SIZE,
+        });
+        Ok(true)
     }
-
-    // ── private ───────────────────────────────────────────────────────────────
 
     /// List the segment files in every oplog directory, sorted by first_index.
     fn list_segments(&self) -> StorageResult<Vec<(u64, PathBuf)>> {
@@ -357,6 +406,13 @@ pub fn bytes_needed_from(oplog_dirs: &[PathBuf], position: u64) -> StorageResult
 }
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
+
+/// Whether an entry the tailer returned (its unit frames already expanded)
+/// passes `filters`: for a reader that shares entries read once among
+/// streams with filters of their own.
+pub fn entry_passes(entry: &OplogEntry, filters: &CdcFilters) -> bool {
+    passes_filter(entry, &entry.ops, filters)
+}
 
 /// Returns `true` if `entry`, whose operations are `ops`, passes all active
 /// filters.
