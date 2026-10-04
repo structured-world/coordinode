@@ -484,6 +484,111 @@ fn replace_all_drops_documents_not_listed() {
     assert_eq!(idx.search("stays", 10).unwrap().len(), 1);
 }
 
+/// Scores of `query` by node over the index alone.
+fn scores(
+    idx: &MultiLanguageTextIndex,
+    query: &str,
+    pending: &PendingDocuments,
+) -> Vec<(u64, f32)> {
+    let mut hits: Vec<(u64, f32)> = idx
+        .find(terms(query), Matches::All, pending)
+        .unwrap()
+        .into_iter()
+        .map(|hit| (hit.node_id, hit.score))
+        .collect();
+    hits.sort_by_key(|(id, _)| *id);
+    hits
+}
+
+fn fresh(dir: &std::path::Path, docs: &[(u64, &str)]) -> MultiLanguageTextIndex {
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::create_scratch(dir, 15_000_000, config).unwrap();
+    let docs: Vec<_> = docs
+        .iter()
+        .map(|(id, body)| (*id, props(&[("body", body)])))
+        .collect();
+    idx.add_nodes_batch(&docs).unwrap();
+    idx
+}
+
+fn assert_same_scores(a: &[(u64, f32)], b: &[(u64, f32)]) {
+    assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
+    for ((ia, sa), (ib, sb)) in a.iter().zip(b) {
+        assert_eq!(ia, ib, "{a:?} vs {b:?}");
+        assert!((sa - sb).abs() < 1e-5, "{a:?} vs {b:?}");
+    }
+}
+
+/// Scores count the documents the index holds, not the ones it replaced or
+/// removed: an index that rewrote its documents ranks exactly as one built
+/// from the final documents, although Tantivy still holds the old ones until
+/// their segments merge.
+#[test]
+fn replaced_documents_leave_the_statistics() {
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut rewritten = fresh(
+        dirs.0.path(),
+        &[(1, "rust graph rust"), (2, "rust engine"), (3, "rust")],
+    );
+    rewritten
+        .apply_changes(&[(1, props(&[("body", "python scripts")]))], &[3])
+        .unwrap();
+    rewritten
+        .apply_changes(&[(4, props(&[("body", "graph rust database")]))], &[])
+        .unwrap();
+    let built = fresh(
+        dirs.1.path(),
+        &[
+            (1, "python scripts"),
+            (2, "rust engine"),
+            (4, "graph rust database"),
+        ],
+    );
+
+    for query in ["rust", "graph", "python"] {
+        assert_same_scores(
+            &scores(&rewritten, query, &PendingDocuments::none()),
+            &scores(&built, query, &PendingDocuments::none()),
+        );
+    }
+}
+
+/// A search with pending documents ranks as the index holding the final
+/// documents would: the superseded ones leave the statistics and the pending
+/// ones join them.
+#[test]
+fn pending_documents_score_as_the_final_corpus() {
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let behind = fresh(
+        dirs.0.path(),
+        &[(1, "rust graph"), (2, "rust engine"), (3, "java beans")],
+    );
+    let pending = behind
+        .pending(
+            Some(&[1, 3, 5]),
+            &[
+                (1, props(&[("body", "python scripts")])),
+                (5, props(&[("body", "rust rust database")])),
+            ],
+        )
+        .unwrap();
+    let built = fresh(
+        dirs.1.path(),
+        &[
+            (1, "python scripts"),
+            (2, "rust engine"),
+            (5, "rust rust database"),
+        ],
+    );
+
+    for query in ["rust", "python", "database", "java"] {
+        assert_same_scores(
+            &scores(&behind, query, &pending),
+            &scores(&built, query, &PendingDocuments::none()),
+        );
+    }
+}
+
 fn terms(query: &str) -> TextRequest<'_> {
     TextRequest::Terms {
         query,

@@ -14,9 +14,36 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use std::collections::HashSet;
+
+use super::corpus::Corpus;
 use super::pending::{Matches, PendingDocuments};
 use super::tokenize;
 use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
+
+/// What one write has done so far, so a node it touches twice is counted
+/// once and its committed document is read once.
+struct Batch {
+    /// The committed state the write started from.
+    searcher: tantivy::Searcher,
+    /// Tokens of the documents this write staged, by node.
+    staged: HashMap<u64, Vec<String>>,
+    /// Nodes whose committed document this write already removed.
+    forgotten: HashSet<u64>,
+    /// Every committed document was removed.
+    cleared: bool,
+}
+
+impl Batch {
+    fn new(searcher: tantivy::Searcher) -> Self {
+        Self {
+            searcher,
+            staged: HashMap::new(),
+            forgotten: HashSet::new(),
+            cleared: false,
+        }
+    }
+}
 
 /// What a search looks for.
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +145,12 @@ impl MultiLanguageTextIndex {
         // is done per-document via PreTokenizedString. The schema tokenizer
         // is only used as fallback for queries without explicit language.
         let inner = TextIndex::open_or_create(dir, heap_size_bytes, Some("none"))?;
+        Self::counted(inner, config)
+    }
+
+    /// `inner` with its live documents counted.
+    fn counted(mut inner: TextIndex, config: MultiLangConfig) -> Result<Self, TextSearchError> {
+        inner.corpus = Some(inner.recount()?);
         Ok(Self { inner, config })
     }
 
@@ -131,7 +164,8 @@ impl MultiLanguageTextIndex {
     ) -> Result<Self, TextSearchError> {
         // Tokenization happens per document via PreTokenizedString, as in
         // `open_or_create`.
-        let inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"))?;
+        let mut inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"))?;
+        inner.corpus = Some(Corpus::default());
         Ok(Self { inner, config })
     }
 
@@ -139,6 +173,8 @@ impl MultiLanguageTextIndex {
     ///
     /// Useful for tests and migration from single-language to multi-language.
     /// The wrapped index uses the config's `default_language` for queries.
+    /// Its documents were written without their tokens, so it scores with
+    /// Tantivy's own statistics.
     pub fn wrap(inner: TextIndex, config: MultiLangConfig) -> Self {
         Self { inner, config }
     }
@@ -156,10 +192,7 @@ impl MultiLanguageTextIndex {
         node_id: u64,
         properties: &HashMap<String, String>,
     ) -> Result<(), TextSearchError> {
-        if !self.stage_node(node_id, properties)? {
-            return Ok(());
-        }
-        self.publish()
+        self.write(|index, batch| index.stage_node(batch, node_id, properties))
     }
 
     /// Add multiple nodes in a single batch commit.
@@ -167,10 +200,13 @@ impl MultiLanguageTextIndex {
         &mut self,
         nodes: &[(u64, HashMap<String, String>)],
     ) -> Result<(), TextSearchError> {
-        for (node_id, properties) in nodes {
-            self.stage_node(*node_id, properties)?;
-        }
-        self.publish()
+        self.write(|index, batch| {
+            let mut changed = false;
+            for (node_id, properties) in nodes {
+                changed |= index.stage_node(batch, *node_id, properties)?;
+            }
+            Ok(changed)
+        })
     }
 
     /// Replace the documents of `upserts` and remove those of `removals`, in
@@ -182,30 +218,63 @@ impl MultiLanguageTextIndex {
         upserts: &[(u64, HashMap<String, String>)],
         removals: &[u64],
     ) -> Result<(), TextSearchError> {
-        let mut changed = false;
-        for node_id in removals {
-            if self.contains(*node_id)? {
-                self.inner.writer.delete_term(tantivy::Term::from_field_u64(
-                    self.inner.node_id_field,
-                    *node_id,
-                ));
-                changed = true;
+        self.write(|index, batch| {
+            let mut changed = false;
+            for node_id in removals {
+                changed |= index.forget(batch, *node_id)?;
+            }
+            for (node_id, properties) in upserts {
+                // A node whose text tokenizes to nothing is left out, as
+                // removed.
+                changed |= index.stage_node(batch, *node_id, properties)?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// Run `work`, which stages changes and says whether it staged any, and
+    /// commit them. A failure discards everything staged and counts the
+    /// committed documents again, so the statistics never describe documents
+    /// a reader cannot see.
+    fn write(
+        &mut self,
+        work: impl FnOnce(&mut Self, &mut Batch) -> Result<bool, TextSearchError>,
+    ) -> Result<(), TextSearchError> {
+        let mut batch = Batch::new(self.inner.reader.searcher());
+        let outcome = match work(self, &mut batch) {
+            Ok(true) => self.publish(),
+            Ok(false) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if outcome.is_err() {
+            self.inner.writer.rollback()?;
+            if self.inner.corpus.is_some() {
+                self.inner.corpus = Some(self.inner.recount()?);
             }
         }
-        for (node_id, properties) in upserts {
-            // A node whose text tokenizes to nothing is left out, as removed.
-            if !self.stage_node(*node_id, properties)? {
-                self.inner.writer.delete_term(tantivy::Term::from_field_u64(
-                    self.inner.node_id_field,
-                    *node_id,
-                ));
-            }
-            changed = true;
+        outcome
+    }
+
+    /// Stage the removal of `node_id`'s document; whether there was one.
+    fn forget(&mut self, batch: &mut Batch, node_id: u64) -> Result<bool, TextSearchError> {
+        let tokens = if let Some(staged) = batch.staged.remove(&node_id) {
+            Some(Some(staged))
+        } else if batch.cleared || !batch.forgotten.insert(node_id) {
+            None
+        } else {
+            self.inner.live_tokens(&batch.searcher, node_id)?
+        };
+        let Some(tokens) = tokens else {
+            return Ok(false);
+        };
+        if let (Some(corpus), Some(tokens)) = (self.inner.corpus.as_mut(), tokens) {
+            corpus.remove(&tokens);
         }
-        if !changed {
-            return Ok(());
-        }
-        self.publish()
+        self.inner.writer.delete_term(tantivy::Term::from_field_u64(
+            self.inner.node_id_field,
+            node_id,
+        ));
+        Ok(true)
     }
 
     /// Whether the index holds a live document of `node_id`.
@@ -227,39 +296,51 @@ impl MultiLanguageTextIndex {
         &mut self,
         documents: &[(u64, HashMap<String, String>)],
     ) -> Result<(), TextSearchError> {
-        self.inner.writer.delete_all_documents()?;
-        for (node_id, properties) in documents {
-            self.stage_node(*node_id, properties)?;
-        }
-        self.publish()
+        self.write(|index, batch| {
+            index.inner.writer.delete_all_documents()?;
+            batch.cleared = true;
+            batch.staged.clear();
+            if index.inner.corpus.is_some() {
+                index.inner.corpus = Some(Corpus::default());
+            }
+            for (node_id, properties) in documents {
+                index.stage_node(batch, *node_id, properties)?;
+            }
+            Ok(true)
+        })
     }
 
-    /// Queue `node_id`'s document built from `properties`, replacing any
-    /// earlier one; whether there was text to index. Nothing is visible to
-    /// readers until [`Self::publish`].
+    /// Queue `node_id`'s document built from `properties` in place of any
+    /// earlier one, or only the removal of that one when there is no text;
+    /// whether anything changed. Nothing is visible to readers until
+    /// [`Self::publish`].
     fn stage_node(
         &mut self,
+        batch: &mut Batch,
         node_id: u64,
         properties: &HashMap<String, String>,
     ) -> Result<bool, TextSearchError> {
-        let Some(doc) = self.document(node_id, properties) else {
-            return Ok(false);
+        let built = self.document(node_id, properties);
+        let removed = self.forget(batch, node_id)?;
+        let Some((doc, tokens)) = built else {
+            return Ok(removed);
         };
-        self.inner.writer.delete_term(tantivy::Term::from_field_u64(
-            self.inner.node_id_field,
-            node_id,
-        ));
         self.inner.writer.add_document(doc)?;
+        if let Some(corpus) = self.inner.corpus.as_mut() {
+            corpus.add(&tokens);
+        }
+        batch.staged.insert(node_id, tokens);
         Ok(true)
     }
 
     /// `node_id`'s document built from `properties`, each field tokenized by
-    /// the language the cascade resolves; `None` when there is no text.
+    /// the language the cascade resolves, with its tokens; `None` when there
+    /// is no text.
     fn document(
         &self,
         node_id: u64,
         properties: &HashMap<String, String>,
-    ) -> Option<tantivy::TantivyDocument> {
+    ) -> Option<(tantivy::TantivyDocument, Vec<String>)> {
         // Extract the language override from the node properties (level 2)
         let node_language_override = properties
             .get(&self.config.language_override_property)
@@ -311,6 +392,7 @@ impl MultiLanguageTextIndex {
         if all_tokens.is_empty() && all_text.is_empty() {
             return None;
         }
+        let token_texts: Vec<String> = all_tokens.iter().map(|t| t.text.clone()).collect();
 
         let pretokenized = tantivy::tokenizer::PreTokenizedString {
             text: all_text,
@@ -330,7 +412,11 @@ impl MultiLanguageTextIndex {
             self.inner.commit_ts_field,
             &tantivy::schema::OwnedValue::U64(0),
         );
-        Some(doc)
+        doc.add_field_value(
+            self.inner.tokens_field,
+            &tantivy::schema::OwnedValue::Bytes(super::encode_tokens(&token_texts)),
+        );
+        Some((doc, token_texts))
     }
 
     /// What a search reads in place of the index's own documents of the nodes
@@ -424,7 +510,7 @@ impl MultiLanguageTextIndex {
 
     /// Delete a document by node ID.
     pub fn delete_document(&mut self, node_id: u64) -> Result<(), TextSearchError> {
-        self.inner.delete_document(node_id)
+        self.write(|index, batch| index.forget(batch, node_id))
     }
 
     /// Number of documents in the index.

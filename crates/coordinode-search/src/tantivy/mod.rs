@@ -9,6 +9,7 @@
 //!
 //! Segment merging happens asynchronously in tantivy's background thread.
 
+mod corpus;
 pub mod multi_lang;
 pub mod pending;
 pub mod scratch_dir;
@@ -161,10 +162,16 @@ pub struct TextIndex {
     /// Legacy `add_document` paths write 0, which is ≤ any valid snapshot T
     /// so such documents remain visible to all snapshot readers.
     commit_ts_field: Field,
+    /// Stored-only tokens of a pre-tokenized body (see [`encode_tokens`]).
+    tokens_field: Field,
     /// Per-segment `(min_ts, max_ts)` cache, reconciled after every reader
     /// reload. Used to partition segments on `search_at(T)` into fully-visible,
     /// fully-hidden, and straddle buckets.
     registry: RwLock<SegmentRegistry>,
+    /// Exact statistics of the live documents, for an index whose documents
+    /// carry their tokens (a [`multi_lang::MultiLanguageTextIndex`]); `None`
+    /// scores with Tantivy's own counts.
+    corpus: Option<corpus::Corpus>,
 }
 
 /// The schema of a text index and the fields the index reads by handle.
@@ -174,6 +181,38 @@ struct Layout {
     node_id_field: Field,
     body_field: Field,
     commit_ts_field: Field,
+    tokens_field: Field,
+}
+
+/// Stored-only field holding the tokens a pre-tokenized body was indexed with.
+const TOKENS_FIELD: &str = "tokens";
+
+/// `tokens` as the bytes of [`TOKENS_FIELD`]: each token's UTF-8 length as a
+/// little-endian u32, then its bytes.
+fn encode_tokens(tokens: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(tokens.iter().map(|t| t.len() + 4).sum());
+    for token in tokens {
+        // A token is a word of a document field, far below 4 GiB.
+        out.extend_from_slice(&(token.len() as u32).to_le_bytes());
+        out.extend_from_slice(token.as_bytes());
+    }
+    out
+}
+
+/// The tokens [`encode_tokens`] wrote; `None` for bytes it did not write.
+fn decode_tokens(mut bytes: &[u8]) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    while !bytes.is_empty() {
+        let (len, rest) = bytes.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_le_bytes(*len)).ok()?;
+        if rest.len() < len {
+            return None;
+        }
+        let (token, rest) = rest.split_at(len);
+        tokens.push(String::from_utf8(token.to_vec()).ok()?);
+        bytes = rest;
+    }
+    Some(tokens)
 }
 
 impl Layout {
@@ -199,12 +238,20 @@ impl Layout {
         // every snapshot reader (0 ≤ any T).
         let commit_ts_opts = NumericOptions::default().set_fast().set_stored();
         let commit_ts_field = schema_builder.add_u64_field(COMMIT_TS_FIELD, commit_ts_opts);
+        // The doc store keeps a pre-tokenized body as its text only, so the
+        // tokens a document was indexed with are stored beside it: replacing
+        // the document takes exactly those out of the corpus statistics.
+        let tokens_field = schema_builder.add_bytes_field(
+            TOKENS_FIELD,
+            tantivy::schema::BytesOptions::default().set_stored(),
+        );
         Self {
             tokenizer_name,
             schema: schema_builder.build(),
             node_id_field,
             body_field,
             commit_ts_field,
+            tokens_field,
         }
     }
 }
@@ -271,6 +318,7 @@ impl TextIndex {
             node_id_field,
             body_field,
             commit_ts_field,
+            tokens_field,
         } = layout;
 
         // Register language-specific tokenizer.
@@ -295,8 +343,52 @@ impl TextIndex {
             node_id_field,
             body_field,
             commit_ts_field,
+            tokens_field,
             registry: RwLock::new(SegmentRegistry::new()),
+            corpus: None,
         })
+    }
+
+    /// The tokens a stored document's body was indexed with, one per
+    /// position; `None` for a document written without them.
+    fn stored_tokens(&self, doc: &TantivyDocument) -> Option<Vec<String>> {
+        decode_tokens(doc.get_first(self.tokens_field)?.as_bytes()?)
+    }
+
+    /// `node_id`'s live document as `searcher` sees it, by its tokens (`None`
+    /// inside for a body stored as plain text); `None` when there is none.
+    fn live_tokens(
+        &self,
+        searcher: &tantivy::Searcher,
+        node_id: u64,
+    ) -> Result<Option<Option<Vec<String>>>, TextSearchError> {
+        let term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let found = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, address)) = found.first() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(*address)?;
+        Ok(Some(self.stored_tokens(&doc)))
+    }
+
+    /// Count every live document of the committed index.
+    fn recount(&self) -> Result<corpus::Corpus, TextSearchError> {
+        let searcher = self.reader.searcher();
+        let mut counted = corpus::Corpus::default();
+        for (ordinal, segment) in searcher.segment_readers().iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                TextSearchError::IndexCorrupted("more segments than a u32 holds".into())
+            })?;
+            for doc_id in segment.doc_ids_alive() {
+                let doc: TantivyDocument =
+                    searcher.doc(tantivy::DocAddress::new(ordinal, doc_id))?;
+                if let Some(tokens) = self.stored_tokens(&doc) {
+                    counted.add(&tokens);
+                }
+            }
+        }
+        Ok(counted)
     }
 
     /// Reconcile per-segment commit_ts ranges from the current searcher state.

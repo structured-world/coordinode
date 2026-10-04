@@ -16,6 +16,7 @@ use tantivy::{
     SingleSegmentIndexWriter, TantivyDocument, Term,
 };
 
+use super::corpus::{Corpus, CorpusChange};
 use super::{HighlightedResult, TextIndex, TextSearchError};
 
 /// Memory budget of the writer that builds a pending segment. It sizes the
@@ -29,7 +30,7 @@ enum Superseded {
     #[default]
     None,
     /// The documents of these nodes.
-    Nodes(Vec<Term>),
+    Nodes(Vec<u64>),
     /// Every document: the index answers for no node.
     All,
 }
@@ -41,6 +42,8 @@ pub struct PendingDocuments {
     superseded: Superseded,
     /// The current documents of the superseded nodes that have text.
     segment: Option<Searcher>,
+    /// What those documents add to the corpus.
+    added: Corpus,
 }
 
 impl std::fmt::Debug for PendingDocuments {
@@ -78,22 +81,18 @@ impl TextIndex {
     pub(crate) fn pending(
         &self,
         superseded: Option<&[u64]>,
-        documents: Vec<TantivyDocument>,
+        documents: Vec<(TantivyDocument, Vec<String>)>,
     ) -> Result<PendingDocuments, TextSearchError> {
         let superseded = match superseded {
             None => Superseded::All,
             Some([]) => Superseded::None,
-            Some(nodes) => Superseded::Nodes(
-                nodes
-                    .iter()
-                    .map(|id| Term::from_field_u64(self.node_id_field, *id))
-                    .collect(),
-            ),
+            Some(nodes) => Superseded::Nodes(nodes.to_vec()),
         };
         if documents.is_empty() {
             return Ok(PendingDocuments {
                 superseded,
                 segment: None,
+                added: Corpus::default(),
             });
         }
         let mut index = Index::create_in_ram(self.schema.clone());
@@ -101,7 +100,9 @@ impl TextIndex {
         index.set_tokenizers(self.index.tokenizers().clone());
         let mut writer: SingleSegmentIndexWriter =
             SingleSegmentIndexWriter::new(index, PENDING_SEGMENT_BUDGET)?;
-        for document in documents {
+        let mut added = Corpus::default();
+        for (document, tokens) in documents {
+            added.add(&tokens);
             writer.add_document(document)?;
         }
         let index = writer.finalize()?;
@@ -112,6 +113,7 @@ impl TextIndex {
         Ok(PendingDocuments {
             superseded,
             segment: Some(reader.searcher()),
+            added,
         })
     }
 
@@ -126,20 +128,38 @@ impl TextIndex {
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
         let searcher = self.reader.searcher();
         // One corpus for both sides, so their scores rank on one scale and a
-        // term only the pending documents hold still scores there.
+        // term only the pending documents hold still scores there: the
+        // index's live documents, less the superseded ones as this same
+        // searcher holds them, plus the pending ones.
+        let mut removed = Corpus::default();
+        if let (Some(_), Superseded::Nodes(nodes)) = (&self.corpus, &pending.superseded) {
+            for node_id in nodes {
+                if let Some(Some(tokens)) = self.live_tokens(&searcher, *node_id)? {
+                    removed.add(&tokens);
+                }
+            }
+        }
+        let base = match (&pending.superseded, &self.corpus) {
+            (Superseded::All, _) => Base::Nothing,
+            (_, Some(corpus)) => Base::Exact(corpus),
+            (_, None) => Base::Index(&searcher),
+        };
         let statistics = CorpusStatistics {
-            index: (!matches!(pending.superseded, Superseded::All)).then_some(&searcher),
-            pending: pending.segment.as_ref(),
+            base,
+            searcher: &searcher,
+            body: self.body_field,
+            added: &pending.added,
+            removed: &removed,
         };
         let mut hits = match &pending.superseded {
             Superseded::None => self.hits(&searcher, query, matches, &statistics, snippets)?,
-            Superseded::Nodes(terms) => {
+            Superseded::Nodes(nodes) => {
+                let terms = nodes
+                    .iter()
+                    .map(|id| Term::from_field_u64(self.node_id_field, *id));
                 let current = BooleanQuery::new(vec![
                     (Occur::Must, query.box_clone()),
-                    (
-                        Occur::MustNot,
-                        Box::new(TermSetQuery::new(terms.iter().cloned())),
-                    ),
+                    (Occur::MustNot, Box::new(TermSetQuery::new(terms))),
                 ]);
                 self.hits(&searcher, &current, matches, &statistics, snippets)?
             }
@@ -200,37 +220,76 @@ impl TextIndex {
     }
 }
 
-/// The corpus a search scores against: the index's documents (unless the
-/// index answers for no node) and the pending ones. A superseded document
-/// still counts in the index's part until the index replaces it, as a
-/// deleted document counts in Tantivy until its segment merges.
+/// What a search's corpus starts from before the pending documents change it.
+enum Base<'a> {
+    /// The index's exact live-document statistics.
+    Exact(&'a Corpus),
+    /// Tantivy's own counts, for an index that does not keep exact ones.
+    Index(&'a Searcher),
+    /// Nothing: the index answers for no node.
+    Nothing,
+}
+
+/// The corpus a search scores against: the base, less the superseded
+/// documents the index holds, plus the pending ones.
 struct CorpusStatistics<'a> {
-    index: Option<&'a Searcher>,
-    pending: Option<&'a Searcher>,
+    base: Base<'a>,
+    /// The index's searcher, for fields other than the body.
+    searcher: &'a Searcher,
+    body: Field,
+    added: &'a Corpus,
+    removed: &'a Corpus,
 }
 
 impl CorpusStatistics<'_> {
-    fn sum(&self, of: impl Fn(&Searcher) -> tantivy::Result<u64>) -> tantivy::Result<u64> {
-        let mut total = 0u64;
-        for searcher in [self.index, self.pending].into_iter().flatten() {
-            // Two document counts of one in-memory index cannot reach 2^64.
-            total += of(searcher)?;
-        }
-        Ok(total)
+    fn combine(&self, base: u64, added: u64, removed: u64) -> tantivy::Result<u64> {
+        CorpusChange::apply(base, added, removed).ok_or_else(|| {
+            tantivy::TantivyError::InternalError(
+                "corpus statistics went below zero: the superseded documents are not \
+                 in the counted corpus"
+                    .to_string(),
+            )
+        })
     }
 }
 
 impl Bm25StatisticsProvider for CorpusStatistics<'_> {
     fn total_num_tokens(&self, field: Field) -> tantivy::Result<u64> {
-        self.sum(|s| s.total_num_tokens(field))
+        if field != self.body {
+            return self.searcher.total_num_tokens(field);
+        }
+        let base = match self.base {
+            Base::Exact(corpus) => corpus.tokens,
+            Base::Index(searcher) => searcher.total_num_tokens(field)?,
+            Base::Nothing => 0,
+        };
+        self.combine(base, self.added.tokens, self.removed.tokens)
     }
 
     fn total_num_docs(&self) -> tantivy::Result<u64> {
-        self.sum(Bm25StatisticsProvider::total_num_docs)
+        let base = match self.base {
+            Base::Exact(corpus) => corpus.docs,
+            Base::Index(searcher) => Bm25StatisticsProvider::total_num_docs(searcher)?,
+            Base::Nothing => 0,
+        };
+        self.combine(base, self.added.docs, self.removed.docs)
     }
 
     fn doc_freq(&self, term: &Term) -> tantivy::Result<u64> {
-        self.sum(|s| s.doc_freq(term))
+        if term.field() != self.body {
+            return self.searcher.doc_freq(term);
+        }
+        let value = term.value();
+        let Some(text) = value.as_str() else {
+            return self.searcher.doc_freq(term);
+        };
+        let count = |corpus: &Corpus| corpus.df.get(text).copied().unwrap_or(0);
+        let base = match self.base {
+            Base::Exact(corpus) => count(corpus),
+            Base::Index(searcher) => searcher.doc_freq(term)?,
+            Base::Nothing => 0,
+        };
+        self.combine(base, count(self.added), count(self.removed))
     }
 }
 
