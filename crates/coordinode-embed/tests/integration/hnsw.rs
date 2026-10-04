@@ -1465,8 +1465,9 @@ fn hnsw_search_after_auto_inserts() {
         .expect("create point");
     }
 
-    // HNSW should have all 10 vectors
+    // HNSW should have all 10 vectors once the worker folded the commits.
     let reg = db.vector_index_registry();
+    await_folded(reg);
     let results = reg
         .search("Point", "coords", &[5.0, (5.0_f32 * 0.5).sin()], 3)
         .expect("search");
