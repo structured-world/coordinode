@@ -393,7 +393,7 @@ impl StorageEngine {
     /// applied in between (with [`Self::apply_raft_proposal`]) record their
     /// markers. Call with the applies paused.
     ///
-    /// The rows land at [`INSTALLED_ROW_SEQNO`], below every commit
+    /// The rows land at seqno `INSTALLED_ROW_SEQNO` (0), below every commit
     /// timestamp: the entries replayed or applied after the install write at
     /// their own commit timestamp, which can sit below this node's next seqno,
     /// and an installed row above them would hide them.
