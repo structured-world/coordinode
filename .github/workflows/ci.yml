@@ -190,6 +190,9 @@ jobs:
       - X64
       - coordinode-windows
     env:
+      # A product embedding the library links the C runtime statically; build
+      # and test the same way.
+      RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
       PROTOC_VERSION: "36.2"
       PROTOC_SHA256: f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3
       NEXTEST_VERSION: "0.9.146"
@@ -245,6 +248,45 @@ jobs:
         # The machine is shared with other runners and people; nothing stays.
         if: always()
         run: cargo clean
+
+  test-macos:
+    name: Test (macOS ${{ matrix.target }})
+    # The crates a product embedding the database links, on both Mac
+    # architectures. The runner is Arm; the Intel build runs its tests under
+    # Rosetta. The server and its integration tests are left to the Linux and
+    # Windows jobs, which have the disk for them.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      CRATES: -p coordinode-embed -p coordinode-storage -p coordinode-raft -p coordinode-query
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Add the target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+      - name: Install protobuf, and Rosetta for the Intel build
+        run: |
+          brew install protobuf
+          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run the library tests (nextest)
+        # Shared GitHub runners: the same generous election timeouts as the
+        # other test jobs.
+        env:
+          COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS: "1"
+        run: cargo nextest run --all-features --target ${{ matrix.target }} $CRATES
+      - name: Run doc tests
+        run: cargo test --doc --all-features --target ${{ matrix.target }} $CRATES
 
   build:
     name: Build

@@ -47,7 +47,9 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$env:RUSTFLAGS = '-D warnings'
+# The C runtime is linked statically, as a product embedding the library
+# links it; the same flags as the CI job.
+$env:RUSTFLAGS = '-D warnings -C target-feature=+crt-static'
 $env:COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS = '1'
 $env:CARGO_TARGET_DIR = $target
 
