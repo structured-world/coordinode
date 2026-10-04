@@ -7,11 +7,14 @@
 //! does; the clients connect to the leader. Modes:
 //!   insert  one node with an indexed `email` per statement
 //!   txn     three such nodes in one statement (one transaction)
+//!   mix     after each client creates its own nodes, one statement at a
+//!           time chosen evenly among insert, update, delete and read, each
+//!           finding its node by the indexed `email`
 //! Printed: statements per second, latency distribution, and the bytes the
 //! leader's Raft log grew by per statement.
 //!
 //! Run: cargo bench -p coordinode-server --bench replicated_writes -- \
-//!        [insert|txn] [threads] [seconds] [resolved|derived] [full|fsync|open_datasync]
+//!        [insert|txn|mix] [threads] [seconds] [resolved|derived] [full|fsync|open_datasync]
 
 #![allow(clippy::expect_used, clippy::print_stdout, clippy::unwrap_used)]
 
@@ -174,6 +177,142 @@ async fn client(port: u16, txn: bool, worker: u64, deadline: Instant) -> (Vec<Du
     (samples, errors)
 }
 
+/// Nodes each mix client creates before its measured window opens.
+const PRELOAD: u64 = 200;
+
+/// The kinds of statement the mix runs, in an even share.
+const KINDS: [&str; 4] = ["insert", "update", "delete", "read"];
+
+/// One mix client: its own nodes first, then `seconds` of statements of the
+/// kinds in [`KINDS`], each over a node it holds. Latencies by kind.
+async fn mix_client(port: u16, worker: u64, seconds: u64) -> ([Vec<Duration>; 4], usize) {
+    let mut client = query::cypher_service_client::CypherServiceClient::connect(format!(
+        "http://127.0.0.1:{port}"
+    ))
+    .await
+    .expect("connect");
+    let mut n = 0u64;
+    // xorshift: the share of each kind only needs to be even, not secret.
+    let mut state = worker | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut live: Vec<String> = Vec::new();
+    let new_email = |n: &mut u64| {
+        let key = (worker << 40) | *n;
+        *n += 1;
+        format!("user-{key}@example.com")
+    };
+    let call = async |client: &mut query::cypher_service_client::CypherServiceClient<
+        tonic::transport::Channel,
+    >,
+                      query: &str,
+                      email: String,
+                      r: f64| {
+        let mut parameters = HashMap::new();
+        parameters.insert("e".to_string(), text(email));
+        parameters.insert("r".to_string(), float(r));
+        client
+            .execute_cypher(query::ExecuteCypherRequest {
+                query: query.to_string(),
+                parameters,
+                ..Default::default()
+            })
+            .await
+    };
+    const CREATE: &str = "CREATE (:User {email: $e, r: $r})";
+    for _ in 0..PRELOAD {
+        let email = new_email(&mut n);
+        call(&mut client, CREATE, email.clone(), 0.5)
+            .await
+            .expect("preload");
+        live.push(email);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut samples: [Vec<Duration>; 4] = Default::default();
+    let mut errors = 0usize;
+    while Instant::now() < deadline {
+        let kind = if live.is_empty() {
+            0
+        } else {
+            (next() % 4) as usize
+        };
+        let r = (next() % 1000) as f64 / 1000.0;
+        let (query, email) = match kind {
+            0 => (CREATE, new_email(&mut n)),
+            1 => (
+                "MATCH (u:User {email: $e}) SET u.r = $r",
+                live[(next() as usize) % live.len()].clone(),
+            ),
+            2 => {
+                let i = (next() as usize) % live.len();
+                (
+                    "MATCH (u:User {email: $e}) DETACH DELETE u",
+                    live.swap_remove(i),
+                )
+            }
+            _ => (
+                "MATCH (u:User {email: $e}) RETURN u.r",
+                live[(next() as usize) % live.len()].clone(),
+            ),
+        };
+        let t = Instant::now();
+        match call(&mut client, query, email.clone(), r).await {
+            Ok(_) => {
+                samples[kind].push(t.elapsed());
+                if kind == 0 {
+                    live.push(email);
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                if errors <= 3 {
+                    println!("worker {worker}: {e}");
+                }
+            }
+        }
+    }
+    (samples, errors)
+}
+
+/// The mix with `threads` clients for `seconds`, one line per kind and a
+/// total.
+async fn run_mix(port: u16, (round, threads, seconds): (u64, u64, u64), label: &str) {
+    let tasks: Vec<_> = (0..threads)
+        .map(|w| tokio::spawn(mix_client(port, (round << 8) | w, seconds)))
+        .collect();
+    let mut by_kind: [Vec<Duration>; 4] = Default::default();
+    let mut errors = 0;
+    for t in tasks {
+        let (s, e) = t.await.expect("client");
+        for (all, mine) in by_kind.iter_mut().zip(s) {
+            all.extend(mine);
+        }
+        errors += e;
+    }
+    let mut total = 0;
+    for (kind, samples) in KINDS.iter().zip(by_kind.iter_mut()) {
+        samples.sort_unstable();
+        total += samples.len();
+        println!(
+            "{label} {kind:<7} ops={:>6} tps={:>6.0}  p50={:>8.2?} p99={:>8.2?} p999={:>8.2?}",
+            samples.len(),
+            samples.len() as f64 / seconds as f64,
+            percentile(samples, 0.50),
+            percentile(samples, 0.99),
+            percentile(samples, 0.999),
+        );
+    }
+    println!(
+        "{label} total   ops={total:>6} errors={errors} tps={:>6.0}",
+        total as f64 / seconds as f64
+    );
+}
+
 /// Run `round` (distinct per run, so no two runs write the same key).
 async fn run(
     leader: &Node,
@@ -232,10 +371,10 @@ fn main() {
         }
     };
     let txn = match mode.as_str() {
-        "insert" => false,
+        "insert" | "mix" => false,
         "txn" => true,
         other => {
-            eprintln!("mode must be insert or txn, got {other}");
+            eprintln!("mode must be insert, txn or mix, got {other}");
             std::process::exit(2);
         }
     };
@@ -274,15 +413,20 @@ fn main() {
         println!(
             "== one group of three, {threads} clients over gRPC to the leader, w:majority, {profile} index, sync {sync:?} =="
         );
-        run(&n1, ports[0], txn, (1, threads, 3), "warm-up").await;
-        run(
-            &n1,
-            ports[0],
-            txn,
-            (2, threads, seconds),
-            &format!("{mode} {profile}"),
-        )
-        .await;
+        if mode == "mix" {
+            run_mix(ports[0], (1, threads, 3), "warm-up").await;
+            run_mix(ports[0], (2, threads, seconds), &format!("mix {profile}")).await;
+        } else {
+            run(&n1, ports[0], txn, (1, threads, 3), "warm-up").await;
+            run(
+                &n1,
+                ports[0],
+                txn,
+                (2, threads, seconds),
+                &format!("{mode} {profile}"),
+            )
+            .await;
+        }
 
         for n in [&n3, &n2, &n1] {
             n.raft.shutdown().await.expect("shutdown");
