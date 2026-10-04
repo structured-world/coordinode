@@ -29,6 +29,19 @@ impl IndexDelta {
         matches!(self, Self::Nodes(nodes) if nodes.is_empty())
     }
 
+    /// This delta with `nodes` added: a transaction's own writes, which no
+    /// index holds until it commits.
+    #[must_use]
+    pub fn with_nodes(self, nodes: impl IntoIterator<Item = NodeId>) -> Self {
+        match self {
+            Self::Nodes(mut set) => {
+                set.extend(nodes);
+                Self::Nodes(set)
+            }
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
     /// Whether the index's entry for `node` cannot be trusted.
     pub fn contains(&self, node: NodeId) -> bool {
         match self {

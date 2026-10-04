@@ -98,9 +98,9 @@ impl TextIndexRegistry {
     }
 
     /// What a search of `(label, property)` on `shard_id` reads: the index,
-    /// and in place of its documents of the nodes written since its position,
-    /// their documents as `read` sees them. `Ok(None)` when there is no such
-    /// index.
+    /// and in place of its documents of the nodes written since its position
+    /// and of `own` (the reading transaction's uncommitted writes), their
+    /// documents as `read` sees them. `Ok(None)` when there is no such index.
     ///
     /// # Errors
     ///
@@ -112,6 +112,7 @@ impl TextIndexRegistry {
         read: &Transaction<'_>,
         shard_id: u16,
         interner: &FieldInterner,
+        own: &[NodeId],
     ) -> Result<Option<TextView>, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
@@ -119,7 +120,8 @@ impl TextIndexRegistry {
         let delta = match self.coverage() {
             Some(coverage) => coverage.delta(shard_id),
             None => IndexDelta::Nodes(Default::default()),
-        };
+        }
+        .with_nodes(own.iter().copied());
         if delta.is_empty() {
             return Ok(Some(TextView {
                 handle,

@@ -104,6 +104,64 @@ fn a_relabelled_node_follows_its_label_in_the_index() {
     assert_eq!(rows.len(), 1, "a node that gained the label is not indexed");
 }
 
+/// A transaction searches its own uncommitted text: its SET is found by the
+/// new words and no longer by the old ones, and a node it created is found;
+/// a search outside it sees none of that, and after rollback nothing stays.
+#[test]
+fn a_transaction_searches_its_own_uncommitted_text() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'committed words'})")
+        .expect("create");
+
+    let titles_in = |db: &mut Database, tx, words: &str| -> Vec<String> {
+        let mut found: Vec<String> = db
+            .execute_in_transaction(
+                tx,
+                &format!(
+                    "MATCH (n:Article) WHERE text_match(n.body, '{words}') RETURN n.title AS t"
+                ),
+                None,
+            )
+            .expect("search in transaction")
+            .into_iter()
+            .filter_map(|row| match row.get("t") {
+                Some(Value::String(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    };
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        "MATCH (n:Article {title: 'a'}) SET n.body = 'private words'",
+        None,
+    )
+    .expect("set");
+    db.execute_in_transaction(
+        tx,
+        "CREATE (:Article {title: 'b', body: 'private draft'})",
+        None,
+    )
+    .expect("create in transaction");
+
+    assert_eq!(titles_in(&mut db, tx, "private"), ["a", "b"]);
+    assert!(titles_in(&mut db, tx, "committed").is_empty());
+    assert!(
+        titles(&mut db, "private").is_empty(),
+        "uncommitted text leaked"
+    );
+    assert_eq!(titles(&mut db, "committed"), ["a"]);
+
+    db.rollback_transaction(tx).expect("rollback");
+    assert!(titles(&mut db, "private").is_empty());
+    assert_eq!(titles(&mut db, "committed"), ["a"]);
+}
+
 // ── Writes the index has not folded ────────────────────────────────
 
 fn node_id(db: &mut Database, title: &str) -> u64 {

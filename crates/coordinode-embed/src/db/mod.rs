@@ -3656,7 +3656,7 @@ impl Database {
             None,
         );
         self.text_index_registry
-            .view(label, property, &read, self.shard_id, &interner)
+            .view(label, property, &read, self.shard_id, &interner, &[])
             .map_err(DatabaseError::Other)
     }
 

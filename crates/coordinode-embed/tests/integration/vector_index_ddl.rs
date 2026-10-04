@@ -216,6 +216,56 @@ fn a_filtered_top_k_ranks_unfolded_writes_by_their_rows() {
     assert_eq!(found, ["fresh", "moved", "far1"]);
 }
 
+/// A transaction's index search ranks its own uncommitted vectors where they
+/// are now; a search outside it, and after rollback, ranks the committed ones.
+#[test]
+fn a_transaction_ranks_its_own_uncommitted_vectors() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(r#"CREATE VECTOR INDEX l2_idx ON :Embed(vec) OPTIONS {metric: "l2"}"#)
+        .expect("create l2 index");
+    db.execute_cypher("CREATE (:Embed {name: 'near', vec: [1.0, 0.0, 0.0]})")
+        .expect("create near");
+    db.execute_cypher("CREATE (:Embed {name: 'far', vec: [0.0, 1.0, 0.0]})")
+        .expect("create far");
+    await_folded(&db);
+
+    let query = "MATCH (n:Embed) WITH n, vector_distance(n.vec, [1.0, 0.0, 0.0]) AS d \
+                 ORDER BY d LIMIT 1 RETURN n.name AS name";
+    let first = |rows: Vec<std::collections::BTreeMap<String, Value>>| match rows[0].get("name") {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("name: {other:?}"),
+    };
+
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        "MATCH (n:Embed {name: 'near'}) SET n.vec = [0.0, 0.0, 5.0]",
+        None,
+    )
+    .expect("move near away");
+    db.execute_in_transaction(
+        tx,
+        "CREATE (:Embed {name: 'new', vec: [0.9, 0.0, 0.0]})",
+        None,
+    )
+    .expect("create new");
+    let inside = first(
+        db.execute_in_transaction(tx, query, None)
+            .expect("search inside"),
+    );
+    assert_eq!(inside, "new");
+    assert_eq!(
+        first(db.execute_cypher(query).expect("search outside")),
+        "near"
+    );
+
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(
+        first(db.execute_cypher(query).expect("search after")),
+        "near"
+    );
+}
+
 /// When the writes the graph lacks are not known (an event was dropped), an
 /// index search ranks every node of the label from the store.
 #[test]

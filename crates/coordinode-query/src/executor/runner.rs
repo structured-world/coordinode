@@ -3976,6 +3976,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             language,
         } => {
             let rows = execute_op(input, ctx)?;
+            materialize_own_node_writes(ctx)?;
             execute_text_filter(&rows, text_expr, query_string, language.as_deref(), ctx)
         }
 
@@ -5284,9 +5285,13 @@ fn execute_hnsw_scan(
     use coordinode_modality::NodeStore as _;
     let nodes = coordinode_modality::LocalNodeStore;
 
-    // The commits the index has not folded yet are answered from the store at
-    // this statement's snapshot; the index answers for every other node.
-    let delta = registry.delta(ctx.shard_id);
+    // The commits the index has not folded yet and the transaction's own
+    // uncommitted writes are answered from the store as this statement sees
+    // it; the index answers for every other node.
+    materialize_own_node_writes(ctx)?;
+    let delta = registry
+        .delta(ctx.shard_id)
+        .with_nodes(own_written_nodes(ctx));
     // (node, record, index score, exact score of the ORDER BY function)
     let mut candidates: Vec<(u64, NodeRecord, f32, Option<f64>)> = Vec::new();
     if delta != IndexDelta::Unknown {
@@ -6701,10 +6706,13 @@ fn try_hnsw_vector_top_k(
     let overfetch = (k * 4).max(rows.len() * 2).clamp(100, 10_000);
 
     gate_vector_index_read(indexes, &label_str, &property_str)?;
-    // The commits the index has not folded yet are answered from the rows,
-    // which hold this statement's view of every node; with no record of which
-    // nodes they touched, the rows are ranked exactly.
-    let delta = registry.delta(ctx.shard_id);
+    // The commits the index has not folded yet and the transaction's own
+    // uncommitted writes are answered from the rows, which hold this
+    // statement's view of every node; with no record of which nodes the
+    // commits touched, the rows are ranked exactly.
+    let delta = registry
+        .delta(ctx.shard_id)
+        .with_nodes(own_written_nodes(ctx));
     if delta == IndexDelta::Unknown {
         return Ok(None);
     }
@@ -7210,6 +7218,8 @@ fn execute_rank_fuse(
     if rows.is_empty() {
         return Ok(rows);
     }
+    // Text methods read the transaction's own writes from the store.
+    materialize_own_node_writes(ctx)?;
 
     // Resolve all methods up-front so we fail fast on a single bad method.
     let mut kinds = Vec::with_capacity(methods.len());
@@ -8027,6 +8037,45 @@ fn text_match_missing_index_error(label: Option<&str>, property: Option<&str>) -
     ExecutionError::Unsupported(msg)
 }
 
+/// Fold the pending node merge operands of the statement's transaction into
+/// its buffered records, so a store read sees the nodes it wrote as it does.
+fn materialize_own_node_writes(ctx: &mut ExecutionContext<'_>) -> Result<(), ExecutionError> {
+    if ctx.txn.node_deltas().is_empty() {
+        return Ok(());
+    }
+    let mut keys: Vec<Vec<u8>> = ctx
+        .txn
+        .node_deltas()
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        coordinode_modality::LocalNodeStore::materialize_pending_deltas(&mut ctx.txn, &key)?;
+    }
+    Ok(())
+}
+
+/// The nodes of this shard the statement's transaction has written and not
+/// committed: no index holds them, so a search reads them through the
+/// transaction.
+fn own_written_nodes(ctx: &ExecutionContext<'_>) -> Vec<NodeId> {
+    let buffered = ctx
+        .txn
+        .write_buffer()
+        .keys()
+        .filter(|(partition, _)| *partition == Partition::Node)
+        .map(|(_, key)| key.as_slice());
+    let merged = ctx.txn.node_deltas().iter().map(|(key, _)| key.as_slice());
+    buffered
+        .chain(merged)
+        .filter_map(coordinode_core::graph::node::decode_node_key)
+        .filter(|(shard, _)| *shard == ctx.shard_id)
+        .map(|(_, id)| id)
+        .collect()
+}
+
 /// Every node the text index of `(label, property)` matches for `query`
 /// (tokenized by `language`, the index's default when `None`) with its BM25
 /// score, the writes the index has not folded yet answered from this
@@ -8042,7 +8091,9 @@ fn text_index_matches(
     use coordinode_search::tantivy::multi_lang::TextRequest;
     use coordinode_search::tantivy::pending::Matches;
 
-    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner)? else {
+    let own = own_written_nodes(ctx);
+    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner, &own)?
+    else {
         return Ok(None);
     };
     let hits = view.find(
