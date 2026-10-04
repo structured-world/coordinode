@@ -1175,6 +1175,7 @@ dependencies = [
  "prost",
  "rlimit",
  "rmpv",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_yaml_ng",

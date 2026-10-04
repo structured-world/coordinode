@@ -331,6 +331,9 @@ pub struct ServerConfig {
     pub cdc_heartbeat_interval_ms: Option<NonZeroU64>,
     /// Most entries a CDC change stream reads and sends per poll (`None` = 256).
     pub cdc_batch_size: Option<NonZeroUsize>,
+    /// Most bytes of log entries the change streams' shared reader keeps in
+    /// memory for streams that have not read them yet (`None` = 64 MiB).
+    pub cdc_buffer_bytes: Option<usize>,
     /// Interactive-transaction idle timeout in seconds.
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction.
@@ -449,6 +452,7 @@ impl Default for ServerConfig {
             registry_eviction_ms: None,
             cdc_heartbeat_interval_ms: None,
             cdc_batch_size: None,
+            cdc_buffer_bytes: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             wire_compression_level: 3,

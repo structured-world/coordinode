@@ -72,6 +72,9 @@ pub struct ChangeEventServiceImpl {
     applied_changes: AppliedSignal,
     /// Read pacing of every stream.
     tuning: CdcStreamTuning,
+    /// The log reader every stream shares, made on the first subscription.
+    // no-std: spin::Mutex; taken once per subscription.
+    hub: parking_lot::Mutex<Option<Arc<CdcHub>>>,
 }
 
 impl ChangeEventServiceImpl {
@@ -92,7 +95,28 @@ impl ChangeEventServiceImpl {
             applied,
             applied_changes,
             tuning: CdcStreamTuning::default(),
+            hub: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The shard's shared log reader, made at the applied position on the
+    /// first call.
+    fn hub(&self) -> Result<Arc<CdcHub>, Status> {
+        let mut slot = self.hub.lock();
+        if let Some(hub) = slot.as_ref() {
+            return Ok(Arc::clone(hub));
+        }
+        let hub = Arc::new(
+            CdcHub::new(
+                &self.oplog_dirs,
+                self.shard_id,
+                (self.applied)(),
+                self.tuning.buffer_bytes,
+            )
+            .map_err(|e| Status::internal(format!("change stream reader: {e}")))?,
+        );
+        *slot = Some(Arc::clone(&hub));
+        Ok(hub)
     }
 
     /// The same service pacing its streams by `tuning`.
@@ -171,6 +195,10 @@ pub struct CdcStreamTuning {
     pub heartbeat_interval: Duration,
     /// Most entries read and sent per poll (back-pressure).
     pub batch_size: NonZeroUsize,
+    /// Most bytes of log entries the streams' shared reader keeps in memory
+    /// for streams that have not passed them yet (`cdc_buffer_bytes`); a
+    /// stream further behind reads from the log.
+    pub buffer_bytes: usize,
 }
 
 impl Default for CdcStreamTuning {
@@ -183,9 +211,13 @@ impl Default for CdcStreamTuning {
                     None => unreachable!(),
                 }
             },
+            buffer_bytes: DEFAULT_CDC_BUFFER_BYTES,
         }
     }
 }
+
+/// Default of [`CdcStreamTuning::buffer_bytes`]: 64 MiB.
+pub const DEFAULT_CDC_BUFFER_BYTES: usize = 64 << 20;
 
 /// The client status for a registry refusal.
 fn registry_status(e: RegistryError) -> Status {
@@ -325,13 +357,8 @@ impl ChangeStreamService for ChangeEventServiceImpl {
                 blocking(move || registry.check_retention(&handle)).await?
             }
         };
-        let tailer_token = ResumeToken {
-            shard_id,
-            segment_id: from,
-            entry_offset: 0,
-        };
-        let tailer = OplogTailer::new(&self.oplog_dirs, tailer_token)
-            .map_err(|e| Status::invalid_argument(format!("resume token: {e}")))?;
+        let hub = self.hub()?;
+        let reader = hub.reader(from);
 
         let (tx, rx) = mpsc::channel::<Result<ChangeEvent, Status>>(64);
         let incarnation = handle.incarnation();
@@ -339,7 +366,11 @@ impl ChangeStreamService for ChangeEventServiceImpl {
             shard_id,
             registry,
             handle,
-            tailer,
+            hub,
+            reader,
+            position: from,
+            own_tailer: None,
+            oplog_dirs: self.oplog_dirs.clone(),
             filters,
             tx,
             applied: Arc::clone(&self.applied),
@@ -422,7 +453,14 @@ struct StreamState {
     shard_id: u32,
     registry: ShardConsumerRegistry,
     handle: RegisteredHandle,
-    tailer: OplogTailer,
+    /// The shard's shared reader of the log.
+    hub: Arc<CdcHub>,
+    reader: HubReader,
+    /// The next log index this stream reads.
+    position: u64,
+    /// Reads the log while the stream is behind what the hub holds.
+    own_tailer: Option<OplogTailer>,
+    oplog_dirs: Vec<PathBuf>,
     filters: CdcFilters,
     tx: mpsc::Sender<Result<ChangeEvent, Status>>,
     applied: AppliedFrontier,
@@ -456,11 +494,9 @@ async fn stream_consumer(mut s: StreamState) {
             break;
         }
 
-        let read_from = s.tailer.next_index();
-        let batch = match s
-            .tailer
-            .read_next(s.tuning.batch_size.get(), &s.filters, (s.applied)())
-        {
+        let read_from = s.position;
+        let until = (s.applied)();
+        let batch = match read_batch(&mut s, until) {
             Ok(b) => b,
             Err(StorageError::RetentionLost {
                 requested,
@@ -479,11 +515,14 @@ async fn stream_consumer(mut s: StreamState) {
                 break;
             }
         };
-        let caught_up = batch.is_empty();
+        // Nothing to send, and either nothing applied past the position or
+        // nothing readable there yet: wait for the next entry.
+        let caught_up = batch.is_empty() && (s.position >= until || s.position == read_from);
 
         // Where the client can resume and acknowledge after what was sent.
         let mut sent_to = read_from;
-        for (entry, token) in batch {
+        for shared in batch {
+            let (entry, token) = &*shared;
             if let Ok(next) = token.next_index() {
                 sent_to = sent_to.max(next);
             }
@@ -507,7 +546,7 @@ async fn stream_consumer(mut s: StreamState) {
         // client acknowledges. Entries the filters dropped after the last
         // event sent are reported as a progress event, so a client whose
         // filters match little can still acknowledge past them.
-        let read_to = s.tailer.next_index();
+        let read_to = s.position;
         if read_to > sent_to {
             let progress = ChangeEvent {
                 ts: 0,
@@ -555,6 +594,39 @@ async fn stream_consumer(mut s: StreamState) {
     }
 }
 
+/// The next entries for stream `s` below `until`: from the shard's hub, or
+/// from the log itself while the stream is behind what the hub holds. Moves
+/// `s.position` past every entry read, sent or filtered out.
+fn read_batch(s: &mut StreamState, until: u64) -> Result<Vec<SharedEntry>, StorageError> {
+    let max = s.tuning.batch_size.get();
+    match s.hub.read(&s.reader, s.position, max, until, &s.filters)? {
+        HubRead::Entries { entries, next } => {
+            s.own_tailer = None;
+            s.position = next;
+            Ok(entries)
+        }
+        HubRead::Behind(base) => {
+            let tailer = match s.own_tailer.as_mut() {
+                Some(tailer) => tailer,
+                None => s.own_tailer.insert(OplogTailer::new(
+                    &s.oplog_dirs,
+                    ResumeToken {
+                        shard_id: s.shard_id,
+                        segment_id: s.position,
+                        entry_offset: 0,
+                    },
+                )?),
+            };
+            let entries = tailer.read_next(max, &s.filters, until.min(base))?;
+            s.position = tailer.next_index();
+            Ok(entries.into_iter().map(Arc::new).collect())
+        }
+    }
+}
+
+mod hub;
+use hub::{CdcHub, HubRead, HubReader, SharedEntry};
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests;
@@ -572,12 +644,13 @@ fn proto_filters_to_cdc(proto: Option<ProtoCdcFilters>) -> CdcFilters {
 }
 
 fn oplog_entry_to_proto(
-    entry: coordinode_storage::oplog::entry::OplogEntry,
-    token: ResumeToken,
+    entry: &coordinode_storage::oplog::entry::OplogEntry,
+    token: &ResumeToken,
 ) -> ChangeEvent {
     let ops = entry
         .ops
-        .into_iter()
+        .iter()
+        .cloned()
         .filter_map(oplog_op_to_proto)
         .collect();
 

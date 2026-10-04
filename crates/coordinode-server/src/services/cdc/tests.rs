@@ -362,6 +362,7 @@ async fn a_slow_bounded_reader_is_not_ended_for_liveness() {
     f.service = f.service.with_tuning(super::CdcStreamTuning {
         heartbeat_interval: Duration::from_millis(50),
         batch_size: std::num::NonZeroUsize::new(256).expect("nonzero"),
+        ..super::CdcStreamTuning::default()
     });
     // Thirty heartbeat intervals: each heartbeat lands through a commit, and
     // a loaded test host can stretch one well past its interval.
@@ -728,6 +729,7 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     f.service = f.service.with_tuning(super::CdcStreamTuning {
         heartbeat_interval: Duration::from_millis(50),
         batch_size: std::num::NonZeroUsize::new(256).expect("nonzero"),
+        ..super::CdcStreamTuning::default()
     });
     let mut stream = f
         .service

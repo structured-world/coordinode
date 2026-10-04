@@ -182,6 +182,7 @@ pub(crate) async fn serve(
         registry_eviction_ms,
         cdc_heartbeat_interval_ms,
         cdc_batch_size,
+        cdc_buffer_bytes,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
         peers: peers_vec,
@@ -246,6 +247,7 @@ pub(crate) async fn serve(
                     std::time::Duration::from_millis(ms.get())
                 }),
             batch_size: cdc_batch_size.unwrap_or(default.batch_size),
+            buffer_bytes: cdc_buffer_bytes.unwrap_or(default.buffer_bytes),
         }
     };
 
