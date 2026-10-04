@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Documentation
+
+- *(cluster)* drop internal ids and document paths
+
 ## 0.5.2 - 2026-08-30
 
 #### Fixed

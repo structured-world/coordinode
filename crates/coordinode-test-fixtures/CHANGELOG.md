@@ -2,6 +2,24 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+
+### Fixed
+
+- *(raft)* settle membership and shutdown under load
+- *(raft)* resume and purge the raft log by per-tree apply coverage
+- *(deps)* require the lsm-tree release the code needs
+
+### Testing
+
+- reserve test ports across processes and catch failed starts
+- make the suites pass on any target dir and as root
+- *(storage,raft)* cut power at every sync and write, and upgrade a v0.6.0 store
+
 ## 0.5.8 - 2026-09-05
 
 #### Testing

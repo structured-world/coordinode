@@ -2,6 +2,29 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(cdc)* [**breaking**] explicit retention policy and acknowledged progress per consumer
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+- *(replicate)* stop linking a private constant from public docs
+
+### Fixed
+
+- *(replicate)* keep heartbeats visible while their write is in flight
+- keep heartbeats of a failed flush, lsm-tree 5.11.10
+- *(replicate)* repair partitions at an exact raft position
+
+### Testing
+
+- *(replicate)* wait for the floor after a bounded consumer ends
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

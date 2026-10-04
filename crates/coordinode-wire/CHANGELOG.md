@@ -2,6 +2,21 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+
+### Fixed
+
+- *(build)* keep aws-lc out of the server binary
+
 ## v0.6.0 - 2026-09-23
 
 ### Fixed

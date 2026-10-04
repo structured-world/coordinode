@@ -2,6 +2,70 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* match group members by version and move a group by majority
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(query)* read temporal nodes at the statement's current time
+- *(query)* [**breaking**] procedure catalog with typed signatures
+- *(embed)* run a TTL reap pass on demand
+- *(vector)* remove nodes and reuse their slots beside live search
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(query)* let the caller bound the wait for a building vector index
+
+### Documentation
+
+- *(cypher)* describe temporal reads and unique scope in the reference
+- *(embed)* resolve the RestoreError links in Database::restore
+- *(server)* drop internal ids and document paths
+- *(core,embed)* replace leftover document stand-ins in comments
+- *(embed)* drop internal ids and document paths
+- state the rules in source comments instead of pointing at a local file
+
+### Fixed
+
+- *(query)* find the nodes of a write through the index
+- *(schema)* refuse the engine's temporal fields on every user input
+- *(schema)* hold a strict temporal label's schema on every version
+- *(storage)* return a transaction's prefix scan in key order
+- *(server)* explain the plan ExecuteCypher runs
+- *(query)* keep undeclared properties where reads find them
+- *(query)* match and write every label of a node pattern
+- *(query)* find an unlabelled temporal traversal target
+- *(restore)* [**breaking**] keep every NodeId, refuse issued ones, restore schema and indexes
+- *(query)* bind the TRANSFER EDGES edge variable during analysis
+- *(query)* say why a temporal write is refused, without internal ids
+- *(vector)* maintain replica indexes from applied entries
+- *(vector)* offline an index whose build cannot start
+- *(vector)* build indexes from a tap of applied writes
+- *(storage)* rebuild from what the checkpoint trees hold
+- *(storage)* survive a crash inside a partition rebuild
+- *(core)* draw proposal ids from a fresh range per process
+- *(storage)* replay the embedded journal by per-partition coverage
+- *(deps)* require the lsm-tree release the code needs
+
+### Performance
+
+- *(query)* read a node pinned by id instead of scanning the shard
+
+### Refactored
+
+- *(query)* pair the vector registry with its build engine
+
+### Testing
+
+- *(schema)* cover constraint recreation, name races and snapshot transfer
+- *(embed)* prove the temporal unique reservation by its reason
+- *(embed)* wait for a node to reach the HNSW graph
+- *(embed)* allow expect in the traversal and label tests
+- *(embed)* find checkpoint-shared tables by name, not inode
+- *(raft)* cover log retention, failed rebuilds and interrupted installs
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

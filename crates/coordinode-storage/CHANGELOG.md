@@ -2,6 +2,61 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* match group members by version and move a group by majority
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(server)* configure storage block compression from the config file
+- *(query)* read temporal nodes at the statement's current time
+- *(cdc)* [**breaking**] explicit retention policy and acknowledged progress per consumer
+- *(storage)* report local commits on the applied feed
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(server)* [**breaking**] drop seqno-bounded incremental backups
+
+### Documentation
+
+- *(storage)* state the durability invariants instead of their ids
+- *(storage)* drop internal ids and document paths
+
+### Fixed
+
+- *(cluster)* restart a member that holds its group's data
+- *(schema)* hold a strict temporal label's schema on every version
+- *(raft)* keep acknowledged writes across a restart over a snapshot
+- *(storage)* record a directory's migration only when its open succeeds
+- *(storage)* return a transaction's prefix scan in key order
+- *(cdc)* refuse a resume past purged log instead of skipping
+- *(storage)* enforce version conditions on unwritten keys
+- *(storage)* skip delete-pending files in retention stats on Windows
+- *(server)* report an unusable storage topology instead of panicking
+- *(cdc)* stream applied Raft log entries from the log's own files
+- *(vector)* maintain replica indexes from applied entries
+- *(vector)* build indexes from a tap of applied writes
+- *(storage)* [**breaking**] name the upgrade path from 0.6 stores
+- *(replicate)* repair partitions at an exact raft position
+- *(raft)* build snapshots from a capture at their log id
+- *(storage)* rebuild from what the checkpoint trees hold
+- *(storage)* survive a crash inside a partition rebuild
+- *(storage)* keep the raft coverage reset tombstone below its base
+- *(raft)* resume and purge the raft log by per-tree apply coverage
+- *(storage)* cover columnar tables in recovery and in snapshots
+- *(storage)* replay the embedded journal by per-partition coverage
+- *(deps)* require the lsm-tree release the code needs
+
+### Performance
+
+- *(storage)* measure the apply pauses of copies and installs
+- *(storage)* measure what apply coverage costs
+
+### Testing
+
+- make the suites pass on any target dir and as root
+- *(storage,raft)* cut power at every sync and write, and upgrade a v0.6.0 store
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

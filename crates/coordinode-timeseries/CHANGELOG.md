@@ -2,6 +2,14 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+- drop internal task and decision ids from four modules
+- state the rules in source comments instead of pointing at a local file
+
 ## v0.6.0 - 2026-09-23
 
 ### Fixed

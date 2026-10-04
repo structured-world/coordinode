@@ -2,6 +2,54 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- *(vector)* remove nodes and reuse their slots beside live search
+- *(vector)* insert through a shared borrow, concurrently with search
+- *(vector)* track whether each node is live
+- schema claims, event-driven background work
+
+### Documentation
+
+- state design reasons instead of citing other codebases
+- *(vector)* drop internal ids and document paths
+- drop internal task and decision ids from four modules
+- state the rules in source comments instead of pointing at a local file
+
+### Fixed
+
+- *(vector)* hand the entry point to an updated node, seed reorder at it
+- *(vector)* keep node metadata at stable addresses
+- *(vector)* recompute neighbour edits after a lost CAS
+- *(vector)* publish layer-0 neighbour lists whole
+- *(vector)* build large insert_batch in rounds
+- *(vector)* publish upper-layer neighbour lists whole
+- *(vector)* keep a reinserted HNSW node reachable
+- *(vector)* build indexes from a tap of applied writes
+
+### Performance
+
+- *(vector)* keep publication counters on their own cache lines
+
+### Refactored
+
+- *(vector)* shard the id map for concurrent inserts
+- *(vector)* create the node stores through a shared borrow
+- *(vector)* keep node codes in the stable store
+- *(vector)* keep layer-0 nodes at stable addresses
+- *(vector)* keep only RaBitQ codes in the code block
+
+### Testing
+
+- *(vector)* wait for the build queue instead of sleeping
+- *(vector)* size the layer-0 replace race for miri
+
+### Bench
+
+- *(vector)* search during concurrent inserts
+
 ## v0.6.0 - 2026-09-23
 
 ### Documentation

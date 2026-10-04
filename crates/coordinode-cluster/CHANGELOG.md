@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-04
+
+### Added
+
+- schema claims, event-driven background work
+
+### Documentation
+
+- *(cluster)* drop internal ids and document paths
+
 ## v0.6.0 - 2026-09-23
 
 ### Documentation
