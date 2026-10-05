@@ -264,3 +264,133 @@ fn as_of_text_match_answers_the_snapshot() {
     assert!(at(&mut db, "golang", Some(before)).is_empty());
     assert!(at(&mut db, "newcomer", Some(before)).is_empty());
 }
+
+/// Each document's BM25 score for `word`, by name, as `db` answers
+/// `text_match`, at `as_of` when given.
+fn text_scores(
+    db: &mut Database,
+    word: &str,
+    as_of: Option<u64>,
+) -> std::collections::BTreeMap<String, f64> {
+    let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+    db.execute_cypher(&format!(
+        "MATCH (n:Doc) WHERE text_match(n.body, '{word}') \
+         RETURN n.name AS name, text_score(n.body, '{word}') AS score{as_of}"
+    ))
+    .expect("full-text read")
+    .iter()
+    .map(|row| {
+        let name = match row.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        };
+        let score = match row.get("score") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("expected a score, got {other:?}"),
+        };
+        (name, score)
+    })
+    .collect()
+}
+
+/// A read at a past timestamp answers as a fresh index built from that
+/// snapshot alone, scores included. Random churn (create, rewrite, delete)
+/// over a small vocabulary; then, at timestamps taken along the way, every
+/// word's matches and BM25 scores are compared with a second database that
+/// holds only the documents of that snapshot, indexed from nothing and read
+/// at its present. The model never reads history, so it checks the history
+/// path rather than repeating it: membership, the corpus counts and lengths
+/// that BM25 scores against, and the documents rewritten or deleted since.
+#[test]
+fn as_of_text_ranking_matches_an_index_built_from_the_snapshot() {
+    use std::collections::BTreeMap;
+
+    const WORDS: [&str; 6] = ["rust", "graph", "engine", "vector", "index", "storage"];
+    // xorshift64: a fixed sequence, so a failure reproduces.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move |bound: usize| -> usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
+        .expect("create text index");
+    let mut live: BTreeMap<String, String> = BTreeMap::new();
+    let mut snapshots: Vec<(u64, BTreeMap<String, String>)> = Vec::new();
+    let mut created = 0usize;
+    for step in 0..60 {
+        let body: Vec<&str> = (0..1 + next(6)).map(|_| WORDS[next(WORDS.len())]).collect();
+        let body = body.join(" ");
+        let choice = next(3);
+        let ts = if live.is_empty() || choice == 0 {
+            let name = format!("d{created}");
+            created += 1;
+            let ts = commit(
+                &mut db,
+                &format!("CREATE (:Doc {{name: '{name}', body: '{body}'}})"),
+            );
+            live.insert(name, body);
+            ts
+        } else {
+            let name = live
+                .keys()
+                .nth(next(live.len()))
+                .expect("a live doc")
+                .clone();
+            if choice == 1 {
+                let ts = commit(
+                    &mut db,
+                    &format!("MATCH (n:Doc {{name: '{name}'}}) SET n.body = '{body}'"),
+                );
+                live.insert(name, body);
+                ts
+            } else {
+                let ts = commit(
+                    &mut db,
+                    &format!("MATCH (n:Doc {{name: '{name}'}}) DETACH DELETE n"),
+                );
+                live.remove(&name);
+                ts
+            }
+        };
+        if step % 12 == 11 {
+            snapshots.push((ts, live.clone()));
+        }
+    }
+
+    for (ts, docs) in &snapshots {
+        let (mut model, model_dir) = open_db();
+        model
+            .execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
+            .expect("create text index");
+        for (name, body) in docs {
+            commit(
+                &mut model,
+                &format!("CREATE (:Doc {{name: '{name}', body: '{body}'}})"),
+            );
+        }
+        for word in WORDS {
+            let past = text_scores(&mut db, word, Some(*ts));
+            let expected = text_scores(&mut model, word, None);
+            assert_eq!(
+                past.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>(),
+                "matches of '{word}' at {ts}"
+            );
+            for (name, score) in &past {
+                let want = expected[name];
+                assert!(
+                    (score - want).abs() <= 1e-4 * want.abs().max(1.0),
+                    "score of {name} for '{word}' at {ts}: {score} against {want}"
+                );
+            }
+        }
+        // The database first, so its index worker stops before its directory
+        // goes away.
+        drop(model);
+        drop(model_dir);
+    }
+}
