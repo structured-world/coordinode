@@ -28,13 +28,14 @@ pub enum SessionOp {
     /// transaction. `params` are already in the engine's value space; the
     /// binding converts its wire values before constructing this. `settings`
     /// are the ones the statement names itself; each one it leaves unset is
-    /// the session's.
+    /// the session's. `source` is where in the client's code it was issued.
     Execute {
         query: String,
         params: HashMap<String, Value>,
         txid: u64,
         nonce: u64,
         settings: ConnectionSettings,
+        source: Option<StatementSource>,
     },
     /// Open an interactive transaction.
     Begin {
@@ -50,6 +51,21 @@ pub enum SessionOp {
     /// Read, and optionally change, the connection's settings. Answered with a
     /// [`SessionEvent::ConnectionStatus`] carrying what is now in effect.
     Configure(ConnectionSettings),
+}
+
+/// Where in a client's code a statement was issued, for the query advisor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatementSource {
+    /// Source file path as the client knows it.
+    pub file: String,
+    /// Line number in that file.
+    pub line: u32,
+    /// Enclosing function; empty when the client cannot tell.
+    pub function: String,
+    /// The client application's name; empty when it did not say.
+    pub app: String,
+    /// The client application's version; empty when it did not say.
+    pub version: String,
 }
 
 /// The settings a connection applies to statements that carry none.

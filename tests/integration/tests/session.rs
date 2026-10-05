@@ -56,6 +56,7 @@ fn execute(request_id: u64, query: &str) -> ClientFrame {
             parameters: Default::default(),
             txid: 0,
             nonce: 0,
+            ..Default::default()
         })),
     }
 }
@@ -79,6 +80,7 @@ fn execute_tx(request_id: u64, query: &str, txid: u64) -> ClientFrame {
             parameters: Default::default(),
             txid,
             nonce: 0,
+            ..Default::default()
         })),
     }
 }
@@ -92,6 +94,7 @@ fn execute_tx_nonce(request_id: u64, query: &str, txid: u64, nonce: u64) -> Clie
             parameters: Default::default(),
             txid,
             nonce,
+            ..Default::default()
         })),
     }
 }

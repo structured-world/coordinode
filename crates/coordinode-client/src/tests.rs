@@ -10,6 +10,7 @@ fn builder_defaults() {
         debug_source_tracking: builder.debug_source_tracking,
         app_name: builder.app_name.clone(),
         app_version: builder.app_version.clone(),
+        transport: builder.transport,
     };
     assert!(
         !config.debug_source_tracking,
@@ -17,6 +18,11 @@ fn builder_defaults() {
     );
     assert!(config.app_name.is_empty());
     assert!(config.app_version.is_empty());
+    assert_eq!(
+        config.transport,
+        Transport::Session,
+        "the session by default"
+    );
 }
 
 /// Builder properly stores configured values.
@@ -43,6 +49,7 @@ fn source_tracking_flag_reflects_config() {
         debug_source_tracking: true,
         app_name: String::new(),
         app_version: String::new(),
+        transport: Transport::default(),
     };
     let config_off = ClientConfig {
         debug_source_tracking: false,

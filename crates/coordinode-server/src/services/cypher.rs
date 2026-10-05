@@ -549,19 +549,43 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
     crate::services::db_err_to_status("Cypher", err)
 }
 
-/// Translate the proto `ReadConcernLevel` integer to the executor enum. The
-/// proto module's `ReadConcern` (used by the read fence) is distinct from
-/// `coordinode_core::txn::read_concern::ReadConcern` (used by the executor for
-/// snapshot timestamp selection) — both are populated from the same proto
-/// field but consumed independently.
-pub(crate) fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
-    match replication::ReadConcernLevel::try_from(level)
-        .unwrap_or(replication::ReadConcernLevel::Unspecified)
-    {
-        replication::ReadConcernLevel::Majority => ExecutorReadConcernLevel::Majority,
-        replication::ReadConcernLevel::Snapshot => ExecutorReadConcernLevel::Snapshot,
-        replication::ReadConcernLevel::Linearizable => ExecutorReadConcernLevel::Linearizable,
-        _ => ExecutorReadConcernLevel::Local,
+/// The read concern level a request names in `field`: `None` for
+/// UNSPECIFIED, which leaves it to the session and then the server's default.
+/// A value this server does not know is refused rather than read as some
+/// other level, which could serve a weaker read than the one asked for.
+pub(crate) fn read_concern_level(
+    field: &str,
+    level: i32,
+) -> Result<Option<ExecutorReadConcernLevel>, Status> {
+    use replication::ReadConcernLevel as Wire;
+    match Wire::try_from(level) {
+        Ok(Wire::Unspecified) => Ok(None),
+        Ok(Wire::Local) => Ok(Some(ExecutorReadConcernLevel::Local)),
+        Ok(Wire::Majority) => Ok(Some(ExecutorReadConcernLevel::Majority)),
+        Ok(Wire::Linearizable) => Ok(Some(ExecutorReadConcernLevel::Linearizable)),
+        Ok(Wire::Snapshot) => Ok(Some(ExecutorReadConcernLevel::Snapshot)),
+        Err(_) => Err(super::error_details::invalid_field(
+            field,
+            format!("read concern level {level} is not one this server knows"),
+        )),
+    }
+}
+
+/// The read preference a request names in `field`: `None` for UNSPECIFIED,
+/// which leaves it to the session and then the server's default. A value this
+/// server does not know is refused rather than read as PRIMARY.
+pub(crate) fn read_preference(
+    field: &str,
+    preference: i32,
+) -> Result<Option<ReadPreference>, Status> {
+    use replication::ReadPreference as Wire;
+    match Wire::try_from(preference) {
+        Ok(Wire::Unspecified) => Ok(None),
+        Ok(_) => Ok(Some(ReadPreference::from_proto(preference))),
+        Err(_) => Err(super::error_details::invalid_field(
+            field,
+            format!("read preference {preference} is not one this server knows"),
+        )),
     }
 }
 
@@ -705,14 +729,13 @@ impl CypherServiceImpl {
 fn requested_from_proto(req: &query::ExecuteCypherRequest) -> Result<Requested, Status> {
     let rc = req.read_concern.as_ref();
     Ok(Requested {
-        read_concern: rc
-            .map(|rc| rc.level)
-            .filter(|&level| level != 0)
-            .map(read_concern_level_to_executor),
+        read_concern: match rc {
+            Some(rc) => read_concern_level("read_concern.level", rc.level)?,
+            None => None,
+        },
         after_index: rc.map_or(0, |rc| rc.after_index),
         at_timestamp: rc.map_or(0, |rc| rc.at_timestamp),
-        read_preference: (req.read_preference != 0)
-            .then(|| ReadPreference::from_proto(req.read_preference)),
+        read_preference: read_preference("read_preference", req.read_preference)?,
         write_concern: req
             .write_concern
             .as_ref()
@@ -806,7 +829,12 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             .await?
         {
             Admission::Run(admitted) => admitted,
-            Admission::Forward(leader_id) => return self.executor.forward(leader_id, req).await,
+            Admission::Forward(leader_id) => {
+                return self
+                    .executor
+                    .forward(leader_id, req, source_ctx.as_ref())
+                    .await;
+            }
         };
 
         let exec_result = {
@@ -829,7 +857,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     // the write rather than repeating it.
                     match leader_hint(&e) {
                         Some(leader_id) if !already_forwarded => {
-                            return self.executor.forward(leader_id, req).await;
+                            return self
+                                .executor
+                                .forward(leader_id, req, source_ctx.as_ref())
+                                .await;
                         }
                         _ => return Err(db_error_to_status(e)),
                     }

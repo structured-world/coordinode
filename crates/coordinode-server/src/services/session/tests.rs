@@ -1,5 +1,10 @@
 use super::*;
-use crate::proto::session::{Begin, Cancel, Commit, Execute, Rollback};
+use crate::proto::session::{Begin, Cancel, Commit, Execute, Rollback, SourceLocation};
+
+/// A session whose metadata names no application.
+fn anonymous() -> ClientApp {
+    ClientApp::default()
+}
 
 #[test]
 fn to_op_maps_execute_with_handles() {
@@ -10,9 +15,10 @@ fn to_op_maps_execute_with_handles() {
             parameters: Default::default(),
             txid: 7,
             nonce: 3,
+            ..Default::default()
         })),
     };
-    match to_op(frame.op) {
+    match to_op(frame.op, &anonymous()) {
         Ok(SessionOp::Execute {
             query, txid, nonce, ..
         }) => {
@@ -33,7 +39,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
             drain_timeout_ms: 50,
         })),
     };
-    match to_op(unordered.op) {
+    match to_op(unordered.op, &anonymous()) {
         Ok(SessionOp::Begin {
             ordering,
             drain_timeout_ms,
@@ -51,7 +57,7 @@ fn to_op_maps_begin_ordering_with_unspecified_defaulting_to_ordered() {
         })),
     };
     assert!(matches!(
-        to_op(unspecified.op),
+        to_op(unspecified.op, &anonymous()),
         Ok(SessionOp::Begin {
             ordering: CoreOrdering::Ordered,
             ..
@@ -69,7 +75,7 @@ fn to_op_maps_commit_rollback_cancel() {
         })),
     };
     assert!(matches!(
-        to_op(commit.op),
+        to_op(commit.op, &anonymous()),
         Ok(SessionOp::Commit {
             txid: 4,
             last_nonce: 9
@@ -80,7 +86,7 @@ fn to_op_maps_commit_rollback_cancel() {
         op: Some(client_frame::Op::Rollback(Rollback { txid: 4 })),
     };
     assert!(matches!(
-        to_op(rollback.op),
+        to_op(rollback.op, &anonymous()),
         Ok(SessionOp::Rollback { txid: 4 })
     ));
     let cancel = ClientFrame {
@@ -90,7 +96,7 @@ fn to_op_maps_commit_rollback_cancel() {
         })),
     };
     assert!(matches!(
-        to_op(cancel.op),
+        to_op(cancel.op, &anonymous()),
         Ok(SessionOp::Cancel {
             target_request_id: 8
         })
@@ -99,7 +105,7 @@ fn to_op_maps_commit_rollback_cancel() {
 
 #[test]
 fn to_op_refuses_a_frame_with_no_op() {
-    assert!(to_op(None).is_err());
+    assert!(to_op(None, &anonymous()).is_err());
 }
 
 /// A Configure carrying a write concern the server cannot honour is refused
@@ -116,22 +122,28 @@ fn to_op_configure_maps_or_refuses_the_write_concern() {
         }))
     };
 
-    match to_op(configure(replication::WriteConcern {
-        w: Some(replication::write_concern::W::Acks(1)),
-        journal: replication::Journal::Cache as i32,
-        timeout_ms: 0,
-    })) {
+    match to_op(
+        configure(replication::WriteConcern {
+            w: Some(replication::write_concern::W::Acks(1)),
+            journal: replication::Journal::Cache as i32,
+            timeout_ms: 0,
+        }),
+        &anonymous(),
+    ) {
         Ok(SessionOp::Configure(settings)) => {
             assert_eq!(settings.write_concern, Some(WriteConcern::cache()));
         }
         other => panic!("expected Configure op, got {other:?}"),
     }
 
-    let refused = to_op(configure(replication::WriteConcern {
-        w: Some(replication::write_concern::W::Acks(2)),
-        journal: replication::Journal::Memory as i32,
-        timeout_ms: 0,
-    }))
+    let refused = to_op(
+        configure(replication::WriteConcern {
+            w: Some(replication::write_concern::W::Acks(2)),
+            journal: replication::Journal::Memory as i32,
+            timeout_ms: 0,
+        }),
+        &anonymous(),
+    )
     .expect_err("w:2 with j:memory must be refused");
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(refused.message().contains("w:2,j:memory"), "got: {refused}");
@@ -230,13 +242,123 @@ fn to_op_converts_execute_parameters_to_engine_values() {
             parameters,
             txid: 0,
             nonce: 0,
+            ..Default::default()
         })),
     };
-    match to_op(frame.op) {
+    match to_op(frame.op, &anonymous()) {
         Ok(SessionOp::Execute { params, .. }) => {
             assert_eq!(params.get("n"), Some(&Value::Int(5)));
         }
         other => panic!("expected Execute op, got {other:?}"),
+    }
+}
+
+/// The settings an Execute names reach the statement, and the parts it leaves
+/// unspecified stay unset so the session's apply; its source carries the
+/// application the session's metadata named.
+#[test]
+fn to_op_reads_a_statements_own_settings_and_source() {
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    let client = ClientApp {
+        app: "billing".to_string(),
+        version: "1.2".to_string(),
+    };
+    let op = Some(client_frame::Op::Execute(Execute {
+        query: "RETURN 1".to_string(),
+        read_concern: Some(replication::ReadConcern {
+            level: replication::ReadConcernLevel::Majority as i32,
+            after_index: 0,
+            at_timestamp: 0,
+        }),
+        write_concern: Some(replication::WriteConcern {
+            w: Some(replication::write_concern::W::Acks(1)),
+            journal: replication::Journal::Journal as i32,
+            timeout_ms: 0,
+        }),
+        read_preference: Some(replication::ReadPreference::Unspecified as i32),
+        source: Some(SourceLocation {
+            file: "pay.rs".to_string(),
+            line: 12,
+            function: "charge".to_string(),
+        }),
+        ..Default::default()
+    }));
+    match to_op(op, &client) {
+        Ok(SessionOp::Execute {
+            settings, source, ..
+        }) => {
+            assert_eq!(
+                settings,
+                ConnectionSettings {
+                    read_concern: Some(replication::ReadConcernLevel::Majority as u8),
+                    write_concern: Some(WriteConcern::w1()),
+                    ..ConnectionSettings::default()
+                },
+                "an unspecified preference and zero positions leave those to the session"
+            );
+            assert_eq!(
+                source,
+                Some(StatementSource {
+                    file: "pay.rs".to_string(),
+                    line: 12,
+                    function: "charge".to_string(),
+                    app: "billing".to_string(),
+                    version: "1.2".to_string(),
+                })
+            );
+        }
+        other => panic!("expected Execute op, got {other:?}"),
+    }
+}
+
+/// A level or preference the server does not know is refused, naming the
+/// field, rather than read as LOCAL or PRIMARY: a client asking for a stronger
+/// guarantee than the server knows must not be served a weaker one. Applies
+/// to a statement and to a Configure alike.
+#[test]
+fn an_unknown_level_or_preference_is_refused_not_downgraded() {
+    let execute = |read_concern, read_preference| {
+        Some(client_frame::Op::Execute(Execute {
+            query: "RETURN 1".to_string(),
+            read_concern,
+            read_preference,
+            ..Default::default()
+        }))
+    };
+    let unknown_level = Some(replication::ReadConcern {
+        level: 99,
+        after_index: 0,
+        at_timestamp: 0,
+    });
+    for (op, field) in [
+        (execute(unknown_level, None), "read_concern.level"),
+        (execute(None, Some(42)), "read_preference"),
+        (
+            Some(client_frame::Op::Configure(Configure {
+                read_concern: unknown_level,
+                ..Default::default()
+            })),
+            "read_concern.level",
+        ),
+        (
+            Some(client_frame::Op::Configure(Configure {
+                read_preference: Some(42),
+                ..Default::default()
+            })),
+            "read_preference",
+        ),
+    ] {
+        let refused = to_op(op, &anonymous()).expect_err("an unknown value");
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert!(refused.message().contains("not one this server knows"));
+        let details = tonic_types::StatusExt::get_error_details(&refused);
+        let violations = details
+            .bad_request()
+            .expect("BadRequest")
+            .field_violations
+            .clone();
+        assert_eq!(violations[0].field, field);
     }
 }
 

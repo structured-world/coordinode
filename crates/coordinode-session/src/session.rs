@@ -22,6 +22,7 @@ use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
 use crate::types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
+    StatementSource,
 };
 
 /// An inbound op tagged with its session-scoped request id.
@@ -192,6 +193,7 @@ impl Session {
                 txid,
                 nonce,
                 settings,
+                source,
             } if txid != 0 && txns.contains_key(&txid) => {
                 let msg = TxnMsg::Statement {
                     nonce,
@@ -200,6 +202,7 @@ impl Session {
                         query,
                         params,
                         settings: self.settings.lock().under(&settings),
+                        source: source.map(Box::new),
                     },
                 };
                 // A send error means the task just resolved (rx dropped) before
@@ -213,6 +216,7 @@ impl Session {
                                 query: String::new(),
                                 params: HashMap::new(),
                                 settings: ConnectionSettings::default(),
+                                source: None,
                             },
                             txid,
                             out,
@@ -227,6 +231,7 @@ impl Session {
                 params,
                 txid,
                 settings,
+                source,
                 ..
             } => {
                 let statement = Statement {
@@ -234,6 +239,7 @@ impl Session {
                     query,
                     params,
                     settings: self.settings.lock().under(&settings),
+                    source: source.map(Box::new),
                 };
                 self.spawn_autonomous(statement, txid, out);
             }
@@ -378,6 +384,10 @@ struct Statement {
     /// The settings it runs under: its own over its session's at the moment
     /// it was received.
     settings: ConnectionSettings,
+    /// Where in the client's code it was issued. Boxed: only a client in
+    /// debug mode sends one, and inline it would triple the size of every
+    /// statement queued to a transaction.
+    source: Option<Box<StatementSource>>,
 }
 
 /// A message in a transaction's serial mailbox.
@@ -712,11 +722,12 @@ async fn execute(
         query,
         params,
         settings,
+        source,
     } = statement;
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
     let opened = tokio::task::spawn_blocking(move || {
-        let cursor = engine.open_cursor(&query, params, txid, &settings)?;
+        let cursor = engine.open_cursor(&query, params, txid, &settings, source.as_deref())?;
         let columns = cursor.columns();
         Ok::<_, EngineError>((cursor, columns))
     })

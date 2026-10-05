@@ -21,11 +21,11 @@ use std::time::Instant;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::{Database, DatabaseError};
+use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
-use coordinode_raft::read_fence::ReadPreference;
 use coordinode_session::{
-    ConnectionSettings, CursorEngine, EngineError, QueryCursor, SessionStats,
+    ConnectionSettings, CursorEngine, EngineError, QueryCursor, SessionStats, StatementSource,
 };
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -33,8 +33,8 @@ use parking_lot::RwLock;
 use super::failure;
 use crate::proto::{query, replication};
 use crate::services::cypher::{
-    db_error_to_status, proto_to_value_pub, read_concern_level_to_executor, value_to_proto_pub,
-    write_concern_to_proto,
+    db_error_to_status, proto_to_value_pub, read_concern_level, read_preference,
+    value_to_proto_pub, write_concern_to_proto,
 };
 use crate::services::statement::{Admission, Requested, StatementExecutor, leader_hint};
 
@@ -86,13 +86,14 @@ impl DatabaseCursorEngine {
         query: &str,
         params: Option<HashMap<String, Value>>,
         settings: &ConnectionSettings,
+        source: Option<&SourceContext>,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let request = forwarded_request(query, params, settings);
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             EngineError::internal(format!("no runtime to reach the leader on: {e}"))
         })?;
         let response = runtime
-            .block_on(self.executor.forward(leader_id, request))
+            .block_on(self.executor.forward(leader_id, request, source))
             .map_err(|s| EngineError(failure(&s)))?
             .into_inner();
         Ok(Box::new(MaterializedCursor {
@@ -115,12 +116,14 @@ impl CursorEngine for DatabaseCursorEngine {
         params: HashMap<String, Value>,
         txid: u64,
         settings: &ConnectionSettings,
+        source: Option<&StatementSource>,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let params = if params.is_empty() {
             None
         } else {
             Some(params)
         };
+        let source = source.and_then(source_context);
         // A statement of an interactive transaction reads at the snapshot
         // pinned when it began and buffers its writes until the commit: no
         // fence and no commit of its own here.
@@ -143,7 +146,7 @@ impl CursorEngine for DatabaseCursorEngine {
         let admitted = match self.admit(query, &requested(settings))? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                return self.forwarded(leader_id, query, params, settings);
+                return self.forwarded(leader_id, query, params, settings, source.as_ref());
             }
         };
         let fenced = SessionStats {
@@ -164,7 +167,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 admitted.read_concern.at_timestamp,
                 fenced,
             )?;
-            self.executor.record(query, None, start);
+            self.executor.record(query, source.as_ref(), start);
             return Ok(Box::new(cursor));
         }
 
@@ -175,16 +178,19 @@ impl CursorEngine for DatabaseCursorEngine {
         // answered with NOT_LEADER and the leader to retry at.
         let retry =
             (self.executor.needs_fence() && !admitted.served_by_leader).then(|| params.clone());
-        let result = match self.executor.execute(query, params, None, &admitted) {
+        let result = match self
+            .executor
+            .execute(query, params, source.as_ref(), &admitted)
+        {
             Ok(result) => result,
             Err(e) => match (leader_hint(&e), retry) {
                 (Some(leader_id), Some(params)) => {
-                    return self.forwarded(leader_id, query, params, settings);
+                    return self.forwarded(leader_id, query, params, settings, source.as_ref());
                 }
                 _ => return Err(engine_error(e)),
             },
         };
-        self.executor.record(query, None, start);
+        self.executor.record(query, source.as_ref(), start);
         let (columns, rows) = rows_to_values(&result.rows);
         let written = write_stats(&result.write_stats);
         Ok(Box::new(MaterializedCursor {
@@ -232,21 +238,45 @@ fn engine_error(err: DatabaseError) -> EngineError {
     EngineError(failure(&db_error_to_status(err)))
 }
 
+/// The advisor's view of where a session statement came from, read the way
+/// the unary path reads its metadata: a statement with no file has no
+/// location, and a Windows path counts as the same one written with `/`.
+fn source_context(source: &StatementSource) -> Option<SourceContext> {
+    let get = |key: &str| -> Option<String> {
+        let value = match key {
+            grpc_keys::FILE => source.file.clone(),
+            grpc_keys::LINE => source.line.to_string(),
+            grpc_keys::FUNCTION => source.function.clone(),
+            grpc_keys::APP => source.app.clone(),
+            grpc_keys::VERSION => source.version.clone(),
+            _ => return None,
+        };
+        (!value.is_empty()).then_some(value)
+    };
+    source::extract_from_map(
+        &get,
+        grpc_keys::FILE,
+        grpc_keys::LINE,
+        grpc_keys::FUNCTION,
+        grpc_keys::APP,
+        grpc_keys::VERSION,
+    )
+}
+
 /// The settings a session statement runs under, as the executor takes them.
 /// A level or preference of zero is the wire's "unspecified": the server's
-/// default, like a setting left out.
+/// default, like a setting left out. The binding admits only values the
+/// server knows into a session's settings, so none is refused here.
 fn requested(settings: &ConnectionSettings) -> Requested {
     Requested {
         read_concern: settings
             .read_concern
-            .filter(|&level| level != 0)
-            .map(|level| read_concern_level_to_executor(i32::from(level))),
+            .and_then(|level| read_concern_level("", i32::from(level)).ok().flatten()),
         after_index: settings.after_index.unwrap_or(0),
         at_timestamp: settings.at_timestamp.unwrap_or(0),
         read_preference: settings
             .read_preference
-            .filter(|&preference| preference != 0)
-            .map(|preference| ReadPreference::from_proto(i32::from(preference))),
+            .and_then(|preference| read_preference("", i32::from(preference)).ok().flatten()),
         write_concern: settings.write_concern,
     }
 }

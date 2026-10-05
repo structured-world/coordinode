@@ -15,10 +15,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use coordinode_query::advisor::source::grpc_keys;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_session::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, InOp, Ordering as CoreOrdering,
     OutEvent, SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
+    StatementSource,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,7 +29,8 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use self::engine::DatabaseCursorEngine;
 use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
 use super::cypher::{
-    proto_to_value_pub, value_to_proto_pub, write_concern_from_proto, write_concern_to_proto,
+    proto_to_value_pub, read_concern_level, read_preference, value_to_proto_pub,
+    write_concern_from_proto, write_concern_to_proto,
 };
 use super::statement::StatementExecutor;
 use crate::proto::query;
@@ -36,8 +39,9 @@ use crate::proto::session::server_frame::Event;
 use crate::proto::session::session_service_server::SessionService as SessionServiceTrait;
 use crate::proto::session::{
     Acknowledged, Begun, ClientFrame, Committed, Configure,
-    ConnectionStatus as ProtoConnectionStatus, CursorEnd, CursorOpen, Ordering as ProtoOrdering,
-    RowBatch, ServerFrame, Subscribed, SubscriptionCancelled, client_frame,
+    ConnectionStatus as ProtoConnectionStatus, CursorEnd, CursorOpen, Execute,
+    Ordering as ProtoOrdering, RowBatch, ServerFrame, Subscribed, SubscriptionCancelled,
+    client_frame,
 };
 
 /// In-flight messages buffered per channel before backpressure: a producer that
@@ -136,6 +140,7 @@ impl SessionServiceTrait for SessionSvc {
             .remote_addr()
             .map(|a| a.to_string())
             .unwrap_or_default();
+        let client = ClientApp::from_metadata(request.metadata());
         let mut inbound = request.into_inner();
         let (op_tx, op_rx) = mpsc::channel::<InOp>(BUFFER);
         let (ev_tx, mut ev_rx) = mpsc::channel::<OutEvent>(BUFFER);
@@ -167,7 +172,7 @@ impl SessionServiceTrait for SessionSvc {
                 ) else {
                     continue;
                 };
-                match to_op(op) {
+                match to_op(op, &client) {
                     Ok(op) => {
                         if op_tx.send((request_id, op)).await.is_err() {
                             break;
@@ -323,12 +328,21 @@ fn serve_subscription_op(
 }
 
 /// Map a gRPC client op to a neutral one. `Err` is the INVALID_ARGUMENT
-/// answer: the frame has no op, or names a write concern the server cannot
-/// honour.
-fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, Status> {
+/// answer: the frame has no op, or names a setting the server does not know
+/// or cannot honour. `client` is the application the session's metadata
+/// names, which every statement's source carries.
+fn to_op(op: Option<client_frame::Op>, client: &ClientApp) -> Result<SessionOp, Status> {
     let op = op.ok_or_else(|| Status::invalid_argument("client frame had no op"))?;
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
+            settings: statement_settings(&e)?,
+            source: e.source.map(|s| StatementSource {
+                file: s.file,
+                line: s.line,
+                function: s.function,
+                app: client.app.clone(),
+                version: client.version.clone(),
+            }),
             query: e.query,
             params: e
                 .parameters
@@ -337,7 +351,6 @@ fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, Status> {
                 .collect(),
             txid: e.txid,
             nonce: e.nonce,
-            settings: ConnectionSettings::default(),
         },
         client_frame::Op::Begin(b) => SessionOp::Begin {
             ordering: match b.ordering() {
@@ -376,7 +389,13 @@ fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, Status> {
 /// concern that sets a level but no fence leaves the fence alone.
 fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
     Ok(ConnectionSettings {
-        read_concern: c.read_concern.as_ref().map(|rc| rc.level as u8),
+        // UNSPECIFIED is kept here: it hands the level back to the server's
+        // default, which is how a client undoes a level it set.
+        read_concern: c
+            .read_concern
+            .as_ref()
+            .map(|rc| known_level("read_concern.level", rc.level))
+            .transpose()?,
         after_index: c
             .read_concern
             .as_ref()
@@ -390,9 +409,76 @@ fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
             .as_ref()
             .map(write_concern_from_proto)
             .transpose()?,
-        read_preference: c.read_preference.map(|p| p as u8),
+        read_preference: c
+            .read_preference
+            .map(|p| known_preference("read_preference", p))
+            .transpose()?,
         drain_timeout_ms: c.drain_timeout_ms,
     })
+}
+
+/// The settings an Execute names for itself. Unlike a Configure, an
+/// UNSPECIFIED level or preference and a zero position leave that setting to
+/// the session: a statement that names nothing changes nothing.
+fn statement_settings(e: &Execute) -> Result<ConnectionSettings, Status> {
+    let rc = e.read_concern.as_ref();
+    Ok(ConnectionSettings {
+        read_concern: rc
+            .map(|rc| known_level("read_concern.level", rc.level))
+            .transpose()?
+            .filter(|&level| level != 0),
+        after_index: rc.and_then(|rc| (rc.after_index != 0).then_some(rc.after_index)),
+        at_timestamp: rc.and_then(|rc| (rc.at_timestamp != 0).then_some(rc.at_timestamp)),
+        write_concern: e
+            .write_concern
+            .as_ref()
+            .map(write_concern_from_proto)
+            .transpose()?,
+        read_preference: e
+            .read_preference
+            .map(|p| known_preference("read_preference", p))
+            .transpose()?
+            .filter(|&preference| preference != 0),
+        drain_timeout_ms: None,
+    })
+}
+
+/// A read concern level the server knows, in the session's encoding.
+fn known_level(field: &str, level: i32) -> Result<u8, Status> {
+    read_concern_level(field, level)?;
+    // A known level is one of the enum's few values.
+    u8::try_from(level).map_err(|_| Status::internal("read concern level out of range"))
+}
+
+/// A read preference the server knows, in the session's encoding.
+fn known_preference(field: &str, preference: i32) -> Result<u8, Status> {
+    read_preference(field, preference)?;
+    // A known preference is one of the enum's few values.
+    u8::try_from(preference).map_err(|_| Status::internal("read preference out of range"))
+}
+
+/// The client application a session's metadata names, carried into the
+/// source of each of its statements.
+#[derive(Debug, Clone, Default)]
+struct ClientApp {
+    app: String,
+    version: String,
+}
+
+impl ClientApp {
+    fn from_metadata(metadata: &tonic::metadata::MetadataMap) -> Self {
+        let get = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .unwrap_or_default()
+        };
+        Self {
+            app: get(grpc_keys::APP),
+            version: get(grpc_keys::VERSION),
+        }
+    }
 }
 
 /// Render settings back for the client, so a Configure is confirmed by what is

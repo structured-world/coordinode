@@ -19,5 +19,5 @@ pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
-    SessionStats,
+    SessionStats, StatementSource,
 };

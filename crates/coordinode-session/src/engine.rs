@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
 
-use crate::types::{ConnectionSettings, Failure, SessionStats};
+use crate::types::{ConnectionSettings, Failure, SessionStats, StatementSource};
 
 /// An error from the query engine, neutral over the engine implementation. It
 /// reaches the client as the request's failure, class and details intact.
@@ -40,7 +40,7 @@ impl std::error::Error for EngineError {}
 /// engine's value space; `txid` is the interactive-transaction handle, or zero
 /// for an autonomous (auto-commit) statement. `settings` are the statement's
 /// own settings over its session's: a field still unset is the engine's
-/// default.
+/// default. `source` is where in the client's code the statement was issued.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot serve a session's statements",
     label = "needs `CursorEngine`",
@@ -53,6 +53,7 @@ pub trait CursorEngine: Send + Sync {
         params: HashMap<String, Value>,
         txid: u64,
         settings: &ConnectionSettings,
+        source: Option<&StatementSource>,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
     /// Open a new interactive transaction and return its handle. Subsequent

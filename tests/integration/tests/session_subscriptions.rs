@@ -90,6 +90,7 @@ impl Session {
                 parameters: Default::default(),
                 txid: 0,
                 nonce: 0,
+                ..Default::default()
             }),
         )
         .await;

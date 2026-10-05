@@ -59,6 +59,7 @@ impl CursorEngine for MockEngine {
         _params: HashMap<String, Value>,
         _txid: u64,
         _settings: &ConnectionSettings,
+        _source: Option<&StatementSource>,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         if let Some(message) = &self.fail {
             return Err(EngineError(Failure {
@@ -107,14 +108,19 @@ fn exec() -> SessionOp {
         txid: 0,
         nonce: 0,
         settings: ConnectionSettings::default(),
+        source: None,
     }
 }
 
+/// A statement as the engine received it: its query text, the settings it
+/// ran under and its source.
+type Received = (String, (ConnectionSettings, Option<StatementSource>));
+
 /// An engine that answers every statement with an empty result and keeps
-/// the settings each one reached it with, by query text.
+/// the settings and source each one reached it with, by query text.
 #[derive(Default)]
 struct RecordingEngine {
-    seen: parking_lot::Mutex<Vec<(String, ConnectionSettings)>>,
+    seen: parking_lot::Mutex<Vec<Received>>,
     next_txn: AtomicU64,
 }
 
@@ -125,8 +131,11 @@ impl CursorEngine for RecordingEngine {
         _params: HashMap<String, Value>,
         _txid: u64,
         settings: &ConnectionSettings,
+        source: Option<&StatementSource>,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
-        self.seen.lock().push((query.to_string(), settings.clone()));
+        self.seen
+            .lock()
+            .push((query.to_string(), (settings.clone(), source.cloned())));
         Ok(Box::new(MockCursor {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -161,6 +170,13 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
         txid: 0,
         nonce: 0,
         settings,
+        source: None,
+    };
+    let here = StatementSource {
+        file: "app.rs".to_string(),
+        line: 7,
+        function: "pay".to_string(),
+        ..StatementSource::default()
     };
     run_session(
         engine,
@@ -193,6 +209,7 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
                     write_concern: Some(WriteConcern::majority()),
                     ..ConnectionSettings::default()
                 },
+                source: Some(here.clone()),
             },
             SessionOp::Commit {
                 txid: 1,
@@ -202,7 +219,20 @@ async fn a_statement_runs_under_its_session_settings_and_its_own() {
     )
     .await;
 
-    let seen: HashMap<String, ConnectionSettings> = recording.seen.lock().iter().cloned().collect();
+    let sources: HashMap<String, Option<StatementSource>> = recording
+        .seen
+        .lock()
+        .iter()
+        .map(|(query, (_, source))| (query.clone(), source.clone()))
+        .collect();
+    assert_eq!(sources["plain"], None);
+    assert_eq!(sources["in-txn"], Some(here), "the source rides along");
+    let seen: HashMap<String, ConnectionSettings> = recording
+        .seen
+        .lock()
+        .iter()
+        .map(|(query, (settings, _))| (query.clone(), settings.clone()))
+        .collect();
     let session = ConnectionSettings {
         read_concern: Some(2),
         read_preference: Some(4),
@@ -398,6 +428,7 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 txid: 1,
                 nonce: 0,
                 settings: ConnectionSettings::default(),
+                source: None,
             },
             SessionOp::Execute {
                 query: "FAIL".to_string(),
@@ -405,6 +436,7 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 txid: 1,
                 nonce: 0,
                 settings: ConnectionSettings::default(),
+                source: None,
             },
             SessionOp::Execute {
                 query: "after".to_string(),
@@ -412,6 +444,7 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 txid: 1,
                 nonce: 0,
                 settings: ConnectionSettings::default(),
+                source: None,
             },
             SessionOp::Commit {
                 txid: 1,
@@ -481,6 +514,7 @@ async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
         txid: 1,
         nonce,
         settings: ConnectionSettings::default(),
+        source: None,
     };
     let events = run_session_flat(
         engine,
@@ -530,6 +564,7 @@ async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
         txid: 1,
         nonce,
         settings: ConnectionSettings::default(),
+        source: None,
     };
     let by_id = run_session(
         engine,
@@ -603,6 +638,7 @@ async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
                 txid,
                 nonce: 2,
                 settings: ConnectionSettings::default(),
+                source: None,
             },
         ))
         .await

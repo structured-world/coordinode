@@ -21,7 +21,7 @@ use coordinode_embed::db::CypherResult;
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
-use coordinode_query::advisor::source::SourceContext;
+use coordinode_query::advisor::source::{SourceContext, grpc_keys};
 use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::read_fence::{
@@ -351,11 +351,13 @@ impl StatementExecutor {
     /// A level-0 client keeps working through a leader change without
     /// noticing one: the node that knows who leads passes the request along.
     /// The response carries the hop count, so a client that does care can see
-    /// it and start addressing the leader directly.
+    /// it and start addressing the leader directly. `source` travels along,
+    /// so the leader's advisor counts the statement where it was issued.
     pub(crate) async fn forward(
         &self,
         leader_id: u64,
         req: query::ExecuteCypherRequest,
+        source: Option<&SourceContext>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
         let addr = self
             .raft_node
@@ -374,6 +376,25 @@ impl StatementExecutor {
             FORWARDED_HEADER,
             tonic::metadata::MetadataValue::from_static("1"),
         );
+        if let Some(source) = source {
+            let line = source.line.to_string();
+            for (key, value) in [
+                (grpc_keys::FILE, source.file.as_str()),
+                (grpc_keys::LINE, line.as_str()),
+                (grpc_keys::FUNCTION, source.function.as_str()),
+                (grpc_keys::APP, source.app.as_str()),
+                (grpc_keys::VERSION, source.version.as_str()),
+            ] {
+                // A value metadata cannot carry (not visible ASCII) is left
+                // out: the leader then counts the statement without it, which
+                // is what the advisor does with any missing part.
+                if let Ok(value) = tonic::metadata::MetadataValue::try_from(value) {
+                    if !value.is_empty() {
+                        forwarded.metadata_mut().insert(key, value);
+                    }
+                }
+            }
+        }
         let mut response = client.execute_cypher(forwarded).await?;
         response.metadata_mut().insert(
             HOPS_HEADER,

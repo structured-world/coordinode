@@ -25,6 +25,7 @@ use std::panic::Location;
 use tonic::metadata::MetadataMap;
 
 use crate::config::ClientConfig;
+use crate::proto::session::SourceLocation;
 
 /// Inject caller source location into gRPC request metadata.
 ///
@@ -42,6 +43,13 @@ pub(crate) fn inject_grpc_metadata(
     if let Ok(v) = location.line().to_string().parse() {
         meta.insert("x-source-line", v);
     }
+    inject_app_metadata(meta, config);
+}
+
+/// Inject the application name and version into gRPC metadata: per request
+/// on the unary path, once per stream on a session, whose statements carry
+/// only their own location.
+pub(crate) fn inject_app_metadata(meta: &mut MetadataMap, config: &ClientConfig) {
     if !config.app_name.is_empty() {
         if let Ok(v) = config.app_name.parse() {
             meta.insert("x-source-app", v);
@@ -51,6 +59,16 @@ pub(crate) fn inject_grpc_metadata(
         if let Ok(v) = config.app_version.parse() {
             meta.insert("x-source-version", v);
         }
+    }
+}
+
+/// The caller's location as a session statement carries it.
+pub(crate) fn statement_source(location: &'static Location<'static>) -> SourceLocation {
+    SourceLocation {
+        file: location.file().to_string(),
+        line: location.line(),
+        // Rust's `Location` does not know the enclosing function.
+        function: String::new(),
     }
 }
 

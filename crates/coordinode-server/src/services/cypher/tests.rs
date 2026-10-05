@@ -963,11 +963,13 @@ async fn grpc_source_tracking_round_trip() {
             .expect("server error");
     });
 
-    // Connect via CoordinodeClient with source tracking enabled.
+    // Connect via CoordinodeClient with source tracking enabled, one unary
+    // call per statement: this test covers the metadata path.
     let mut client = coordinode_client::CoordinodeClient::builder(format!("http://{addr}"))
         .debug_source_tracking(true)
         .app_name("test-service")
         .app_version("0.0.1")
+        .transport(coordinode_client::Transport::Unary)
         .build()
         .await
         .expect("connect");
@@ -999,10 +1001,11 @@ async fn grpc_source_tracking_round_trip() {
     assert_eq!(src.call_count, 1);
 }
 
-/// End-to-end: source tracking works when query has parameters
-/// (the `has_params=true, source_ctx=Some` branch in execute_cypher).
-#[tokio::test]
-async fn grpc_source_tracking_with_params_round_trip() {
+/// End-to-end over the session, the driver's default transport: a statement
+/// with parameters reaches the advisor counted at the caller's file and line,
+/// with the application the stream's metadata named once.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_source_tracking_with_params_round_trip() {
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -1012,10 +1015,13 @@ async fn grpc_source_tracking_with_params_round_trip() {
     ));
     let registry = Arc::new(QueryRegistry::new());
     let detector = Arc::new(NPlus1Detector::new());
-    let svc = CypherServiceImpl::new(
-        Arc::clone(&database),
-        Arc::clone(&registry),
-        Arc::clone(&detector),
+    let executor = StatementExecutor::new(Arc::clone(&database))
+        .with_advisor(Arc::clone(&registry), Arc::clone(&detector));
+    let sessions = crate::services::session::SessionSvc::new(
+        executor,
+        Arc::new(coordinode_session::SessionRegistry::new(
+            std::time::Duration::from_secs(30),
+        )),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1026,7 +1032,9 @@ async fn grpc_source_tracking_with_params_round_trip() {
 
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(crate::proto::query::cypher_service_server::CypherServiceServer::new(svc))
+            .add_service(
+                crate::proto::session::session_service_server::SessionServiceServer::new(sessions),
+            )
             .serve_with_incoming(incoming)
             .await
             .expect("server error");
@@ -1842,6 +1850,39 @@ async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
         .expect_err("a w:1 default is not causal-safe");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
     assert!(refused.message().contains("writeConcern"));
+}
+
+/// A read concern level or read preference the server does not know is
+/// refused with the field named, instead of being served as LOCAL or PRIMARY:
+/// a client that asked for something stronger than the server knows must not
+/// silently get something weaker.
+#[tokio::test]
+async fn an_unknown_level_or_preference_is_refused_not_downgraded() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    let mut unknown_level = cypher_request("RETURN 1 AS one");
+    unknown_level.get_mut().read_concern = Some(crate::proto::replication::ReadConcern {
+        level: 99,
+        after_index: 0,
+        at_timestamp: 0,
+    });
+    let mut unknown_preference = cypher_request("RETURN 1 AS one");
+    unknown_preference.get_mut().read_preference = 42;
+
+    for (request, field) in [
+        (unknown_level, "read_concern.level"),
+        (unknown_preference, "read_preference"),
+    ] {
+        let refused = svc
+            .execute_cypher(request)
+            .await
+            .expect_err("an unknown value is refused");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        let details = refused.get_error_details();
+        let violations = &details.bad_request().expect("BadRequest").field_violations;
+        assert_eq!(violations[0].field, field);
+    }
 }
 
 /// after_index = 0 with any readConcern level is always valid (no fence).

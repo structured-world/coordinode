@@ -49,7 +49,13 @@ fn keyset_cursor_drains_every_row_across_small_batches() {
     // the column header established before the first batch.
     let engine = DatabaseCursorEngine::new(seeded_db(25));
     let mut cursor = engine
-        .open_cursor("MATCH (n:Page) RETURN n.k", HashMap::new(), 0, &unset())
+        .open_cursor(
+            "MATCH (n:Page) RETURN n.k",
+            HashMap::new(),
+            0,
+            &unset(),
+            None,
+        )
         .expect("open");
 
     assert_eq!(cursor.columns(), vec!["n.k".to_string()]);
@@ -78,6 +84,7 @@ fn keyset_cursor_with_filter_still_drains_all_matches() {
             HashMap::new(),
             0,
             &unset(),
+            None,
         )
         .expect("open");
 
@@ -109,6 +116,7 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
             HashMap::new(),
             0,
             &unset(),
+            None,
         )
         .expect("open");
 
@@ -127,7 +135,13 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
 fn keyset_cursor_empty_label_yields_no_rows() {
     let engine = DatabaseCursorEngine::new(seeded_db(0));
     let mut cursor = engine
-        .open_cursor("MATCH (n:Page) RETURN n.k", HashMap::new(), 0, &unset())
+        .open_cursor(
+            "MATCH (n:Page) RETURN n.k",
+            HashMap::new(),
+            0,
+            &unset(),
+            None,
+        )
         .expect("open");
     assert!(cursor.next_batch(8).expect("batch").is_empty());
 }
@@ -167,6 +181,7 @@ async fn run_execute_with(
                 txid: 0,
                 nonce: 0,
                 settings,
+                source: None,
             },
         ))
         .await
@@ -272,6 +287,49 @@ async fn session_core_surfaces_a_query_error() {
             assert_eq!(failure.details, expected.details());
         }
         other => panic!("expected a single Error, got {other:?}"),
+    }
+}
+
+/// A session statement's source reaches the advisor as a unary statement's
+/// metadata does: counted at its file, line and function, with the
+/// application its session named, and a Windows path read as the same file
+/// written with `/`. Before, the session recorded nothing for the advisor.
+#[test]
+fn a_session_statement_is_counted_where_it_was_issued() {
+    use coordinode_query::advisor::QueryRegistry;
+    use coordinode_query::advisor::nplus1::NPlus1Detector;
+
+    let registry = Arc::new(QueryRegistry::new());
+    let engine = DatabaseCursorEngine::from_executor(
+        StatementExecutor::new(seeded_db(1))
+            .with_advisor(Arc::clone(&registry), Arc::new(NPlus1Detector::new())),
+    );
+    let source = StatementSource {
+        file: "src\\pay.rs".to_string(),
+        line: 12,
+        function: "charge".to_string(),
+        app: "billing".to_string(),
+        version: "1.2".to_string(),
+    };
+    for query in ["MATCH (n:Page) RETURN n.k", "RETURN 1 AS one"] {
+        let mut cursor = engine
+            .open_cursor(query, HashMap::new(), 0, &unset(), Some(&source))
+            .expect("open");
+        drain(cursor.as_mut(), 8);
+    }
+
+    let top = registry.top_by_count(10);
+    assert_eq!(
+        top.len(),
+        2,
+        "the keyset and the materialized path both count"
+    );
+    for entry in &top {
+        let src = &entry.sources[0];
+        assert_eq!(src.file, "src/pay.rs");
+        assert_eq!(src.line, 12);
+        assert_eq!(src.function, "charge");
+        assert_eq!(src.app, "billing");
     }
 }
 

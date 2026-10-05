@@ -10,6 +10,7 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::proto::session::session_service_client::SessionServiceClient;
 use crate::proto::session::{ClientFrame, ServerFrame, SessionError, client_frame};
@@ -27,11 +28,20 @@ pub(crate) struct SessionLink {
 }
 
 impl SessionLink {
-    /// Open a session on `channel` and start routing what it answers.
-    pub(crate) async fn open(channel: tonic::transport::Channel) -> Result<Arc<Self>, ClientError> {
+    /// Open a session on `channel` and start routing what it answers. With
+    /// source tracking on, the stream names the application once; each
+    /// statement then carries only where it was issued.
+    pub(crate) async fn open(
+        channel: tonic::transport::Channel,
+        config: &ClientConfig,
+    ) -> Result<Arc<Self>, ClientError> {
         let (out, rx) = mpsc::channel(OUTBOUND);
+        let mut request = tonic::Request::new(ReceiverStream::new(rx));
+        if config.debug_source_tracking {
+            crate::source::inject_app_metadata(request.metadata_mut(), config);
+        }
         let mut inbound = SessionServiceClient::new(channel)
-            .session(ReceiverStream::new(rx))
+            .session(request)
             .await?
             .into_inner();
         let routes: Arc<Mutex<HashMap<u64, mpsc::Sender<ServerFrame>>>> = Arc::default();

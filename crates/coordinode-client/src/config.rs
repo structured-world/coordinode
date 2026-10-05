@@ -20,6 +20,22 @@ pub struct ClientConfig {
 
     /// Optional application version sent alongside the source location.
     pub(crate) app_version: String,
+
+    /// How statements reach the server.
+    pub(crate) transport: Transport,
+}
+
+/// How the client carries statements to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// One persistent bidirectional session per client: statements are frames
+    /// on a stream already open and authenticated, answered as cursors. The
+    /// default.
+    #[default]
+    Session,
+    /// One unary call per statement, for an environment whose proxies cannot
+    /// carry a bidirectional stream.
+    Unary,
 }
 
 impl ClientConfig {
@@ -51,6 +67,7 @@ pub struct CoordinodeClientBuilder {
     pub(crate) debug_source_tracking: bool,
     pub(crate) app_name: String,
     pub(crate) app_version: String,
+    pub(crate) transport: Transport,
 }
 
 impl CoordinodeClientBuilder {
@@ -61,7 +78,15 @@ impl CoordinodeClientBuilder {
             debug_source_tracking: false,
             app_name: String::new(),
             app_version: String::new(),
+            transport: Transport::default(),
         }
+    }
+
+    /// Choose how statements reach the server: over the persistent session
+    /// (the default) or one unary call each.
+    pub fn transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Enable or disable source location tracking.
@@ -97,6 +122,7 @@ impl CoordinodeClientBuilder {
             debug_source_tracking: self.debug_source_tracking,
             app_name: self.app_name,
             app_version: self.app_version,
+            transport: self.transport,
         };
         super::CoordinodeClient::connect_with_config(config).await
     }

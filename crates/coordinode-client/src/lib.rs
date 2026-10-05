@@ -40,15 +40,20 @@
 //!     .await
 //!     .unwrap();
 //!
-//! // The gRPC request will include:
-//! //   x-source-file: "src/api/handlers/feed.rs"
-//! //   x-source-line: "47"
-//! //   x-source-app:  "my-service"
+//! // The statement carries its call site (file "src/api/handlers/feed.rs",
+//! // line 47); the session names the application ("my-service") once.
 //! let rows = client.execute_cypher("MATCH (u:User)-[:FOLLOWS]->(f) RETURN f LIMIT 10")
 //!     .await
 //!     .unwrap();
 //! # })
 //! ```
+//!
+//! ## Transport
+//!
+//! Statements travel over one persistent bidirectional session per client,
+//! opened on first use: no connection, authentication or stream setup per
+//! statement. Where a proxy cannot carry a bidirectional stream, choose one
+//! unary call per statement with [`Transport::Unary`].
 //!
 //! Source tracking relies on Rust's built-in `#[track_caller]` attribute.
 //! No macros are needed — simply call the normal client methods and the
@@ -61,7 +66,7 @@ mod source;
 pub mod subscription;
 mod value;
 
-pub use config::{ClientConfig, CoordinodeClientBuilder};
+pub use config::{ClientConfig, CoordinodeClientBuilder, Transport};
 pub use error::ClientError;
 pub use subscription::{
     ChangeEvent, ChangeKind, ChangeOp, Position, Retention, SubscribeOptions, Subscription,
@@ -133,6 +138,7 @@ mod proto {
 use proto::{
     query::{ExecuteCypherRequest, cypher_service_client::CypherServiceClient},
     replication::{Journal, ReadConcern, ReadConcernLevel, WriteConcern, WriteConcernMode},
+    session::{Execute, client_frame, server_frame},
 };
 
 /// Routing preference for read queries in a replicated cluster.
@@ -262,7 +268,7 @@ impl CoordinodeClient {
         if let Some(link) = self.session.as_ref().filter(|link| !link.is_closed()) {
             return Ok(Arc::clone(link));
         }
-        let link = session::SessionLink::open(self.channel.clone()).await?;
+        let link = session::SessionLink::open(self.channel.clone(), &self.config).await?;
         self.session = Some(Arc::clone(&link));
         Ok(link)
     }
@@ -327,9 +333,10 @@ impl CoordinodeClient {
 
     /// Execute a read query with an explicit [`ReadPreference`].
     ///
-    /// [`execute_cypher`] and [`execute_cypher_with_params`] always
-    /// route to the Raft leader; this method lets a connection to a
-    /// follower serve reads ([`ReadPreference::Secondary`] /
+    /// [`execute_cypher`] and [`execute_cypher_with_params`] leave the
+    /// preference to the server's configured default (the Raft leader unless
+    /// the server says otherwise); this method names one, letting a
+    /// connection to a follower serve reads ([`ReadPreference::Secondary`] /
     /// [`SecondaryPreferred`] / [`Nearest`]) for read scale-out.
     /// Follower reads observe that follower's applied state — use
     /// [`execute_causal_read`] when the read must observe a specific
@@ -483,13 +490,9 @@ impl CoordinodeClient {
         params: HashMap<String, Value>,
         location: Option<&'static Location<'static>>,
     ) -> Result<Vec<Row>, ClientError> {
+        // Settings left unset: the server applies its configured defaults.
         let (rows, _applied_index) = self
-            .execute_request(
-                query, params, 0,    // read_preference = PRIMARY
-                None, // read_concern = LOCAL (default)
-                None, // write_concern = MAJORITY (default)
-                location,
-            )
+            .execute_request(query, params, 0, None, None, location)
             .await?;
         Ok(rows)
     }
@@ -536,7 +539,8 @@ impl CoordinodeClient {
     /// Low-level request executor shared by all public methods.
     ///
     /// Returns the decoded rows **and** the `applied_index` from `QueryStats`
-    /// so causal methods can wrap it in a [`CausalToken`].
+    /// so causal methods can wrap it in a [`CausalToken`]. A `read_preference`
+    /// of zero and an absent concern leave the setting to the server.
     async fn execute_request(
         &mut self,
         query: String,
@@ -550,6 +554,25 @@ impl CoordinodeClient {
             .into_iter()
             .map(|(k, v)| (k, value::to_proto(v)))
             .collect();
+
+        if self.config.transport == Transport::Session {
+            let link = self.session().await?;
+            return execute_on_session(
+                &link,
+                Execute {
+                    query,
+                    parameters: proto_params,
+                    // Auto-commit, as on the unary path.
+                    txid: 0,
+                    nonce: 0,
+                    read_concern,
+                    write_concern,
+                    read_preference: (read_preference != 0).then_some(read_preference),
+                    source: location.map(source::statement_source),
+                },
+            )
+            .await;
+        }
 
         let mut request = tonic::Request::new(ExecuteCypherRequest {
             query,
@@ -587,6 +610,51 @@ impl CoordinodeClient {
 
         Ok((rows, applied_index))
     }
+}
+
+/// Rows of one statement buffered in the session before its reader is waited
+/// on: a few batches, enough that the stream does not stall on a reader that
+/// is merely collecting.
+const STATEMENT_BATCHES: usize = 16;
+
+/// Run `execute` on the session and collect its cursor: the column header,
+/// every row batch, and the applied index its end reports.
+async fn execute_on_session(
+    link: &session::SessionLink,
+    execute: Execute,
+) -> Result<(Vec<Row>, u64), ClientError> {
+    let (id, mut answers) = link.request(STATEMENT_BATCHES);
+    let collected = async {
+        link.send(id, client_frame::Op::Execute(execute)).await?;
+        let mut columns: Vec<String> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
+        loop {
+            let frame = answers.recv().await.ok_or(ClientError::SessionClosed)?;
+            match frame.event {
+                Some(server_frame::Event::CursorOpen(open)) => columns = open.columns,
+                Some(server_frame::Event::Rows(batch)) => {
+                    rows.extend(batch.rows.into_iter().map(|row| {
+                        columns
+                            .iter()
+                            .zip(row.values)
+                            .map(|(col, pv)| (col.clone(), value::from_proto(pv)))
+                            .collect::<Row>()
+                    }));
+                }
+                Some(server_frame::Event::CursorEnd(end)) => {
+                    let applied_index = end.stats.map_or(0, |s| s.applied_index);
+                    return Ok((rows, applied_index));
+                }
+                Some(server_frame::Event::Error(error)) => {
+                    return Err(ClientError::Grpc(session::error_status(error)));
+                }
+                other => return Err(ClientError::UnexpectedAnswer(format!("{other:?}"))),
+            }
+        }
+    }
+    .await;
+    link.forget(id);
+    collected
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

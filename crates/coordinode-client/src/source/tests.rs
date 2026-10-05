@@ -7,6 +7,7 @@ fn make_config(tracking: bool) -> ClientConfig {
         debug_source_tracking: tracking,
         app_name: "test-app".into(),
         app_version: "v1.0.0".into(),
+        transport: crate::Transport::default(),
     }
 }
 
@@ -40,6 +41,7 @@ fn skips_empty_app_fields() {
         debug_source_tracking: true,
         app_name: String::new(),
         app_version: String::new(),
+        transport: crate::Transport::default(),
     };
 
     inject_grpc_metadata(&mut meta, loc, &config);
@@ -58,4 +60,32 @@ fn no_function_key() {
     let mut meta = MetadataMap::new();
     inject_grpc_metadata(&mut meta, loc, &make_config(true));
     assert!(meta.get("x-source-function").is_none());
+}
+
+/// A session stream names only the application; its statements carry their
+/// own location, so the stream's metadata holds no file or line.
+#[test]
+fn app_metadata_names_the_application_only() {
+    let mut meta = MetadataMap::new();
+    inject_app_metadata(&mut meta, &make_config(true));
+    assert_eq!(
+        meta.get("x-source-app").unwrap().to_str().unwrap(),
+        "test-app"
+    );
+    assert_eq!(
+        meta.get("x-source-version").unwrap().to_str().unwrap(),
+        "v1.0.0"
+    );
+    assert!(meta.get("x-source-file").is_none());
+    assert!(meta.get("x-source-line").is_none());
+}
+
+/// A statement's source is the caller's file and line.
+#[test]
+fn a_statement_source_is_the_call_site() {
+    let loc: &'static Location<'static> = Location::caller();
+    let source = statement_source(loc);
+    assert_eq!(source.file, loc.file());
+    assert_eq!(source.line, loc.line());
+    assert!(source.function.is_empty());
 }
