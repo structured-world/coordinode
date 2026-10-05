@@ -7,21 +7,19 @@ use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use coordinode_core::graph::types::{PathRel, PathValue, Value};
-use coordinode_core::txn::read_concern::{
-    ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
-};
+use coordinode_core::txn::read_concern::ReadConcernLevel as ExecutorReadConcernLevel;
 use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
 use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
-use coordinode_query::frontend::QueryFrontend;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_raft::read_fence::{
-    READ_FENCE_TIMEOUT, ReadConcern, ReadFenceError, ReadPreference,
-};
-use coordinode_replicate::ReplicatedWriter;
+use coordinode_raft::read_fence::ReadPreference;
 
+use super::statement::{
+    Admission, Admitted, FORWARDED_HEADER, Requested, StatementExecutor, leader_hint,
+    mismatch_metadata,
+};
 use crate::config::StatementDefaults;
 use crate::proto::{common, query, replication};
 
@@ -556,7 +554,7 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
 /// `coordinode_core::txn::read_concern::ReadConcern` (used by the executor for
 /// snapshot timestamp selection) — both are populated from the same proto
 /// field but consumed independently.
-fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
+pub(crate) fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
     match replication::ReadConcernLevel::try_from(level)
         .unwrap_or(replication::ReadConcernLevel::Unspecified)
     {
@@ -564,17 +562,6 @@ fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
         replication::ReadConcernLevel::Snapshot => ExecutorReadConcernLevel::Snapshot,
         replication::ReadConcernLevel::Linearizable => ExecutorReadConcernLevel::Linearizable,
         _ => ExecutorReadConcernLevel::Local,
-    }
-}
-
-/// The read fence's view of an executor read concern level: the same four
-/// levels, checked before the statement runs.
-fn fence_concern(level: ExecutorReadConcernLevel) -> ReadConcern {
-    match level {
-        ExecutorReadConcernLevel::Local => ReadConcern::Local,
-        ExecutorReadConcernLevel::Majority => ReadConcern::Majority,
-        ExecutorReadConcernLevel::Linearizable => ReadConcern::Linearizable,
-        ExecutorReadConcernLevel::Snapshot => ReadConcern::Snapshot,
     }
 }
 
@@ -673,95 +660,10 @@ pub(crate) fn write_concern_to_proto(wc: &WriteConcern) -> replication::WriteCon
     }
 }
 
-/// The metadata of a read-only member's refusal: both versions, what its
-/// reads are as of, and the leader to retry at when known.
-fn mismatch_metadata(m: &coordinode_core::version::Mismatch) -> Vec<(&'static str, String)> {
-    let mut metadata = vec![
-        ("member_engine_format", m.own.engine.to_string()),
-        ("member_host_epoch", m.own.host_epoch.to_string()),
-        ("group_engine_format", m.group.engine.to_string()),
-        ("group_host_epoch", m.group.host_epoch.to_string()),
-        ("behind", m.behind.to_string()),
-        ("as_of_ts", m.as_of.to_string()),
-    ];
-    if let Some((id, addr)) = &m.leader {
-        metadata.push(("leader_id", id.to_string()));
-        metadata.push(("leader_addr", addr.clone()));
-    }
-    metadata
-}
-
-/// Convert a ReadFenceError to a tonic Status.
-fn fence_error_to_status(err: ReadFenceError) -> Status {
-    use crate::services::error_details::{Reason, status_with_reason};
-    use tonic::Code;
-    match err {
-        ReadFenceError::NotFollower => Status::failed_precondition(err.to_string()),
-        ReadFenceError::NotLeader => Status::failed_precondition(err.to_string()),
-        ReadFenceError::LinearizableRequiresLeader => Status::failed_precondition(err.to_string()),
-        ReadFenceError::StaleReplica { .. } => Status::unavailable(err.to_string()),
-        ReadFenceError::Timeout { .. } | ReadFenceError::LeaseTimeout { .. } => {
-            Status::deadline_exceeded(err.to_string())
-        }
-        ReadFenceError::Raft(e) => Status::internal(format!("Raft error: {e}")),
-        // Named like a refused write: the same metadata says why this member
-        // is read-only and where the current reads are.
-        ReadFenceError::ReadOnly(ref m) => status_with_reason(
-            Code::FailedPrecondition,
-            err.to_string(),
-            Reason::MemberReadOnly,
-            mismatch_metadata(m),
-        ),
-    }
-}
-
 pub struct CypherServiceImpl {
-    database: Arc<RwLock<Database>>,
-    /// Write coordination point: Cypher execution routes through this so the
-    /// committed Raft index of a write reaches the response as the causal
-    /// `operationTime`. Shares the same `Database` handle as `database`
-    /// (used directly only for read-only EXPLAIN / stats paths).
-    writer: ReplicatedWriter,
-    query_registry: Arc<QueryRegistry>,
-    nplus1_detector: Arc<NPlus1Detector>,
-    /// Raft node for read fence (follower reads). `None` in standalone mode.
-    raft_node: Option<Arc<RaftNode>>,
-    /// Lazily-connected channels to peers, keyed by advertised address, for
-    /// forwarding a write that arrived while another node holds leadership.
-    ///
-    /// Lazy channels reconnect on their own, so a peer that restarts does not
-    /// poison the entry; keeping them keyed by address means a leadership
-    /// change costs a map lookup rather than a connection.
-    peer_channels: Arc<parking_lot::Mutex<HashMap<String, tonic::transport::Channel>>>,
-    /// The read concern and preference a request that names none is fenced
-    /// with. Its write concern comes from the database, which the server
-    /// seeds with the same defaults.
-    defaults: StatementDefaults,
-}
-
-/// Marks a request that has already been forwarded once.
-///
-/// A stale leader hint could otherwise bounce a write between two nodes that
-/// each believe the other leads. One hop is enough: the second node answers
-/// with NOT_LEADER and its own hint, and the client decides.
-const FORWARDED_HEADER: &str = "x-coordinode-forwarded";
-
-/// How many nodes handled this request: 0 local, 1 forwarded, 2+ scattered.
-const HOPS_HEADER: &str = "x-coordinode-hops";
-
-/// The leader named by a failure that says this node cannot take the write.
-///
-/// `None` for any other failure, and also for a leader change during an
-/// election, when there is no node to forward to and the caller has to be told
-/// to try again.
-fn leader_hint(err: &DatabaseError) -> Option<u64> {
-    match err {
-        DatabaseError::NotLeader { leader_id }
-        | DatabaseError::Execution(
-            coordinode_query::executor::runner::ExecutionError::NotLeader { leader_id },
-        ) => *leader_id,
-        _ => None,
-    }
+    /// The path every statement takes: settings, fence, forwarding,
+    /// execution and the advisor, shared with the session.
+    executor: StatementExecutor,
 }
 
 impl CypherServiceImpl {
@@ -770,88 +672,53 @@ impl CypherServiceImpl {
         query_registry: Arc<QueryRegistry>,
         nplus1_detector: Arc<NPlus1Detector>,
     ) -> Self {
-        Self {
-            writer: ReplicatedWriter::new(Arc::clone(&database)),
-            database,
-            query_registry,
-            nplus1_detector,
-            raft_node: None,
-            peer_channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            defaults: StatementDefaults::default(),
-        }
+        Self::from_executor(
+            StatementExecutor::new(database).with_advisor(query_registry, nplus1_detector),
+        )
+    }
+
+    /// Serve statements through `executor`, the one the session shares.
+    pub fn from_executor(executor: StatementExecutor) -> Self {
+        Self { executor }
     }
 
     /// Fence a request that names no read concern or preference with these
     /// instead of the built-in ones.
     pub fn with_statement_defaults(mut self, defaults: StatementDefaults) -> Self {
-        self.defaults = defaults;
+        self.executor = self.executor.with_statement_defaults(defaults);
         self
     }
 
     /// Attach a Raft node for read fence enforcement (cluster mode).
     pub fn with_raft_node(mut self, raft_node: Arc<RaftNode>) -> Self {
-        self.raft_node = Some(raft_node);
+        self.executor = self.executor.with_raft_node(raft_node);
         self
     }
 
-    /// A lazily-connected channel to `addr`, created once and reused.
-    ///
-    /// Lazy means no connection is made here: the first RPC connects, and the
-    /// channel reconnects by itself afterwards, so a peer restart costs a
-    /// retry rather than a permanently dead entry.
-    fn peer_channel(&self, addr: &str) -> Result<tonic::transport::Channel, Status> {
-        if let Some(channel) = self.peer_channels.lock().get(addr) {
-            return Ok(channel.clone());
-        }
-        // Same address form and TLS as the Raft and segment-transfer clients: a
-        // cluster that encrypts peer traffic must not get a plaintext hop here.
-        let channel = coordinode_wire::peer_endpoint(addr)
-            .map_err(|e| Status::internal(format!("peer address '{addr}': {e}")))?
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .connect_lazy();
-        self.peer_channels
-            .lock()
-            .insert(addr.to_string(), channel.clone());
-        Ok(channel)
+    fn database(&self) -> &Arc<RwLock<Database>> {
+        self.executor.database()
     }
+}
 
-    /// Re-issue this write at the leader and return its answer as our own.
-    ///
-    /// The caller reached a node that cannot replicate the write. Rather than
-    /// making every client learn the cluster's topology, the node that knows
-    /// who leads passes the request along: a level-0 client keeps working
-    /// through a leader change without noticing one happened. The response
-    /// carries the hop count, so a client that DOES care can see it and start
-    /// addressing the leader directly.
-    async fn forward_to_leader(
-        &self,
-        leader_id: u64,
-        req: query::ExecuteCypherRequest,
-    ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
-        let addr = self
-            .raft_node
+/// The settings a unary request names, as the executor takes them. A level,
+/// preference or concern left unspecified is `None`: the server's default.
+fn requested_from_proto(req: &query::ExecuteCypherRequest) -> Result<Requested, Status> {
+    let rc = req.read_concern.as_ref();
+    Ok(Requested {
+        read_concern: rc
+            .map(|rc| rc.level)
+            .filter(|&level| level != 0)
+            .map(read_concern_level_to_executor),
+        after_index: rc.map_or(0, |rc| rc.after_index),
+        at_timestamp: rc.map_or(0, |rc| rc.at_timestamp),
+        read_preference: (req.read_preference != 0)
+            .then(|| ReadPreference::from_proto(req.read_preference)),
+        write_concern: req
+            .write_concern
             .as_ref()
-            .and_then(|n| n.node_addr(leader_id))
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "not the leader; leader is node {leader_id}, whose address this node \
-                     does not know"
-                ))
-            })?;
-        let mut client =
-            query::cypher_service_client::CypherServiceClient::new(self.peer_channel(&addr)?);
-        let mut forwarded = Request::new(req);
-        forwarded.metadata_mut().insert(
-            FORWARDED_HEADER,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        let mut response = client.execute_cypher(forwarded).await?;
-        response.metadata_mut().insert(
-            HOPS_HEADER,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
-        Ok(response)
-    }
+            .map(write_concern_from_proto)
+            .transpose()?,
+    })
 }
 
 #[tonic::async_trait]
@@ -882,9 +749,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 Some(convert_params(&req.parameters))
             };
             let rows = super::blocking(|| {
-                self.database
-                    .read()
-                    .execute_in_transaction(req.transaction_id, &req.query, params)
+                self.database().read().execute_in_transaction(
+                    req.transaction_id,
+                    &req.query,
+                    params,
+                )
             })
             .map_err(db_error_to_status)?;
             let columns: Vec<String> = rows
@@ -928,173 +797,18 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             }));
         }
 
-        // Extract causal fence parameters before entering the Raft block so that
-        // validation can run in both cluster and standalone modes.
-        let level = match req.read_concern.as_ref().map(|rc| rc.level) {
-            None | Some(0) => self.defaults.read_concern,
-            Some(level) => read_concern_level_to_executor(level),
+        // Resolve and check the settings, fence the read and wait for the
+        // causal position. A statement that needs the leader is passed there.
+        let requested = requested_from_proto(&req)?;
+        let admitted = match self
+            .executor
+            .admit(&req.query, &requested, already_forwarded)
+            .await?
+        {
+            Admission::Run(admitted) => admitted,
+            Admission::Forward(leader_id) => return self.executor.forward(leader_id, req).await,
         };
-        let concern = fence_concern(level);
-        let after_idx = req
-            .read_concern
-            .as_ref()
-            .map(|rc| rc.after_index)
-            .unwrap_or(0);
 
-        // Causal session validation: after_index requires readConcern >= MAJORITY.
-        //
-        // A LOCAL read offers no majority-commit guarantee, so a causal fence on top
-        // of it would be logically unsound. LINEARIZABLE is rejected too: it
-        // already reads the latest committed state, so a causal fence adds
-        // nothing and a request carrying both is a client error.
-        if after_idx > 0 {
-            match concern {
-                ReadConcern::Local => {
-                    return Err(Status::failed_precondition(
-                        "readConcern=LOCAL is incompatible with afterClusterTime. \
-                         Causal reads require readConcern=MAJORITY.",
-                    ));
-                }
-                ReadConcern::Linearizable => {
-                    return Err(Status::failed_precondition(
-                        "readConcern=LINEARIZABLE is incompatible with afterClusterTime. \
-                         Use readConcern=MAJORITY for causal reads.",
-                    ));
-                }
-                _ => {} // Majority, Snapshot: OK for causal sessions
-            }
-        }
-
-        // Causal session write-concern validation.
-        //
-        // Writes in a causal session (after_index > 0) MUST use writeConcern >=
-        // majority. A sub-majority write (w:1, w:0) may be acknowledged to the
-        // client before it is replicated. If the leader crashes before replication,
-        // the write is lost — but the client already received an `applied_index` from
-        // the response. Any subsequent causal read with that `after_index` will wait
-        // forever on a follower (the entry was never committed) or observe a missing
-        // write (violating read-your-writes). This is a hard rejection, not a silent
-        // upgrade: the client must explicitly choose between volatile + non-causal or
-        // durable + causal.
-        //
-        // We detect write queries via AST inspection BEFORE execution to avoid
-        // executing a write that we would then reject.
-        if after_idx > 0 {
-            // Parse the query to determine if it contains any mutating clauses.
-            // On parse failure we let execution proceed and fail with a richer error.
-            if let Ok(ast) = coordinode_query::cypher::parse(&req.query) {
-                let writes = {
-                    let db = self.database.read();
-                    ast.is_write(&|name| db.procedures().writes(name))
-                };
-                if writes {
-                    // A request that names no concern runs under the
-                    // database's default, so that is the one to check.
-                    let concern = match req.write_concern.as_ref() {
-                        Some(wc) => write_concern_from_proto(wc)?,
-                        None => self.database.read().write_concern(),
-                    };
-                    if !concern.is_causal_safe() {
-                        return Err(Status::failed_precondition(
-                            "Causal sessions require writeConcern w:majority with \
-                             j:journal for write statements. A weaker write (w:1, w:0, \
-                             or a volatile journal level) may be lost before replication: \
-                             the resulting applied_index would be a dangling causal \
-                             dependency that followers can never satisfy. Use a \
-                             non-causal session for such writes, or upgrade to \
-                             w:majority.",
-                        ));
-                    }
-                }
-            }
-        }
-
-        // --- Read fence: enforce readPreference and readConcern before query ---
-        //
-        // In cluster mode, apply the preference/concern fence, then the causal
-        // after_index fence if the client supplied one.
-        // In standalone mode (raft_node = None), all writes are immediately visible
-        // and applied_index is always 0 — causal fences are trivially satisfied.
-        let (applied_index, served_by_leader, read_as_of_ts) =
-            if let Some(ref raft) = self.raft_node {
-                let preference = match req.read_preference {
-                    0 => self.defaults.read_preference,
-                    named => ReadPreference::from_proto(named),
-                };
-                let mut fence = raft.read_fence();
-                if let Err(e) = fence.apply_default(preference, concern).await {
-                    // The request needs the leader and this node is not it. Pass it
-                    // along rather than making the caller find the leader itself:
-                    // that is what a client without a topology map cannot do, and
-                    // this node already knows the answer. Once forwarded, a request
-                    // is answered rather than passed on again.
-                    match raft.current_leader() {
-                        Some(leader_id)
-                            if !already_forwarded
-                                && matches!(
-                                    e,
-                                    ReadFenceError::NotLeader
-                                        | ReadFenceError::LinearizableRequiresLeader
-                                ) =>
-                        {
-                            return self.forward_to_leader(leader_id, req).await;
-                        }
-                        _ => return Err(fence_error_to_status(e)),
-                    }
-                }
-
-                // Causal fence: block until applied_index >= after_idx.
-                // after_idx = 0 means no fence (default).
-                if after_idx > 0 {
-                    fence
-                        .wait_for_index(after_idx, READ_FENCE_TIMEOUT)
-                        .await
-                        .map_err(fence_error_to_status)?;
-                }
-
-                let idx = fence.applied_index();
-                let is_leader = raft.is_leader().await;
-                (idx, is_leader, fence.as_of().unwrap_or(0))
-            } else {
-                (0u64, false, 0u64)
-            };
-
-        // Build executor-level concerns from the proto request, then execute
-        // through the unified entry point so they actually reach the executor
-        // (the previous handler validated write_concern for causal sessions but
-        // silently dropped it before calling the engine, downgrading every
-        // MAJORITY write to W1).
-        let at_ts_raw = req
-            .read_concern
-            .as_ref()
-            .map(|rc| rc.at_timestamp)
-            .unwrap_or(0);
-        // at_timestamp only meaningful with SNAPSHOT level (see proto doc).
-        // Reject misuse at the boundary rather than letting it silently slide
-        // through to a non-snapshot read which would ignore the timestamp.
-        if at_ts_raw > 0 && level != ExecutorReadConcernLevel::Snapshot {
-            return Err(Status::failed_precondition(
-                "readConcern.at_timestamp is only valid with level=SNAPSHOT",
-            ));
-        }
-        let executor_read_concern = ExecutorReadConcern {
-            level,
-            after_index: if after_idx > 0 { Some(after_idx) } else { None },
-            at_timestamp: if at_ts_raw > 0 { Some(at_ts_raw) } else { None },
-        };
-        let executor_write_concern = req
-            .write_concern
-            .as_ref()
-            .map(write_concern_from_proto)
-            .transpose()?;
-
-        // Execute under a shared read lock by default. CypherService
-        // accepts any Cypher (CREATE / MATCH / SET / …); the
-        // shared path runs regular Cypher on `&self` concurrently
-        // and explicitly rejects session-SET commands. On rejection
-        // (SET requires exclusive access) we re-run under `.write()`
-        // through the `&mut self` API. This keeps the hot read path
-        // parallel without losing the embedded SET semantics.
         let exec_result = {
             let params = if req.parameters.is_empty() {
                 None
@@ -1102,13 +816,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                 Some(convert_params(&req.parameters))
             };
             match super::blocking(|| {
-                self.writer.execute(
-                    &req.query,
-                    params,
-                    source_ctx.as_ref(),
-                    Some(&executor_read_concern),
-                    executor_write_concern.as_ref(),
-                )
+                self.executor
+                    .execute(&req.query, params, source_ctx.as_ref(), &admitted)
             }) {
                 Ok(result) => result,
                 Err(e) => {
@@ -1120,54 +829,30 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     // the write rather than repeating it.
                     match leader_hint(&e) {
                         Some(leader_id) if !already_forwarded => {
-                            return self.forward_to_leader(leader_id, req).await;
+                            return self.executor.forward(leader_id, req).await;
                         }
                         _ => return Err(db_error_to_status(e)),
                     }
                 }
             }
         };
-        // Read / write guard released here, held only during query execution.
         let result_rows = exec_result.rows;
         let write_stats = exec_result.write_stats;
+        let Admitted {
+            applied_index,
+            served_by_leader,
+            read_as_of_ts,
+            ..
+        } = admitted;
 
         // Causal operationTime: a replicated write reports its OWN committed
-        // Raft index, not the node's current applied index sampled around
-        // execution by the read fence (which is not this write's index — the
-        // operationTime inaccuracy). Reads keep the fence value. `None` (embedded /
-        // non-replicated) falls back to the fence value.
+        // Raft index, not the node's applied index sampled by the read fence,
+        // which is not this write's index. Reads keep the fence value; `None`
+        // (embedded, non-replicated) falls back to it too.
         let applied_index = write_stats.applied_index.unwrap_or(applied_index);
 
         let duration_ms = start.elapsed().as_millis() as u64;
-
-        // Advisor tracking: fingerprint + source + N+1
-        // Database::execute_cypher already records in its own registry,
-        // but server has its own registry for gRPC-specific tracking. The
-        // fingerprint comes from the query frontend (no plan build needed).
-        if let Ok((canonical, fp)) =
-            coordinode_query::frontend::CypherFrontend::new().fingerprint(&req.query)
-        {
-            let duration_us = start.elapsed().as_micros() as u64;
-
-            match &source_ctx {
-                Some(src) => {
-                    self.query_registry
-                        .record_with_source(fp, &canonical, duration_us, src);
-                    if let Some(alert) = self.nplus1_detector.record(fp, &canonical, src) {
-                        tracing::warn!(
-                            fingerprint = fp,
-                            count = alert.call_count,
-                            file = %alert.source_file,
-                            line = alert.source_line,
-                            "N+1 query pattern detected"
-                        );
-                    }
-                }
-                None => {
-                    self.query_registry.record(fp, &canonical, duration_us);
-                }
-            }
-        }
+        self.executor.record(&req.query, source_ctx.as_ref(), start);
 
         // Convert executor rows → proto rows.
         // Determine columns from the first row (all rows share the same keys).
@@ -1223,7 +908,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // The plan ExecuteCypher would run, index selection and push-down
         // included, so what is explained is what executes.
         let (plan, suggest_result, stats) = super::blocking(|| {
-            let db = self.database.read();
+            let db = self.database().read();
             let stats = db.compute_stats();
             let plan = db.explain_plan(&req.query, stats.as_ref())?;
             let suggest = db.suggest_for(&plan, stats.as_ref());
@@ -1275,7 +960,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         &self,
         _request: Request<query::BeginTransactionRequest>,
     ) -> Result<Response<query::BeginTransactionResponse>, Status> {
-        let transaction_id = super::blocking(|| self.database.read().begin_transaction());
+        let transaction_id = super::blocking(|| self.database().read().begin_transaction());
         Ok(Response::new(query::BeginTransactionResponse {
             transaction_id,
         }))
@@ -1287,7 +972,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
     ) -> Result<Response<query::CommitTransactionResponse>, Status> {
         let request = request.into_inner();
         let receipt = super::blocking(|| {
-            let db = self.database.read();
+            let db = self.database().read();
             // The conditions the caller built its statements on, stated before
             // the commit that checks them. A condition naming a node the caller
             // never read is still a condition: the engine decides it against the
@@ -1315,7 +1000,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         request: Request<query::RollbackTransactionRequest>,
     ) -> Result<Response<query::RollbackTransactionResponse>, Status> {
         let transaction_id = request.into_inner().transaction_id;
-        super::blocking(|| self.database.read().rollback_transaction(transaction_id))
+        super::blocking(|| self.database().read().rollback_transaction(transaction_id))
             .map_err(db_error_to_status)?;
         Ok(Response::new(query::RollbackTransactionResponse {}))
     }

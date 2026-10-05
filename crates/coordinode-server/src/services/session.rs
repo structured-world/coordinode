@@ -15,14 +15,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
-use coordinode_raft::cluster::version::VersionGate;
 use coordinode_session::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, InOp, Ordering as CoreOrdering,
     OutEvent, SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
 };
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status, Streaming};
@@ -32,6 +29,7 @@ use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
 use super::cypher::{
     proto_to_value_pub, value_to_proto_pub, write_concern_from_proto, write_concern_to_proto,
 };
+use super::statement::StatementExecutor;
 use crate::proto::query;
 use crate::proto::replication;
 use crate::proto::session::server_frame::Event;
@@ -55,17 +53,12 @@ pub struct SessionSvc {
 }
 
 impl SessionSvc {
-    /// Create the binding, backing its sessions with the embedded database and
-    /// registering each session in the shared `registry` so it is visible to
-    /// `SHOW SESSIONS` / `SHOW TRANSACTIONS`. In a cluster, `version` labels
-    /// the reads of a member that does not run its group's version with what
-    /// they are as of.
-    pub fn new(
-        database: Arc<RwLock<Database>>,
-        registry: Arc<SessionRegistry>,
-        version: Option<Arc<VersionGate>>,
-    ) -> Self {
-        let engine = Arc::new(DatabaseCursorEngine::new(database).with_version(version));
+    /// Create the binding, running its sessions' statements through
+    /// `executor` (the path the unary RPC takes too) and registering each
+    /// session in the shared `registry` so it is visible to `SHOW SESSIONS` /
+    /// `SHOW TRANSACTIONS`.
+    pub fn new(executor: StatementExecutor, registry: Arc<SessionRegistry>) -> Self {
+        let engine = Arc::new(DatabaseCursorEngine::from_executor(executor));
         Self {
             manager: SessionManager::new(engine, registry),
             change_streams: None,
@@ -344,6 +337,7 @@ fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, Status> {
                 .collect(),
             txid: e.txid,
             nonce: e.nonce,
+            settings: ConnectionSettings::default(),
         },
         client_frame::Op::Begin(b) => SessionOp::Begin {
             ordering: match b.ordering() {

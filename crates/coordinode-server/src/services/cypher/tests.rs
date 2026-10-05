@@ -139,7 +139,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
     // handle is what a client does through GetNode.
     let account = coordinode_core::graph::node::NodeId::from_raw(1);
     let read_version = svc
-        .database
+        .database()
         .read()
         .node_version(account)
         .expect("read version")
@@ -210,7 +210,7 @@ async fn grpc_commit_conditioned_on_a_node_version() {
 
     // Retried against the version that is actually there, it lands.
     let current = svc
-        .database
+        .database()
         .read()
         .node_version(account)
         .expect("read version")
@@ -250,7 +250,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
         .expect("create");
     let guard = coordinode_core::graph::node::NodeId::from_raw(1);
     let read_version = svc
-        .database
+        .database()
         .read()
         .node_version(guard)
         .expect("read version")
@@ -291,7 +291,7 @@ async fn grpc_a_read_only_commit_still_checks_its_condition() {
 
     // At the version that is there, the same read-only commit succeeds.
     let current = svc
-        .database
+        .database()
         .read()
         .node_version(guard)
         .expect("read version")
@@ -326,7 +326,7 @@ async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight
         .expect("create the guard");
     let guard = coordinode_core::graph::node::NodeId::from_raw(1);
     let version = svc
-        .database
+        .database()
         .read()
         .node_version(guard)
         .expect("read version")
@@ -344,7 +344,7 @@ async fn grpc_a_guard_condition_is_refused_beside_a_write_of_the_guard_in_flight
 
     // Another commit has validated and is about to write the guard. Its
     // timestamp is above every clock reading here, so no reader waits on it.
-    let engine = svc.database.read().engine_shared();
+    let engine = svc.database().read().engine_shared();
     let guard_key = coordinode_core::graph::node::encode_node_key(1, guard);
     let in_flight = engine
         .pending_commits()
@@ -400,7 +400,7 @@ async fn grpc_a_self_committing_statement_reports_the_version_it_wrote() {
 
     let node = coordinode_core::graph::node::NodeId::from_raw(1);
     assert_eq!(
-        svc.database.read().node_version(node).expect("read"),
+        svc.database().read().node_version(node).expect("read"),
         Some(reported),
         "what the statement reports is the version of what it wrote"
     );
@@ -500,7 +500,7 @@ async fn grpc_a_claim_fences_the_writes_of_the_holder_it_replaced() {
 
     let claim = coordinode_core::graph::node::NodeId::from_raw(1);
     let held_at = svc
-        .database
+        .database()
         .read()
         .node_version(claim)
         .expect("read")
@@ -573,7 +573,7 @@ async fn grpc_a_retry_after_an_unheard_outcome_learns_which_way_it_went() {
 
     let counter = coordinode_core::graph::node::NodeId::from_raw(1);
     let before = svc
-        .database
+        .database()
         .read()
         .node_version(counter)
         .expect("read")
@@ -635,7 +635,7 @@ async fn grpc_two_claimers_of_one_record_produce_one_winner() {
 
     let lease = coordinode_core::graph::node::NodeId::from_raw(1);
     let free_at = svc
-        .database
+        .database()
         .read()
         .node_version(lease)
         .expect("read")
@@ -682,7 +682,7 @@ async fn grpc_two_claimers_of_one_record_produce_one_winner() {
     assert_eq!(
         info.metadata.get("current_version"),
         Some(
-            &svc.database
+            &svc.database()
                 .read()
                 .node_version(lease)
                 .expect("read")
@@ -1824,7 +1824,7 @@ async fn an_unnamed_read_concern_takes_the_server_default() {
 #[tokio::test]
 async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
     let (svc, _dir) = test_service();
-    svc.database.write().set_write_concern(WriteConcern::w1());
+    svc.database().write().set_write_concern(WriteConcern::w1());
     let refused = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "CREATE (n:DefaultWc) RETURN n".to_string(),
@@ -2000,7 +2000,7 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
     }
 
     let (svc, _dir) = test_service();
-    svc.database
+    svc.database()
         .write()
         .register_procedure(Arc::new(Touch(ProcedureSignature::new(
             "app.touch",

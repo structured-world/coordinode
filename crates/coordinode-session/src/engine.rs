@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
 
-use crate::types::{Failure, SessionStats};
+use crate::types::{ConnectionSettings, Failure, SessionStats};
 
 /// An error from the query engine, neutral over the engine implementation. It
 /// reaches the client as the request's failure, class and details intact.
@@ -38,13 +38,21 @@ impl std::error::Error for EngineError {}
 /// The binding injects an implementation backed by the query engine. `query` is
 /// opaque dialect text the core does not inspect; `params` are already in the
 /// engine's value space; `txid` is the interactive-transaction handle, or zero
-/// for an autonomous (auto-commit) statement.
+/// for an autonomous (auto-commit) statement. `settings` are the statement's
+/// own settings over its session's: a field still unset is the engine's
+/// default.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot serve a session's statements",
+    label = "needs `CursorEngine`",
+    note = "the server implements it over the database as `DatabaseCursorEngine`"
+)]
 pub trait CursorEngine: Send + Sync {
     fn open_cursor(
         &self,
         query: &str,
         params: HashMap<String, Value>,
         txid: u64,
+        settings: &ConnectionSettings,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
     /// Open a new interactive transaction and return its handle. Subsequent
@@ -66,6 +74,11 @@ pub trait CursorEngine: Send + Sync {
 ///
 /// The cursor pins its read snapshot for its whole life; the session pulls
 /// batches until one comes back empty (exhausted), then reads [`Self::stats`].
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a result cursor the session can page",
+    label = "needs `QueryCursor`",
+    note = "a `CursorEngine` returns one from `open_cursor`"
+)]
 pub trait QueryCursor: Send {
     /// Result column names, in result order. Available before the first batch.
     fn columns(&self) -> Vec<String>;

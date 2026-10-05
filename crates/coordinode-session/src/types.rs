@@ -26,12 +26,15 @@ pub enum Ordering {
 pub enum SessionOp {
     /// Run one query statement, autonomously (`txid == 0`) or inside a
     /// transaction. `params` are already in the engine's value space; the
-    /// binding converts its wire values before constructing this.
+    /// binding converts its wire values before constructing this. `settings`
+    /// are the ones the statement names itself; each one it leaves unset is
+    /// the session's.
     Execute {
         query: String,
         params: HashMap<String, Value>,
         txid: u64,
         nonce: u64,
+        settings: ConnectionSettings,
     },
     /// Open an interactive transaction.
     Begin {
@@ -96,6 +99,14 @@ impl ConnectionSettings {
         if change.drain_timeout_ms.is_some() {
             self.drain_timeout_ms = change.drain_timeout_ms;
         }
+    }
+
+    /// The settings a statement runs under: these, with every setting the
+    /// statement names itself in place of this one.
+    pub fn under(&self, statement: &ConnectionSettings) -> ConnectionSettings {
+        let mut effective = self.clone();
+        effective.apply(statement);
+        effective
     }
 }
 

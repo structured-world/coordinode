@@ -16,18 +16,27 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
-use coordinode_raft::cluster::version::{MemberState, VersionGate};
-use coordinode_session::{CursorEngine, EngineError, QueryCursor, SessionStats};
+use coordinode_raft::read_fence::ReadPreference;
+use coordinode_session::{
+    ConnectionSettings, CursorEngine, EngineError, QueryCursor, SessionStats,
+};
+// no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
 
 use super::failure;
-use crate::services::cypher::db_error_to_status;
+use crate::proto::{query, replication};
+use crate::services::cypher::{
+    db_error_to_status, proto_to_value_pub, read_concern_level_to_executor, value_to_proto_pub,
+    write_concern_to_proto,
+};
+use crate::services::statement::{Admission, Requested, StatementExecutor, leader_hint};
 
 /// Storage keys scanned per keyset page. Independent of the client's batch size:
 /// a page may yield fewer output rows than this when a `Filter` rejects some, so
@@ -35,35 +44,67 @@ use crate::services::cypher::db_error_to_status;
 /// is exhausted.
 const KEYSET_PAGE: usize = 1024;
 
-/// A [`CursorEngine`] that runs statements through the embedded [`Database`].
+/// A [`CursorEngine`] that runs statements through the embedded [`Database`],
+/// on the same path as the unary RPC: settings, fence, forwarding, execution
+/// and the advisor.
 pub struct DatabaseCursorEngine {
-    database: Arc<RwLock<Database>>,
-    /// This member's version view; `None` outside a cluster.
-    version: Option<Arc<VersionGate>>,
+    executor: StatementExecutor,
 }
 
 impl DatabaseCursorEngine {
-    pub fn new(database: Arc<RwLock<Database>>) -> Self {
-        Self {
-            database,
-            version: None,
-        }
+    /// An engine that runs statements through `executor`.
+    pub fn from_executor(executor: StatementExecutor) -> Self {
+        Self { executor }
     }
 
-    /// Label the reads this member serves while it does not run its group's
-    /// version with what they are as of.
-    pub fn with_version(mut self, version: Option<Arc<VersionGate>>) -> Self {
-        self.version = version;
-        self
+    fn database(&self) -> &Arc<RwLock<Database>> {
+        self.executor.database()
     }
 
-    /// What a read starting now is as of: the last commit applied, while this
-    /// member is read-only; zero while it serves current reads.
-    fn read_as_of(&self) -> u64 {
-        match self.version.as_ref().map(|v| v.state()) {
-            Some(MemberState::Mismatched(m)) => m.as_of,
-            _ => 0,
+    /// Check and fence an autonomous statement. The fence waits on the
+    /// consensus node, which only a cluster has: the session calls in from
+    /// the blocking pool, where waiting on the runtime is allowed.
+    fn admit(&self, query: &str, requested: &Requested) -> Result<Admission, EngineError> {
+        let checked = self
+            .executor
+            .check(query, requested)
+            .map_err(|s| EngineError(failure(&s)))?;
+        if !self.executor.needs_fence() {
+            return Ok(Admission::Run(self.executor.admit_standalone(checked)));
         }
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|e| EngineError::internal(format!("no runtime to fence the read on: {e}")))?;
+        runtime
+            .block_on(self.executor.fence(checked, false))
+            .map_err(|s| EngineError(failure(&s)))
+    }
+
+    /// Run `query` at the leader and page its answer out of memory.
+    fn forwarded(
+        &self,
+        leader_id: u64,
+        query: &str,
+        params: Option<HashMap<String, Value>>,
+        settings: &ConnectionSettings,
+    ) -> Result<Box<dyn QueryCursor>, EngineError> {
+        let request = forwarded_request(query, params, settings);
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            EngineError::internal(format!("no runtime to reach the leader on: {e}"))
+        })?;
+        let response = runtime
+            .block_on(self.executor.forward(leader_id, request))
+            .map_err(|s| EngineError(failure(&s)))?
+            .into_inner();
+        Ok(Box::new(MaterializedCursor {
+            rows: response
+                .rows
+                .iter()
+                .map(|row| row.values.iter().map(proto_to_value_pub).collect())
+                .collect(),
+            columns: response.columns,
+            pos: 0,
+            stats: response.stats.map(stats_from_proto).unwrap_or_default(),
+        }))
     }
 }
 
@@ -73,63 +114,111 @@ impl CursorEngine for DatabaseCursorEngine {
         query: &str,
         params: HashMap<String, Value>,
         txid: u64,
+        settings: &ConnectionSettings,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let params = if params.is_empty() {
             None
         } else {
             Some(params)
         };
-        let read_as_of_ts = self.read_as_of();
-        // Keyset path: auto-commit read whose plan pages by a single NodeScan.
-        // An interactive statement (txid != 0) reuses the parked transaction
-        // and cannot re-pin a snapshot per page, so it always materializes.
-        if txid == 0 && self.database.read().keyset_pageable(query) {
+        // A statement of an interactive transaction reads at the snapshot
+        // pinned when it began and buffers its writes until the commit: no
+        // fence and no commit of its own here.
+        if txid != 0 {
+            let rows = self
+                .database()
+                .read()
+                .execute_in_transaction(txid, query, params)
+                .map_err(engine_error)?;
+            let (columns, rows) = rows_to_values(&rows);
+            return Ok(Box::new(MaterializedCursor {
+                columns,
+                rows,
+                pos: 0,
+                stats: SessionStats::default(),
+            }));
+        }
+
+        let start = Instant::now();
+        let admitted = match self.admit(query, &requested(settings))? {
+            Admission::Run(admitted) => admitted,
+            Admission::Forward(leader_id) => {
+                return self.forwarded(leader_id, query, params, settings);
+            }
+        };
+        let fenced = SessionStats {
+            applied_index: admitted.applied_index,
+            served_by_leader: admitted.served_by_leader,
+            read_as_of_ts: admitted.read_as_of_ts,
+            ..SessionStats::default()
+        };
+
+        // Keyset path: an auto-commit read whose plan pages by a single
+        // NodeScan pins one snapshot and pages by key, so memory stays one
+        // page whatever the result size.
+        if self.database().read().keyset_pageable(query) {
             let cursor = KeysetCursor::open(
-                Arc::clone(&self.database),
+                Arc::clone(self.database()),
                 query.to_string(),
                 params,
-                read_as_of_ts,
+                admitted.read_concern.at_timestamp,
+                fenced,
             )?;
+            self.executor.record(query, None, start);
             return Ok(Box::new(cursor));
         }
 
-        let db = self.database.read();
-        let (rows, mut stats) = if txid == 0 {
-            let result = db
-                .execute_cypher_shared(query, params, None, None, None)
-                .map_err(engine_error)?;
-            (
-                rows_to_values(&result.rows),
-                write_stats(&result.write_stats),
-            )
-        } else {
-            let rows = db
-                .execute_in_transaction(txid, query, params)
-                .map_err(engine_error)?;
-            (rows_to_values(&rows), SessionStats::default())
+        // A write that reaches a follower is refused by consensus and goes to
+        // the leader, as on the unary path: nothing was applied here. Only a
+        // follower needs the parameters again for that, so only a follower
+        // keeps a copy; on the leader, a leadership lost mid-statement is
+        // answered with NOT_LEADER and the leader to retry at.
+        let retry =
+            (self.executor.needs_fence() && !admitted.served_by_leader).then(|| params.clone());
+        let result = match self.executor.execute(query, params, None, &admitted) {
+            Ok(result) => result,
+            Err(e) => match (leader_hint(&e), retry) {
+                (Some(leader_id), Some(params)) => {
+                    return self.forwarded(leader_id, query, params, settings);
+                }
+                _ => return Err(engine_error(e)),
+            },
         };
-        stats.read_as_of_ts = read_as_of_ts;
+        self.executor.record(query, None, start);
+        let (columns, rows) = rows_to_values(&result.rows);
+        let written = write_stats(&result.write_stats);
         Ok(Box::new(MaterializedCursor {
-            columns: rows.0,
-            rows: rows.1,
+            columns,
+            rows,
             pos: 0,
-            stats,
+            stats: SessionStats {
+                // A replicated write reports its own committed index, a read
+                // the index the fence saw.
+                applied_index: result
+                    .write_stats
+                    .applied_index
+                    .unwrap_or(fenced.applied_index),
+                execution_time_ms: start.elapsed().as_millis() as i64,
+                served_by_leader: fenced.served_by_leader,
+                read_as_of_ts: fenced.read_as_of_ts,
+                ..written
+            },
         }))
     }
 
     fn begin_transaction(&self) -> Result<u64, EngineError> {
-        Ok(self.database.read().begin_transaction())
+        Ok(self.database().read().begin_transaction())
     }
 
     fn commit_transaction(&self, txid: u64) -> Result<CommitReceipt, EngineError> {
-        self.database
+        self.database()
             .read()
             .commit_transaction(txid)
             .map_err(engine_error)
     }
 
     fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError> {
-        self.database
+        self.database()
             .read()
             .rollback_transaction(txid)
             .map_err(engine_error)
@@ -141,6 +230,69 @@ impl CursorEngine for DatabaseCursorEngine {
 /// redirects or gives up on the same signal.
 fn engine_error(err: DatabaseError) -> EngineError {
     EngineError(failure(&db_error_to_status(err)))
+}
+
+/// The settings a session statement runs under, as the executor takes them.
+/// A level or preference of zero is the wire's "unspecified": the server's
+/// default, like a setting left out.
+fn requested(settings: &ConnectionSettings) -> Requested {
+    Requested {
+        read_concern: settings
+            .read_concern
+            .filter(|&level| level != 0)
+            .map(|level| read_concern_level_to_executor(i32::from(level))),
+        after_index: settings.after_index.unwrap_or(0),
+        at_timestamp: settings.at_timestamp.unwrap_or(0),
+        read_preference: settings
+            .read_preference
+            .filter(|&preference| preference != 0)
+            .map(|preference| ReadPreference::from_proto(i32::from(preference))),
+        write_concern: settings.write_concern,
+    }
+}
+
+/// The unary request that carries a session statement to the leader, with the
+/// settings it runs under spelled out: the leader does not know the session.
+fn forwarded_request(
+    query: &str,
+    params: Option<HashMap<String, Value>>,
+    settings: &ConnectionSettings,
+) -> query::ExecuteCypherRequest {
+    let read_concern = (settings.read_concern.is_some()
+        || settings.after_index.is_some()
+        || settings.at_timestamp.is_some())
+    .then(|| replication::ReadConcern {
+        level: settings.read_concern.map_or(0, i32::from),
+        after_index: settings.after_index.unwrap_or(0),
+        at_timestamp: settings.at_timestamp.unwrap_or(0),
+    });
+    query::ExecuteCypherRequest {
+        query: query.to_string(),
+        parameters: params
+            .unwrap_or_default()
+            .iter()
+            .map(|(k, v)| (k.clone(), value_to_proto_pub(v)))
+            .collect(),
+        read_preference: settings.read_preference.map_or(0, i32::from),
+        read_concern,
+        write_concern: settings.write_concern.as_ref().map(write_concern_to_proto),
+        transaction_id: 0,
+    }
+}
+
+fn stats_from_proto(stats: query::QueryStats) -> SessionStats {
+    SessionStats {
+        nodes_created: stats.nodes_created,
+        nodes_deleted: stats.nodes_deleted,
+        edges_created: stats.edges_created,
+        edges_deleted: stats.edges_deleted,
+        properties_set: stats.properties_set,
+        execution_time_ms: stats.execution_time_ms,
+        applied_index: stats.applied_index,
+        served_by_leader: stats.served_by_leader,
+        commit_ts: stats.commit_ts,
+        read_as_of_ts: stats.read_as_of_ts,
+    }
 }
 
 /// A keyset-resumable cursor: pins one MVCC snapshot and pages the result by
@@ -161,31 +313,38 @@ struct KeysetCursor {
     exhausted: bool,
     pending: VecDeque<Vec<Value>>,
     stats: SessionStats,
-    /// What the whole scan is as of on a read-only member, zero otherwise:
-    /// its pages all read the snapshot pinned when it opened.
-    read_as_of_ts: u64,
+    /// What the fence learned: the applied index the read was served at,
+    /// whether the leader served it, and what a read-only member's read is as
+    /// of. Every page reads the snapshot pinned when the cursor opened, so it
+    /// holds for the whole scan.
+    fenced: SessionStats,
+    /// Time spent reading pages so far.
+    busy: std::time::Duration,
 }
 
 impl KeysetCursor {
     /// Open the cursor, prefetching pages until the first row is found (so the
-    /// column header is known) or the scan is exhausted.
+    /// column header is known) or the scan is exhausted. `at` pins the scan to
+    /// that snapshot; `None` pins a fresh one.
     fn open(
         database: Arc<RwLock<Database>>,
         query: String,
         params: Option<HashMap<String, Value>>,
-        read_as_of_ts: u64,
+        at: Option<u64>,
+        fenced: SessionStats,
     ) -> Result<Self, EngineError> {
         let mut cursor = Self {
             database,
             query,
             params,
             columns: Vec::new(),
-            read_ts: None,
+            read_ts: at,
             resume: None,
             exhausted: false,
             pending: VecDeque::new(),
-            stats: SessionStats::default(),
-            read_as_of_ts,
+            stats: fenced.clone(),
+            fenced,
+            busy: std::time::Duration::ZERO,
         };
         // Drive the scan until columns are established. A heavy Filter can empty
         // a leading page while later pages still produce rows, so loop rather
@@ -199,6 +358,7 @@ impl KeysetCursor {
     /// Fetch the next keyset page, extend `pending`, and advance the resume
     /// token + exhaustion flag. Establishes `columns` from the first row seen.
     fn fetch_page(&mut self) -> Result<(), EngineError> {
+        let started = Instant::now();
         let page = self
             .database
             .read()
@@ -210,11 +370,15 @@ impl KeysetCursor {
                 KEYSET_PAGE,
             )
             .map_err(engine_error)?;
+        self.busy += started.elapsed();
         self.read_ts = Some(page.read_ts);
         self.resume = page.last_key;
         self.exhausted = page.exhausted;
         self.stats = SessionStats {
-            read_as_of_ts: self.read_as_of_ts,
+            applied_index: self.fenced.applied_index,
+            served_by_leader: self.fenced.served_by_leader,
+            read_as_of_ts: self.fenced.read_as_of_ts,
+            execution_time_ms: self.busy.as_millis() as i64,
             ..write_stats(&page.write_stats)
         };
         if self.columns.is_empty() {

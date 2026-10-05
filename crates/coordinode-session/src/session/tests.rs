@@ -58,6 +58,7 @@ impl CursorEngine for MockEngine {
         query: &str,
         _params: HashMap<String, Value>,
         _txid: u64,
+        _settings: &ConnectionSettings,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         if let Some(message) = &self.fail {
             return Err(EngineError(Failure {
@@ -105,7 +106,124 @@ fn exec() -> SessionOp {
         params: HashMap::new(),
         txid: 0,
         nonce: 0,
+        settings: ConnectionSettings::default(),
     }
+}
+
+/// An engine that answers every statement with an empty result and keeps
+/// the settings each one reached it with, by query text.
+#[derive(Default)]
+struct RecordingEngine {
+    seen: parking_lot::Mutex<Vec<(String, ConnectionSettings)>>,
+    next_txn: AtomicU64,
+}
+
+impl CursorEngine for RecordingEngine {
+    fn open_cursor(
+        &self,
+        query: &str,
+        _params: HashMap<String, Value>,
+        _txid: u64,
+        settings: &ConnectionSettings,
+    ) -> Result<Box<dyn QueryCursor>, EngineError> {
+        self.seen.lock().push((query.to_string(), settings.clone()));
+        Ok(Box::new(MockCursor {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            pos: 0,
+        }))
+    }
+
+    fn begin_transaction(&self) -> Result<u64, EngineError> {
+        Ok(self.next_txn.fetch_add(1, AtomicOrdering::Relaxed) + 1)
+    }
+
+    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+        Ok(MOCK_RECEIPT)
+    }
+
+    fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+/// A statement reaches the engine with its session's settings, its own in
+/// place of any it names, and the session's as they stood when it arrived.
+/// Before, the session stored a Configure and echoed it back while every
+/// statement ran on the server's defaults.
+#[tokio::test]
+async fn a_statement_runs_under_its_session_settings_and_its_own() {
+    let recording = Arc::new(RecordingEngine::default());
+    let engine: Arc<dyn CursorEngine> = Arc::clone(&recording) as Arc<dyn CursorEngine>;
+    let statement = |query: &str, settings: ConnectionSettings| SessionOp::Execute {
+        query: query.to_string(),
+        params: HashMap::new(),
+        txid: 0,
+        nonce: 0,
+        settings,
+    };
+    run_session(
+        engine,
+        vec![
+            SessionOp::Configure(ConnectionSettings {
+                read_concern: Some(2),
+                read_preference: Some(4),
+                write_concern: Some(WriteConcern::w1()),
+                ..ConnectionSettings::default()
+            }),
+            statement("plain", ConnectionSettings::default()),
+            statement(
+                "own",
+                ConnectionSettings {
+                    read_concern: Some(3),
+                    ..ConnectionSettings::default()
+                },
+            ),
+            // A transaction's statement takes the same path through its mailbox.
+            SessionOp::Begin {
+                ordering: Ordering::Unordered,
+                drain_timeout_ms: 0,
+            },
+            SessionOp::Execute {
+                query: "in-txn".to_string(),
+                params: HashMap::new(),
+                txid: 1,
+                nonce: 0,
+                settings: ConnectionSettings {
+                    write_concern: Some(WriteConcern::majority()),
+                    ..ConnectionSettings::default()
+                },
+            },
+            SessionOp::Commit {
+                txid: 1,
+                last_nonce: 0,
+            },
+        ],
+    )
+    .await;
+
+    let seen: HashMap<String, ConnectionSettings> = recording.seen.lock().iter().cloned().collect();
+    let session = ConnectionSettings {
+        read_concern: Some(2),
+        read_preference: Some(4),
+        write_concern: Some(WriteConcern::w1()),
+        ..ConnectionSettings::default()
+    };
+    assert_eq!(seen["plain"], session);
+    assert_eq!(
+        seen["own"],
+        ConnectionSettings {
+            read_concern: Some(3),
+            ..session.clone()
+        }
+    );
+    assert_eq!(
+        seen["in-txn"],
+        ConnectionSettings {
+            write_concern: Some(WriteConcern::majority()),
+            ..session
+        }
+    );
 }
 
 /// Drive a fresh session with `ops` (request_id = index + 1) and collect every
@@ -279,18 +397,21 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
                 params: HashMap::new(),
                 txid: 1,
                 nonce: 0,
+                settings: ConnectionSettings::default(),
             },
             SessionOp::Execute {
                 query: "FAIL".to_string(),
                 params: HashMap::new(),
                 txid: 1,
                 nonce: 0,
+                settings: ConnectionSettings::default(),
             },
             SessionOp::Execute {
                 query: "after".to_string(),
                 params: HashMap::new(),
                 txid: 1,
                 nonce: 0,
+                settings: ConnectionSettings::default(),
             },
             SessionOp::Commit {
                 txid: 1,
@@ -359,6 +480,7 @@ async fn ordered_applies_statements_in_nonce_order_not_arrival_order() {
         params: HashMap::new(),
         txid: 1,
         nonce,
+        settings: ConnectionSettings::default(),
     };
     let events = run_session_flat(
         engine,
@@ -407,6 +529,7 @@ async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
         params: HashMap::new(),
         txid: 1,
         nonce,
+        settings: ConnectionSettings::default(),
     };
     let by_id = run_session(
         engine,
@@ -479,6 +602,7 @@ async fn ordered_commit_drain_times_out_on_a_missing_nonce() {
                 params: HashMap::new(),
                 txid,
                 nonce: 2,
+                settings: ConnectionSettings::default(),
             },
         ))
         .await

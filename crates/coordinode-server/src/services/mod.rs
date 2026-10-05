@@ -7,6 +7,7 @@ pub mod graph;
 pub mod health;
 pub mod schema;
 pub mod session;
+pub mod statement;
 pub mod text;
 pub mod vector;
 

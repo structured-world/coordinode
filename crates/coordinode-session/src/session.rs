@@ -184,24 +184,39 @@ impl Session {
     ) {
         match op {
             // A statement bound to an open transaction: route to its mailbox.
+            // Its settings are taken now, so a Configure that arrives after it
+            // does not reach back.
             SessionOp::Execute {
                 query,
                 params,
                 txid,
                 nonce,
+                settings,
             } if txid != 0 && txns.contains_key(&txid) => {
                 let msg = TxnMsg::Statement {
-                    request_id,
                     nonce,
-                    query,
-                    params,
+                    statement: Statement {
+                        request_id,
+                        query,
+                        params,
+                        settings: self.settings.lock().under(&settings),
+                    },
                 };
                 // A send error means the task just resolved (rx dropped) before
                 // its `done` was processed; fall back to the engine's
                 // unknown-transaction error.
                 if let Some(tx) = txns.get(&txid) {
                     if tx.send(msg).await.is_err() {
-                        self.spawn_autonomous(request_id, String::new(), HashMap::new(), txid, out);
+                        self.spawn_autonomous(
+                            Statement {
+                                request_id,
+                                query: String::new(),
+                                params: HashMap::new(),
+                                settings: ConnectionSettings::default(),
+                            },
+                            txid,
+                            out,
+                        );
                     }
                 }
             }
@@ -211,8 +226,17 @@ impl Session {
                 query,
                 params,
                 txid,
+                settings,
                 ..
-            } => self.spawn_autonomous(request_id, query, params, txid, out),
+            } => {
+                let statement = Statement {
+                    request_id,
+                    query,
+                    params,
+                    settings: self.settings.lock().under(&settings),
+                };
+                self.spawn_autonomous(statement, txid, out);
+            }
 
             SessionOp::Begin {
                 ordering,
@@ -271,21 +295,14 @@ impl Session {
 
     /// Run an autonomous statement (or one against an unknown transaction)
     /// concurrently, bracketing it as in-flight for its lifetime.
-    fn spawn_autonomous(
-        &self,
-        request_id: u64,
-        query: String,
-        params: HashMap<String, Value>,
-        txid: u64,
-        out: &mpsc::Sender<OutEvent>,
-    ) {
+    fn spawn_autonomous(&self, statement: Statement, txid: u64, out: &mpsc::Sender<OutEvent>) {
         let engine = Arc::clone(&self.engine);
         let registry = Arc::clone(&self.registry);
         let session_id = self.session_id;
         let out = out.clone();
         registry.request_started(session_id);
         tokio::spawn(async move {
-            let _ = execute(&engine, request_id, &query, params, txid, &out).await;
+            let _ = execute(&engine, statement, txid, &out).await;
             registry.request_finished(session_id);
         });
     }
@@ -353,16 +370,24 @@ impl Session {
     }
 }
 
+/// One statement on its way to the engine.
+struct Statement {
+    request_id: u64,
+    query: String,
+    params: HashMap<String, Value>,
+    /// The settings it runs under: its own over its session's at the moment
+    /// it was received.
+    settings: ConnectionSettings,
+}
+
 /// A message in a transaction's serial mailbox.
 enum TxnMsg {
     /// A statement to run inside the transaction.
     Statement {
-        request_id: u64,
         /// Client-assigned sequence number; orders ORDERED transactions, ignored
         /// for UNORDERED.
         nonce: u64,
-        query: String,
-        params: HashMap<String, Value>,
+        statement: Statement,
     },
     /// Commit the transaction and finish. `last_nonce` is the expected final
     /// nonce of an ORDERED chain, so the commit can drain a reorder gap.
@@ -418,17 +443,12 @@ async fn run_unordered(
     while let Some(msg) = rx.recv().await {
         registry.request_started(session_id);
         match msg {
-            TxnMsg::Statement {
-                request_id,
-                query,
-                params,
-                ..
-            } => {
+            TxnMsg::Statement { statement, .. } => {
                 if aborted {
-                    send_error(out, request_id, aborted_txn()).await;
+                    send_error(out, statement.request_id, aborted_txn()).await;
                 } else {
                     registry.touch_txn(session_id, txid);
-                    if !execute(engine, request_id, &query, params, txid, out).await {
+                    if !execute(engine, statement, txid, out).await {
                         aborted = true;
                         registry.end_txn(session_id, txid);
                     }
@@ -479,26 +499,21 @@ async fn run_ordered(
     // (the UNORDERED default) therefore never becomes applicable here and the
     // commit drains it as a gap; callers wanting arrival order use UNORDERED.
     let mut next_nonce = 1u64;
-    let mut buffer: BTreeMap<u64, (u64, String, HashMap<String, Value>)> = BTreeMap::new();
+    let mut buffer: BTreeMap<u64, Statement> = BTreeMap::new();
     let mut aborted = false;
     let mut resolved = false;
 
     while let Some(msg) = rx.recv().await {
         match msg {
-            TxnMsg::Statement {
-                request_id,
-                nonce,
-                query,
-                params,
-            } => {
+            TxnMsg::Statement { nonce, statement } => {
                 registry.request_started(session_id);
                 if aborted {
-                    send_error(out, request_id, aborted_txn()).await;
+                    send_error(out, statement.request_id, aborted_txn()).await;
                     registry.request_finished(session_id);
                     continue;
                 }
                 registry.touch_txn(session_id, txid);
-                buffer.insert(nonce, (request_id, query, params));
+                buffer.insert(nonce, statement);
                 if apply_contiguous(
                     engine,
                     registry,
@@ -571,12 +586,12 @@ async fn apply_contiguous(
     session_id: u64,
     txid: u64,
     next_nonce: &mut u64,
-    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+    buffer: &mut BTreeMap<u64, Statement>,
     out: &mpsc::Sender<OutEvent>,
 ) -> bool {
-    while let Some((request_id, query, params)) = buffer.remove(next_nonce) {
+    while let Some(statement) = buffer.remove(next_nonce) {
         registry.touch_txn(session_id, txid);
-        let ok = execute(engine, request_id, &query, params, txid, out).await;
+        let ok = execute(engine, statement, txid, out).await;
         registry.request_finished(session_id);
         *next_nonce += 1;
         if !ok {
@@ -600,7 +615,7 @@ async fn drain_to_commit(
     last_nonce: u64,
     drain: Duration,
     next_nonce: &mut u64,
-    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+    buffer: &mut BTreeMap<u64, Statement>,
     rx: &mut mpsc::Receiver<TxnMsg>,
     out: &mpsc::Sender<OutEvent>,
 ) -> bool {
@@ -609,14 +624,9 @@ async fn drain_to_commit(
     }
     while *next_nonce <= last_nonce {
         match tokio::time::timeout(drain, rx.recv()).await {
-            Ok(Some(TxnMsg::Statement {
-                request_id,
-                nonce,
-                query,
-                params,
-            })) => {
+            Ok(Some(TxnMsg::Statement { nonce, statement })) => {
                 registry.request_started(session_id);
-                buffer.insert(nonce, (request_id, query, params));
+                buffer.insert(nonce, statement);
                 if apply_contiguous(engine, registry, session_id, txid, next_nonce, buffer, out)
                     .await
                 {
@@ -638,7 +648,7 @@ async fn drain_to_commit(
 fn finish_buffered(
     registry: &Arc<SessionRegistry>,
     session_id: u64,
-    buffer: &mut BTreeMap<u64, (u64, String, HashMap<String, Value>)>,
+    buffer: &mut BTreeMap<u64, Statement>,
 ) {
     let parked = buffer.len();
     buffer.clear();
@@ -693,17 +703,20 @@ async fn rollback(engine: &Arc<dyn CursorEngine>, txid: u64) {
 /// transaction uses this to abort on the first failing statement.
 async fn execute(
     engine: &Arc<dyn CursorEngine>,
-    request_id: u64,
-    query: &str,
-    params: HashMap<String, Value>,
+    statement: Statement,
     txid: u64,
     out: &mpsc::Sender<OutEvent>,
 ) -> bool {
+    let Statement {
+        request_id,
+        query,
+        params,
+        settings,
+    } = statement;
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
-    let query = query.to_string();
     let opened = tokio::task::spawn_blocking(move || {
-        let cursor = engine.open_cursor(&query, params, txid)?;
+        let cursor = engine.open_cursor(&query, params, txid, &settings)?;
         let columns = cursor.columns();
         Ok::<_, EngineError>((cursor, columns))
     })

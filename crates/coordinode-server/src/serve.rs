@@ -1067,19 +1067,20 @@ pub(crate) async fn serve(
 
     let graph_service = services::graph::GraphServiceImpl::new(Arc::clone(&database));
     let schema_service = services::schema::SchemaServiceImpl::new(Arc::clone(&database));
-    let cypher_service = {
-        let svc = services::cypher::CypherServiceImpl::new(
-            Arc::clone(&database),
-            Arc::clone(&query_registry),
-            Arc::clone(&nplus1_detector),
-        )
-        .with_statement_defaults(statement_defaults);
-        if let Some(ref rn) = raft_node_shared {
-            svc.with_raft_node(Arc::clone(rn))
-        } else {
-            svc
+    // One path for every Cypher statement, whichever transport carries it:
+    // the unary service and the session share the settings, fence,
+    // forwarding and advisor.
+    let statement_executor = {
+        let executor = services::statement::StatementExecutor::new(Arc::clone(&database))
+            .with_advisor(Arc::clone(&query_registry), Arc::clone(&nplus1_detector))
+            .with_statement_defaults(statement_defaults);
+        match raft_node_shared {
+            Some(ref rn) => executor.with_raft_node(Arc::clone(rn)),
+            None => executor,
         }
     };
+    let cypher_service =
+        services::cypher::CypherServiceImpl::from_executor(statement_executor.clone());
     let vector_service = services::vector::VectorServiceImpl::new(Arc::clone(&database));
     let text_service = services::text::TextServiceImpl::new(Arc::clone(&database));
     let health_service = services::health::HealthServiceImpl;
@@ -1415,11 +1416,8 @@ pub(crate) async fn serve(
         .add_service(
             proto::session::session_service_server::SessionServiceServer::new({
                 let svc = services::session::SessionSvc::new(
-                    Arc::clone(&database),
+                    statement_executor.clone(),
                     Arc::clone(&session_registry),
-                    raft_node_shared
-                        .as_ref()
-                        .map(|raft| Arc::clone(raft.version())),
                 )
                 .with_change_streams(Arc::clone(&cdc_service));
                 // In a cluster, a session reports what its node can
