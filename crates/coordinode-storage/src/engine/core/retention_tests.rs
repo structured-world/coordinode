@@ -232,6 +232,14 @@ fn compaction_keeps_no_history_of_the_system_partitions() {
             part.name()
         );
     }
+
+    // The system partitions' retention floors sit past the window, and a
+    // time-travel read of data inside it is still served.
+    assert!(engine.oldest_readable_seqno() <= base + 1_001);
+    assert_eq!(
+        read_in(&engine, Partition::Node, b"node:00:00000001", base + 1_001).expect("in window"),
+        Some(0u64.to_le_bytes().to_vec())
+    );
 }
 
 /// The system threshold drops the window but not the live pins: a reader

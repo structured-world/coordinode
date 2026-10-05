@@ -1980,10 +1980,14 @@ impl StorageEngine {
     ///   history independently of the window, so this can sit above the
     ///   watermark. A read at or below the floor is refused by the tree itself
     ///   (`lsm_tree::Error::SnapshotBelowRetention`), hence the `+ 1`.
+    ///
+    /// The system partitions keep no history of their own (see
+    /// [`Partition::is_system`]), so their floors run ahead of the window and
+    /// do not bound a time-travel read of data.
     pub fn oldest_readable_seqno(&self) -> lsm_tree::SeqNo {
         use lsm_tree::AbstractTree as _;
         let mut horizon = self.coordinator.gc_watermark_value();
-        for part in Partition::all() {
+        for part in Partition::all().iter().filter(|part| !part.is_system()) {
             if let Ok(tree) = self.tree(*part) {
                 // A tree serves strictly above its floor, so the first
                 // readable seqno is one past it. Plain arithmetic: the floor
