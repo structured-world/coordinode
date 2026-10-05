@@ -355,7 +355,10 @@ pub struct Database {
     /// Session-level write concern. Default: Majority.
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
     /// Index registry — tracks active indexes for EXPLAIN SUGGEST false-positive prevention.
-    index_registry: coordinode_query::index::IndexRegistry,
+    index_registry: Arc<coordinode_query::index::IndexRegistry>,
+    /// The executor of index builds: CREATE INDEX, constraints and rebuilds
+    /// admit builds the engine runs, independent of the statement that asked.
+    index_builds: coordinode_query::index::IndexBuildService,
     /// Vector index registry — holds live HNSW indexes for accelerated vector search.
     vector_index_registry: Arc<coordinode_query::index::VectorIndexRegistry>,
     /// Background follower of the applied commits keeping HNSW indexes
@@ -725,16 +728,6 @@ pub enum DatabaseError {
     Other(String),
 }
 
-/// What a B-tree index build that fails leaves behind.
-#[derive(Debug, Clone, Copy)]
-enum FailedBuild {
-    /// Nothing: the index being created is withdrawn.
-    Withdraw,
-    /// The index being rebuilt, marked failed: its constraint still holds
-    /// for new writes, lookups stop using it.
-    Keep,
-}
-
 impl From<coordinode_modality::StoreError> for DatabaseError {
     fn from(e: coordinode_modality::StoreError) -> Self {
         DatabaseError::Execution(e.into())
@@ -973,10 +966,22 @@ impl Database {
         let opened_view = fields.current()?;
 
         // Load index registry from storage for EXPLAIN SUGGEST accuracy.
-        let index_registry = coordinode_query::index::IndexRegistry::new();
+        let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
         if let Err(e) = index_registry.load_all(&engine) {
             tracing::warn!("failed to load index registry: {e}, starting fresh");
         }
+        let index_builds = coordinode_query::index::IndexBuildService::new(
+            Arc::new(index_builds::DatabaseBuilds {
+                engine: Arc::clone(&engine),
+                oracle: Arc::clone(&oracle),
+                pipeline: Arc::clone(&pipeline),
+                proposal_id_gen: Arc::clone(&proposal_id_gen),
+                fields: Arc::clone(&fields),
+                registry: Arc::clone(&index_registry),
+                shard_id: 1,
+            }),
+            index_builds::MAX_RUNNING,
+        );
 
         // Follow the applied commits (Raft entries, or the local commits of a
         // store without Raft) from before the rebuild below, so no commit
@@ -1143,6 +1148,7 @@ impl Database {
             stats_computations: AtomicU64::new(0),
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
             index_registry,
+            index_builds,
             vector_index_registry,
             _vector_worker: vector_worker,
             text_index_registry,
@@ -1168,10 +1174,9 @@ impl Database {
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
         };
-        // A store that owns its log finishes its interrupted index builds now
-        // (a directory migrated from the previous format leaves its B-tree
-        // indexes building in new generations); a cluster member does it once
-        // it leads, since the builds are written through the log.
+        // A store that owns its log takes up its unfinished index builds now;
+        // a cluster member does it once it leads, since the builds are
+        // written through the log.
         if !follow_raft_applies {
             db.resume_interrupted_index_builds()?;
             db.adopt_unowned_unique_indexes()?;
@@ -2203,10 +2208,35 @@ impl Database {
     /// index is free the moment this returns.
     pub fn cancel_index_build(&self, index: &str) -> bool {
         // The name resolves to the index it binds now, and the build of the
-        // generation that index serves is the one stopped.
+        // generation that index serves is the one stopped. A key-shaped
+        // index's build is cancelled through its record: the index it was
+        // creating is withdrawn, one it was rebuilding kept failed.
+        if let Some(def) = self.index_registry.get(index) {
+            if def.index_type == coordinode_query::index::IndexType::BTree {
+                return match self.index_builds.cancel(def.generation) {
+                    Ok(cancelled) => cancelled,
+                    Err(e) => {
+                        tracing::warn!(index, error = %e, "could not cancel the index build");
+                        false
+                    }
+                };
+            }
+        }
         self.vector_index_registry
             .get_definition_by_name(index)
             .is_some_and(|def| self.vector_index_registry.cancel_build(def.generation))
+    }
+
+    /// The durable record of every key-shaped index build: the index and
+    /// generation it fills, what it does on failure, and where it stands.
+    ///
+    /// # Errors
+    ///
+    /// The records could not be read.
+    pub fn index_build_records(
+        &self,
+    ) -> Result<Vec<coordinode_query::index::IndexBuildRecord>, DatabaseError> {
+        Ok(self.index_builds.builds()?)
     }
 
     /// Set the interactive-transaction idle timeout (server config wiring).
@@ -2825,7 +2855,8 @@ impl Database {
                 // The query's own bound wins over the session's.
                 build_wait: hinted_build_wait.unwrap_or(session.vector_build_wait),
             }),
-            btree_index_registry: Some(&self.index_registry),
+            btree_index_registry: Some(self.index_registry.as_ref()),
+            index_builds: Some(&self.index_builds),
             // Extension-op handlers for this Database (empty by default). An
             // enterprise layer / integration test populates it via
             // Database::register_extension so SHARDED-BY-style extension ops
@@ -3243,24 +3274,21 @@ impl Database {
     }
 
     /// Rebuild the B-tree index `def` from the nodes already stored, into a
-    /// new generation of the same index.
+    /// new generation of the same index, on the engine's build executor.
     ///
     /// The definition is published as building in the new generation, with
-    /// the entries of the generation it served from removed, in one catalog
-    /// commit conditioned on the record it replaces; writers maintain the new
-    /// generation from then on while the backfill fills in the stored nodes,
-    /// every page bound to the published record; the definition is then
-    /// published as ready, on the same condition. A backfill that fails
-    /// keeps the index (`on_failure` [`FailedBuild::Keep`]), marked failed,
-    /// so its constraint still holds for new writes while lookups stop using
-    /// it, or withdraws it. Returns the number of nodes indexed.
+    /// the entries of the generation it served from removed and the build
+    /// admitted, in one catalog commit conditioned on the record it
+    /// replaces; writers maintain the new generation from then on. A build
+    /// the stored data refuses keeps the index, marked failed, so its
+    /// constraint still holds for new writes while lookups stop using it.
+    /// Returns the number of nodes indexed.
     fn build_btree_index(
         &self,
         mut def: coordinode_query::index::IndexDefinition,
-        on_failure: FailedBuild,
     ) -> Result<u64, DatabaseError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        use coordinode_query::index::IndexState;
+        use coordinode_query::index::{BuildFailure, IndexBuildRecord, IndexState};
         let store = LocalIndexStore::new(&self.engine);
         def.layout = ENTRY_LAYOUT;
         def.state = IndexState::Building {
@@ -3273,155 +3301,78 @@ impl Database {
             store.expect_definition_txn(txn, def.id, replaced)?;
             def.generation = store.allocate_generation_txn(txn)?;
             store.clear_txn(txn, retired)?;
-            store.put_definition_txn(txn, &def)
+            store.put_definition_txn(txn, &def)?;
+            store.put_build_txn(
+                txn,
+                &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Keep),
+                None,
+            )
         })?;
-        let definition_version = store.definition_version(def.id)?;
         self.index_registry
             .register_published(&self.engine, def.clone())?;
-        self.complete_btree_build(def, definition_version, on_failure)
+        self.index_builds
+            .submit(def.generation, 0)
+            .map_err(DatabaseError::Other)?;
+        self.build_outcome(&def)
     }
 
-    /// Fill the building B-tree index `def`, published at
-    /// `definition_version`, from the stored nodes and publish it ready, or,
-    /// when the stored data refuses it, withdraw it or keep it failed as
-    /// `on_failure` says. Every commit is bound to that record. The
-    /// constraint that owns the index becomes active with it, or is
-    /// withdrawn with it, in the same commit. Returns the number of nodes
-    /// indexed.
-    fn complete_btree_build(
+    /// Wait for the build of `def` and turn its outcome into what the caller
+    /// is told: the nodes indexed, or why the index was not published.
+    fn build_outcome(
         &self,
-        mut def: coordinode_query::index::IndexDefinition,
-        definition_version: Option<u64>,
-        on_failure: FailedBuild,
+        def: &coordinode_query::index::IndexDefinition,
     ) -> Result<u64, DatabaseError> {
-        use coordinode_modality::{IndexStore as _, LocalIndexStore};
-        use coordinode_query::executor::runner::{
-            stage_constraint_activation, stage_constraint_withdrawal,
-        };
-        use coordinode_query::index::IndexState;
-        let store = LocalIndexStore::new(&self.engine);
-        let (id, generation, shown) = (def.id, def.generation, def.to_string());
-        let fields = self.fields.current()?;
-        let wc = self.write_concern;
-        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
-            write_concern: &wc,
-            pipeline: Some(self.pipeline.as_ref()),
-            id_gen: Some(&self.proposal_id_gen),
-            drain_buffer: Some(&self.drain_buffer),
-            nvme_write_buffer: self.nvme_write_buffer.as_deref(),
-        };
-        let built = coordinode_query::index::build::Backfill {
-            engine: &self.engine,
-            oracle: Some(&self.oracle),
-            interner: &fields,
-            shard_id: self.shard_id,
-            own_open: 0,
-            definition_version,
-        }
-        .run(&def, &mut |txn| txn.commit(&commit_ctx).map(|_| ()));
-
-        match built {
-            Ok(indexed) => {
-                def.state = IndexState::Ready;
-                self.commit_catalog(|txn| {
-                    store.expect_definition_txn(txn, id, definition_version)?;
-                    store.put_definition_txn(txn, &def)?;
-                    match &def.owner {
-                        Some(owner) => {
-                            stage_constraint_activation(&self.engine, txn, &def.label, owner)
-                        }
-                        None => Ok(()),
-                    }
-                })?;
-                self.index_registry.register_published(&self.engine, def)?;
-                Ok(indexed)
+        use coordinode_query::index::{BuildError, IndexBuildOutcome};
+        match self.index_builds.wait(def.generation, None)? {
+            Some(IndexBuildOutcome::Published { indexed }) => Ok(indexed.unwrap_or(0)),
+            Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => {
+                Err(DatabaseError::Execution(v.into()))
             }
-            Err(e) => {
-                match on_failure {
-                    FailedBuild::Withdraw => {
-                        self.commit_catalog(|txn| {
-                            store.expect_definition_txn(txn, id, definition_version)?;
-                            store.delete_definition_txn(txn, &def)?;
-                            store.clear_txn(txn, generation)?;
-                            match &def.owner {
-                                Some(owner) => stage_constraint_withdrawal(
-                                    &self.engine,
-                                    txn,
-                                    &def.label,
-                                    owner,
-                                ),
-                                None => Ok(()),
-                            }
-                        })?;
-                        self.index_registry.unregister(id);
-                    }
-                    FailedBuild::Keep => {
-                        def.state = IndexState::Failed {
-                            reason: e.to_string(),
-                        };
-                        self.commit_catalog(|txn| {
-                            store.expect_definition_txn(txn, id, definition_version)?;
-                            store.put_definition_txn(txn, &def)
-                        })?;
-                        self.index_registry.register_published(&self.engine, def)?;
-                    }
-                }
-                Err(match e {
-                    coordinode_query::index::build::BackfillError::Duplicate(v) => {
-                        DatabaseError::Execution(v.into())
-                    }
-                    other => DatabaseError::Other(format!("build index '{shown}': {other}")),
-                })
+            Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+                Err(DatabaseError::Other(reason))
             }
+            Some(IndexBuildOutcome::Cancelled) => Err(DatabaseError::Other(format!(
+                "the build of index '{def}' was cancelled"
+            ))),
+            None => Err(DatabaseError::Other(format!(
+                "the build of index '{def}' has no outcome yet"
+            ))),
         }
     }
 
-    /// Finish every B-tree index build an earlier process left unfinished: a
-    /// definition still building, whose statement never returned. Each is
-    /// filled from the stored nodes, bound to its record as it stands, and
-    /// published ready, its owning constraint active with it; one the stored
-    /// data refuses is withdrawn with its owning constraint, which the
-    /// interrupted statement never acknowledged, and reported. Returns how
-    /// many builds were finished.
+    /// Take up every index build an earlier process left without an
+    /// outcome, on this process's executor, and wait for them: a build of a
+    /// new index whose statement never returned is filled and published, its
+    /// owning constraint active with it, or, refused by the stored data,
+    /// withdrawn with that constraint, which the interrupted statement never
+    /// acknowledged; a rebuild refused by the data keeps its index failed.
+    /// Returns how many were published.
     ///
     /// # Errors
     ///
-    /// Publishing through the log failed (this member is not the leader).
+    /// The build records could not be read, or an executor could not start.
     pub fn resume_interrupted_index_builds(&self) -> Result<usize, DatabaseError> {
-        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        use coordinode_query::index::{IndexState, IndexType};
-        let interrupted: Vec<_> = self
-            .index_registry
-            .all()
-            .into_iter()
-            .filter(|d| {
-                d.index_type == IndexType::BTree
-                    && d.layout == ENTRY_LAYOUT
-                    && matches!(d.state, IndexState::Building { .. })
-            })
-            .collect();
-        let store = LocalIndexStore::new(&self.engine);
-        let mut finished = 0;
-        for def in interrupted {
-            let name = def.to_string();
-            let version = store.definition_version(def.id)?;
-            match self.complete_btree_build(def, version, FailedBuild::Withdraw) {
-                Ok(_) => {
-                    finished += 1;
-                    tracing::info!(index = %name, "finished an interrupted B-tree index build");
-                }
-                Err(DatabaseError::Execution(e @ ExecutionError::UniqueViolation { .. })) => {
-                    tracing::error!(
-                        index = %name,
-                        error = %e,
-                        "the stored data breaks an interrupted index build; the index and the \
-                         constraint that owns it are withdrawn"
+        use coordinode_query::index::IndexBuildOutcome;
+        let resumed = self.index_builds.resume().map_err(DatabaseError::Other)?;
+        let mut published = 0;
+        for generation in resumed {
+            match self.index_builds.wait(generation, None)? {
+                Some(IndexBuildOutcome::Published { .. }) => {
+                    published += 1;
+                    tracing::info!(
+                        generation = generation.as_raw(),
+                        "finished an interrupted index build"
                     );
                 }
-                Err(e) => return Err(e),
+                outcome => tracing::error!(
+                    generation = generation.as_raw(),
+                    ?outcome,
+                    "an interrupted index build ended without its index"
+                ),
             }
         }
-        Ok(finished)
+        self.refresh_btree_indexes()?;
+        Ok(published)
     }
 
     /// Make every unique B-tree index that no constraint owns the uniqueness
@@ -3739,7 +3690,7 @@ impl Database {
             .map_err(|e| format!("read the index definitions: {e}"))?;
         self.refresh_btree_indexes().map_err(|e| e.to_string())?;
         for def in defs.iter().filter(|d| d.index_type == IndexType::BTree) {
-            self.build_btree_index(def.clone(), FailedBuild::Keep)
+            self.build_btree_index(def.clone())
                 .map_err(|e| format!("build index '{def}': {e}"))?;
         }
 
@@ -3909,6 +3860,7 @@ mod after_commit;
 mod catalog;
 mod fields;
 mod id_lease;
+mod index_builds;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use fields::FieldDictionary;

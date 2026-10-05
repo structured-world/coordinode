@@ -9,7 +9,8 @@
 //! [`IndexStore`]: coordinode_modality::IndexStore
 
 pub use coordinode_modality::index_def::{
-    GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,
-    IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
-    TextFieldConfig, TextIndexConfig, VectorIndexConfig,
+    BuildFailure, BuildState, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
+    IndexId, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
+    OnlineDuringBuild, PartialFilter, ProfileSource, TextFieldConfig, TextIndexConfig,
+    VectorIndexConfig,
 };

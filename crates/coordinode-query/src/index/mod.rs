@@ -4,6 +4,7 @@
 
 pub mod build;
 pub mod definition;
+pub mod lifecycle;
 pub mod ops;
 pub mod registry;
 pub mod ttl_reaper;
@@ -17,10 +18,11 @@ pub mod text_registry;
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
 pub use coverage::{IndexCoverage, IndexDelta};
 pub use definition::{
-    GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,
-    IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, ProfileSource, TextFieldConfig,
-    TextIndexConfig, VectorIndexConfig,
+    BuildFailure, BuildState, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
+    IndexId, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
+    OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
+pub use lifecycle::{BuildEnvironment, BuildError, IndexBuildOutcome, IndexBuildService};
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };

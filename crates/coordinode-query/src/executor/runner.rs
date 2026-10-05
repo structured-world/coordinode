@@ -789,6 +789,10 @@ pub struct ExecutionContext<'a> {
     /// When set, `execute_create_node` calls `on_node_created` to check
     /// unique constraints and maintain B-tree index entries.
     pub btree_index_registry: Option<&'a crate::index::IndexRegistry>,
+    /// The engine's executor of index builds. CREATE INDEX and CREATE
+    /// CONSTRAINT admit a build with the index's publication and wait for
+    /// its outcome here; the build itself does not belong to the statement.
+    pub index_builds: Option<&'a crate::index::IndexBuildService>,
     /// Registry of extension-op handlers (EE-populated, CE default empty).
     /// Reached only by the [`LogicalOp::Extension`] dispatch arm; `None` /
     /// empty in pure-CE contexts means no extension ops are dispatchable.
@@ -1713,35 +1717,6 @@ impl<'a> ExecutionContext<'a> {
             },
             &field_of,
         )?)
-    }
-
-    /// Fill `index` from the stored nodes, one log entry per page through
-    /// this statement's commit path, each page bound to the definition
-    /// record at `definition_version`. Call once the index is registered
-    /// with the writers.
-    pub fn backfill_index(
-        &mut self,
-        index: &crate::index::IndexDefinition,
-        definition_version: Option<u64>,
-    ) -> Result<u64, crate::index::build::BackfillError> {
-        let write_concern = self.write_concern;
-        let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
-            write_concern: &write_concern,
-            pipeline: self.proposal_pipeline,
-            id_gen: self.proposal_id_gen,
-            drain_buffer: self.drain_buffer,
-            nvme_write_buffer: self.nvme_write_buffer,
-        };
-        crate::index::build::Backfill {
-            engine: self.engine,
-            oracle: self.mvcc_oracle,
-            interner: self.interner,
-            shard_id: self.shard_id,
-            // This statement's own transaction is open throughout.
-            own_open: 1,
-            definition_version,
-        }
-        .run(index, &mut |txn| txn.commit(&commit_ctx).map(|_| ()))
     }
 
     /// Stage and commit one catalog change in a transaction of its own,
@@ -17312,12 +17287,9 @@ fn execute_create_btree_index(
     if let Some(f) = filter {
         descriptor = descriptor.with_filter(f.clone());
     }
-    let build = publish_index_build(descriptor, maintenance, ctx, |_| Ok(()))?;
-    let backfilled = match ctx.backfill_index(&build.def, build.version) {
-        Ok(n) => n,
-        Err(e) => return Err(abandon_index_build(&build, e, ctx, |_| Ok(()))),
-    };
-    let maintenance = finish_index_build(build, ctx, |_| Ok(()))?;
+    let def = publish_index_build(descriptor, maintenance, ctx, |_| Ok(()))?;
+    let backfilled = await_index_build(&def, ctx)?;
+    let maintenance = def.maintenance;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -17328,15 +17300,6 @@ fn execute_create_btree_index(
     row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
     insert_maintenance(&mut row, &maintenance);
     Ok(vec![row])
-}
-
-/// A B-tree index build in flight: the definition as published and the
-/// version of its record, which every page of the backfill and the commit
-/// that closes the build are bound to. A build whose definition was dropped
-/// or moved to another generation meanwhile writes nothing more.
-struct IndexBuild {
-    def: crate::index::IndexDefinition,
-    version: Option<u64>,
 }
 
 /// The error a catalog commit that lost the name race fails with: the
@@ -17353,11 +17316,12 @@ fn name_taken(e: ExecutionError) -> ExecutionError {
     }
 }
 
-/// Publish B-tree index `descriptor` as building in one catalog commit
-/// together with `with`: the catalog gives it a new identity and generation
-/// and binds its name, on the condition that no live index holds the name
-/// when it commits. The generation is new, so no entry of a dropped index
-/// can be under it. Writers maintain the index from this commit on.
+/// Publish B-tree index `descriptor` as building, with its build admitted,
+/// in one catalog commit together with `with`: the catalog gives it a new
+/// identity and generation and binds its name, on the condition that no
+/// live index holds the name when it commits. The generation is new, so no
+/// entry of a dropped index can be under it. Writers maintain the index from
+/// this commit on; the build belongs to the engine's executor.
 fn publish_index_build(
     mut descriptor: crate::index::IndexDescriptor,
     maintenance: Option<crate::index::IndexProfile>,
@@ -17365,7 +17329,7 @@ fn publish_index_build(
     mut with: impl FnMut(
         &mut coordinode_storage::engine::transaction::Transaction<'_>,
     ) -> Result<(), coordinode_modality::StoreError>,
-) -> Result<IndexBuild, ExecutionError> {
+) -> Result<crate::index::IndexDefinition, ExecutionError> {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     let Some(registry) = ctx.btree_index_registry else {
         return Err(ExecutionError::Unsupported(
@@ -17394,84 +17358,56 @@ fn publish_index_build(
 
     let mut published = None;
     ctx.commit_catalog_change(|txn| {
-        published = Some(store.publish_definition_txn(txn, descriptor)?);
+        let def = store.publish_definition_txn(txn, descriptor)?;
+        store.put_build_txn(
+            txn,
+            &crate::index::IndexBuildRecord::accepted(
+                def.id,
+                def.generation,
+                crate::index::BuildFailure::Withdraw,
+            ),
+            None,
+        )?;
+        published = Some(def);
         with(txn)
     })
     .map_err(name_taken)?;
     let def = published.ok_or_else(|| {
         ExecutionError::Unsupported("the index publication staged no definition".into())
     })?;
-    let version = store.definition_version(def.id)?;
     registry.register_published(engine, def.clone())?;
-    Ok(IndexBuild { def, version })
+    Ok(def)
 }
 
-/// Publish the index of `build` as ready in one catalog commit together with
-/// `with`, on the condition that its definition is still the one the build
-/// published. Returns the maintenance binding it was given.
-fn finish_index_build(
-    build: IndexBuild,
-    ctx: &mut ExecutionContext<'_>,
-    mut with: impl FnMut(
-        &mut coordinode_storage::engine::transaction::Transaction<'_>,
-    ) -> Result<(), coordinode_modality::StoreError>,
-) -> Result<crate::index::IndexMaintenance, ExecutionError> {
-    use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let engine = ctx.engine;
-    let store = LocalIndexStore::new(engine);
-    let mut def = build.def;
-    def.state = IndexState::Ready;
-    ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, def.id, build.version)?;
-        store.put_definition_txn(txn, &def)?;
-        with(txn)
+/// Run the admitted build of `def` on the engine's executor and wait for
+/// its outcome: the number of nodes indexed once the index is published,
+/// or the error the statement fails with. The executor publishes the index
+/// ready, or withdraws it with the constraint that owns it, itself.
+fn await_index_build(
+    def: &crate::index::IndexDefinition,
+    ctx: &ExecutionContext<'_>,
+) -> Result<u64, ExecutionError> {
+    use crate::index::{BuildError, IndexBuildOutcome};
+    let builds = ctx.index_builds.ok_or_else(|| {
+        ExecutionError::Unsupported("building an index requires the engine's index builds".into())
     })?;
-    let maintenance = def.maintenance;
-    if let Some(registry) = ctx.btree_index_registry {
-        registry.register_published(engine, def)?;
-    }
-    Ok(maintenance)
-}
-
-/// Withdraw the index of `build`, whose backfill failed with `failure`: its
-/// definition and every entry go in one catalog commit together with `with`,
-/// on the condition that the definition is still the one the build
-/// published, and writers stop maintaining it once that commit is durable.
-/// Returns the error the statement fails with.
-fn abandon_index_build(
-    build: &IndexBuild,
-    failure: crate::index::build::BackfillError,
-    ctx: &mut ExecutionContext<'_>,
-    mut with: impl FnMut(
-        &mut coordinode_storage::engine::transaction::Transaction<'_>,
-    ) -> Result<(), coordinode_modality::StoreError>,
-) -> ExecutionError {
-    use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let def = &build.def;
-    let failure = match failure {
-        crate::index::build::BackfillError::Duplicate(v) => unique_violation(v),
-        other => ExecutionError::Unsupported(format!("build index '{def}': {other}")),
-    };
-    let store = LocalIndexStore::new(ctx.engine);
-    let withdrawn = ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, def.id, build.version)?;
-        store.delete_definition_txn(txn, def)?;
-        store.clear_txn(txn, def.generation)?;
-        with(txn)
-    });
-    match withdrawn {
-        Ok(()) => {
-            if let Some(registry) = ctx.btree_index_registry {
-                registry.unregister(def.id);
-            }
-            failure
+    // The statement's own transaction is open while it waits; it writes no
+    // node, so the backfill does not wait for it.
+    builds
+        .submit(def.generation, 1)
+        .map_err(ExecutionError::Unsupported)?;
+    match builds.wait(def.generation, None)? {
+        Some(IndexBuildOutcome::Published { indexed }) => Ok(indexed.unwrap_or(0)),
+        Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => Err(unique_violation(v)),
+        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
+            Err(ExecutionError::Unsupported(reason))
         }
-        // The definition is somebody else's now, or the catalog could not
-        // be written: the build's failure stays the answer, and what was
-        // left behind is named.
-        Err(e) => ExecutionError::Unsupported(format!(
-            "{failure}; the index '{def}' was not withdrawn: {e}"
-        )),
+        Some(IndexBuildOutcome::Cancelled) => Err(ExecutionError::Unsupported(format!(
+            "the build of index '{def}' was cancelled"
+        ))),
+        None => Err(ExecutionError::Unsupported(format!(
+            "the build of index '{def}' has no outcome yet"
+        ))),
     }
 }
 
@@ -17616,9 +17552,12 @@ fn execute_drop_btree_index(
     let property = def.property().to_string();
     // Bound to the object the name resolved to: a statement that resolved
     // the name before it was rebound drops nothing of the later index.
+    // Its finished build records go with it; a build still running has its
+    // pages fenced by the deleted definition and removes its own record.
     ctx.commit_catalog_change(|txn| {
         store.expect_definition_txn(txn, def.id, version)?;
         store.delete_definition_txn(txn, &def)?;
+        store.delete_finished_builds_txn(txn, def.id)?;
         store.clear_txn(txn, def.generation)
     })?;
     registry.unregister(def.id);
@@ -17898,26 +17837,15 @@ fn execute_create_constraint(
     {
         descriptor = descriptor.sparse();
     }
-    let build = publish_index_build(descriptor, shape.maintenance, ctx, &mut stage_constraint);
+    let def = publish_index_build(descriptor, shape.maintenance, ctx, &mut stage_constraint);
     ctx.label_schema_cache.remove(label);
-    let build = build?;
+    let def = def?;
 
-    let name = constraint.name.as_str();
-    let indexed = match ctx.backfill_index(&build.def, build.version) {
-        Ok(n) => n,
-        Err(e) => {
-            let failure = abandon_index_build(&build, e, ctx, |txn| {
-                stage_constraint_withdrawal(engine, txn, label, name)
-            });
-            ctx.label_schema_cache.remove(label);
-            return Err(failure);
-        }
-    };
-    let finished = finish_index_build(build, ctx, |txn| {
-        stage_constraint_activation(engine, txn, label, name)
-    });
+    // The executor activates the constraint with the index, or withdraws it
+    // with the index, in the commit that ends the build.
+    let indexed = await_index_build(&def, ctx);
     ctx.label_schema_cache.remove(label);
-    finished?;
+    let indexed = indexed?;
 
     published.state = ConstraintState::Active;
     let mut row = constraint_row(&published, label, ("created", true));
@@ -18069,6 +17997,7 @@ fn execute_drop_constraint(
             let indexes = LocalIndexStore::new(engine);
             indexes.expect_definition_txn(txn, def.id, *version)?;
             indexes.delete_definition_txn(txn, def)?;
+            indexes.delete_finished_builds_txn(txn, def.id)?;
             indexes.clear_txn(txn, def.generation)?;
         }
         Ok(())

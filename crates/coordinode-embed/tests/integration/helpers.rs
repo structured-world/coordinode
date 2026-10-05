@@ -102,6 +102,41 @@ pub fn publish_index(
         .expect("publish index")
 }
 
+/// Publish `descriptor` as building with its build admitted, as a CREATE
+/// whose statement never returned leaves it: the next open of a database
+/// over `engine` takes the build up.
+#[allow(clippy::expect_used)]
+pub fn admit_index(
+    engine: &StorageEngine,
+    mut descriptor: coordinode_modality::IndexDescriptor,
+) -> coordinode_modality::IndexDefinition {
+    use coordinode_modality::{
+        BuildFailure, IndexBuildRecord, IndexState, IndexStore as _, LocalIndexStore,
+    };
+    descriptor.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    let store = LocalIndexStore::new(engine);
+    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+        engine,
+        None,
+        Timestamp::ZERO,
+        None,
+    );
+    let def = store
+        .publish_definition_txn(&mut txn, descriptor)
+        .expect("publish index");
+    store
+        .put_build_txn(
+            &mut txn,
+            &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Withdraw),
+            None,
+        )
+        .expect("admit build");
+    def
+}
+
 /// Build an ExecutionContext in legacy mode (no MVCC, no oracle).
 ///
 /// Used by tests that write directly to engine without MVCC versioning.
@@ -131,6 +166,7 @@ pub fn make_ctx_legacy<'a>(
         text_index_registry: None,
         vector_indexes: None,
         btree_index_registry: None,
+        index_builds: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: None,
@@ -203,6 +239,7 @@ pub fn make_ctx_mvcc<'a>(
         text_index_registry: None,
         vector_indexes: None,
         btree_index_registry: None,
+        index_builds: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: Some(oracle),
@@ -276,6 +313,7 @@ pub fn make_ctx_with_pipeline<'a>(
         text_index_registry: None,
         vector_indexes: None,
         btree_index_registry: None,
+        index_builds: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: Some(oracle),

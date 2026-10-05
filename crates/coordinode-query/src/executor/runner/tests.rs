@@ -391,6 +391,7 @@ fn make_ctx<'a>(
         text_index_registry: None,
         vector_indexes: None,
         btree_index_registry: None,
+        index_builds: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: None,
@@ -5516,15 +5517,31 @@ fn detach_delete_adj_purge_is_buffered_not_immediate() {
 // --- CREATE INDEX / DROP INDEX DDL integration tests ---
 
 /// Helper: build an ExecutionContext with the btree_index_registry wired in.
+/// The member `engine` belongs to, with its index registry and the executor
+/// its index builds run on, resolving properties through `interner`.
+fn btree_member(
+    engine: StorageEngine,
+    interner: &FieldInterner,
+) -> (
+    Arc<crate::index::lifecycle::test_env::TestEnv>,
+    crate::index::IndexBuildService,
+) {
+    let env = crate::index::lifecycle::test_env::TestEnv::over(Arc::new(engine), None);
+    env.set_fields(interner);
+    let builds = env.service(1);
+    (env, builds)
+}
+
 fn make_ctx_with_btree<'a>(
-    engine: &'a StorageEngine,
+    env: &'a crate::index::lifecycle::test_env::TestEnv,
     interner: &'a mut FieldInterner,
     allocator: &'a NodeIdAllocator,
-    registry: &'a crate::index::IndexRegistry,
+    builds: &'a crate::index::IndexBuildService,
 ) -> ExecutionContext<'a> {
     ExecutionContext {
-        btree_index_registry: Some(registry),
-        ..make_ctx(engine, interner, allocator)
+        btree_index_registry: Some(&env.registry),
+        index_builds: Some(builds),
+        ..make_ctx(&env.engine, interner, allocator)
     }
 }
 
@@ -5534,12 +5551,13 @@ fn create_index_registers_and_backfills() {
     // existing nodes.
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
+    let registry = &env.registry;
 
     // Pre-condition: no index for User.name yet.
     assert!(registry.get("user_name_idx").is_none());
 
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
 
     let result = execute_op(
         &LogicalOp::CreateIndex {
@@ -5586,7 +5604,8 @@ fn create_unique_index_enforces_constraint_on_insert() {
     // must return UniqueViolation.
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
+    let registry = &env.registry;
 
     // Register a unique index on User.name (skip backfill — insert two fresh nodes).
     let unique_def = crate::index::IndexDescriptor::btree("u_name", "User", "name")
@@ -5597,7 +5616,7 @@ fn create_unique_index_enforces_constraint_on_insert() {
         );
     registry.register_in_memory(unique_def);
 
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
 
     // First insert: should succeed.
     let r1 = execute_op(
@@ -5647,9 +5666,10 @@ fn drop_index_removes_from_registry() {
     // CREATE then DROP should leave the registry empty for that index name.
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
+    let registry = &env.registry;
 
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
     // DROP INDEX acts on the stored catalog, so the index is created the way
     // a statement creates it.
     execute_op(
@@ -5689,8 +5709,8 @@ fn drop_index_removes_from_registry() {
 fn drop_index_not_found_returns_error() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let (env, builds) = btree_member(engine, &interner);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
 
     let result = execute_op(
         &LogicalOp::DropIndex {
@@ -5713,16 +5733,16 @@ fn drop_index_not_found_returns_error() {
 fn create_index_duplicate_name_returns_error() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
 
     // Register once.
     let def = crate::index::IndexDescriptor::btree("dup_idx", "User", "age").bind(
         crate::index::IndexId::from_raw(1),
         crate::index::GenerationId::from_raw(1),
     );
-    registry.register_in_memory(def);
+    env.registry.register_in_memory(def);
 
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
 
     // Attempt to CREATE INDEX with the same name again.
     let result = execute_op(
@@ -5895,10 +5915,11 @@ fn lifted_correlated_equality_uses_index_scan() {
 fn index_scan_returns_correct_node() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
+    let registry = &env.registry;
 
     // CREATE INDEX on User.name — will backfill Alice, Bob, Charlie.
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
     execute_op(
         &LogicalOp::CreateIndex {
             name: "user_name_idx".to_string(),
@@ -6046,9 +6067,10 @@ fn self_referential_filter_stays_node_scan() {
 fn index_scan_resolves_correlated_key() {
     let (_dir, engine, mut interner) = setup_test_graph();
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let registry = crate::index::IndexRegistry::new();
+    let (env, builds) = btree_member(engine, &interner);
+    let registry = &env.registry;
 
-    let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
+    let mut ctx = make_ctx_with_btree(&env, &mut interner, &allocator, &builds);
     execute_op(
         &LogicalOp::CreateIndex {
             name: "user_name_idx".to_string(),

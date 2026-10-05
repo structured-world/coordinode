@@ -1838,7 +1838,7 @@ async fn schema_label_cache_multiple_doc_functions_same_node() {
 async fn an_earlier_unique_index_is_listed_and_found_as_a_constraint() {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     use coordinode_query::index::ops::list_index_definitions;
-    use coordinode_query::index::{IndexDescriptor, IndexState};
+    use coordinode_query::index::{BuildFailure, IndexBuildRecord, IndexDescriptor, IndexState};
     use coordinode_storage::engine::transaction::Transaction;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1853,17 +1853,23 @@ async fn an_earlier_unique_index_is_listed_and_found_as_a_constraint() {
             written: 0,
             estimated_total: 0,
         };
-        LocalIndexStore::new(db.engine())
-            .publish_definition_txn(
-                &mut Transaction::new(
-                    db.engine(),
-                    None,
-                    coordinode_core::txn::timestamp::Timestamp::ZERO,
-                    None,
-                ),
-                earlier,
-            )
+        let store = LocalIndexStore::new(db.engine());
+        let mut txn = Transaction::new(
+            db.engine(),
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        );
+        let def = store
+            .publish_definition_txn(&mut txn, earlier)
             .expect("plant the earlier index");
+        store
+            .put_build_txn(
+                &mut txn,
+                &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Withdraw),
+                None,
+            )
+            .expect("admit its build");
     }
     let svc = SchemaServiceImpl::new(Arc::new(RwLock::new(
         Database::open(dir.path()).expect("reopen"),

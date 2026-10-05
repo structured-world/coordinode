@@ -69,6 +69,7 @@ fn make_test_ctx<'a>(
         text_index_registry: None,
         vector_indexes: None,
         btree_index_registry: None,
+        index_builds: None,
         extensions: None,
         vector_loader: None,
         mvcc_oracle: None,

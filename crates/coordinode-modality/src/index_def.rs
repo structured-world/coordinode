@@ -601,6 +601,94 @@ impl IndexDefinition {
     }
 }
 
+/// What a build does when the stored data refuses its index (a unique index
+/// over values held twice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildFailure {
+    /// The index being created is withdrawn with the constraint that owns
+    /// it: nobody was told it exists.
+    Withdraw,
+    /// The index being rebuilt is kept, marked failed: its constraint still
+    /// holds for new writes, lookups stop using it.
+    Keep,
+}
+
+/// Where one build stands. Every move is a catalog commit conditioned on
+/// the record the mover read, so publication, failure and cancellation
+/// cannot all win.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildState {
+    /// Admitted with the index's publication; no executor has taken it.
+    Accepted,
+    /// Taken by the executor `executor`, which alone may finish it.
+    Running {
+        /// The executor's token, fresh for every take.
+        executor: u64,
+    },
+    /// The index was published ready.
+    Published,
+    /// The stored data refused the index; `reason` says why.
+    Failed {
+        /// Why the build failed.
+        reason: String,
+    },
+    /// Cancelled before it finished; its candidate entries are cleared.
+    Cancelled,
+}
+
+impl BuildState {
+    /// Whether the build has an outcome and no executor will touch it again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Published | Self::Failed { .. } | Self::Cancelled
+        )
+    }
+}
+
+/// The durable record of one index build: the operation a CREATE or a
+/// rebuild admits, independent of the request, connection or thread that
+/// asked for it. Its generation is its identity: one build fills one
+/// representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexBuildRecord {
+    /// The representation the build fills, and the build's identity.
+    pub generation: GenerationId,
+    /// The logical index it belongs to.
+    pub index: IndexId,
+    /// What the build does when the stored data refuses the index.
+    pub on_failure: BuildFailure,
+    /// Where the build stands.
+    pub state: BuildState,
+    /// Nodes indexed so far, reported by the executor; progress, not proof.
+    pub indexed: u64,
+}
+
+impl IndexBuildRecord {
+    /// Prefix of every build record in the schema catalog. Outside the
+    /// definition and name prefixes.
+    pub const PREFIX: &'static [u8] = b"schema:idxbuild:";
+
+    /// A build of `generation` of the index `index`, admitted and not taken.
+    pub fn accepted(index: IndexId, generation: GenerationId, on_failure: BuildFailure) -> Self {
+        Self {
+            generation,
+            index,
+            on_failure,
+            state: BuildState::Accepted,
+            indexed: 0,
+        }
+    }
+
+    /// The catalog key of the build of `generation`.
+    pub fn key_of(generation: GenerationId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::PREFIX.len() + 8);
+        key.extend_from_slice(Self::PREFIX);
+        key.extend_from_slice(&generation.as_raw().to_be_bytes());
+        key
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

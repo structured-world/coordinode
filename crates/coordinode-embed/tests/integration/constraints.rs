@@ -676,10 +676,10 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
     use coordinode_core::schema::definition::{
         LabelSchema, NodeConstraint, SchemaMode, encode_constraint_name_key,
     };
-    use coordinode_query::index::{IndexDescriptor, IndexState};
+    use coordinode_query::index::IndexDescriptor;
     use coordinode_storage::engine::partition::Partition;
 
-    use super::helpers::{index_named, publish_index};
+    use super::helpers::{admit_index, index_named};
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -700,15 +700,13 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
         LocalSchemaStore::new(db.engine())
             .save_label(&schema)
             .expect("plant the schema");
-        let mut def = IndexDescriptor::compound("user_email", "User", vec!["email".into()])
-            .unique()
-            .sparse()
-            .owned_by("user_email");
-        def.state = IndexState::Building {
-            written: 0,
-            estimated_total: 0,
-        };
-        publish_index(db.engine(), def);
+        admit_index(
+            db.engine(),
+            IndexDescriptor::compound("user_email", "User", vec!["email".into()])
+                .unique()
+                .sparse()
+                .owned_by("user_email"),
+        );
         db.engine()
             .put(
                 Partition::Schema,
@@ -1155,7 +1153,7 @@ fn unique_indexes_on(db: &Database, label: &str) -> Vec<String> {
 /// for the next open to build.
 fn plant_earlier_uniqueness(db: &Database, label: &str, property: &str, index: &str, flag: bool) {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef};
-    use coordinode_query::index::{IndexDescriptor, IndexState};
+    use coordinode_query::index::IndexDescriptor;
     if flag {
         let mut schema = LabelSchema::new_node_id(label);
         let mut p = PropertyDef::new(property, PropertyType::String);
@@ -1165,12 +1163,10 @@ fn plant_earlier_uniqueness(db: &Database, label: &str, property: &str, index: &
             .save_label(&schema)
             .expect("plant the earlier schema");
     }
-    let mut earlier = IndexDescriptor::btree(index, label, property).unique();
-    earlier.state = IndexState::Building {
-        written: 0,
-        estimated_total: 0,
-    };
-    super::helpers::publish_index(db.engine(), earlier);
+    super::helpers::admit_index(
+        db.engine(),
+        IndexDescriptor::btree(index, label, property).unique(),
+    );
 }
 
 /// The owner recorded on index `name`.

@@ -46,8 +46,8 @@ use coordinode_storage::engine::transaction::Transaction;
 
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
-    GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexProfile, IndexState,
-    NamespaceIndexPolicy,
+    GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexProfile,
+    IndexState, NamespaceIndexPolicy,
 };
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
@@ -304,6 +304,62 @@ pub trait IndexStore {
         txn: &mut Transaction,
         name: &str,
         version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// The record of the build of `generation` with the version of the same
+    /// write, read together: an executor that moves the build conditions its
+    /// commit on exactly the record it read.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn load_build(&self, generation: GenerationId) -> StoreResult<Option<(IndexBuildRecord, u64)>>;
+
+    /// Every build record in generation order. A record whose bytes do not
+    /// decode is skipped with a warning.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn list_builds(&self) -> StoreResult<Vec<IndexBuildRecord>>;
+
+    /// Stage `record` through a statement [`Transaction`], only while the
+    /// stored record of its generation is at `version` when it commits
+    /// (`None`: while there is none), so two movers of one build cannot
+    /// both commit.
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
+    fn put_build_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &IndexBuildRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// Stage the removal of the finished build records of the index `index`,
+    /// with the commit that drops it. A build still without an outcome is its
+    /// executor's to end: it finds the index gone and removes the record
+    /// itself, so the drop and the executor never write one record at once.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn delete_finished_builds_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
+
+    /// Stage the removal of the build record of `generation`, only while it
+    /// is at `version` when the transaction commits: an executor removing
+    /// the record of a build whose index is gone.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn delete_build_txn(
+        &self,
+        txn: &mut Transaction,
+        generation: GenerationId,
+        version: u64,
     ) -> StoreResult<()>;
 }
 
@@ -740,6 +796,68 @@ impl IndexStore for LocalIndexStore<'_> {
             &IndexDefinition::name_key_of(name),
             version,
         )?)
+    }
+
+    fn load_build(&self, generation: GenerationId) -> StoreResult<Option<(IndexBuildRecord, u64)>> {
+        self.engine
+            .get_versioned(Partition::Schema, &IndexBuildRecord::key_of(generation))?
+            .map(|(bytes, version)| Ok((decode("index build record", &bytes)?, version)))
+            .transpose()
+    }
+
+    fn list_builds(&self) -> StoreResult<Vec<IndexBuildRecord>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, IndexBuildRecord::PREFIX)?
+        {
+            let (_key, value) = guard.into_inner()?;
+            match decode::<IndexBuildRecord>("index build record", &value) {
+                Ok(record) => out.push(record),
+                Err(e) => tracing::warn!("list_builds: skipping corrupt build record: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    fn put_build_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &IndexBuildRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        let key = IndexBuildRecord::key_of(record.generation);
+        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.put(
+            Partition::Schema,
+            &key,
+            &encode("index build record", record)?,
+        )?;
+        Ok(())
+    }
+
+    fn delete_finished_builds_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()> {
+        for record in self.list_builds()? {
+            if record.index == index && record.state.is_terminal() {
+                txn.delete(
+                    Partition::Schema,
+                    &IndexBuildRecord::key_of(record.generation),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_build_txn(
+        &self,
+        txn: &mut Transaction,
+        generation: GenerationId,
+        version: u64,
+    ) -> StoreResult<()> {
+        let key = IndexBuildRecord::key_of(generation);
+        txn.expect_version(Partition::Schema, &key, Some(version))?;
+        txn.delete(Partition::Schema, &key)?;
+        Ok(())
     }
 }
 
