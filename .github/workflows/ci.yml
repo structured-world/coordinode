@@ -251,17 +251,18 @@ jobs:
 
   test-macos:
     name: Test (macOS ${{ matrix.target }})
-    # The crates a product embedding the database links, on both Mac
-    # architectures. The runner is Arm; the Intel build runs its tests under
+    # The crates a product embedding the database or talking to it links, on
+    # both Mac architectures: the engine, replication, the session core and
+    # the driver. The runner is Arm; the Intel build runs its tests under
     # Rosetta. The server and its integration tests are left to the Linux and
-    # Windows jobs, which have the disk for them.
+    # Windows jobs, which have the disk for them; macOS is not a server target.
     runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     env:
-      CRATES: -p coordinode-embed -p coordinode-storage -p coordinode-raft -p coordinode-query
+      CRATES: -p coordinode-embed -p coordinode-storage -p coordinode-raft -p coordinode-query -p coordinode-replicate -p coordinode-session -p coordinode-client
     steps:
       - uses: actions/checkout@v4
         with:
