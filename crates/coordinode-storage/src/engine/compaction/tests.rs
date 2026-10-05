@@ -102,10 +102,11 @@ fn a_compaction_that_did_work_is_counted_for_its_partition() {
     use metrics::{CounterFn, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
     use std::sync::Mutex;
 
-    /// What a recorder saw: name and labels of each counter increment and
-    /// histogram sample.
+    /// A metric's name and its labels.
+    type Recorded = (String, Vec<(String, String)>);
+    /// What a recorder saw: each counter increment and histogram sample.
     #[derive(Default)]
-    struct Seen(Mutex<Vec<(String, Vec<(String, String)>)>>);
+    struct Seen(Mutex<Vec<Recorded>>);
     struct Handle(Key, Arc<Seen>);
     impl CounterFn for Handle {
         fn increment(&self, _: u64) {
