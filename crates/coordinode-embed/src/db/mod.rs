@@ -1043,7 +1043,7 @@ impl Database {
                 text_registry: Arc::clone(&text_index_registry),
                 shard_id: 1,
             }),
-            index_builds::MAX_RUNNING,
+            coordinode_query::index::IndexBuildConfig::default(),
         );
 
         // Every NodeId comes from a lease the log granted, taken on the first
@@ -2187,16 +2187,29 @@ impl Database {
             .is_some_and(|def| self.vector_index_registry.cancel_build(def.generation))
     }
 
-    /// The durable record of every key-shaped index build: the index and
-    /// generation it fills, what it does on failure, and where it stands.
+    /// Every index build the catalog records or an executor of this process
+    /// holds: the record (index, generation, what it does on failure, its
+    /// state) and, while this process runs it, whether it waits for a seat
+    /// or for older transactions, or how far it has indexed.
     ///
     /// # Errors
     ///
     /// The records could not be read.
-    pub fn index_build_records(
+    pub fn index_build_status(
         &self,
-    ) -> Result<Vec<coordinode_query::index::IndexBuildRecord>, DatabaseError> {
+    ) -> Result<Vec<coordinode_query::index::BuildStatus>, DatabaseError> {
         Ok(self.index_builds.builds()?)
+    }
+
+    /// How index builds run: how many fill indexes at once and how long a
+    /// backfill waits for the transactions opened before its index.
+    pub fn index_build_config(&self) -> coordinode_query::index::IndexBuildConfig {
+        self.index_builds.config()
+    }
+
+    /// Retune index builds while the database runs (server config wiring).
+    pub fn set_index_build_config(&self, config: coordinode_query::index::IndexBuildConfig) {
+        self.index_builds.set_config(config);
     }
 
     /// Set the interactive-transaction idle timeout (server config wiring).

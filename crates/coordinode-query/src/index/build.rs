@@ -35,9 +35,8 @@ const PAGE: usize = 512;
 /// one means a writer changed a node of the page while it was being read.
 const MAX_PAGE_CONFLICTS: u32 = 64;
 
-/// How long the backfill waits for the transactions opened before the index
-/// was registered, and how often it looks.
-const OLDER_TRANSACTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the backfill looks whether the transactions opened before the
+/// index have ended.
 const OLDER_TRANSACTIONS_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Why a backfill stopped.
@@ -97,7 +96,26 @@ pub struct Backfill<'a> {
     /// build whose index was dropped or recreated meanwhile writes nothing.
     /// `None` for a definition without a stored record.
     pub definition_version: Option<u64>,
+    /// How long the backfill waits for the transactions opened before the
+    /// index was registered.
+    pub older_transactions_wait: std::time::Duration,
+    /// Told where the backfill stands: waiting for older transactions,
+    /// then the entries committed so far after every page.
+    pub progress: Option<&'a dyn Fn(BackfillProgress)>,
 }
+
+/// Where a running backfill stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillProgress {
+    /// Waiting for the transactions opened before the index existed to end.
+    AwaitingOlderTransactions,
+    /// Scanning; the entries committed so far.
+    Indexed(u64),
+}
+
+/// How long a backfill waits for the transactions opened before its index
+/// by default.
+pub const DEFAULT_OLDER_TRANSACTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl<'a> Backfill<'a> {
     /// Stage and commit the entries of every stored node of `index`'s label,
@@ -114,15 +132,22 @@ impl<'a> Backfill<'a> {
         index: &IndexDefinition,
         commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
     ) -> Result<u64, BackfillError> {
+        let report = |p| {
+            if let Some(progress) = self.progress {
+                progress(p);
+            }
+        };
         let boundary = self.engine.snapshot_boundary();
+        report(BackfillProgress::AwaitingOlderTransactions);
         self.engine
             .await_transactions_through(
                 boundary,
                 self.own_open,
                 OLDER_TRANSACTIONS_POLL,
-                OLDER_TRANSACTIONS_WAIT,
+                self.older_transactions_wait,
             )
             .map_err(BackfillError::OlderTransactions)?;
+        report(BackfillProgress::Indexed(0));
         let nodes = LocalNodeStore;
         let prefix = nodes.shard_scan_prefix(self.shard_id);
         let mut start_after: Option<Vec<u8>> = None;
@@ -207,6 +232,7 @@ impl<'a> Backfill<'a> {
                 continue;
             }
             indexed += staged;
+            report(BackfillProgress::Indexed(indexed));
             conflicts = 0;
             if page.exhausted {
                 return Ok(indexed);

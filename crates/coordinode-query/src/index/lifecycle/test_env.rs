@@ -10,7 +10,7 @@ use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
 
-use super::{BuildEnvironment, IndexBuildService};
+use super::{BuildEnvironment, IndexBuildConfig, IndexBuildService};
 use crate::index::IndexRegistry;
 
 /// The engine, oracle, field dictionary and registry of one test member.
@@ -19,7 +19,17 @@ pub(crate) struct TestEnv {
     pub(crate) oracle: Option<Arc<TimestampOracle>>,
     fields: parking_lot::Mutex<FieldInterner>,
     pub(crate) registry: IndexRegistry,
+    fault: parking_lot::Mutex<Option<Fault>>,
     _dir: Option<tempfile::TempDir>,
+}
+
+/// A fault a test member injects into the builds it runs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Fault {
+    /// The field dictionary cannot be read.
+    FieldsUnavailable,
+    /// Committing a backfill page panics.
+    PanicOnPage,
 }
 
 impl TestEnv {
@@ -51,6 +61,7 @@ impl TestEnv {
             oracle: Some(oracle),
             fields: parking_lot::Mutex::new(FieldInterner::new()),
             registry: IndexRegistry::new(),
+            fault: parking_lot::Mutex::new(None),
             _dir: Some(dir),
         })
     }
@@ -65,6 +76,7 @@ impl TestEnv {
             oracle,
             fields: parking_lot::Mutex::new(FieldInterner::new()),
             registry: IndexRegistry::new(),
+            fault: parking_lot::Mutex::new(None),
             _dir: None,
         })
     }
@@ -74,6 +86,11 @@ impl TestEnv {
         *self.fields.lock() = fields.clone();
     }
 
+    /// Make the builds this member runs from now on meet `fault`.
+    pub(crate) fn inject(&self, fault: Option<Fault>) {
+        *self.fault.lock() = fault;
+    }
+
     /// The field dictionary builds resolve properties through.
     pub(crate) fn fields_now(&self) -> FieldInterner {
         self.fields.lock().clone()
@@ -81,7 +98,15 @@ impl TestEnv {
 
     /// A build service over this member.
     pub(crate) fn service(self: &Arc<Self>, max_running: usize) -> IndexBuildService {
-        IndexBuildService::new(Arc::clone(self) as Arc<dyn BuildEnvironment>, max_running)
+        self.service_with(IndexBuildConfig {
+            max_running,
+            ..IndexBuildConfig::default()
+        })
+    }
+
+    /// A build service over this member configured as `config` says.
+    pub(crate) fn service_with(self: &Arc<Self>, config: IndexBuildConfig) -> IndexBuildService {
+        IndexBuildService::new(Arc::clone(self) as Arc<dyn BuildEnvironment>, config)
     }
 
     /// A transaction as the member opens one.
@@ -121,6 +146,9 @@ impl BuildEnvironment for TestEnv {
     }
 
     fn fields(&self) -> Result<FieldInterner, String> {
+        if matches!(*self.fault.lock(), Some(Fault::FieldsUnavailable)) {
+            return Err("field dictionary unavailable".into());
+        }
         Ok(self.fields_now())
     }
 
@@ -136,7 +164,12 @@ impl BuildEnvironment for TestEnv {
         None
     }
 
+    // The injected fault is a panic: what the executor must survive.
+    #[allow(clippy::panic)]
     fn commit_page(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
+        if matches!(*self.fault.lock(), Some(Fault::PanicOnPage)) {
+            panic!("page commit broke");
+        }
         commit(txn)
     }
 

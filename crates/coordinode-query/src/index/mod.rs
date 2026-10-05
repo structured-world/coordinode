@@ -22,7 +22,10 @@ pub use definition::{
     IndexId, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
     OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
-pub use lifecycle::{BuildEnvironment, BuildError, IndexBuildOutcome, IndexBuildService};
+pub use lifecycle::{
+    BuildEnvironment, BuildError, BuildPhase, BuildStatus, IndexBuildConfig, IndexBuildOutcome,
+    IndexBuildService,
+};
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
 };

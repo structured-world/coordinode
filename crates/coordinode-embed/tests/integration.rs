@@ -28,6 +28,7 @@ mod integration {
     mod helpers;
     mod historical_index;
     mod hnsw;
+    mod index_builds;
     mod index_profiles;
     mod interactive_txn;
     mod merge_stress;

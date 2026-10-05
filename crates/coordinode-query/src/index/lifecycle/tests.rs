@@ -2,7 +2,7 @@ use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 
-use super::test_env::{TestEnv, commit};
+use super::test_env::{Fault, TestEnv, commit};
 use super::*;
 use crate::index::IndexDescriptor;
 
@@ -398,6 +398,8 @@ fn local_builds_take_seats() {
             }),
         )
         .expect("run first");
+    // The executors are threads: the second could take the seat first.
+    await_phase(&builds, first, BuildPhase::Indexing { indexed: None });
     builds
         .run_local(second, Box::new(|_| Ok(2)))
         .expect("run second");
@@ -417,6 +419,270 @@ fn local_builds_take_seats() {
     assert!(matches!(
         builds.wait(first, None).expect("wait"),
         Some(IndexBuildOutcome::Published { indexed: Some(1) })
+    ));
+}
+
+/// Wait until inspection shows the build of `generation` in `phase`.
+fn await_phase(builds: &IndexBuildService, generation: GenerationId, phase: BuildPhase) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = builds.builds().expect("inspect");
+        if status
+            .iter()
+            .any(|s| s.generation == generation && s.phase == Some(phase))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never {phase:?}: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Inspection shows a build that waits for a seat as waiting, beside the
+/// build holding the seat, and a finished build with no phase.
+#[test]
+fn a_build_without_a_seat_shows_it_waits_for_one() {
+    let env = env();
+    let builds = env.service(1);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (first, second) = (GenerationId::from_raw(10), GenerationId::from_raw(11));
+    builds
+        .run_local(
+            first,
+            Box::new(move |_| {
+                held.recv().expect("released");
+                Ok(1)
+            }),
+        )
+        .expect("run first");
+    await_phase(&builds, first, BuildPhase::Indexing { indexed: None });
+    builds
+        .run_local(second, Box::new(|_| Ok(2)))
+        .expect("run second");
+
+    await_phase(&builds, second, BuildPhase::AwaitingSeat);
+    release.send(()).expect("release");
+    builds.wait(second, None).expect("wait");
+    builds.wait(first, None).expect("wait");
+
+    assert!(
+        builds.builds().expect("inspect").is_empty(),
+        "member builds keep no record, and finished ones no phase"
+    );
+}
+
+/// A key-shaped build waiting for a transaction older than its index shows
+/// that wait; once published, its record remains and its phase is gone.
+#[test]
+fn a_build_behind_an_older_transaction_shows_the_wait() {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    let older = older_transaction(&env);
+
+    builds.submit(def.generation, 0).expect("submit");
+    await_phase(
+        &builds,
+        def.generation,
+        BuildPhase::AwaitingOlderTransactions,
+    );
+    let status = builds.builds().expect("inspect");
+    let running = status
+        .iter()
+        .find(|s| s.generation == def.generation)
+        .expect("listed");
+    assert!(
+        matches!(
+            running.record.as_ref().map(|r| &r.state),
+            Some(BuildState::Running { .. })
+        ),
+        "{running:?}"
+    );
+
+    drop(older);
+    builds.wait(def.generation, None).expect("wait");
+    let status = builds.builds().expect("inspect");
+    assert_eq!(status.len(), 1, "{status:?}");
+    assert_eq!(status[0].phase, None);
+    assert_eq!(
+        status[0].record.as_ref().map(|r| &r.state),
+        Some(&BuildState::Published)
+    );
+}
+
+/// A backfill that outwaits the configured wait for older transactions
+/// fails its build, and the new index is withdrawn.
+#[test]
+fn a_build_outwaited_by_an_older_transaction_fails() {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = env.service_with(IndexBuildConfig {
+        max_running: 1,
+        older_transactions_wait: Duration::from_millis(50),
+    });
+    let older = older_transaction(&env);
+
+    builds.submit(def.generation, 0).expect("submit");
+    let outcome = builds.wait(def.generation, None).expect("wait");
+    drop(older);
+
+    assert!(
+        matches!(
+            &outcome,
+            Some(IndexBuildOutcome::Failed(BuildError::Other(reason)))
+                if reason.contains("still open")
+        ),
+        "{outcome:?}"
+    );
+    assert!(env.stored(&def).is_none(), "the new index is withdrawn");
+}
+
+/// Raising the number of builds that run at once seats a waiting build
+/// without waiting for a running one to finish.
+#[test]
+fn raising_the_seat_count_seats_a_waiting_build() {
+    let env = env();
+    let builds = env.service(1);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (first, second) = (GenerationId::from_raw(10), GenerationId::from_raw(11));
+    builds
+        .run_local(
+            first,
+            Box::new(move |_| {
+                held.recv().expect("released");
+                Ok(1)
+            }),
+        )
+        .expect("run first");
+    await_phase(&builds, first, BuildPhase::Indexing { indexed: None });
+    builds
+        .run_local(second, Box::new(|_| Ok(2)))
+        .expect("run second");
+    await_phase(&builds, second, BuildPhase::AwaitingSeat);
+
+    builds.set_config(IndexBuildConfig {
+        max_running: 2,
+        ..builds.config()
+    });
+
+    assert!(matches!(
+        builds.wait(second, None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(2) })
+    ));
+    release.send(()).expect("release");
+    builds.wait(first, None).expect("wait");
+}
+
+/// A seat count of zero is taken as one: builds still run.
+#[test]
+fn a_zero_seat_count_still_runs_builds() {
+    let env = env();
+    let builds = env.service(0);
+    assert_eq!(builds.config().max_running, 1);
+    builds
+        .run_local(GenerationId::from_raw(10), Box::new(|_| Ok(1)))
+        .expect("run");
+    assert!(matches!(
+        builds.wait(GenerationId::from_raw(10), None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(1) })
+    ));
+}
+
+/// A member build that panics fails with the panic's message instead of
+/// leaving its waiters hanging, and frees its seat.
+#[test]
+fn a_panicking_local_build_fails_and_frees_its_seat() {
+    let env = env();
+    let builds = env.service(1);
+    let (bad, good) = (GenerationId::from_raw(10), GenerationId::from_raw(11));
+    builds
+        .run_local(bad, Box::new(|_| panic!("text tokenizer broke")))
+        .expect("run");
+
+    assert!(matches!(
+        builds.wait(bad, None).expect("wait"),
+        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) if reason == "text tokenizer broke"
+    ));
+    builds.run_local(good, Box::new(|_| Ok(1))).expect("run");
+    assert!(matches!(
+        builds.wait(good, None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(1) })
+    ));
+}
+
+/// A taken build that cannot go on settles its record failed, so the
+/// catalog and the waiter agree and no later process resumes a build its
+/// waiter was told had failed.
+fn a_taken_build_that_breaks_settles_failed(fault: Fault, cause: &str) {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    env.inject(Some(fault));
+
+    builds.submit(def.generation, 0).expect("submit");
+    let outcome = builds.wait(def.generation, None).expect("wait");
+
+    assert!(
+        matches!(
+            &outcome,
+            Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) if reason.contains(cause)
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        matches!(
+            env.record(&def).expect("record").state,
+            BuildState::Failed { .. }
+        ),
+        "{:?}",
+        env.record(&def)
+    );
+    assert!(env.stored(&def).is_none(), "the new index is withdrawn");
+    env.inject(None);
+    assert!(
+        builds.resume().expect("resume").is_empty(),
+        "nothing is left to resume"
+    );
+}
+
+#[test]
+fn a_build_whose_environment_fails_settles_failed() {
+    a_taken_build_that_breaks_settles_failed(Fault::FieldsUnavailable, "field dictionary");
+}
+
+#[test]
+fn a_build_that_panics_settles_failed() {
+    a_taken_build_that_breaks_settles_failed(Fault::PanicOnPage, "page commit broke");
+}
+
+/// Cancelling a build the catalog has no record of cancels nothing, and a
+/// waiter on it is told at once that no such build will finish rather than
+/// waiting.
+#[test]
+fn cancelling_an_unknown_build_cancels_nothing() {
+    let env = env();
+    let builds = service(&env);
+    assert!(!builds.cancel(GenerationId::from_raw(999)).expect("cancel"));
+    assert!(matches!(
+        builds
+            .wait(GenerationId::from_raw(999), None)
+            .expect("wait"),
+        Some(IndexBuildOutcome::Cancelled)
     ));
 }
 

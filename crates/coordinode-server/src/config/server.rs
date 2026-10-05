@@ -289,6 +289,12 @@ pub struct ServerConfig {
     /// reclamation before its writers hold off until running searches finish
     /// (`None` = 256 MiB).
     pub vector_retired_bytes_budget: Option<u64>,
+    /// Index builds this node fills at once (`None` = 2); the others wait
+    /// for a seat with their builds accepted.
+    pub index_build_max_running: Option<std::num::NonZeroUsize>,
+    /// How long an index build waits for the transactions opened before its
+    /// index to end before it fails, in seconds (`None` = 60).
+    pub index_build_older_transactions_wait_secs: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -447,6 +453,8 @@ impl Default for ServerConfig {
             planner_stats_ttl_secs: None,
             vector_build_wait_ms: None,
             vector_retired_bytes_budget: None,
+            index_build_max_running: None,
+            index_build_older_transactions_wait_secs: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

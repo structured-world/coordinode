@@ -200,6 +200,8 @@ pub(crate) async fn serve(
         planner_stats_ttl_secs,
         vector_build_wait_ms,
         vector_retired_bytes_budget,
+        index_build_max_running,
+        index_build_older_transactions_wait_secs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -719,6 +721,16 @@ pub(crate) async fn serve(
         // `usize::MAX` means.
         database.set_vector_retired_bytes_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
+    // Before any build resumes: this process takes up interrupted builds only
+    // once it leads, below.
+    let defaults = database.index_build_config();
+    database.set_index_build_config(coordinode_query::index::IndexBuildConfig {
+        max_running: index_build_max_running.map_or(defaults.max_running, |n| n.get()),
+        older_transactions_wait: index_build_older_transactions_wait_secs.map_or(
+            defaults.older_transactions_wait,
+            std::time::Duration::from_secs,
+        ),
+    });
     // What a statement executes under when neither it nor its session names a
     // concern.
     database.set_read_concern(statement_defaults.read_concern);
@@ -1014,58 +1026,9 @@ pub(crate) async fn serve(
         });
     }
 
-    // Rebuild the B-tree indexes a store kept in the entry layout that
-    // preceded transactional entries, and finish the builds an earlier
-    // process left unfinished. Both are written through the log, so the
-    // leader runs them; a member that is not leading looks again at each
-    // applied entry (a new leader's first entry among them) until it leads or
-    // another member's work reaches it through apply.
-    {
-        let db = Arc::clone(&database);
-        let rn = Arc::clone(&raft_node);
-        let mut applied_rx = rn.subscribe_applied();
-        tokio::spawn(async move {
-            // A failed rebuild is tried again after this, not at the next apply.
-            const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
-            let mut first = true;
-            loop {
-                if !std::mem::take(&mut first) && applied_rx.changed().await.is_err() {
-                    break; // RaftNode dropped.
-                }
-                if rn.current_leader() != Some(rn.node_id()) {
-                    continue;
-                }
-                let db2 = Arc::clone(&db);
-                match tokio::task::spawn_blocking(move || {
-                    let db = db2.read();
-                    let resumed = db.resume_interrupted_index_builds()?;
-                    // After the builds: an index is ready before it is
-                    // adopted.
-                    db.adopt_unowned_unique_indexes()
-                        .map(|adopted| (resumed, adopted))
-                })
-                .await
-                {
-                    Ok(Ok((resumed, adopted))) => {
-                        if resumed > 0 {
-                            tracing::info!(resumed, "interrupted B-tree index builds finished");
-                        }
-                        if adopted > 0 {
-                            tracing::info!(
-                                adopted,
-                                "unique indexes became the constraints owning them"
-                            );
-                        }
-                        break;
-                    }
-                    Ok(Err(e)) => tracing::warn!(%e, "B-tree index rebuild failed; retrying"),
-                    Err(e) => tracing::warn!(%e, "B-tree index rebuild task join error"),
-                }
-                tokio::time::sleep(RETRY).await;
-                first = true;
-            }
-        });
-    }
+    // Finish the index builds no executor finishes, each time this member
+    // becomes the leader.
+    crate::index_build_resumer::spawn(Arc::clone(&database), Arc::clone(&raft_node));
 
     let query_registry = Arc::new(coordinode_query::advisor::QueryRegistry::new());
     let nplus1_detector = Arc::new(coordinode_query::advisor::nplus1::NPlus1Detector::new());

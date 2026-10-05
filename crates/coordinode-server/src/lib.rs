@@ -60,6 +60,7 @@ pub mod cli;
 pub mod config;
 mod grpc;
 mod healthcheck;
+mod index_build_resumer;
 mod logging;
 mod metrics_catalog;
 mod ops;

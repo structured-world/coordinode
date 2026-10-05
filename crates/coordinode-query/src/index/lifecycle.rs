@@ -31,7 +31,7 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitError, Transaction};
 use rustc_hash::FxHashMap;
 
-use super::build::{Backfill, BackfillError};
+use super::build::{Backfill, BackfillError, BackfillProgress};
 use super::definition::{GenerationId, IndexDefinition, IndexState};
 use super::registry::{IndexRegistry, UniqueViolation};
 use super::text_registry::TextIndexRegistry;
@@ -148,12 +148,76 @@ enum Concluded {
 
 struct Shared {
     env: Arc<dyn BuildEnvironment>,
+    /// Retunable while builds run: a seat and a backfill read it when they
+    /// start.
+    config: parking_lot::RwLock<IndexBuildConfig>,
     slots: parking_lot::Mutex<FxHashMap<GenerationId, Slot>>,
     finished: parking_lot::Condvar,
-    /// Builds executing now, bounded by `max_running`.
+    /// Builds executing now, bounded by `config.max_running`.
     running: parking_lot::Mutex<usize>,
     vacancy: parking_lot::Condvar,
-    max_running: usize,
+    /// Where each build an executor of this process holds stands now.
+    phases: parking_lot::Mutex<FxHashMap<GenerationId, BuildPhase>>,
+}
+
+/// How the engine runs its index builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBuildConfig {
+    /// Builds filling indexes at once (at least one); the others wait for a
+    /// seat with their builds accepted.
+    pub max_running: usize,
+    /// How long a key-shaped backfill waits for the transactions opened
+    /// before its index existed to end; a build that outwaits it fails.
+    pub older_transactions_wait: Duration,
+}
+
+impl Default for IndexBuildConfig {
+    fn default() -> Self {
+        Self {
+            max_running: 2,
+            older_transactions_wait: super::build::DEFAULT_OLDER_TRANSACTIONS_WAIT,
+        }
+    }
+}
+
+impl IndexBuildConfig {
+    /// At least one build runs, or none would ever start.
+    fn normalized(self) -> Self {
+        Self {
+            max_running: self.max_running.max(1),
+            ..self
+        }
+    }
+}
+
+/// Where a build an executor of this process holds stands now. Kept in
+/// memory: it changes every page, and only the outcome is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildPhase {
+    /// Waiting for a seat: as many builds as the engine runs at once are
+    /// filling indexes.
+    AwaitingSeat,
+    /// Waiting for the transactions opened before the index to end.
+    AwaitingOlderTransactions,
+    /// Filling the index; the records indexed so far, `None` for a build
+    /// that does not report them.
+    Indexing {
+        /// Records indexed so far.
+        indexed: Option<u64>,
+    },
+}
+
+/// One build as inspection shows it: its durable record when it has one (a
+/// member's own build has none) and, while an executor of this process
+/// holds it, where it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildStatus {
+    /// The generation the build fills.
+    pub generation: GenerationId,
+    /// The build's record in the catalog.
+    pub record: Option<IndexBuildRecord>,
+    /// Where it stands on this process's executor.
+    pub phase: Option<BuildPhase>,
 }
 
 /// The build of a full-text index over `properties` of `label`: each
@@ -193,6 +257,15 @@ pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
 /// a fault, not contention.
 pub const MOVE_ATTEMPTS: usize = 16;
 
+/// The message a panic carried, as a build failure states it.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic in the build executor".to_string())
+}
+
 /// How often a waiter whose executor lost the build looks at the record.
 const LOST_POLL: Duration = Duration::from_millis(20);
 
@@ -221,19 +294,36 @@ pub struct IndexBuildService {
 }
 
 impl IndexBuildService {
-    /// A service running builds over `env`, at most `max_running` filling at
-    /// once (at least one).
-    pub fn new(env: Arc<dyn BuildEnvironment>, max_running: usize) -> Self {
+    /// A service running builds over `env` as `config` says.
+    pub fn new(env: Arc<dyn BuildEnvironment>, config: IndexBuildConfig) -> Self {
         Self {
             shared: Arc::new(Shared {
                 env,
+                config: parking_lot::RwLock::new(config.normalized()),
                 slots: parking_lot::Mutex::new(FxHashMap::default()),
                 finished: parking_lot::Condvar::new(),
                 running: parking_lot::Mutex::new(0),
                 vacancy: parking_lot::Condvar::new(),
-                max_running: max_running.max(1),
+                phases: parking_lot::Mutex::new(FxHashMap::default()),
             }),
         }
+    }
+
+    /// How the service runs builds now.
+    pub fn config(&self) -> IndexBuildConfig {
+        *self.shared.config.read()
+    }
+
+    /// Retune the service while it runs. A higher `max_running` seats
+    /// waiting builds at once; a lower one lets the running builds finish
+    /// and seats no more until fewer run. A new `older_transactions_wait`
+    /// applies to backfills that start after the call.
+    pub fn set_config(&self, config: IndexBuildConfig) {
+        *self.shared.config.write() = config.normalized();
+        // Under the seat lock, so a build checking the limit either sees the
+        // new one or is already waiting when the wakeup comes.
+        let _running = self.shared.running.lock();
+        self.shared.vacancy.notify_all();
     }
 
     /// Run the build of `generation` on an executor of this process, unless
@@ -260,7 +350,8 @@ impl IndexBuildService {
     /// The executor thread could not be started.
     pub fn run_local(&self, generation: GenerationId, build: LocalBuild) -> Result<(), String> {
         self.spawn(generation, move |shared| {
-            let _seat = shared.seat();
+            let _seat = shared.seat(generation);
+            shared.set_phase(generation, BuildPhase::Indexing { indexed: None });
             Executed::Outcome(match build(shared.env.as_ref()) {
                 Ok(indexed) => IndexBuildOutcome::Published {
                     indexed: Some(indexed),
@@ -292,17 +383,15 @@ impl IndexBuildService {
                 let executed =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&shared)))
                         .unwrap_or_else(|panic| {
-                            let reason = panic
-                                .downcast_ref::<&'static str>()
-                                .map(|s| (*s).to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "panic in the build executor".to_string());
-                            Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(reason)))
+                            Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(
+                                panic_message(&*panic),
+                            )))
                         });
                 let slot = match executed {
                     Executed::Outcome(outcome) => Slot::Done(outcome),
                     Executed::Lost => Slot::Lost,
                 };
+                shared.phases.lock().remove(&generation);
                 shared.slots.lock().insert(generation, slot);
                 shared.finished.notify_all();
             });
@@ -454,13 +543,30 @@ impl IndexBuildService {
         Ok(resumed)
     }
 
-    /// The builds the catalog records.
+    /// Every build the catalog records, and every build an executor of this
+    /// process holds, each with its record and where it stands here.
     ///
     /// # Errors
     ///
     /// The records could not be read.
-    pub fn builds(&self) -> Result<Vec<IndexBuildRecord>, StoreError> {
-        LocalIndexStore::new(self.shared.env.engine()).list_builds()
+    pub fn builds(&self) -> Result<Vec<BuildStatus>, StoreError> {
+        let records = LocalIndexStore::new(self.shared.env.engine()).list_builds()?;
+        let mut phases = self.shared.phases.lock().clone();
+        let mut out: Vec<BuildStatus> = records
+            .into_iter()
+            .map(|record| BuildStatus {
+                generation: record.generation,
+                phase: phases.remove(&record.generation),
+                record: Some(record),
+            })
+            .collect();
+        out.extend(phases.into_iter().map(|(generation, phase)| BuildStatus {
+            generation,
+            record: None,
+            phase: Some(phase),
+        }));
+        out.sort_by_key(|s| s.generation);
+        Ok(out)
     }
 }
 
@@ -476,7 +582,7 @@ impl Shared {
     /// Take the build of `generation`, fill its generation and publish the
     /// outcome.
     fn execute(&self, generation: GenerationId, own_open: usize) -> Executed {
-        let _seat = self.seat();
+        let _seat = self.seat(generation);
         self.try_execute(generation, own_open)
             .unwrap_or_else(|e| Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(e))))
     }
@@ -486,22 +592,71 @@ impl Shared {
             Ok(taken) => taken,
             Err(executed) => return Ok(executed),
         };
+        // From here the record names this executor: whatever stops the fill,
+        // an error or a panic, settles it, or no waiter could trust the
+        // outcome it is told and a restart would resume a failed build.
+        let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.fill(generation, &taken, own_open)
+        }));
+        let def = &taken.def;
+        match filled {
+            Ok(Ok(Ok(indexed))) => self.publish(generation, &taken, indexed),
+            Ok(Ok(Err(BackfillError::Superseded))) => self.lost_to_mover(generation, taken.token),
+            Ok(Ok(Err(BackfillError::Duplicate(v)))) => {
+                self.fail(generation, &taken, BuildError::Duplicate(v))
+            }
+            Ok(Ok(Err(other))) => self.fail(
+                generation,
+                &taken,
+                BuildError::Other(format!("build index '{def}': {other}")),
+            ),
+            Ok(Err(e)) => self.fail(
+                generation,
+                &taken,
+                BuildError::Other(format!("build index '{def}': {e}")),
+            ),
+            Err(panic) => self.fail(
+                generation,
+                &taken,
+                BuildError::Other(format!("build index '{def}': {}", panic_message(&*panic))),
+            ),
+        }
+    }
+
+    /// Fill the generation `taken` holds. The outer error is the
+    /// environment's, the inner the backfill's.
+    fn fill(
+        &self,
+        generation: GenerationId,
+        taken: &Taken,
+        own_open: usize,
+    ) -> Result<Result<u64, BackfillError>, String> {
         let env = self.env.as_ref();
         let fields = env.fields()?;
-        let built = Backfill {
+        let progress = |p: BackfillProgress| {
+            self.set_phase(
+                generation,
+                match p {
+                    BackfillProgress::AwaitingOlderTransactions => {
+                        BuildPhase::AwaitingOlderTransactions
+                    }
+                    BackfillProgress::Indexed(indexed) => BuildPhase::Indexing {
+                        indexed: Some(indexed),
+                    },
+                },
+            );
+        };
+        Ok(Backfill {
             engine: env.engine(),
             oracle: env.oracle(),
             interner: &fields,
             shard_id: env.shard_id(),
             own_open,
             definition_version: taken.def_version,
+            older_transactions_wait: self.config.read().older_transactions_wait,
+            progress: Some(&progress),
         }
-        .run(&taken.def, &mut |txn| env.commit_page(txn));
-
-        match built {
-            Ok(indexed) => self.publish(generation, &taken, indexed),
-            Err(failure) => self.fail(generation, &taken, failure),
-        }
+        .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }
 
     /// Take the build of `generation`: its record moves to running under a
@@ -603,26 +758,18 @@ impl Shared {
         }
     }
 
-    /// Settle a build whose backfill stopped with `failure`: per its record,
-    /// the index is withdrawn with its constraint or kept failed, with the
+    /// Settle a build whose fill stopped with `error`: per its record, the
+    /// index is withdrawn with its constraint or kept failed, with the
     /// record moved to failed, in one commit conditioned on both records as
-    /// taken. A backfill that stopped because its definition moved (a
-    /// cancellation, a drop) defers to whoever moved it.
+    /// taken.
     fn fail(
         &self,
         generation: GenerationId,
         taken: &Taken,
-        failure: BackfillError,
+        error: BuildError,
     ) -> Result<Executed, String> {
         let env = self.env.as_ref();
         let def = &taken.def;
-        if matches!(failure, BackfillError::Superseded) {
-            return self.lost_to_mover(generation, taken.token);
-        }
-        let error = match failure {
-            BackfillError::Duplicate(v) => BuildError::Duplicate(v),
-            other => BuildError::Other(format!("build index '{def}': {other}")),
-        };
         let reason = error.to_string();
         let mut on_failure = BuildFailure::Withdraw;
         let concluded = self.conclude(generation, taken, |txn, record| {
@@ -750,15 +897,25 @@ impl Shared {
         ))
     }
 
-    /// A seat among the builds filling indexes now, waited for while all are
-    /// taken. Released when dropped.
-    fn seat(&self) -> Seat<'_> {
+    /// A seat for the build of `generation` among the builds filling
+    /// indexes now, waited for while all are taken; the build is shown
+    /// awaiting a seat meanwhile. Released when dropped.
+    fn seat(&self, generation: GenerationId) -> Seat<'_> {
         let mut running = self.running.lock();
-        while *running >= self.max_running {
-            self.vacancy.wait(&mut running);
+        if *running >= self.config.read().max_running {
+            self.set_phase(generation, BuildPhase::AwaitingSeat);
+            while *running >= self.config.read().max_running {
+                self.vacancy.wait(&mut running);
+            }
         }
         *running += 1;
+        self.set_phase(generation, BuildPhase::Indexing { indexed: None });
         Seat { shared: self }
+    }
+
+    /// Record where the build of `generation` stands on this process.
+    fn set_phase(&self, generation: GenerationId, phase: BuildPhase) {
+        self.phases.lock().insert(generation, phase);
     }
 }
 

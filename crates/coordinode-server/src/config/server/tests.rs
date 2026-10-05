@@ -289,6 +289,29 @@ fn vector_retired_bytes_budget_parses_from_the_config_file() {
     assert_eq!(c.vector_retired_bytes_budget, Some(64 << 20));
 }
 
+/// The index build knobs are config-file settings: unset they leave the
+/// engine defaults; zero builds at once is refused at parse, since no build
+/// would ever start.
+#[test]
+fn index_build_settings_parse_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(d.index_build_max_running.is_none());
+    assert!(d.index_build_older_transactions_wait_secs.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "index_build_max_running: 4\nindex_build_older_transactions_wait_secs: 300\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.index_build_max_running.map(|v| v.get()), Some(4));
+    assert_eq!(c.index_build_older_transactions_wait_secs, Some(300));
+
+    std::fs::write(&path, "index_build_max_running: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// The change-stream pacing is a config-file setting; zero is refused at
 /// parse, since a zero batch never reads and a zero heartbeat interval spins.
 #[test]

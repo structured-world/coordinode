@@ -15,10 +15,6 @@ use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transa
 
 use super::fields::FieldDictionary;
 
-/// Builds filling indexes at once; the others wait with their builds
-/// accepted.
-pub(super) const MAX_RUNNING: usize = 2;
-
 /// What a build of this database runs over.
 pub(super) struct DatabaseBuilds {
     pub(super) engine: Arc<StorageEngine>,

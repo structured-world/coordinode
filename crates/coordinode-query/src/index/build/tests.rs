@@ -65,6 +65,8 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         shard_id: 1,
         own_open: 0,
         definition_version: None,
+        older_transactions_wait: super::DEFAULT_OLDER_TRANSACTIONS_WAIT,
+        progress: None,
     }
 }
 
@@ -163,6 +165,37 @@ fn a_backfill_spans_pages() {
     assert_eq!(indexed, total);
     assert_eq!(commits, 3);
     assert_eq!(lookup(&fx, &index, &format!("u{total}@x")), vec![total]);
+}
+
+/// A backfill reports the wait for older transactions, then the entries
+/// committed after every page, ending at its total.
+#[test]
+fn a_backfill_reports_its_progress_per_page() {
+    let mut fx = fixture();
+    let total = PAGE as u64 + 3;
+    for id in 1..=total {
+        put_node(&mut fx, id, "User", &email(&format!("u{id}@x")));
+    }
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
+    let reports = std::cell::RefCell::new(Vec::new());
+    let record = |p: BackfillProgress| reports.borrow_mut().push(p);
+    let mut run = backfill(&fx);
+    run.progress = Some(&record);
+    run.run(&index, &mut |txn| commit(txn)).expect("backfill");
+
+    assert_eq!(
+        reports.into_inner(),
+        [
+            BackfillProgress::AwaitingOlderTransactions,
+            BackfillProgress::Indexed(0),
+            BackfillProgress::Indexed(PAGE as u64),
+            BackfillProgress::Indexed(total),
+        ]
+    );
 }
 
 /// A node a writer changes after a page read it makes that page conflict at

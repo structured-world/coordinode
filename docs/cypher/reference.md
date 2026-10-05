@@ -338,9 +338,30 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   finds it instead of building a second index, `DROP INDEX` refuses it and
   `DROP CONSTRAINT` removes both. A partial unique index (`WHERE`) stays an
   index of its own, since a constraint has no filter.
-- **Building.** `CREATE INDEX` indexes the nodes already stored before it
-  returns, and serves lookups once built. `CREATE UNIQUE INDEX` over data that
-  already has a duplicate fails and leaves no index.
+- **Building.** `CREATE INDEX` publishes the index and admits its build in one
+  commit, then waits for the build, which indexes the nodes already stored,
+  and returns once the index is ready. The build runs on the engine, not on
+  the statement: a client that times out or disconnects leaves it running, a
+  restart resumes it, and after a change of leader the new leader resumes it.
+  Writes made meanwhile maintain the index themselves. The build first waits
+  for transactions opened before the index existed to end, then indexes the
+  stored nodes a page at a time; a page that read a node a writer changed is
+  read again.
+- **Build failure and cancellation.** `CREATE UNIQUE INDEX` over data that
+  already has a duplicate fails and leaves no index. A build of a new index
+  that fails or is cancelled withdraws the index (and the constraint owning
+  it); a rebuild of an existing one keeps it, marked failed. `DROP INDEX`
+  during a build ends the build without writing more entries. The embedded
+  API cancels a build (`Database::cancel_index_build`) and lists builds with
+  where each stands (`Database::index_build_status`: accepted, waiting for a
+  seat or for older transactions, indexing with the count so far, then
+  published, failed with its reason, or cancelled). How many builds run at
+  once and how long a build waits for older transactions are server settings
+  (`index_build_max_running`, `index_build_older_transactions_wait_secs`).
+- **Member-local indexes.** A full-text index and a vector index are built by
+  every member from the data it holds; their definitions replicate, their
+  readiness is each member's own. A full-text index's backfill runs on the
+  same engine builds as the others.
 - **Lists.** A list value is indexed by each element, so a unique index keeps
   an element to one node. An equality on the property still means the whole
   value: `n.tags = 'x'` does not match a node whose `tags` is `['x', 'y']`.
