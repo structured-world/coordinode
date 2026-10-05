@@ -60,10 +60,14 @@ impl CursorEngine for MockEngine {
         _txid: u64,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         if let Some(message) = &self.fail {
-            return Err(EngineError(message.clone()));
+            return Err(EngineError(Failure {
+                code: ErrorCode::Unavailable,
+                message: message.clone(),
+                details: b"opaque".to_vec(),
+            }));
         }
         if self.fail_query.as_deref() == Some(query) {
-            return Err(EngineError("statement failed".to_string()));
+            return Err(EngineError::internal("statement failed"));
         }
         Ok(Box::new(MockCursor {
             columns: self.columns.clone(),
@@ -166,6 +170,9 @@ async fn execute_with_an_empty_result_opens_then_ends_with_no_rows() {
     ));
 }
 
+/// An engine failure reaches the client as the engine reported it: class,
+/// message and the binding's opaque details, so a retryable failure is not
+/// flattened into an internal one.
 #[tokio::test]
 async fn execute_surfaces_an_engine_error() {
     let engine: Arc<dyn CursorEngine> = Arc::new(MockEngine {
@@ -177,9 +184,10 @@ async fn execute_surfaces_an_engine_error() {
     });
     let events = run_one(engine, exec()).await;
     match events.as_slice() {
-        [SessionEvent::Error { code, message }] => {
-            assert_eq!(*code, ErrorCode::Internal);
-            assert_eq!(message, "boom");
+        [SessionEvent::Error(failure)] => {
+            assert_eq!(failure.code, ErrorCode::Unavailable);
+            assert_eq!(failure.message, "boom");
+            assert_eq!(failure.details, b"opaque");
         }
         other => panic!("expected a single Error, got {other:?}"),
     }
@@ -302,11 +310,14 @@ async fn a_failed_statement_aborts_the_transaction_and_rejects_the_rest() {
     // The later statement and the commit are both rejected as aborted.
     for rid in [4u64, 5] {
         match by_id[&rid].as_slice() {
-            [SessionEvent::Error { message, .. }] => {
+            [SessionEvent::Error(failure)] => {
                 assert!(
-                    message.contains("aborted"),
-                    "req {rid} expected aborted error, got {message:?}"
+                    failure.message.contains("aborted"),
+                    "req {rid} expected aborted error, got {failure:?}"
                 );
+                // Retrying the same statement cannot help: the transaction
+                // has to be rolled back first.
+                assert_eq!(failure.code, ErrorCode::FailedPrecondition);
             }
             other => panic!("req {rid} expected a single aborted Error, got {other:?}"),
         }
@@ -422,9 +433,9 @@ async fn ordered_failed_statement_aborts_and_rejects_later_nonces() {
     assert!(matches!(by_id[&3].as_slice(), [SessionEvent::Error { .. }]));
     for rid in [4u64, 5] {
         match by_id[&rid].as_slice() {
-            [SessionEvent::Error { message, .. }] => assert!(
-                message.contains("aborted"),
-                "req {rid} expected aborted error, got {message:?}"
+            [SessionEvent::Error(failure)] => assert!(
+                failure.message.contains("aborted"),
+                "req {rid} expected aborted error, got {failure:?}"
             ),
             other => panic!("req {rid} expected aborted Error, got {other:?}"),
         }

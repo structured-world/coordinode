@@ -18,5 +18,6 @@ pub use engine::{CursorEngine, EngineError, QueryCursor};
 pub use registry::SessionRegistry;
 pub use session::{InOp, OutEvent, Session, SessionManager};
 pub use types::{
-    ConnectionSettings, ConnectionState, ErrorCode, Ordering, SessionEvent, SessionOp, SessionStats,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
+    SessionStats,
 };

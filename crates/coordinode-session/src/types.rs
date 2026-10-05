@@ -152,14 +152,78 @@ pub struct SessionStats {
     pub read_as_of_ts: u64,
 }
 
-/// Neutral error class for a failed request. The binding maps this to its
-/// protocol's status taxonomy.
+/// Error class of a failed request: the canonical status codes, which every
+/// binding maps one to one onto its protocol. A client decides by the class
+/// whether to retry, go elsewhere or give up, so a failure keeps the class the
+/// engine gave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
+    /// The caller cancelled the request.
+    Cancelled,
+    /// A failure with no better class.
+    Unknown,
     /// The request was malformed (for example, a frame carrying no operation).
     InvalidArgument,
+    /// The request ran out of time before it finished.
+    DeadlineExceeded,
+    /// Something the request names does not exist.
+    NotFound,
+    /// Something the request creates exists already.
+    AlreadyExists,
+    /// The caller may not do this.
+    PermissionDenied,
+    /// A limit or a quota was reached; retrying later may succeed.
+    ResourceExhausted,
+    /// The request is fine, the state it needs is not (for example, it reached
+    /// a node that is not the leader).
+    FailedPrecondition,
+    /// The request lost to a concurrent one; retrying it may succeed.
+    Aborted,
+    /// A value is past the valid range (for example, a timestamp older than
+    /// the retention window).
+    OutOfRange,
+    /// The server does not do this.
+    Unimplemented,
     /// An internal failure while serving the request.
     Internal,
+    /// The service cannot answer right now; retrying may succeed.
+    Unavailable,
+    /// Data was lost or corrupted.
+    DataLoss,
+    /// The caller is not authenticated.
+    Unauthenticated,
+}
+
+/// Why a request failed, as the engine reported it.
+///
+/// `details` is opaque to the session core: the binding that backs the engine
+/// fills it in its protocol's encoding (structured details a client branches
+/// on, such as the reason and the leader to go to) and the same binding reads
+/// it back when it answers. The core only carries it from one to the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The failure's class.
+    pub code: ErrorCode,
+    /// What happened, for a human.
+    pub message: String,
+    /// Structured details, encoded by the binding; empty when there are none.
+    pub details: Vec<u8>,
+}
+
+impl Failure {
+    /// A failure of class `code` with no structured details.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
+
+    /// An internal failure with no structured details.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Internal, message)
+    }
 }
 
 /// A neutral result event for a request.
@@ -177,7 +241,7 @@ pub enum SessionEvent {
     /// timestamp and the causal applied-index token.
     Committed { receipt: CommitReceipt },
     /// Reports a request failure; terminates the request's cursor.
-    Error { code: ErrorCode, message: String },
+    Error(Failure),
     /// The state of the connection and the settings in effect on it.
     ///
     /// Answers a [`SessionOp::Configure`], and is also emitted unsolicited

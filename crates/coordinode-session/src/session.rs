@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
 use crate::types::{
-    ConnectionSettings, ConnectionState, ErrorCode, Ordering, SessionEvent, SessionOp,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
 };
 
 /// An inbound op tagged with its session-scoped request id.
@@ -333,7 +333,7 @@ impl Session {
                 let _ = out.send((request_id, SessionEvent::Begun { txid })).await;
             }
             Ok(Err(e)) => send_error(out, request_id, e.0).await,
-            Err(join) => send_error(out, request_id, join.to_string()).await,
+            Err(join) => send_error(out, request_id, lost_call(join)).await,
         }
         self.registry.request_finished(self.session_id);
     }
@@ -425,7 +425,7 @@ async fn run_unordered(
                 ..
             } => {
                 if aborted {
-                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, aborted_txn()).await;
                 } else {
                     registry.touch_txn(session_id, txid);
                     if !execute(engine, request_id, &query, params, txid, out).await {
@@ -436,7 +436,7 @@ async fn run_unordered(
             }
             TxnMsg::Commit { request_id, .. } => {
                 if aborted {
-                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, aborted_txn()).await;
                 } else {
                     commit(engine, request_id, txid, out).await;
                 }
@@ -493,7 +493,7 @@ async fn run_ordered(
             } => {
                 registry.request_started(session_id);
                 if aborted {
-                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, aborted_txn()).await;
                     registry.request_finished(session_id);
                     continue;
                 }
@@ -536,7 +536,7 @@ async fn run_ordered(
                 if aborted {
                     // Discard whatever the transaction buffered or applied.
                     rollback(engine, txid).await;
-                    send_error(out, request_id, ABORTED_TXN.to_string()).await;
+                    send_error(out, request_id, aborted_txn()).await;
                 } else {
                     commit(engine, request_id, txid, out).await;
                 }
@@ -666,7 +666,7 @@ async fn commit(
                 .await;
         }
         Ok(Err(e)) => send_error(out, request_id, e.0).await,
-        Err(join) => send_error(out, request_id, join.to_string()).await,
+        Err(join) => send_error(out, request_id, lost_call(join)).await,
     }
 }
 
@@ -715,7 +715,7 @@ async fn execute(
             return false;
         }
         Err(join) => {
-            send_error(out, request_id, join.to_string()).await;
+            send_error(out, request_id, lost_call(join)).await;
             return false;
         }
     };
@@ -742,7 +742,7 @@ async fn execute(
                 batch
             }
             Err(join) => {
-                send_error(out, request_id, join.to_string()).await;
+                send_error(out, request_id, lost_call(join)).await;
                 return false;
             }
         };
@@ -777,16 +777,19 @@ async fn execute(
 }
 
 /// Emit a single `Error` event for a failed request.
-async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, message: String) {
-    let _ = out
-        .send((
-            request_id,
-            SessionEvent::Error {
-                code: ErrorCode::Internal,
-                message,
-            },
-        ))
-        .await;
+async fn send_error(out: &mpsc::Sender<OutEvent>, request_id: u64, failure: Failure) {
+    let _ = out.send((request_id, SessionEvent::Error(failure))).await;
+}
+
+/// The failure of a statement or commit sent to a transaction that already
+/// failed one: the transaction has to be rolled back before anything else.
+fn aborted_txn() -> Failure {
+    Failure::new(ErrorCode::FailedPrecondition, ABORTED_TXN)
+}
+
+/// A blocking engine call that did not return (it panicked or was cancelled).
+fn lost_call(join: tokio::task::JoinError) -> Failure {
+    Failure::internal(join.to_string())
 }
 
 #[cfg(test)]

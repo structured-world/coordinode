@@ -133,7 +133,53 @@ fn to_op_configure_maps_or_refuses_the_write_concern() {
         timeout_ms: 0,
     }))
     .expect_err("w:2 with j:memory must be refused");
-    assert!(refused.contains("w:2,j:memory"), "got: {refused}");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(refused.message().contains("w:2,j:memory"), "got: {refused}");
+}
+
+/// A refusal carried through the session core comes out as the status that
+/// went in: same code, message and reason. Before, the session answered every
+/// engine failure as INTERNAL with the message alone, so a client could not
+/// tell a request to send elsewhere from a server fault.
+#[test]
+fn a_failure_keeps_its_code_and_reason_through_the_session() {
+    use tonic_types::StatusExt;
+
+    let original = crate::services::error_details::status_with_reason(
+        Code::FailedPrecondition,
+        "not the leader".to_string(),
+        crate::services::error_details::Reason::NotLeader,
+        [("leader_id", "3".to_string())],
+    );
+    let frame = event_to_frame(9, SessionEvent::Error(failure(&original)));
+    let Some(Event::Error(e)) = frame.event else {
+        panic!("expected Error, got {:?}", frame.event);
+    };
+    assert_eq!(e.code, Code::FailedPrecondition as u32);
+    assert_eq!(e.message, "not the leader");
+
+    let back = status(failure(&original));
+    assert_eq!(back.code(), Code::FailedPrecondition);
+    let info = back
+        .get_details_error_info()
+        .expect("the reason survives the session core");
+    assert_eq!(
+        info.reason,
+        crate::services::error_details::Reason::NotLeader.as_str()
+    );
+    assert_eq!(
+        info.metadata.get("leader_id").map(String::as_str),
+        Some("3")
+    );
+    let canonical = e.status.expect("canonical status");
+    assert!(
+        canonical
+            .details
+            .iter()
+            .any(|d| d.type_url.ends_with("google.rpc.ErrorInfo")),
+        "ErrorInfo rides along on the frame: {:?}",
+        canonical.details
+    );
 }
 
 #[test]
@@ -157,10 +203,7 @@ fn event_to_frame_tags_the_request_id_and_maps_each_event() {
 
     let error = event_to_frame(
         7,
-        SessionEvent::Error {
-            code: ErrorCode::InvalidArgument,
-            message: "bad".to_string(),
-        },
+        SessionEvent::Error(Failure::new(ErrorCode::InvalidArgument, "bad")),
     );
     match error.event {
         Some(Event::Error(e)) => assert_eq!(e.code, Code::InvalidArgument as u32),

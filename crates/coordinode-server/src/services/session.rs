@@ -19,8 +19,8 @@ use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
 use coordinode_raft::cluster::version::VersionGate;
 use coordinode_session::{
-    ConnectionSettings, ConnectionState, ErrorCode, InOp, Ordering as CoreOrdering, OutEvent,
-    SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
+    ConnectionSettings, ConnectionState, ErrorCode, Failure, InOp, Ordering as CoreOrdering,
+    OutEvent, SessionEvent, SessionManager, SessionOp, SessionRegistry, SessionStats,
 };
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
@@ -180,15 +180,9 @@ impl SessionServiceTrait for SessionSvc {
                             break;
                         }
                     }
-                    Err(message) => {
+                    Err(status) => {
                         let _ = err_tx
-                            .send((
-                                request_id,
-                                SessionEvent::Error {
-                                    code: ErrorCode::InvalidArgument,
-                                    message,
-                                },
-                            ))
+                            .send((request_id, SessionEvent::Error(failure(&status))))
                             .await;
                     }
                 }
@@ -335,11 +329,11 @@ fn serve_subscription_op(
     }
 }
 
-/// Map a gRPC client op to a neutral one. `Err` carries the message for the
-/// INVALID_ARGUMENT answer: the frame has no op, or names a write concern the
-/// server cannot honour.
-fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, String> {
-    let op = op.ok_or_else(|| "client frame had no op".to_string())?;
+/// Map a gRPC client op to a neutral one. `Err` is the INVALID_ARGUMENT
+/// answer: the frame has no op, or names a write concern the server cannot
+/// honour.
+fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, Status> {
+    let op = op.ok_or_else(|| Status::invalid_argument("client frame had no op"))?;
     Ok(match op {
         client_frame::Op::Execute(e) => SessionOp::Execute {
             query: e.query,
@@ -367,15 +361,15 @@ fn to_op(op: Option<client_frame::Op>) -> Result<SessionOp, String> {
         client_frame::Op::Cancel(c) => SessionOp::Cancel {
             target_request_id: c.target_request_id,
         },
-        client_frame::Op::Configure(c) => {
-            SessionOp::Configure(settings_from_proto(&c).map_err(|s| s.message().to_string())?)
-        }
+        client_frame::Op::Configure(c) => SessionOp::Configure(settings_from_proto(&c)?),
         // Served by `serve_subscription_op` before an op reaches here.
         client_frame::Op::Subscribe(_)
         | client_frame::Op::Credit(_)
         | client_frame::Op::Acknowledge(_)
         | client_frame::Op::CancelSubscription(_) => {
-            return Err("a subscription op is served by the session binding".to_string());
+            return Err(Status::internal(
+                "a subscription op is served by the session binding",
+            ));
         }
     })
 }
@@ -444,9 +438,7 @@ fn event_to_frame(request_id: u64, event: SessionEvent) -> ServerFrame {
             applied_index: receipt.applied_index.unwrap_or(0),
             commit_ts: receipt.commit_ts.as_raw(),
         }),
-        SessionEvent::Error { code, message } => {
-            Event::Error(session_error(&Status::new(error_code(code), message)))
-        }
+        SessionEvent::Error(f) => Event::Error(session_error(&status(f))),
         SessionEvent::ConnectionStatus { state, settings } => {
             Event::ConnectionStatus(ProtoConnectionStatus {
                 writable: state.writable,
@@ -481,11 +473,57 @@ fn stats_to_proto(stats: SessionStats) -> query::QueryStats {
     }
 }
 
-fn error_code(code: ErrorCode) -> Code {
-    match code {
-        ErrorCode::InvalidArgument => Code::InvalidArgument,
-        ErrorCode::Internal => Code::Internal,
+/// Carry a status through the session core: its code, message and encoded
+/// details, which [`status`] turns back into the same status.
+pub(crate) fn failure(status: &Status) -> Failure {
+    let code = match status.code() {
+        // A failure always has a non-OK class; an OK status here would be a
+        // bug upstream, and Unknown is the honest answer for it.
+        Code::Ok | Code::Unknown => ErrorCode::Unknown,
+        Code::Cancelled => ErrorCode::Cancelled,
+        Code::InvalidArgument => ErrorCode::InvalidArgument,
+        Code::DeadlineExceeded => ErrorCode::DeadlineExceeded,
+        Code::NotFound => ErrorCode::NotFound,
+        Code::AlreadyExists => ErrorCode::AlreadyExists,
+        Code::PermissionDenied => ErrorCode::PermissionDenied,
+        Code::ResourceExhausted => ErrorCode::ResourceExhausted,
+        Code::FailedPrecondition => ErrorCode::FailedPrecondition,
+        Code::Aborted => ErrorCode::Aborted,
+        Code::OutOfRange => ErrorCode::OutOfRange,
+        Code::Unimplemented => ErrorCode::Unimplemented,
+        Code::Internal => ErrorCode::Internal,
+        Code::Unavailable => ErrorCode::Unavailable,
+        Code::DataLoss => ErrorCode::DataLoss,
+        Code::Unauthenticated => ErrorCode::Unauthenticated,
+    };
+    Failure {
+        code,
+        message: status.message().to_string(),
+        details: status.details().to_vec(),
     }
+}
+
+/// The status a failure carried through the session core stands for.
+fn status(f: Failure) -> Status {
+    let code = match f.code {
+        ErrorCode::Cancelled => Code::Cancelled,
+        ErrorCode::Unknown => Code::Unknown,
+        ErrorCode::InvalidArgument => Code::InvalidArgument,
+        ErrorCode::DeadlineExceeded => Code::DeadlineExceeded,
+        ErrorCode::NotFound => Code::NotFound,
+        ErrorCode::AlreadyExists => Code::AlreadyExists,
+        ErrorCode::PermissionDenied => Code::PermissionDenied,
+        ErrorCode::ResourceExhausted => Code::ResourceExhausted,
+        ErrorCode::FailedPrecondition => Code::FailedPrecondition,
+        ErrorCode::Aborted => Code::Aborted,
+        ErrorCode::OutOfRange => Code::OutOfRange,
+        ErrorCode::Unimplemented => Code::Unimplemented,
+        ErrorCode::Internal => Code::Internal,
+        ErrorCode::Unavailable => Code::Unavailable,
+        ErrorCode::DataLoss => Code::DataLoss,
+        ErrorCode::Unauthenticated => Code::Unauthenticated,
+    };
+    Status::with_details(code, f.message, f.details.into())
 }
 
 mod engine;

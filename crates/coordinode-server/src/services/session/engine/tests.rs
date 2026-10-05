@@ -229,8 +229,20 @@ async fn session_core_surfaces_a_query_error() {
         "MATCH (n) RETURN undefined_var",
     )
     .await;
-    assert!(
-        matches!(events.as_slice(), [SessionEvent::Error { .. }]),
-        "expected a single Error, got {events:?}"
+    // The class is the one the unary path answers with for the same query: a
+    // fault in the request, not in the server.
+    let expected = crate::services::cypher::db_error_to_status(
+        seeded_db(1)
+            .read()
+            .execute_cypher_shared("MATCH (n) RETURN undefined_var", None, None, None, None)
+            .expect_err("the query is invalid"),
     );
+    match events.as_slice() {
+        [SessionEvent::Error(failure)] => {
+            assert_ne!(failure.code, coordinode_session::ErrorCode::Internal);
+            assert_eq!(failure.code, super::super::failure(&expected).code);
+            assert_eq!(failure.details, expected.details());
+        }
+        other => panic!("expected a single Error, got {other:?}"),
+    }
 }

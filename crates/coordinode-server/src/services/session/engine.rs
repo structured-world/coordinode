@@ -19,12 +19,15 @@ use std::sync::Arc;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
-use coordinode_embed::Database;
+use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::executor::row::Row;
 use coordinode_query::executor::runner::WriteStats;
 use coordinode_raft::cluster::version::{MemberState, VersionGate};
 use coordinode_session::{CursorEngine, EngineError, QueryCursor, SessionStats};
 use parking_lot::RwLock;
+
+use super::failure;
+use crate::services::cypher::db_error_to_status;
 
 /// Storage keys scanned per keyset page. Independent of the client's batch size:
 /// a page may yield fewer output rows than this when a `Filter` rejects some, so
@@ -94,7 +97,7 @@ impl CursorEngine for DatabaseCursorEngine {
         let (rows, mut stats) = if txid == 0 {
             let result = db
                 .execute_cypher_shared(query, params, None, None, None)
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(engine_error)?;
             (
                 rows_to_values(&result.rows),
                 write_stats(&result.write_stats),
@@ -102,7 +105,7 @@ impl CursorEngine for DatabaseCursorEngine {
         } else {
             let rows = db
                 .execute_in_transaction(txid, query, params)
-                .map_err(|e| EngineError(e.to_string()))?;
+                .map_err(engine_error)?;
             (rows_to_values(&rows), SessionStats::default())
         };
         stats.read_as_of_ts = read_as_of_ts;
@@ -122,15 +125,22 @@ impl CursorEngine for DatabaseCursorEngine {
         self.database
             .read()
             .commit_transaction(txid)
-            .map_err(|e| EngineError(e.to_string()))
+            .map_err(engine_error)
     }
 
     fn rollback_transaction(&self, txid: u64) -> Result<(), EngineError> {
         self.database
             .read()
             .rollback_transaction(txid)
-            .map_err(|e| EngineError(e.to_string()))
+            .map_err(engine_error)
     }
+}
+
+/// A database failure as the session reports it: the same status, reason and
+/// details the unary path answers with, so a client of either path retries,
+/// redirects or gives up on the same signal.
+fn engine_error(err: DatabaseError) -> EngineError {
+    EngineError(failure(&db_error_to_status(err)))
 }
 
 /// A keyset-resumable cursor: pins one MVCC snapshot and pages the result by
@@ -199,7 +209,7 @@ impl KeysetCursor {
                 self.resume.clone(),
                 KEYSET_PAGE,
             )
-            .map_err(|e| EngineError(e.to_string()))?;
+            .map_err(engine_error)?;
         self.read_ts = Some(page.read_ts);
         self.resume = page.last_key;
         self.exhausted = page.exhausted;

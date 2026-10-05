@@ -11,15 +11,23 @@ use std::collections::HashMap;
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
 
-use crate::types::SessionStats;
+use crate::types::{Failure, SessionStats};
 
-/// An error from the query engine, neutral over the engine implementation.
-#[derive(Debug, Clone)]
-pub struct EngineError(pub String);
+/// An error from the query engine, neutral over the engine implementation. It
+/// reaches the client as the request's failure, class and details intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineError(pub Failure);
+
+impl EngineError {
+    /// An internal failure with no structured details.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self(Failure::internal(message))
+    }
+}
 
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.0.message)
     }
 }
 
