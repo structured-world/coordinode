@@ -1,12 +1,32 @@
 //! Notices that a registration's record may have changed, so a reader that
 //! has to know whether its registration still stands rechecks it when a
-//! write to it applies instead of on every read.
+//! write to it applies instead of on every read, and a reader parked until
+//! something happens is woken by such a write.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+
+/// A counter bumped as writes apply, and the readers waiting for it to move.
+#[derive(Debug, Default)]
+struct Generation {
+    value: AtomicU64,
+    moved: Notify,
+}
+
+impl Generation {
+    fn bump(&self) {
+        self.value.fetch_add(1, Ordering::Release);
+        self.moved.notify_waiters();
+    }
+
+    fn get(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+}
 
 /// The generation of every watched record, bumped as writes to it apply.
 #[derive(Debug, Default)]
@@ -16,9 +36,9 @@ pub(crate) struct Watches {
     relayed: AtomicBool,
     /// Bumped when an applied write's keys are not known: any record may
     /// have changed.
-    all: AtomicU64,
+    all: Generation,
     /// Generations by record key; an entry lives while a watch holds it.
-    by_key: Mutex<HashMap<Vec<u8>, Weak<AtomicU64>>>,
+    by_key: Mutex<HashMap<Vec<u8>, Weak<Generation>>>,
 }
 
 impl Watches {
@@ -27,19 +47,21 @@ impl Watches {
         let by_key = self.by_key.lock();
         for key in keys {
             if let Some(generation) = by_key.get(key).and_then(Weak::upgrade) {
-                generation.fetch_add(1, Ordering::Release);
+                generation.bump();
             }
         }
     }
 
     /// Writes whose keys are not known applied.
     pub(crate) fn applied_unknown(&self) {
-        self.all.fetch_add(1, Ordering::Release);
+        self.all.bump();
     }
 
     /// Whether applied writes are relayed from now on.
     pub(crate) fn set_relayed(&self, relayed: bool) {
         self.relayed.store(relayed, Ordering::Release);
+        // A reader waiting for the relay to start looks again.
+        self.all.moved.notify_waiters();
     }
 
     /// A watch over the record stored under `key`.
@@ -49,7 +71,7 @@ impl Watches {
             match by_key.get(&key).and_then(Weak::upgrade) {
                 Some(generation) => generation,
                 None => {
-                    let generation = Arc::new(AtomicU64::new(0));
+                    let generation = Arc::new(Generation::default());
                     by_key.insert(key.clone(), Arc::downgrade(&generation));
                     generation
                 }
@@ -71,7 +93,7 @@ impl Watches {
 pub struct RegistrationWatch {
     watches: Arc<Watches>,
     key: Vec<u8>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<Generation>,
     /// The generations seen at the last answer; `None` before the first.
     seen: Option<(u64, u64)>,
 }
@@ -85,13 +107,38 @@ impl RegistrationWatch {
         if !self.watches.relayed.load(Ordering::Acquire) {
             return true;
         }
-        let now = (
-            self.generation.load(Ordering::Acquire),
-            self.watches.all.load(Ordering::Acquire),
-        );
+        let now = self.now();
         let changed = self.seen != Some(now);
         self.seen = Some(now);
         changed
+    }
+
+    /// Resolves once a write to the record, or one whose keys are not known,
+    /// applied since the last [`changed`](Self::changed). A reader parked
+    /// until something happens waits on this beside its other wake-ups, so it
+    /// does not learn of the end of its registration only at its next one.
+    /// Without the relay it waits for the relay to start: such a reader
+    /// rechecks at every wake-up anyway.
+    pub async fn wait(&self) {
+        loop {
+            let record = self.generation.moved.notified();
+            let any = self.watches.all.moved.notified();
+            tokio::pin!(record, any);
+            // Registered before the look, so a bump in between still wakes.
+            record.as_mut().enable();
+            any.as_mut().enable();
+            if self.watches.relayed.load(Ordering::Acquire) && self.seen != Some(self.now()) {
+                return;
+            }
+            tokio::select! {
+                () = record => {}
+                () = any => {}
+            }
+        }
+    }
+
+    fn now(&self) -> (u64, u64) {
+        (self.generation.get(), self.watches.all.get())
     }
 }
 

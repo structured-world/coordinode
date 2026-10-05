@@ -826,6 +826,48 @@ async fn cancelling_ends_the_registration_and_its_stream() {
     );
 }
 
+/// A caught-up stream learns that its registration ended as soon as the end
+/// applies, not at its next heartbeat: the stream wakes on the applied entry
+/// and the registry relays the write to its record on another thread, so it
+/// must also wake on that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_stream_learns_of_its_end_without_waiting_for_a_heartbeat() {
+    let oplog_dir = tempfile::tempdir().expect("oplog dir");
+    let mut f = fixture(
+        vec![oplog_dir.path().to_path_buf()],
+        empty_log(oplog_dir.path()),
+        Arc::new(|| 0),
+        None,
+        RegistryTuning::default(),
+    );
+    f.service = f.service.with_tuning(super::CdcStreamTuning {
+        heartbeat_interval: Duration::from_secs(600),
+        ..super::CdcStreamTuning::default()
+    });
+    let mut stream = f
+        .service
+        .subscribe(Request::new(register("parked", strict())))
+        .await
+        .expect("subscribe")
+        .into_inner();
+    // Let the stream reach its caught-up wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    f.service
+        .cancel_subscription(Request::new(CancelSubscriptionRequest {
+            consumer_id: "parked".to_string(),
+            incarnation: 1,
+        }))
+        .await
+        .expect("cancel");
+    let ended = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("told well before the heartbeat")
+        .expect("an item");
+    let status = ended.expect_err("the stream ends with the refusal");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+}
+
 /// A registration refused under write pressure reaches the client as
 /// retryable RESOURCE_EXHAUSTED with WRITE_BACKPRESSURE and a retry delay,
 /// the same answer a write gets in that state.

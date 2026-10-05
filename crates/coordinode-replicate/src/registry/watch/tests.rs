@@ -46,6 +46,47 @@ fn without_the_relay_every_call_is_a_change() {
     assert!(watch.changed());
 }
 
+/// A reader waiting on its watch is woken by a write to its record: a stream
+/// parked until the next applied entry must not miss the end of its
+/// registration because the relay bumped the generation after it looked.
+#[tokio::test]
+async fn a_waiting_watch_is_woken_by_a_write_to_its_record() {
+    let watches = relayed();
+    let mut watch = watches.watch(b"consumer:a".to_vec());
+    assert!(watch.changed());
+    let relay = Arc::clone(&watches);
+    let waiter = tokio::spawn(async move {
+        watch.wait().await;
+        watch.changed()
+    });
+    tokio::task::yield_now().await;
+    relay.applied(&[b"consumer:b".to_vec()]);
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished(), "another record's write");
+    relay.applied(&[b"consumer:a".to_vec()]);
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("woken")
+        .expect("task");
+    assert!(changed);
+}
+
+/// A write whose keys are not known wakes every waiting watch.
+#[tokio::test]
+async fn an_unknown_write_wakes_a_waiting_watch() {
+    let watches = relayed();
+    let mut watch = watches.watch(b"consumer:a".to_vec());
+    assert!(watch.changed());
+    let relay = Arc::clone(&watches);
+    let waiter = tokio::spawn(async move { watch.wait().await });
+    tokio::task::yield_now().await;
+    relay.applied_unknown();
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("woken")
+        .expect("task");
+}
+
 /// Watches of one record share its generation, and the entry goes with the
 /// last of them.
 #[test]

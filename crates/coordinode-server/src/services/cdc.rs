@@ -633,8 +633,9 @@ async fn stream_consumer(mut s: StreamState) {
 
         if caught_up {
             // Heartbeat so a BOUNDED liveness timeout sees a connected reader,
-            // then sleep until an entry applies, the client leaves, or the
-            // next heartbeat is due.
+            // then sleep until an entry applies, a write to the registration
+            // applies (the relay may notice it after the entry woke us), the
+            // client leaves, or the next heartbeat is due.
             if let Err(e) = s.registry.heartbeat(&s.handle) {
                 tracing::warn!(error = %e, "change stream heartbeat failed");
             }
@@ -647,10 +648,12 @@ async fn stream_consumer(mut s: StreamState) {
                             s.applied_changes = None;
                         }
                     }
+                    () = s.watch.wait() => {}
                     () = s.delivery.closed() => break,
                     () = heartbeat => {}
                 },
                 None => tokio::select! {
+                    () = s.watch.wait() => {}
                     () = s.delivery.closed() => break,
                     () = heartbeat => {}
                 },
