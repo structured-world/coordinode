@@ -250,19 +250,44 @@ async fn vector_search_reports_ready_health_and_hlc_header() {
     assert_eq!(health.indexed_hlc, 4242);
 }
 
-/// A rebuilding index surfaces `Rebuilding{progress, indexed_hlc}` in the
-/// response metadata so a caller can apply its VECTOR_REBUILD_POLICY.
+/// A rebuilding index under the partial-recall policy serves from the graph
+/// it holds and surfaces `Rebuilding{progress, indexed_hlc}` in the response
+/// metadata, so the caller sees what it was served from. (Under the default
+/// block policy the search waits for the rebuild instead.)
 #[tokio::test]
 async fn vector_search_reports_rebuilding_health() {
     use query::vector_index_health::ServingState;
-    let (svc, _dir) = test_service_with_index("Vec", "embedding", 3);
-
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut database = Database::open(dir.path()).expect("open database");
+    database
+        .execute_cypher(
+            "CREATE VECTOR INDEX test_vec_idx ON :Vec(embedding) \
+             OPTIONS {dimensions: 3, metric: \"l2\", online_during_build: \"partial-recall\"}",
+        )
+        .expect("create vector index");
+    // The creating build ends first, so the rebuild below is the only one.
+    let built_by = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !database
+        .vector_index_registry()
+        .health_snapshot("Vec", "embedding")
+        .is_some_and(|h| h.is_ready())
     {
+        assert!(std::time::Instant::now() < built_by, "never built");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let svc = VectorServiceImpl::new(Arc::new(RwLock::new(database)));
+
+    let folded = {
         let db = svc.database.write();
         let reg = db.vector_index_registry();
         reg.advance_indexed_hlc_all(900);
+        let folded = match reg.health_snapshot("Vec", "embedding") {
+            Some(coordinode_vector::health::IndexHealthState::Ready { indexed_hlc }) => indexed_hlc,
+            other => panic!("the built index is ready, got {other:?}"),
+        };
         reg.report_health_rebuild("Vec", "embedding", 0.42, 1_500);
-    }
+        folded
+    };
 
     let resp = svc
         .vector_search(Request::new(query::VectorSearchRequest {
@@ -282,7 +307,7 @@ async fn vector_search_reports_rebuilding_health() {
     assert!((health.rebuild_progress - 0.42).abs() < 1e-3);
     assert_eq!(health.eta_ms, 1_500);
     // The watermark folded so far survives the rebuild transition.
-    assert_eq!(health.indexed_hlc, 900);
+    assert_eq!(health.indexed_hlc, folded);
 }
 
 /// A query that runs without a managed HNSW index (brute-force fallback)
