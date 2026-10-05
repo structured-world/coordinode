@@ -20,7 +20,7 @@
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
 # anything when one is missing. Logs and the status file land in
-# target/linux-check/ locally; the run's directory on the host, build output
+# target/linux-check/<host>/ locally; the run's directory on the host, build output
 # included, is removed afterwards. The exit code is 0 only when the run got to
 # its end and every step in the status file passed.
 set -euo pipefail
@@ -32,7 +32,6 @@ host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of th
 # second run on the same host waits for no one; it stops and says why.
 remote_root="/var/tmp/cn-check"
 locked=0
-ref='refs/check/linux'
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 only_bench="${COORDINODE_CHECK_BENCH:-}"
 # Extra NAME=value assignments exported for the bench run only.
@@ -59,7 +58,11 @@ fi"; then
   exit 1
 fi
 
-out="$repo/target/linux-check"
+# One local directory and one snapshot ref per host, so runs on two hosts at
+# once (a gate on one, a measurement on another) keep their logs apart.
+host_dir="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+out="$repo/target/linux-check/$host_dir"
+ref="refs/check/linux/$host_dir"
 mkdir -p "$out"
 # shellcheck source=../check-verdict.sh
 . "$repo/scripts/check-verdict.sh"
