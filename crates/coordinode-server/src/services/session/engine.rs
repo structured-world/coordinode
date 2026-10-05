@@ -187,6 +187,12 @@ impl CursorEngine for DatabaseCursorEngine {
                 admitted.read_concern.at_timestamp,
                 fenced,
             )?;
+            // Counted at its first page; later pages are served as the
+            // client asks for them.
+            crate::services::statement::observe_query(
+                crate::services::statement::QueryKind::Read,
+                start,
+            );
             self.executor.record(query, source.as_ref(), start);
             return Ok(Box::new(cursor));
         }

@@ -350,8 +350,21 @@ impl StatementExecutor {
         source: Option<&SourceContext>,
         admitted: &Admitted,
     ) -> Result<CypherResult, DatabaseError> {
-        self.writer
-            .execute(query, params, source, &admitted.options())
+        let started = Instant::now();
+        metrics::gauge!("coordinode_query_active").increment(1.0);
+        let result = self
+            .writer
+            .execute(query, params, source, &admitted.options());
+        metrics::gauge!("coordinode_query_active").decrement(1.0);
+        // A statement that committed writes reports where they landed; one
+        // that did not is a read.
+        let kind = match &result {
+            Ok(r) if r.commit_ts().is_some() => QueryKind::Write,
+            Ok(_) => QueryKind::Read,
+            Err(_) => QueryKind::Failed,
+        };
+        observe_query(kind, started);
+        result
     }
 
     /// Record a finished statement for the advisor: its fingerprint, timing,
@@ -466,6 +479,38 @@ pub(crate) const FORWARDED_HEADER: &str = "x-coordinode-forwarded";
 
 /// How many nodes handled this request: 0 local, 1 forwarded, 2+ scattered.
 pub(crate) const HOPS_HEADER: &str = "x-coordinode-hops";
+
+/// What a finished statement was, as the query metrics count it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryKind {
+    /// It read and committed nothing.
+    Read,
+    /// It committed writes of its own.
+    Write,
+    /// It failed.
+    Failed,
+}
+
+impl QueryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Count a statement that started at `started` in the query metrics.
+pub(crate) fn observe_query(kind: QueryKind, started: Instant) {
+    let kind = kind.label();
+    metrics::histogram!("coordinode_query_duration_seconds", "type" => kind)
+        .record(started.elapsed().as_secs_f64());
+    metrics::counter!("coordinode_query_total", "type" => kind).increment(1);
+    if kind == QueryKind::Failed.label() {
+        metrics::counter!("coordinode_query_errors_total").increment(1);
+    }
+}
 
 /// The leader named by a failure that says this node cannot take the write.
 ///

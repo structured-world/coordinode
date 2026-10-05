@@ -109,11 +109,14 @@ fn register_query_metrics() {
     // Cypher
     metrics::describe_histogram!(
         "coordinode_query_duration_seconds",
-        "Query duration by type and operation"
+        "Statement duration by type (read, write, failed)"
     );
-    metrics::describe_counter!("coordinode_query_total", "Queries executed by type");
-    metrics::describe_counter!("coordinode_query_errors_total", "Query errors by type");
-    metrics::describe_gauge!("coordinode_query_active", "Currently executing queries");
+    metrics::describe_counter!(
+        "coordinode_query_total",
+        "Statements finished by type (read, write, failed)"
+    );
+    metrics::describe_counter!("coordinode_query_errors_total", "Statements that failed");
+    metrics::describe_gauge!("coordinode_query_active", "Statements executing now");
 
     // Vector search
     metrics::describe_histogram!(

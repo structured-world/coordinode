@@ -47,6 +47,44 @@ pub(crate) async fn raft() -> (StatementExecutor, Arc<RaftNode>, tempfile::TempD
     (executor, node, dir)
 }
 
+/// Every executed statement is counted under what it did: a write that
+/// committed, a read, or a failure, which also counts as an error.
+#[test]
+fn statements_are_counted_by_what_they_did() {
+    let (executor, _dir) = standalone();
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for query in [
+                "CREATE (:T {v: 1})",
+                "MATCH (t:T) RETURN t.v",
+                "MATCH (t:T) RETURN no_such_function(t.v)",
+            ] {
+                let Ok(Admission::Run(admitted)) =
+                    executor.admit(query, &Requested::default(), false).await
+                else {
+                    panic!("{query} was not admitted to run here");
+                };
+                let _ = executor.execute(query, None, None, &admitted);
+            }
+        });
+    });
+    let text = handle.render();
+    for kind in ["write", "read", "failed"] {
+        assert!(
+            text.contains(&format!(r#"coordinode_query_total{{type="{kind}"}} 1"#)),
+            "{kind}: {text}"
+        );
+    }
+    assert!(text.contains("coordinode_query_errors_total 1"), "{text}");
+    assert!(text.contains("coordinode_query_active 0"), "{text}");
+}
+
 /// What a statement leaves out comes from the defaults, what it names wins,
 /// and the write concern it leaves out stays unset for the database to fill.
 #[test]
