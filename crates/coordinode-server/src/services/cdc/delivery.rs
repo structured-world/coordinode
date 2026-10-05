@@ -144,11 +144,12 @@ impl Delivery {
         }
     }
 
-    /// Send `events`, at most the room last returned. `Err` once the client
-    /// is gone.
+    /// Send `events`, at most the room last returned; `more` when applied
+    /// entries were left past them. `Err` once the client is gone.
     pub(crate) async fn send(
         &self,
         events: Vec<ChangeEvent>,
+        more: bool,
         registry: &ShardConsumerRegistry,
         handle: &RegisteredHandle,
         heartbeat_interval: Duration,
@@ -177,7 +178,7 @@ impl Delivery {
                 credit.take(events.len() as u64);
                 let frame = ServerFrame {
                     request_id: *request_id,
-                    event: Some(Event::ChangeEvents(ChangeEventBatch { events })),
+                    event: Some(Event::ChangeEvents(ChangeEventBatch { events, more })),
                 };
                 frames.send(Ok(frame)).await.map_err(|_| ())
             }

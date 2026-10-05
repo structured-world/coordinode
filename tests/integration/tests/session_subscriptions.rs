@@ -138,9 +138,25 @@ fn events_for(frames: &[ServerFrame], request_id: u64) -> usize {
         .sum()
 }
 
+/// Whether the last change-event batch for `request_id` among `frames` said
+/// applied entries were still waiting past it.
+fn last_more(frames: &[ServerFrame], request_id: u64) -> bool {
+    frames
+        .iter()
+        .rev()
+        .filter(|f| f.request_id == request_id)
+        .find_map(|f| match &f.event {
+            Some(Event::ChangeEvents(batch)) => Some(batch.more),
+            _ => None,
+        })
+        .expect("a batch")
+}
+
 /// A subscription is sent exactly as many events as its client granted, in
-/// batches; more credit releases more. A subscription with no credit left
-/// sends nothing and does not hold up the session's queries.
+/// batches; more credit releases more. A batch cut short by the credit says
+/// more is waiting, and the one that reaches everything applied says not. A
+/// subscription with no credit left sends nothing and does not hold up the
+/// session's queries.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_is_sent_what_its_credit_allows() {
     let proc = CoordinodeProcess::start().await;
@@ -161,6 +177,7 @@ async fn a_subscription_is_sent_what_its_credit_allows() {
         frames.push(frame);
     }
     assert_eq!(events_for(&frames, 1), 3, "the initial credit");
+    assert!(last_more(&frames, 1), "the log holds more than 3 entries");
 
     // Out of credit: a query on the same session still answers at once.
     s.run(200, "RETURN 1 AS one", &mut frames).await;
@@ -181,6 +198,21 @@ async fn a_subscription_is_sent_what_its_credit_allows() {
         7,
         "the initial and the granted credit"
     );
+
+    // Enough credit to drain the log: the last batch reaches the end.
+    s.send(
+        3,
+        client_frame::Op::Credit(Credit {
+            target_request_id: 1,
+            events: 10_000,
+        }),
+    )
+    .await;
+    while let Some(frame) = s.next(Duration::from_millis(500)).await {
+        frames.push(frame);
+    }
+    assert!(events_for(&frames, 1) > 7, "the rest of the log");
+    assert!(!last_more(&frames, 1), "drained to what was applied");
 }
 
 /// Acknowledging and cancelling ride the session: an acknowledgement is

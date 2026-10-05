@@ -614,9 +614,17 @@ async fn stream_consumer(mut s: StreamState) {
                 }),
             });
         }
+        // Applied entries left past the read: the room, not the log, ended it.
+        let more = s.position < until;
         if !events.is_empty()
             && s.delivery
-                .send(events, &s.registry, &s.handle, s.tuning.heartbeat_interval)
+                .send(
+                    events,
+                    more,
+                    &s.registry,
+                    &s.handle,
+                    s.tuning.heartbeat_interval,
+                )
                 .await
                 .is_err()
         {
