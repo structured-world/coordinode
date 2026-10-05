@@ -114,22 +114,33 @@ fn create_items(db: &mut Database, range: std::ops::Range<usize>) {
     .expect("create items");
 }
 
-fn nearest(db: &mut Database, i: usize) -> Option<i64> {
-    db.execute_cypher(&format!(
-        "MATCH (n:Item) WITH *, vector_distance(n.embedding, [{}]) AS d \
-         ORDER BY d ASC LIMIT 1 RETURN n.ext_id AS ext_id",
-        spread_vector(i)
-    ))
-    .expect("vector search")
-    .first()
-    .and_then(|row| row.get("ext_id"))
-    .and_then(|v| v.as_int())
+/// The node id of every item written as a row from `from` on, by row, in one
+/// scan.
+fn node_ids_from(db: &mut Database, from: usize) -> Vec<(usize, u64)> {
+    let mut ids: Vec<(usize, u64)> = db
+        .execute_cypher(&format!(
+            "MATCH (n:Item) WHERE n.ext_id >= {from} RETURN n.ext_id AS row, id(n) AS id"
+        ))
+        .expect("look up items")
+        .iter()
+        .map(|r| {
+            let field = |name: &str| r.get(name).and_then(|v| v.as_int()).expect(name);
+            (
+                usize::try_from(field("row")).expect("rows are not negative"),
+                u64::try_from(field("id")).expect("node ids are not negative"),
+            )
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Statements that keep committing for the whole length of a build, each in
 /// its own transaction, some before the handover and some after: every
-/// vector they wrote is in the index when the build is done, found by the
-/// index itself.
+/// vector they wrote is in the index's graph once the worker has folded what
+/// applied. Membership is checked on the graph itself: a nearest-neighbour
+/// search is approximate and misses a point now and then (1 in 24,900 seen)
+/// for reasons unrelated to whether the build kept the write.
 #[test]
 fn every_write_across_a_build_is_in_the_index() {
     const N: usize = 6000;
@@ -154,12 +165,29 @@ fn every_write_across_a_build_is_in_the_index() {
     }
     assert!(during > 1, "the build finished before the writes started");
 
-    let missing: Vec<usize> = (N..late)
-        .filter(|&i| nearest(&mut db, i) != Some(i as i64))
+    let ids = node_ids_from(&mut db, N);
+    assert_eq!(ids.len(), late - N, "every row written is in the store");
+    let registry = db.vector_index_registry();
+    // The embedded database keeps its nodes on shard 1.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !registry.delta(1).is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the vector worker did not fold the applied writes within 60 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let handle = registry.get("Item", "embedding").expect("the index");
+    let graph = handle.read().expect("the graph");
+    let missing: Vec<usize> = ids
+        .iter()
+        .filter(|&&(_, id)| !graph.contains(id))
+        .map(|&(i, _)| i)
         .collect();
+    drop(graph);
     assert!(
         missing.is_empty(),
-        "{} of {} vectors written across the build are not found by the index: {missing:?}",
+        "{} of {} vectors written across the build are not in the index: {missing:?}",
         missing.len(),
         late - N
     );

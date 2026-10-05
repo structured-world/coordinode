@@ -264,7 +264,15 @@ async fn acknowledging_and_cancelling_ride_the_session() {
         s.answer(3, |_| {}).await,
         Event::SubscriptionCancelled(_)
     ));
-    match s.answer(1, |_| {}).await {
+    // Events applied before the end (the cancellation is itself a log entry)
+    // still arrive first; the subscription then ends.
+    let end = loop {
+        match s.answer(1, |_| {}).await {
+            Event::ChangeEvents(_) => continue,
+            other => break other,
+        }
+    };
+    match end {
         Event::Error(e) => {
             let status = e.status.expect("the canonical status");
             let status = tonic::Status::with_details(
