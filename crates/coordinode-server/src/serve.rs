@@ -822,6 +822,15 @@ pub(crate) async fn serve(
         let engine_metrics = Arc::clone(&engine);
         let version_node = Arc::clone(&raft_node);
         Arc::new(move || {
+            // Where this member stands in consensus, sampled per scrape.
+            {
+                let raft = &version_node;
+                metrics::gauge!("coordinode_raft_term").set(raft.current_term() as f64);
+                metrics::gauge!("coordinode_raft_commit_index").set(raft.commit_index() as f64);
+                metrics::gauge!("coordinode_raft_applied_index").set(raft.applied_index() as f64);
+                let leads = raft.current_leader() == Some(raft.node_id());
+                metrics::gauge!("coordinode_raft_leader").set(if leads { 1.0 } else { 0.0 });
+            }
             // This member's version, its group's, and whether it is
             // read-only or its group paused: sampled per scrape.
             {

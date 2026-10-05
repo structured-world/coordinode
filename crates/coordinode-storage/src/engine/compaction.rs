@@ -278,8 +278,16 @@ fn compaction_worker_loop(receiver: flume::Receiver<CompactionRequest>, compacte
     }) = receiver.recv()
     {
         let strategy = Arc::new(lsm_tree::compaction::Leveled::default());
+        let started = std::time::Instant::now();
         match tree.compact(strategy, gc_watermark) {
             Ok(result) if result.action != lsm_tree::compaction::CompactionAction::Nothing => {
+                metrics::counter!("coordinode_storage_compaction_total", "partition" => partition.name())
+                    .increment(1);
+                metrics::histogram!(
+                    "coordinode_storage_compaction_duration_seconds",
+                    "partition" => partition.name()
+                )
+                .record(started.elapsed().as_secs_f64());
                 tracing::debug!(
                     partition = partition.name(),
                     ?priority,

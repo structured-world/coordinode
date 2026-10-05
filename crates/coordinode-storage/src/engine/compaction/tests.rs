@@ -95,6 +95,109 @@ fn compaction_priority_rules() {
     );
 }
 
+/// A compaction that did work is counted for its partition, with its
+/// duration. Two requests reach the worker, the second finds the merge done.
+#[test]
+fn a_compaction_that_did_work_is_counted_for_its_partition() {
+    use metrics::{CounterFn, HistogramFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+    use std::sync::Mutex;
+
+    /// What a recorder saw: name and labels of each counter increment and
+    /// histogram sample.
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<(String, Vec<(String, String)>)>>);
+    struct Handle(Key, Arc<Seen>);
+    impl CounterFn for Handle {
+        fn increment(&self, _: u64) {
+            self.record();
+        }
+        fn absolute(&self, _: u64) {}
+    }
+    impl HistogramFn for Handle {
+        fn record(&self, _: f64) {
+            Handle::record(self);
+        }
+    }
+    impl Handle {
+        fn record(&self) {
+            let labels = self
+                .0
+                .labels()
+                .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                .collect();
+            self.1
+                .0
+                .lock()
+                .expect("seen")
+                .push((self.0.name().to_owned(), labels));
+        }
+    }
+    struct Capture(Arc<Seen>);
+    impl Recorder for Capture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(Handle(key.clone(), Arc::clone(&self.0))))
+        }
+        fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> metrics::Histogram {
+            metrics::Histogram::from_arc(Arc::new(Handle(key.clone(), Arc::clone(&self.0))))
+        }
+    }
+
+    let (trees, _dir) = make_test_trees();
+    let tree = trees.get(&Partition::Node).expect("node tree").clone();
+    let seqno = lsm_tree::SequenceNumberCounter::default();
+    // Overlapping L0 tables, enough for the leveled strategy to merge them.
+    for round in 0_u64..8 {
+        for i in 0_u64..20 {
+            tree.insert(
+                format!("key{i:04}").as_bytes(),
+                round.to_le_bytes(),
+                seqno.next(),
+            );
+        }
+        tree.rotate_memtable();
+        let lock = tree.get_flush_lock();
+        tree.flush(&lock, 0).expect("flush");
+    }
+
+    let seen = Arc::new(Seen::default());
+    let recorder = Capture(Arc::clone(&seen));
+    let (sender, receiver) = flume::bounded(2);
+    for _ in 0..2 {
+        sender
+            .send(CompactionRequest {
+                tree: tree.clone(),
+                partition: Partition::Node,
+                priority: CompactionPriority::Urgent,
+                gc_watermark: seqno.get(),
+            })
+            .expect("queue");
+    }
+    drop(sender);
+    let compacted = Wake::default();
+    metrics::with_local_recorder(&recorder, || compaction_worker_loop(receiver, &compacted));
+
+    let seen = seen.0.lock().expect("seen");
+    let node = |name: &str| {
+        seen.iter()
+            .filter(|(n, labels)| {
+                n == name && labels.iter().any(|(k, v)| k == "partition" && v == "node")
+            })
+            .count()
+    };
+    let total = node("coordinode_storage_compaction_total");
+    assert!(total >= 1, "a compaction that merged the tables: {seen:?}");
+    assert_eq!(
+        node("coordinode_storage_compaction_duration_seconds"),
+        total
+    );
+}
+
 #[test]
 fn compaction_priority_ordering() {
     // Urgent < High < Normal < Low (lower value = higher priority via Ord).
