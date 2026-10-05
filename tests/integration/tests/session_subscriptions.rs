@@ -69,10 +69,9 @@ impl Session {
     /// `other`.
     async fn answer(&mut self, request_id: u64, mut other: impl FnMut(ServerFrame)) -> Event {
         loop {
-            let frame = self
-                .next(Duration::from_secs(10))
-                .await
-                .expect("an answer within 10 s");
+            let Some(frame) = self.next(Duration::from_secs(10)).await else {
+                panic!("no answer to request {request_id} within 10 s");
+            };
             if frame.request_id == request_id {
                 return frame.event.expect("an event");
             }
@@ -261,16 +260,29 @@ async fn acknowledging_and_cancelling_ride_the_session() {
         }),
     )
     .await;
+    // The subscription may end before the cancellation is answered: the two
+    // are answers to different requests, in no fixed order, so its frames
+    // are kept rather than dropped while waiting.
+    let mut subscription = Vec::new();
     assert!(matches!(
-        s.answer(3, |_| {}).await,
+        s.answer(3, |f| subscription.push(f)).await,
         Event::SubscriptionCancelled(_)
     ));
     // Events applied before the end (the cancellation is itself a log entry)
     // still arrive first; the subscription then ends.
+    let mut subscription = subscription.into_iter();
     let end = loop {
-        match s.answer(1, |_| {}).await {
-            Event::ChangeEvents(_) => continue,
-            other => break other,
+        let frame = match subscription.next() {
+            Some(frame) => frame,
+            None => match s.next(Duration::from_secs(10)).await {
+                Some(frame) => frame,
+                None => panic!("the cancelled subscription did not end within 10 s"),
+            },
+        };
+        match (frame.request_id, frame.event) {
+            (1, Some(Event::ChangeEvents(_))) => continue,
+            (1, Some(other)) => break other,
+            other => panic!("unexpected frame {other:?}"),
         }
     };
     match end {
