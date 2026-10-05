@@ -59,8 +59,13 @@ $env:CARGO_TARGET_DIR = $target
 
 if ($Nextest) {
     $extra = $Nextest -split '\s+' | Where-Object { $_ }
-    cargo nextest run --all-features --workspace --no-fail-fast --failure-output final @extra *> (Join-Path $Root 'test.log')
-    "nextest=$LASTEXITCODE" | Out-File -Append $status
+    $log = Join-Path $Root 'test.log'
+    cargo nextest run --all-features --workspace --no-fail-fast --failure-output final @extra *> $log
+    $code = $LASTEXITCODE
+    # A stress run (--stress-count) exits 0 when some of its iterations
+    # failed (cargo-nextest 0.9.146); its summary line still counts them.
+    if ($code -eq 0 -and (Select-String -Path $log -Pattern '^\s*Summary .* [1-9][0-9]* failed' -Quiet)) { $code = 1 }
+    "nextest=$code" | Out-File -Append $status
     Set-Location $Root
     Remove-Item -Recurse -Force $src, $target, $Bundle -ErrorAction SilentlyContinue
     'done' | Out-File -Append $status

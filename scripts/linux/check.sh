@@ -17,6 +17,14 @@
 # COORDINODE_CHECK_BENCH='-p coordinode-vector --bench hnsw_publication');
 # its output lands in bench.log.
 #
+# With COORDINODE_CHECK_PROFILE set (the same `cargo bench` arguments), the
+# bench runs with line tables and `perf` samples it once its output prints a
+# line matching COORDINODE_CHECK_PROFILE_AFTER (an extended regex; from the
+# start when unset), for COORDINODE_CHECK_PROFILE_SECONDS (30 by default).
+# The bench output lands in bench.log, the hottest call paths in profile.txt
+# and, when the host has inferno, a flame graph in profile.svg. The host
+# needs perf.
+#
 # The host needs git, the pinned Rust toolchain, cargo-nextest and protoc
 # (scripts/linux/provision.sh installs them); the run stops before uploading
 # anything when one is missing. Logs and the status file land in
@@ -34,6 +42,9 @@ remote_root="/var/tmp/cn-check"
 locked=0
 only_nextest="${COORDINODE_CHECK_NEXTEST:-}"
 only_bench="${COORDINODE_CHECK_BENCH:-}"
+only_profile="${COORDINODE_CHECK_PROFILE:-}"
+profile_after="${COORDINODE_CHECK_PROFILE_AFTER:-}"
+profile_seconds="${COORDINODE_CHECK_PROFILE_SECONDS:-30}"
 # Extra NAME=value assignments exported for the bench run only.
 bench_env="${COORDINODE_CHECK_BENCH_ENV:-}"
 
@@ -142,13 +153,60 @@ echo done >> ../status.txt" || true
   exit
 fi
 
+if [ -n "$only_profile" ]; then
+  ssh "$host" "set -u
+cd '$remote_root'
+$checkout
+if ! command -v perf >/dev/null 2>&1; then
+  echo 'perf is missing on the host' > ../profile.txt
+  echo perf=1 >> ../status.txt
+  echo done >> ../status.txt
+  exit 0
+fi
+export CARGO_TARGET_DIR='$remote_root/target' CARGO_PROFILE_BENCH_DEBUG=line-tables-only CARGO_PROFILE_BENCH_STRIP=none $bench_env
+cargo bench $only_profile --no-run > ../bench-build.log 2>&1
+echo build=\$? >> ../status.txt
+bin=\$(sed -n 's/.*Executable .*(\(.*\))\$/\1/p' ../bench-build.log | tail -n 1)
+if command -v sccache >/dev/null 2>&1; then sccache --stop-server >/dev/null 2>&1; fi
+\"\$bin\" --bench > ../bench.log 2>&1 &
+pid=\$!
+if [ -n '$profile_after' ]; then
+  until grep -Eq '$profile_after' ../bench.log || ! kill -0 \$pid 2>/dev/null; do sleep 1; done
+fi
+perf record -F 499 --call-graph dwarf,16384 -p \$pid -o ../perf.data -- sleep '$profile_seconds' > ../perf.log 2>&1
+echo perf=\$? >> ../status.txt
+kill \$pid 2>/dev/null
+wait \$pid 2>/dev/null
+{
+  echo '== self time =='
+  perf report -i ../perf.data --stdio --no-children -g none --percent-limit 0.5
+  echo '== with callees =='
+  perf report -i ../perf.data --stdio --children -g none --percent-limit 2
+  echo '== call paths into the hottest functions =='
+  perf report -i ../perf.data --stdio --no-children -g caller,2,callee,function,percent --percent-limit 5
+} > ../profile.txt 2>> ../perf.log
+if command -v inferno-collapse-perf >/dev/null 2>&1; then
+  perf script -i ../perf.data 2>> ../perf.log | inferno-collapse-perf | inferno-flamegraph > ../profile.svg
+fi
+echo done >> ../status.txt" || true
+  for f in status.txt bench-build.log bench.log perf.log profile.txt profile.svg; do
+    ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
+  done
+  check_verdict "$out/status.txt"
+  exit
+fi
+
 if [ -n "$only_nextest" ]; then
   ssh "$host" "set -u
 cd '$remote_root'
 $checkout
 export RUSTFLAGS='-D warnings' COORDINODE_TEST_RAFT_GENEROUS_TIMEOUTS=1 CARGO_TARGET_DIR='$remote_root/target'
 cargo nextest run --all-features --workspace --no-fail-fast --failure-output final $only_nextest > ../test.log 2>&1
-echo nextest=\$? >> ../status.txt
+code=\$?
+# A stress run (--stress-count) exits 0 when some of its iterations failed
+# (cargo-nextest 0.9.146); its summary line still counts them.
+if [ \$code = 0 ] && grep -Eq '^ *Summary .* [1-9][0-9]* failed' ../test.log; then code=1; fi
+echo nextest=\$code >> ../status.txt
 echo done >> ../status.txt" || true
   for f in status.txt test.log; do
     ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true

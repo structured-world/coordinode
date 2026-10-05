@@ -9,6 +9,9 @@
 //! distribution of single-query latencies, with the store's size on disk.
 //!
 //! Run: cargo bench -p coordinode-embed --bench text_history
+//!
+//! `TEXT_HISTORY_CHURN` (comma-separated counts, e.g. `10000`) measures only
+//! those steps, the rewrites still applied in between, to profile one case.
 
 #![allow(clippy::expect_used, clippy::print_stdout)]
 
@@ -149,9 +152,17 @@ fn main() {
     let t0 = db.read_ts().as_raw();
     println!("== full-text read, {DOCS} docs x {WORDS_PER_DOC} words, vocabulary {VOCABULARY} ==");
 
+    let measured: Vec<usize> = std::env::var("TEXT_HISTORY_CHURN").map_or_else(
+        |_| CHURN.to_vec(),
+        |list| {
+            list.split(',')
+                .map(|n| n.trim().parse().expect("TEXT_HISTORY_CHURN: a count"))
+                .collect()
+        },
+    );
     let query = "MATCH (n:Doc) WHERE text_match(n.body, 'w7') RETURN n.id";
     let mut rewritten = 0;
-    for churn in CHURN {
+    for churn in measured {
         while rewritten < churn {
             let tx = db.begin_transaction();
             for _ in 0..100.min(churn - rewritten) {
