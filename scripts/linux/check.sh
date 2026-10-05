@@ -87,9 +87,15 @@ index="$(mktemp)"
 cleanup() {
   rm -f "$index"
   git -C "$repo" update-ref -d "$ref" 2>/dev/null || true
-  # Only the run that took the lock removes the directory.
+  # Only the run that took the lock removes the directory. A lookup or
+  # connection failure at this point would leave the lock behind and refuse
+  # every later run, so the removal is tried a few times.
   if [ "$locked" = 1 ]; then
-    ssh "$host" "rm -rf '$remote_root'" || true
+    for attempt in 1 2 3 4 5; do
+      ssh "$host" "rm -rf '$remote_root'" && break
+      echo "cleanup attempt $attempt on $host failed; retrying" >&2
+      sleep 10
+    done
   fi
 }
 trap cleanup EXIT
