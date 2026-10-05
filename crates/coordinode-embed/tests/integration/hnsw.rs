@@ -2177,9 +2177,11 @@ fn forced_offload_cypher_e2e() {
         .expect("create");
     }
 
-    // Force SQ8 calibration + offloading
+    // Force SQ8 calibration + offloading. Calibration reads the graph itself,
+    // which the vector worker fills after the commits apply.
     {
         let reg = db.vector_index_registry();
+        await_folded(reg);
         let handle = reg.get("Part", "emb").expect("index");
         let mut hnsw = handle.write().expect("lock");
         let params = coordinode_vector::quantize::Sq8Params::calibrate_from_index(&mut hnsw)
