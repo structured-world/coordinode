@@ -113,16 +113,6 @@ fn building_vector_index() -> (
         crate::index::IndexId::from_raw(1),
         crate::index::GenerationId::from_raw(1),
     );
-    crate::index::ops::save_index_definition(&engine, &def).expect("persist definition");
-    crate::index::ops::save_index_state(
-        &engine,
-        def.id,
-        IndexState::Building {
-            written: 0,
-            estimated_total: 0,
-        },
-    )
-    .expect("persist building");
     let registry = crate::index::VectorIndexRegistry::new();
     registry.register_for_build(def, None);
     (dir, oracle, engine, registry)

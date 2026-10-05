@@ -132,6 +132,10 @@ impl BuildEnvironment for TestEnv {
         &self.registry
     }
 
+    fn text_registry(&self) -> Option<&crate::index::TextIndexRegistry> {
+        None
+    }
+
     fn commit_page(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
         commit(txn)
     }

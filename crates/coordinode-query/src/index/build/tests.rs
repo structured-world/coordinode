@@ -216,12 +216,19 @@ fn a_page_of_a_replaced_definition_writes_nothing() {
     put_node(&mut fx, 1, "User", &email("alice@x"));
 
     let store = LocalIndexStore::new(&fx.engine);
+    let (engine, oracle) = (&fx.engine, &fx.oracle);
+    // A catalog write of its own, as a statement commits one.
+    let put = |def: &IndexDefinition| {
+        let mut txn = Transaction::begin(engine, Some(oracle), oracle.next());
+        store.put_definition_txn(&mut txn, def).expect("stage");
+        commit(&mut txn).expect("commit definition");
+    };
     let index = bound(crate::index::IndexDescriptor::btree(
         "user_email",
         "User",
         "email",
     ));
-    store.put_definition(&index).expect("publish");
+    put(&index);
     let published = store.definition_version(index.id).expect("version");
     assert!(published.is_some());
 
@@ -234,7 +241,7 @@ fn a_page_of_a_replaced_definition_writes_nothing() {
                 // The record moves between the page's read and its commit.
                 let mut moved = index.clone();
                 moved.generation = crate::index::GenerationId::from_raw(2);
-                store.put_definition(&moved).expect("move");
+                put(&moved);
             }
             commit(txn)
         })

@@ -45,15 +45,6 @@ fn save_and_load_definition() {
     assert_eq!(loaded.label, "User");
     assert_eq!(loaded.property(), "email");
     assert!(loaded.unique);
-
-    // A save outside the log rewrites the record under its identity.
-    let mut changed = loaded.clone();
-    changed.description = Some("emails".into());
-    save_index_definition(&engine, &changed).expect("save");
-    assert_eq!(
-        load_index_definition(&engine, idx.id).expect("load"),
-        Some(changed)
-    );
 }
 
 #[test]
@@ -114,69 +105,4 @@ fn list_index_definitions_skips_corrupt_bodies() {
 
     let listed = list_index_definitions(&engine).expect("list");
     assert_eq!(listed, vec![real], "corrupt entry skipped, real one kept");
-}
-
-#[test]
-fn save_index_state_updates_persisted_state_only() {
-    use crate::index::definition::VectorIndexConfig;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-
-    let def = publish(
-        &engine,
-        IndexDescriptor::hnsw("v_idx", "Doc", "embed", VectorIndexConfig::default()),
-    );
-
-    let updated = save_index_state(
-        &engine,
-        def.id,
-        IndexState::Building {
-            written: 100,
-            estimated_total: 1000,
-        },
-    )
-    .expect("save state");
-    assert!(updated, "save_index_state should report success");
-
-    let reloaded = load_index_definition(&engine, def.id)
-        .expect("load")
-        .expect("present");
-    assert_eq!(
-        reloaded.state,
-        IndexState::Building {
-            written: 100,
-            estimated_total: 1000
-        }
-    );
-    assert_eq!(reloaded.name.as_deref(), Some("v_idx"));
-    assert_eq!(reloaded.label, "Doc");
-    assert_eq!(reloaded.properties, vec!["embed".to_string()]);
-    assert_eq!(reloaded.generation, def.generation);
-
-    let updated = save_index_state(&engine, def.id, IndexState::Ready).expect("save ready");
-    assert!(updated);
-    let reloaded = load_index_definition(&engine, def.id)
-        .expect("load")
-        .expect("present");
-    assert_eq!(reloaded.state, IndexState::Ready);
-}
-
-/// A state saved for an identity no record holds changes nothing: a build
-/// that outlived its index cannot mark a successor created under the name.
-#[test]
-fn save_index_state_missing_index_returns_false() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let engine = test_engine(dir.path());
-
-    let updated = save_index_state(
-        &engine,
-        crate::index::IndexId::from_raw(7),
-        IndexState::Ready,
-    )
-    .expect("save state should not error on missing");
-    assert!(
-        !updated,
-        "missing index should report not-found via Ok(false)"
-    );
 }

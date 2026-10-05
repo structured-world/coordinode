@@ -1,14 +1,14 @@
 //! Index catalog operations over [`coordinode_modality::LocalIndexStore`].
 //!
 //! Entries are maintained through the statement transaction by
-//! [`super::IndexRegistry`]; these helpers read and write the definition
-//! catalog.
+//! [`super::IndexRegistry`]; these helpers read the definition catalog,
+//! which only the log writes.
 
 use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
 
-use super::definition::{IndexDefinition, IndexId, IndexState};
+use super::definition::{IndexDefinition, IndexId};
 
 /// Convert [`coordinode_modality::StoreError`] back into the
 /// [`StorageError`] vocabulary callers of this module use.
@@ -19,32 +19,6 @@ fn map_store_err(e: StoreError) -> StorageError {
             name: format!("index store: {other}"),
         },
     }
-}
-
-/// Save an index definition to the catalog directly, outside the log. For
-/// state a member keeps about itself; a definition the deployment shares is
-/// written by the statement that creates it.
-pub fn save_index_definition(
-    engine: &StorageEngine,
-    index: &IndexDefinition,
-) -> Result<(), StorageError> {
-    LocalIndexStore::new(engine)
-        .put_definition(index)
-        .map_err(map_store_err)
-}
-
-/// Update only the `state` field of a persisted index definition.
-///
-/// Returns `Ok(false)` if the index has no persisted definition (the
-/// caller's race to handle).
-pub fn save_index_state(
-    engine: &StorageEngine,
-    id: IndexId,
-    state: IndexState,
-) -> Result<bool, StorageError> {
-    LocalIndexStore::new(engine)
-        .set_definition_state(id, state)
-        .map_err(map_store_err)
 }
 
 /// Load index definition from the index-store catalog.

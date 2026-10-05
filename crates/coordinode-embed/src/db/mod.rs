@@ -970,18 +970,6 @@ impl Database {
         if let Err(e) = index_registry.load_all(&engine) {
             tracing::warn!("failed to load index registry: {e}, starting fresh");
         }
-        let index_builds = coordinode_query::index::IndexBuildService::new(
-            Arc::new(index_builds::DatabaseBuilds {
-                engine: Arc::clone(&engine),
-                oracle: Arc::clone(&oracle),
-                pipeline: Arc::clone(&pipeline),
-                proposal_id_gen: Arc::clone(&proposal_id_gen),
-                fields: Arc::clone(&fields),
-                registry: Arc::clone(&index_registry),
-                shard_id: 1,
-            }),
-            index_builds::MAX_RUNNING,
-        );
 
         // Follow the applied commits (Raft entries, or the local commits of a
         // store without Raft) from before the rebuild below, so no commit
@@ -1043,6 +1031,19 @@ impl Database {
             Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
             text_coverage,
             1, /* shard_id */
+        );
+        let index_builds = coordinode_query::index::IndexBuildService::new(
+            Arc::new(index_builds::DatabaseBuilds {
+                engine: Arc::clone(&engine),
+                oracle: Arc::clone(&oracle),
+                pipeline: Arc::clone(&pipeline),
+                proposal_id_gen: Arc::clone(&proposal_id_gen),
+                fields: Arc::clone(&fields),
+                registry: Arc::clone(&index_registry),
+                text_registry: Arc::clone(&text_index_registry),
+                shard_id: 1,
+            }),
+            index_builds::MAX_RUNNING,
         );
 
         // Every NodeId comes from a lease the log granted, taken on the first
@@ -1399,14 +1400,12 @@ impl Database {
                             tracing::warn!(index = %def, %reason, "HNSW rebuild on open failed");
                             health.mark_offline(reason.clone());
                         }
-                        return;
                     }
                     Err(_) => {
                         for (def, _, _, health) in &members {
                             tracing::warn!(index = %def, "HNSW rebuild on open panicked");
                             health.mark_offline("panic in the rebuild on open".to_string());
                         }
-                        return;
                     }
                 }
             }
@@ -1416,45 +1415,6 @@ impl Database {
                         registry, engine, shard_id, def, field_id, hnsw, health,
                     );
                 }
-                return;
-            }
-        }
-
-        for def in hnsw_defs {
-            // Crash-recovery cleanup: a backfill that was interrupted (state
-            // == Building) or that aborted (state == Failed) leaves stale
-            // markers in schema. The rebuild above repopulated the
-            // in-memory HNSW from every node record, so the index is
-            // consistent with on-disk data; flip the persisted state back to
-            // Ready to match.
-            let needs_state_reset =
-                !matches!(def.state, coordinode_query::index::IndexState::Ready);
-            if needs_state_reset {
-                match coordinode_query::index::ops::save_index_state(
-                    engine,
-                    def.id,
-                    coordinode_query::index::IndexState::Ready,
-                ) {
-                    Ok(true) => tracing::info!(
-                        index = %def,
-                        prior = ?def.state,
-                        "reset stale index state to Ready after rebuild"
-                    ),
-                    Ok(false) => tracing::warn!(
-                        index = %def,
-                        "save_index_state returned false during state reset"
-                    ),
-                    Err(e) => tracing::warn!(
-                        index = %def,
-                        error = %e,
-                        "failed to reset index state after rebuild"
-                    ),
-                }
-                registry.set_state(
-                    &def.label,
-                    def.property(),
-                    coordinode_query::index::IndexState::Ready,
-                );
             }
         }
     }
@@ -3549,28 +3509,20 @@ impl Database {
         })?;
 
         // Register in the text index registry (creates empty tantivy index).
+        let generation = def.generation;
         self.text_index_registry
-            .register(def)
+            .register(def.clone())
             .map_err(DatabaseError::Other)?;
 
-        // Backfill from the store. The index is registered above, so a commit
-        // after the scan starts reaches it through the text worker, and the
-        // rebuild holds the index while it scans, so that commit lands after
-        // the backfill rather than under it.
-        let interner = self.fields.current()?;
-        let count = self
-            .text_index_registry
-            .rebuild_index(&label, &property, || {
-                coordinode_query::index::text_registry::stored_texts(
-                    &self.engine,
-                    self.shard_id,
-                    &interner,
-                    &label,
-                    &property,
-                )
-            })
+        // The backfill is this member's build of the index, run by the
+        // engine's executor; waiting for it cancels nothing.
+        self.index_builds
+            .run_local(
+                generation,
+                coordinode_query::index::lifecycle::text_build(label, vec![property]),
+            )
             .map_err(DatabaseError::Other)?;
-
+        let count = self.build_outcome(&def)?;
         if count > 0 {
             tracing::info!("backfilled text index with {count} document(s)");
         }

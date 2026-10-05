@@ -1402,19 +1402,24 @@ fn online_during_build_partial_recall_does_not_block() {
         .expect("partial-recall search must not error");
 }
 
-/// Crash-recovery: an index whose persisted state is `Building` (because
-/// the engine crashed mid-backfill) is rebuilt on reopen and the state is
-/// reset to `Ready`. Verified by writing a Building marker into the schema
-/// without going through the executor, closing the DB, and reopening.
+/// A vector index's build is its member's own: the graph is built from the
+/// data the member holds and its readiness is the graph's health, so the
+/// replicated definition records only that the index exists. A build, on
+/// creation or on a reopen, never writes that record, which would make the
+/// members' catalogs differ; the reopened member rebuilds its graph and
+/// serves the search.
 #[test]
-fn building_state_resets_to_ready_on_reopen() {
-    use coordinode_query::index::{IndexState, ops as index_ops};
+fn a_member_build_never_writes_the_replicated_definition() {
+    use coordinode_query::index::IndexState;
+    use coordinode_storage::engine::partition::Partition;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().to_path_buf();
+    let search = "MATCH (n:Item) \
+                  WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
+                  RETURN n.embedding AS vec";
 
-    // Step 1: open, create index synchronously, close.
-    {
+    let (key, version) = {
         let mut db = coordinode_embed::Database::open(&path).expect("first open");
         db.execute_cypher("CREATE (n:Item {embedding: [1.0, 0.0, 0.0]})")
             .expect("node");
@@ -1422,48 +1427,39 @@ fn building_state_resets_to_ready_on_reopen() {
             "CREATE VECTOR INDEX item_emb ON :Item(embedding) OPTIONS {metric: \"cosine\"}",
         )
         .expect("create");
-
-        // Inject a stale Building marker directly via the storage engine,
-        // simulating a crash that left the backfill half-done.
-        let storage = db.engine();
-        let id = super::helpers::index_named(storage, "item_emb")
-            .expect("created")
-            .id;
-        index_ops::save_index_state(
-            storage,
-            id,
-            IndexState::Building {
-                written: 0,
-                estimated_total: 1,
-            },
-        )
-        .expect("inject Building state");
-
-        // db drops here, releasing the engine.
-    }
-
-    // Step 2: reopen. The HNSW rebuild path should flip the state back
-    // to Ready after re-populating the graph from node records.
-    {
-        let mut db = coordinode_embed::Database::open(&path).expect("reopen");
-        let storage = db.engine();
-        let def =
-            super::helpers::index_named(storage, "item_emb").expect("def present after reopen");
+        let def = super::helpers::index_named(db.engine(), "item_emb").expect("created");
         assert_eq!(
             def.state,
             IndexState::Ready,
-            "reopen should reset stale Building to Ready"
+            "the definition carries no build"
         );
+        let key = def.schema_key();
+        let version = db
+            .engine()
+            .record_version(Partition::Schema, &key)
+            .expect("version");
+        // The search waits for this member's build.
+        assert_eq!(db.execute_cypher(search).expect("search").len(), 1);
+        assert_eq!(
+            db.engine()
+                .record_version(Partition::Schema, &key)
+                .expect("version"),
+            version,
+            "the finished build left the definition as published"
+        );
+        (key, version)
+    };
 
-        // And the rebuilt index serves searches without the block gate
-        // hanging on a stale state.
-        let rows = db
-            .execute_cypher(
-                "MATCH (n:Item) \
-                 WHERE vector_similarity(n.embedding, [1.0, 0.0, 0.0]) > 0.9 \
-                 RETURN n.embedding AS vec",
-            )
-            .expect("post-reopen search");
-        assert_eq!(rows.len(), 1);
-    }
+    let mut db = coordinode_embed::Database::open(&path).expect("reopen");
+    assert_eq!(
+        db.execute_cypher(search).expect("post-reopen search").len(),
+        1
+    );
+    assert_eq!(
+        db.engine()
+            .record_version(Partition::Schema, &key)
+            .expect("version"),
+        version,
+        "the rebuild on reopen left the definition as published"
+    );
 }

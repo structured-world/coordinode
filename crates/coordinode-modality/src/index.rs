@@ -47,7 +47,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
     GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexProfile,
-    IndexState, NamespaceIndexPolicy,
+    NamespaceIndexPolicy,
 };
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
@@ -153,15 +153,6 @@ pub trait IndexStore {
     /// A storage failure, or DERIVED work that cannot be derived.
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()>;
 
-    /// Persist an index definition into the schema catalog directly, outside
-    /// the log. For state this member keeps about itself (a vector index's
-    /// build state).
-    ///
-    /// # Errors
-    ///
-    /// A storage or encoding failure.
-    fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()>;
-
     /// Load a persisted index definition.
     ///
     /// # Errors
@@ -184,14 +175,6 @@ pub trait IndexStore {
     ///
     /// A storage failure.
     fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>>;
-
-    /// Update only the build `state` of a persisted definition, directly.
-    /// `Ok(false)` when no definition is stored under `id`.
-    ///
-    /// # Errors
-    ///
-    /// A storage or encoding failure.
-    fn set_definition_state(&self, id: IndexId, state: IndexState) -> StoreResult<bool>;
 
     /// Publish a new index through a statement [`Transaction`]: allocate its
     /// identity and first generation, bind its name if it has one, and stage
@@ -628,13 +611,6 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(self.engine.apply_proposal_at(mutations, 0)?)
     }
 
-    fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()> {
-        let value = encode("index definition", def)?;
-        self.engine
-            .put(Partition::Schema, &def.schema_key(), &value)?;
-        Ok(())
-    }
-
     fn load_definition(&self, id: IndexId) -> StoreResult<Option<IndexDefinition>> {
         self.engine
             .get(Partition::Schema, &IndexDefinition::schema_key_of(id))?
@@ -662,15 +638,6 @@ impl IndexStore for LocalIndexStore<'_> {
             }
         }
         Ok(out)
-    }
-
-    fn set_definition_state(&self, id: IndexId, state: IndexState) -> StoreResult<bool> {
-        let Some(mut def) = self.load_definition(id)? else {
-            return Ok(false);
-        };
-        def.state = state;
-        self.put_definition(&def)?;
-        Ok(true)
     }
 
     fn publish_definition_txn(

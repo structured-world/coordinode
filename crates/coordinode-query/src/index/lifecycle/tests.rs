@@ -352,6 +352,74 @@ fn a_build_taken_over_is_finished_once() {
     assert_eq!(env.holders(&def, "b@x"), [2]);
 }
 
+/// A build a member runs for itself reports its outcome to waiters like any
+/// other: the records it indexed, or why it failed.
+#[test]
+fn a_local_build_reports_its_outcome() {
+    let env = env();
+    let builds = service(&env);
+    let (ok, failed) = (GenerationId::from_raw(10), GenerationId::from_raw(11));
+
+    builds
+        .run_local(ok, Box::new(|_| Ok(5)))
+        .expect("run local");
+    builds
+        .run_local(
+            failed,
+            Box::new(|_| Err(BuildError::Other("no texts".into()))),
+        )
+        .expect("run local");
+
+    assert!(matches!(
+        builds.wait(ok, None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(5) })
+    ));
+    assert!(matches!(
+        builds.wait(failed, None).expect("wait"),
+        Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) if reason == "no texts"
+    ));
+}
+
+/// Builds a member runs for itself take seats like the others: with one
+/// seat, a second build waits until the first has finished.
+#[test]
+fn local_builds_take_seats() {
+    let env = env();
+    let builds = env.service(1);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (first, second) = (GenerationId::from_raw(10), GenerationId::from_raw(11));
+
+    builds
+        .run_local(
+            first,
+            Box::new(move |_| {
+                held.recv().expect("released");
+                Ok(1)
+            }),
+        )
+        .expect("run first");
+    builds
+        .run_local(second, Box::new(|_| Ok(2)))
+        .expect("run second");
+
+    assert!(
+        builds
+            .wait(second, Some(Duration::from_millis(200)))
+            .expect("wait")
+            .is_none(),
+        "the second build waits for the seat the first holds"
+    );
+    release.send(()).expect("release");
+    assert!(matches!(
+        builds.wait(second, None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(2) })
+    ));
+    assert!(matches!(
+        builds.wait(first, None).expect("wait"),
+        Some(IndexBuildOutcome::Published { indexed: Some(1) })
+    ));
+}
+
 /// An index dropped while its build runs takes the build with it: the drop
 /// leaves the running build's record alone, the executor, its pages fenced
 /// by the deleted definition, writes no entry, removes its record and ends

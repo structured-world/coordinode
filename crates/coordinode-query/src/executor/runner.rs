@@ -1858,19 +1858,6 @@ impl<'a> ExecutionContext<'a> {
         error
     }
 
-    /// Publish a new index transactionally (CREATE INDEX DDL): the catalog
-    /// allocates its identities and binds its name in the statement
-    /// transaction, through the Layer-4 index store, which owns the catalog
-    /// keyspace and encoding; Layer 5 names neither.
-    pub fn mvcc_publish_index_def(
-        &mut self,
-        descriptor: crate::index::IndexDescriptor,
-    ) -> Result<crate::index::IndexDefinition, ExecutionError> {
-        use coordinode_modality::{IndexStore as _, LocalIndexStore};
-        self.sync_txn_state();
-        Ok(LocalIndexStore::new(self.engine).publish_definition_txn(&mut self.txn, descriptor)?)
-    }
-
     /// Publish a new index as a catalog commit of its own, outside the
     /// statement transaction: the catalog gives it its identities and binds
     /// its name in that commit, so the index exists for every member before
@@ -10311,105 +10298,79 @@ fn execute_create_from_pattern(
     }
 }
 
-/// Gate a vector search against the index's persisted build state and
-/// online-during-build policy. Returns `Ok(())` when the caller can use
-/// the in-memory HNSW handle, `Err(...)` when the caller must abort.
+/// Gate a vector search against this member's build of the index and its
+/// online-during-build policy. Returns `Ok(())` when the caller can use the
+/// in-memory HNSW handle, `Err(...)` when the caller must abort.
 ///
-/// Under `Block` the reader waits at most `indexes.build_wait`, the bound
-/// its caller chose (query hint, else session setting).
+/// The graph is this member's own, built from the data it holds, so its
+/// readiness is the graph's health signal, never the replicated definition.
+/// Under `Block` the reader waits at most `indexes.build_wait`, the bound its
+/// caller chose (query hint, else session setting).
 ///
-/// Cost: when the in-memory registry policy is `PartialRecall` this is a
-/// single map lookup with no schema read — the dominant common case.
-/// `Block` and `Offline` policies plus the rarely-hit `Failed` recovery
-/// path consult the persisted schema for a fresh state.
+/// Cost: under `PartialRecall` this is a single map lookup, the dominant
+/// common case.
 fn gate_vector_index_read(
     indexes: VectorIndexes<'_>,
     label: &str,
     property: &str,
 ) -> Result<(), ExecutionError> {
     let registry = indexes.registry;
-    let engine: &StorageEngine = indexes.engine;
     let Some(def) = registry.get_definition(label, property) else {
         // No registered def — caller will fall back to brute-force or
         // return an empty result. Not our gate to enforce.
         return Ok(());
     };
 
-    // PartialRecall: short-circuit before any schema read. Matches the
-    // pre-policy behaviour (search whatever's in the graph right now).
+    // PartialRecall: search whatever the graph holds right now.
     if def.online_during_build == OnlineDuringBuild::PartialRecall {
         return Ok(());
     }
+    // A graph without a health signal is not being built.
+    let Some(health) = registry.health_handle(label, property) else {
+        return Ok(());
+    };
 
-    // For Block / Offline, fetch the live state from schema so we react
-    // to backfill completion that happened after registry registration.
-    // Block polls until the backfill completes (matching the legacy
-    // synchronous-build semantic), Offline returns an error immediately.
-    //
-    // This node's own graph is what the read uses, and its health turns
-    // ready when the build hands maintenance to the writers. The persisted
-    // state lags behind that: the build then keeps folding in the writes of
-    // the transactions opened before the handover, this one among them, so a
-    // reader waiting for the persisted state would wait for itself.
-    let local = registry.health_handle(label, property);
+    // The health turns ready when the build hands maintenance to the
+    // writers; the build then keeps folding in the writes of the
+    // transactions opened before the handover, this one among them, so a
+    // reader waits for the handover, never for the build's end.
     let wait = indexes.build_wait;
     // A wait too long to add to the clock is no bound at all.
     let deadline = std::time::Instant::now().checked_add(wait);
     let poll_step = std::time::Duration::from_millis(25);
     loop {
-        if let Some(health) = &local {
-            let state = health.snapshot();
-            if state.is_ready() {
-                return Ok(());
-            }
-            if state.is_offline() {
-                return Err(ExecutionError::Unsupported(format!(
-                    "vector index '{def}' failed to build on this node"
-                )));
-            }
+        let state = health.snapshot();
+        if state.is_ready() {
+            return Ok(());
         }
-        let live_state = crate::index::ops::load_index_definition(engine, def.id)
-            .ok()
-            .flatten()
-            .map(|d| d.descriptor.state)
-            .unwrap_or(IndexState::Ready);
-
-        match live_state {
-            IndexState::Ready => return Ok(()),
-            IndexState::Failed { reason } => {
+        if state.is_offline() {
+            return Err(ExecutionError::Unsupported(format!(
+                "vector index '{def}' failed to build on this node"
+            )));
+        }
+        match def.online_during_build {
+            OnlineDuringBuild::Offline => {
                 return Err(ExecutionError::Unsupported(format!(
-                    "vector index '{def}' failed to build: {reason}"
+                    "vector index '{def}' is offline during build"
                 )));
             }
-            IndexState::Building { .. } => match def.online_during_build {
-                OnlineDuringBuild::Offline => {
+            OnlineDuringBuild::Block => {
+                let remaining = match deadline {
+                    Some(deadline) => deadline.saturating_duration_since(std::time::Instant::now()),
+                    None => poll_step,
+                };
+                if remaining.is_zero() {
                     return Err(ExecutionError::Unsupported(format!(
-                        "vector index '{def}' is offline during build"
+                        "vector index '{def}' still building after {wait:?}; wait longer \
+                         with /*+ vector_build_wait('...') */ or the session's \
+                         vector_build_wait"
                     )));
                 }
-                OnlineDuringBuild::Block => {
-                    let remaining = match deadline {
-                        Some(deadline) => {
-                            deadline.saturating_duration_since(std::time::Instant::now())
-                        }
-                        None => poll_step,
-                    };
-                    if remaining.is_zero() {
-                        return Err(ExecutionError::Unsupported(format!(
-                            "vector index '{def}' still building after {wait:?}; wait longer \
-                             with /*+ vector_build_wait('...') */ or the session's \
-                             vector_build_wait"
-                        )));
-                    }
-                    // Never sleep past the caller's bound.
-                    std::thread::sleep(poll_step.min(remaining));
-                    continue;
-                }
-                OnlineDuringBuild::PartialRecall => {
-                    // Early-return above handles this; unreachable here.
-                    return Ok(());
-                }
-            },
+                // Never sleep past the caller's bound.
+                std::thread::sleep(poll_step.min(remaining));
+            }
+            // Returned above.
+            OnlineDuringBuild::PartialRecall => return Ok(()),
         }
     }
 }
@@ -16849,39 +16810,43 @@ fn execute_create_text_index(
         default_language: lang.clone(),
         language_override_property: lang_override,
     };
-    // Publish the definition transactionally through the index store, which
-    // gives it its identities.
-    let def = ctx.mvcc_publish_index_def(crate::index::IndexDescriptor::text(
+    // Publish the definition as its own catalog commit, which gives it its
+    // identities, so every member sees the index before anything is built.
+    let def = ctx.publish_index_in_catalog(crate::index::IndexDescriptor::text(
         name,
         label,
         properties.clone(),
         config,
     ))?;
+    let generation = def.generation;
 
     // Register in text index registry (creates tantivy directory + empty index).
     registry
         .register(def)
         .map_err(|e| ExecutionError::Unsupported(format!("register text index: {e}")))?;
 
-    // Backfill each property's index from the store. The index is registered
-    // above, so a commit after the scan starts reaches it through the text
-    // worker, and the rebuild holds the index while it scans, so that commit
-    // lands after the backfill rather than under it.
-    let shard_id = ctx.shard_id;
-    let interner = &*ctx.interner;
-    let mut indexed_nodes: rustc_hash::FxHashSet<NodeId> = rustc_hash::FxHashSet::default();
-    for prop in &properties {
-        registry
-            .rebuild_index(label, prop, || {
-                let texts = crate::index::text_registry::stored_texts(
-                    ctx.engine, shard_id, interner, label, prop,
-                )?;
-                indexed_nodes.extend(texts.iter().map(|(id, _)| *id));
-                Ok(texts)
-            })
-            .map_err(|e| ExecutionError::Unsupported(format!("backfill text index: {e}")))?;
-    }
-    let count = indexed_nodes.len();
+    // The backfill is this member's build of the index, run by the engine's
+    // executor; the statement waits for it, and waiting cancels nothing.
+    let builds = ctx.index_builds.ok_or_else(|| {
+        ExecutionError::Unsupported("building an index requires the engine's index builds".into())
+    })?;
+    builds
+        .run_local(
+            generation,
+            crate::index::lifecycle::text_build(label.to_string(), properties.clone()),
+        )
+        .map_err(ExecutionError::Unsupported)?;
+    let count = match builds.wait(generation, None)? {
+        Some(crate::index::IndexBuildOutcome::Published { indexed }) => indexed.unwrap_or(0),
+        Some(crate::index::IndexBuildOutcome::Failed(e)) => {
+            return Err(ExecutionError::Unsupported(e.to_string()));
+        }
+        other => {
+            return Err(ExecutionError::Unsupported(format!(
+                "the build of text index '{name}' ended without its index: {other:?}"
+            )));
+        }
+    };
 
     let props_str = properties.join(", ");
     let mut row = Row::new();
@@ -17035,7 +17000,6 @@ fn execute_create_vector_index(
     // folded into operationTime, so a causal read after a CREATE VECTOR INDEX
     // fences past the definition's replication.
     let def = ctx.publish_index_in_catalog(descriptor)?;
-    let index_id = def.id;
 
     // Register the empty HNSW graph in memory with its tier handle,
     // keyed by the ids bound above.
@@ -17053,19 +17017,11 @@ fn execute_create_vector_index(
     })?;
 
     // The build runs on its own thread, owned by the registry, and the
-    // statement returns once it has started. Publish the Building state
-    // first, so concurrent readers and the crash-recovery path see
-    // "backfill in progress" before the thread starts touching SSTs.
-    let initial_state = IndexState::Building {
-        written: 0,
-        estimated_total: 0,
-    };
-    if let Err(e) = crate::index::ops::save_index_state(ctx.engine, index_id, initial_state) {
-        // Only the crash-recovery marker is lost: a reopen then
-        // finds the index Ready and rebuilds it all the same.
-        tracing::warn!(index = %name, error = %e, "could not persist the building state");
-    }
-
+    // statement returns once it has started. Its readiness is this member's
+    // own: the graph's health signal carries it, and every member builds
+    // its graph from the data it holds; the replicated definition says only
+    // that the index exists. A member that restarts rebuilds the graph on
+    // open.
     let engine = Arc::clone(engine_arc);
     let label_owned = label.to_string();
     let name_owned = name.to_string();
@@ -17099,44 +17055,27 @@ fn execute_create_vector_index(
                 }
                 .run()
             }));
-            let terminal = match outcome {
+            match outcome {
                 Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
                     tracing::info!(
                         index = %name_owned,
                         scanned,
                         "vector index backfill complete"
                     );
-                    IndexState::Ready
+                    health.mark_ready();
                 }
-                // Cancelled: the index is being dropped or replaced
-                // by whoever cancelled us. Writing anything now —
-                // state or progress — would land under their
-                // statement and conflict with a write they never
-                // saw. They own the index from here.
-                Ok(Ok(crate::index::BuildOutcome::Cancelled)) => return,
-                Ok(Err(e)) => IndexState::Failed { reason: e },
+                // Cancelled: the index is being dropped or replaced by
+                // whoever cancelled us, who owns it from here.
+                Ok(Ok(crate::index::BuildOutcome::Cancelled)) => {}
+                Ok(Err(reason)) => health.mark_offline(reason),
                 Err(panic) => {
                     let reason = panic
                         .downcast_ref::<&'static str>()
                         .map(|s| (*s).to_string())
                         .or_else(|| panic.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "panic in backfill thread".to_string());
-                    IndexState::Failed { reason }
+                    health.mark_offline(reason);
                 }
-            };
-            match &terminal {
-                IndexState::Failed { reason } => health.mark_offline(reason.clone()),
-                _ => health.mark_ready(),
-            }
-            // By identity: an index created later under the same name is
-            // not this build's to mark.
-            if let Err(e) = crate::index::ops::save_index_state(engine.as_ref(), index_id, terminal)
-            {
-                tracing::warn!(
-                    index = %name_owned,
-                    error = %e,
-                    "could not persist the build's terminal state"
-                );
             }
         })
         .map_err(|e| {

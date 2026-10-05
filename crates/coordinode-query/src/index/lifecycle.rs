@@ -34,6 +34,13 @@ use rustc_hash::FxHashMap;
 use super::build::{Backfill, BackfillError};
 use super::definition::{GenerationId, IndexDefinition, IndexState};
 use super::registry::{IndexRegistry, UniqueViolation};
+use super::text_registry::TextIndexRegistry;
+
+/// A build a member runs for itself: an index whose structure every member
+/// derives from the data it holds (a full-text index), so the build has no
+/// catalog moves and its readiness is the member's own. Returns how many
+/// records it indexed.
+pub type LocalBuild = Box<dyn FnOnce(&dyn BuildEnvironment) -> Result<u64, BuildError> + Send>;
 
 /// What a build executor needs from the deployment that runs it: the store,
 /// the field dictionary, the registry writers consult, and the commit path
@@ -63,6 +70,9 @@ pub trait BuildEnvironment: Send + Sync {
 
     /// The registry writers maintain indexes through.
     fn registry(&self) -> &IndexRegistry;
+
+    /// The full-text indexes this member keeps, `None` where it keeps none.
+    fn text_registry(&self) -> Option<&TextIndexRegistry>;
 
     /// Commit one backfill page through the deployment's write path.
     ///
@@ -146,6 +156,37 @@ struct Shared {
     max_running: usize,
 }
 
+/// The build of a full-text index over `properties` of `label`: each
+/// property's index is filled from the texts the member stores, holding the
+/// index while it scans, so a commit after the scan starts reaches it
+/// through the text worker and lands after the backfill rather than under
+/// it. Returns how many distinct nodes it indexed.
+pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
+    Box::new(move |env: &dyn BuildEnvironment| {
+        let registry = env
+            .text_registry()
+            .ok_or_else(|| BuildError::Other("this member keeps no full-text indexes".into()))?;
+        let fields = env.fields().map_err(BuildError::Other)?;
+        let mut nodes = rustc_hash::FxHashSet::default();
+        for property in &properties {
+            registry
+                .rebuild_index(&label, property, || {
+                    let texts = super::text_registry::stored_texts(
+                        env.engine(),
+                        env.shard_id(),
+                        &fields,
+                        &label,
+                        property,
+                    )?;
+                    nodes.extend(texts.iter().map(|(id, _)| *id));
+                    Ok(texts)
+                })
+                .map_err(|e| BuildError::Other(format!("backfill text index: {e}")))?;
+        }
+        Ok(nodes.len() as u64)
+    })
+}
+
 /// Attempts one move of a build makes against other moves of the same
 /// build. A build moves a few times in its life (taken, published or
 /// failed, cancelled), so a mover that loses this many races in a row faces
@@ -204,6 +245,39 @@ impl IndexBuildService {
     ///
     /// The executor thread could not be started.
     pub fn submit(&self, generation: GenerationId, own_open: usize) -> Result<(), String> {
+        self.spawn(generation, move |shared| {
+            shared.execute(generation, own_open)
+        })
+    }
+
+    /// Run `build`, a build this member runs for itself, as the build of
+    /// `generation` on an executor of this process, unless one already has
+    /// it. It takes a seat like any other build, and [`Self::wait`] reports
+    /// its outcome.
+    ///
+    /// # Errors
+    ///
+    /// The executor thread could not be started.
+    pub fn run_local(&self, generation: GenerationId, build: LocalBuild) -> Result<(), String> {
+        self.spawn(generation, move |shared| {
+            let _seat = shared.seat();
+            Executed::Outcome(match build(shared.env.as_ref()) {
+                Ok(indexed) => IndexBuildOutcome::Published {
+                    indexed: Some(indexed),
+                },
+                Err(e) => IndexBuildOutcome::Failed(e),
+            })
+        })
+    }
+
+    /// Run `work` for the build of `generation` on a thread of its own,
+    /// unless an executor of this process already has the build, and keep
+    /// its outcome for the waiters.
+    fn spawn(
+        &self,
+        generation: GenerationId,
+        work: impl FnOnce(&Shared) -> Executed + Send + 'static,
+    ) -> Result<(), String> {
         {
             let mut slots = self.shared.slots.lock();
             if matches!(slots.get(&generation), Some(Slot::Running)) {
@@ -215,17 +289,16 @@ impl IndexBuildService {
         let spawned = std::thread::Builder::new()
             .name(format!("index-build-{}", generation.as_raw()))
             .spawn(move || {
-                let executed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    shared.execute(generation, own_open)
-                }))
-                .unwrap_or_else(|panic| {
-                    let reason = panic
-                        .downcast_ref::<&'static str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "panic in the build executor".to_string());
-                    Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(reason)))
-                });
+                let executed =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&shared)))
+                        .unwrap_or_else(|panic| {
+                            let reason = panic
+                                .downcast_ref::<&'static str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "panic in the build executor".to_string());
+                            Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(reason)))
+                        });
                 let slot = match executed {
                     Executed::Outcome(outcome) => Slot::Done(outcome),
                     Executed::Lost => Slot::Lost,
