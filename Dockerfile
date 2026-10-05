@@ -46,9 +46,16 @@ COPY tests/ /build/tests/
 
 # Build the coordinode binary (static musl link, release profile with LTO).
 # REST/JSON proxy (port 7081) is embedded via the rest-proxy feature (default).
+# SYMBOLS=1 keeps the symbol table and line tables, same optimisation, so a
+# profiler attached to the running server names functions:
+#   docker build --build-arg SYMBOLS=1 -t coordinode:symbols .
+ARG SYMBOLS=0
 RUN MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
+    && if [ "$SYMBOLS" = 1 ]; then \
+         export CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only; \
+       fi \
     && cargo build --release --target "$MUSL_TARGET" --bin coordinode \
-    && strip "target/$MUSL_TARGET/release/coordinode" \
+    && if [ "$SYMBOLS" != 1 ]; then strip "target/$MUSL_TARGET/release/coordinode"; fi \
     && cp "target/$MUSL_TARGET/release/coordinode" /coordinode-bin
 
 # ─── Stage 2: Runtime (scratch, static binary) ──────────────────────
