@@ -608,6 +608,10 @@ horizon for both time-travel reads and lagging-consumer recovery.
   answered from partially collected history. A window of `0` turns time travel
   off; statements and open transactions reading the current state are
   unaffected, because each holds its own snapshot for as long as it runs.
+- The window covers data only. The deployment's own state (the consumer
+  registry and the node's consensus state) is read as it stands now and is
+  rewritten on every heartbeat, so compaction keeps only its live version
+  plus whatever a running snapshot still reads.
 - The window is paid for in storage, per key: compaction keeps every version
   of a key written inside the window plus the newest one below it, and folds
   the rest. Budget disk for the data size plus one stored version per update

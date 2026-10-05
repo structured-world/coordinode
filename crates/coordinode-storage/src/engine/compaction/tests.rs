@@ -27,7 +27,7 @@ fn compaction_scheduler_starts_and_stops() {
 
     let sched = CompactionScheduler::start(
         &trees,
-        Arc::clone(&gc_watermark),
+        GcWatermarks::uniform(&gc_watermark),
         1,                       // 1 worker
         8,                       // l0_urgent_threshold
         64 * 1024 * 1024 * 1024, // debt_urgent_bytes
@@ -230,7 +230,7 @@ fn compaction_scheduler_no_panic_with_l0_data() {
 
     let sched = CompactionScheduler::start(
         &trees,
-        Arc::clone(&gc_watermark),
+        GcWatermarks::uniform(&gc_watermark),
         1,
         8,
         64 * 1024 * 1024 * 1024,
@@ -250,7 +250,7 @@ fn compaction_scheduler_multiple_workers_no_panic() {
 
     let sched = CompactionScheduler::start(
         &trees,
-        Arc::clone(&gc_watermark),
+        GcWatermarks::uniform(&gc_watermark),
         4, // 4 workers
         8,
         64 * 1024 * 1024 * 1024,

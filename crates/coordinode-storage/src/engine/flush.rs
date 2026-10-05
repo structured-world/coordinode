@@ -21,12 +21,13 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use lsm_tree::AbstractTree;
 
+use crate::engine::coordinator::GcWatermarks;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
@@ -108,7 +109,7 @@ impl FlushManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
-        gc_watermark: Arc<AtomicU64>,
+        gc_watermarks: GcWatermarks,
         flush_threshold_bytes: u64,
         max_sealed: usize,
         num_workers: usize,
@@ -150,7 +151,7 @@ impl FlushManager {
                     monitored,
                     FlushMonitorConfig {
                         sender: tx,
-                        gc_watermark,
+                        gc_watermarks,
                         flush_threshold_bytes,
                         max_sealed,
                         max_memtable_age_secs,
@@ -197,7 +198,7 @@ impl Drop for FlushManager {
 /// `too_many_arguments` budget. Pure data — borrowed only by the spawned thread.
 struct FlushMonitorConfig {
     sender: flume::Sender<FlushRequest>,
-    gc_watermark: Arc<AtomicU64>,
+    gc_watermarks: GcWatermarks,
     flush_threshold_bytes: u64,
     max_sealed: usize,
     max_memtable_age_secs: u64,
@@ -230,7 +231,6 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
         trees.iter().map(|(p, _)| (*p, start)).collect();
 
     while !cfg.shutdown.load(Ordering::Relaxed) {
-        let watermark = cfg.gc_watermark.load(Ordering::Relaxed);
         let now = Instant::now();
         // The soonest a memtable that holds data and stays below the other
         // triggers becomes due by age. None while every memtable is empty: an
@@ -256,7 +256,7 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
                 let req = FlushRequest {
                     tree: tree.clone(),
                     partition: *partition,
-                    gc_watermark: watermark,
+                    gc_watermark: cfg.gc_watermarks.for_partition(*partition),
                 };
 
                 // Non-blocking: if channel is full, workers are busy.

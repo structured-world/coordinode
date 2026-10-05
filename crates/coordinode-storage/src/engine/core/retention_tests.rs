@@ -183,6 +183,90 @@ fn time_travel_inside_the_window_survives_compaction() {
     }
 }
 
+/// The window keeps history of the data partitions only. The system ones
+/// (the consumer registry, the Raft state) hold state nobody reads back in
+/// time, rewritten on every heartbeat: compaction keeps their live version
+/// alone, while a data key's versions inside the window survive.
+#[test]
+fn compaction_keeps_no_history_of_the_system_partitions() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(3_600));
+
+    // Replicated partitions are written by applied entries; the Raft
+    // partition is this node's own and is written directly.
+    for (part, pid, key) in [
+        (
+            Partition::Node,
+            Some(PartitionId::Node),
+            &b"node:00:00000001"[..],
+        ),
+        (
+            Partition::Registry,
+            Some(PartitionId::Registry),
+            &b"consumer:a"[..],
+        ),
+        (Partition::Raft, None, &b"raft:vote"[..]),
+    ] {
+        for round in 0..10u64 {
+            let value = round.to_le_bytes();
+            match pid {
+                Some(pid) => put_in(&engine, pid, key, &value, base + 1_000 * (round + 1)),
+                None => engine.put(part, key, &value).expect("put"),
+            }
+            flush_in(&engine, part);
+        }
+        engine.force_compaction(part).expect("compact");
+    }
+
+    assert_eq!(
+        engine.approximate_len(Partition::Node).expect("len"),
+        10,
+        "every data version inside the window is kept"
+    );
+    for part in [Partition::Registry, Partition::Raft] {
+        assert_eq!(
+            engine.approximate_len(part).expect("len"),
+            1,
+            "{}: only the live version of a system record is kept",
+            part.name()
+        );
+    }
+}
+
+/// The system threshold drops the window but not the live pins: a reader
+/// pinned at a snapshot still holds a system partition's versions at it.
+#[test]
+fn a_live_pin_holds_the_system_threshold_back() {
+    let base = future_base();
+    let (engine, _oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(3_600));
+    put_in(
+        &engine,
+        PartitionId::Registry,
+        b"consumer:a",
+        b"1",
+        base + 1_000,
+    );
+
+    let (pinned, _pin) = engine.pin_snapshot();
+    put_in(
+        &engine,
+        PartitionId::Registry,
+        b"consumer:a",
+        b"2",
+        base + 2_000,
+    );
+    engine.advance_gc_watermark();
+
+    let data = engine.coordinator.gc_watermark_value_for(Partition::Node);
+    let system = engine
+        .coordinator
+        .gc_watermark_value_for(Partition::Registry);
+    assert_eq!(system, pinned, "the pin is the system threshold");
+    assert!(data < system, "the window holds data further back");
+}
+
 /// A chain of merge operands inside the window keeps its intermediate
 /// states, so time travel over it answers what the counter held at each
 /// point rather than what it holds now.

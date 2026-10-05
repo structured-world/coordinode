@@ -22,11 +22,12 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use lsm_tree::AbstractTree;
 
+use crate::engine::coordinator::GcWatermarks;
 use crate::engine::partition::Partition;
 use crate::error::{StorageError, StorageResult};
 use coordinode_core::txn::wake::Wake;
@@ -79,7 +80,7 @@ impl CompactionScheduler {
     /// Returns `Err` if any background thread fails to spawn (OS resource limit).
     pub(crate) fn start(
         trees: &HashMap<Partition, lsm_tree::AnyTree>,
-        gc_watermark: Arc<AtomicU64>,
+        gc_watermarks: GcWatermarks,
         num_workers: usize,
         l0_urgent_threshold: usize,
         debt_urgent_bytes: u64,
@@ -119,7 +120,7 @@ impl CompactionScheduler {
                 compaction_monitor_loop(
                     monitored,
                     tx,
-                    gc_watermark,
+                    gc_watermarks,
                     l0_urgent_threshold,
                     debt_urgent_bytes,
                     write_pressure,
@@ -187,7 +188,7 @@ pub(crate) fn compaction_priority(
 fn compaction_monitor_loop(
     trees: Vec<(Partition, lsm_tree::AnyTree)>,
     sender: flume::Sender<CompactionRequest>,
-    gc_watermark: Arc<AtomicU64>,
+    gc_watermarks: GcWatermarks,
     l0_urgent_threshold: usize,
     debt_urgent_bytes: u64,
     write_pressure: Arc<std::sync::atomic::AtomicU8>,
@@ -197,8 +198,6 @@ fn compaction_monitor_loop(
     wake.bind();
     let strategy = lsm_tree::compaction::Leveled::default();
     while !shutdown.load(Ordering::Relaxed) {
-        let watermark = gc_watermark.load(Ordering::Relaxed);
-
         // Build requests sorted by priority: Urgent (0) first, Low (3) last.
         // Along the way, compute the worst backpressure tier across trees.
         let mut worst_tier: u8 = 0;
@@ -245,7 +244,7 @@ fn compaction_monitor_loop(
                     tree: tree.clone(),
                     partition: *partition,
                     priority,
-                    gc_watermark: watermark,
+                    gc_watermark: gc_watermarks.for_partition(*partition),
                 }
             })
             .collect();

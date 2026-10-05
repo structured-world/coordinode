@@ -783,7 +783,7 @@ impl StorageEngine {
         ));
         let flush_manager = FlushManager::start(
             &trees,
-            Arc::clone(&gc_watermark),
+            gc_controller.watermarks(),
             config.max_write_buffer_bytes,
             config.max_sealed_memtables,
             config.flush_workers,
@@ -810,7 +810,7 @@ impl StorageEngine {
         let write_pressure = Arc::new(AtomicU8::new(0));
         let compaction_scheduler = CompactionScheduler::start(
             &trees,
-            Arc::clone(&gc_watermark),
+            gc_controller.watermarks(),
             config.compaction_workers,
             config.compaction_l0_urgent_threshold,
             config.backpressure.bytes_slowdown,
@@ -871,7 +871,7 @@ impl StorageEngine {
                             &endpoints_c,
                             &trees_c,
                             &seqno_c,
-                            gc_controller_c.maintenance_compaction_threshold(),
+                            &|part| gc_controller_c.maintenance_compaction_threshold_for(part),
                             id,
                         )
                     });
@@ -2794,7 +2794,7 @@ impl StorageEngine {
         // What "as much as is legitimate" means depends on whether the engine
         // owes anyone a time-travel contract; see
         // `GcWatermarkController::maintenance_compaction_threshold`.
-        let threshold = self.coordinator.maintenance_compaction_threshold();
+        let threshold = self.coordinator.maintenance_compaction_threshold_for(part);
         tree.major_compact(64 * 1024 * 1024, threshold)
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         Ok(())
@@ -2827,7 +2827,7 @@ impl StorageEngine {
             &self.endpoints,
             self.coordinator.trees(),
             self.coordinator.seqno_generator(),
-            self.coordinator.maintenance_compaction_threshold(),
+            &|part| self.coordinator.maintenance_compaction_threshold_for(part),
             endpoint_id,
         )
     }
@@ -2957,7 +2957,14 @@ impl StorageEngine {
         // cannot see, so forcing the watermark forward would collect state it
         // still observes. `seqno_threshold` is the fold/GC boundary: versions
         // below it may go, everything at or above it is preserved.
-        let watermark = self.coordinator.gc_watermark_value();
+        //
+        // A system partition has no such reader, so its threshold is brought
+        // up to the live pins first: its own writes (this node's Raft state)
+        // do not pass through the commit path that republishes it.
+        if part.is_system() {
+            self.coordinator.advance_gc_watermark();
+        }
+        let watermark = self.coordinator.gc_watermark_value_for(part);
         tree.major_compact(u64::MAX, watermark)?;
         // Operand fold for commutative partitions is time-travel safe: it
         // rewrites each key's merged value with `put`, adding a new version on
@@ -3548,7 +3555,7 @@ fn run_cascade_evict(
     endpoints: &[crate::engine::config::EndpointConfig],
     trees: &HashMap<Partition, lsm_tree::AnyTree>,
     seqno: &lsm_tree::SharedSequenceNumberGenerator,
-    gc_watermark: u64,
+    gc_watermark: &dyn Fn(Partition) -> u64,
     endpoint_id: &str,
 ) -> StorageResult<CascadeReport> {
     use lsm_tree::AbstractTree;
@@ -3595,11 +3602,11 @@ fn run_cascade_evict(
             .ok_or_else(|| StorageError::PartitionNotFound {
                 name: part.name().to_string(),
             })?;
-        // The engine's GC watermark, not `SeqNo::MAX`: eviction moves data
-        // between endpoints and must not collect history the retention policy
-        // still holds. See `StorageEngine::major_compact` for what the
-        // threshold means.
-        tree.major_compact(64 * 1024 * 1024, gc_watermark)
+        // The engine's GC watermark for this partition, not `SeqNo::MAX`:
+        // eviction moves data between endpoints and must not collect history
+        // the retention policy still holds. See `StorageEngine::major_compact`
+        // for what the threshold means.
+        tree.major_compact(64 * 1024 * 1024, gc_watermark(part))
             .map_err(|e| StorageError::Io(format!("major compact {}: {e}", part.name())))?;
         compacted_partitions += 1;
     }

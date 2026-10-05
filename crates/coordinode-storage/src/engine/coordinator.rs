@@ -415,8 +415,36 @@ pub trait MultiModalCoordinator: Send + Sync {
     }
 }
 
-/// CE single-Raft, single-shard [`MultiModalCoordinator`] implementation.
-/// Owns the per-partition LSM tree handles + shared seqno generator
+/// The thresholds [`GcWatermarkController`] publishes, as the background
+/// flush and compaction services read them: one for data, one for the
+/// system partitions.
+#[derive(Clone)]
+pub(crate) struct GcWatermarks {
+    data: Arc<AtomicU64>,
+    system: Arc<AtomicU64>,
+}
+
+impl GcWatermarks {
+    /// One threshold for every partition, for tests that drive a service
+    /// without a controller.
+    #[cfg(test)]
+    pub(crate) fn uniform(watermark: &Arc<AtomicU64>) -> Self {
+        Self {
+            data: Arc::clone(watermark),
+            system: Arc::clone(watermark),
+        }
+    }
+
+    /// The threshold to pass when flushing or compacting `part`.
+    pub(crate) fn for_partition(&self, part: Partition) -> u64 {
+        if part.is_system() {
+            self.system.load(Ordering::Acquire)
+        } else {
+            self.data.load(Ordering::Acquire)
+        }
+    }
+}
+
 /// Drives the MVCC GC watermark from the set of currently-pinned read
 /// snapshots.
 ///
@@ -436,6 +464,11 @@ pub struct GcWatermarkController {
     pins: parking_lot::Mutex<BTreeMap<u64, usize>>,
     /// The shared atomic the compaction filter reads as its fold/GC threshold.
     gc_watermark: Arc<AtomicU64>,
+    /// The threshold for the system partitions ([`Partition::is_system`]):
+    /// the oldest live pin, or the latest complete snapshot, alone. The
+    /// external floor and the time-travel window keep history of data, and
+    /// nothing reads the deployment's own state back in time.
+    system_watermark: Arc<AtomicU64>,
     /// Current-seqno source; with `pending`, the watermark target when
     /// nothing is pinned.
     seqno: lsm_tree::SharedSequenceNumberGenerator,
@@ -472,6 +505,7 @@ impl GcWatermarkController {
         let controller = Self {
             pins: parking_lot::Mutex::new(BTreeMap::new()),
             gc_watermark,
+            system_watermark: Arc::new(AtomicU64::new(0)),
             seqno,
             pending,
             external_floor: AtomicU64::new(u64::MAX),
@@ -494,6 +528,7 @@ impl GcWatermarkController {
     fn recompute(&self, pins: &BTreeMap<u64, usize>) {
         let current = self.pending.snapshot_floor(|| self.seqno.get());
         let pin_floor = pins.keys().next().copied().unwrap_or(current);
+        self.system_watermark.store(pin_floor, Ordering::Release);
         let mut watermark = pin_floor.min(self.external_floor.load(Ordering::Acquire));
         let window = self.retention_window_us.load(Ordering::Acquire);
         if self.seqno_is_clock && window != u64::MAX {
@@ -522,6 +557,24 @@ impl GcWatermarkController {
         self.gc_watermark.load(Ordering::Acquire)
     }
 
+    /// The published thresholds, for the flush and compaction services that
+    /// read them on every pass.
+    pub(crate) fn watermarks(&self) -> GcWatermarks {
+        GcWatermarks {
+            data: Arc::clone(&self.gc_watermark),
+            system: Arc::clone(&self.system_watermark),
+        }
+    }
+
+    /// The threshold compaction and flush pass for `part`.
+    pub fn watermark_for(&self, part: Partition) -> u64 {
+        if part.is_system() {
+            self.system_watermark.load(Ordering::Acquire)
+        } else {
+            self.watermark()
+        }
+    }
+
     /// The threshold a maintenance compaction should pass to reclaim space.
     ///
     /// A compaction releases the tables it consumed only once the watermark
@@ -545,6 +598,18 @@ impl GcWatermarkController {
             self.watermark()
         } else {
             u64::MAX
+        }
+    }
+
+    /// [`maintenance_compaction_threshold`](Self::maintenance_compaction_threshold)
+    /// for `part`: a system partition owes no time-travel contract, only its
+    /// live pins.
+    pub fn maintenance_compaction_threshold_for(&self, part: Partition) -> u64 {
+        let threshold = self.maintenance_compaction_threshold();
+        if part.is_system() && self.seqno_is_clock {
+            self.watermark_for(part)
+        } else {
+            threshold
         }
     }
 
@@ -824,6 +889,13 @@ impl LocalMultiModalCoordinator {
         self.gc_controller.maintenance_compaction_threshold()
     }
 
+    /// The maintenance threshold for `part`. See
+    /// [`GcWatermarkController::maintenance_compaction_threshold_for`].
+    pub fn maintenance_compaction_threshold_for(&self, part: Partition) -> u64 {
+        self.gc_controller
+            .maintenance_compaction_threshold_for(part)
+    }
+
     /// The configured MVCC time-travel retention window (seqno units).
     pub fn retention_window_us(&self) -> u64 {
         self.gc_controller.retention_window_us()
@@ -833,6 +905,12 @@ impl LocalMultiModalCoordinator {
     /// fold operands / collect versions). Observability + test hook.
     pub fn gc_watermark_value(&self) -> u64 {
         self.gc_watermark.load(Ordering::Acquire)
+    }
+
+    /// The published threshold for `part`: [`Self::gc_watermark_value`] for
+    /// data, the live-pin floor alone for a system partition.
+    pub fn gc_watermark_value_for(&self, part: Partition) -> u64 {
+        self.gc_controller.watermark_for(part)
     }
 
     /// Borrow the partition handle for a given logical partition.

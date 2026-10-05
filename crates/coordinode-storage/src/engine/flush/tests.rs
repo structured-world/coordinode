@@ -34,7 +34,7 @@ fn start(
     let wake = Arc::new(Wake::default());
     let mgr = FlushManager::start(
         trees,
-        Arc::clone(gc_watermark),
+        GcWatermarks::uniform(gc_watermark),
         threshold,
         max_sealed,
         workers,

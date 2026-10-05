@@ -131,6 +131,14 @@ impl Partition {
         matches!(self, Self::Adj | Self::Counter)
     }
 
+    /// Whether this partition holds the deployment's own state (the consumer
+    /// registry, this node's consensus state) rather than data. Its records
+    /// are read only as they stand now, so the time-travel window keeps no
+    /// history of them: compaction holds back only for live snapshot pins.
+    pub fn is_system(self) -> bool {
+        matches!(self, Self::Registry | Self::Raft)
+    }
+
     /// The key prefix under which this partition holds data a user put
     /// there, or `None` when the whole partition is state the deployment
     /// keeps about itself.
