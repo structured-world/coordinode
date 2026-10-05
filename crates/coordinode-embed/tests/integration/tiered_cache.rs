@@ -242,9 +242,11 @@ fn cache_no_stale_after_overwrite() {
     );
 }
 
-/// Engine persist + reopen: cache file survives, entries recoverable.
+/// Engine persist + reopen: the cache starts cold (its file records puts but
+/// not the invalidations that followed them), and reads are served from the
+/// store and cached afresh.
 #[test]
-fn cache_survives_engine_reopen() {
+fn a_reopened_engine_starts_with_a_cold_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let cache_config = TieredCacheConfig {
@@ -280,7 +282,7 @@ fn cache_survives_engine_reopen() {
         assert_eq!(cache.total_entries(), 1);
     }
 
-    // Reopen — cache file should be recovered
+    // Reopen: nothing cached, the value comes from the store.
     {
         let mut config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
@@ -293,21 +295,15 @@ fn cache_survives_engine_reopen() {
         let engine = StorageEngine::open(&config).expect("reopen");
 
         let cache = engine.tiered_cache().expect("cache");
-        assert_eq!(
-            cache.total_entries(),
-            1,
-            "cache entry should survive reopen"
-        );
+        assert_eq!(cache.total_entries(), 0, "the cache starts cold");
 
-        // Read from recovered cache — should be a hit
         let result = engine.get(Partition::Node, b"persist_k").expect("get");
         assert_eq!(result.as_deref(), Some(b"persist_v".as_slice()));
+        assert_eq!(cache.stats().total_hits, 0, "a miss, served from the store");
 
-        assert_eq!(
-            cache.stats().total_hits,
-            1,
-            "should be cache hit from recovered file"
-        );
+        let result = engine.get(Partition::Node, b"persist_k").expect("get");
+        assert_eq!(result.as_deref(), Some(b"persist_v".as_slice()));
+        assert_eq!(cache.stats().total_hits, 1, "cached by the first read");
     }
 }
 
