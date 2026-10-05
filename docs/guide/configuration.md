@@ -628,7 +628,9 @@ horizon for both time-travel reads and lagging-consumer recovery.
   it: tables a compaction has replaced and that are still waiting to be
   unlinked. It rises by up to a compaction's input size right after an
   install and drains to zero by itself; a figure that stays high is worth
-  investigating. Both refresh on the capacity-scan cadence.
+  investigating. Both refresh every five seconds (the capacity-scan
+  cadence) on every deployment, whether or not an endpoint sets a capacity
+  limit.
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: the window over which
   buffered consumer heartbeats are coalesced into one proposal (opened by the

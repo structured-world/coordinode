@@ -999,54 +999,135 @@ fn retained_history_reports_an_unreadable_tables_folder() {
     );
 }
 
+/// One observed gauge `set`: metric name, labels, value.
+type Observed = (String, Vec<(String, String)>, f64);
+
+/// A recorder that keeps every gauge `set` with its key and labels.
+struct GaugeCapture(Arc<parking_lot::Mutex<Vec<Observed>>>);
+
+struct GaugeHandle {
+    key: metrics::Key,
+    sink: Arc<parking_lot::Mutex<Vec<Observed>>>,
+}
+
+impl metrics::GaugeFn for GaugeHandle {
+    fn increment(&self, _: f64) {}
+    fn decrement(&self, _: f64) {}
+    fn set(&self, value: f64) {
+        let labels = self
+            .key
+            .labels()
+            .map(|l| (l.key().to_owned(), l.value().to_owned()))
+            .collect();
+        self.sink
+            .lock()
+            .push((self.key.name().to_owned(), labels, value));
+    }
+}
+
+impl metrics::Recorder for GaugeCapture {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::noop()
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::from_arc(Arc::new(GaugeHandle {
+            key: key.clone(),
+            sink: Arc::clone(&self.0),
+        }))
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// The last value `seen` holds for gauge `name` of partition `part`.
+fn partition_gauge(seen: &[Observed], name: &str, part: Partition) -> Option<f64> {
+    seen.iter()
+        .rev()
+        .find(|(n, labels, _)| {
+            n == name
+                && labels
+                    .iter()
+                    .any(|(k, v)| k == "partition" && v == part.name())
+        })
+        .map(|(_, _, value)| *value)
+}
+
+/// The footprint gauges are published by the engine's own background
+/// sampling, on a deployment with no capacity limits too: they describe the
+/// trees, not the enforcement of a limit.
+#[test]
+fn footprint_gauges_are_sampled_without_capacity_limits() {
+    let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    metrics::set_global_recorder(GaugeCapture(Arc::clone(&sink))).expect("recorder");
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    assert!(config.endpoints.iter().all(|ep| ep.hard_limit_bytes == 0));
+    let engine = StorageEngine::open(&config).expect("open");
+    engine
+        .put(Partition::Registry, b"consumer:a", b"v")
+        .expect("put");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while partition_gauge(
+        &sink.lock(),
+        "coordinode_storage_live_bytes",
+        Partition::Registry,
+    )
+    .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no footprint sample within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        partition_gauge(
+            &sink.lock(),
+            "coordinode_storage_retained_history_bytes",
+            Partition::Registry
+        )
+        .is_some()
+    );
+}
+
 /// The capacity refresh publishes the two gauges per partition with the
 /// values `retained_history` reports, under the `partition` label.
 #[test]
 fn capacity_refresh_publishes_retained_history_gauges() {
-    use metrics::{Gauge, GaugeFn, Key, KeyName, Metadata, Recorder, SharedString, Unit};
-    use std::sync::Mutex;
-
-    /// One observed gauge `set`: metric name, labels, value.
-    type Observed = (String, Vec<(String, String)>, f64);
-    /// Records every gauge `set` with its key and labels.
-    struct Capture(Arc<Mutex<Vec<Observed>>>);
-    struct Handle {
-        key: Key,
-        sink: Arc<Mutex<Vec<Observed>>>,
-    }
-    impl GaugeFn for Handle {
-        fn increment(&self, _: f64) {}
-        fn decrement(&self, _: f64) {}
-        fn set(&self, value: f64) {
-            let labels = self
-                .key
-                .labels()
-                .map(|l| (l.key().to_owned(), l.value().to_owned()))
-                .collect();
-            self.sink
-                .lock()
-                .expect("sink")
-                .push((self.key.name().to_owned(), labels, value));
-        }
-    }
-    impl Recorder for Capture {
-        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
-        fn register_counter(&self, _: &Key, _: &Metadata<'_>) -> metrics::Counter {
-            metrics::Counter::noop()
-        }
-        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
-            Gauge::from_arc(Arc::new(Handle {
-                key: key.clone(),
-                sink: Arc::clone(&self.0),
-            }))
-        }
-        fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> metrics::Histogram {
-            metrics::Histogram::noop()
-        }
-    }
-
     let dir = TempDir::new().expect("tempdir");
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -1062,27 +1143,21 @@ fn capacity_refresh_publishes_retained_history_gauges() {
     flush(&engine);
     let expected = engine.retained_history(Partition::Node).expect("stats");
 
-    let sink = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Capture(Arc::clone(&sink));
+    let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let recorder = GaugeCapture(Arc::clone(&sink));
     metrics::with_local_recorder(&recorder, || engine.refresh_capacity());
 
-    let seen = sink.lock().expect("sink");
-    let find = |name: &str| {
-        seen.iter()
-            .find(|(n, labels, _)| {
-                n == name
-                    && labels
-                        .iter()
-                        .any(|(k, v)| k == "partition" && v == Partition::Node.name())
-            })
-            .map(|(_, _, value)| *value)
-    };
+    let seen = sink.lock();
     assert_eq!(
-        find("coordinode_storage_live_bytes"),
+        partition_gauge(&seen, "coordinode_storage_live_bytes", Partition::Node),
         Some(expected.live_bytes as f64)
     );
     assert_eq!(
-        find("coordinode_storage_retained_history_bytes"),
+        partition_gauge(
+            &seen,
+            "coordinode_storage_retained_history_bytes",
+            Partition::Node
+        ),
         Some(expected.retained_bytes as f64)
     );
     assert!(

@@ -852,12 +852,13 @@ impl StorageEngine {
             Arc::new(tracker)
         };
 
-        // Spawn the background scanner. Skip when every endpoint has
-        // `hard_limit_bytes == 0` (untracked deployment) — no point
-        // spinning a thread that does nothing. The closure captures
-        // cheap snapshots (AnyTree is internally Arc'd) so no
-        // circular reference with `Self`.
-        let capacity_scanner = if config.endpoints.iter().any(|ep| ep.hard_limit_bytes > 0) {
+        // Spawn the background scanner. It samples every partition's
+        // footprint on every deployment; the capacity scan, its persisted
+        // usage and cascade eviction run only where an endpoint has a
+        // `hard_limit_bytes` to enforce. The closure captures cheap snapshots
+        // (AnyTree is internally Arc'd) so no circular reference with `Self`.
+        let capacity_scanner = {
+            let tracked = config.endpoints.iter().any(|ep| ep.hard_limit_bytes > 0);
             let tracker_c = Arc::clone(&capacity_arc);
             let endpoints_c = config.endpoints.clone();
             let trees_c = trees.clone();
@@ -866,6 +867,10 @@ impl StorageEngine {
             let interval = std::time::Duration::from_secs(5);
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
+                    if !tracked {
+                        publish_footprint(&trees_c);
+                        return;
+                    }
                     run_capacity_refresh(&tracker_c, &endpoints_c, &trees_c, &seqno_c, |id| {
                         run_cascade_evict(
                             &endpoints_c,
@@ -878,8 +883,6 @@ impl StorageEngine {
                 })
                 .map_err(|e| StorageError::InvalidConfig(format!("spawn capacity scanner: {e}")))?,
             )
-        } else {
-            None
         };
 
         // Per-table columnar trees live under `<primary endpoint>/tables`,
@@ -3620,6 +3623,29 @@ fn run_cascade_evict(
     })
 }
 
+/// Publish each partition's footprint: the live version (in-window key
+/// versions included, so this is where the retention window shows) next to
+/// what is on disk beside it. A folder walk, sampled on the capacity-scan
+/// cadence whether or not any endpoint has a capacity limit.
+fn publish_footprint(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
+    for (part, tree) in trees {
+        match crate::engine::retention_stats::retained_history(tree) {
+            Ok(history) => {
+                metrics::gauge!("coordinode_storage_live_bytes", "partition" => part.name())
+                    .set(history.live_bytes as f64);
+                metrics::gauge!(
+                    "coordinode_storage_retained_history_bytes",
+                    "partition" => part.name()
+                )
+                .set(history.retained_bytes as f64);
+            }
+            Err(e) => {
+                tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
+            }
+        }
+    }
+}
+
 /// Free function form of `StorageEngine::refresh_capacity` — the
 /// scan + persist + auto-cascade pipeline. Pulled out of the method
 /// so the background `CapacityScanner` can drive it via a closure
@@ -3648,27 +3674,7 @@ fn run_capacity_refresh<F>(
         .map(|p| p.name())
         .collect();
     capacity.refresh(&endpoint_paths, &partition_names);
-
-    // Per-partition footprint: the live version (in-window key versions
-    // included, so this is where the retention window shows) next to what is
-    // on disk beside it. Same cadence as the capacity scan, since both are a
-    // folder walk.
-    for (part, tree) in trees {
-        match crate::engine::retention_stats::retained_history(tree) {
-            Ok(history) => {
-                metrics::gauge!("coordinode_storage_live_bytes", "partition" => part.name())
-                    .set(history.live_bytes as f64);
-                metrics::gauge!(
-                    "coordinode_storage_retained_history_bytes",
-                    "partition" => part.name()
-                )
-                .set(history.retained_bytes as f64);
-            }
-            Err(e) => {
-                tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
-            }
-        }
-    }
+    publish_footprint(trees);
 
     // Persist used_bytes snapshots to Schema for warm-load on the
     // next engine open, only when the value moved: an unchanged
