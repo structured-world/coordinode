@@ -1580,6 +1580,9 @@ impl HnswIndex {
         let Some(idx) = self.id_to_idx.remove(id) else {
             return false;
         };
+        // No longer a result before the count says it is gone: a reader
+        // that sees the count drop finds no more results than it says.
+        self.nodes().set_state(idx, data_level0::NodeState::Retired);
         self.live_count
             .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
         self.hand_over_entry_point(idx);
