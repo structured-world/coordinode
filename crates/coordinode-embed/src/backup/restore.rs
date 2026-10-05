@@ -847,7 +847,7 @@ fn json_schema(
     use coordinode_modality::{
         IndexStore as _, LocalIndexStore, LocalSchemaStore, SchemaStore as _,
     };
-    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::IndexDescriptor;
 
     let engine = load.target.engine;
     let storage = |e: coordinode_modality::StoreError| RestoreError::Storage(e.to_string());
@@ -899,21 +899,46 @@ fn json_schema(
             }
         }
         _ => {
-            let def: IndexDefinition = serde_json::from_value(body).map_err(decode_error)?;
-            if !kept(&def.label) {
+            let dumped: IndexDescriptor = serde_json::from_value(body).map_err(decode_error)?;
+            if !kept(&dumped.label) {
                 return Ok(());
             }
-            match indexes.load_definition(&def.name).map_err(storage)? {
-                Some(current) if same_index(&current, &def) => false,
-                Some(_) => return Err(differs("index", &def.name)),
+            // The index the target already has under the dumped one's name,
+            // or, for an index without a name, one that declares the same.
+            let current = match &dumped.name {
+                Some(name) => match indexes.resolve_name(name).map_err(storage)? {
+                    Some(id) => indexes.load_definition(id).map_err(storage)?,
+                    None => None,
+                },
+                None => indexes
+                    .list_definitions()
+                    .map_err(storage)?
+                    .into_iter()
+                    .find(|current| same_index(current, &dumped)),
+            };
+            let shown = dumped.name.clone().unwrap_or_else(|| "(unnamed)".into());
+            match current {
+                Some(current) if same_index(&current, &dumped) => false,
+                Some(_) => return Err(differs("index", &shown)),
                 None if load.writes() => {
                     // An index resolves its label and properties through the
                     // field dictionary, as its DDL registered them; the
                     // entries are built from the loaded nodes once they are in.
-                    let mut names: Vec<&str> = vec![def.label.as_str()];
-                    names.extend(def.properties.iter().map(String::as_str));
+                    let mut names: Vec<&str> = vec![dumped.label.as_str()];
+                    names.extend(dumped.properties.iter().map(String::as_str));
                     field_ids(load.target.fields, &names)?;
-                    indexes.put_definition(&def).map_err(storage)?;
+                    // Recreated in the target catalog, which gives it
+                    // identities of its own; the restore writes straight to
+                    // storage, so the publication applies at once.
+                    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+                        engine,
+                        None,
+                        coordinode_core::txn::timestamp::Timestamp::ZERO,
+                        None,
+                    );
+                    indexes
+                        .publish_definition_txn(&mut txn, dumped)
+                        .map_err(storage)?;
                     true
                 }
                 None => false,
@@ -926,12 +951,12 @@ fn json_schema(
     Ok(())
 }
 
-/// Whether two definitions of one index declare the same index: its build
-/// state, entry layout and the multikey flag its data set are not part of
-/// the declaration.
+/// Whether an index of the target and a dumped one declare the same index:
+/// its identities, build state, entry layout and the multikey flag its data
+/// set are not part of the declaration.
 fn same_index(
     current: &coordinode_query::index::IndexDefinition,
-    dumped: &coordinode_query::index::IndexDefinition,
+    dumped: &coordinode_query::index::IndexDescriptor,
 ) -> bool {
     let mut dumped = dumped.clone();
     dumped.state = current.state.clone();
@@ -939,7 +964,7 @@ fn same_index(
     dumped.multikey = current.multikey;
     dumped.maintenance.epoch = current.maintenance.epoch;
     dumped.maintenance.source = current.maintenance.source;
-    *current == dumped
+    current.descriptor == dumped
 }
 
 /// Decode a lowercase or uppercase hex string.

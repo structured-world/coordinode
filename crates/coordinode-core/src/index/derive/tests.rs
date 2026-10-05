@@ -2,7 +2,10 @@
 //! maintenance profiles share.
 
 use super::*;
-use crate::index::encoding::{encode_index_key, encode_tuple, encode_unique_index_key};
+use crate::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
+
+/// The generation of the index the tests derive entries of.
+const GEN: GenerationId = GenerationId::from_raw(41);
 
 fn prop(name: &str, field: Option<u32>) -> PropertyRef {
     PropertyRef {
@@ -14,7 +17,7 @@ fn prop(name: &str, field: Option<u32>) -> PropertyRef {
 fn interp(unique: bool, sparse: bool, filter: Option<MembershipFilter>) -> IndexInterpretation {
     IndexInterpretation {
         codec: KEY_CODEC,
-        name: "user_email".into(),
+        generation: GEN,
         unique,
         sparse,
         properties: vec![prop("email", Some(1))],
@@ -134,7 +137,7 @@ fn membership_effects_are_the_difference_of_the_two_states() {
     let index = interp(false, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
     let c = encode_tuple(&[s("c")]).expect("c");
-    let key = |t: &[u8]| encode_index_key("user_email", t, 7);
+    let key = |t: &[u8]| encode_entry_key(GEN, t, 7);
     let node = EntryOwner::node(7);
 
     let enter = index.membership_effects(node, None, Some(&[s("a")]));
@@ -186,7 +189,7 @@ fn a_unique_entry_holds_its_node() {
     assert_eq!(
         index.membership_effects(EntryOwner::node(9), None, Some(&[s("a")])),
         vec![EntryEffect {
-            key: encode_unique_index_key("user_email", &a),
+            key: encode_unique_entry_key(GEN, &a),
             value: Some(9u64.to_be_bytes().to_vec()),
         }]
     );
@@ -197,7 +200,7 @@ fn a_unique_entry_holds_its_node() {
 /// version leaving a value removes only its own.
 #[test]
 fn a_version_entry_carries_its_valid_from() {
-    use crate::index::encoding::encode_version_index_key;
+    use crate::index::encoding::encode_version_entry_key;
     let index = interp(false, false, None);
     let a = encode_tuple(&[s("a")]).expect("a");
     let first = index.membership_effects(EntryOwner::version(7, 100), None, Some(&[s("a")]));
@@ -205,7 +208,7 @@ fn a_version_entry_carries_its_valid_from() {
     assert_eq!(
         first,
         vec![EntryEffect {
-            key: encode_version_index_key("user_email", &a, 7, 100),
+            key: encode_version_entry_key(GEN, &a, 7, 100),
             value: Some(Vec::new()),
         }]
     );
@@ -213,7 +216,7 @@ fn a_version_entry_carries_its_valid_from() {
     assert_eq!(
         index.membership_effects(EntryOwner::version(7, 100), Some(&[s("a")]), None),
         vec![EntryEffect {
-            key: encode_version_index_key("user_email", &a, 7, 100),
+            key: encode_version_entry_key(GEN, &a, 7, 100),
             value: None,
         }]
     );
@@ -234,7 +237,7 @@ fn a_version_leaving_a_unique_value_keeps_the_claim() {
             Some(&[s("b")])
         ),
         vec![EntryEffect {
-            key: encode_unique_index_key("user_email", &b),
+            key: encode_unique_entry_key(GEN, &b),
             value: Some(9u64.to_be_bytes().to_vec()),
         }]
     );
@@ -242,7 +245,7 @@ fn a_version_leaving_a_unique_value_keeps_the_claim() {
     assert_eq!(
         index.membership_effects(EntryOwner::node(9), Some(&[s("a")]), None),
         vec![EntryEffect {
-            key: encode_unique_index_key("user_email", &a),
+            key: encode_unique_entry_key(GEN, &a),
             value: None,
         }]
     );
@@ -380,9 +383,9 @@ mod resolve {
                 unit[0].clone(),
                 Mutation::Delete {
                     partition: PartitionId::Idx,
-                    key: encode_index_key("user_email", &old, 7),
+                    key: encode_entry_key(GEN, &old, 7),
                 },
-                idx_put(encode_index_key("user_email", &new, 7), Vec::new()),
+                idx_put(encode_entry_key(GEN, &new, 7), Vec::new()),
             ]
         );
     }
@@ -391,7 +394,7 @@ mod resolve {
     /// entry, keyed by node and valid_from, at every member.
     #[test]
     fn version_work_derives_the_versions_entry() {
-        use crate::index::encoding::encode_version_index_key;
+        use crate::index::encoding::encode_version_entry_key;
         let index = interp(false, false, None);
         let Mutation::Derive(mut version_work) =
             work(&index, 7, None, DerivedSource::Values(Some(vec![s("v")])))
@@ -405,7 +408,7 @@ mod resolve {
                 .expect("resolve")
                 .as_ref(),
             &[idx_put(
-                encode_version_index_key("user_email", &tuple, 7, -3),
+                encode_version_entry_key(GEN, &tuple, 7, -3),
                 Vec::new()
             )]
         );
@@ -424,7 +427,7 @@ mod resolve {
         assert_eq!(
             resolve_unit(&unit, 16).expect("resolve").as_ref(),
             &[idx_put(
-                encode_unique_index_key("user_email", &tuple),
+                encode_unique_entry_key(GEN, &tuple),
                 2u64.to_be_bytes().to_vec()
             )]
         );
@@ -484,7 +487,7 @@ fn another_codec_is_refused() {
     assert_eq!(
         other.check_supported(),
         Err(UnsupportedInterpretation {
-            name: "user_email".into(),
+            generation: GEN,
             codec: KEY_CODEC + 1
         })
     );

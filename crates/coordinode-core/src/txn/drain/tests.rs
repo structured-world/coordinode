@@ -235,10 +235,14 @@ mod derived {
     use crate::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding};
     use std::collections::BTreeMap;
 
+    /// The generation of the unique email index.
+    const EMAIL_GEN: crate::index::identity::GenerationId =
+        crate::index::identity::GenerationId::from_raw(12);
+
     fn unique_email() -> IndexInterpretation {
         IndexInterpretation {
             codec: KEY_CODEC,
-            name: "u_email".into(),
+            generation: EMAIL_GEN,
             unique: true,
             sparse: false,
             properties: vec![PropertyRef {
@@ -253,7 +257,7 @@ mod derived {
     fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
         let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
         entry(
-            "u_email",
+            EMAIL_GEN,
             true,
             &tuple,
             crate::index::derive::EntryOwner::node(node_id),

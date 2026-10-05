@@ -1231,15 +1231,19 @@ mod derived {
     use coordinode_core::graph::node::NodeRecord;
     use coordinode_core::graph::types::Value;
     use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef};
-    use coordinode_core::index::encoding::{encode_index_key, encode_tuple};
+    use coordinode_core::index::encoding::{encode_entry_key, encode_tuple};
+    use coordinode_core::index::identity::GenerationId;
     use coordinode_core::txn::proposal::{DerivedIndexWork, DerivedSource, IndexBinding};
 
     use super::*;
 
+    /// The generation of the email index.
+    const EMAIL_GEN: GenerationId = GenerationId::from_raw(1);
+
     fn email_index() -> IndexInterpretation {
         IndexInterpretation {
             codec: KEY_CODEC,
-            name: "user_email".into(),
+            generation: EMAIL_GEN,
             unique: false,
             sparse: false,
             properties: vec![PropertyRef {
@@ -1252,7 +1256,7 @@ mod derived {
 
     fn entry_key(email: &str, node_id: u64) -> Vec<u8> {
         let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
-        encode_index_key("user_email", &tuple, node_id)
+        encode_entry_key(EMAIL_GEN, &tuple, node_id)
     }
 
     /// A node record put for `email`, then the DERIVED work moving the node's

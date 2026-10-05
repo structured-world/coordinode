@@ -10,7 +10,8 @@ use std::time::Duration;
 use coordinode_core::graph::node::NodeRecord;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef, entry};
-use coordinode_core::index::encoding::encode_tuple;
+use coordinode_core::index::encoding::{encode_tuple, unique_entries_prefix};
+use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId, ProposalError,
     ProposalIdGenerator, ProposalPipeline, RaftProposal,
@@ -102,12 +103,15 @@ async fn bootstrap_3() -> (Member, Member, Member) {
     )
 }
 
+/// The generation the unique email index serves from.
+const EMAIL: GenerationId = GenerationId::from_raw(1);
+
 fn unique_email() -> IndexBinding {
     IndexBinding {
         epoch: 1,
         interpretation: IndexInterpretation {
             codec: KEY_CODEC,
-            name: "u_email".into(),
+            generation: EMAIL,
             unique: true,
             sparse: false,
             properties: vec![PropertyRef {
@@ -123,7 +127,7 @@ fn unique_email() -> IndexBinding {
 fn claim(node_id: u64, email: &str) -> (Vec<u8>, Vec<u8>) {
     let tuple = encode_tuple(&[Value::String(email.into())]).expect("tuple");
     entry(
-        "u_email",
+        EMAIL,
         true,
         &tuple,
         coordinode_core::index::derive::EntryOwner::node(node_id),
@@ -166,7 +170,7 @@ fn write_email(
 /// Every entry of the index a member holds.
 fn entries(engine: &StorageEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
     use coordinode_storage::Guard as _;
-    let prefix = coordinode_core::index::encoding::unique_index_prefix("u_email");
+    let prefix = unique_entries_prefix(EMAIL);
     engine
         .prefix_scan(Partition::Idx, &prefix)
         .expect("scan")

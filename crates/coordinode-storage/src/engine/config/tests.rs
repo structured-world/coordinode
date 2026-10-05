@@ -959,3 +959,113 @@ fn prefix_scan_uses_extractor() {
         "prefix scan for missing prefix should find 0"
     );
 }
+
+/// Filter-pruned scans of index entries return exactly what an unfiltered
+/// pass over the partition finds, for generation numbers at the boundaries of
+/// their fixed width and for values full of separator and zero bytes: a
+/// prefix the extractor failed to record would make a table look empty to
+/// the filter and lose matching entries.
+#[test]
+fn index_entry_scans_match_an_unfiltered_oracle() {
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::encoding::{
+        encode_entry_key, encode_tuple, encode_unique_entry_key, entries_prefix,
+        entry_value_prefix, unique_entries_prefix,
+    };
+    use coordinode_core::index::identity::GenerationId;
+    use lsm_tree::Guard as _;
+
+    use crate::engine::core::StorageEngine;
+    use crate::engine::partition::Partition;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![default_disk_endpoint(dir.path())]);
+    let engine = StorageEngine::open(&config).expect("open");
+
+    let generations = [
+        0,
+        1,
+        0x3A,
+        0xFF,
+        0x100,
+        0x3A3A_003A_0000_FF3A,
+        u64::MAX - 1,
+        u64::MAX,
+    ]
+    .map(GenerationId::from_raw);
+    let values = [
+        Value::String(String::new()),
+        Value::String(":".into()),
+        Value::String("a\0:".into()),
+        Value::Binary(vec![0, b':', 0xFF, 0]),
+        Value::Int(0x3A),
+        Value::Null,
+    ];
+    let tuples: Vec<Vec<u8>> = values
+        .iter()
+        .map(|v| encode_tuple(std::slice::from_ref(v)).expect("indexable"))
+        .collect();
+    // Each generation lands in tables of its own and shares others, so the
+    // filters of several tables decide every scan.
+    for (round, g) in generations.iter().enumerate() {
+        for (i, tuple) in tuples.iter().enumerate() {
+            let node = 0x3A00_0000_0000_0000 | (round * 16 + i) as u64;
+            engine
+                .put(Partition::Idx, &encode_entry_key(*g, tuple, node), b"")
+                .expect("put");
+            engine
+                .put(
+                    Partition::Idx,
+                    &encode_unique_entry_key(*g, tuple),
+                    &node.to_be_bytes(),
+                )
+                .expect("put");
+        }
+        if round % 3 == 2 {
+            engine.persist().expect("persist");
+        }
+    }
+    engine.persist().expect("persist");
+
+    let all: Vec<Vec<u8>> = engine
+        .prefix_scan(Partition::Idx, b"")
+        .expect("scan")
+        .map(|guard| guard.into_inner().expect("entry").0.to_vec())
+        .collect();
+    let scan = |prefix: &[u8]| -> Vec<Vec<u8>> {
+        engine
+            .prefix_scan(Partition::Idx, prefix)
+            .expect("scan")
+            .map(|guard| guard.into_inner().expect("entry").0.to_vec())
+            .collect()
+    };
+    let oracle = |prefix: &[u8]| -> Vec<Vec<u8>> {
+        all.iter()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
+    };
+    let mut probes: Vec<Vec<u8>> = Vec::new();
+    // Generations that hold entries and ones that do not, next to them.
+    for raw in [0, 2, 0x39, 0x3A, 0x3B, 0x1_00, 0x1_01, u64::MAX] {
+        let g = GenerationId::from_raw(raw);
+        probes.push(entries_prefix(g).to_vec());
+        probes.push(unique_entries_prefix(g).to_vec());
+        for tuple in &tuples {
+            probes.push(entry_value_prefix(g, tuple));
+        }
+    }
+    for probe in &probes {
+        // Every probe is a boundary the filter answers for, so a prefix
+        // recorded wrongly at write time would show here as a lost entry.
+        assert!(
+            lsm_tree::PrefixExtractor::is_valid_scan_boundary(&super::IndexEntryPrefix, probe),
+            "prefix {probe:02x?} is not a filter boundary"
+        );
+        assert_eq!(scan(probe), oracle(probe), "prefix {probe:02x?}");
+    }
+    assert_eq!(
+        scan(&entries_prefix(GenerationId::from_raw(u64::MAX))).len(),
+        values.len()
+    );
+}

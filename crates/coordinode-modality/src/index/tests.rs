@@ -75,6 +75,12 @@ fn derived(mut index: IndexDefinition) -> IndexDefinition {
     index
 }
 
+/// `descriptor` as the index numbered `raw` serving from generation `raw`:
+/// the entry tests drive the store without a catalog.
+fn bound(descriptor: IndexDescriptor, raw: u64) -> IndexDefinition {
+    descriptor.bind(IndexId::from_raw(raw), GenerationId::from_raw(raw))
+}
+
 /// Entries of a non-unique index commit with their transaction and are
 /// found by value, one per node.
 #[test]
@@ -82,7 +88,7 @@ fn non_unique_entries_are_found_by_value() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_name", "User", "name");
+    let index = bound(IndexDescriptor::btree("user_name", "User", "name"), 1);
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
@@ -110,7 +116,7 @@ fn an_uncommitted_entry_is_invisible_outside_its_transaction() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_name", "User", "name");
+    let index = bound(IndexDescriptor::btree("user_name", "User", "name"), 1);
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
@@ -135,7 +141,7 @@ fn a_staged_removal_hides_the_entry_from_its_transaction() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_name", "User", "name");
+    let index = bound(IndexDescriptor::btree("user_name", "User", "name"), 1);
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
@@ -156,7 +162,10 @@ fn a_unique_value_has_one_holder() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let index = bound(
+        IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("a@x"), id(1));
@@ -190,8 +199,14 @@ fn a_unique_value_has_one_holder() {
 #[test]
 fn two_concurrent_claims_of_one_value_conflict() {
     for index in [
-        IndexDefinition::btree("user_email", "User", "email").unique(),
-        derived(IndexDefinition::btree("user_email", "User", "email").unique()),
+        bound(
+            IndexDescriptor::btree("user_email", "User", "email").unique(),
+            1,
+        ),
+        derived(bound(
+            IndexDescriptor::btree("user_email", "User", "email").unique(),
+            1,
+        )),
     ] {
         let fx = open_engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
@@ -228,7 +243,10 @@ fn a_unique_entry_is_removed_only_by_its_holder() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let index = bound(
+        IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("a@x"), id(1));
@@ -258,7 +276,10 @@ fn lists_index_their_elements_and_unkeyed_values_nothing() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_tag", "User", "tags").unique();
+    let index = bound(
+        IndexDescriptor::btree("user_tag", "User", "tags").unique(),
+        1,
+    );
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     let tags = vec![Value::Array(vec![
@@ -290,7 +311,10 @@ fn compound_entries_are_told_apart_by_every_column() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::compound("by_city_age", "User", vec!["city".into(), "age".into()]);
+    let index = bound(
+        IndexDescriptor::compound("by_city_age", "User", vec!["city".into(), "age".into()]),
+        1,
+    );
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     let a = vec![Value::String("Oslo".into()), Value::Int(30)];
@@ -307,26 +331,28 @@ fn compound_entries_are_told_apart_by_every_column() {
     );
 }
 
-/// Clearing an index in a transaction removes every entry of the index, in
-/// both shapes, and no entry of another index, when the transaction
-/// commits and not before.
+/// Clearing a generation in a transaction removes every entry of it, in
+/// both shapes, and no entry of another generation, the neighbouring
+/// numbers included, when the transaction commits and not before.
 #[test]
-fn clearing_an_index_removes_its_entries_only() {
+fn clearing_a_generation_removes_its_entries_only() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let plain = IndexDefinition::btree("i", "User", "name");
-    let unique = IndexDefinition::btree("i", "User", "name").unique();
-    let other = IndexDefinition::btree("ij", "User", "name");
+    let plain = bound(IndexDescriptor::btree("i", "User", "name"), 0x100);
+    let unique = bound(IndexDescriptor::btree("i", "User", "name").unique(), 0x100);
+    let other = bound(IndexDescriptor::btree("j", "User", "name"), 0x101);
+    let before = bound(IndexDescriptor::btree("k", "User", "name").unique(), 0xFF);
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &plain, &s("a"), id(1));
     enter(&store, &mut t, &unique, &s("b"), id(2));
     enter(&store, &mut t, &other, &s("a"), id(3));
+    enter(&store, &mut t, &before, &s("a"), id(4));
     commit(&mut t).unwrap();
 
     let mut clear = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
-    store.clear_txn(&mut clear, "i").unwrap();
+    store.clear_txn(&mut clear, plain.generation).unwrap();
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     assert_eq!(
         store.scan_entry_ids(&mut t, &plain).unwrap(),
@@ -339,6 +365,7 @@ fn clearing_an_index_removes_its_entries_only() {
     assert!(store.scan_entry_ids(&mut t, &plain).unwrap().is_empty());
     assert!(store.scan_entry_ids(&mut t, &unique).unwrap().is_empty());
     assert_eq!(store.scan_entry_ids(&mut t, &other).unwrap(), vec![id(3)]);
+    assert_eq!(store.scan_entry_ids(&mut t, &before).unwrap(), vec![id(4)]);
 }
 
 /// Versions of a temporal node have entries of their own: two versions
@@ -347,8 +374,11 @@ fn clearing_an_index_removes_its_entries_only() {
 #[test]
 fn version_entries_answer_once_and_move_alone() {
     for index in [
-        IndexDefinition::btree("user_name", "User", "name"),
-        derived(IndexDefinition::btree("user_name", "User", "name")),
+        bound(IndexDescriptor::btree("user_name", "User", "name"), 1),
+        derived(bound(
+            IndexDescriptor::btree("user_name", "User", "name"),
+            1,
+        )),
     ] {
         let fx = open_engine();
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
@@ -392,7 +422,10 @@ fn a_derived_index_gives_the_resolved_view() {
     let fx = open_engine();
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(&fx.engine);
-    let index = derived(IndexDefinition::btree("user_name", "User", "name"));
+    let index = derived(bound(
+        IndexDescriptor::btree("user_name", "User", "name"),
+        1,
+    ));
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
@@ -436,27 +469,185 @@ fn a_derived_index_gives_the_resolved_view() {
     );
 }
 
+/// A published definition is stored under its identity and found by its
+/// name; deleting it removes both, and its numbers stay taken.
 #[test]
-fn definition_txn_round_trip() {
+fn publication_round_trip_keeps_numbers_taken() {
     let fx = open_engine();
     let engine = &fx.engine;
     let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
     let store = LocalIndexStore::new(engine);
-    let def = IndexDefinition::btree("user_email", "User", "email").unique();
 
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
-    store.put_definition_txn(&mut t, &def).expect("put txn");
+    let def = store
+        .publish_definition_txn(
+            &mut t,
+            IndexDescriptor::btree("user_email", "User", "email").unique(),
+        )
+        .expect("publish");
     commit(&mut t).unwrap();
+    assert_eq!(store.resolve_name("user_email").unwrap(), Some(def.id));
     let loaded = store
-        .load_definition("user_email")
+        .load_definition(def.id)
         .expect("load")
         .expect("present after commit");
-    assert!(loaded.unique);
+    assert_eq!(loaded, def);
 
     let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
-    store
-        .delete_definition_txn(&mut t, "user_email")
-        .expect("delete txn");
+    store.delete_definition_txn(&mut t, &def).expect("delete");
     commit(&mut t).unwrap();
-    assert!(store.load_definition("user_email").expect("load").is_none());
+    assert!(store.load_definition(def.id).unwrap().is_none());
+    assert_eq!(store.resolve_name("user_email").unwrap(), None);
+
+    // The same name again is a new object with new numbers: a delayed
+    // writer or cleanup bound to the dropped one cannot reach it.
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let again = store
+        .publish_definition_txn(
+            &mut t,
+            IndexDescriptor::btree("user_email", "User", "email").unique(),
+        )
+        .expect("publish");
+    commit(&mut t).unwrap();
+    assert_ne!(again.id, def.id);
+    assert_ne!(again.generation, def.generation);
+}
+
+/// A name another live index holds refuses the publication without taking
+/// a number; an unnamed index needs no binding and is found by identity.
+#[test]
+fn a_taken_name_refuses_publication_and_unnamed_indexes_need_none() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let first = store
+        .publish_definition_txn(&mut t, IndexDescriptor::btree("i", "User", "a"))
+        .expect("publish");
+    commit(&mut t).unwrap();
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    assert!(matches!(
+        store.publish_definition_txn(&mut t, IndexDescriptor::btree("i", "Post", "b")),
+        Err(StoreError::IndexNameTaken(name)) if name == "i"
+    ));
+    let unnamed = IndexDescriptor {
+        name: None,
+        ..IndexDescriptor::btree("unused", "Post", "b")
+    };
+    let second = store
+        .publish_definition_txn(&mut t, unnamed)
+        .expect("publish unnamed");
+    commit(&mut t).unwrap();
+    assert_eq!(
+        (second.id.as_raw(), second.generation.as_raw()),
+        (first.id.as_raw() + 1, first.generation.as_raw() + 1),
+        "the refused publication took no number"
+    );
+    assert_eq!(store.load_definition(second.id).unwrap(), Some(second));
+}
+
+/// Two statements publishing at once read the same free numbers; the
+/// allocator record lets only one of them commit, so no number is handed
+/// out twice. Two of one name conflict the same way.
+#[test]
+fn concurrent_publications_never_share_a_number_or_a_name() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+
+    let mut a = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let mut b = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let da = store
+        .publish_definition_txn(&mut a, IndexDescriptor::btree("a", "User", "x"))
+        .expect("publish a");
+    let db = store
+        .publish_definition_txn(&mut b, IndexDescriptor::btree("b", "User", "y"))
+        .expect("publish b");
+    assert_eq!(da.id, db.id, "both read the same free number");
+    commit(&mut a).unwrap();
+    assert!(commit(&mut b).is_err(), "the second must not commit");
+
+    let mut c = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let mut d = Transaction::begin(engine, Some(&oracle), oracle.next());
+    store
+        .publish_definition_txn(&mut c, IndexDescriptor::btree("same", "User", "x"))
+        .expect("publish c");
+    commit(&mut c).unwrap();
+    // `d` began before `c` committed, so its read finds the name free; the
+    // binding's condition refuses it at commit.
+    let found_free =
+        store.publish_definition_txn(&mut d, IndexDescriptor::btree("same", "Post", "y"));
+    match found_free {
+        Ok(_) => assert!(commit(&mut d).is_err(), "a second binding of one name"),
+        Err(e) => assert!(matches!(e, StoreError::IndexNameTaken(_)), "{e}"),
+    }
+}
+
+/// A description is catalog metadata: editing it rewrites the definition
+/// record only, never the generation or an entry.
+#[test]
+fn a_description_edit_touches_no_entry() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let mut def = store
+        .publish_definition_txn(&mut t, IndexDescriptor::btree("i", "User", "name"))
+        .expect("publish");
+    enter(&store, &mut t, &def, &s("a"), id(1));
+    commit(&mut t).unwrap();
+    let entries_before = engine
+        .prefix_scan(Partition::Idx, &entries_prefix(def.generation))
+        .unwrap()
+        .count();
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    def.description = Some("emails of active users".into());
+    store.put_definition_txn(&mut t, &def).expect("put");
+    commit(&mut t).unwrap();
+
+    let loaded = store.load_definition(def.id).unwrap().expect("present");
+    assert_eq!(
+        loaded.description.as_deref(),
+        Some("emails of active users")
+    );
+    assert_eq!(loaded.generation, def.generation);
+    assert_eq!(
+        engine
+            .prefix_scan(Partition::Idx, &entries_prefix(def.generation))
+            .unwrap()
+            .count(),
+        entries_before
+    );
+}
+
+/// A rebuild's generation comes from the same allocator: never one an
+/// index already used.
+#[test]
+fn a_new_generation_is_never_one_already_used() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let store = LocalIndexStore::new(engine);
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let def = store
+        .publish_definition_txn(&mut t, IndexDescriptor::btree("i", "User", "name"))
+        .expect("publish");
+    let rebuilt = store.allocate_generation_txn(&mut t).expect("allocate");
+    commit(&mut t).unwrap();
+    assert_ne!(rebuilt, def.generation);
+
+    let mut t = Transaction::begin(engine, Some(&oracle), oracle.next());
+    let other = store
+        .publish_definition_txn(&mut t, IndexDescriptor::btree("j", "User", "name"))
+        .expect("publish");
+    commit(&mut t).unwrap();
+    assert!(other.generation != rebuilt && other.generation != def.generation);
 }

@@ -15,9 +15,10 @@ use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
-    BlobStore, Bucket, Crs, DocumentStore, EdgeStore, IndexDefinition, IndexStore, LocalBlobStore,
-    LocalDocumentStore, LocalEdgeStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
-    LocalTimeSeriesStore, Measurement, NodeStore, Point, SpatialStore, TimeSeriesStore,
+    BlobStore, Bucket, Crs, DocumentStore, EdgeStore, GenerationId, IndexDescriptor, IndexId,
+    IndexStore, LocalBlobStore, LocalDocumentStore, LocalEdgeStore, LocalIndexStore,
+    LocalNodeStore, LocalSpatialStore, LocalTimeSeriesStore, Measurement, NodeStore, Point,
+    SpatialStore, TimeSeriesStore,
 };
 use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use std::collections::BTreeMap;
@@ -118,7 +119,8 @@ fn node_edge_index_document_flow() {
     put_node(engine, 0, bob, &bob_rec);
 
     // 2. Index both by name (buffered, committed).
-    let by_name = IndexDefinition::btree("by_name", "User", "name");
+    let by_name = IndexDescriptor::btree("by_name", "User", "name")
+        .bind(IndexId::from_raw(1), GenerationId::from_raw(1));
     {
         let read_ts = oracle.next();
         let mut txn = Transaction::begin(engine, Some(&oracle), read_ts);

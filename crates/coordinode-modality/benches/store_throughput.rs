@@ -383,7 +383,10 @@ fn bench_spatial_bbox_tight_in_large(c: &mut Criterion) {
 fn bench_index_put_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_put_then_scan_exact");
     group.sample_size(10);
-    let index = coordinode_modality::IndexDefinition::btree("by_id", "L", "id");
+    let index = coordinode_modality::IndexDescriptor::btree("by_id", "L", "id").bind(
+        coordinode_modality::IndexId::from_raw(1),
+        coordinode_modality::GenerationId::from_raw(1),
+    );
     for &n in &[100usize, 1000, 10_000] {
         let (_dir, engine) = mk_engine();
         let store = LocalIndexStore::new(&engine);

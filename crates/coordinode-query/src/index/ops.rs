@@ -8,7 +8,7 @@ use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::error::StorageError;
 
-use super::definition::{IndexDefinition, IndexState};
+use super::definition::{IndexDefinition, IndexId, IndexState};
 
 /// Convert [`coordinode_modality::StoreError`] back into the
 /// [`StorageError`] vocabulary callers of this module use.
@@ -39,25 +39,25 @@ pub fn save_index_definition(
 /// caller's race to handle).
 pub fn save_index_state(
     engine: &StorageEngine,
-    name: &str,
+    id: IndexId,
     state: IndexState,
 ) -> Result<bool, StorageError> {
     LocalIndexStore::new(engine)
-        .set_definition_state(name, state)
+        .set_definition_state(id, state)
         .map_err(map_store_err)
 }
 
 /// Load index definition from the index-store catalog.
 pub fn load_index_definition(
     engine: &StorageEngine,
-    name: &str,
+    id: IndexId,
 ) -> Result<Option<IndexDefinition>, StorageError> {
     LocalIndexStore::new(engine)
-        .load_definition(name)
+        .load_definition(id)
         .map_err(map_store_err)
 }
 
-/// List every persisted index definition in `schema:idx:` order.
+/// List every persisted index definition in identity order.
 ///
 /// Skips entries whose body fails to decode rather than aborting the
 /// whole list (a corrupt index def shouldn't take out the registry).

@@ -147,7 +147,7 @@ fn derived_record_sources_follow_their_record() {
                 epoch: 1,
                 interpretation: IndexInterpretation {
                     codec: KEY_CODEC,
-                    name: "i".into(),
+                    generation: crate::index::identity::GenerationId::from_raw(1),
                     unique: false,
                     sparse: false,
                     properties: Vec::new(),

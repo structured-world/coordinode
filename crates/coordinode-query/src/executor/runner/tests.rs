@@ -94,7 +94,7 @@ fn building_vector_index() -> (
         )
         .expect("open engine"),
     );
-    let def = crate::index::IndexDefinition::hnsw(
+    let def = crate::index::IndexDescriptor::hnsw(
         "emb",
         "Doc",
         "embedding",
@@ -108,11 +108,15 @@ fn building_vector_index() -> (
             ef_search: None,
             rerank_candidates: None,
         },
+    )
+    .bind(
+        crate::index::IndexId::from_raw(1),
+        crate::index::GenerationId::from_raw(1),
     );
     crate::index::ops::save_index_definition(&engine, &def).expect("persist definition");
     crate::index::ops::save_index_state(
         &engine,
-        "emb",
+        def.id,
         IndexState::Building {
             written: 0,
             estimated_total: 0,
@@ -5585,7 +5589,12 @@ fn create_unique_index_enforces_constraint_on_insert() {
     let registry = crate::index::IndexRegistry::new();
 
     // Register a unique index on User.name (skip backfill — insert two fresh nodes).
-    let unique_def = crate::index::IndexDefinition::btree("u_name", "User", "name").unique();
+    let unique_def = crate::index::IndexDescriptor::btree("u_name", "User", "name")
+        .unique()
+        .bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        );
     registry.register_in_memory(unique_def);
 
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
@@ -5707,7 +5716,10 @@ fn create_index_duplicate_name_returns_error() {
     let registry = crate::index::IndexRegistry::new();
 
     // Register once.
-    let def = crate::index::IndexDefinition::btree("dup_idx", "User", "age");
+    let def = crate::index::IndexDescriptor::btree("dup_idx", "User", "age").bind(
+        crate::index::IndexId::from_raw(1),
+        crate::index::GenerationId::from_raw(1),
+    );
     registry.register_in_memory(def);
 
     let mut ctx = make_ctx_with_btree(&engine, &mut interner, &allocator, &registry);
@@ -5748,7 +5760,10 @@ fn explain_shows_index_scan_after_create_index() {
 
     // Register a B-tree index on User.name (no storage needed for planner test).
     // We skip storage-backed register and use register_in_memory directly.
-    let def = crate::index::IndexDefinition::btree("user_name_idx", "User", "name");
+    let def = crate::index::IndexDescriptor::btree("user_name_idx", "User", "name").bind(
+        crate::index::IndexId::from_raw(1),
+        crate::index::GenerationId::from_raw(1),
+    );
     registry.register_in_memory(def);
 
     // Build Filter(NodeScan) — what the planner emits BEFORE optimization.
@@ -5822,11 +5837,12 @@ fn lifted_correlated_equality_uses_index_scan() {
     use crate::planner::optimize_index_selection;
 
     let registry = crate::index::IndexRegistry::new();
-    registry.register_in_memory(crate::index::IndexDefinition::btree(
-        "person_pid",
-        "Person",
-        "pid",
-    ));
+    registry.register_in_memory(
+        crate::index::IndexDescriptor::btree("person_pid", "Person", "pid").bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
 
     // Filter(CartesianProduct(NodeScan(e), NodeScan(b:Person)), b.pid = e.d):
     // the shape the planner emits for the lifted correlated endpoint.
@@ -5898,10 +5914,12 @@ fn index_scan_returns_correct_node() {
     .expect("CREATE INDEX failed");
 
     // Execute IndexScan for name = "Bob".
+    let index = registry.get("user_name_idx").expect("created").id;
     let rows = execute_op(
         &LogicalOp::IndexScan {
             variable: "n".to_string(),
             label: "User".to_string(),
+            index,
             index_name: "user_name_idx".to_string(),
             property: "name".to_string(),
             value_expr: nx(Expr::Literal(coordinode_core::graph::types::Value::String(
@@ -5935,11 +5953,12 @@ fn index_scan_returns_correct_node() {
 #[test]
 fn correlated_property_filter_rewrites_to_index_scan() {
     let registry = crate::index::IndexRegistry::new();
-    registry.register_in_memory(crate::index::IndexDefinition::btree(
-        "person_pid",
-        "Person",
-        "pid",
-    ));
+    registry.register_in_memory(
+        crate::index::IndexDescriptor::btree("person_pid", "Person", "pid").bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
 
     // right = NodeScan(a:Person {pid: e.s}) — correlated key e.s.
     let right = LogicalOp::NodeScan {
@@ -5983,11 +6002,12 @@ fn correlated_property_filter_rewrites_to_index_scan() {
 #[test]
 fn self_referential_filter_stays_node_scan() {
     let registry = crate::index::IndexRegistry::new();
-    registry.register_in_memory(crate::index::IndexDefinition::btree(
-        "person_pid",
-        "Person",
-        "pid",
-    ));
+    registry.register_in_memory(
+        crate::index::IndexDescriptor::btree("person_pid", "Person", "pid").bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
 
     let plan = LogicalOp::NodeScan {
         variable: "a".to_string(),
@@ -6051,10 +6071,12 @@ fn index_scan_resolves_correlated_key() {
     );
     ctx.correlated_row = Some(corr);
 
+    let index = registry.get("user_name_idx").expect("created").id;
     let rows = execute_op(
         &LogicalOp::IndexScan {
             variable: "n".to_string(),
             label: "User".to_string(),
+            index,
             index_name: "user_name_idx".to_string(),
             property: "name".to_string(),
             value_expr: nx(Expr::PropertyAccess {

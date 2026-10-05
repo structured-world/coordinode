@@ -48,6 +48,14 @@ pub enum StoreError {
          timestamp or binary value"
     )]
     UnsupportedKey(&'static str),
+
+    /// An index name another live index holds.
+    #[error("an index named `{0}` already exists")]
+    IndexNameTaken(String),
+
+    /// The index catalog has no identity left to allocate.
+    #[error(transparent)]
+    IdentityExhausted(#[from] coordinode_core::index::identity::IdentityExhausted),
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

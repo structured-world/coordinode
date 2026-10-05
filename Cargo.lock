@@ -1157,6 +1157,7 @@ dependencies = [
  "coordinode-cluster",
  "coordinode-core",
  "coordinode-embed",
+ "coordinode-modality",
  "coordinode-query",
  "coordinode-raft",
  "coordinode-replicate",

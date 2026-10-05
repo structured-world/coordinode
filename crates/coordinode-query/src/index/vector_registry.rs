@@ -20,7 +20,7 @@ use coordinode_vector::storage::lsm_backed::LsmVectorTier;
 use coordinode_vector::storage::{VectorTierHandle, VectorTierStorage};
 
 use super::coverage::{IndexCoverage, IndexDelta};
-use super::definition::IndexDefinition;
+use super::definition::{GenerationId, IndexDefinition};
 
 /// Key for vector index lookup: (label, property).
 type VectorIndexKey = (String, String);
@@ -116,13 +116,15 @@ pub struct VectorIndexRegistry {
     /// caller (executor, Database) so we never re-enter the same
     /// `parking_lot` RwLock from inside an active write transaction.
     tier_backend: Option<Arc<dyn VectorTierStorage>>,
-    /// Backfills running right now, keyed by index name.
+    /// Backfills running right now, keyed by the generation each fills.
     ///
     /// A build is a task the index owns, not a detached thread: DROP, a
     /// replacing CREATE, and database shutdown all cancel and join it here
     /// before touching the index. Without that ownership the build outlives
     /// the index it belongs to and keeps writing under whatever comes next.
-    builds: Mutex<HashMap<String, BuildHandle>>,
+    /// Keyed by generation, a build of a dropped index can never be taken
+    /// for one of an index created later under the same name.
+    builds: Mutex<HashMap<GenerationId, BuildHandle>>,
     /// Retired-memory budget each graph gets (see
     /// [`Self::set_retired_bytes_budget`]).
     retired_bytes_budget: AtomicUsize,
@@ -140,6 +142,8 @@ pub struct VectorIndexRegistry {
 struct BuildHandle {
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
+    /// How the index is named in progress reports.
+    index: String,
     label: String,
     property: String,
 }
@@ -363,10 +367,7 @@ impl VectorIndexRegistry {
         health: Arc<HealthSignal>,
     ) {
         let Some(config) = def.vector_config.as_ref() else {
-            tracing::error!(
-                "register called with non-vector IndexDefinition: {}",
-                def.name
-            );
+            tracing::error!("register called with non-vector IndexDefinition: {def}");
             return;
         };
 
@@ -435,10 +436,7 @@ impl VectorIndexRegistry {
     /// Uses interior mutability — safe to call via `&self`.
     pub fn register_sharded(&self, def: IndexDefinition, router: Arc<dyn VectorShardRouter>) {
         let Some(config) = def.vector_config.as_ref() else {
-            tracing::error!(
-                "register_sharded called with non-vector IndexDefinition: {}",
-                def.name
-            );
+            tracing::error!("register_sharded called with non-vector IndexDefinition: {def}");
             return;
         };
         let n = router.n_partitions().max(1);
@@ -727,45 +725,45 @@ impl VectorIndexRegistry {
         BuildToken(Arc::new(AtomicBool::new(false)))
     }
 
-    /// Adopt a running backfill so the index owns it.
+    /// Adopt a running backfill of `def`'s generation so the index owns it.
     ///
-    /// A build already registered under `name` is cancelled and joined first:
-    /// two builds for one index would race each other's inserts into the same
-    /// graph, and only the survivor's progress would mean anything.
+    /// A build already registered for that generation is cancelled and
+    /// joined first: two builds of one generation would race each other's
+    /// inserts into the same graph, and only the survivor's progress would
+    /// mean anything.
     pub fn register_build(
         &self,
-        name: &str,
-        label: &str,
-        property: &str,
+        def: &IndexDefinition,
         token: &BuildToken,
         thread: std::thread::JoinHandle<()>,
     ) {
-        self.cancel_build(name);
+        self.cancel_build(def.generation);
         self.reap_finished_builds();
         let handle = BuildHandle {
             stop: Arc::clone(&token.0),
             thread,
-            label: label.to_string(),
-            property: property.to_string(),
+            index: def.to_string(),
+            label: def.label.clone(),
+            property: def.property().to_string(),
         };
         self.builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(name.to_string(), handle);
+            .insert(def.generation, handle);
     }
 
-    /// Stop the backfill for `name` and wait for it to finish.
+    /// Stop the backfill of `generation` and wait for it to finish.
     ///
     /// Returns whether a build was running. On return the build has stopped
     /// touching the index AND its persisted definition, which is what lets a
     /// caller drop or replace the index immediately afterwards without racing
     /// a write it cannot see.
-    pub fn cancel_build(&self, name: &str) -> bool {
+    pub fn cancel_build(&self, generation: GenerationId) -> bool {
         let handle = self
             .builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
+            .remove(&generation);
         let Some(handle) = handle else {
             return false;
         };
@@ -801,26 +799,26 @@ impl VectorIndexRegistry {
     /// one to notify us, and joining a finished thread returns at once.
     fn reap_finished_builds(&self) {
         let mut builds = self.builds.lock().unwrap_or_else(|e| e.into_inner());
-        let finished: Vec<String> = builds
+        let finished: Vec<GenerationId> = builds
             .iter()
             .filter(|(_, h)| h.thread.is_finished())
-            .map(|(name, _)| name.clone())
+            .map(|(generation, _)| *generation)
             .collect();
-        for name in finished {
-            if let Some(handle) = builds.remove(&name) {
+        for generation in finished {
+            if let Some(handle) = builds.remove(&generation) {
                 let _ = handle.thread.join();
             }
         }
     }
 
-    /// Names of the backfills running right now.
+    /// Names of the indexes whose backfills are running right now.
     pub fn running_builds(&self) -> Vec<String> {
         self.reap_finished_builds();
         self.builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
+            .values()
+            .map(|h| h.index.clone())
             .collect()
     }
 
@@ -837,8 +835,8 @@ impl VectorIndexRegistry {
             .builds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(name, h)| (name.clone(), h.label.clone(), h.property.clone()))
+            .values()
+            .map(|h| (h.index.clone(), h.label.clone(), h.property.clone()))
             .collect();
         running
             .into_iter()
@@ -923,7 +921,7 @@ impl VectorIndexRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .find(|def| def.name == name)
+            .find(|def| def.name.as_deref() == Some(name))
             .cloned()
     }
 

@@ -14,8 +14,8 @@ use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use coordinode_modality::{
-    Bbox, Crs, IndexDefinition, IndexStore, LocalIndexStore, LocalNodeStore, LocalSpatialStore,
-    NodeStore, Point, SpatialStore,
+    Bbox, Crs, GenerationId, IndexDescriptor, IndexId, IndexStore, LocalIndexStore, LocalNodeStore,
+    LocalSpatialStore, NodeStore, Point, SpatialStore,
 };
 use coordinode_storage::engine::transaction::{CommitContext, Transaction};
 use proptest::prelude::*;
@@ -49,7 +49,8 @@ proptest! {
         let fx = open_engine();
         let engine = &fx.engine;
         let store = LocalIndexStore::new(engine);
-        let index = IndexDefinition::btree("p", "L", "p");
+        let index = IndexDescriptor::btree("p", "L", "p")
+            .bind(IndexId::from_raw(1), GenerationId::from_raw(1));
         let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
         let mut txn = Transaction::begin(engine, Some(&oracle), oracle.next());
         let no_fields = |_: &str| None;

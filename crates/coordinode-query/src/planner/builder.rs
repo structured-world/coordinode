@@ -1044,16 +1044,17 @@ fn parse_quantization_codec(s: Option<&str>) -> coordinode_vector::hnsw::Quantiz
     }
 }
 
-/// Reconstruct a vector index definition and its distance metric from a parsed
-/// CREATE VECTOR INDEX clause, applying the same option defaults and string
-/// parsing the planner uses for the non-extension path. An engine extension
-/// (e.g. a sharded-index handler) calls this to rebuild the definition from the
-/// clause carried verbatim in an `Extension` op payload, keeping the parsing of
-/// metric / quantization / online-build options as a single source of truth.
+/// Reconstruct a vector index descriptor and its distance metric from a
+/// parsed CREATE VECTOR INDEX clause, applying the same option defaults and
+/// string parsing the planner uses for the non-extension path. An engine
+/// extension (e.g. a sharded-index handler) calls this to rebuild the
+/// descriptor from the clause carried verbatim in an `Extension` op payload,
+/// keeping the parsing of metric / quantization / online-build options as a
+/// single source of truth; publishing it gives it its identities.
 pub fn vector_index_definition_from_clause(
     clause: &crate::cypher::ast::CreateVectorIndexClause,
 ) -> (
-    crate::index::IndexDefinition,
+    crate::index::IndexDescriptor,
     coordinode_core::graph::types::VectorMetric,
 ) {
     let metric = parse_vector_metric(clause.metric.as_deref());
@@ -1081,7 +1082,7 @@ pub fn vector_index_definition_from_clause(
         rerank_candidates: clause.rerank_candidates,
     };
     let mut def =
-        crate::index::IndexDefinition::hnsw(&clause.name, &clause.label, &clause.property, config);
+        crate::index::IndexDescriptor::hnsw(&clause.name, &clause.label, &clause.property, config);
     def.online_during_build = online_during_build;
     (def, metric)
 }
@@ -1638,7 +1639,7 @@ fn lower_remove_item(item: &crate::cypher::ast::RemoveItem) -> crate::plan::Remo
 /// holds every node of `label` by `property` alone. A compound index keys
 /// its entries by more columns and a partial one holds only the nodes its
 /// filter admits: a one-value lookup in either misses nodes, so neither
-/// qualifies. Of several that do, the name decides, so the plan does not
+/// qualifies. Of several that do, the oldest decides, so the plan does not
 /// depend on registration order.
 fn try_index_rewrite(
     variable: &str,
@@ -1655,11 +1656,12 @@ fn try_index_rewrite(
                 && idx.properties.len() == 1
                 && idx.filter.is_none()
         })
-        .min_by(|a, b| a.name.cmp(&b.name))?;
+        .min_by_key(|idx| idx.id)?;
     Some(LogicalOp::IndexScan {
         variable: variable.to_string(),
         label: label.to_string(),
-        index_name: idx.name.clone(),
+        index: idx.id,
+        index_name: idx.to_string(),
         property: property.to_string(),
         value_expr: value_expr.clone(),
     })
@@ -1775,7 +1777,7 @@ fn annotate_top_k_index(op: LogicalOp, registry: &crate::index::VectorIndexRegis
                         coordinode_core::graph::types::VectorMetric::L1 => "l1",
                         coordinode_core::graph::types::VectorMetric::DotProduct => "dot",
                     };
-                    format!("{}, {metric}", def.name)
+                    format!("{def}, {metric}")
                 }),
                 _ => None,
             };
@@ -2124,7 +2126,7 @@ fn hnsw_scan_target(
         variable.clone(),
         label.clone(),
         property.clone(),
-        def.name.clone(),
+        def.to_string(),
     ))
 }
 

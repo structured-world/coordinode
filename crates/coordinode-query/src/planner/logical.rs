@@ -202,7 +202,11 @@ pub enum LogicalOp {
         variable: String,
         /// Label this scan covers.
         label: String,
-        /// Index name used for the lookup.
+        /// The index the planner chose, bound by identity: a scan planned
+        /// against an index dropped since does not reach one created later
+        /// under its name.
+        index: crate::index::IndexId,
+        /// How EXPLAIN names the index: its name when the plan was built.
         index_name: String,
         /// Property being looked up.
         property: String,

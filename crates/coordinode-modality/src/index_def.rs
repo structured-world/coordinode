@@ -9,6 +9,7 @@
 //! the query engine).
 
 use coordinode_core::graph::types::VectorMetric;
+pub use coordinode_core::index::identity::{GenerationId, IndexId};
 use serde::{Deserialize, Serialize};
 
 /// Reader behaviour while an index is in [`IndexState::Building`].
@@ -137,15 +138,62 @@ impl PartialFilter {
     }
 }
 
-/// Definition of an index.
+/// Definition of an index: the catalog record of one logical index, with
+/// the identities the catalog gave it when it published it.
+///
+/// Reads of the descriptor go through [`Deref`](core::ops::Deref), so
+/// `def.label` is the label of the index whatever holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDefinition {
-    /// Index name (unique per database).
-    pub name: String,
+    /// The logical index, stable across rename, description edits and
+    /// rebuilds.
+    pub id: IndexId,
+    /// The representation the index serves from and maintains: the scope of
+    /// its entry keys. A rebuild writes a new one.
+    pub generation: GenerationId,
+    /// What the index is.
+    pub descriptor: IndexDescriptor,
+}
+
+impl core::ops::Deref for IndexDefinition {
+    type Target = IndexDescriptor;
+
+    fn deref(&self) -> &IndexDescriptor {
+        &self.descriptor
+    }
+}
+
+impl core::ops::DerefMut for IndexDefinition {
+    fn deref_mut(&mut self) -> &mut IndexDescriptor {
+        &mut self.descriptor
+    }
+}
+
+impl core::fmt::Display for IndexDefinition {
+    /// The name when the index has one, its identity otherwise: how logs and
+    /// messages refer to it.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.descriptor.name {
+            Some(name) => f.write_str(name),
+            None => write!(f, "{}", self.id),
+        }
+    }
+}
+
+/// What an index is, as DDL declares it and its catalog record keeps it:
+/// everything but the identities the catalog gives it at publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDescriptor {
+    /// Optional alias, unique among the live indexes of the catalog. The
+    /// index is addressable by its identity with or without it.
+    pub name: Option<String>,
+    /// Optional description. Catalog metadata only: no entry, effect or
+    /// interpretation carries it.
+    pub description: Option<String>,
     /// Node label this index applies to (e.g., "User").
     pub label: String,
     /// Indexed property names. Single-field: 1 entry. Compound: 2+ entries.
-    /// Order matters for compound indexes — the key is encoded in this order.
+    /// Order matters for compound indexes: the key is encoded in this order.
     pub properties: Vec<String>,
     /// Index type.
     pub index_type: IndexType,
@@ -164,35 +212,18 @@ pub struct IndexDefinition {
     /// Vector index configuration. Only set when `index_type` is `Hnsw` or `Flat`.
     pub vector_config: Option<VectorIndexConfig>,
     /// Text index configuration. Only set when `index_type` is `Text`.
-    ///
-    /// Note: do NOT mark `skip_serializing_if` here — the struct uses
-    /// rmp-serde's default positional encoding, so a skipped field would
-    /// shift every following field's position on decode and corrupt the
-    /// roundtrip.
-    #[serde(default)]
     pub text_config: Option<TextIndexConfig>,
-    /// Build state. Defaults to `Ready` when deserializing pre-state schema records.
-    #[serde(default)]
+    /// Build state.
     pub state: IndexState,
-    /// Reader behaviour during `IndexState::Building`. Defaults to
-    /// [`OnlineDuringBuild::Block`] for backward compatibility.
-    #[serde(default)]
+    /// Reader behaviour during `IndexState::Building`.
     pub online_during_build: OnlineDuringBuild,
-    /// Key layout the index's entries are written in. A definition stored
-    /// before the field existed decodes as `0`, the layout whose entries were
-    /// written outside the transaction; such an index is rebuilt in
-    /// [`ENTRY_LAYOUT`] before it is used.
-    #[serde(default)]
+    /// Key layout the generation's entries are written in.
     pub layout: u32,
     /// How a key-shaped index's entries reach every member, and under which
-    /// policy epoch. A definition stored before the field existed decodes as
-    /// RESOLVED, inherited, epoch 0: what its entries have always been.
-    #[serde(default)]
+    /// policy epoch.
     pub maintenance: IndexMaintenance,
     /// The constraint this index enforces, which creates and drops it; `None`
-    /// for an index of its own. A definition stored before the field existed
-    /// decodes as `None`.
-    #[serde(default)]
+    /// for an index of its own.
     pub owner: Option<String>,
 }
 
@@ -356,60 +387,54 @@ impl Default for VectorIndexConfig {
     }
 }
 
-impl IndexDefinition {
-    /// Create a new single-field B-tree index.
+impl IndexDescriptor {
+    fn new(
+        name: impl Into<String>,
+        label: impl Into<String>,
+        properties: Vec<String>,
+        index_type: IndexType,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            description: None,
+            label: label.into(),
+            properties,
+            index_type,
+            unique: false,
+            sparse: false,
+            multikey: false,
+            filter: None,
+            ttl_seconds: None,
+            vector_config: None,
+            text_config: None,
+            state: IndexState::Ready,
+            online_during_build: OnlineDuringBuild::Block,
+            layout: ENTRY_LAYOUT,
+            maintenance: IndexMaintenance::default(),
+            owner: None,
+        }
+    }
+
+    /// A single-field B-tree index named `name`.
     pub fn btree(
         name: impl Into<String>,
         label: impl Into<String>,
         property: impl Into<String>,
     ) -> Self {
-        Self {
-            name: name.into(),
-            label: label.into(),
-            properties: vec![property.into()],
-            index_type: IndexType::BTree,
-            unique: false,
-            sparse: false,
-            multikey: false,
-            filter: None,
-            ttl_seconds: None,
-            vector_config: None,
-            text_config: None,
-            state: IndexState::Ready,
-            online_during_build: OnlineDuringBuild::Block,
-            layout: ENTRY_LAYOUT,
-            maintenance: IndexMaintenance::default(),
-            owner: None,
-        }
+        Self::new(name, label, vec![property.into()], IndexType::BTree)
     }
 
-    /// Create a compound B-tree index on multiple properties.
+    /// A compound B-tree index named `name` on several properties.
     pub fn compound(
         name: impl Into<String>,
         label: impl Into<String>,
         properties: Vec<String>,
     ) -> Self {
-        Self {
-            name: name.into(),
-            label: label.into(),
-            properties,
-            index_type: IndexType::BTree,
-            unique: false,
-            sparse: false,
-            multikey: false,
-            filter: None,
-            ttl_seconds: None,
-            vector_config: None,
-            text_config: None,
-            state: IndexState::Ready,
-            online_during_build: OnlineDuringBuild::Block,
-            layout: ENTRY_LAYOUT,
-            maintenance: IndexMaintenance::default(),
-            owner: None,
-        }
+        Self::new(name, label, properties, IndexType::BTree)
     }
 
-    /// Create a new HNSW vector index on a single property.
+    /// An HNSW vector index named `name` on one property. Sparse: a node
+    /// without the vector has no entry.
     pub fn hnsw(
         name: impl Into<String>,
         label: impl Into<String>,
@@ -417,26 +442,13 @@ impl IndexDefinition {
         config: VectorIndexConfig,
     ) -> Self {
         Self {
-            name: name.into(),
-            label: label.into(),
-            properties: vec![property.into()],
-            index_type: IndexType::Hnsw,
-            unique: false,
-            sparse: true, // skip nodes without the vector property
-            multikey: false,
-            filter: None,
-            ttl_seconds: None,
+            sparse: true,
             vector_config: Some(config),
-            text_config: None,
-            state: IndexState::Ready,
-            online_during_build: OnlineDuringBuild::Block,
-            layout: ENTRY_LAYOUT,
-            maintenance: IndexMaintenance::default(),
-            owner: None,
+            ..Self::new(name, label, vec![property.into()], IndexType::Hnsw)
         }
     }
 
-    /// Create a new full-text search index on one or more properties.
+    /// A full-text search index named `name` on one or more properties.
     pub fn text(
         name: impl Into<String>,
         label: impl Into<String>,
@@ -444,22 +456,21 @@ impl IndexDefinition {
         config: TextIndexConfig,
     ) -> Self {
         Self {
-            name: name.into(),
-            label: label.into(),
-            properties,
-            index_type: IndexType::Text,
-            unique: false,
             sparse: true,
-            multikey: false,
-            filter: None,
-            ttl_seconds: None,
-            vector_config: None,
             text_config: Some(config),
-            state: IndexState::Ready,
-            online_during_build: OnlineDuringBuild::Block,
-            layout: ENTRY_LAYOUT,
-            maintenance: IndexMaintenance::default(),
-            owner: None,
+            ..Self::new(name, label, properties, IndexType::Text)
+        }
+    }
+
+    /// The definition of this index under the identities `id` and
+    /// `generation`. The catalog binds a descriptor when it publishes it
+    /// ([`crate::IndexStore::publish_definition_txn`]); binding one by hand
+    /// is for a store that has no catalog, such as a unit test's.
+    pub fn bind(self, id: IndexId, generation: GenerationId) -> IndexDefinition {
+        IndexDefinition {
+            id,
+            generation,
+            descriptor: self,
         }
     }
 
@@ -499,6 +510,18 @@ impl IndexDefinition {
         }
     }
 
+    /// Whether this is a compound index (2+ properties).
+    pub fn is_compound(&self) -> bool {
+        self.properties.len() > 1
+    }
+
+    /// First (or only) property name.
+    pub fn property(&self) -> &str {
+        self.properties.first().map_or("", |s| s.as_str())
+    }
+}
+
+impl IndexDefinition {
     /// The interpretation that decides this B-tree index's entries, with
     /// each property resolved to the field id `field_of` binds it to now:
     /// what a DERIVED effect is sealed with, so no member consults the
@@ -514,7 +537,7 @@ impl IndexDefinition {
         };
         IndexInterpretation {
             codec: self.layout,
-            name: self.name.clone(),
+            generation: self.generation,
             unique: self.unique,
             sparse: self.sparse,
             properties: self.properties.iter().map(|p| property(p)).collect(),
@@ -546,25 +569,33 @@ impl IndexDefinition {
         }
     }
 
-    /// Whether this is a compound index (2+ properties).
-    pub fn is_compound(&self) -> bool {
-        self.properties.len() > 1
-    }
-
-    /// First (or only) property name. For backwards compatibility.
-    pub fn property(&self) -> &str {
-        self.properties.first().map_or("", |s| s.as_str())
-    }
-
     /// Schema storage key for this index definition.
     pub fn schema_key(&self) -> Vec<u8> {
-        Self::schema_key_of(&self.name)
+        Self::schema_key_of(self.id)
     }
 
-    /// The catalog key of the definition of the index `name`.
-    pub fn schema_key_of(name: &str) -> Vec<u8> {
-        let mut key = Vec::with_capacity(11 + name.len());
-        key.extend_from_slice(b"schema:idx:");
+    /// Prefix of every definition record in the schema catalog.
+    pub const SCHEMA_PREFIX: &'static [u8] = b"schema:idx:";
+
+    /// Prefix of every name binding in the schema catalog.
+    pub const NAME_PREFIX: &'static [u8] = b"schema:idxname:";
+
+    /// Schema catalog key of the identity allocator: the next unallocated
+    /// index and generation numbers. Outside both prefixes above.
+    pub const ALLOCATOR_KEY: &'static [u8] = b"schema:idx_alloc";
+
+    /// The catalog key of the definition of the index `id`.
+    pub fn schema_key_of(id: IndexId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::SCHEMA_PREFIX.len() + 8);
+        key.extend_from_slice(Self::SCHEMA_PREFIX);
+        key.extend_from_slice(&id.as_raw().to_be_bytes());
+        key
+    }
+
+    /// The catalog key binding the name `name` to the index that holds it.
+    pub fn name_key_of(name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::NAME_PREFIX.len() + name.len());
+        key.extend_from_slice(Self::NAME_PREFIX);
         key.extend_from_slice(name.as_bytes());
         key
     }

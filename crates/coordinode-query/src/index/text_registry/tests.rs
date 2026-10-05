@@ -10,11 +10,27 @@ fn test_config() -> TextIndexConfig {
     }
 }
 
+/// The text index `name` as the index numbered `raw`, serving from
+/// generation `raw`: the registry is driven without a catalog here.
+fn text(
+    raw: u64,
+    name: &str,
+    label: &str,
+    properties: Vec<String>,
+    config: TextIndexConfig,
+) -> IndexDefinition {
+    crate::index::IndexDescriptor::text(name, label, properties, config).bind(
+        crate::index::IndexId::from_raw(raw),
+        crate::index::GenerationId::from_raw(raw),
+    )
+}
+
 #[test]
 fn register_and_lookup() {
     let dir = TempDir::new().unwrap();
     let reg = TextIndexRegistry::new(dir.path());
-    let def = IndexDefinition::text(
+    let def = text(
+        1,
         "article_body",
         "Article",
         vec!["body".into()],
@@ -32,7 +48,8 @@ fn register_and_lookup() {
 fn index_and_search() {
     let dir = TempDir::new().unwrap();
     let reg = TextIndexRegistry::new(dir.path());
-    let def = IndexDefinition::text(
+    let def = text(
+        1,
         "article_body",
         "Article",
         vec!["body".into()],
@@ -71,7 +88,8 @@ fn index_and_search() {
 fn delete_document() {
     let dir = TempDir::new().unwrap();
     let reg = TextIndexRegistry::new(dir.path());
-    let def = IndexDefinition::text(
+    let def = text(
+        1,
         "article_body",
         "Article",
         vec!["body".into()],
@@ -97,7 +115,8 @@ fn delete_document() {
 fn unregister() {
     let dir = TempDir::new().unwrap();
     let reg = TextIndexRegistry::new(dir.path());
-    let def = IndexDefinition::text(
+    let def = text(
+        1,
         "article_body",
         "Article",
         vec!["body".into()],
@@ -142,7 +161,8 @@ fn multi_field_register_all_properties() {
         default_language: "english".to_string(),
         language_override_property: "_language".to_string(),
     };
-    let def = IndexDefinition::text(
+    let def = text(
+        1,
         "article_text",
         "Article",
         vec!["title".into(), "body".into()],
@@ -166,21 +186,24 @@ fn multi_field_register_all_properties() {
 fn indexes_for_label() {
     let dir = TempDir::new().unwrap();
     let reg = TextIndexRegistry::new(dir.path());
-    reg.register(IndexDefinition::text(
+    reg.register(text(
+        1,
         "article_body",
         "Article",
         vec!["body".into()],
         test_config(),
     ))
     .unwrap();
-    reg.register(IndexDefinition::text(
+    reg.register(text(
+        2,
         "article_title",
         "Article",
         vec!["title".into()],
         test_config(),
     ))
     .unwrap();
-    reg.register(IndexDefinition::text(
+    reg.register(text(
+        3,
         "user_bio",
         "User",
         vec!["bio".into()],

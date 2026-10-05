@@ -63,9 +63,9 @@ pub enum BackfillError {
          retry once they have ended"
     )]
     OlderTransactions(usize),
-    /// The definition being built was dropped or replaced meanwhile: its
-    /// entries belong to whatever holds the name now, and this build writes
-    /// none of them.
+    /// The definition being built was dropped or moved to another
+    /// generation meanwhile: this build's generation is no longer the one
+    /// to fill, and it writes nothing more into it.
     #[error("the index definition changed while it was being built")]
     Superseded,
 }
@@ -187,7 +187,7 @@ impl<'a> Backfill<'a> {
                         // definition that moved is not this build's any more.
                         if self.definition_version.is_some()
                             && coordinode_modality::LocalIndexStore::new(self.engine)
-                                .definition_version(&index.name)?
+                                .definition_version(index.id)?
                                 != self.definition_version
                         {
                             return Err(BackfillError::Superseded);

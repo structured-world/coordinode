@@ -10,13 +10,15 @@
 use serde::{Deserialize, Serialize};
 
 use super::encoding::{
-    encode_index_key, encode_tuple, encode_unique_index_key, encode_version_index_key,
+    encode_entry_key, encode_tuple, encode_unique_entry_key, encode_version_entry_key,
 };
+use super::identity::GenerationId;
 use crate::graph::node::NodeRecord;
 use crate::graph::types::Value;
 
-/// The entry key layout these functions produce.
-pub const KEY_CODEC: u32 = 1;
+/// The entry key layout these functions produce: entries keyed by their
+/// index generation.
+pub const KEY_CODEC: u32 = 2;
 
 /// A property as a record stores it: under its interned field id when the
 /// name was bound at sealing, otherwise, or in addition, by name.
@@ -71,8 +73,8 @@ pub struct IndexInterpretation {
     /// Entry key layout, [`KEY_CODEC`] for every interpretation this build
     /// writes.
     pub codec: u32,
-    /// The index name its entry keys carry.
-    pub name: String,
+    /// The index generation its entry keys carry.
+    pub generation: GenerationId,
     /// One entry per value, keyed by the value alone.
     pub unique: bool,
     /// A node missing any indexed property has no entry.
@@ -85,10 +87,10 @@ pub struct IndexInterpretation {
 
 /// An interpretation this build cannot derive entries for.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("index `{name}` uses key codec {codec}, which this build does not derive")]
+#[error("{generation} uses key codec {codec}, which this build does not derive")]
 pub struct UnsupportedInterpretation {
-    /// The index.
-    pub name: String,
+    /// The index generation.
+    pub generation: GenerationId,
     /// Its codec.
     pub codec: u32,
 }
@@ -113,7 +115,7 @@ impl IndexInterpretation {
             Ok(())
         } else {
             Err(UnsupportedInterpretation {
-                name: self.name.clone(),
+                generation: self.generation,
                 codec: self.codec,
             })
         }
@@ -162,7 +164,7 @@ impl IndexInterpretation {
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> Vec<EntryEffect> {
-        membership_effects(&self.name, self.unique, owner, old, new)
+        membership_effects(self.generation, self.unique, owner, old, new)
     }
 }
 
@@ -194,25 +196,32 @@ impl EntryOwner {
     }
 }
 
-/// The entry of `owner` under `tuple` in the index `name`: keyed by the
-/// value alone and holding the node when `unique`, keyed by value and owner
-/// with an empty value otherwise.
-pub fn entry(name: &str, unique: bool, tuple: &[u8], owner: EntryOwner) -> (Vec<u8>, Vec<u8>) {
+/// The entry of `owner` under `tuple` in the index generation `generation`:
+/// keyed by the value alone and holding the node when `unique`, keyed by
+/// value and owner with an empty value otherwise.
+pub fn entry(
+    generation: GenerationId,
+    unique: bool,
+    tuple: &[u8],
+    owner: EntryOwner,
+) -> (Vec<u8>, Vec<u8>) {
     if unique {
         (
-            encode_unique_index_key(name, tuple),
+            encode_unique_entry_key(generation, tuple),
             owner.node_id.to_be_bytes().to_vec(),
         )
     } else {
         let key = match owner.valid_from {
-            Some(valid_from) => encode_version_index_key(name, tuple, owner.node_id, valid_from),
-            None => encode_index_key(name, tuple, owner.node_id),
+            Some(valid_from) => {
+                encode_version_entry_key(generation, tuple, owner.node_id, valid_from)
+            }
+            None => encode_entry_key(generation, tuple, owner.node_id),
         };
         (key, Vec::new())
     }
 }
 
-/// The entry effects in the index `name` of `owner`'s membership moving from
+/// The entry effects in the index generation `generation` of `owner`'s membership moving from
 /// `old` to `new`: a delete for each tuple it leaves, a put for each it
 /// enters. A tuple in both is untouched.
 ///
@@ -221,7 +230,7 @@ pub fn entry(name: &str, unique: bool, tuple: &[u8], owner: EntryOwner) -> (Vec<
 /// value therefore keeps the claim: another version of the node may hold the
 /// value too, and the node holds it in its history either way.
 pub fn membership_effects(
-    name: &str,
+    generation: GenerationId,
     unique: bool,
     owner: EntryOwner,
     old: Option<&[Value]>,
@@ -234,14 +243,14 @@ pub fn membership_effects(
     for tuple in &before {
         if releases && after.binary_search(tuple).is_err() {
             effects.push(EntryEffect {
-                key: entry(name, unique, tuple, owner).0,
+                key: entry(generation, unique, tuple, owner).0,
                 value: None,
             });
         }
     }
     for tuple in &after {
         if before.binary_search(tuple).is_err() {
-            let (key, value) = entry(name, unique, tuple, owner);
+            let (key, value) = entry(generation, unique, tuple, owner);
             effects.push(EntryEffect {
                 key,
                 value: Some(value),

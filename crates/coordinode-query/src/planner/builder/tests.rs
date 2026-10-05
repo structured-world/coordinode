@@ -866,21 +866,27 @@ fn find_hnsw_scan(op: &LogicalOp) -> Option<&LogicalOp> {
 
 fn test_registry_with_doc_index() -> crate::index::VectorIndexRegistry {
     let registry = crate::index::VectorIndexRegistry::new();
-    registry.register(crate::index::IndexDefinition::hnsw(
-        "doc_emb_idx",
-        "Doc",
-        "embedding",
-        crate::index::VectorIndexConfig {
-            dimensions: 2,
-            metric: coordinode_core::graph::types::VectorMetric::L2,
-            m: 16,
-            ef_construction: 200,
-            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
-            offload_vectors: false,
-            ef_search: None,
-            rerank_candidates: None,
-        },
-    ));
+    registry.register(
+        crate::index::IndexDescriptor::hnsw(
+            "doc_emb_idx",
+            "Doc",
+            "embedding",
+            crate::index::VectorIndexConfig {
+                dimensions: 2,
+                metric: coordinode_core::graph::types::VectorMetric::L2,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
+            },
+        )
+        .bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
     registry
 }
 

@@ -7,12 +7,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::encoding::{index_prefix, unique_index_prefix};
+use coordinode_core::index::encoding::{
+    GENERATION_PREFIX_LEN, entries_prefix, unique_entries_prefix,
+};
+use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::DerivedIndexWork;
 use coordinode_embed::Database;
 use coordinode_storage::Guard as _;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::oplog::entry::OplogOp;
+
+use super::helpers::index_named;
 
 fn open_db() -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -20,14 +25,25 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
-/// The key prefixes of the index `name`: its unique and non-unique entries.
-fn prefixes(name: &str) -> [Vec<u8>; 2] {
-    [index_prefix(name), unique_index_prefix(name)]
+/// The generation the index `name` serves from.
+fn generation(db: &Database, name: &str) -> GenerationId {
+    index_named(db.engine(), name)
+        .unwrap_or_else(|| panic!("index {name}"))
+        .generation
+}
+
+/// The key prefixes of the index `name`: its non-unique and unique entries.
+fn prefixes(db: &Database, name: &str) -> [[u8; GENERATION_PREFIX_LEN]; 2] {
+    let generation = generation(db, name);
+    [
+        entries_prefix(generation),
+        unique_entries_prefix(generation),
+    ]
 }
 
 /// Every entry of the index `name`, keys and values, in key order.
 fn entries(db: &Database, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    prefixes(name)
+    prefixes(db, name)
         .iter()
         .flat_map(|prefix| {
             db.engine()
@@ -82,8 +98,8 @@ fn journalled_since(db: &Database, from: u64) -> Vec<OplogOp> {
 }
 
 /// Journalled inserts of an entry of the index `name`.
-fn entry_inserts(ops: &[OplogOp], name: &str) -> usize {
-    let prefixes = prefixes(name);
+fn entry_inserts(db: &Database, ops: &[OplogOp], name: &str) -> usize {
+    let prefixes = prefixes(db, name);
     ops.iter()
         .filter(|op| {
             matches!(op, OplogOp::Insert { key, .. }
@@ -93,12 +109,13 @@ fn entry_inserts(ops: &[OplogOp], name: &str) -> usize {
 }
 
 /// Journalled DERIVED work for the index `name`.
-fn derived_work(ops: &[OplogOp], name: &str) -> usize {
+fn derived_work(db: &Database, ops: &[OplogOp], name: &str) -> usize {
+    let generation = generation(db, name);
     ops.iter()
         .filter(|op| match op {
             OplogOp::Derive { work } => {
                 let work: DerivedIndexWork = rmp_serde::from_slice(work).expect("decode work");
-                work.binding.interpretation.name == name
+                work.binding.interpretation.generation == generation
             }
             _ => false,
         })
@@ -211,24 +228,24 @@ fn a_derived_index_journals_its_work_and_not_its_entries() {
 
     let ops = journalled_since(&db, tip);
     assert_eq!(
-        entry_inserts(&ops, "d_name"),
+        entry_inserts(&db, &ops, "d_name"),
         0,
         "no derived entry is journalled"
     );
-    assert_eq!(derived_work(&ops, "d_name"), 2, "one work per write");
+    assert_eq!(derived_work(&db, &ops, "d_name"), 2, "one work per write");
     assert_eq!(
-        entry_inserts(&ops, "r_name"),
+        entry_inserts(&db, &ops, "r_name"),
         2,
         "resolved entries are journalled"
     );
-    assert_eq!(derived_work(&ops, "r_name"), 0);
+    assert_eq!(derived_work(&db, &ops, "r_name"), 0);
     assert_eq!(entries(&db, "d_name").len(), 1);
     assert_eq!(entries(&db, "d_name"), {
         let mut r = entries(&db, "r_name");
-        // Same membership under another index name: compare the suffixes.
-        let (d, rp) = (index_prefix("d_name"), index_prefix("r_name"));
+        // Same membership under another generation: compare the suffixes.
+        let d = entries_prefix(generation(&db, "d_name"));
         for (k, _) in &mut r {
-            *k = [d.as_slice(), &k[rp.len()..]].concat();
+            *k = [d.as_slice(), &k[GENERATION_PREFIX_LEN..]].concat();
         }
         r
     });
@@ -407,8 +424,8 @@ fn alter_index_moves_between_profiles_without_a_rebuild() {
     let tip = journal_tip(&db);
     db.execute_cypher("CREATE (:U {name: 'bea'})").expect("bea");
     let ops = journalled_since(&db, tip);
-    assert_eq!(derived_work(&ops, "i_name"), 1);
-    assert_eq!(entry_inserts(&ops, "i_name"), 0);
+    assert_eq!(derived_work(&db, &ops, "i_name"), 1);
+    assert_eq!(entry_inserts(&db, &ops, "i_name"), 0);
 
     let rows = db
         .execute_cypher("ALTER INDEX i_name SET MAINTENANCE INHERIT")
@@ -420,8 +437,8 @@ fn alter_index_moves_between_profiles_without_a_rebuild() {
     let tip = journal_tip(&db);
     db.execute_cypher("CREATE (:U {name: 'cid'})").expect("cid");
     let ops = journalled_since(&db, tip);
-    assert_eq!(derived_work(&ops, "i_name"), 0);
-    assert_eq!(entry_inserts(&ops, "i_name"), 1);
+    assert_eq!(derived_work(&db, &ops, "i_name"), 0);
+    assert_eq!(entry_inserts(&db, &ops, "i_name"), 1);
     assert_eq!(
         count(
             &mut db,
@@ -488,10 +505,10 @@ fn the_namespace_default_binds_only_new_indexes() {
     db.execute_cypher("CREATE (:U {a: 1, b: 2})")
         .expect("write");
     let ops = journalled_since(&db, tip);
-    assert_eq!(entry_inserts(&ops, "before_idx"), 1);
-    assert_eq!(derived_work(&ops, "before_idx"), 0);
-    assert_eq!(entry_inserts(&ops, "after_idx"), 0);
-    assert_eq!(derived_work(&ops, "after_idx"), 1);
+    assert_eq!(entry_inserts(&db, &ops, "before_idx"), 1);
+    assert_eq!(derived_work(&db, &ops, "before_idx"), 0);
+    assert_eq!(entry_inserts(&db, &ops, "after_idx"), 0);
+    assert_eq!(derived_work(&db, &ops, "after_idx"), 1);
 
     let rows = db
         .execute_cypher("CREATE INDEX pinned_idx ON :U(c) OPTIONS {maintenance: 'resolved'}")

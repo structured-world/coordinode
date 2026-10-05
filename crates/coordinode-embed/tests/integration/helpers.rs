@@ -68,6 +68,40 @@ pub fn temporal_versions(
     out
 }
 
+/// The stored definition of the index named `name`, resolved through the
+/// catalog's name binding, or `None` when no index holds the name.
+#[allow(clippy::expect_used)]
+pub fn index_named(
+    engine: &StorageEngine,
+    name: &str,
+) -> Option<coordinode_modality::IndexDefinition> {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    let store = LocalIndexStore::new(engine);
+    let id = store.resolve_name(name).expect("resolve name")?;
+    store.load_definition(id).expect("load definition")
+}
+
+/// Publish `descriptor` through the catalog of `engine` in a direct-mode
+/// transaction, as a database opened over it afterwards will find it.
+#[allow(clippy::expect_used)]
+pub fn publish_index(
+    engine: &StorageEngine,
+    descriptor: coordinode_modality::IndexDescriptor,
+) -> coordinode_modality::IndexDefinition {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    LocalIndexStore::new(engine)
+        .publish_definition_txn(
+            &mut coordinode_storage::engine::transaction::Transaction::new(
+                engine,
+                None,
+                Timestamp::ZERO,
+                None,
+            ),
+            descriptor,
+        )
+        .expect("publish index")
+}
+
 /// Build an ExecutionContext in legacy mode (no MVCC, no oracle).
 ///
 /// Used by tests that write directly to engine without MVCC versioning.

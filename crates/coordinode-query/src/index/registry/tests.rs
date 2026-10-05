@@ -106,26 +106,71 @@ fn all_ids(engine: &StorageEngine, index: &IndexDefinition) -> Vec<u64> {
         .collect()
 }
 
+/// `descriptor` as the index numbered `raw`, serving from generation `raw`.
+fn bound(descriptor: crate::index::IndexDescriptor, raw: u64) -> IndexDefinition {
+    descriptor.bind(
+        crate::index::IndexId::from_raw(raw),
+        crate::index::GenerationId::from_raw(raw),
+    )
+}
+
+fn btree(name: &str, property: &str, raw: u64) -> IndexDefinition {
+    bound(
+        crate::index::IndexDescriptor::btree(name, "User", property),
+        raw,
+    )
+}
+
 #[test]
 fn register_and_lookup() {
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
+    let index = bound(
+        crate::index::IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
+    reg.register_in_memory(index.clone());
 
     assert_eq!(reg.len(), 1);
-    assert!(reg.get("user_email").is_some());
+    assert_eq!(reg.get("user_email"), Some(index.clone()));
+    assert_eq!(reg.get_by_id(index.id), Some(index));
     assert_eq!(reg.indexes_for_label("User").len(), 1);
     assert_eq!(reg.indexes_for_label("Movie").len(), 0);
+}
+
+/// A name names the index that holds it now: after a drop and a create of
+/// the same name the name finds the new index, and the dropped identity
+/// finds nothing, so work bound to it cannot reach its successor.
+#[test]
+fn a_name_follows_its_index_and_a_dropped_identity_finds_nothing() {
+    let reg = IndexRegistry::new();
+    let first = btree("user_email", "email", 1);
+    reg.register_in_memory(first.clone());
+    reg.unregister(first.id);
+    assert_eq!(reg.get("user_email"), None);
+
+    let second = btree("user_email", "email", 2);
+    reg.register_in_memory(second.clone());
+    assert_eq!(reg.get("user_email"), Some(second.clone()));
+    assert_eq!(reg.get_by_id(first.id), None);
+
+    // Re-registering an index under another name moves its binding.
+    let mut renamed = second.clone();
+    renamed.name = Some("by_email".into());
+    reg.register_in_memory(renamed.clone());
+    assert_eq!(reg.get("user_email"), None);
+    assert_eq!(reg.get("by_email"), Some(renamed));
+    assert_eq!(reg.len(), 1);
 }
 
 #[test]
 fn indexes_for_property() {
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email"));
-    reg.register_in_memory(IndexDefinition::btree("user_name", "User", "name"));
+    reg.register_in_memory(btree("user_email", "email", 1));
+    reg.register_in_memory(btree("user_name", "name", 2));
 
     let email_idxs = reg.indexes_for_property("User", "email");
     assert_eq!(email_idxs.len(), 1);
-    assert_eq!(email_idxs[0].name, "user_email");
+    assert_eq!(email_idxs[0].name.as_deref(), Some("user_email"));
 }
 
 #[test]
@@ -133,7 +178,10 @@ fn distinct_unique_values_are_accepted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
+    reg.register_in_memory(bound(
+        crate::index::IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    ));
 
     create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("first create");
     create(&reg, &engine, 2, &[("email", s("bob@test.com"))]).expect("second create");
@@ -146,7 +194,10 @@ fn a_taken_unique_value_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
+    reg.register_in_memory(bound(
+        crate::index::IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    ));
 
     create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("first");
     let err =
@@ -165,7 +216,10 @@ fn a_changed_value_moves_its_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let index = bound(
+        crate::index::IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    );
     reg.register_in_memory(index.clone());
 
     create(&reg, &engine, 1, &[("email", s("old@test.com"))]).expect("create");
@@ -188,7 +242,10 @@ fn changing_to_a_taken_unique_value_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email").unique());
+    reg.register_in_memory(bound(
+        crate::index::IndexDescriptor::btree("user_email", "User", "email").unique(),
+        1,
+    ));
 
     create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("create 1");
     create(&reg, &engine, 2, &[("email", s("bob@test.com"))]).expect("create 2");
@@ -210,8 +267,14 @@ fn a_compound_entry_moves_when_one_of_its_properties_changes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index =
-        IndexDefinition::compound("user_city_age", "User", vec!["city".into(), "age".into()]);
+    let index = bound(
+        crate::index::IndexDescriptor::compound(
+            "user_city_age",
+            "User",
+            vec!["city".into(), "age".into()],
+        ),
+        1,
+    );
     reg.register_in_memory(index.clone());
 
     let before = [("city", s("Oslo")), ("age", Value::Int(30))];
@@ -231,7 +294,7 @@ fn a_deleted_node_leaves_the_index() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("user_email", "User", "email");
+    let index = btree("user_email", "email", 1);
     reg.register_in_memory(index.clone());
 
     create(&reg, &engine, 1, &[("email", s("alice@test.com"))]).expect("create");
@@ -259,11 +322,14 @@ fn a_vector_index_in_the_registry_gets_no_entries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let vector = IndexDefinition::hnsw(
-        "user_vec",
-        "User",
-        "email",
-        crate::index::definition::VectorIndexConfig::default(),
+    let vector = bound(
+        crate::index::IndexDescriptor::hnsw(
+            "user_vec",
+            "User",
+            "email",
+            crate::index::definition::VectorIndexConfig::default(),
+        ),
+        1,
     );
     reg.register_in_memory(vector.clone());
 
@@ -276,22 +342,25 @@ fn a_vector_index_in_the_registry_gets_no_entries() {
 fn load_all_from_storage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
-    super::super::ops::save_index_definition(
-        &engine,
-        &IndexDefinition::btree("idx1", "User", "email").unique(),
-    )
-    .expect("save");
-    super::super::ops::save_index_definition(
-        &engine,
-        &IndexDefinition::btree("idx2", "User", "name"),
-    )
-    .expect("save");
+    let store = LocalIndexStore::new(&engine);
+    let first = store
+        .publish_definition_txn(
+            &mut txn(&engine),
+            crate::index::IndexDescriptor::btree("idx1", "User", "email").unique(),
+        )
+        .expect("publish");
+    let second = store
+        .publish_definition_txn(
+            &mut txn(&engine),
+            crate::index::IndexDescriptor::btree("idx2", "User", "name"),
+        )
+        .expect("publish");
 
     let reg = IndexRegistry::new();
     reg.load_all(&engine).expect("load");
     assert_eq!(reg.len(), 2);
-    assert!(reg.get("idx1").is_some());
-    assert!(reg.get("idx2").is_some());
+    assert_eq!(reg.get("idx1"), Some(first));
+    assert_eq!(reg.get("idx2"), Some(second));
 }
 
 #[test]
@@ -299,7 +368,10 @@ fn sparse_index_skips_null_on_create() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("user_bio", "User", "bio").sparse();
+    let index = bound(
+        crate::index::IndexDescriptor::btree("user_bio", "User", "bio").sparse(),
+        1,
+    );
     reg.register_in_memory(index.clone());
 
     create(&reg, &engine, 1, &[("bio", Value::Null)]).expect("create");
@@ -313,11 +385,14 @@ fn partial_index_filters_on_create() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("active_email", "User", "email").with_filter(
-        super::super::definition::PartialFilter::PropertyEquals {
-            property: "status".into(),
-            value: "active".into(),
-        },
+    let index = bound(
+        crate::index::IndexDescriptor::btree("active_email", "User", "email").with_filter(
+            super::super::definition::PartialFilter::PropertyEquals {
+                property: "status".into(),
+                value: "active".into(),
+            },
+        ),
+        1,
     );
     reg.register_in_memory(index.clone());
 
@@ -346,11 +421,14 @@ fn a_node_leaves_a_partial_index_when_its_filter_stops_matching() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("active_email", "User", "email").with_filter(
-        super::super::definition::PartialFilter::PropertyEquals {
-            property: "status".into(),
-            value: "active".into(),
-        },
+    let index = bound(
+        crate::index::IndexDescriptor::btree("active_email", "User", "email").with_filter(
+            super::super::definition::PartialFilter::PropertyEquals {
+                property: "status".into(),
+                value: "active".into(),
+            },
+        ),
+        1,
     );
     reg.register_in_memory(index.clone());
 
@@ -367,11 +445,14 @@ fn partial_index_bool_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("verified_email", "User", "email").with_filter(
-        super::super::definition::PartialFilter::PropertyEqualsBool {
-            property: "verified".into(),
-            value: true,
-        },
+    let index = bound(
+        crate::index::IndexDescriptor::btree("verified_email", "User", "email").with_filter(
+            super::super::definition::PartialFilter::PropertyEqualsBool {
+                property: "verified".into(),
+                value: true,
+            },
+        ),
+        1,
     );
     reg.register_in_memory(index.clone());
 
@@ -404,10 +485,13 @@ fn partial_index_exists_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
-    let index = IndexDefinition::btree("user_bio_idx", "User", "bio").with_filter(
-        super::super::definition::PartialFilter::PropertyExists {
-            property: "bio".into(),
-        },
+    let index = bound(
+        crate::index::IndexDescriptor::btree("user_bio_idx", "User", "bio").with_filter(
+            super::super::definition::PartialFilter::PropertyExists {
+                property: "bio".into(),
+            },
+        ),
+        1,
     );
     reg.register_in_memory(index.clone());
 

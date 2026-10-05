@@ -229,9 +229,9 @@ fn an_index_lookup_resolves_the_state_valid_now() {
 
 /// The stored entries of index `emp_end` on `Emp(valid_to)` holding `end`.
 fn end_entries(db: &Database, end: i64) -> Vec<NodeId> {
-    use coordinode_modality::{IndexDefinition, IndexStore as _, LocalIndexStore};
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
     use coordinode_storage::engine::transaction::Transaction;
-    let index = IndexDefinition::btree("emp_end", "Emp", "valid_to");
+    let index = super::helpers::index_named(db.engine(), "emp_end").expect("index emp_end");
     let mut txn = Transaction::new(
         db.engine(),
         None,

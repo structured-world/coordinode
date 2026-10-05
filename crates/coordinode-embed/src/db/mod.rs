@@ -1168,11 +1168,11 @@ impl Database {
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
         };
-        // A store that owns its log rebuilds its legacy-layout indexes now; a
-        // cluster member does it once it leads, since the rebuild is written
-        // through the log.
+        // A store that owns its log finishes its interrupted index builds now
+        // (a directory migrated from the previous format leaves its B-tree
+        // indexes building in new generations); a cluster member does it once
+        // it leads, since the builds are written through the log.
         if !follow_raft_applies {
-            db.rebuild_legacy_btree_indexes()?;
             db.resume_interrupted_index_builds()?;
             db.adopt_unowned_unique_indexes()?;
         }
@@ -1281,7 +1281,7 @@ impl Database {
 
         let mut changed = 0usize;
         for def in &registered {
-            if !stored.iter().any(|d| d.name == def.name) {
+            if !stored.iter().any(|d| d.id == def.id) {
                 self.text_index_registry
                     .unregister(&def.label, def.property());
                 changed += 1;
@@ -1289,7 +1289,7 @@ impl Database {
         }
         let new_defs: Vec<_> = stored
             .into_iter()
-            .filter(|d| !registered.iter().any(|r| r.name == d.name))
+            .filter(|d| !registered.iter().any(|r| r.id == d.id))
             .collect();
         if !new_defs.is_empty() {
             Self::populate_text_indexes(
@@ -1330,7 +1330,7 @@ impl Database {
                 (fields.lookup(&def.label), fields.lookup(def.property()))
             else {
                 tracing::error!(
-                    index = %def.name,
+                    index = %def,
                     label = %def.label,
                     property = %def.property(),
                     "vector index names have no field binding; the index stays offline"
@@ -1348,7 +1348,7 @@ impl Database {
                 registry.get(&def.label, def.property()),
                 registry.health_handle(&def.label, def.property()),
             ) else {
-                tracing::warn!(index = %def.name, "registered vector index has no graph to build");
+                tracing::warn!(index = %def, "registered vector index has no graph to build");
                 continue;
             };
             members.push((def, field_id, hnsw, health));
@@ -1391,14 +1391,14 @@ impl Database {
                     ),
                     Ok(Err(reason)) => {
                         for (def, _, _, health) in &members {
-                            tracing::warn!(index = %def.name, %reason, "HNSW rebuild on open failed");
+                            tracing::warn!(index = %def, %reason, "HNSW rebuild on open failed");
                             health.mark_offline(reason.clone());
                         }
                         return;
                     }
                     Err(_) => {
                         for (def, _, _, health) in &members {
-                            tracing::warn!(index = %def.name, "HNSW rebuild on open panicked");
+                            tracing::warn!(index = %def, "HNSW rebuild on open panicked");
                             health.mark_offline("panic in the rebuild on open".to_string());
                         }
                         return;
@@ -1427,20 +1427,20 @@ impl Database {
             if needs_state_reset {
                 match coordinode_query::index::ops::save_index_state(
                     engine,
-                    &def.name,
+                    def.id,
                     coordinode_query::index::IndexState::Ready,
                 ) {
                     Ok(true) => tracing::info!(
-                        index = %def.name,
+                        index = %def,
                         prior = ?def.state,
                         "reset stale index state to Ready after rebuild"
                     ),
                     Ok(false) => tracing::warn!(
-                        index = %def.name,
+                        index = %def,
                         "save_index_state returned false during state reset"
                     ),
                     Err(e) => tracing::warn!(
-                        index = %def.name,
+                        index = %def,
                         error = %e,
                         "failed to reset index state after rebuild"
                     ),
@@ -1469,7 +1469,7 @@ impl Database {
         let token = registry.new_build_token();
         let build_token = token.clone();
         let engine = Arc::clone(engine);
-        let name = def.name.clone();
+        let name = def.to_string();
         let label = def.label.clone();
         // The index was registered rebuilding; without a build it would stay
         // so, and a blocked reader would wait on it until its timeout.
@@ -1507,17 +1507,17 @@ impl Database {
             });
         match spawned {
             Ok(thread) => {
-                registry.register_build(&def.name, &def.label, def.property(), &token, thread);
+                registry.register_build(def, &token, thread);
             }
             Err(e) => {
-                tracing::warn!(index = %def.name, error = %e, "could not spawn the replica build");
+                tracing::warn!(index = %def, error = %e, "could not spawn the replica build");
                 unbuilt.mark_offline(format!("could not start the build: {e}"));
             }
         }
     }
 
-    /// Load persisted text index definitions from `schema:idx:*` and
-    /// rebuild tantivy indexes by scanning stored nodes in the `node:` partition.
+    /// Load the persisted text index definitions and rebuild their tantivy
+    /// indexes by scanning the stored nodes in the `node:` partition.
     fn load_text_indexes(
         engine: &StorageEngine,
         interner: &FieldInterner,
@@ -1528,28 +1528,17 @@ impl Database {
 
         let registry = coordinode_query::index::TextIndexRegistry::new(base_dir);
 
-        // Step 1: Scan schema:idx:* for Text index definitions.
-        let iter = match engine.prefix_scan(Partition::Schema, b"schema:idx:") {
-            Ok(it) => it,
+        let defs = match coordinode_query::index::ops::list_index_definitions(engine) {
+            Ok(defs) => defs,
             Err(e) => {
                 tracing::warn!("failed to scan text index definitions: {e}");
                 return registry;
             }
         };
-
-        let mut text_defs = Vec::new();
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            if let Ok(def) =
-                rmp_serde::from_slice::<coordinode_query::index::IndexDefinition>(&value)
-            {
-                if def.index_type == IndexType::Text && def.text_config.is_some() {
-                    text_defs.push(def);
-                }
-            }
-        }
+        let text_defs: Vec<_> = defs
+            .into_iter()
+            .filter(|def| def.index_type == IndexType::Text && def.text_config.is_some())
+            .collect();
 
         Self::populate_text_indexes(&registry, engine, interner, shard_id, &text_defs);
         registry
@@ -1569,7 +1558,7 @@ impl Database {
         let mut total_docs = 0usize;
         for def in text_defs {
             if let Err(e) = registry.register(def.clone()) {
-                tracing::warn!("failed to register text index {}: {e}", def.name);
+                tracing::warn!("failed to register text index {def}: {e}");
                 continue;
             }
             for property in &def.properties {
@@ -1580,10 +1569,9 @@ impl Database {
                 });
                 match rebuilt {
                     Ok(docs) => total_docs += docs,
-                    Err(e) => tracing::warn!(
-                        "failed to rebuild text index {} on {property}: {e}",
-                        def.name
-                    ),
+                    Err(e) => {
+                        tracing::warn!("failed to rebuild text index {def} on {property}: {e}")
+                    }
                 }
             }
         }
@@ -2214,7 +2202,11 @@ impl Database {
     /// What a cancelled build does NOT do is write its state afterwards — the
     /// index is free the moment this returns.
     pub fn cancel_index_build(&self, index: &str) -> bool {
-        self.vector_index_registry.cancel_build(index)
+        // The name resolves to the index it binds now, and the build of the
+        // generation that index serves is the one stopped.
+        self.vector_index_registry
+            .get_definition_by_name(index)
+            .is_some_and(|def| self.vector_index_registry.cancel_build(def.generation))
     }
 
     /// Set the interactive-transaction idle timeout (server config wiring).
@@ -3038,14 +3030,15 @@ impl Database {
         // a brute-force fallback names no index and gets no annotation.
         let mut health_lines = Vec::new();
         for def in self.vector_index_registry.all_definitions() {
-            if !explain.contains(&def.name) {
+            let shown = def.to_string();
+            if !explain.contains(&shown) {
                 continue;
             }
             if let Some(state) = self
                 .vector_index_registry
                 .health_snapshot(&def.label, def.property())
             {
-                health_lines.push(format!("  {}: {}", def.name, describe_index_health(&state)));
+                health_lines.push(format!("  {shown}: {}", describe_index_health(&state)));
             }
         }
         if !health_lines.is_empty() {
@@ -3154,27 +3147,6 @@ impl Database {
         Arc::clone(&self.engine)
     }
 
-    /// Publish `mutations` as one Schema change through the write pipeline,
-    /// so it replicates, survives a crash and is replayed like any write:
-    /// catalog records are never put beside the history that recovers them.
-    fn publish_schema(
-        &self,
-        mutations: Vec<coordinode_core::txn::proposal::Mutation>,
-    ) -> Result<(), DatabaseError> {
-        let proposal = coordinode_core::txn::proposal::RaftProposal {
-            id: self.proposal_id_gen.next(),
-            mutations,
-            commit_ts: self.oracle.next(),
-            start_ts: Timestamp::from_raw(0),
-            bypass_rate_limiter: false,
-        };
-        self.pipeline
-            .propose_and_wait(&proposal)
-            .map_err(|e| DatabaseError::Other(format!("publish schema change: {e}")))?;
-        self.engine.note_schema_change();
-        Ok(())
-    }
-
     /// Commit the catalog change `stage` makes in a transaction of its own,
     /// through the write pipeline, so the conditions it states (record
     /// versions, names that must be free) are decided at its commit.
@@ -3220,15 +3192,6 @@ impl Database {
         Ok(())
     }
 
-    /// A Schema put for `publish_schema`.
-    fn schema_put(key: Vec<u8>, value: Vec<u8>) -> coordinode_core::txn::proposal::Mutation {
-        coordinode_core::txn::proposal::Mutation::Put {
-            partition: coordinode_core::txn::proposal::PartitionId::Schema,
-            key,
-            value,
-        }
-    }
-
     /// Create a vector (HNSW) index on a label's vector property.
     ///
     /// After creation, queries using `vector_similarity(n.prop, $q)` will
@@ -3246,17 +3209,27 @@ impl Database {
         property: impl Into<String>,
         config: coordinode_query::index::VectorIndexConfig,
     ) -> Result<(), DatabaseError> {
-        let def = coordinode_query::index::IndexDefinition::hnsw(name, label, property, config);
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        let descriptor =
+            coordinode_query::index::IndexDescriptor::hnsw(name, label, property, config);
 
         // The names the index is keyed by are bound before its definition is
         // published, so every member that sees the definition resolves them.
         let ids = self
             .fields
-            .register(&[&def.label, def.property()])
+            .register(&[&descriptor.label, descriptor.property()])
             .map_err(ExecutionError::from)?;
-        let bytes = rmp_serde::to_vec(&def)
-            .map_err(|e| DatabaseError::Other(format!("serialize vector index: {e}")))?;
-        self.publish_schema(vec![Self::schema_put(def.schema_key(), bytes)])?;
+        // Published in a catalog commit of its own, which gives the index
+        // its identities and binds its name.
+        let store = LocalIndexStore::new(&self.engine);
+        let mut published = None;
+        self.commit_catalog(|txn| {
+            published = Some(store.publish_definition_txn(txn, descriptor)?);
+            Ok::<(), coordinode_modality::StoreError>(())
+        })?;
+        let def = published.ok_or_else(|| {
+            DatabaseError::Other("the vector index publication staged no definition".into())
+        })?;
 
         // Register in both registries: VectorIndexRegistry holds the live HNSW
         // graph for query acceleration; IndexRegistry mirrors the definition so
@@ -3269,18 +3242,18 @@ impl Database {
         Ok(())
     }
 
-    /// Create the B-tree index `def` from the nodes already stored.
+    /// Rebuild the B-tree index `def` from the nodes already stored, into a
+    /// new generation of the same index.
     ///
-    /// The definition is published as building, with any entries left under
-    /// its name removed, in one catalog commit conditioned on the record it
-    /// replaces (none for a new index); writers maintain the index from then
-    /// on while the backfill fills in the stored nodes, every page bound to
-    /// the published record; the definition is then published as ready, on
-    /// the same condition. A backfill that fails withdraws a new index; an
-    /// existing one being rebuilt (`on_failure` [`FailedBuild::Keep`]) stays,
-    /// marked failed, so its constraint still holds for new writes while
-    /// lookups stop using it. The writers stop maintaining an index only once
-    /// its withdrawal is durable. Returns the number of nodes indexed.
+    /// The definition is published as building in the new generation, with
+    /// the entries of the generation it served from removed, in one catalog
+    /// commit conditioned on the record it replaces; writers maintain the new
+    /// generation from then on while the backfill fills in the stored nodes,
+    /// every page bound to the published record; the definition is then
+    /// published as ready, on the same condition. A backfill that fails
+    /// keeps the index (`on_failure` [`FailedBuild::Keep`]), marked failed,
+    /// so its constraint still holds for new writes while lookups stop using
+    /// it, or withdraws it. Returns the number of nodes indexed.
     fn build_btree_index(
         &self,
         mut def: coordinode_query::index::IndexDefinition,
@@ -3289,25 +3262,20 @@ impl Database {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
         use coordinode_query::index::IndexState;
         let store = LocalIndexStore::new(&self.engine);
-        let name = def.name.clone();
         def.layout = ENTRY_LAYOUT;
-        if def.maintenance.epoch == 0 {
-            // A new index, or one from before maintenance bindings: it takes
-            // the namespace default, recorded, as any index created now.
-            let (policy, _) = store.index_policy()?;
-            def.maintenance = policy.resolve(None, 1);
-        }
         def.state = IndexState::Building {
             written: 0,
             estimated_total: 0,
         };
-        let replaced = store.definition_version(&name)?;
+        let replaced = store.definition_version(def.id)?;
+        let retired = def.generation;
         self.commit_catalog(|txn| {
-            store.expect_definition_txn(txn, &name, replaced)?;
-            store.clear_txn(txn, &name)?;
+            store.expect_definition_txn(txn, def.id, replaced)?;
+            def.generation = store.allocate_generation_txn(txn)?;
+            store.clear_txn(txn, retired)?;
             store.put_definition_txn(txn, &def)
         })?;
-        let definition_version = store.definition_version(&name)?;
+        let definition_version = store.definition_version(def.id)?;
         self.index_registry
             .register_published(&self.engine, def.clone())?;
         self.complete_btree_build(def, definition_version, on_failure)
@@ -3332,7 +3300,7 @@ impl Database {
         };
         use coordinode_query::index::IndexState;
         let store = LocalIndexStore::new(&self.engine);
-        let name = def.name.clone();
+        let (id, generation, shown) = (def.id, def.generation, def.to_string());
         let fields = self.fields.current()?;
         let wc = self.write_concern;
         let commit_ctx = coordinode_storage::engine::transaction::CommitContext {
@@ -3356,7 +3324,7 @@ impl Database {
             Ok(indexed) => {
                 def.state = IndexState::Ready;
                 self.commit_catalog(|txn| {
-                    store.expect_definition_txn(txn, &name, definition_version)?;
+                    store.expect_definition_txn(txn, id, definition_version)?;
                     store.put_definition_txn(txn, &def)?;
                     match &def.owner {
                         Some(owner) => {
@@ -3372,9 +3340,9 @@ impl Database {
                 match on_failure {
                     FailedBuild::Withdraw => {
                         self.commit_catalog(|txn| {
-                            store.expect_definition_txn(txn, &name, definition_version)?;
-                            store.delete_definition_txn(txn, &name)?;
-                            store.clear_txn(txn, &name)?;
+                            store.expect_definition_txn(txn, id, definition_version)?;
+                            store.delete_definition_txn(txn, &def)?;
+                            store.clear_txn(txn, generation)?;
                             match &def.owner {
                                 Some(owner) => stage_constraint_withdrawal(
                                     &self.engine,
@@ -3385,14 +3353,14 @@ impl Database {
                                 None => Ok(()),
                             }
                         })?;
-                        self.index_registry.unregister(&name);
+                        self.index_registry.unregister(id);
                     }
                     FailedBuild::Keep => {
                         def.state = IndexState::Failed {
                             reason: e.to_string(),
                         };
                         self.commit_catalog(|txn| {
-                            store.expect_definition_txn(txn, &name, definition_version)?;
+                            store.expect_definition_txn(txn, id, definition_version)?;
                             store.put_definition_txn(txn, &def)
                         })?;
                         self.index_registry.register_published(&self.engine, def)?;
@@ -3402,56 +3370,10 @@ impl Database {
                     coordinode_query::index::build::BackfillError::Duplicate(v) => {
                         DatabaseError::Execution(v.into())
                     }
-                    other => DatabaseError::Other(format!("build index '{name}': {other}")),
+                    other => DatabaseError::Other(format!("build index '{shown}': {other}")),
                 })
             }
         }
-    }
-
-    /// Rebuild every B-tree index still in the entry layout that preceded
-    /// transactional entries.
-    ///
-    /// Those entries were written outside the log on whichever member ran the
-    /// statement, so they are this member's own: they are cleared here, and
-    /// the index is built again through the log like a new one. Until then a
-    /// lookup does not use the index; writers already maintain it in the
-    /// current layout. An index whose stored data breaks it (a unique index
-    /// with duplicates the old layout let in) is kept, marked failed, and
-    /// reported. Returns how many indexes were rebuilt.
-    ///
-    /// # Errors
-    ///
-    /// Publishing through the log failed (this member is not the leader).
-    pub fn rebuild_legacy_btree_indexes(&self) -> Result<usize, DatabaseError> {
-        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        use coordinode_query::index::IndexType;
-        let legacy: Vec<_> = self
-            .index_registry
-            .all()
-            .into_iter()
-            .filter(|d| d.index_type == IndexType::BTree && d.layout < ENTRY_LAYOUT)
-            .collect();
-        let store = LocalIndexStore::new(&self.engine);
-        let mut rebuilt = 0;
-        for def in &legacy {
-            store.clear_legacy(&def.name)?;
-            match self.build_btree_index(def.clone(), FailedBuild::Keep) {
-                Ok(_) => {
-                    rebuilt += 1;
-                    tracing::info!(index = %def.name, "rebuilt a B-tree index in the current entry layout");
-                }
-                Err(DatabaseError::Execution(e @ ExecutionError::UniqueViolation { .. })) => {
-                    tracing::error!(
-                        index = %def.name,
-                        error = %e,
-                        "the stored data breaks this index; it stays failed until the data is \
-                         fixed and the index is dropped and created again"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(rebuilt)
     }
 
     /// Finish every B-tree index build an earlier process left unfinished: a
@@ -3481,8 +3403,8 @@ impl Database {
         let store = LocalIndexStore::new(&self.engine);
         let mut finished = 0;
         for def in interrupted {
-            let name = def.name.clone();
-            let version = store.definition_version(&name)?;
+            let name = def.to_string();
+            let version = store.definition_version(def.id)?;
             match self.complete_btree_build(def, version, FailedBuild::Withdraw) {
                 Ok(_) => {
                     finished += 1;
@@ -3547,20 +3469,22 @@ impl Database {
         let schemas = LocalSchemaStore::new(&self.engine);
         let mut adopted = 0;
         for def in unowned {
+            // The constraint takes the index's name; an index without one
+            // has none to give it.
+            let Some(name) = def.name.clone() else {
+                continue;
+            };
             let constraint = NodeConstraint {
-                name: def.name.clone(),
+                name: name.clone(),
                 properties: def.properties.clone(),
                 kind: ConstraintKind::Unique,
                 state: ConstraintState::Active,
             };
-            let version = indexes.definition_version(&def.name)?;
+            let version = indexes.definition_version(def.id)?;
             let mut skipped = None;
             self.commit_catalog(|txn| -> Result<(), DatabaseError> {
-                if let Some(holder) = schemas.constraint_label_txn(txn, &def.name)? {
-                    skipped = Some(format!(
-                        "constraint '{}' of :{holder} holds the name",
-                        def.name
-                    ));
+                if let Some(holder) = schemas.constraint_label_txn(txn, &name)? {
+                    skipped = Some(format!("constraint '{name}' of :{holder} holds the name"));
                     return Ok(());
                 }
                 let mut schema = match schemas.load_label_for_update_txn(txn, &def.label)? {
@@ -3600,21 +3524,22 @@ impl Database {
                 // The index already enforces what the constraint requires, so
                 // every stored node satisfies the new revision.
                 schemas.save_label_admitting_txn(txn, &schema)?;
-                schemas.claim_constraint_name_txn(txn, &def.name, &def.label)?;
-                let owned = def.clone().owned_by(&def.name);
-                indexes.expect_definition_txn(txn, &def.name, version)?;
+                schemas.claim_constraint_name_txn(txn, &name, &def.label)?;
+                let mut owned = def.clone();
+                owned.owner = Some(name.clone());
+                indexes.expect_definition_txn(txn, def.id, version)?;
                 indexes.put_definition_txn(txn, &owned)?;
                 Ok(())
             })?;
             match skipped {
                 Some(reason) => tracing::warn!(
-                    index = %def.name,
+                    index = %name,
                     reason,
                     "a unique index no constraint owns stays as it is"
                 ),
                 None => {
                     adopted += 1;
-                    tracing::info!(index = %def.name, "a unique index became the constraint owning it");
+                    tracing::info!(index = %name, "a unique index became the constraint owning it");
                 }
             }
         }
@@ -3650,21 +3575,27 @@ impl Database {
         property: impl Into<String>,
         config: coordinode_query::index::TextIndexConfig,
     ) -> Result<(), DatabaseError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
         let label = label.into();
         let property = property.into();
-        let def = coordinode_query::index::IndexDefinition::text(
+        let descriptor = coordinode_query::index::IndexDescriptor::text(
             name,
             &label,
             vec![property.clone()],
             config,
         );
 
-        // Publish the index definition before the local index exists.
-        let key = def.schema_key();
-        let bytes = rmp_serde::to_vec(&def).map_err(|e| {
-            DatabaseError::Other(format!("failed to serialize text index def: {e}"))
+        // Publish the index definition before the local index exists, in a
+        // catalog commit that gives it its identities and binds its name.
+        let store = LocalIndexStore::new(&self.engine);
+        let mut published = None;
+        self.commit_catalog(|txn| {
+            published = Some(store.publish_definition_txn(txn, descriptor)?);
+            Ok::<(), coordinode_modality::StoreError>(())
         })?;
-        self.publish_schema(vec![Self::schema_put(key, bytes)])?;
+        let def = published.ok_or_else(|| {
+            DatabaseError::Other("the text index publication staged no definition".into())
+        })?;
 
         // Register in the text index registry (creates empty tantivy index).
         self.text_index_registry
@@ -3809,7 +3740,7 @@ impl Database {
         self.refresh_btree_indexes().map_err(|e| e.to_string())?;
         for def in defs.iter().filter(|d| d.index_type == IndexType::BTree) {
             self.build_btree_index(def.clone(), FailedBuild::Keep)
-                .map_err(|e| format!("build index '{}': {e}", def.name))?;
+                .map_err(|e| format!("build index '{def}': {e}"))?;
         }
 
         let fields = self.fields.current().map_err(|e| e.to_string())?;

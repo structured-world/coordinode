@@ -85,6 +85,15 @@ fn email(v: &str) -> [(&'static str, Value); 1] {
     [("email", Value::String(v.into()))]
 }
 
+/// `descriptor` as the index numbered 1, serving from generation 1: the
+/// backfill is driven without a catalog here.
+fn bound(descriptor: crate::index::IndexDescriptor) -> IndexDefinition {
+    descriptor.bind(
+        crate::index::IndexId::from_raw(1),
+        crate::index::GenerationId::from_raw(1),
+    )
+}
+
 /// The nodes of the index's label are indexed, others are not.
 #[test]
 fn a_backfill_indexes_the_nodes_of_its_label() {
@@ -93,7 +102,11 @@ fn a_backfill_indexes_the_nodes_of_its_label() {
     put_node(&mut fx, 2, "User", &email("bob@x"));
     put_node(&mut fx, 3, "Movie", &email("alice@x"));
 
-    let index = IndexDefinition::btree("user_email", "User", "email");
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
     let indexed = backfill(&fx).run(&index, &mut commit).expect("backfill");
 
     assert_eq!(indexed, 2);
@@ -109,7 +122,7 @@ fn a_unique_backfill_stops_at_a_duplicate() {
     put_node(&mut fx, 1, "User", &email("same@x"));
     put_node(&mut fx, 2, "User", &email("same@x"));
 
-    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let index = bound(crate::index::IndexDescriptor::btree("user_email", "User", "email").unique());
     let err = backfill(&fx)
         .run(&index, &mut commit)
         .expect_err("duplicate data");
@@ -126,7 +139,7 @@ fn a_sparse_backfill_skips_missing_values() {
     put_node(&mut fx, 1, "User", &[("bio", Value::String("dev".into()))]);
     put_node(&mut fx, 2, "User", &[("name", Value::String("bob".into()))]);
 
-    let index = IndexDefinition::btree("user_bio", "User", "bio").sparse();
+    let index = bound(crate::index::IndexDescriptor::btree("user_bio", "User", "bio").sparse());
     assert_eq!(backfill(&fx).run(&index, &mut commit).expect("backfill"), 1);
 }
 
@@ -139,7 +152,7 @@ fn a_backfill_spans_pages() {
     for id in 1..=total {
         put_node(&mut fx, id, "User", &email(&format!("u{id}@x")));
     }
-    let index = IndexDefinition::btree("user_email", "User", "email").unique();
+    let index = bound(crate::index::IndexDescriptor::btree("user_email", "User", "email").unique());
     let mut commits = 0;
     let indexed = backfill(&fx)
         .run(&index, &mut |txn| {
@@ -161,7 +174,11 @@ fn a_page_that_read_a_changed_node_is_read_again() {
     put_node(&mut fx, 1, "User", &email("alice@x"));
     let field = fx.interner.intern("email");
 
-    let index = IndexDefinition::btree("user_email", "User", "email");
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
     let engine = &fx.engine;
     let oracle = &fx.oracle;
     let mut first = true;
@@ -190,18 +207,22 @@ fn a_page_that_read_a_changed_node_is_read_again() {
     );
 }
 
-/// A build whose definition is dropped and created again before one of its
-/// pages commits stops, and that page writes no entry under the name the
-/// new definition now holds.
+/// A build whose definition record moves (a drop, or a rebuild into another
+/// generation) before one of its pages commits stops, and that page writes
+/// no entry into the generation it was filling.
 #[test]
 fn a_page_of_a_replaced_definition_writes_nothing() {
     let mut fx = fixture();
     put_node(&mut fx, 1, "User", &email("alice@x"));
 
     let store = LocalIndexStore::new(&fx.engine);
-    let index = IndexDefinition::btree("user_email", "User", "email");
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
     store.put_definition(&index).expect("publish");
-    let published = store.definition_version(&index.name).expect("version");
+    let published = store.definition_version(index.id).expect("version");
     assert!(published.is_some());
 
     let mut build = backfill(&fx);
@@ -210,9 +231,10 @@ fn a_page_of_a_replaced_definition_writes_nothing() {
     let err = build
         .run(&index, &mut |txn| {
             if std::mem::take(&mut first) {
-                // DROP and CREATE of the same name between the page's read and
-                // its commit.
-                store.put_definition(&index).expect("recreate");
+                // The record moves between the page's read and its commit.
+                let mut moved = index.clone();
+                moved.generation = crate::index::GenerationId::from_raw(2);
+                store.put_definition(&moved).expect("move");
             }
             commit(txn)
         })
@@ -220,6 +242,6 @@ fn a_page_of_a_replaced_definition_writes_nothing() {
     assert!(matches!(err, BackfillError::Superseded), "{err:?}");
     assert!(
         lookup(&fx, &index, "alice@x").is_empty(),
-        "a page of the old build must not land under the new definition"
+        "a page of the superseded build must not land"
     );
 }

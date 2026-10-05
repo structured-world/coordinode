@@ -846,17 +846,36 @@ fn reaping_a_table_row_frees_its_key() {
     );
 }
 
-/// Seed a unique index on `Session.content` holding `values` for `node`.
-fn seed_unique_content(engine: &StorageEngine, value: &str, node: NodeId) {
+/// Publish `descriptor` through the catalog in a direct-mode transaction.
+fn publish_index(
+    engine: &StorageEngine,
+    descriptor: super::super::IndexDescriptor,
+) -> super::super::IndexDefinition {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     use coordinode_storage::engine::transaction::Transaction;
-    let index = super::super::IndexDefinition::btree("s_content", "Session", "content").unique();
+    LocalIndexStore::new(engine)
+        .publish_definition_txn(
+            &mut Transaction::new(engine, None, Timestamp::ZERO, None),
+            descriptor,
+        )
+        .expect("define index")
+}
+
+/// Seed the unique `index` on `Session.content` holding `value` for `node`.
+fn seed_unique_content(
+    engine: &StorageEngine,
+    index: &super::super::IndexDefinition,
+    value: &str,
+    node: NodeId,
+) {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_storage::engine::transaction::Transaction;
     let mut txn = Transaction::new(engine, None, Timestamp::ZERO, None);
     let no_fields = |_: &str| None;
     LocalIndexStore::new(engine)
         .stage_membership(
             &mut txn,
-            &index,
+            index,
             &no_fields,
             coordinode_core::index::derive::EntryOwner::node(node.as_raw()),
             None,
@@ -865,11 +884,14 @@ fn seed_unique_content(engine: &StorageEngine, value: &str, node: NodeId) {
         .expect("seed entry");
 }
 
-fn content_holder(engine: &StorageEngine, value: &str) -> Option<NodeId> {
+fn content_holder(
+    engine: &StorageEngine,
+    index: &super::super::IndexDefinition,
+    value: &str,
+) -> Option<NodeId> {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let index = super::super::IndexDefinition::btree("s_content", "Session", "content").unique();
     LocalIndexStore::new(engine)
-        .committed_conflict(&index, &[Value::String(value.into())], NodeId::from_raw(0))
+        .committed_conflict(index, &[Value::String(value.into())], NodeId::from_raw(0))
         .expect("holder")
 }
 
@@ -881,11 +903,10 @@ fn reaping_a_node_frees_its_unique_index_value() {
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
     persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
-    super::super::ops::save_index_definition(
+    let index = publish_index(
         &engine,
-        &super::super::IndexDefinition::btree("s_content", "Session", "content").unique(),
-    )
-    .expect("define index");
+        super::super::IndexDescriptor::btree("s_content", "Session", "content").unique(),
+    );
 
     let now = now_us();
     let content = interner.intern("content");
@@ -898,17 +919,20 @@ fn reaping_a_node_frees_its_unique_index_value() {
         record.set(content, Value::String(value.into()));
         record.set(created, Value::Timestamp(now - age_us));
         seed_node_record(&engine, 1, NodeId::from_raw(id), &record);
-        seed_unique_content(&engine, value, NodeId::from_raw(id));
+        seed_unique_content(&engine, &index, value, NodeId::from_raw(id));
     }
 
     let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
     assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
     assert_eq!(
-        content_holder(&engine, "old"),
+        content_holder(&engine, &index, "old"),
         None,
         "the reaped value is free"
     );
-    assert_eq!(content_holder(&engine, "new"), Some(NodeId::from_raw(2)));
+    assert_eq!(
+        content_holder(&engine, &index, "new"),
+        Some(NodeId::from_raw(2))
+    );
 }
 
 /// Expiring a property an index reads would leave the entry of its old
@@ -919,11 +943,10 @@ fn an_indexed_property_is_not_expired_by_field() {
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
     persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Field));
-    super::super::ops::save_index_definition(
+    publish_index(
         &engine,
-        &super::super::IndexDefinition::btree("s_created", "Session", "created_at"),
-    )
-    .expect("define index");
+        super::super::IndexDescriptor::btree("s_created", "Session", "created_at"),
+    );
     insert_node(
         &engine,
         1,

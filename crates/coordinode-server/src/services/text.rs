@@ -92,7 +92,7 @@ impl TextServiceImpl {
             .definitions()
             .into_iter()
             .filter(|d| d.label == req.label)
-            .flat_map(|d| d.properties)
+            .flat_map(|d| d.descriptor.properties)
             .collect();
 
         if indexed_properties.is_empty() {

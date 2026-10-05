@@ -89,9 +89,9 @@ pub use encrypted_index::{
 pub use error::{StoreError, StoreResult};
 pub use index::{IndexStore, LocalIndexStore};
 pub use index_def::{
-    ENTRY_LAYOUT, IndexDefinition, IndexMaintenance, IndexProfile, IndexState, IndexType,
-    NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource, TextFieldConfig,
-    TextIndexConfig, VectorIndexConfig,
+    ENTRY_LAYOUT, GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance,
+    IndexProfile, IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter,
+    ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
 pub use node::{LocalNodeStore, NodeStore};
 pub use schema::{LocalSchemaStore, SchemaStore};

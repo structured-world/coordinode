@@ -1,9 +1,10 @@
 use super::*;
 
 #[test]
-fn btree_definition() {
-    let idx = IndexDefinition::btree("user_email", "User", "email").unique();
-    assert_eq!(idx.name, "user_email");
+fn btree_descriptor() {
+    let idx = IndexDescriptor::btree("user_email", "User", "email").unique();
+    assert_eq!(idx.name.as_deref(), Some("user_email"));
+    assert_eq!(idx.description, None);
     assert_eq!(idx.label, "User");
     assert_eq!(idx.property(), "email");
     assert_eq!(idx.properties, vec!["email"]);
@@ -11,11 +12,12 @@ fn btree_definition() {
     assert!(!idx.sparse);
     assert!(!idx.multikey);
     assert!(!idx.is_compound());
+    assert_eq!(idx.layout, ENTRY_LAYOUT);
 }
 
 #[test]
-fn compound_definition() {
-    let idx = IndexDefinition::compound(
+fn compound_descriptor() {
+    let idx = IndexDescriptor::compound(
         "user_label_status",
         "User",
         vec!["label".into(), "status".into()],
@@ -26,74 +28,64 @@ fn compound_definition() {
 }
 
 #[test]
-fn sparse_definition() {
-    let idx = IndexDefinition::btree("user_bio", "User", "bio").sparse();
+fn sparse_descriptor() {
+    let idx = IndexDescriptor::btree("user_bio", "User", "bio").sparse();
     assert!(idx.sparse);
 }
 
-/// A definition stored before the layout field existed decodes as layout 0,
-/// the one to rebuild; a new definition carries the current layout.
+/// The catalog key is the identity, so a rename moves no record; the name
+/// binding is a key of its own, outside the definitions' prefix.
 #[test]
-fn a_definition_without_a_layout_is_the_legacy_one() {
-    #[derive(serde::Serialize)]
-    struct BeforeLayout {
-        name: String,
-        label: String,
-        properties: Vec<String>,
-        index_type: IndexType,
-        unique: bool,
-        sparse: bool,
-        multikey: bool,
-        filter: Option<PartialFilter>,
-        ttl_seconds: Option<u64>,
-        vector_config: Option<VectorIndexConfig>,
-        text_config: Option<TextIndexConfig>,
-        state: IndexState,
-        online_during_build: OnlineDuringBuild,
-    }
-    let bytes = rmp_serde::to_vec(&BeforeLayout {
-        name: "u_email".into(),
-        label: "User".into(),
-        properties: vec!["email".into()],
-        index_type: IndexType::BTree,
-        unique: true,
-        sparse: false,
-        multikey: false,
-        filter: None,
-        ttl_seconds: None,
-        vector_config: None,
-        text_config: None,
-        state: IndexState::Ready,
-        online_during_build: OnlineDuringBuild::Block,
-    })
-    .expect("encode");
-    let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode");
-    assert_eq!(back.layout, 0);
-    assert!(back.unique);
-
-    let current = IndexDefinition::btree("u_email", "User", "email");
-    assert_eq!(current.layout, ENTRY_LAYOUT);
-    let back: IndexDefinition =
-        rmp_serde::from_slice(&rmp_serde::to_vec(&current).expect("encode")).expect("decode");
-    assert_eq!(back.layout, ENTRY_LAYOUT);
+fn catalog_keys() {
+    let idx = IndexDescriptor::btree("user_email", "User", "email")
+        .bind(IndexId::from_raw(0x0102), GenerationId::from_raw(7));
+    assert_eq!(
+        idx.schema_key(),
+        [&b"schema:idx:"[..], &0x0102u64.to_be_bytes()].concat()
+    );
+    let name_key = IndexDefinition::name_key_of("user_email");
+    assert!(!name_key.starts_with(IndexDefinition::SCHEMA_PREFIX));
+    assert!(!IndexDefinition::ALLOCATOR_KEY.starts_with(IndexDefinition::SCHEMA_PREFIX));
+    assert!(!IndexDefinition::ALLOCATOR_KEY.starts_with(IndexDefinition::NAME_PREFIX));
 }
 
+/// The interpretation a DERIVED effect is sealed with carries the
+/// generation, not the name: renaming the index changes no entry key.
 #[test]
-fn schema_key() {
-    let idx = IndexDefinition::btree("user_email", "User", "email");
-    assert_eq!(idx.schema_key(), b"schema:idx:user_email");
+fn the_interpretation_carries_the_generation() {
+    let named = IndexDescriptor::btree("a", "User", "email")
+        .bind(IndexId::from_raw(1), GenerationId::from_raw(9));
+    let mut renamed = named.clone();
+    renamed.name = Some("b".into());
+    let field = |_: &str| Some(1);
+    assert_eq!(named.interpretation(&field), renamed.interpretation(&field));
+    assert_eq!(
+        named.interpretation(&field).generation,
+        GenerationId::from_raw(9)
+    );
+}
+
+/// Logs name an index by its name, or by its identity when it has none.
+#[test]
+fn display_names_or_identifies() {
+    let named = IndexDescriptor::btree("a", "User", "email")
+        .bind(IndexId::from_raw(4), GenerationId::from_raw(4));
+    assert_eq!(named.to_string(), "a");
+    let mut unnamed = named.clone();
+    unnamed.name = None;
+    assert_eq!(unnamed.to_string(), "index#4");
 }
 
 #[test]
 fn new_indexes_default_to_ready_state() {
-    let btree = IndexDefinition::btree("u_email", "User", "email");
-    let hnsw = IndexDefinition::hnsw("u_vec", "User", "vec", VectorIndexConfig::default());
-    let compound = IndexDefinition::compound(
+    let btree = IndexDescriptor::btree("u_email", "User", "email");
+    let hnsw = IndexDescriptor::hnsw("u_vec", "User", "vec", VectorIndexConfig::default());
+    let compound = IndexDescriptor::compound(
         "u_lbl_status",
         "User",
         vec!["label".into(), "status".into()],
     );
-    let text = IndexDefinition::text(
+    let text = IndexDescriptor::text(
         "u_text",
         "User",
         vec!["bio".into()],
@@ -106,62 +98,22 @@ fn new_indexes_default_to_ready_state() {
 }
 
 #[test]
-fn state_roundtrip_serde() {
-    let mut idx = IndexDefinition::hnsw("v", "L", "p", VectorIndexConfig::default());
+fn definition_roundtrip_serde() {
+    let mut idx = IndexDescriptor::hnsw("v", "L", "p", VectorIndexConfig::default())
+        .bind(IndexId::from_raw(3), GenerationId::from_raw(5));
+    idx.description = Some("embeddings".into());
     idx.state = IndexState::Building {
         written: 1234,
         estimated_total: 9999,
     };
     let bytes = rmp_serde::to_vec(&idx).expect("encode");
     let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode");
-    assert_eq!(back.state, idx.state);
+    assert_eq!(back, idx);
 
     idx.state = IndexState::Failed {
         reason: "build aborted".to_string(),
     };
     let bytes = rmp_serde::to_vec(&idx).expect("encode failed");
     let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode failed");
-    assert_eq!(
-        back.state,
-        IndexState::Failed {
-            reason: "build aborted".to_string()
-        }
-    );
-}
-
-#[test]
-fn legacy_def_without_state_deserializes_as_ready() {
-    // Simulate a pre-state IndexDefinition record by encoding a struct
-    // that has the same field layout MINUS the `state` field. rmp-serde
-    // accepts the shorter struct because we marked `state` with
-    // `#[serde(default)]`.
-    #[derive(serde::Serialize)]
-    struct LegacyDef {
-        name: String,
-        label: String,
-        properties: Vec<String>,
-        index_type: IndexType,
-        unique: bool,
-        sparse: bool,
-        multikey: bool,
-        filter: Option<PartialFilter>,
-        ttl_seconds: Option<u64>,
-        vector_config: Option<VectorIndexConfig>,
-    }
-    let legacy = LegacyDef {
-        name: "u".into(),
-        label: "U".into(),
-        properties: vec!["v".into()],
-        index_type: IndexType::Hnsw,
-        unique: false,
-        sparse: true,
-        multikey: false,
-        filter: None,
-        ttl_seconds: None,
-        vector_config: Some(VectorIndexConfig::default()),
-    };
-    let bytes = rmp_serde::to_vec(&legacy).expect("encode legacy");
-    let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode legacy as current");
-    assert_eq!(back.state, IndexState::Ready);
-    assert_eq!(back.name, "u");
+    assert_eq!(back, idx);
 }

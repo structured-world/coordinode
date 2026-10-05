@@ -297,7 +297,8 @@ impl DerivedIndexWork {
             DerivedSource::UnitRecord(_) => 5,
             DerivedSource::Values(v) => values(v),
         };
-        16 + interpretation.name.len() + names + values(&self.old) + new
+        // The fixed part includes the generation, a u64.
+        24 + names + values(&self.old) + new
     }
 }
 

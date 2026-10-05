@@ -396,7 +396,7 @@ fn drop_constraint_lifts_it_and_its_index() {
 /// from the values its predecessor indexed.
 #[test]
 fn a_constraint_recreated_under_its_name_follows_the_current_data() {
-    use coordinode_query::index::ops::load_index_definition;
+    use super::helpers::index_named;
     let (mut db, _dir) = open_db();
     let create = "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE";
     db.execute_cypher(create).expect("create");
@@ -419,9 +419,7 @@ fn a_constraint_recreated_under_its_name_follows_the_current_data() {
     );
     assert_eq!(stored_state(&db, "User", "user_email"), None);
     assert!(
-        load_index_definition(db.engine(), "user_email")
-            .expect("load")
-            .is_none(),
+        index_named(db.engine(), "user_email").is_none(),
         "the refused creation leaves no index behind"
     );
 
@@ -678,9 +676,10 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
     use coordinode_core::schema::definition::{
         LabelSchema, NodeConstraint, SchemaMode, encode_constraint_name_key,
     };
-    use coordinode_query::index::ops::{load_index_definition, save_index_definition};
-    use coordinode_query::index::{IndexDefinition, IndexState};
+    use coordinode_query::index::{IndexDescriptor, IndexState};
     use coordinode_storage::engine::partition::Partition;
+
+    use super::helpers::{index_named, publish_index};
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
@@ -701,7 +700,7 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
         LocalSchemaStore::new(db.engine())
             .save_label(&schema)
             .expect("plant the schema");
-        let mut def = IndexDefinition::compound("user_email", "User", vec!["email".into()])
+        let mut def = IndexDescriptor::compound("user_email", "User", vec!["email".into()])
             .unique()
             .sparse()
             .owned_by("user_email");
@@ -709,7 +708,7 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
             written: 0,
             estimated_total: 0,
         };
-        save_index_definition(db.engine(), &def).expect("plant the index");
+        publish_index(db.engine(), def);
         db.engine()
             .put(
                 Partition::Schema,
@@ -726,9 +725,7 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
         "the refused constraint is withdrawn, never left reading as active"
     );
     assert!(
-        load_index_definition(db.engine(), "user_email")
-            .expect("load")
-            .is_none(),
+        index_named(db.engine(), "user_email").is_none(),
         "its index went with it"
     );
     db.execute_cypher("CREATE (:User {email: 'same'})")
@@ -825,7 +822,7 @@ fn a_schema_change_during_validation_survives_activation() {
 /// left.
 #[test]
 fn a_constraint_dropped_during_validation_leaves_nothing() {
-    use coordinode_query::index::ops::load_index_definition;
+    use super::helpers::index_named;
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE (:User {email: 'a@x'})")
         .expect("seed");
@@ -841,11 +838,7 @@ fn a_constraint_dropped_during_validation_leaves_nothing() {
     assert!(outcome.is_err(), "the superseded build fails: {outcome:?}");
 
     assert_eq!(stored_state(&db, "User", "user_email"), None);
-    assert!(
-        load_index_definition(db.engine(), "user_email")
-            .expect("load")
-            .is_none()
-    );
+    assert!(index_named(db.engine(), "user_email").is_none());
     db.execute_cypher("CREATE (:User {email: 'a@x'})")
         .expect("no uniqueness is left behind");
     db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.name IS NOT NULL")
@@ -860,7 +853,7 @@ fn a_constraint_dropped_during_validation_leaves_nothing() {
 /// that never landed.
 #[test]
 fn a_refused_withdrawal_keeps_the_published_index_enforced() {
-    use coordinode_query::index::ops::load_index_definition;
+    use super::helpers::index_named;
     let (mut db, refuse, _dir) = open_db_refusing_definition_deletes();
     db.execute_cypher("CREATE (:User {email: 'same'}), (:User {email: 'same'})")
         .expect("duplicates");
@@ -870,9 +863,7 @@ fn a_refused_withdrawal_keeps_the_published_index_enforced() {
         .expect_err("duplicates");
     assert!(err.to_string().contains("was not withdrawn"), "{err}");
     assert!(
-        load_index_definition(db.engine(), "user_email")
-            .expect("load")
-            .is_some(),
+        index_named(db.engine(), "user_email").is_some(),
         "the definition is still stored"
     );
     db.execute_cypher("CREATE (:User {email: 'new'})")
@@ -948,7 +939,7 @@ fn a_nested_write_is_judged_by_the_state_it_leaves() {
 /// validated stays active, and the failed one's name is free again.
 #[test]
 fn a_failed_validation_withdraws_only_its_own_constraint() {
-    use coordinode_query::index::ops::load_index_definition;
+    use super::helpers::index_named;
     let (mut db, _dir) = open_db();
     db.execute_cypher(
         "CREATE (:User {email: 'same', name: 'a'}), (:User {email: 'same', name: 'b'})",
@@ -978,11 +969,7 @@ fn a_failed_validation_withdraws_only_its_own_constraint() {
         Some(ConstraintState::Active),
         "the constraint created meanwhile survives the withdrawal"
     );
-    assert!(
-        load_index_definition(db.engine(), "user_email")
-            .expect("load")
-            .is_none()
-    );
+    assert!(index_named(db.engine(), "user_email").is_none());
     expect_violation(db.execute_cypher("CREATE (:User {email: 'x'})"));
     db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.name IS NOT NULL")
         .expect_err("an equivalent constraint exists under another name");
@@ -1034,8 +1021,8 @@ fn interrupted_child_publishes_a_constraint_then_aborts() {
 /// a duplicate of that stored value is refused.
 #[test]
 fn a_kill_between_publication_and_activation_is_finished_on_open() {
+    use super::helpers::index_named;
     use coordinode_query::index::IndexState;
-    use coordinode_query::index::ops::load_index_definition;
     let dir = tempfile::tempdir().expect("tempdir");
     let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .args([
@@ -1063,9 +1050,7 @@ fn a_kill_between_publication_and_activation_is_finished_on_open() {
         stored_state(&db, "User", "user_email"),
         Some(ConstraintState::Active)
     );
-    let def = load_index_definition(db.engine(), "user_email")
-        .expect("load")
-        .expect("the index is published");
+    let def = index_named(db.engine(), "user_email").expect("the index is published");
     assert_eq!(def.state, IndexState::Ready);
     expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
     let rows = db
@@ -1104,7 +1089,7 @@ fn replay_child_creates_constraints_then_aborts() {
 /// index, the dropped one gone with its index, and none of it half applied.
 #[test]
 fn constraint_ddl_survives_a_kill_and_replay() {
-    use coordinode_query::index::ops::load_index_definition;
+    use super::helpers::index_named;
     let dir = tempfile::tempdir().expect("tempdir");
     let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .args([
@@ -1138,9 +1123,7 @@ fn constraint_ddl_survives_a_kill_and_replay() {
     );
     assert_eq!(stored_state(&db, "User", "user_age"), None);
     assert!(
-        load_index_definition(db.engine(), "user_age")
-            .expect("load")
-            .is_none(),
+        index_named(db.engine(), "user_age").is_none(),
         "the dropped constraint's index is gone"
     );
     expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})"));
@@ -1160,7 +1143,7 @@ fn unique_indexes_on(db: &Database, label: &str) -> Vec<String> {
         .expect("list indexes")
         .into_iter()
         .filter(|d| d.label == label && d.unique)
-        .map(|d| d.name)
+        .filter_map(|d| d.descriptor.name)
         .collect();
     names.sort();
     names
@@ -1168,12 +1151,11 @@ fn unique_indexes_on(db: &Database, label: &str) -> Vec<String> {
 
 /// Leave in `db` what an earlier release kept for a property declared
 /// unique: the flag on the property of `label`'s schema (when `flag`) and
-/// a unique index `index` over it that no constraint owns, in the entry
-/// layout the next open rebuilds.
+/// a unique index `index` over it that no constraint owns, its entries left
+/// for the next open to build.
 fn plant_earlier_uniqueness(db: &Database, label: &str, property: &str, index: &str, flag: bool) {
     use coordinode_core::schema::definition::{LabelSchema, PropertyDef};
-    use coordinode_query::index::IndexDefinition;
-    use coordinode_query::index::ops::save_index_definition;
+    use coordinode_query::index::{IndexDescriptor, IndexState};
     if flag {
         let mut schema = LabelSchema::new_node_id(label);
         let mut p = PropertyDef::new(property, PropertyType::String);
@@ -1183,16 +1165,19 @@ fn plant_earlier_uniqueness(db: &Database, label: &str, property: &str, index: &
             .save_label(&schema)
             .expect("plant the earlier schema");
     }
-    let mut legacy = IndexDefinition::btree(index, label, property).unique();
-    legacy.layout = 0;
-    save_index_definition(db.engine(), &legacy).expect("plant the earlier index");
+    let mut earlier = IndexDescriptor::btree(index, label, property).unique();
+    earlier.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    super::helpers::publish_index(db.engine(), earlier);
 }
 
 /// The owner recorded on index `name`.
 fn index_owner(db: &Database, name: &str) -> Option<String> {
-    coordinode_query::index::ops::load_index_definition(db.engine(), name)
-        .expect("load")
+    super::helpers::index_named(db.engine(), name)
         .expect("the index is defined")
+        .descriptor
         .owner
 }
 
@@ -1300,9 +1285,7 @@ fn create_unique_index_keeps_its_stated_options() {
         rows[0].get("maintenance"),
         Some(&Value::String("DERIVED".into()))
     );
-    let def = coordinode_query::index::ops::load_index_definition(db.engine(), "user_email")
-        .expect("load")
-        .expect("defined");
+    let def = super::helpers::index_named(db.engine(), "user_email").expect("defined");
     assert!(def.sparse && def.unique);
     assert_eq!(def.maintenance.profile, IndexProfile::Derived);
     assert_eq!(def.owner.as_deref(), Some("user_email"));
@@ -1355,8 +1338,8 @@ fn an_index_whose_name_another_constraint_holds_is_left_as_it_is() {
     expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x'})"));
 }
 
-/// An earlier index the stored data breaks (duplicates it let in) is not
-/// enforcing anything once rebuilt: it is not made an active constraint.
+/// An earlier index the stored data breaks (duplicates it let in) enforces
+/// nothing once its build runs: it is not made an active constraint.
 #[test]
 fn an_index_the_stored_data_breaks_does_not_become_a_constraint() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1368,18 +1351,10 @@ fn an_index_the_stored_data_breaks_does_not_become_a_constraint() {
     }
     let db = Database::open(dir.path()).expect("reopen");
     assert!(db.constraints().expect("constraints").is_empty());
-    let def = coordinode_query::index::ops::load_index_definition(db.engine(), "user_email")
-        .expect("load")
-        .expect("kept, failed");
     assert!(
-        matches!(
-            def.state,
-            coordinode_query::index::IndexState::Failed { .. }
-        ),
-        "{:?}",
-        def.state
+        super::helpers::index_named(db.engine(), "user_email").is_none(),
+        "the build the data refuses is withdrawn, owned by nothing"
     );
-    assert_eq!(def.owner, None);
 }
 
 /// A partial unique index requires uniqueness only among the nodes its

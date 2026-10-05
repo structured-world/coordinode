@@ -242,15 +242,18 @@ impl TextIndexRegistry {
     pub fn register(&self, def: IndexDefinition) -> Result<(), String> {
         let Some(config) = def.text_config.as_ref() else {
             return Err(format!(
-                "register called with non-text IndexDefinition: {}",
-                def.name
+                "register called with non-text IndexDefinition: {def}"
             ));
         };
 
         // Create one tantivy index per indexed property.
         for prop in &def.properties {
-            // Per-property subdirectory: text_idx_{name}_{prop}
-            let idx_dir = self.base_dir.join(format!("text_idx_{}_{prop}", def.name));
+            // Per-property subdirectory of the generation:
+            // text_idx_{generation}_{prop}. A rebuild into a new generation
+            // gets a directory of its own.
+            let idx_dir = self
+                .base_dir
+                .join(format!("text_idx_{}_{prop}", def.generation.as_raw()));
             if let Err(e) = std::fs::create_dir_all(&idx_dir) {
                 return Err(format!("failed to create text index directory: {e}"));
             }

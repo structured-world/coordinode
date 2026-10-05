@@ -1239,11 +1239,16 @@ impl StorageConfig {
             config = config.with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()));
         }
 
-        // Prefix extractor for bloom-accelerated prefix scans.
-        // All partitions use colon-separated keys (node:, adj:, edgeprop:, etc.)
-        // so one extractor serves all. Biggest impact on adj: partition where
+        // Prefix extractor for bloom-accelerated prefix scans. Partitions
+        // other than the index one use colon-separated keys (node:, adj:,
+        // edgeprop:, etc.); biggest impact on adj: where
         // prefix_scan("adj:KNOWS:out:") is the hot path for graph traversal.
-        config = config.prefix_extractor(Arc::new(ColonSeparatedPrefix));
+        // Index entries are binary, so their boundaries are decoded instead.
+        if part == Partition::Idx {
+            config = config.prefix_extractor(Arc::new(IndexEntryPrefix));
+        } else {
+            config = config.prefix_extractor(Arc::new(ColonSeparatedPrefix));
+        }
 
         // Per-block Reed-Solomon page ECC. The lsm-tree
         // flag is per-tree, but the ECC policy is per-endpoint, and a
@@ -1283,12 +1288,31 @@ pub(crate) struct ColonSeparatedPrefix;
 
 impl lsm_tree::PrefixExtractor for ColonSeparatedPrefix {
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
-        Box::new(
-            key.iter()
-                .enumerate()
-                .filter(|(_, b)| **b == b':')
-                .map(move |(i, _)| &key[..=i]),
-        )
+        Box::new(colon_prefixes(key))
+    }
+}
+
+fn colon_prefixes(key: &[u8]) -> impl Iterator<Item = &[u8]> {
+    key.iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b':')
+        .map(move |(i, _)| &key[..=i])
+}
+
+/// The index partition's extractor: an entry's generation prefix and, for a
+/// non-unique entry, the prefix through its value tuple, both found by
+/// decoding the entry ([`coordinode_core::index::encoding::entry_scan_prefixes`])
+/// rather than by a separator byte the generation number or a value may
+/// hold. The partition's other keys (its in-band coverage records) keep the
+/// colon boundaries.
+pub(crate) struct IndexEntryPrefix;
+
+impl lsm_tree::PrefixExtractor for IndexEntryPrefix {
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        match coordinode_core::index::encoding::entry_scan_prefixes(key) {
+            Some(prefixes) => Box::new(prefixes),
+            None => Box::new(colon_prefixes(key)),
+        }
     }
 }
 

@@ -292,7 +292,7 @@ fn binding(codec: u32) -> IndexBinding {
         epoch: 3,
         interpretation: IndexInterpretation {
             codec,
-            name: "user_email".into(),
+            generation: crate::index::identity::GenerationId::from_raw(4),
             unique: false,
             sparse: false,
             properties: vec![PropertyRef {

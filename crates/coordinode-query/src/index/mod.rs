@@ -17,8 +17,9 @@ pub mod text_registry;
 pub use crate::planner::logical::{NumericCmp, VectorPredicate};
 pub use coverage::{IndexCoverage, IndexDelta};
 pub use definition::{
-    IndexDefinition, IndexMaintenance, IndexProfile, IndexState, IndexType, NamespaceIndexPolicy,
-    OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
+    GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,
+    IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, ProfileSource, TextFieldConfig,
+    TextIndexConfig, VectorIndexConfig,
 };
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,

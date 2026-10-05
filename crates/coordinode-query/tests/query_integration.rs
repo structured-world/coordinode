@@ -13,7 +13,7 @@ use coordinode_core::graph::types::Value;
 use coordinode_query::cypher::parse;
 use coordinode_query::executor::{AdaptiveConfig, ExecutionContext, WriteStats, execute};
 use coordinode_query::index::{
-    IndexDefinition, TextIndexConfig, TextIndexRegistry, VectorIndexRegistry,
+    GenerationId, IndexDescriptor, IndexId, TextIndexConfig, TextIndexRegistry, VectorIndexRegistry,
 };
 use coordinode_query::planner::{build_logical_plan, estimate_cost};
 use coordinode_search::tantivy::TextIndex;
@@ -10167,12 +10167,13 @@ fn setup_rrf_indices(
         ef_search: None,
         rerank_candidates: None,
     };
-    let vec_def = IndexDefinition::hnsw(
+    let vec_def = IndexDescriptor::hnsw(
         format!("{label}_{vector_prop}_idx"),
         label,
         vector_prop,
         vec_cfg,
-    );
+    )
+    .bind(IndexId::from_raw(1), GenerationId::from_raw(1));
     vec_reg.register(vec_def);
     // Populate HNSW directly via the handle.
     if let Some(handle) = vec_reg.get(label, vector_prop) {
@@ -10187,12 +10188,13 @@ fn setup_rrf_indices(
     std::fs::create_dir_all(&text_reg_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_reg_dir);
     let text_cfg = TextIndexConfig::default();
-    let text_def = IndexDefinition::text(
+    let text_def = IndexDescriptor::text(
         format!("{label}_{text_prop}_idx"),
         label,
         vec![text_prop.to_string()],
         text_cfg,
-    );
+    )
+    .bind(IndexId::from_raw(2), GenerationId::from_raw(2));
     text_reg.register(text_def).unwrap();
     for (id, _v, text) in rows {
         text_reg.on_text_written(label, NodeId::from_raw(*id), text_prop, text);
@@ -10691,12 +10693,15 @@ fn rrf_score_brute_force_vector_without_hnsw() {
     std::fs::create_dir_all(&text_reg_dir).unwrap();
     let text_reg = TextIndexRegistry::new(&text_reg_dir);
     text_reg
-        .register(IndexDefinition::text(
-            "Item_body_idx",
-            "Item",
-            vec!["body".into()],
-            TextIndexConfig::default(),
-        ))
+        .register(
+            IndexDescriptor::text(
+                "Item_body_idx",
+                "Item",
+                vec!["body".into()],
+                TextIndexConfig::default(),
+            )
+            .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+        )
         .unwrap();
     for (id, _v, body) in &rows {
         text_reg.on_text_written("Item", NodeId::from_raw(*id), "body", body);
@@ -11863,7 +11868,7 @@ fn hnsw_scan_executor_returns_index_top_k() {
     }
     let registry = VectorIndexRegistry::new();
     registry.register_with_index(
-        IndexDefinition::hnsw(
+        IndexDescriptor::hnsw(
             "item_emb_idx",
             "Item",
             "embedding",
@@ -11877,7 +11882,8 @@ fn hnsw_scan_executor_returns_index_top_k() {
                 ef_search: None,
                 rerank_candidates: None,
             },
-        ),
+        )
+        .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
         hnsw,
     );
 

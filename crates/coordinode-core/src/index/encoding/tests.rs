@@ -40,14 +40,18 @@ fn encoding_preserves_order() {
     }
 }
 
-/// A string holding NUL followed by the key separator must not share a
-/// prefix with the shorter string: the old encoding wrote NUL unescaped, so
-/// the entries of "a" were a prefix of those of "a\0:x" and a lookup of one
+fn generation(raw: u64) -> GenerationId {
+    GenerationId::from_raw(raw)
+}
+
+/// A string holding NUL followed by the tuple terminator must not share a
+/// prefix with the shorter string: an encoding that wrote NUL unescaped made
+/// the entries of "a" a prefix of those of "a\0:x", and a lookup of one
 /// returned the other.
 #[test]
 fn a_string_is_never_a_key_prefix_of_another() {
-    let short = index_value_prefix("i", &enc(Value::String("a".into())));
-    let long = encode_index_key("i", &enc(Value::String("a\0:x".into())), 7);
+    let short = entry_value_prefix(generation(1), &enc(Value::String("a".into())));
+    let long = encode_entry_key(generation(1), &enc(Value::String("a\0:x".into())), 7);
     assert!(!long.starts_with(&short));
 }
 
@@ -93,13 +97,13 @@ fn compound_tuples_are_injective() {
 fn non_unique_entries_sort_by_value_then_id() {
     let alice = enc(Value::String("alice".into()));
     let bob = enc(Value::String("bob".into()));
-    let k1 = encode_index_key("idx", &alice, 1);
-    let k2 = encode_index_key("idx", &alice, 2);
-    let k3 = encode_index_key("idx", &bob, 1);
+    let k1 = encode_entry_key(generation(3), &alice, 1);
+    let k2 = encode_entry_key(generation(3), &alice, 2);
+    let k3 = encode_entry_key(generation(3), &bob, 1);
     assert!(k1 < k2 && k2 < k3);
-    assert_eq!(decode_index_entry("idx", &k2), Some((2, None)));
-    assert!(k1.starts_with(&index_value_prefix("idx", &alice)));
-    assert!(k1.starts_with(&index_prefix("idx")));
+    assert_eq!(decode_entry(generation(3), &k2), Some((2, None)));
+    assert!(k1.starts_with(&entry_value_prefix(generation(3), &alice)));
+    assert!(k1.starts_with(&entries_prefix(generation(3))));
 }
 
 /// An entry of a temporal node's version carries the node and the version
@@ -114,40 +118,103 @@ fn version_entries_carry_node_and_valid_from() {
         Value::Bool(true),
     ])
     .expect("indexable");
-    let older = encode_version_index_key("idx", &tricky, 7, -5);
-    let newer = encode_version_index_key("idx", &tricky, 7, 3);
-    let other = encode_version_index_key("idx", &tricky, 8, i64::MIN);
+    let g = generation(0x3A00_3A00_FF00_003A);
+    let older = encode_version_entry_key(g, &tricky, 7, -5);
+    let newer = encode_version_entry_key(g, &tricky, 7, 3);
+    let other = encode_version_entry_key(g, &tricky, 8, i64::MIN);
     assert!(older < newer && newer < other);
-    assert!(older.starts_with(&index_value_prefix("idx", &tricky)));
-    assert_eq!(decode_index_entry("idx", &older), Some((7, Some(-5))));
-    assert_eq!(decode_index_entry("idx", &newer), Some((7, Some(3))));
-    assert_eq!(decode_index_entry("idx", &other), Some((8, Some(i64::MIN))));
+    assert!(older.starts_with(&entry_value_prefix(g, &tricky)));
+    assert_eq!(decode_entry(g, &older), Some((7, Some(-5))));
+    assert_eq!(decode_entry(g, &newer), Some((7, Some(3))));
+    assert_eq!(decode_entry(g, &other), Some((8, Some(i64::MIN))));
     assert_eq!(
-        decode_index_entry("idx", &encode_index_key("idx", &tricky, 9)),
+        decode_entry(g, &encode_entry_key(g, &tricky, 9)),
         Some((9, None))
     );
 }
 
-/// A key of another index, a truncated owner or a malformed tuple decodes to
-/// nothing rather than to a wrong node.
+/// A key of another generation, a truncated owner or a malformed tuple
+/// decodes to nothing rather than to a wrong node.
 #[test]
 fn foreign_or_malformed_keys_decode_to_nothing() {
     let value = enc(Value::Int(1));
-    let key = encode_index_key("idx", &value, 1);
-    assert_eq!(decode_index_entry("other", &key), None);
-    assert_eq!(decode_index_entry("idx", &key[..key.len() - 1]), None);
-    let mut bad = index_prefix("idx");
+    let key = encode_entry_key(generation(1), &value, 1);
+    assert_eq!(decode_entry(generation(2), &key), None);
+    assert_eq!(decode_entry(generation(1), &key[..key.len() - 1]), None);
+    let mut bad = entries_prefix(generation(1)).to_vec();
     bad.extend_from_slice(&[0x7F, b':']);
     bad.extend_from_slice(&1u64.to_be_bytes());
-    assert_eq!(decode_index_entry("idx", &bad), None);
+    assert_eq!(decode_entry(generation(1), &bad), None);
 }
 
-/// One index name is never a prefix of another's entries, whatever the
-/// names hold, and the unique and non-unique layouts never meet.
+/// One generation's entries never fall under another's prefix or range,
+/// at the boundaries of the fixed-width number too, and the unique and
+/// non-unique shapes never meet.
 #[test]
-fn index_namespaces_are_disjoint() {
+fn generations_are_disjoint() {
     let value = enc(Value::Int(1));
-    assert!(!encode_index_key("ab", &value, 1).starts_with(&index_prefix("a")));
-    assert!(!encode_unique_index_key("i", &value).starts_with(&index_prefix("i")));
-    assert!(!encode_index_key("i", &value, 1).starts_with(&legacy_index_prefix("i")));
+    for (a, b) in [
+        (1, 2),
+        (0xFF, 0x100),
+        (u64::MAX - 1, u64::MAX),
+        (0, u64::MAX),
+    ] {
+        let key = encode_entry_key(generation(a), &value, 1);
+        assert!(!key.starts_with(&entries_prefix(generation(b))));
+        for (start, end) in generation_ranges(generation(b)) {
+            assert!(
+                !(start.as_slice() <= key.as_slice() && key.as_slice() < end.as_slice()),
+                "generation {a} entry inside generation {b}'s range"
+            );
+        }
+    }
+    let g = generation(5);
+    let unique = encode_unique_entry_key(g, &value);
+    assert!(!unique.starts_with(&entries_prefix(g)));
+    let [(start, end), (ustart, uend)] = generation_ranges(g);
+    let entry = encode_entry_key(g, &value, 1);
+    assert!(start <= entry && entry < end);
+    assert!(ustart <= unique && unique < uend);
+}
+
+/// The last generation's ranges still end: the range end steps the tag.
+#[test]
+fn the_last_generation_has_a_range_end() {
+    let [(start, end), _] = generation_ranges(generation(u64::MAX));
+    assert!(start < end);
+    let key = encode_entry_key(generation(u64::MAX), &enc(Value::Int(1)), 1);
+    assert!(start <= key && key < end);
+}
+
+/// The filter prefixes of an entry are found structurally: the generation
+/// prefix and the value prefix, however many separator and zero bytes the
+/// generation number and the values hold; a key of no entry shape has none.
+#[test]
+fn scan_prefixes_follow_the_structure() {
+    let g = generation(0x3A3A_003A_0000_FF3A);
+    let tuple = encode_tuple(&[
+        Value::String("a:\0b".into()),
+        Value::Binary(vec![b':', 0, 0xFF, b':']),
+    ])
+    .expect("indexable");
+    let key = encode_version_entry_key(g, &tuple, 0x3A00_0000_0000_003A, -1);
+    let prefixes: Vec<&[u8]> = entry_scan_prefixes(&key).expect("an entry").collect();
+    assert_eq!(
+        prefixes,
+        vec![
+            &entries_prefix(g)[..],
+            entry_value_prefix(g, &tuple).as_slice()
+        ]
+    );
+
+    let unique = encode_unique_entry_key(g, &tuple);
+    let prefixes: Vec<&[u8]> = entry_scan_prefixes(&unique).expect("an entry").collect();
+    assert_eq!(prefixes, vec![&unique_entries_prefix(g)[..]]);
+
+    assert!(entry_scan_prefixes(b"idx:\0\0\0\x01a:x").is_none());
+    assert!(entry_scan_prefixes(&[0x00, 1, 2]).is_none());
+    assert!(
+        entry_scan_prefixes(&[0x01, 0, 0]).is_none(),
+        "shorter than a prefix"
+    );
 }

@@ -1657,17 +1657,17 @@ impl<'a> ExecutionContext<'a> {
             .map_err(index_write_error)
     }
 
-    /// The nodes whose entry in the B-tree index `index_name` holds exactly
-    /// `value`, as this statement sees the index. `None` when the index
-    /// cannot answer: it is not active here, not fully built, or `value` has
-    /// no key.
+    /// The nodes whose entry in the B-tree index `id` holds exactly `value`,
+    /// as this statement sees the index. `None` when the index cannot
+    /// answer: it is not active here (dropped since the plan was built), not
+    /// fully built, or `value` has no key.
     pub fn index_lookup(
         &mut self,
-        index_name: &str,
+        id: crate::index::IndexId,
         value: &Value,
     ) -> Result<Option<Vec<NodeId>>, ExecutionError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        let Some(index) = self.btree_index_registry.and_then(|r| r.get(index_name)) else {
+        let Some(index) = self.btree_index_registry.and_then(|r| r.get_by_id(id)) else {
             return Ok(None);
         };
         if index.index_type != crate::index::IndexType::BTree
@@ -1883,9 +1883,42 @@ impl<'a> ExecutionContext<'a> {
         error
     }
 
-    /// Persist an index definition transactionally (CREATE INDEX DDL). Buffers
-    /// on the statement transaction through the Layer-4 index store, which
-    /// owns the `schema:idx:` keyspace and encoding — Layer 5 names neither.
+    /// Publish a new index transactionally (CREATE INDEX DDL): the catalog
+    /// allocates its identities and binds its name in the statement
+    /// transaction, through the Layer-4 index store, which owns the catalog
+    /// keyspace and encoding; Layer 5 names neither.
+    pub fn mvcc_publish_index_def(
+        &mut self,
+        descriptor: crate::index::IndexDescriptor,
+    ) -> Result<crate::index::IndexDefinition, ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        self.sync_txn_state();
+        Ok(LocalIndexStore::new(self.engine).publish_definition_txn(&mut self.txn, descriptor)?)
+    }
+
+    /// Publish a new index as a catalog commit of its own, outside the
+    /// statement transaction: the catalog gives it its identities and binds
+    /// its name in that commit, so the index exists for every member before
+    /// anything is built for it. A name another index holds is refused as
+    /// [`ExecutionError::CatalogObjectExists`].
+    pub fn publish_index_in_catalog(
+        &mut self,
+        descriptor: crate::index::IndexDescriptor,
+    ) -> Result<crate::index::IndexDefinition, ExecutionError> {
+        use coordinode_modality::{IndexStore as _, LocalIndexStore};
+        let store = LocalIndexStore::new(self.engine);
+        let mut published = None;
+        self.commit_catalog_change(|txn| {
+            published = Some(store.publish_definition_txn(txn, descriptor)?);
+            Ok::<(), coordinode_modality::StoreError>(())
+        })
+        .map_err(name_taken)?;
+        published.ok_or_else(|| {
+            ExecutionError::Unsupported("the index publication staged no definition".into())
+        })
+    }
+
+    /// Persist an existing index definition transactionally.
     pub fn mvcc_put_index_def(
         &mut self,
         def: &crate::index::IndexDefinition,
@@ -1895,11 +1928,15 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalIndexStore::new(self.engine).put_definition_txn(&mut self.txn, def)?)
     }
 
-    /// Delete an index definition by name transactionally (DROP INDEX DDL).
-    pub fn mvcc_delete_index_def(&mut self, name: &str) -> Result<(), ExecutionError> {
+    /// Delete an index definition and its name binding transactionally
+    /// (DROP INDEX DDL).
+    pub fn mvcc_delete_index_def(
+        &mut self,
+        def: &crate::index::IndexDefinition,
+    ) -> Result<(), ExecutionError> {
         use coordinode_modality::{IndexStore as _, LocalIndexStore};
         self.sync_txn_state();
-        Ok(LocalIndexStore::new(self.engine).delete_definition_txn(&mut self.txn, name)?)
+        Ok(LocalIndexStore::new(self.engine).delete_definition_txn(&mut self.txn, def)?)
     }
 
     /// Persist an encrypted-index definition transactionally (CREATE ENCRYPTED
@@ -3292,10 +3329,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         LogicalOp::IndexScan {
             variable,
             label,
-            index_name,
+            index,
+            index_name: _,
             property,
             value_expr,
-        } => execute_btree_index_scan(variable, label, index_name, property, value_expr, ctx),
+        } => execute_btree_index_scan(variable, label, *index, property, value_expr, ctx),
 
         // Index access path for pure vector top-K: the index IS the row
         // source; only the k result nodes are fetched from storage.
@@ -5100,7 +5138,7 @@ fn equality_filters(
 fn execute_btree_index_scan(
     variable: &str,
     label: &str,
-    index_name: &str,
+    index: crate::index::IndexId,
     property: &str,
     value_expr: &crate::plan::expr::Expr,
     ctx: &mut ExecutionContext<'_>,
@@ -5125,7 +5163,7 @@ fn execute_btree_index_scan(
     // The entries as this statement sees them: its snapshot, its own writes.
     // An index that cannot answer (not built, or a value with no key) leaves
     // the equality to a scan, which applies the query's own comparison.
-    let Some(ids) = ctx.index_lookup(index_name, &lookup_val)? else {
+    let Some(ids) = ctx.index_lookup(index, &lookup_val)? else {
         return execute_node_scan(
             variable,
             &[label.to_string()],
@@ -10351,30 +10389,27 @@ fn gate_vector_index_read(
             }
             if state.is_offline() {
                 return Err(ExecutionError::Unsupported(format!(
-                    "vector index '{}' failed to build on this node",
-                    def.name
+                    "vector index '{def}' failed to build on this node"
                 )));
             }
         }
-        let live_state = crate::index::ops::load_index_definition(engine, &def.name)
+        let live_state = crate::index::ops::load_index_definition(engine, def.id)
             .ok()
             .flatten()
-            .map(|d| d.state)
+            .map(|d| d.descriptor.state)
             .unwrap_or(IndexState::Ready);
 
         match live_state {
             IndexState::Ready => return Ok(()),
             IndexState::Failed { reason } => {
                 return Err(ExecutionError::Unsupported(format!(
-                    "vector index '{}' failed to build: {reason}",
-                    def.name
+                    "vector index '{def}' failed to build: {reason}"
                 )));
             }
             IndexState::Building { .. } => match def.online_during_build {
                 OnlineDuringBuild::Offline => {
                     return Err(ExecutionError::Unsupported(format!(
-                        "vector index '{}' is offline during build",
-                        def.name
+                        "vector index '{def}' is offline during build"
                     )));
                 }
                 OnlineDuringBuild::Block => {
@@ -10386,10 +10421,9 @@ fn gate_vector_index_read(
                     };
                     if remaining.is_zero() {
                         return Err(ExecutionError::Unsupported(format!(
-                            "vector index '{}' still building after {wait:?}; wait longer \
+                            "vector index '{def}' still building after {wait:?}; wait longer \
                              with /*+ vector_build_wait('...') */ or the session's \
-                             vector_build_wait",
-                            def.name
+                             vector_build_wait"
                         )));
                     }
                     // Never sleep past the caller's bound.
@@ -16840,10 +16874,14 @@ fn execute_create_text_index(
         default_language: lang.clone(),
         language_override_property: lang_override,
     };
-    let def = crate::index::IndexDefinition::text(name, label, properties.clone(), config);
-
-    // Persist index definition transactionally through the index store.
-    ctx.mvcc_put_index_def(&def)?;
+    // Publish the definition transactionally through the index store, which
+    // gives it its identities.
+    let def = ctx.mvcc_publish_index_def(crate::index::IndexDescriptor::text(
+        name,
+        label,
+        properties.clone(),
+        config,
+    ))?;
 
     // Register in text index registry (creates tantivy directory + empty index).
     registry
@@ -16892,7 +16930,10 @@ fn execute_drop_text_index(
     };
 
     // Find the definition by name to get (label, property).
-    let def = registry.definitions().into_iter().find(|d| d.name == name);
+    let def = registry
+        .definitions()
+        .into_iter()
+        .find(|d| d.name.as_deref() == Some(name));
 
     let Some(def) = def else {
         return Err(ExecutionError::Unsupported(format!(
@@ -16904,7 +16945,7 @@ fn execute_drop_text_index(
     registry.unregister(&def.label, def.property());
 
     // Remove the definition transactionally through the index store.
-    ctx.mvcc_delete_index_def(&def.name)?;
+    ctx.mvcc_delete_index_def(&def)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -17003,52 +17044,23 @@ fn execute_create_vector_index(
         ef_search,
         rerank_candidates,
     };
-    let mut def = crate::index::IndexDefinition::hnsw(name, label, property, config);
-    def.online_during_build = online_during_build;
+    let mut descriptor = crate::index::IndexDescriptor::hnsw(name, label, property, config);
+    descriptor.online_during_build = online_during_build;
 
     // The names the index is keyed by are bound before its definition is
     // published, so every member that sees the definition can resolve them.
     let ids = ctx.field_ids(&[label, property])?;
     let (label_id, property_id) = (ids[0], ids[1]);
 
-    // Persist the definition to the schema partition THROUGH the
-    // proposal pipeline: replicas discover the index by observing this
-    // key in their applied stream and run their own local backfill
-    // (the HNSW graph itself is never replicated, only the data is).
-    // Falls back to a direct engine write in legacy/test contexts that
-    // carry no pipeline.
-    if let (Some(pipeline), Some(id_gen)) = (ctx.proposal_pipeline, ctx.proposal_id_gen) {
-        let value = rmp_serde::to_vec(&def).map_err(|e| {
-            ExecutionError::Unsupported(format!("serialize vector index '{name}': {e}"))
-        })?;
-        let proposal = coordinode_core::txn::proposal::RaftProposal {
-            id: id_gen.next(),
-            mutations: vec![coordinode_core::txn::proposal::Mutation::Put {
-                partition: coordinode_core::txn::proposal::PartitionId::Schema,
-                key: def.schema_key(),
-                value,
-            }],
-            commit_ts: ctx
-                .mvcc_oracle
-                .map(|o| o.next())
-                .unwrap_or(ctx.mvcc_read_ts),
-            start_ts: ctx.mvcc_read_ts,
-            bypass_rate_limiter: false,
-        };
-        let outcome = pipeline.propose_and_wait(&proposal).map_err(|e| {
-            ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))
-        })?;
-        // DDL persists the index definition as its own Raft entry — fold its
-        // committed index into operationTime so a causal read after a
-        // CREATE VECTOR INDEX fences past the definition's replication, not
-        // just the (often empty) data-write flush. `max` keeps any larger
-        // index a later data flush in the same statement might mint.
-        ctx.write_stats.applied_index = ctx.write_stats.applied_index.max(outcome.applied_index);
-    } else {
-        crate::index::ops::save_index_definition(ctx.engine, &def).map_err(|e| {
-            ExecutionError::Unsupported(format!("persist vector index '{name}': {e}"))
-        })?;
-    }
+    // Publish the definition as its own catalog commit, before the build
+    // starts: the catalog gives it its identities and binds its name in that
+    // commit, and replicas discover the index by observing it in their
+    // applied stream and run their own local backfill (the HNSW graph itself
+    // is never replicated, only the data is). The commit's log index is
+    // folded into operationTime, so a causal read after a CREATE VECTOR INDEX
+    // fences past the definition's replication.
+    let def = ctx.publish_index_in_catalog(descriptor)?;
+    let index_id = def.id;
 
     // Register the empty HNSW graph in memory with its tier handle,
     // keyed by the ids bound above.
@@ -17073,7 +17085,7 @@ fn execute_create_vector_index(
         written: 0,
         estimated_total: 0,
     };
-    if let Err(e) = crate::index::ops::save_index_state(ctx.engine, name, initial_state) {
+    if let Err(e) = crate::index::ops::save_index_state(ctx.engine, index_id, initial_state) {
         // Only the crash-recovery marker is lost: a reopen then
         // finds the index Ready and rebuilds it all the same.
         tracing::warn!(index = %name, error = %e, "could not persist the building state");
@@ -17141,8 +17153,9 @@ fn execute_create_vector_index(
                 IndexState::Failed { reason } => health.mark_offline(reason.clone()),
                 _ => health.mark_ready(),
             }
-            if let Err(e) =
-                crate::index::ops::save_index_state(engine.as_ref(), &name_owned, terminal)
+            // By identity: an index created later under the same name is
+            // not this build's to mark.
+            if let Err(e) = crate::index::ops::save_index_state(engine.as_ref(), index_id, terminal)
             {
                 tracing::warn!(
                     index = %name_owned,
@@ -17157,7 +17170,7 @@ fn execute_create_vector_index(
             unbuilt.mark_offline(format!("could not start the build: {e}"));
             ExecutionError::Unsupported(format!("spawn backfill thread: {e}"))
         })?;
-    registry.register_build(name, label, property, &token, thread);
+    registry.register_build(&def, &token, thread);
 
     // The build has only started: nothing is indexed yet, and the state
     // reported is the one persisted above.
@@ -17189,7 +17202,7 @@ fn execute_drop_vector_index(
     let def = registry
         .all_definitions()
         .into_iter()
-        .find(|d| d.name == name);
+        .find(|d| d.name.as_deref() == Some(name));
 
     let Some(def) = def else {
         return Err(ExecutionError::Unsupported(format!(
@@ -17204,7 +17217,7 @@ fn execute_drop_vector_index(
     // owns the index's persisted state; dropping out from under it would race
     // its writes. Cancelling joins the thread, so once this returns the
     // definition has exactly one writer left: this statement.
-    if registry.cancel_build(&def.name) {
+    if registry.cancel_build(def.generation) {
         // The cancelled build may have written state after this statement drew
         // its read snapshot, which conflict detection would (correctly) read as
         // a write from the future. The build is now joined and can write no
@@ -17215,7 +17228,7 @@ fn execute_drop_vector_index(
     }
 
     // Tombstone the definition transactionally through the index store.
-    ctx.mvcc_delete_index_def(&def.name)?;
+    ctx.mvcc_delete_index_def(&def)?;
 
     // Remove from in-memory registry.
     registry.unregister(&label, &property);
@@ -17289,17 +17302,17 @@ fn execute_create_btree_index(
         }
         return Ok(vec![row]);
     }
-    let mut def = crate::index::IndexDefinition::btree(name, label, property);
+    let mut descriptor = crate::index::IndexDescriptor::btree(name, label, property);
     if unique {
-        def = def.unique();
+        descriptor = descriptor.unique();
     }
     if sparse {
-        def = def.sparse();
+        descriptor = descriptor.sparse();
     }
     if let Some(f) = filter {
-        def = def.with_filter(f.clone());
+        descriptor = descriptor.with_filter(f.clone());
     }
-    let build = publish_index_build(def, maintenance, ctx, |_| Ok(()))?;
+    let build = publish_index_build(descriptor, maintenance, ctx, |_| Ok(()))?;
     let backfilled = match ctx.backfill_index(&build.def, build.version) {
         Ok(n) => n,
         Err(e) => return Err(abandon_index_build(&build, e, ctx, |_| Ok(()))),
@@ -17320,18 +17333,33 @@ fn execute_create_btree_index(
 /// A B-tree index build in flight: the definition as published and the
 /// version of its record, which every page of the backfill and the commit
 /// that closes the build are bound to. A build whose definition was dropped
-/// or replaced meanwhile writes nothing more under the name.
+/// or moved to another generation meanwhile writes nothing more.
 struct IndexBuild {
     def: crate::index::IndexDefinition,
     version: Option<u64>,
 }
 
-/// Publish B-tree index `def` as building in one catalog commit together
-/// with `with`: on the condition that no definition holds the name when it
-/// commits, with any entries left under the name removed. Writers maintain
-/// the index from this commit on.
+/// The error a catalog commit that lost the name race fails with: the
+/// index exists, as when the name was found taken before the commit.
+fn name_taken(e: ExecutionError) -> ExecutionError {
+    match e {
+        ExecutionError::Modality(coordinode_modality::StoreError::IndexNameTaken(name)) => {
+            ExecutionError::CatalogObjectExists {
+                object: CatalogObject::Index,
+                name,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Publish B-tree index `descriptor` as building in one catalog commit
+/// together with `with`: the catalog gives it a new identity and generation
+/// and binds its name, on the condition that no live index holds the name
+/// when it commits. The generation is new, so no entry of a dropped index
+/// can be under it. Writers maintain the index from this commit on.
 fn publish_index_build(
-    mut def: crate::index::IndexDefinition,
+    mut descriptor: crate::index::IndexDescriptor,
     maintenance: Option<crate::index::IndexProfile>,
     ctx: &mut ExecutionContext<'_>,
     mut with: impl FnMut(
@@ -17344,11 +17372,13 @@ fn publish_index_build(
             "CREATE INDEX requires btree_index_registry in ExecutionContext".into(),
         ));
     };
-    if registry.get(&def.name).is_some() {
-        return Err(ExecutionError::CatalogObjectExists {
-            object: CatalogObject::Index,
-            name: def.name,
-        });
+    if let Some(name) = &descriptor.name {
+        if registry.get(name).is_some() {
+            return Err(ExecutionError::CatalogObjectExists {
+                object: CatalogObject::Index,
+                name: name.clone(),
+            });
+        }
     }
 
     let engine = ctx.engine;
@@ -17356,19 +17386,22 @@ fn publish_index_build(
     // The binding is resolved once, here, and recorded: a later change of
     // the namespace default does not reinterpret this index.
     let (policy, _) = store.index_policy()?;
-    def.maintenance = policy.resolve(maintenance, 1);
-    def.state = IndexState::Building {
+    descriptor.maintenance = policy.resolve(maintenance, 1);
+    descriptor.state = IndexState::Building {
         written: 0,
         estimated_total: 0,
     };
 
+    let mut published = None;
     ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, &def.name, None)?;
-        store.clear_txn(txn, &def.name)?;
-        store.put_definition_txn(txn, &def)?;
+        published = Some(store.publish_definition_txn(txn, descriptor)?);
         with(txn)
+    })
+    .map_err(name_taken)?;
+    let def = published.ok_or_else(|| {
+        ExecutionError::Unsupported("the index publication staged no definition".into())
     })?;
-    let version = store.definition_version(&def.name)?;
+    let version = store.definition_version(def.id)?;
     registry.register_published(engine, def.clone())?;
     Ok(IndexBuild { def, version })
 }
@@ -17389,7 +17422,7 @@ fn finish_index_build(
     let mut def = build.def;
     def.state = IndexState::Ready;
     ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, &def.name, build.version)?;
+        store.expect_definition_txn(txn, def.id, build.version)?;
         store.put_definition_txn(txn, &def)?;
         with(txn)
     })?;
@@ -17414,22 +17447,22 @@ fn abandon_index_build(
     ) -> Result<(), coordinode_modality::StoreError>,
 ) -> ExecutionError {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
-    let name = &build.def.name;
+    let def = &build.def;
     let failure = match failure {
         crate::index::build::BackfillError::Duplicate(v) => unique_violation(v),
-        other => ExecutionError::Unsupported(format!("build index '{name}': {other}")),
+        other => ExecutionError::Unsupported(format!("build index '{def}': {other}")),
     };
     let store = LocalIndexStore::new(ctx.engine);
     let withdrawn = ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, name, build.version)?;
-        store.delete_definition_txn(txn, name)?;
-        store.clear_txn(txn, name)?;
+        store.expect_definition_txn(txn, def.id, build.version)?;
+        store.delete_definition_txn(txn, def)?;
+        store.clear_txn(txn, def.generation)?;
         with(txn)
     });
     match withdrawn {
         Ok(()) => {
             if let Some(registry) = ctx.btree_index_registry {
-                registry.unregister(name);
+                registry.unregister(def.id);
             }
             failure
         }
@@ -17437,7 +17470,7 @@ fn abandon_index_build(
         // be written: the build's failure stays the answer, and what was
         // left behind is named.
         Err(e) => ExecutionError::Unsupported(format!(
-            "{failure}; the index '{name}' was not withdrawn: {e}"
+            "{failure}; the index '{def}' was not withdrawn: {e}"
         )),
     }
 }
@@ -17481,8 +17514,7 @@ fn execute_alter_index_maintenance(
         ));
     };
     let store = LocalIndexStore::new(ctx.engine);
-    let mut def = store
-        .load_definition(name)?
+    let (mut def, version) = stored_definition(name, ctx.engine)?
         .ok_or_else(|| ExecutionError::Unsupported(format!("index '{name}' not found")))?;
     if def.index_type != crate::index::IndexType::BTree {
         return Err(ExecutionError::Unsupported(format!(
@@ -17494,7 +17526,6 @@ fn execute_alter_index_maintenance(
             "index '{name}' is still being built; change its maintenance once it is ready"
         )));
     }
-    let version = store.definition_version(name)?;
     let (policy, _) = store.index_policy()?;
     let epoch = def.maintenance.epoch.checked_add(1).ok_or_else(|| {
         ExecutionError::Unsupported(format!("index '{name}' has no maintenance epoch left"))
@@ -17503,7 +17534,7 @@ fn execute_alter_index_maintenance(
     def.maintenance = policy.resolve(profile, epoch);
     let staged = def.clone();
     ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, name, version)?;
+        store.expect_definition_txn(txn, staged.id, version)?;
         store.put_definition_txn(txn, &staged)
     })?;
     let to = def.maintenance;
@@ -17583,12 +17614,14 @@ fn execute_drop_btree_index(
 
     let label = def.label.clone();
     let property = def.property().to_string();
+    // Bound to the object the name resolved to: a statement that resolved
+    // the name before it was rebound drops nothing of the later index.
     ctx.commit_catalog_change(|txn| {
-        store.expect_definition_txn(txn, name, version)?;
-        store.delete_definition_txn(txn, name)?;
-        store.clear_txn(txn, name)
+        store.expect_definition_txn(txn, def.id, version)?;
+        store.delete_definition_txn(txn, &def)?;
+        store.clear_txn(txn, def.generation)
     })?;
-    registry.unregister(name);
+    registry.unregister(def.id);
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -17598,18 +17631,23 @@ fn execute_drop_btree_index(
     Ok(vec![row])
 }
 
-/// The stored definition of index `name` and the version of its record, read
-/// as one: a definition replaced between the two reads is reported as a
-/// concurrent change rather than paired with another one's version.
+/// The stored definition of the index the name `name` binds and the version
+/// of its record, read as one: a name rebound or a definition replaced
+/// between the reads is reported as a concurrent change rather than paired
+/// with another object or another version.
 fn stored_definition(
     name: &str,
     engine: &StorageEngine,
 ) -> Result<Option<(crate::index::IndexDefinition, Option<u64>)>, ExecutionError> {
     use coordinode_modality::{IndexStore as _, LocalIndexStore};
     let store = LocalIndexStore::new(engine);
-    let version = store.definition_version(name)?;
-    let def = store.load_definition(name)?;
-    if store.definition_version(name)? != version {
+    let binding = store.name_version(name)?;
+    let Some(id) = store.resolve_name(name)? else {
+        return Ok(None);
+    };
+    let version = store.definition_version(id)?;
+    let def = store.load_definition(id)?;
+    if store.name_version(name)? != binding || store.definition_version(id)? != version {
         return Err(ExecutionError::Unsupported(format!(
             "the definition of index '{name}' changed concurrently; retry the statement"
         )));
@@ -17848,8 +17886,8 @@ fn execute_create_constraint(
         return Ok(vec![constraint_row(&published, label, ("created", true))]);
     }
 
-    let mut def =
-        crate::index::IndexDefinition::compound(&constraint.name, label, properties.to_vec())
+    let mut descriptor =
+        crate::index::IndexDescriptor::compound(&constraint.name, label, properties.to_vec())
             .unique()
             .owned_by(&constraint.name);
     // A node missing a value is not constrained by uniqueness; a key
@@ -17858,9 +17896,9 @@ fn execute_create_constraint(
         .sparse
         .unwrap_or(constraint.kind == ConstraintKind::Unique)
     {
-        def = def.sparse();
+        descriptor = descriptor.sparse();
     }
-    let build = publish_index_build(def, shape.maintenance, ctx, &mut stage_constraint);
+    let build = publish_index_build(descriptor, shape.maintenance, ctx, &mut stage_constraint);
     ctx.label_schema_cache.remove(label);
     let build = build?;
 
@@ -18027,19 +18065,19 @@ fn execute_drop_constraint(
         }
         store.save_label_admitting_txn(txn, &next)?;
         store.release_constraint_name_txn(txn, name)?;
-        if let Some((_, version)) = &index {
+        if let Some((def, version)) = &index {
             let indexes = LocalIndexStore::new(engine);
-            indexes.expect_definition_txn(txn, name, *version)?;
-            indexes.delete_definition_txn(txn, name)?;
-            indexes.clear_txn(txn, name)?;
+            indexes.expect_definition_txn(txn, def.id, *version)?;
+            indexes.delete_definition_txn(txn, def)?;
+            indexes.clear_txn(txn, def.generation)?;
         }
         Ok(())
     });
     ctx.label_schema_cache.remove(&label);
     dropped?;
-    if index.is_some() {
+    if let Some((def, _)) = &index {
         if let Some(registry) = ctx.btree_index_registry {
-            registry.unregister(name);
+            registry.unregister(def.id);
         }
     }
     Ok(vec![constraint_row(&removed, &label, ("dropped", true))])

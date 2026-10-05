@@ -7,13 +7,14 @@
 //! key, a rolled-back statement leaves none behind, and a scan inside the
 //! transaction sees its own writes.
 //!
-//! Two entry shapes, keyed by the values' tuple encoding
-//! ([`coordinode_core::index::encoding`]):
+//! Two entry shapes, keyed by the index generation and the values' tuple
+//! encoding ([`coordinode_core::index::encoding`]):
 //!
-//! - a non-unique index writes `idx:<name>:<tuple>:<node_id>` with an empty
-//!   value, one entry per node, found by a prefix scan; on a temporal label
-//!   the key also carries the version's `valid_from`, one entry per version;
-//! - a unique index writes `uidx:<name>:<tuple>` whose value is the holder's
+//! - a non-unique index writes `<generation><tuple>:<node_id>` with an
+//!   empty value, one entry per node, found by a prefix scan; on a temporal
+//!   label the key also carries the version's `valid_from`, one entry per
+//!   version;
+//! - a unique index writes `<generation><tuple>` whose value is the holder's
 //!   node id. Keyed by the value alone, the entry is its own uniqueness claim:
 //!   two transactions inserting one value write one key, and write-write
 //!   conflict detection lets only one of them commit. Checking the value is a
@@ -23,14 +24,20 @@
 //! A list value indexes each of its elements (multikey). A value with no key
 //! (NaN, a map, a vector) is not indexed; a lookup of it reports so, and the
 //! caller answers with a scan.
+//!
+//! The catalog keeps a definition under its [`IndexId`], a name binding per
+//! named index, and the identity allocator. Publishing a definition allocates
+//! its identities and binds its name in the publishing transaction, so a
+//! failed or refused publication takes nothing, and no number is reused.
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{EntryOwner, membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_index_entry, encode_tuple, encode_unique_index_key, index_prefix, index_value_prefix,
-    legacy_index_prefix, unique_index_prefix,
+    decode_entry, encode_tuple, encode_unique_entry_key, entries_prefix, entry_value_prefix,
+    generation_ranges, unique_entries_prefix,
 };
+use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::txn::proposal::Mutation;
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
@@ -38,7 +45,10 @@ use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
 
 use crate::error::{StoreError, StoreResult};
-use crate::index_def::{IndexDefinition, IndexProfile, IndexState, NamespaceIndexPolicy};
+use crate::index_def::{
+    GenerationId, IndexDefinition, IndexDescriptor, IndexId, IndexProfile, IndexState,
+    NamespaceIndexPolicy,
+};
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
 #[diagnostic::on_unimplemented(
@@ -125,14 +135,15 @@ pub trait IndexStore {
         index: &IndexDefinition,
     ) -> StoreResult<Vec<NodeId>>;
 
-    /// Stage the removal of every entry of the index `name`, of both shapes,
-    /// with the transaction's commit: for DDL that drops or replaces the
-    /// definition in the same commit, which fences every writer bound to it.
+    /// Stage the removal of every entry of the index generation `generation`,
+    /// of both shapes, with the transaction's commit: for DDL that drops or
+    /// replaces the definition in the same commit, which fences every writer
+    /// bound to it.
     ///
     /// # Errors
     ///
     /// A storage failure in legacy (no-MVCC) mode, which removes at once.
-    fn clear_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+    fn clear_txn(&self, txn: &mut Transaction, generation: GenerationId) -> StoreResult<()>;
 
     /// Apply one unit of mutations straight to the engine as one batch, for a
     /// context that has no log to replicate them through.
@@ -142,35 +153,32 @@ pub trait IndexStore {
     /// A storage failure, or DERIVED work that cannot be derived.
     fn apply_unreplicated(&self, mutations: &[Mutation]) -> StoreResult<()>;
 
-    /// Remove every entry the index `name` wrote in the layout that preceded
-    /// transactional entries. Local: those entries were written outside the
-    /// log on the member that ran the statement, so each member removes its
-    /// own before rebuilding the index.
-    ///
-    /// # Errors
-    ///
-    /// A storage failure.
-    fn clear_legacy(&self, name: &str) -> StoreResult<()>;
-
-    /// Persist an index definition into the schema catalog (keyed by
-    /// `schema:idx:<name>`) directly, outside the log. For state this member
-    /// keeps about itself (a vector index's build state).
+    /// Persist an index definition into the schema catalog directly, outside
+    /// the log. For state this member keeps about itself (a vector index's
+    /// build state).
     ///
     /// # Errors
     ///
     /// A storage or encoding failure.
     fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()>;
 
-    /// Load a persisted index definition by name.
+    /// Load a persisted index definition.
     ///
     /// # Errors
     ///
     /// A storage failure or an undecodable definition.
-    fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>>;
+    fn load_definition(&self, id: IndexId) -> StoreResult<Option<IndexDefinition>>;
 
-    /// Every persisted index definition in `schema:idx:` key order. A
-    /// definition whose bytes do not decode is skipped with a warning, so one
-    /// corrupt record does not take down the registry on open.
+    /// The live index the name `name` binds, if any.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable binding.
+    fn resolve_name(&self, name: &str) -> StoreResult<Option<IndexId>>;
+
+    /// Every persisted index definition in identity order. A definition
+    /// whose bytes do not decode is skipped with a warning, so one corrupt
+    /// record does not take down the registry on open.
     ///
     /// # Errors
     ///
@@ -178,28 +186,60 @@ pub trait IndexStore {
     fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>>;
 
     /// Update only the build `state` of a persisted definition, directly.
-    /// `Ok(false)` when no definition is stored under `name`.
+    /// `Ok(false)` when no definition is stored under `id`.
     ///
     /// # Errors
     ///
     /// A storage or encoding failure.
-    fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool>;
+    fn set_definition_state(&self, id: IndexId, state: IndexState) -> StoreResult<bool>;
 
-    /// Persist an index definition through a statement [`Transaction`]: it
-    /// commits, and replicates, with the statement.
+    /// Publish a new index through a statement [`Transaction`]: allocate its
+    /// identity and first generation, bind its name if it has one, and stage
+    /// its definition, all with the statement's commit. The allocation is
+    /// conditioned on the allocator record, so two concurrent publications
+    /// cannot take one number, and a name another live index holds refuses
+    /// the publication without staging anything.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::IndexNameTaken`], [`StoreError::IdentityExhausted`], or
+    /// a storage or encoding failure.
+    fn publish_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        descriptor: IndexDescriptor,
+    ) -> StoreResult<IndexDefinition>;
+
+    /// Allocate a new generation for `def` through a statement
+    /// [`Transaction`], for a rebuild that writes a new representation. The
+    /// caller stages the definition that serves from it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_definition_txn`].
+    fn allocate_generation_txn(&self, txn: &mut Transaction) -> StoreResult<GenerationId>;
+
+    /// Persist an existing index definition through a statement
+    /// [`Transaction`]: it commits, and replicates, with the statement. The
+    /// name binding is not touched.
     ///
     /// # Errors
     ///
     /// An encoding failure.
     fn put_definition_txn(&self, txn: &mut Transaction, def: &IndexDefinition) -> StoreResult<()>;
 
-    /// Delete a persisted index definition through a statement
-    /// [`Transaction`]. Tombstone semantics: no error when absent.
+    /// Delete a persisted index definition and its name binding through a
+    /// statement [`Transaction`]. Tombstone semantics: no error when absent.
+    /// The identities stay taken.
     ///
     /// # Errors
     ///
     /// A storage failure.
-    fn delete_definition_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()>;
+    fn delete_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+    ) -> StoreResult<()>;
 
     /// The namespace index policy and the version of its record (`None`
     /// before the first change: the RESOLVED default at revision 0).
@@ -223,22 +263,43 @@ pub trait IndexStore {
         version: Option<u64>,
     ) -> StoreResult<()>;
 
-    /// The version of the stored definition `name`, the value a writer binds
+    /// The version of the stored definition `id`, the value a writer binds
     /// its effects to so a transition between staging and commit refuses it.
     ///
     /// # Errors
     ///
     /// A storage failure.
-    fn definition_version(&self, name: &str) -> StoreResult<Option<u64>>;
+    fn definition_version(&self, id: IndexId) -> StoreResult<Option<u64>>;
 
-    /// Write the transaction only while the definition record of `name` is
-    /// at `version` when it commits (`None`: while no definition holds the
-    /// name), so DDL and builds act on the definition they inspected.
+    /// Write the transaction only while the definition record of `id` is at
+    /// `version` when it commits, so DDL and builds act on the definition
+    /// they inspected.
     ///
     /// # Errors
     ///
     /// A storage failure.
     fn expect_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        id: IndexId,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// The version of the binding of the name `name`.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn name_version(&self, name: &str) -> StoreResult<Option<u64>>;
+
+    /// Write the transaction only while the binding of `name` is at
+    /// `version` when it commits (`None`: while no index holds the name), so
+    /// a statement that resolved a name acts on the index it resolved.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn expect_name_txn(
         &self,
         txn: &mut Transaction,
         name: &str,
@@ -251,7 +312,7 @@ pub trait IndexStore {
 /// # Examples
 ///
 /// ```no_run
-/// use coordinode_modality::{IndexDefinition, IndexStore, LocalIndexStore};
+/// use coordinode_modality::{IndexDescriptor, IndexStore, LocalIndexStore};
 /// use coordinode_core::graph::{node::NodeId, types::Value};
 /// # use coordinode_storage::engine::{config::*, core::StorageEngine, transaction::Transaction};
 /// # use coordinode_core::txn::timestamp::Timestamp;
@@ -260,9 +321,12 @@ pub trait IndexStore {
 /// #     Media::Hdd, Durability::Durable, Tier::Warm)]);
 /// # let engine = StorageEngine::open(&cfg)?;
 /// # let mut txn = Transaction::begin(&engine, None, Timestamp::from_raw(1));
-/// let index = IndexDefinition::btree("user_email", "User", "email").unique();
-/// let email = [Value::String("a@x".into())];
 /// let store = LocalIndexStore::new(&engine);
+/// let index = store.publish_definition_txn(
+///     &mut txn,
+///     IndexDescriptor::btree("user_email", "User", "email").unique(),
+/// )?;
+/// let email = [Value::String("a@x".into())];
 /// assert_eq!(store.unique_conflict(&mut txn, &index, &email, NodeId::from_raw(1))?, None);
 /// let no_fields = |_: &str| None;
 /// let owner = coordinode_core::index::derive::EntryOwner::node(1);
@@ -294,26 +358,56 @@ fn decode_holder(bytes: &[u8]) -> StoreResult<NodeId> {
     }
 }
 
-/// Smallest key strictly greater than every key starting with `prefix`, the
-/// exclusive end of the prefix's range. Every prefix built here ends in `:`,
-/// so an end always exists.
-fn prefix_end(prefix: &[u8]) -> Vec<u8> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return end;
-        }
-        end.pop();
-    }
-    end
+fn encode<T: serde::Serialize>(what: &'static str, value: &T) -> StoreResult<Vec<u8>> {
+    rmp_serde::to_vec(value).map_err(|e| StoreError::Invariant(format!("{what} serialize: {e}")))
 }
 
-fn definition_key(name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(11 + name.len());
-    key.extend_from_slice(b"schema:idx:");
-    key.extend_from_slice(name.as_bytes());
-    key
+fn decode<T: serde::de::DeserializeOwned>(kind: &'static str, bytes: &[u8]) -> StoreResult<T> {
+    rmp_serde::from_slice(bytes).map_err(|e| StoreError::Decode {
+        kind,
+        message: e.to_string(),
+    })
+}
+
+fn decode_index_id(bytes: &[u8]) -> StoreResult<IndexId> {
+    match <[u8; 8]>::try_from(bytes) {
+        Ok(raw) => Ok(IndexId::from_raw(u64::from_be_bytes(raw))),
+        Err(_) => Err(StoreError::Decode {
+            kind: "index name binding",
+            message: format!("{} bytes, expected 8", bytes.len()),
+        }),
+    }
+}
+
+impl LocalIndexStore<'_> {
+    /// The allocator as this transaction sees it, conditioning the
+    /// transaction on the record it read. A transaction that already
+    /// allocated reads its own staged record, which is conditioned already.
+    fn allocator_txn(&self, txn: &mut Transaction) -> StoreResult<IdentityAllocator> {
+        let key = IndexDefinition::ALLOCATOR_KEY;
+        if let Some(Some(bytes)) = txn.buffered(Partition::Schema, key) {
+            return decode("index identity allocator", bytes);
+        }
+        // The value and the version of one write, read together: a version
+        // newer than the value would let the condition pass on a stale
+        // allocator and hand out a number twice.
+        let (allocator, version) = match self.engine.get_versioned(Partition::Schema, key)? {
+            Some((bytes, version)) => (decode("index identity allocator", &bytes)?, Some(version)),
+            None => (IdentityAllocator::default(), None),
+        };
+        txn.expect_version(Partition::Schema, key, version)?;
+        Ok(allocator)
+    }
+
+    fn put_allocator_txn(
+        &self,
+        txn: &mut Transaction,
+        allocator: &IdentityAllocator,
+    ) -> StoreResult<()> {
+        let value = encode("index identity allocator", allocator)?;
+        txn.put(Partition::Schema, IndexDefinition::ALLOCATOR_KEY, &value)?;
+        Ok(())
+    }
 }
 
 impl IndexStore for LocalIndexStore<'_> {
@@ -327,7 +421,7 @@ impl IndexStore for LocalIndexStore<'_> {
         new: Option<&[Value]>,
     ) -> StoreResult<usize> {
         let node_id = NodeId::from_raw(owner.node_id);
-        let mut effects = membership_effects(&index.name, index.unique, owner, old, new);
+        let mut effects = membership_effects(index.generation, index.unique, owner, old, new);
         if index.unique {
             // A value another node holds now (taken in this transaction) is
             // not this node's to release.
@@ -373,7 +467,7 @@ impl IndexStore for LocalIndexStore<'_> {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
         for tuple in tuples(values) {
-            let key = encode_unique_index_key(&index.name, &tuple);
+            let key = encode_unique_entry_key(index.generation, &tuple);
             if let Some(bytes) = txn.get(Partition::Idx, &key)? {
                 let holder = decode_holder(&bytes)?;
                 if holder != node_id {
@@ -391,7 +485,7 @@ impl IndexStore for LocalIndexStore<'_> {
         node_id: NodeId,
     ) -> StoreResult<Option<NodeId>> {
         for tuple in tuples(values) {
-            let key = encode_unique_index_key(&index.name, &tuple);
+            let key = encode_unique_entry_key(index.generation, &tuple);
             if let Some(bytes) = self.engine.get(Partition::Idx, &key)? {
                 let holder = decode_holder(&bytes)?;
                 if holder != node_id {
@@ -412,13 +506,13 @@ impl IndexStore for LocalIndexStore<'_> {
             return Ok(None);
         };
         if index.unique {
-            let key = encode_unique_index_key(&index.name, &tuple);
+            let key = encode_unique_entry_key(index.generation, &tuple);
             return match txn.get(Partition::Idx, &key)? {
                 Some(bytes) => Ok(Some(vec![decode_holder(&bytes)?])),
                 None => Ok(Some(Vec::new())),
             };
         }
-        let prefix = index_value_prefix(&index.name, &tuple);
+        let prefix = entry_value_prefix(index.generation, &tuple);
         let mut out = Vec::new();
         for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
             // The scan overlays buffered values but not buffered tombstones:
@@ -426,7 +520,7 @@ impl IndexStore for LocalIndexStore<'_> {
             if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
                 continue;
             }
-            if let Some((id, _)) = decode_index_entry(&index.name, &key) {
+            if let Some((id, _)) = decode_entry(index.generation, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }
@@ -443,9 +537,9 @@ impl IndexStore for LocalIndexStore<'_> {
         index: &IndexDefinition,
     ) -> StoreResult<Vec<NodeId>> {
         let prefix = if index.unique {
-            unique_index_prefix(&index.name)
+            unique_entries_prefix(index.generation)
         } else {
-            index_prefix(&index.name)
+            entries_prefix(index.generation)
         };
         // The scan appends this transaction's own entries after the stored
         // ones; key order is restored here.
@@ -458,16 +552,16 @@ impl IndexStore for LocalIndexStore<'_> {
             }
             if index.unique {
                 out.push(decode_holder(&value)?);
-            } else if let Some((id, _)) = decode_index_entry(&index.name, &key) {
+            } else if let Some((id, _)) = decode_entry(index.generation, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }
         Ok(out)
     }
 
-    fn clear_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
-        for start in [index_prefix(name), unique_index_prefix(name)] {
-            txn.remove_range(Partition::Idx, &start, &prefix_end(&start))?;
+    fn clear_txn(&self, txn: &mut Transaction, generation: GenerationId) -> StoreResult<()> {
+        for (start, end) in generation_ranges(generation) {
+            txn.remove_range(Partition::Idx, &start, &end)?;
         }
         Ok(())
     }
@@ -478,38 +572,35 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(self.engine.apply_proposal_at(mutations, 0)?)
     }
 
-    fn clear_legacy(&self, name: &str) -> StoreResult<()> {
-        let start = legacy_index_prefix(name);
-        self.engine
-            .remove_range(Partition::Idx, &start, &prefix_end(&start))?;
-        Ok(())
-    }
-
     fn put_definition(&self, def: &IndexDefinition) -> StoreResult<()> {
-        let value = rmp_serde::to_vec(def)
-            .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?;
+        let value = encode("index definition", def)?;
         self.engine
             .put(Partition::Schema, &def.schema_key(), &value)?;
         Ok(())
     }
 
-    fn load_definition(&self, name: &str) -> StoreResult<Option<IndexDefinition>> {
-        match self.engine.get(Partition::Schema, &definition_key(name))? {
-            Some(bytes) => Ok(Some(rmp_serde::from_slice(&bytes).map_err(|e| {
-                StoreError::Decode {
-                    kind: "index definition",
-                    message: e.to_string(),
-                }
-            })?)),
-            None => Ok(None),
-        }
+    fn load_definition(&self, id: IndexId) -> StoreResult<Option<IndexDefinition>> {
+        self.engine
+            .get(Partition::Schema, &IndexDefinition::schema_key_of(id))?
+            .map(|bytes| decode("index definition", &bytes))
+            .transpose()
+    }
+
+    fn resolve_name(&self, name: &str) -> StoreResult<Option<IndexId>> {
+        self.engine
+            .get(Partition::Schema, &IndexDefinition::name_key_of(name))?
+            .map(|bytes| decode_index_id(&bytes))
+            .transpose()
     }
 
     fn list_definitions(&self) -> StoreResult<Vec<IndexDefinition>> {
         let mut out = Vec::new();
-        for guard in self.engine.prefix_scan(Partition::Schema, b"schema:idx:")? {
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, IndexDefinition::SCHEMA_PREFIX)?
+        {
             let (_key, value) = guard.into_inner()?;
-            match rmp_serde::from_slice::<IndexDefinition>(&value) {
+            match decode::<IndexDefinition>("index definition", &value) {
                 Ok(def) => out.push(def),
                 Err(e) => tracing::warn!("list_definitions: skipping corrupt index def: {e}"),
             }
@@ -517,8 +608,8 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(out)
     }
 
-    fn set_definition_state(&self, name: &str, state: IndexState) -> StoreResult<bool> {
-        let Some(mut def) = self.load_definition(name)? else {
+    fn set_definition_state(&self, id: IndexId, state: IndexState) -> StoreResult<bool> {
+        let Some(mut def) = self.load_definition(id)? else {
             return Ok(false);
         };
         def.state = state;
@@ -526,29 +617,79 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(true)
     }
 
+    fn publish_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        descriptor: IndexDescriptor,
+    ) -> StoreResult<IndexDefinition> {
+        if let Some(name) = &descriptor.name {
+            let key = IndexDefinition::name_key_of(name);
+            if txn.get(Partition::Schema, &key)?.is_some() {
+                return Err(StoreError::IndexNameTaken(name.clone()));
+            }
+            // Bound only while it is free when the statement commits: two
+            // publications of one name cannot both commit.
+            txn.expect_version(Partition::Schema, &key, None)?;
+        }
+        let mut allocator = self.allocator_txn(txn)?;
+        let id = allocator.allocate_index()?;
+        let generation = allocator.allocate_generation()?;
+        self.put_allocator_txn(txn, &allocator)?;
+        let def = descriptor.bind(id, generation);
+        if let Some(name) = &def.name {
+            txn.put(
+                Partition::Schema,
+                &IndexDefinition::name_key_of(name),
+                &id.as_raw().to_be_bytes(),
+            )?;
+        }
+        self.put_definition_txn(txn, &def)?;
+        Ok(def)
+    }
+
+    fn allocate_generation_txn(&self, txn: &mut Transaction) -> StoreResult<GenerationId> {
+        let mut allocator = self.allocator_txn(txn)?;
+        let generation = allocator.allocate_generation()?;
+        self.put_allocator_txn(txn, &allocator)?;
+        Ok(generation)
+    }
+
     fn put_definition_txn(&self, txn: &mut Transaction, def: &IndexDefinition) -> StoreResult<()> {
-        let value = rmp_serde::to_vec(def)
-            .map_err(|e| StoreError::Invariant(format!("index definition serialize: {e}")))?;
+        let value = encode("index definition", def)?;
         txn.put(Partition::Schema, &def.schema_key(), &value)?;
         Ok(())
     }
 
-    fn delete_definition_txn(&self, txn: &mut Transaction, name: &str) -> StoreResult<()> {
-        txn.delete(Partition::Schema, &definition_key(name))?;
+    fn delete_definition_txn(
+        &self,
+        txn: &mut Transaction,
+        def: &IndexDefinition,
+    ) -> StoreResult<()> {
+        txn.delete(Partition::Schema, &def.schema_key())?;
+        if let Some(name) = &def.name {
+            let key = IndexDefinition::name_key_of(name);
+            // The binding goes only while it is this index's: a name it no
+            // longer holds belongs to another index.
+            match txn.get(Partition::Schema, &key)? {
+                Some(bytes) if decode_index_id(&bytes)? == def.id => {
+                    txn.delete(Partition::Schema, &key)?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
     fn index_policy(&self) -> StoreResult<(NamespaceIndexPolicy, Option<u64>)> {
-        let key = NamespaceIndexPolicy::KEY;
-        let version = self.engine.record_version(Partition::Schema, key)?;
-        let policy = match self.engine.get(Partition::Schema, key)? {
-            Some(bytes) => rmp_serde::from_slice(&bytes).map_err(|e| StoreError::Decode {
-                kind: "index policy",
-                message: e.to_string(),
-            })?,
-            None => NamespaceIndexPolicy::default(),
-        };
-        Ok((policy, version))
+        // The value and the version of one write, read together, so a
+        // change conditioned on the version builds on this value.
+        match self
+            .engine
+            .get_versioned(Partition::Schema, NamespaceIndexPolicy::KEY)?
+        {
+            Some((bytes, version)) => Ok((decode("index policy", &bytes)?, Some(version))),
+            None => Ok((NamespaceIndexPolicy::default(), None)),
+        }
     }
 
     fn put_index_policy_txn(
@@ -557,26 +698,48 @@ impl IndexStore for LocalIndexStore<'_> {
         policy: &NamespaceIndexPolicy,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        let value = rmp_serde::to_vec(policy)
-            .map_err(|e| StoreError::Invariant(format!("index policy serialize: {e}")))?;
+        let value = encode("index policy", policy)?;
         txn.expect_version(Partition::Schema, NamespaceIndexPolicy::KEY, version)?;
         txn.put(Partition::Schema, NamespaceIndexPolicy::KEY, &value)?;
         Ok(())
     }
 
-    fn definition_version(&self, name: &str) -> StoreResult<Option<u64>> {
+    fn definition_version(&self, id: IndexId) -> StoreResult<Option<u64>> {
         Ok(self
             .engine
-            .record_version(Partition::Schema, &definition_key(name))?)
+            .record_version(Partition::Schema, &IndexDefinition::schema_key_of(id))?)
     }
 
     fn expect_definition_txn(
         &self,
         txn: &mut Transaction,
+        id: IndexId,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        Ok(txn.expect_version(
+            Partition::Schema,
+            &IndexDefinition::schema_key_of(id),
+            version,
+        )?)
+    }
+
+    fn name_version(&self, name: &str) -> StoreResult<Option<u64>> {
+        Ok(self
+            .engine
+            .record_version(Partition::Schema, &IndexDefinition::name_key_of(name))?)
+    }
+
+    fn expect_name_txn(
+        &self,
+        txn: &mut Transaction,
         name: &str,
         version: Option<u64>,
     ) -> StoreResult<()> {
-        Ok(txn.expect_version(Partition::Schema, &definition_key(name), version)?)
+        Ok(txn.expect_version(
+            Partition::Schema,
+            &IndexDefinition::name_key_of(name),
+            version,
+        )?)
     }
 }
 

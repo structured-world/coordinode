@@ -1248,19 +1248,24 @@ fn vector_query_brute_force_without_index() {
 /// HNSW index registry: bulk_insert populates index correctly.
 #[test]
 fn hnsw_bulk_insert_and_search() {
-    use coordinode_query::index::{VectorIndexConfig, VectorIndexRegistry};
+    use coordinode_query::index::{
+        GenerationId, IndexDescriptor, IndexId, VectorIndexConfig, VectorIndexRegistry,
+    };
 
     let reg = VectorIndexRegistry::new();
-    reg.register(coordinode_query::index::IndexDefinition::hnsw(
-        "test_idx",
-        "Item",
-        "vec",
-        VectorIndexConfig {
-            dimensions: 4,
-            metric: VectorMetric::L2,
-            ..VectorIndexConfig::default()
-        },
-    ));
+    reg.register(
+        IndexDescriptor::hnsw(
+            "test_idx",
+            "Item",
+            "vec",
+            VectorIndexConfig {
+                dimensions: 4,
+                metric: VectorMetric::L2,
+                ..VectorIndexConfig::default()
+            },
+        )
+        .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+    );
 
     // Bulk insert 100 vectors
     let vectors: Vec<(u64, Vec<f32>)> = (0..100)

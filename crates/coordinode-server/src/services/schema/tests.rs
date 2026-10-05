@@ -1836,17 +1836,34 @@ async fn schema_label_cache_multiple_doc_functions_same_node() {
 /// building no second index.
 #[tokio::test]
 async fn an_earlier_unique_index_is_listed_and_found_as_a_constraint() {
-    use coordinode_query::index::IndexDefinition;
-    use coordinode_query::index::ops::{list_index_definitions, save_index_definition};
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_query::index::ops::list_index_definitions;
+    use coordinode_query::index::{IndexDescriptor, IndexState};
+    use coordinode_storage::engine::transaction::Transaction;
 
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let mut db = Database::open(dir.path()).expect("open");
         db.execute_cypher("CREATE (:Customer {email: 'a@x'})")
             .expect("a");
-        let mut legacy = IndexDefinition::btree("customer_email", "Customer", "email").unique();
-        legacy.layout = 0;
-        save_index_definition(db.engine(), &legacy).expect("plant the earlier index");
+        // A unique index no constraint owns, its entries left for the next
+        // open to build.
+        let mut earlier = IndexDescriptor::btree("customer_email", "Customer", "email").unique();
+        earlier.state = IndexState::Building {
+            written: 0,
+            estimated_total: 0,
+        };
+        LocalIndexStore::new(db.engine())
+            .publish_definition_txn(
+                &mut Transaction::new(
+                    db.engine(),
+                    None,
+                    coordinode_core::txn::timestamp::Timestamp::ZERO,
+                    None,
+                ),
+                earlier,
+            )
+            .expect("plant the earlier index");
     }
     let svc = SchemaServiceImpl::new(Arc::new(RwLock::new(
         Database::open(dir.path()).expect("reopen"),

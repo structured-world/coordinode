@@ -4,7 +4,7 @@ use super::*;
 use coordinode_core::graph::node::{NodeRecord, encode_node_key};
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::proposal::{Mutation, PartitionId};
-use coordinode_query::index::{IndexDefinition, VectorIndexConfig};
+use coordinode_query::index::{GenerationId, IndexDescriptor, IndexId, VectorIndexConfig};
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::partition::Partition;
 
@@ -72,21 +72,24 @@ fn fixture() -> Fixture {
         .unwrap(),
     );
     let registry = Arc::new(VectorIndexRegistry::new());
-    registry.register(IndexDefinition::hnsw(
-        "item_emb",
-        "Item",
-        "embedding",
-        VectorIndexConfig {
-            dimensions: 4,
-            metric: coordinode_core::graph::types::VectorMetric::L2,
-            m: 8,
-            ef_construction: 32,
-            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
-            offload_vectors: false,
-            ef_search: None,
-            rerank_candidates: None,
-        },
-    ));
+    registry.register(
+        IndexDescriptor::hnsw(
+            "item_emb",
+            "Item",
+            "embedding",
+            VectorIndexConfig {
+                dimensions: 4,
+                metric: coordinode_core::graph::types::VectorMetric::L2,
+                m: 8,
+                ef_construction: 32,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
+            },
+        )
+        .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+    );
     let mut interner = coordinode_core::graph::intern::FieldInterner::new();
     let field = interner.intern("embedding");
     Fixture {

@@ -1404,7 +1404,7 @@ fn stats_cache_ttl_max_stays_stale_until_invalidation() {
 /// CREATE INDEX for that property — preventing false positives.
 #[test]
 fn explain_suggest_no_false_positive_when_index_exists() {
-    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::IndexDescriptor;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -1423,11 +1423,10 @@ fn explain_suggest_no_false_positive_when_index_exists() {
             Tier::Warm,
         )]);
         let engine = StorageEngine::open(&config).expect("open engine");
-        coordinode_query::index::ops::save_index_definition(
+        super::helpers::publish_index(
             &engine,
-            &IndexDefinition::btree("user_email", "User", "email"),
-        )
-        .expect("register index");
+            IndexDescriptor::btree("user_email", "User", "email"),
+        );
         // engine dropped, data flushed
     }
 
@@ -1458,7 +1457,7 @@ fn explain_suggest_no_false_positive_when_index_exists() {
 /// EXPLAIN SUGGEST should suggest only for the missing one.
 #[test]
 fn explain_suggest_partial_coverage() {
-    use coordinode_query::index::IndexDefinition;
+    use coordinode_query::index::IndexDescriptor;
     use coordinode_storage::engine::config::{
         Durability, EndpointConfig, Media, StorageConfig, Tier,
     };
@@ -1476,11 +1475,7 @@ fn explain_suggest_partial_coverage() {
             Tier::Warm,
         )]);
         let engine = StorageEngine::open(&config).expect("open engine");
-        coordinode_query::index::ops::save_index_definition(
-            &engine,
-            &IndexDefinition::btree("user_name", "User", "name"),
-        )
-        .expect("register");
+        super::helpers::publish_index(&engine, IndexDescriptor::btree("user_name", "User", "name"));
     }
 
     let db = Database::open(dir.path()).expect("open db");

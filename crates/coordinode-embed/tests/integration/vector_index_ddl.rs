@@ -1426,9 +1426,12 @@ fn building_state_resets_to_ready_on_reopen() {
         // Inject a stale Building marker directly via the storage engine,
         // simulating a crash that left the backfill half-done.
         let storage = db.engine();
+        let id = super::helpers::index_named(storage, "item_emb")
+            .expect("created")
+            .id;
         index_ops::save_index_state(
             storage,
-            "item_emb",
+            id,
             IndexState::Building {
                 written: 0,
                 estimated_total: 1,
@@ -1444,9 +1447,8 @@ fn building_state_resets_to_ready_on_reopen() {
     {
         let mut db = coordinode_embed::Database::open(&path).expect("reopen");
         let storage = db.engine();
-        let def = index_ops::load_index_definition(storage, "item_emb")
-            .expect("load")
-            .expect("def present after reopen");
+        let def =
+            super::helpers::index_named(storage, "item_emb").expect("def present after reopen");
         assert_eq!(
             def.state,
             IndexState::Ready,

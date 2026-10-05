@@ -209,8 +209,14 @@ fn json_schema_lines(engine: &StorageEngine) -> Result<Vec<serde_json::Value>, E
             serde_json::to_value(edge_type),
         )?);
     }
+    // The descriptor, not the identities: a restore recreates the index in
+    // its target catalog, which allocates its own.
     for index in &indexes {
-        lines.push(encode("index", "definition", serde_json::to_value(index))?);
+        lines.push(encode(
+            "index",
+            "definition",
+            serde_json::to_value(&index.descriptor),
+        )?);
     }
     Ok(lines)
 }

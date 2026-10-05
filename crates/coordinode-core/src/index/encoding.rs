@@ -13,6 +13,7 @@
 //! `0xFF`). This is the escaping of the FoundationDB tuple layer, used for the
 //! same reason: the encoding stays injective and keeps byte order.
 
+use super::identity::GenerationId;
 use crate::graph::types::Value;
 
 /// Type tags, in the order the types sort.
@@ -25,10 +26,15 @@ const TAG_STRING: u8 = 0x40;
 const TAG_TIMESTAMP: u8 = 0x50;
 const TAG_BINARY: u8 = 0x60;
 
-/// Prefix of the entries of an index that allows several nodes per value.
-const INDEX_PREFIX: &[u8] = b"idx:";
-/// Prefix of the entries of a unique index: one entry per value.
-const UNIQUE_PREFIX: &[u8] = b"uidx:";
+/// First byte of an entry of an index that allows several nodes per value.
+const TAG_ENTRIES: u8 = 0x01;
+/// First byte of an entry of a unique index: one entry per value.
+const TAG_UNIQUE_ENTRIES: u8 = 0x02;
+/// Ends the tuple of a non-unique entry. No element starts with it, so it
+/// marks where the tuple ends and the owner begins.
+const TUPLE_END: u8 = b':';
+/// Length of a generation prefix: the shape tag and the generation, u64 BE.
+pub const GENERATION_PREFIX_LEN: usize = 9;
 
 /// A value that has no index key.
 ///
@@ -122,85 +128,122 @@ fn escape(bytes: &[u8], out: &mut Vec<u8>) {
     out.push(0);
 }
 
-/// `<prefix><name length u32 BE><name>:`. The length makes the name
-/// self-delimiting whatever it contains; the trailing `:` makes the prefix a
-/// boundary the partition's prefix bloom filter indexes.
-fn named_prefix(prefix: &[u8], name: &str) -> Vec<u8> {
-    // Index names are identifiers bounded far below 4 GiB by the parser.
-    let len = name.len() as u32;
-    let mut out = Vec::with_capacity(prefix.len() + 4 + name.len() + 1);
-    out.extend_from_slice(prefix);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(name.as_bytes());
-    out.push(b':');
+fn generation_prefix(tag: u8, generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
+    let mut out = [0u8; GENERATION_PREFIX_LEN];
+    out[0] = tag;
+    out[1..].copy_from_slice(&generation.as_raw().to_be_bytes());
     out
 }
 
-/// Prefix of every entry of the non-unique index `name`.
-pub fn index_prefix(name: &str) -> Vec<u8> {
-    named_prefix(INDEX_PREFIX, name)
+/// Prefix of every entry of the non-unique index generation `generation`:
+/// the shape tag and the generation. Fixed width, so it ends where the tuple
+/// begins whatever the generation is.
+pub fn entries_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
+    generation_prefix(TAG_ENTRIES, generation)
 }
 
-/// Prefix of the entries of the non-unique index `name` holding `tuple`
-/// (an [`encode_tuple`] result): `idx:<name>:<tuple>:`.
+/// Prefix of the entries of the non-unique `generation` holding `tuple` (an
+/// [`encode_tuple`] result): `<prefix><tuple>:`.
 ///
 /// Only entries of exactly this tuple carry it: the tuple is self-delimiting
 /// and every entry of one index has the same arity.
-pub fn index_value_prefix(name: &str, tuple: &[u8]) -> Vec<u8> {
-    let mut out = index_prefix(name);
+pub fn entry_value_prefix(generation: GenerationId, tuple: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len() + 17);
+    out.extend_from_slice(&entries_prefix(generation));
     out.extend_from_slice(tuple);
-    out.push(b':');
+    out.push(TUPLE_END);
     out
 }
 
-/// Entry of `node_id` under `tuple` in the non-unique index `name`:
-/// `idx:<name>:<tuple>:<node_id u64 BE>`, empty value.
-pub fn encode_index_key(name: &str, tuple: &[u8], node_id: u64) -> Vec<u8> {
-    let mut out = index_value_prefix(name, tuple);
+/// Entry of `node_id` under `tuple` in the non-unique `generation`:
+/// `<prefix><tuple>:<node_id u64 BE>`, empty value.
+pub fn encode_entry_key(generation: GenerationId, tuple: &[u8], node_id: u64) -> Vec<u8> {
+    let mut out = entry_value_prefix(generation, tuple);
     out.extend_from_slice(&node_id.to_be_bytes());
     out
 }
 
 /// Entry of the version of temporal node `node_id` that starts at
-/// `valid_from` under `tuple` in the non-unique index `name`:
-/// `idx:<name>:<tuple>:<node_id u64 BE><valid_from>`, empty value, with
+/// `valid_from` under `tuple` in the non-unique `generation`:
+/// `<prefix><tuple>:<node_id u64 BE><valid_from>`, empty value, with
 /// `valid_from` in the order-preserving form of an integer. A node's
 /// versions sort together, oldest first.
-pub fn encode_version_index_key(
-    name: &str,
+pub fn encode_version_entry_key(
+    generation: GenerationId,
     tuple: &[u8],
     node_id: u64,
     valid_from: i64,
 ) -> Vec<u8> {
-    let mut out = encode_index_key(name, tuple, node_id);
+    let mut out = encode_entry_key(generation, tuple, node_id);
     out.extend_from_slice(&((valid_from as u64) ^ (1 << 63)).to_be_bytes());
     out
 }
 
-/// Prefix of every entry of the unique index `name`.
-pub fn unique_index_prefix(name: &str) -> Vec<u8> {
-    named_prefix(UNIQUE_PREFIX, name)
+/// Prefix of every entry of the unique index generation `generation`.
+pub fn unique_entries_prefix(generation: GenerationId) -> [u8; GENERATION_PREFIX_LEN] {
+    generation_prefix(TAG_UNIQUE_ENTRIES, generation)
 }
 
-/// Entry of `tuple` in the unique index `name`: `uidx:<name>:<tuple>`, whose
+/// Entry of `tuple` in the unique `generation`: `<prefix><tuple>`, whose
 /// value is the holder's node id (u64 BE).
 ///
 /// Keyed by the value alone, the entry is its own uniqueness claim: two
 /// transactions inserting one value write one key, and write-write conflict
 /// detection lets one of them commit.
-pub fn encode_unique_index_key(name: &str, tuple: &[u8]) -> Vec<u8> {
-    let mut out = unique_index_prefix(name);
+pub fn encode_unique_entry_key(generation: GenerationId, tuple: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(GENERATION_PREFIX_LEN + tuple.len());
+    out.extend_from_slice(&unique_entries_prefix(generation));
     out.extend_from_slice(tuple);
     out
 }
 
-/// The owner a non-unique entry key of the index `name` names: the node id,
-/// and the version's `valid_from` for an entry of one version of a temporal
-/// node ([`encode_version_index_key`]). `None` for a key that is no entry of
-/// that index.
-pub fn decode_index_entry(name: &str, key: &[u8]) -> Option<(u64, Option<i64>)> {
-    let rest = key.strip_prefix(index_prefix(name).as_slice())?;
-    let owner = rest.get(tuple_len(rest)?..)?.strip_prefix(b":")?;
+/// The key ranges, `[start, end)`, holding every entry of `generation` in
+/// either shape: what removing a generation's entries removes.
+pub fn generation_ranges(generation: GenerationId) -> [(Vec<u8>, Vec<u8>); 2] {
+    [
+        entries_prefix(generation),
+        unique_entries_prefix(generation),
+    ]
+    .map(|prefix| (prefix.to_vec(), prefix_end(&prefix)))
+}
+
+/// Smallest key strictly greater than every key starting with `prefix`. The
+/// prefixes here start with a tag below `0xFF`, so an end always exists.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xFF {
+            end.push(last + 1);
+            break;
+        }
+    }
+    end
+}
+
+/// The scan prefixes of an index partition key a prefix filter records:
+/// its generation prefix and, for a non-unique entry, the prefix through its
+/// tuple. Both are structural boundaries, found by decoding the shape and
+/// the tuple, never by searching for a separator byte, which a value or a
+/// generation number may contain. `None` for a key of no entry shape.
+pub fn entry_scan_prefixes(key: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+    let tag = *key.first()?;
+    if (tag != TAG_ENTRIES && tag != TAG_UNIQUE_ENTRIES) || key.len() < GENERATION_PREFIX_LEN {
+        return None;
+    }
+    let value = (tag == TAG_ENTRIES)
+        .then(|| tuple_len(&key[GENERATION_PREFIX_LEN..]))
+        .flatten()
+        .map(|len| &key[..GENERATION_PREFIX_LEN + len + 1]);
+    Some(core::iter::once(&key[..GENERATION_PREFIX_LEN]).chain(value))
+}
+
+/// The owner a non-unique entry key of `generation` names: the node id, and
+/// the version's `valid_from` for an entry of one version of a temporal node
+/// ([`encode_version_entry_key`]). `None` for a key that is no entry of that
+/// generation.
+pub fn decode_entry(generation: GenerationId, key: &[u8]) -> Option<(u64, Option<i64>)> {
+    let rest = key.strip_prefix(entries_prefix(generation).as_slice())?;
+    let owner = rest.get(tuple_len(rest)?..)?.strip_prefix(&[TUPLE_END])?;
     let node_id = u64::from_be_bytes(owner.get(..8)?.try_into().ok()?);
     match owner.len() {
         8 => Some((node_id, None)),
@@ -213,13 +256,13 @@ pub fn decode_index_entry(name: &str, key: &[u8]) -> Option<(u64, Option<i64>)> 
 }
 
 /// Length of the encoded tuple `bytes` starts with: the elements up to the
-/// `:` that ends it, which is no element tag. `None` when an element is
-/// malformed or the tuple does not end.
+/// [`TUPLE_END`] that ends it, which is no element tag. `None` when an
+/// element is malformed or the tuple does not end.
 fn tuple_len(bytes: &[u8]) -> Option<usize> {
     let mut at = 0;
     loop {
         match *bytes.get(at)? {
-            b':' => return Some(at),
+            TUPLE_END => return Some(at),
             TAG_NULL | TAG_FALSE | TAG_TRUE => at += 1,
             TAG_INT | TAG_FLOAT | TAG_TIMESTAMP => at += 9,
             TAG_STRING | TAG_BINARY => {
@@ -240,18 +283,6 @@ fn tuple_len(bytes: &[u8]) -> Option<usize> {
             _ => return None,
         }
     }
-}
-
-/// Prefix of every entry the index `name` wrote under the layout that
-/// preceded [`encode_index_key`]: `idx:<name>:`. Disjoint from the current
-/// layouts, whose name is length-prefixed and so starts with a zero byte for
-/// any name a parser accepts.
-pub fn legacy_index_prefix(name: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INDEX_PREFIX.len() + name.len() + 1);
-    out.extend_from_slice(INDEX_PREFIX);
-    out.extend_from_slice(name.as_bytes());
-    out.push(b':');
-    out
 }
 
 #[cfg(test)]

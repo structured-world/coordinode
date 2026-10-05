@@ -48,10 +48,19 @@ fn test_config() -> VectorIndexConfig {
     }
 }
 
+/// The vector index `name` as the index numbered `raw`, serving from
+/// generation `raw`: the registry is driven without a catalog here.
+fn hnsw(raw: u64, name: &str, label: &str, property: &str) -> IndexDefinition {
+    crate::index::IndexDescriptor::hnsw(name, label, property, test_config()).bind(
+        crate::index::IndexId::from_raw(raw),
+        GenerationId::from_raw(raw),
+    )
+}
+
 #[test]
 fn register_and_lookup() {
     let reg = VectorIndexRegistry::new();
-    let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
+    let def = hnsw(1, "movie_embedding", "Movie", "embedding");
 
     reg.register(def);
 
@@ -64,12 +73,7 @@ fn register_and_lookup() {
 #[test]
 fn health_tracks_state_and_freshness_watermark() {
     let reg = VectorIndexRegistry::new();
-    reg.register(IndexDefinition::hnsw(
-        "movie_embedding",
-        "Movie",
-        "embedding",
-        test_config(),
-    ));
+    reg.register(hnsw(1, "movie_embedding", "Movie", "embedding"));
 
     // Freshly registered → Ready with a zero watermark.
     assert_eq!(
@@ -118,7 +122,7 @@ fn health_tracks_state_and_freshness_watermark() {
 #[test]
 fn search_empty_index_returns_empty() {
     let reg = VectorIndexRegistry::new();
-    let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
+    let def = hnsw(1, "movie_embedding", "Movie", "embedding");
     reg.register(def);
 
     let results = reg.search("Movie", "embedding", &[1.0, 0.0, 0.0], 10);
@@ -129,7 +133,7 @@ fn search_empty_index_returns_empty() {
 #[test]
 fn insert_and_search() {
     let reg = VectorIndexRegistry::new();
-    let def = IndexDefinition::hnsw("movie_embedding", "Movie", "embedding", test_config());
+    let def = hnsw(1, "movie_embedding", "Movie", "embedding");
     reg.register(def);
 
     // Insert vectors
@@ -151,24 +155,9 @@ fn insert_and_search() {
 #[test]
 fn indexes_for_label() {
     let reg = VectorIndexRegistry::new();
-    reg.register(IndexDefinition::hnsw(
-        "movie_embed",
-        "Movie",
-        "embedding",
-        test_config(),
-    ));
-    reg.register(IndexDefinition::hnsw(
-        "movie_thumb",
-        "Movie",
-        "thumbnail_vec",
-        test_config(),
-    ));
-    reg.register(IndexDefinition::hnsw(
-        "user_embed",
-        "User",
-        "embedding",
-        test_config(),
-    ));
+    reg.register(hnsw(1, "movie_embed", "Movie", "embedding"));
+    reg.register(hnsw(2, "movie_thumb", "Movie", "thumbnail_vec"));
+    reg.register(hnsw(3, "user_embed", "User", "embedding"));
 
     let movie_idxs = reg.indexes_for_label("Movie");
     assert_eq!(movie_idxs.len(), 2);
@@ -180,12 +169,7 @@ fn indexes_for_label() {
 #[test]
 fn unregister() {
     let reg = VectorIndexRegistry::new();
-    reg.register(IndexDefinition::hnsw(
-        "movie_embed",
-        "Movie",
-        "embedding",
-        test_config(),
-    ));
+    reg.register(hnsw(1, "movie_embed", "Movie", "embedding"));
     assert!(reg.has_index("Movie", "embedding"));
 
     reg.unregister("Movie", "embedding");
@@ -204,7 +188,7 @@ fn no_index_search_returns_none() {
 fn register_sharded_marks_label_sharded() {
     let reg = VectorIndexRegistry::new();
     reg.register_sharded(
-        IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+        hnsw(1, "emb", "Doc", "embedding"),
         Arc::new(TwoPartitionRouter),
     );
     assert!(reg.is_sharded("Doc", "embedding"));
@@ -222,12 +206,7 @@ fn register_sharded_marks_label_sharded() {
 #[test]
 fn unsharded_register_is_not_sharded() {
     let reg = VectorIndexRegistry::new();
-    reg.register(IndexDefinition::hnsw(
-        "emb",
-        "Doc",
-        "embedding",
-        test_config(),
-    ));
+    reg.register(hnsw(1, "emb", "Doc", "embedding"));
     assert!(!reg.is_sharded("Doc", "embedding"));
     assert!(reg.get("Doc", "embedding").is_some());
 }
@@ -245,18 +224,13 @@ fn sharded_search_matches_single_index_top1() {
 
     // Single-index baseline.
     let single = VectorIndexRegistry::new();
-    single.register(IndexDefinition::hnsw(
-        "emb",
-        "Doc",
-        "embedding",
-        test_config(),
-    ));
+    single.register(hnsw(1, "emb", "Doc", "embedding"));
     single.bulk_insert("Doc", "embedding", vectors.iter().cloned());
 
     // Sharded index, 2 partitions split on the first-coord sign.
     let sharded = VectorIndexRegistry::new();
     sharded.register_sharded(
-        IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+        hnsw(1, "emb", "Doc", "embedding"),
         Arc::new(TwoPartitionRouter),
     );
     sharded.bulk_insert("Doc", "embedding", vectors.iter().cloned());
@@ -276,7 +250,7 @@ fn sharded_search_matches_single_index_top1() {
 fn sharded_dedup_replicated_boundary_id() {
     let reg = VectorIndexRegistry::new();
     reg.register_sharded(
-        IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+        hnsw(1, "emb", "Doc", "embedding"),
         Arc::new(TwoPartitionRouter),
     );
     // id 7 sits on the boundary (|x| < 0.5) -> replicated into BOTH
@@ -299,7 +273,7 @@ fn sharded_dedup_replicated_boundary_id() {
 fn sharded_search_with_visibility_filters_hidden_ids() {
     let reg = VectorIndexRegistry::new();
     reg.register_sharded(
-        IndexDefinition::hnsw("emb", "Doc", "embedding", test_config()),
+        hnsw(1, "emb", "Doc", "embedding"),
         Arc::new(TwoPartitionRouter),
     );
     reg.bulk_insert(

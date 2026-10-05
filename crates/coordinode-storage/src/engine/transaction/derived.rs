@@ -11,6 +11,7 @@
 use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
+use coordinode_core::index::identity::GenerationId;
 use coordinode_core::txn::proposal::{
     DerivedIndexWork, DerivedSource, IndexBinding, Mutation, PartitionId,
 };
@@ -33,7 +34,7 @@ struct Change {
 pub(crate) struct DerivedLedger {
     /// In the order each (index, owner) was first changed.
     changes: Vec<Change>,
-    by_target: FxHashMap<(String, EntryOwner), usize>,
+    by_target: FxHashMap<(GenerationId, EntryOwner), usize>,
     /// The index-partition keys staged for DERIVED indexes.
     keys: FxHashSet<Vec<u8>>,
     /// The index definitions this transaction's effects are bound to, in
@@ -62,7 +63,7 @@ impl DerivedLedger {
             self.staged_effects += 1;
             self.keys.insert(key);
         }
-        let target = (binding.interpretation.name.clone(), owner);
+        let target = (binding.interpretation.generation, owner);
         match self.by_target.get(&target) {
             Some(&at) => self.changes[at].new = new,
             None => {

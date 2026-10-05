@@ -5,8 +5,7 @@
 //! [`coordinode_modality::IndexStore`]), so it commits, replicates and rolls
 //! back with the data it indexes.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Arc;
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
@@ -15,23 +14,59 @@ use coordinode_modality::{IndexStore as _, LocalIndexStore, StoreError};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
+use rustc_hash::FxHashMap;
 
-use super::definition::{IndexDefinition, IndexType};
+use super::definition::{IndexDefinition, IndexId, IndexType};
 
-/// Registry of active B-tree indexes.
+/// Registry of active indexes.
 ///
 /// Interior mutability lets DDL executed inside a statement update the live
 /// registry through the shared reference the execution context holds.
 pub struct IndexRegistry {
-    /// Active indexes: name → definition.
-    indexes: RwLock<HashMap<String, Registered>>,
+    indexes: parking_lot::RwLock<Catalog>,
+}
+
+/// The indexes in force, by identity, and the names that bind them.
+#[derive(Default)]
+struct Catalog {
+    by_id: FxHashMap<IndexId, Registered>,
+    by_name: FxHashMap<String, IndexId>,
+}
+
+impl Catalog {
+    fn insert(&mut self, registered: Registered) {
+        let id = registered.def.id;
+        if let Some(old) = self.by_id.insert(id, registered) {
+            self.unbind(&old.def);
+        }
+        if let Some(name) = &self.by_id[&id].def.name {
+            self.by_name.insert(name.clone(), id);
+        }
+    }
+
+    fn remove(&mut self, id: IndexId) {
+        if let Some(old) = self.by_id.remove(&id) {
+            self.unbind(&old.def);
+        }
+    }
+
+    /// Drop `def`'s name binding while it is still `def`'s.
+    fn unbind(&mut self, def: &IndexDefinition) {
+        if let Some(name) = &def.name {
+            if self.by_name.get(name) == Some(&def.id) {
+                self.by_name.remove(name);
+            }
+        }
+    }
 }
 
 /// A definition in force, with the version of its stored record when this
 /// member read it; `None` for one registered without a stored record.
+/// Shared, so the maintenance a write runs takes the definitions it needs
+/// without copying them.
 #[derive(Debug, Clone)]
 struct Registered {
-    def: IndexDefinition,
+    def: Arc<IndexDefinition>,
     version: Option<u64>,
 }
 
@@ -126,7 +161,7 @@ impl UniqueViolation {
     /// The violation of `index` by `values`, held by `holder`.
     pub fn new(index: &IndexDefinition, values: &[Value], holder: NodeId) -> Self {
         Self {
-            index_name: index.name.clone(),
+            index_name: index.to_string(),
             property: index.properties.join(","),
             value: match values {
                 [one] => one.clone(),
@@ -179,7 +214,7 @@ impl IndexRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            indexes: RwLock::new(HashMap::new()),
+            indexes: parking_lot::RwLock::new(Catalog::default()),
         }
     }
 
@@ -210,18 +245,15 @@ impl IndexRegistry {
     }
 
     fn insert(&self, def: IndexDefinition, version: Option<u64>) {
-        self.indexes
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(def.name.clone(), Registered { def, version });
+        self.indexes.write().insert(Registered {
+            def: Arc::new(def),
+            version,
+        });
     }
 
-    /// Stop maintaining the index `name` in this process.
-    pub fn unregister(&self, name: &str) {
-        self.indexes
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
+    /// Stop maintaining the index `id` in this process.
+    pub fn unregister(&self, id: IndexId) {
+        self.indexes.write().remove(id);
     }
 
     /// Replace the active set with the definitions stored in the schema
@@ -230,15 +262,18 @@ impl IndexRegistry {
     /// every index; only B-tree indexes have entries maintained here.
     pub fn load_all(&self, engine: &StorageEngine) -> Result<(), StorageError> {
         let defs = super::ops::list_index_definitions(engine)?;
-        let mut loaded = HashMap::with_capacity(defs.len());
+        let mut loaded = Catalog::default();
         for def in defs {
             let version = engine.record_version(
                 coordinode_storage::engine::partition::Partition::Schema,
                 &def.schema_key(),
             )?;
-            loaded.insert(def.name.clone(), Registered { def, version });
+            loaded.insert(Registered {
+                def: Arc::new(def),
+                version,
+            });
         }
-        *self.indexes.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+        *self.indexes.write() = loaded;
         Ok(())
     }
 
@@ -247,7 +282,7 @@ impl IndexRegistry {
     fn btree_for_label(&self, label: &str) -> Vec<Registered> {
         self.indexes
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .by_id
             .values()
             .filter(|r| r.def.label == label && r.def.index_type == IndexType::BTree)
             .cloned()
@@ -258,10 +293,10 @@ impl IndexRegistry {
     fn defs_where(&self, keep: impl Fn(&IndexDefinition) -> bool) -> Vec<IndexDefinition> {
         self.indexes
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .by_id
             .values()
             .filter(|r| keep(&r.def))
-            .map(|r| r.def.clone())
+            .map(|r| IndexDefinition::clone(&r.def))
             .collect()
     }
 
@@ -275,13 +310,23 @@ impl IndexRegistry {
         self.defs_where(|idx| idx.label == label && idx.properties.iter().any(|p| p == property))
     }
 
-    /// Get an index by name (returns owned clone).
+    /// The index the name `name` binds (owned clone).
     pub fn get(&self, name: &str) -> Option<IndexDefinition> {
+        let catalog = self.indexes.read();
+        let id = catalog.by_name.get(name)?;
+        catalog
+            .by_id
+            .get(id)
+            .map(|r| IndexDefinition::clone(&r.def))
+    }
+
+    /// The index `id` (owned clone).
+    pub fn get_by_id(&self, id: IndexId) -> Option<IndexDefinition> {
         self.indexes
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .map(|r| r.def.clone())
+            .by_id
+            .get(&id)
+            .map(|r| IndexDefinition::clone(&r.def))
     }
 
     /// Every active index (owned clones).
@@ -305,7 +350,7 @@ impl IndexRegistry {
     pub fn has_indexes_for(&self, label: &str) -> bool {
         self.indexes
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .by_id
             .values()
             .any(|r| r.def.label == label)
     }
@@ -315,22 +360,19 @@ impl IndexRegistry {
     pub fn has_btree_for(&self, label: &str) -> bool {
         self.indexes
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .by_id
             .values()
             .any(|r| r.def.label == label && r.def.index_type == IndexType::BTree)
     }
 
     /// Number of registered indexes.
     pub fn len(&self) -> usize {
-        self.indexes.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.indexes.read().by_id.len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.indexes
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        self.indexes.read().by_id.is_empty()
     }
 
     /// Stage the entries of a node being created. A unique value another

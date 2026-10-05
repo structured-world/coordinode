@@ -399,7 +399,7 @@ impl Database {
                         backing_index: indexes
                             .iter()
                             .find(|d| d.owner.as_deref() == Some(constraint.name.as_str()))
-                            .map(|d| d.name.clone()),
+                            .and_then(|d| d.name.clone()),
                         constraint: constraint.clone(),
                     })
                     .collect::<Vec<_>>()

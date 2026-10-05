@@ -3480,6 +3480,32 @@ impl StorageEngine {
             .map(|e| e.key.seqno))
     }
 
+    /// A record's latest value together with its [`Self::record_version`],
+    /// both of one write: what a read-modify-write states as its condition.
+    /// Reading the value and the version separately could pair a version
+    /// with an older value when a commit lands between the two reads, and a
+    /// write conditioned on that version would then pass on stale data.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::record_version`].
+    pub fn get_versioned(
+        &self,
+        part: Partition,
+        key: &[u8],
+    ) -> StorageResult<Option<(bytes::Bytes, lsm_tree::SeqNo)>> {
+        let Some(version) = self.record_version(part, key)? else {
+            return Ok(None);
+        };
+        // The value of exactly that write: a snapshot just past it sees it
+        // and nothing newer. A committed version is a commit timestamp,
+        // never the read-latest sentinel, so the step does not overflow.
+        let tree = self.tree(part)?;
+        Ok(tree
+            .get(key, version + 1)?
+            .map(|value| (bytes::Bytes::copy_from_slice(&value), version)))
+    }
+
     /// Whether `key` was written by anything this snapshot does not already
     /// include.
     ///

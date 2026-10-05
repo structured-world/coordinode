@@ -128,10 +128,13 @@ fn no_missing_index_different_variable() {
 /// Index exists for (label, property) → no MissingIndex suggestion.
 #[test]
 fn no_missing_index_when_index_exists() {
-    use crate::index::{IndexDefinition, IndexRegistry};
+    use crate::index::{GenerationId, IndexDescriptor, IndexId, IndexRegistry};
 
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_email", "User", "email"));
+    reg.register_in_memory(
+        IndexDescriptor::btree("user_email", "User", "email")
+            .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+    );
 
     let p = plan(filter(node_scan("n", "User"), prop_eq("n", "email")));
     let suggestions = detect_suggestions(&p, Some(&reg));
@@ -148,10 +151,13 @@ fn no_missing_index_when_index_exists() {
 /// Index exists for different property → still suggests for the unindexed one.
 #[test]
 fn missing_index_for_unindexed_property() {
-    use crate::index::{IndexDefinition, IndexRegistry};
+    use crate::index::{GenerationId, IndexDescriptor, IndexId, IndexRegistry};
 
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("user_name", "User", "name"));
+    reg.register_in_memory(
+        IndexDescriptor::btree("user_name", "User", "name")
+            .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+    );
 
     // Filtering on "email" which is NOT indexed (only "name" is)
     let p = plan(filter(node_scan("n", "User"), prop_eq("n", "email")));
@@ -165,10 +171,13 @@ fn missing_index_for_unindexed_property() {
 /// Index for different label → still suggests (no cross-label suppression).
 #[test]
 fn missing_index_different_label() {
-    use crate::index::{IndexDefinition, IndexRegistry};
+    use crate::index::{GenerationId, IndexDescriptor, IndexId, IndexRegistry};
 
     let reg = IndexRegistry::new();
-    reg.register_in_memory(IndexDefinition::btree("post_title", "Post", "email"));
+    reg.register_in_memory(
+        IndexDescriptor::btree("post_title", "Post", "email")
+            .bind(IndexId::from_raw(1), GenerationId::from_raw(1)),
+    );
 
     // Filtering User.email but only Post.email is indexed
     let p = plan(filter(node_scan("n", "User"), prop_eq("n", "email")));

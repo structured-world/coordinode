@@ -1038,19 +1038,15 @@ pub(crate) async fn serve(
                 let db2 = Arc::clone(&db);
                 match tokio::task::spawn_blocking(move || {
                     let db = db2.read();
-                    let rebuilt = db.rebuild_legacy_btree_indexes()?;
                     let resumed = db.resume_interrupted_index_builds()?;
-                    // After the rebuild: an index of an earlier release is
-                    // ready, in the current layout, before it is adopted.
+                    // After the builds: an index is ready before it is
+                    // adopted.
                     db.adopt_unowned_unique_indexes()
-                        .map(|adopted| (rebuilt, resumed, adopted))
+                        .map(|adopted| (resumed, adopted))
                 })
                 .await
                 {
-                    Ok(Ok((rebuilt, resumed, adopted))) => {
-                        if rebuilt > 0 {
-                            tracing::info!(rebuilt, "B-tree indexes rebuilt in the current layout");
-                        }
+                    Ok(Ok((resumed, adopted))) => {
                         if resumed > 0 {
                             tracing::info!(resumed, "interrupted B-tree index builds finished");
                         }

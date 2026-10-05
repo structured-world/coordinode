@@ -12,7 +12,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use coordinode_vector::health::HealthSignal;
 
 use super::{BuildOutcome, BuildTarget, VectorBuild};
-use crate::index::{IndexDefinition, VectorIndexConfig, VectorIndexRegistry};
+use crate::index::{VectorIndexConfig, VectorIndexRegistry};
 
 struct Fixture {
     engine: Arc<StorageEngine>,
@@ -42,21 +42,27 @@ fn fixture() -> Fixture {
         .expect("open engine"),
     );
     let registry = VectorIndexRegistry::new();
-    registry.register(IndexDefinition::hnsw(
-        "emb",
-        "Doc",
-        "embedding",
-        VectorIndexConfig {
-            dimensions: 3,
-            metric: coordinode_core::graph::types::VectorMetric::Cosine,
-            m: 16,
-            ef_construction: 200,
-            quantization: coordinode_vector::hnsw::QuantizationCodec::None,
-            offload_vectors: false,
-            ef_search: None,
-            rerank_candidates: None,
-        },
-    ));
+    registry.register(
+        crate::index::IndexDescriptor::hnsw(
+            "emb",
+            "Doc",
+            "embedding",
+            VectorIndexConfig {
+                dimensions: 3,
+                metric: coordinode_core::graph::types::VectorMetric::Cosine,
+                m: 16,
+                ef_construction: 200,
+                quantization: coordinode_vector::hnsw::QuantizationCodec::None,
+                offload_vectors: false,
+                ef_search: None,
+                rerank_candidates: None,
+            },
+        )
+        .bind(
+            crate::index::IndexId::from_raw(1),
+            crate::index::GenerationId::from_raw(1),
+        ),
+    );
     registry
         .health_handle("Doc", "embedding")
         .expect("health")
@@ -457,7 +463,7 @@ fn one_build_fills_every_index_of_the_shard() {
     assert_eq!(interner.intern("embedding"), fx.field);
     let pixels = interner.intern("pixels");
     fx.registry.register_for_build(
-        IndexDefinition::hnsw(
+        crate::index::IndexDescriptor::hnsw(
             "img",
             "Img",
             "pixels",
@@ -471,6 +477,10 @@ fn one_build_fills_every_index_of_the_shard() {
                 ef_search: None,
                 rerank_candidates: None,
             },
+        )
+        .bind(
+            crate::index::IndexId::from_raw(2),
+            crate::index::GenerationId::from_raw(2),
         ),
         None,
     );

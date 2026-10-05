@@ -17,7 +17,7 @@ fn binding() -> IndexBinding {
         epoch: 1,
         interpretation: IndexInterpretation {
             codec: KEY_CODEC,
-            name: "user_email".into(),
+            generation: GenerationId::from_raw(1),
             unique: false,
             sparse: false,
             properties: vec![PropertyRef {
