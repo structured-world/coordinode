@@ -516,6 +516,8 @@ struct StreamState {
 /// ends, or the log no longer holds what the stream needs. Leaving does not
 /// end the registration: the client resumes it.
 async fn stream_consumer(mut s: StreamState) {
+    // Counted while this task runs, whichever way it ends.
+    let _open = OpenStream::count(&s.delivery);
     loop {
         // Client cancelled (channel closed).
         if s.delivery.is_closed() {
@@ -659,6 +661,27 @@ async fn stream_consumer(mut s: StreamState) {
                 },
             }
         }
+    }
+}
+
+/// One open change stream in `coordinode_subscription_active`, labelled by
+/// how its events are delivered; released when the stream's task ends.
+struct OpenStream(&'static str);
+
+impl OpenStream {
+    fn count(delivery: &Delivery) -> Self {
+        let transport = match delivery {
+            Delivery::Stream { .. } => "stream",
+            Delivery::Session { .. } => "session",
+        };
+        metrics::gauge!("coordinode_subscription_active", "transport" => transport).increment(1.0);
+        Self(transport)
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        metrics::gauge!("coordinode_subscription_active", "transport" => self.0).decrement(1.0);
     }
 }
 

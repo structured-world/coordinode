@@ -86,9 +86,14 @@ where
     }
 
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        // The gRPC method is the request path, `/package.Service/Method`: a
+        // label of bounded cardinality, one per registered method.
+        let method = req.uri().path().to_owned();
         NodeInfoFuture {
             inner: self.inner.call(req),
             node_id: self.node_id,
+            method,
+            started: std::time::Instant::now(),
         }
     }
 }
@@ -101,6 +106,8 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: F,
         node_id: u64,
+        method: String,
+        started: std::time::Instant,
     }
 }
 
@@ -133,6 +140,29 @@ where
                     http::header::HeaderName::from_static(HEADER_LOAD),
                     http::HeaderValue::from_static("0"),
                 );
+
+                // A call is counted when its response starts: for a stream
+                // the duration is the time to its first frame, not its life.
+                // A refused call is answered with headers only and carries
+                // its code there (gRPC over HTTP/2, "Trailers-Only").
+                let method = std::mem::take(this.method);
+                metrics::histogram!("coordinode_grpc_duration_seconds", "method" => method.clone())
+                    .record(this.started.elapsed().as_secs_f64());
+                if let Some(code) = response
+                    .headers()
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|code| *code != "0")
+                {
+                    metrics::counter!(
+                        "coordinode_grpc_errors_total",
+                        "method" => method.clone(),
+                        "code" => code.to_owned()
+                    )
+                    .increment(1);
+                }
+                metrics::counter!("coordinode_grpc_requests_total", "method" => method)
+                    .increment(1);
 
                 Poll::Ready(Ok(response))
             }

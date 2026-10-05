@@ -169,10 +169,10 @@ fn register_query_metrics() {
         "Documents in tantivy index"
     );
 
-    // GraphQL subscriptions
+    // Change-stream subscriptions
     metrics::describe_gauge!(
         "coordinode_subscription_active",
-        "Active GraphQL subscriptions"
+        "Open change streams, by transport (stream: the change-stream RPC, session: a Session subscription)"
     );
 }
 

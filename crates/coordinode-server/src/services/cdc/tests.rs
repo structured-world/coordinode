@@ -212,6 +212,60 @@ async fn a_stream_registers_a_consumer_that_outlives_the_connection() {
     );
 }
 
+/// An open change stream is counted in `coordinode_subscription_active` under
+/// its transport while it runs, and no longer once the client has left.
+#[test]
+fn an_open_stream_is_counted_until_its_client_leaves() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let open = |text: &str| -> Option<String> {
+        text.lines()
+            .find(|l| l.starts_with(r#"coordinode_subscription_active{transport="stream"}"#))
+            .map(|l| l.rsplit(' ').next().unwrap_or_default().to_string())
+    };
+    metrics::with_local_recorder(&recorder, || {
+        // One thread, so the stream's spawned task records into this
+        // thread's recorder.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let oplog_dir = tempfile::tempdir().expect("oplog dir");
+            let f = fixture(
+                vec![oplog_dir.path().to_path_buf()],
+                empty_log(oplog_dir.path()),
+                Arc::new(|| 0),
+                None,
+                RegistryTuning::default(),
+            );
+            let response = f
+                .service
+                .subscribe(Request::new(register("sink", strict())))
+                .await
+                .expect("subscribe");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while open(&handle.render()).as_deref() != Some("1") {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{}",
+                    handle.render()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(response);
+            while open(&handle.render()).as_deref() != Some("0") {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{}",
+                    handle.render()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    });
+}
+
 /// Requests a stream cannot serve are refused up front, and nothing is left
 /// registered for them.
 #[tokio::test(flavor = "multi_thread")]
