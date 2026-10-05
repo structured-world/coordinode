@@ -15,8 +15,11 @@ publish.workspace = true
 [dependencies]
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
+tonic-types = { workspace = true }
 prost = "0.14"
 tokio = { workspace = true }
+tokio-stream = "0.1"
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 [build-dependencies]

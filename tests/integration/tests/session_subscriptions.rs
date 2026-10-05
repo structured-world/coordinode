@@ -279,6 +279,76 @@ async fn acknowledging_and_cancelling_ride_the_session() {
     }
 }
 
+/// The driver's subscription drains a backlog larger than its window by
+/// granting credit as batches are taken, and a subscription resumed after an
+/// acknowledgement starts right past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_driver_drains_and_resumes_after_its_acknowledgement() {
+    use coordinode_client::{CoordinodeClient, Retention, SubscribeOptions};
+
+    let proc = CoordinodeProcess::start().await;
+    let mut client = CoordinodeClient::connect(proc.endpoint())
+        .await
+        .expect("connect");
+    for i in 0..20 {
+        client
+            .execute_cypher(format!("CREATE (:Item {{n: {i}}})"))
+            .await
+            .expect("write");
+    }
+    let node_inserts = |events: &[coordinode_client::ChangeEvent]| {
+        events
+            .iter()
+            .flat_map(|e| &e.ops)
+            .filter(|op| {
+                op.kind == coordinode_client::ChangeKind::Insert
+                    && op.key.len() == 16
+                    && op.key.starts_with(b"node:")
+            })
+            .count()
+    };
+
+    let mut sub = client
+        .subscribe(SubscribeOptions::register("driver", Retention::Strict).window(4))
+        .await
+        .expect("subscribe");
+    let incarnation = sub.incarnation();
+    let mut seen = Vec::new();
+    while node_inserts(&seen) < 20 {
+        let batch = tokio::time::timeout(Duration::from_secs(10), sub.next())
+            .await
+            .expect("the backlog drains")
+            .expect("a batch")
+            .expect("session open");
+        assert!(batch.len() <= 4, "a batch within the window");
+        seen.extend(batch);
+    }
+    let last = seen.last().expect("events").position;
+    sub.acknowledge(last).await.expect("acknowledge");
+    drop(sub);
+
+    client
+        .execute_cypher("CREATE (:Item {n: 20})")
+        .await
+        .expect("write after");
+    let mut resumed = client
+        .subscribe(SubscribeOptions::resume("driver", incarnation))
+        .await
+        .expect("resume");
+    let batch = tokio::time::timeout(Duration::from_secs(10), resumed.next())
+        .await
+        .expect("the new write arrives")
+        .expect("a batch")
+        .expect("session open");
+    assert!(
+        batch
+            .iter()
+            .all(|e| e.log_index > seen.last().expect("seen").log_index),
+        "resumed past the acknowledged position"
+    );
+    resumed.cancel_registration().await.expect("cancel");
+}
+
 /// Cancelling a subscription's request ends only its delivery: the
 /// registration stays, and a later session resumes its incarnation.
 #[tokio::test(flavor = "multi_thread")]

@@ -61,6 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(false)
         .build_client(true)
+        // The canonical error model, tonic-types' own google.rpc.Status.
+        .extern_path(".google.rpc", "::tonic_types::pb")
         .compile_protos(
             &[
                 // Graph types referenced by query protos
@@ -74,6 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_root_str}/coordinode/v1/query/cypher.proto"),
                 format!("{proto_root_str}/coordinode/v1/query/vector.proto"),
                 format!("{proto_root_str}/coordinode/v1/query/text.proto"),
+                // The persistent session: queries, transactions and change
+                // stream subscriptions on one stream.
+                format!("{proto_root_str}/coordinode/v1/replication/cdc.proto"),
+                format!("{proto_root_str}/coordinode/v1/session/session.proto"),
             ],
             &includes,
         )?;

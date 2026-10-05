@@ -858,13 +858,16 @@ dependencies = [
 name = "coordinode-client"
 version = "0.6.0"
 dependencies = [
+ "parking_lot",
  "prost",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tonic-types",
 ]
 
 [[package]]

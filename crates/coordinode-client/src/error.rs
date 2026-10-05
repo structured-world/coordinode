@@ -17,6 +17,16 @@ pub enum ClientError {
     #[error("gRPC error {}: {}", .0.code(), .0.message())]
     Grpc(#[from] tonic::Status),
 
+    /// The persistent session to the server ended; a new request opens a new
+    /// one.
+    #[error("the session to the server ended")]
+    SessionClosed,
+
+    /// The server answered a session request with something other than what
+    /// the request expects.
+    #[error("unexpected session answer: {0}")]
+    UnexpectedAnswer(String),
+
     /// Source-tracking metadata value contained characters invalid for HTTP/2
     /// header values. This is always a bug in the driver — file paths and line
     /// numbers should always be ASCII-clean.
