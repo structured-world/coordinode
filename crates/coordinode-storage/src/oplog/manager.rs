@@ -382,9 +382,21 @@ impl OplogManager {
             0 => 0,
             n => n - 1,
         };
-        for (first_idx, path) in &self.sealed[start..] {
+        let active_first = self
+            .current
+            .as_ref()
+            .and_then(SegmentWriter::first_entry_index);
+        for (n, (first_idx, path)) in self.sealed.iter().enumerate().skip(start) {
             if *first_idx >= to_index {
                 break;
+            }
+            // A segment ends where the next one begins. One that ends at or
+            // before `from_index` holds nothing of the range, and opening it
+            // would decode and checksum all of it: the last sealed segment,
+            // on every read of the active tail.
+            let next_first = self.sealed.get(n + 1).map(|&(i, _)| i).or(active_first);
+            if next_first.is_some_and(|end| end <= from_index) {
+                continue;
             }
 
             let reader = SegmentReader::open(path)?;

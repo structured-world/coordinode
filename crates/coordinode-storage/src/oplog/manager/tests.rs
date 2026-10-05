@@ -166,6 +166,34 @@ fn read_range_spans_sealed_and_active_segments() {
     assert!(mgr.read_range(30, 40).expect("past the end").is_empty());
 }
 
+/// A read of the active segment's entries opens no sealed segment: the last
+/// sealed one ends where the active one begins. Its file is removed here, so
+/// a read that opened it fails.
+#[test]
+fn a_read_of_the_active_tail_opens_no_sealed_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut mgr = test_manager(dir.path());
+    for i in 0..10u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+    }
+    mgr.rotate().expect("rotate");
+    for i in 10..15u64 {
+        mgr.append(&make_entry(i, 3000 + i)).expect("append");
+    }
+    let (_, sealed) = mgr.sealed.last().expect("a sealed segment").clone();
+    std::fs::remove_file(&sealed).expect("remove the sealed segment");
+
+    let indexes = |v: Vec<OplogEntry>| v.iter().map(|e| e.index).collect::<Vec<_>>();
+    assert_eq!(
+        indexes(mgr.read_range(10, u64::MAX).expect("the active tail")),
+        (10..15).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        indexes(mgr.read_range(12, 14).expect("inside the active segment")),
+        vec![12, 13]
+    );
+}
+
 /// The sync method the manager is given is the one each new segment uses,
 /// across a rotation too; unset, it is the full flush.
 #[test]
