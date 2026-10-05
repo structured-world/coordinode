@@ -229,13 +229,20 @@ impl<'a> WriteBatch<'a> {
     /// before it gets here, so the error marks a bug upstream, never a
     /// silent overwrite.
     pub(crate) fn commit_at(self, seqno: lsm_tree::SeqNo) -> StorageResult<()> {
-        self.commit_covered(seqno, None)
+        self.commit_covered(seqno, None)?;
+        // The engine's read point includes `seqno` once it was allocated, so
+        // the writes are visible now.
+        self.forget_cached();
+        Ok(())
     }
 
     /// [`Self::commit_at`] that also writes the coverage marker `cover` into
-    /// every partition the batch touches, atomically with its effects.
+    /// every partition the batch touches, atomically with its effects. The
+    /// tiered cache is left as it was: the caller calls
+    /// [`forget_cached`](Self::forget_cached) once the writes are visible to
+    /// reads, or a read between the two could cache what they replaced.
     pub(crate) fn commit_covered(
-        self,
+        &self,
         seqno: lsm_tree::SeqNo,
         cover: Option<coverage::Mark>,
     ) -> StorageResult<()> {
@@ -251,7 +258,7 @@ impl<'a> WriteBatch<'a> {
         // partitions), not O(mutations).
         let mut checked: std::collections::HashSet<Partition> =
             std::collections::HashSet::with_capacity(Partition::all().len());
-        for m in &mutations {
+        for m in mutations {
             let part = m.partition();
             if checked.insert(part) {
                 engine.check_partition_capacity(part)?;
@@ -263,7 +270,7 @@ impl<'a> WriteBatch<'a> {
         // staged.
         let mut groups: HashMap<Partition, Vec<&Mutation>> =
             HashMap::with_capacity(Partition::all().len());
-        for m in &mutations {
+        for m in mutations {
             groups.entry(m.partition()).or_default().push(m);
         }
 
@@ -277,21 +284,24 @@ impl<'a> WriteBatch<'a> {
             }
         }
 
-        // Invalidate cache for all mutated keys to prevent stale reads. A range
-        // tombstone leaves the shadowed keys physically present, so the whole
-        // partition's cache goes.
-        if let Some(cache) = engine.tiered_cache() {
-            for mutation in &mutations {
-                match mutation {
-                    Mutation::Put { partition, key, .. }
-                    | Mutation::Delete { partition, key }
-                    | Mutation::Merge { partition, key, .. } => cache.remove(*partition, key),
-                    Mutation::RemoveRange { partition, .. } => cache.clear_partition(*partition),
-                }
+        Ok(())
+    }
+
+    /// Invalidate the tiered cache for every key the batch wrote. Call once
+    /// the writes are visible to reads. A range tombstone leaves the shadowed
+    /// keys physically present, so the whole partition's cache goes.
+    pub(crate) fn forget_cached(&self) {
+        let Some(cache) = self.engine.tiered_cache() else {
+            return;
+        };
+        for mutation in &self.mutations {
+            match mutation {
+                Mutation::Put { partition, key, .. }
+                | Mutation::Delete { partition, key }
+                | Mutation::Merge { partition, key, .. } => cache.remove(*partition, key),
+                Mutation::RemoveRange { partition, .. } => cache.clear_partition(*partition),
             }
         }
-
-        Ok(())
     }
 }
 

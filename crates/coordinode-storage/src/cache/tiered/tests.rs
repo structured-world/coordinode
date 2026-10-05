@@ -124,8 +124,10 @@ fn single_layer_partitions_isolated() {
     );
 }
 
+/// A reopened layer is empty: its file holds puts but not the invalidations
+/// that followed them, so nothing in it can be served as current.
 #[test]
-fn single_layer_survives_reopen() {
+fn a_reopened_layer_starts_cold() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = one_layer_config(dir.path(), 1024 * 1024);
 
@@ -133,13 +135,61 @@ fn single_layer_survives_reopen() {
         let cache = TieredCache::open(&config).expect("open");
         cache.put(Partition::Node, b"k", b"v");
     }
-    {
-        let cache = TieredCache::open(&config).expect("reopen");
-        assert_eq!(
-            cache.get(Partition::Node, b"k").as_deref(),
-            Some(b"v".as_slice())
-        );
+    let cache = TieredCache::open(&config).expect("reopen");
+    assert!(cache.get(Partition::Node, b"k").is_none());
+    assert!(cache.is_empty());
+}
+
+/// A value read before an invalidation and cached after it is not served:
+/// the read was of what the invalidating write replaced.
+#[test]
+fn a_fill_read_before_an_invalidation_is_not_served() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = TieredCache::open(&one_layer_config(dir.path(), 1024 * 1024)).expect("open");
+
+    let ticket = cache.ticket(Partition::Node, b"k");
+    cache.remove(Partition::Node, b"k");
+    cache.fill(Partition::Node, b"k", b"old", 1.0, ticket);
+    assert!(cache.get(Partition::Node, b"k").is_none());
+
+    let ticket = cache.ticket(Partition::Node, b"p");
+    cache.clear_partition(Partition::Node);
+    cache.fill(Partition::Node, b"p", b"old", 1.0, ticket);
+    assert!(cache.get(Partition::Node, b"p").is_none());
+
+    // A fill taken after the invalidation is served.
+    let ticket = cache.ticket(Partition::Node, b"k");
+    cache.fill(Partition::Node, b"k", b"new", 1.0, ticket);
+    assert_eq!(
+        cache.get(Partition::Node, b"k").as_deref(),
+        Some(&b"new"[..])
+    );
+}
+
+/// An entry that drained to a slower layer keeps the generations it was
+/// read under: an invalidation after it was read makes it stale there too.
+#[test]
+fn a_drained_entry_stays_bound_to_its_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = TieredCache::open(&two_layer_config(dir.path())).expect("open");
+
+    // The lowest weight: the first entry the fast layer evicts.
+    let ticket = cache.ticket(Partition::Node, b"key_0");
+    cache.fill(Partition::Node, b"key_0", &[7u8; 64], 0.1, ticket);
+    // Invalidated while cached, as by a write whose removal ran before the
+    // entry drained: the copy the drain writes must carry the old stamp.
+    cache
+        .key_generation(compute_cache_key(Partition::Node, b"key_0"))
+        .fetch_add(1, Ordering::SeqCst);
+    for i in 1..20 {
+        cache.put(Partition::Node, format!("key_{i}").as_bytes(), &[1u8; 64]);
     }
+    let slow = &cache.layers[1];
+    assert!(
+        slow.get(Partition::Node, b"key_0").is_some(),
+        "key_0 drained to the slow layer"
+    );
+    assert!(cache.get(Partition::Node, b"key_0").is_none());
 }
 
 #[test]

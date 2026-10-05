@@ -40,6 +40,11 @@ const MAGIC: &[u8; 4] = b"CNDC";
 const ENTRY_HEADER_SIZE: usize = 8 + 1 + 2 + 4; // key_hash + partition + key_len + value_len
 const MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024; // 16MB — skip blobs
 
+/// Bounds of the number of key stripes the invalidation generations are kept
+/// by: 32 KiB to 32 MiB of counters.
+const MIN_STRIPES: usize = 1 << 12;
+const MAX_STRIPES: usize = 1 << 22;
+
 // ── Per-layer statistics ──────────────────────────────────────────
 
 /// Statistics for a single cache layer.
@@ -78,6 +83,28 @@ struct EntryMeta {
     /// a partition-scoped invalidation (`clear_partition`, used by range delete)
     /// can filter the index without reading each backing entry.
     partition: u8,
+    /// The generations the value was read under; it is served only while
+    /// they are current.
+    stamp: FillTicket,
+}
+
+/// The invalidation generations of one key when its value was read from the
+/// trees: the generation of the key's stripe and of its partition. Taken
+/// before the read with [`TieredCache::ticket`] and stored with the cached
+/// value, which is served only while both are unchanged, so a value read
+/// before a write and cached after its invalidation is never served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillTicket {
+    key: u64,
+    partition: u64,
+}
+
+/// An entry evicted from a layer, on its way to the next one.
+struct Drained {
+    part: Partition,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    stamp: FillTicket,
 }
 
 // ── CacheLayer: single file-backed cache ──────────────────────────
@@ -105,49 +132,29 @@ impl CacheLayer {
             std::fs::create_dir_all(parent)?;
         }
 
-        let exists = config.path.exists();
+        // A layer starts empty: the file records puts but not the
+        // invalidations of the run that wrote it, so an entry found in it may
+        // be older than a write that followed, and nothing in the file says
+        // which. The cache is volatile by contract; a restart is a cold start.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
+            .truncate(true)
             .open(&config.path)?;
-
-        let mut index = HashMap::new();
-
-        let (file_bytes, live_bytes) = if exists && file.metadata()?.len() >= MAGIC.len() as u64 {
-            match Self::scan_file(&mut file, &mut index) {
-                Ok(result) => {
-                    info!(
-                        path = %config.path.display(),
-                        entries = index.len(),
-                        "cache layer recovered"
-                    );
-                    result
-                }
-                Err(e) => {
-                    warn!(path = %config.path.display(), error = %e, "cache layer corrupt, resetting");
-                    Self::reset_file(&mut file)?;
-                    index.clear();
-                    (MAGIC.len() as u64, 0)
-                }
-            }
-        } else {
-            file.write_all(MAGIC)?;
-            file.flush()?;
-            info!(path = %config.path.display(), "cache layer created");
-            (MAGIC.len() as u64, 0)
-        };
+        file.write_all(MAGIC)?;
+        file.flush()?;
+        info!(path = %config.path.display(), "cache layer opened empty");
 
         Ok(Self {
             path: config.path.clone(),
             file: Mutex::new(file),
-            index: RwLock::new(index),
+            index: RwLock::new(HashMap::new()),
             max_bytes: config.max_bytes,
             max_entries: config.max_entries,
             compaction_threshold: config.compaction_threshold,
-            file_bytes: AtomicU64::new(file_bytes),
-            live_bytes: AtomicU64::new(live_bytes),
+            file_bytes: AtomicU64::new(MAGIC.len() as u64),
+            live_bytes: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             puts: AtomicU64::new(0),
@@ -156,8 +163,8 @@ impl CacheLayer {
         })
     }
 
-    /// Read from this layer. Returns `Some(value)` on hit.
-    fn get(&self, part: Partition, key: &[u8]) -> Option<bytes::Bytes> {
+    /// Read from this layer: the value and the generations it was read under.
+    fn get(&self, part: Partition, key: &[u8]) -> Option<(bytes::Bytes, FillTicket)> {
         let cache_key = compute_cache_key(part, key);
 
         let meta = {
@@ -178,7 +185,7 @@ impl CacheLayer {
             Ok((read_part, read_key, value)) => {
                 if read_part == part && read_key == key {
                     self.hits.fetch_add(1, Ordering::Relaxed);
-                    Some(bytes::Bytes::from(value))
+                    Some((bytes::Bytes::from(value), meta.stamp))
                 } else {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     None
@@ -192,16 +199,18 @@ impl CacheLayer {
         }
     }
 
-    /// Write to this layer with a priority weight. Evicts if necessary,
-    /// returns evicted entries for drain-through to the next layer.
-    /// Higher weight = stays in cache longer during eviction.
+    /// Write to this layer with a priority weight and the generations the
+    /// value was read under. Evicts if necessary, returns evicted entries for
+    /// drain-through to the next layer. Higher weight = stays in cache longer
+    /// during eviction.
     fn put(
         &self,
         part: Partition,
         key: &[u8],
         value: &[u8],
         weight: f32,
-    ) -> Vec<(Partition, Vec<u8>, Vec<u8>)> {
+        stamp: FillTicket,
+    ) -> Vec<Drained> {
         if value.len() > MAX_ENTRY_BYTES {
             return Vec::new();
         }
@@ -245,6 +254,7 @@ impl CacheLayer {
             key_len: key.len() as u16,
             weight,
             partition: part as u8,
+            stamp,
         };
         idx.insert(cache_key, meta);
 
@@ -264,6 +274,18 @@ impl CacheLayer {
         if let Some(meta) = idx.remove(&cache_key) {
             self.live_bytes
                 .fetch_sub(u64::from(meta.total_size), Ordering::Relaxed);
+        }
+    }
+
+    /// Remove the entry of `cache_key` if it still carries `stamp`: a stale
+    /// entry found by a read, and not one a later fill put in its place.
+    fn remove_stale(&self, cache_key: CacheKey, stamp: FillTicket) {
+        let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
+        if idx.get(&cache_key).is_some_and(|meta| meta.stamp == stamp) {
+            if let Some(meta) = idx.remove(&cache_key) {
+                self.live_bytes
+                    .fetch_sub(u64::from(meta.total_size), Ordering::Relaxed);
+            }
         }
     }
 
@@ -366,8 +388,9 @@ impl CacheLayer {
 
     // ── Internal ──────────────────────────────────────────────────
 
-    /// Evict entries if over capacity. Returns evicted (part, key, value) for drain-through.
-    fn evict_if_needed(&self, incoming_bytes: u64) -> Vec<(Partition, Vec<u8>, Vec<u8>)> {
+    /// Evict entries if over capacity. Returns the evicted entries, each with
+    /// the generations it was read under, for drain-through.
+    fn evict_if_needed(&self, incoming_bytes: u64) -> Vec<Drained> {
         let current = self.live_bytes.load(Ordering::Relaxed);
         let entry_count = {
             let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
@@ -408,8 +431,13 @@ impl CacheLayer {
 
         for (key, meta) in &keys_to_remove {
             // Read entry data for drain-through before removing
-            if let Ok((part, entry_key, value)) = Self::read_entry(&mut file, meta) {
-                drained.push((part, entry_key, value));
+            if let Ok((part, key, value)) = Self::read_entry(&mut file, meta) {
+                drained.push(Drained {
+                    part,
+                    key,
+                    value,
+                    stamp: meta.stamp,
+                });
                 self.drains.fetch_add(1, Ordering::Relaxed);
             }
 
@@ -430,70 +458,6 @@ impl CacheLayer {
         );
 
         drained
-    }
-
-    fn scan_file(
-        file: &mut File,
-        index: &mut HashMap<CacheKey, EntryMeta>,
-    ) -> Result<(u64, u64), std::io::Error> {
-        file.seek(SeekFrom::Start(0))?;
-
-        let mut magic_buf = [0u8; 4];
-        file.read_exact(&mut magic_buf)?;
-        if &magic_buf != MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid cache magic",
-            ));
-        }
-
-        let file_len = file.metadata()?.len();
-        let mut offset = MAGIC.len() as u64;
-        let mut live_bytes: u64 = 0;
-
-        while offset + ENTRY_HEADER_SIZE as u64 <= file_len {
-            file.seek(SeekFrom::Start(offset))?;
-
-            let mut header = [0u8; ENTRY_HEADER_SIZE];
-            if file.read_exact(&mut header).is_err() {
-                break;
-            }
-
-            let cache_key = u64::from_le_bytes(header[0..8].try_into().unwrap_or([0; 8]));
-            let key_len = u16::from_le_bytes(header[9..11].try_into().unwrap_or([0; 2]));
-            let value_len = u32::from_le_bytes(header[11..15].try_into().unwrap_or([0; 4]));
-
-            let total_size = ENTRY_HEADER_SIZE as u32 + u32::from(key_len) + value_len;
-            let entry_end = offset + u64::from(total_size);
-
-            if entry_end > file_len {
-                break;
-            }
-
-            let meta = EntryMeta {
-                offset,
-                total_size,
-                value_size: value_len,
-                key_len,
-                weight: 1.0,          // Recovered entries use default weight
-                partition: header[8], // partition byte in the entry header
-            };
-
-            if let Some(old) = index.insert(cache_key, meta) {
-                live_bytes -= u64::from(old.total_size);
-            }
-            live_bytes += u64::from(total_size);
-            offset = entry_end;
-        }
-
-        Ok((offset, live_bytes))
-    }
-
-    fn reset_file(file: &mut File) -> Result<(), std::io::Error> {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(MAGIC)?;
-        file.flush()
     }
 
     fn write_entry(
@@ -570,6 +534,12 @@ pub struct TieredCache {
     compaction_thread: Option<std::thread::JoinHandle<()>>,
     /// Per-label eviction priority weights. Used by `resolve_weight()`.
     label_weights: Arc<HashMap<String, f32>>,
+    /// Invalidation generations by key stripe: bumped by every
+    /// [`remove`](Self::remove) of a key of the stripe, after its write.
+    key_generations: Box<[AtomicU64]>,
+    /// Invalidation generations by partition discriminant: bumped by
+    /// [`clear_partition`](Self::clear_partition).
+    partition_generations: Box<[AtomicU64]>,
 }
 
 impl Drop for TieredCache {
@@ -621,46 +591,94 @@ impl TieredCache {
             "tiered cache opened"
         );
 
+        // About one stripe per entry the layers hold, so a write invalidates
+        // about one unrelated entry; bounded both ways.
+        let entries: usize = config.layers.iter().map(|l| l.max_entries).sum();
+        let stripes = entries.next_power_of_two().clamp(MIN_STRIPES, MAX_STRIPES);
         Ok(Self {
             layers,
             shutdown,
             wake,
             compaction_thread,
             label_weights,
+            key_generations: (0..stripes).map(|_| AtomicU64::new(0)).collect(),
+            partition_generations: (0..=usize::from(u8::MAX))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
         })
     }
 
-    /// Read from the tiered cache, cascading through layers.
+    /// The generations of `part`/`key` now. A value read from the trees is
+    /// cached with the ticket taken BEFORE the read: a write whose
+    /// invalidation follows the ticket then makes the cached value stale.
+    pub fn ticket(&self, part: Partition, key: &[u8]) -> FillTicket {
+        self.ticket_of(compute_cache_key(part, key), part)
+    }
+
+    fn ticket_of(&self, cache_key: CacheKey, part: Partition) -> FillTicket {
+        FillTicket {
+            key: self.key_generation(cache_key).load(Ordering::SeqCst),
+            partition: self.partition_generations[usize::from(part as u8)].load(Ordering::SeqCst),
+        }
+    }
+
+    fn key_generation(&self, cache_key: CacheKey) -> &AtomicU64 {
+        // The stripe count is a power of two, and the cache key a hash.
+        #[allow(clippy::cast_possible_truncation)]
+        let stripe = (cache_key as usize) & (self.key_generations.len() - 1);
+        &self.key_generations[stripe]
+    }
+
+    /// Read from the tiered cache, cascading through layers. An entry read
+    /// before an invalidation that followed it is a miss.
     ///
     /// On hit at layer N, the value is promoted to layer 0 (if N > 0)
     /// for faster future access.
     pub fn get(&self, part: Partition, key: &[u8]) -> Option<bytes::Bytes> {
+        let cache_key = compute_cache_key(part, key);
         for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(value) = layer.get(part, key) {
-                // Promote to faster layer on hit at deeper layer
-                if i > 0 {
-                    self.layers[0].put(part, key, &value, 1.0);
-                }
-                return Some(value);
+            let Some((value, stamp)) = layer.get(part, key) else {
+                continue;
+            };
+            // Checked after the read: an invalidation the entry predates is
+            // seen here even when it landed after the entry was found.
+            if stamp != self.ticket_of(cache_key, part) {
+                layer.remove_stale(cache_key, stamp);
+                continue;
             }
+            // Promote to faster layer on hit at deeper layer, still under
+            // the generations it was read under.
+            if i > 0 {
+                let drained = self.layers[0].put(part, key, &value, 1.0, stamp);
+                self.drain_to_next(0, drained);
+            }
+            return Some(value);
         }
         None
     }
 
-    /// Write to the fastest cache layer with default weight (1.0).
-    /// Evicted entries drain to slower layers.
+    /// Cache `value` as the current value of `part`/`key`, with default
+    /// weight (1.0). Evicted entries drain to slower layers. A value read
+    /// from the trees goes through [`fill`](Self::fill) instead.
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) {
         self.put_weighted(part, key, value, 1.0);
     }
 
-    /// Write to the fastest cache layer with a specific eviction weight.
-    /// Higher weight = entry stays in cache longer during eviction.
+    /// [`put`](Self::put) with a specific eviction weight. Higher weight =
+    /// entry stays in cache longer during eviction.
     pub fn put_weighted(&self, part: Partition, key: &[u8], value: &[u8], weight: f32) {
-        if self.layers.is_empty() {
+        self.fill(part, key, value, weight, self.ticket(part, key));
+    }
+
+    /// Cache `value`, read from the trees after `ticket` was taken, with an
+    /// eviction weight. A value whose ticket is already stale is not stored,
+    /// and one that turns stale later is not served.
+    pub fn fill(&self, part: Partition, key: &[u8], value: &[u8], weight: f32, ticket: FillTicket) {
+        if self.layers.is_empty() || ticket != self.ticket(part, key) {
             return;
         }
 
-        let drained = self.layers[0].put(part, key, value, weight);
+        let drained = self.layers[0].put(part, key, value, weight, ticket);
         self.drain_to_next(0, drained);
     }
 
@@ -676,17 +694,25 @@ impl TieredCache {
         self.label_weights.is_empty()
     }
 
-    /// Remove entry from all layers.
+    /// Invalidate `part`/`key` once a write to it is visible to reads: every
+    /// value of it cached, or read before now and cached later, is stale.
     pub fn remove(&self, part: Partition, key: &[u8]) {
+        let cache_key = compute_cache_key(part, key);
+        // The generation moves first: an entry a concurrent fill or drain
+        // puts back after the removal below still carries the old one.
+        self.key_generation(cache_key)
+            .fetch_add(1, Ordering::SeqCst);
         for layer in self.layers.iter() {
             layer.remove(part, key);
         }
     }
 
-    /// Invalidate every cached entry for `part` across all layers. Called by a
-    /// range delete, which cannot enumerate the affected keys cheaply and must
-    /// not leave a stale cache hit shadowing a range-tombstoned key.
+    /// Invalidate every cached entry for `part` across all layers, once a
+    /// change to the whole partition is visible to reads. Called by a range
+    /// delete, which cannot enumerate the affected keys cheaply and must not
+    /// leave a stale cache hit shadowing a range-tombstoned key.
     pub fn clear_partition(&self, part: Partition) {
+        self.partition_generations[usize::from(part as u8)].fetch_add(1, Ordering::SeqCst);
         for layer in self.layers.iter() {
             layer.clear_partition(part);
         }
@@ -772,16 +798,18 @@ impl TieredCache {
         debug!("background cache compaction stopped");
     }
 
-    /// Drain evicted entries to the next layer in the cascade.
-    fn drain_to_next(&self, from_layer: usize, entries: Vec<(Partition, Vec<u8>, Vec<u8>)>) {
+    /// Drain evicted entries to the next layer in the cascade, each under
+    /// the generations it was read under.
+    fn drain_to_next(&self, from_layer: usize, entries: Vec<Drained>) {
         let next = from_layer + 1;
         if next >= self.layers.len() || entries.is_empty() {
             return; // Bottom layer — drop (lossy cache)
         }
 
-        for (part, key, value) in entries {
+        for entry in entries {
             // Drained entries get default weight (evicted = already "cooler").
-            let further_drained = self.layers[next].put(part, &key, &value, 1.0);
+            let further_drained =
+                self.layers[next].put(entry.part, &entry.key, &entry.value, 1.0, entry.stamp);
             // Recursively drain deeper
             if !further_drained.is_empty() {
                 self.drain_to_next(next, further_drained);

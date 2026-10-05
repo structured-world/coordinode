@@ -2088,13 +2088,19 @@ impl StorageEngine {
     ///   2. LSM storage (DRAM block cache → persistent storage) → populate cache → return
     ///   3. Miss → None
     pub fn get(&self, part: Partition, key: &[u8]) -> StorageResult<Option<bytes::Bytes>> {
-        // Check tiered cache first.
-        if let Some(cache) = &self.tiered_cache {
-            if let Some(value) = cache.get(part, key) {
-                self.access_tracker.record(part, key);
-                return Ok(Some(value));
+        // Check tiered cache first. A miss takes the key's ticket before the
+        // tree read, so the value is cached only if no write was invalidated
+        // since.
+        let ticket = match &self.tiered_cache {
+            Some(cache) => {
+                if let Some(value) = cache.get(part, key) {
+                    self.access_tracker.record(part, key);
+                    return Ok(Some(value));
+                }
+                Some(cache.ticket(part, key))
             }
-        }
+            None => None,
+        };
 
         // Fall through to LSM storage.
         let tree = self.tree(part)?;
@@ -2103,9 +2109,9 @@ impl StorageEngine {
         match value {
             Some(v) => {
                 let bytes = bytes::Bytes::copy_from_slice(&v);
-                if let Some(cache) = &self.tiered_cache {
+                if let (Some(cache), Some(ticket)) = (&self.tiered_cache, ticket) {
                     let weight = Self::resolve_cache_weight(cache, part, &bytes);
-                    cache.put_weighted(part, key, &bytes, weight);
+                    cache.fill(part, key, &bytes, weight, ticket);
                 }
                 self.access_tracker.record(part, key);
                 Ok(Some(bytes))
@@ -2132,9 +2138,11 @@ impl StorageEngine {
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
         let mut out: Vec<Option<bytes::Bytes>> = vec![None; keys.len()];
 
-        // Split cache hits from misses; only the misses go to the tree.
+        // Split cache hits from misses; only the misses go to the tree, each
+        // with its ticket taken before the read (see `get`).
         let mut miss_idx: Vec<usize> = Vec::new();
         let mut miss_keys: Vec<&[u8]> = Vec::new();
+        let mut tickets = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             if let Some(cache) = &self.tiered_cache {
                 if let Some(value) = cache.get(part, key) {
@@ -2142,6 +2150,7 @@ impl StorageEngine {
                     out[i] = Some(value);
                     continue;
                 }
+                tickets.push(cache.ticket(part, key));
             }
             miss_idx.push(i);
             miss_keys.push(key);
@@ -2155,12 +2164,12 @@ impl StorageEngine {
         let seqno = self.coordinator.current_seqno();
         let values = tree.multi_get(miss_keys.iter().copied(), seqno)?;
 
-        for (slot, value) in miss_idx.into_iter().zip(values) {
+        for (n, (slot, value)) in miss_idx.into_iter().zip(values).enumerate() {
             if let Some(v) = value {
                 let bytes = bytes::Bytes::copy_from_slice(&v);
-                if let Some(cache) = &self.tiered_cache {
+                if let (Some(cache), Some(ticket)) = (&self.tiered_cache, tickets.get(n)) {
                     let weight = Self::resolve_cache_weight(cache, part, &bytes);
-                    cache.put_weighted(part, keys[slot], &bytes, weight);
+                    cache.fill(part, keys[slot], &bytes, weight, *ticket);
                 }
                 self.access_tracker.record(part, keys[slot]);
                 out[slot] = Some(bytes);
@@ -2647,6 +2656,11 @@ impl StorageEngine {
             // background timer. One uncontended lock per proposal.
             self.coordinator.advance_gc_watermark();
         }
+        // Only now does the engine's read point include `seqno` (an entry
+        // applied on a follower can carry a commit timestamp ahead of its
+        // clock): invalidated earlier, a read in between would cache the
+        // values this commit replaced.
+        batch.forget_cached();
         Ok(())
     }
 
@@ -2668,10 +2682,11 @@ impl StorageEngine {
         let tree = self.tree(part)?;
         tree.drop_range(range)?;
         self.write_taps.replaced(part);
-        // Note: tiered cache entries for dropped keys become stale.
-        // They will miss on next read (key gone from tree) and naturally evict.
-        // Per-partition cache clear is not implemented — drop_range is rare
-        // and cache staleness is harmless (read returns None, cache evicts).
+        // A read is answered from the cache before the tree, so a dropped
+        // key's cached value would outlive the drop.
+        if let Some(cache) = &self.tiered_cache {
+            cache.clear_partition(part);
+        }
         Ok(())
     }
 
@@ -4015,6 +4030,10 @@ mod merge_tests;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod retention_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod cache_tests;
 
 #[cfg(all(test, feature = "columnar"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
