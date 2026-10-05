@@ -76,6 +76,66 @@ fn save_label_is_atomic_pointer_and_body() {
     assert_eq!(v1_loaded.schema_revision, 1);
 }
 
+/// A label schema read while revisions of it commit sees one whole
+/// revision: the pointer and the body it names are read from one snapshot,
+/// so a commit applying between the two reads cannot leave the reader with a
+/// pointer to a body it does not see.
+#[test]
+fn a_label_read_during_revision_commits_sees_a_whole_revision() {
+    use coordinode_core::txn::timestamp::TimestampOracle;
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+    use coordinode_storage::engine::transaction::CommitContext;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&oracle),
+        )
+        .expect("open engine"),
+    );
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let store = LocalSchemaStore::new(&engine);
+            let wc = WriteConcern::majority();
+            for revision in 1..=2_000 {
+                let mut schema = sample_label();
+                schema.schema_revision = revision;
+                let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+                store.save_label_txn(&mut txn, &schema).expect("stage");
+                txn.commit(&CommitContext {
+                    write_concern: &wc,
+                    pipeline: None,
+                    id_gen: None,
+                    drain_buffer: None,
+                    nvme_write_buffer: None,
+                })
+                .expect("commit revision");
+            }
+            done.store(true, Ordering::Release);
+        });
+        let store = LocalSchemaStore::new(&engine);
+        while !done.load(Ordering::Acquire) {
+            store
+                .load_label("User")
+                .expect("a whole revision or none, never a torn one");
+        }
+    });
+}
+
 #[test]
 fn corrupt_pointer_surfaces_as_decode_error() {
     let fx = open_engine();

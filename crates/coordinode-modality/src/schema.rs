@@ -278,8 +278,14 @@ impl<'a> LocalSchemaStore<'a> {
         Self { engine }
     }
 
-    fn load_revision_pointer(&self, key: &[u8], kind: &'static str) -> StoreResult<Option<u64>> {
-        let Some(bytes) = self.engine.get(Partition::Schema, key)? else {
+    /// The revision the pointer at `key` names, as of `snapshot`.
+    fn load_revision_pointer(
+        &self,
+        snapshot: &coordinode_storage::engine::StorageSnapshot,
+        key: &[u8],
+        kind: &'static str,
+    ) -> StoreResult<Option<u64>> {
+        let Some(bytes) = self.engine.snapshot_get(snapshot, Partition::Schema, key)? else {
             return Ok(None);
         };
         let array: [u8; 8] = bytes.as_ref().try_into().map_err(|_| StoreError::Decode {
@@ -322,13 +328,21 @@ fn claim_activation(txn: &mut Transaction, label: &str, revision: u64) {
 
 impl SchemaStore for LocalSchemaStore<'_> {
     fn load_label(&self, name: &str) -> StoreResult<Option<LabelSchema>> {
+        // The pointer and the body it names are read from one complete
+        // snapshot: a revision committing between two latest-state reads
+        // could show its pointer and not yet its body.
+        let snapshot = self.engine.snapshot();
         let pointer_key = encode_label_current_revision_key(name);
-        let Some(revision) = self.load_revision_pointer(&pointer_key, "label revision pointer")?
+        let Some(revision) =
+            self.load_revision_pointer(&snapshot, &pointer_key, "label revision pointer")?
         else {
             return Ok(None);
         };
         let schema_key = encode_label_schema_key(name, revision);
-        let Some(schema_bytes) = self.engine.get(Partition::Schema, &schema_key)? else {
+        let Some(schema_bytes) =
+            self.engine
+                .snapshot_get(&snapshot, Partition::Schema, &schema_key)?
+        else {
             return Err(StoreError::Decode {
                 kind: "label schema",
                 message: format!("pointer for '{name}' references missing revision {revision}"),
@@ -363,14 +377,19 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn load_edge_type(&self, name: &str) -> StoreResult<Option<EdgeTypeSchema>> {
+        // One snapshot for the pointer and the body, as in `load_label`.
+        let snapshot = self.engine.snapshot();
         let pointer_key = encode_edge_type_current_revision_key(name);
         let Some(revision) =
-            self.load_revision_pointer(&pointer_key, "edge type revision pointer")?
+            self.load_revision_pointer(&snapshot, &pointer_key, "edge type revision pointer")?
         else {
             return Ok(None);
         };
         let schema_key = encode_edge_type_schema_key(name, revision);
-        let Some(schema_bytes) = self.engine.get(Partition::Schema, &schema_key)? else {
+        let Some(schema_bytes) =
+            self.engine
+                .snapshot_get(&snapshot, Partition::Schema, &schema_key)?
+        else {
             return Err(StoreError::Decode {
                 kind: "edge type schema",
                 message: format!("pointer for '{name}' references missing revision {revision}"),
