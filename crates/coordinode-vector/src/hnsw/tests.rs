@@ -2856,18 +2856,20 @@ fn concurrent_removals_reinserts_and_searches_stay_consistent() {
 }
 
 /// A removed node stops being a result before the count drops: a reader that
-/// sees the count fall finds no more results than it says. Two nodes, one
-/// removed on another thread while a reader waits for the count to read one
-/// and searches at once; many rounds, so the reader lands inside a removal.
+/// sees the count fall finds no more results than it says. Two nodes; in
+/// each round one is removed on another thread while a reader waits for the
+/// count to read one and searches at once, then it is inserted again. Many
+/// rounds, so the reader lands inside a removal.
 #[test]
 fn a_removed_node_is_no_result_once_the_count_says_it_is_gone() {
-    for round in 0..2_000u64 {
-        let index = HnswIndex::new(removal_config());
-        index.insert_shared(1, &scattered_vector(round, 8));
-        index.insert_shared(2, &scattered_vector(round + 1, 8));
-        let query = scattered_vector(round, 8);
+    let index = HnswIndex::new(removal_config());
+    index.insert_shared(1, &scattered_vector(1, 8));
+    index.insert_shared(2, &scattered_vector(2, 8));
+    let query = scattered_vector(1, 8);
+    for round in 0..10_000u64 {
+        let id = 1 + round % 2;
         std::thread::scope(|s| {
-            let remover = s.spawn(|| assert!(index.remove(1 + round % 2)));
+            let remover = s.spawn(|| assert!(index.remove(id)));
             while index.len() != 1 {
                 std::hint::spin_loop();
             }
@@ -2878,6 +2880,7 @@ fn a_removed_node_is_no_result_once_the_count_says_it_is_gone() {
             );
             remover.join().expect("remover panicked");
         });
+        index.insert_shared(id, &scattered_vector(id, 8));
     }
 }
 
