@@ -125,6 +125,13 @@ struct RecordingEngine {
 }
 
 impl CursorEngine for RecordingEngine {
+    fn session_setting(&self, query: &str) -> Option<ConnectionSettings> {
+        (query == "SET exact").then(|| ConnectionSettings {
+            vector_consistency: Some(coordinode_core::graph::types::VectorConsistencyMode::Exact),
+            ..ConnectionSettings::default()
+        })
+    }
+
     fn open_cursor(
         &self,
         query: &str,
@@ -154,6 +161,53 @@ impl CursorEngine for RecordingEngine {
     fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
         Ok(())
     }
+}
+
+/// A session SET changes that session's settings: it answers with an empty
+/// result without reaching the engine, and the statements after it run under
+/// the new setting. A second session is untouched, which is the point: before,
+/// a SET sent to a server changed the database every client reads.
+#[tokio::test]
+async fn a_session_set_changes_only_its_session() {
+    use coordinode_core::graph::types::VectorConsistencyMode;
+
+    let recording = Arc::new(RecordingEngine::default());
+    let engine = || Arc::clone(&recording) as Arc<dyn CursorEngine>;
+    let statement = |query: &str| SessionOp::Execute {
+        query: query.to_string(),
+        params: HashMap::new(),
+        txid: 0,
+        nonce: 0,
+        settings: ConnectionSettings::default(),
+        source: None,
+    };
+
+    let by_id = run_session(engine(), vec![statement("SET exact"), statement("after")]).await;
+    assert!(
+        matches!(
+            by_id[&1].as_slice(),
+            [
+                SessionEvent::CursorOpen { .. },
+                SessionEvent::CursorEnd { .. }
+            ]
+        ),
+        "{:?}",
+        by_id[&1]
+    );
+    run_session(engine(), vec![statement("other session")]).await;
+
+    let seen: HashMap<String, ConnectionSettings> = recording
+        .seen
+        .lock()
+        .iter()
+        .map(|(query, (settings, _))| (query.clone(), settings.clone()))
+        .collect();
+    assert!(!seen.contains_key("SET exact"), "the SET is the session's");
+    assert_eq!(
+        seen["after"].vector_consistency,
+        Some(VectorConsistencyMode::Exact)
+    );
+    assert_eq!(seen["other session"].vector_consistency, None);
 }
 
 /// A statement reaches the engine with its session's settings, its own in

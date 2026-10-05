@@ -584,6 +584,10 @@ impl CoordinodeClient {
             // own. Interactive transactions use the BeginTransaction RPC and
             // set transaction_id on the request directly.
             transaction_id: 0,
+            // Vector settings are named in a hint in the query, or by the
+            // server's defaults.
+            vector_consistency: 0,
+            vector_build_wait_ms: None,
         });
 
         if let Some(loc) = location {

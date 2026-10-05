@@ -105,10 +105,11 @@ fn cypher_request(q: &str) -> Request<query::ExecuteCypherRequest> {
     Request::new(query::ExecuteCypherRequest {
         query: q.to_string(),
         parameters: std::collections::HashMap::new(),
-        read_preference: 0,  // omitted → the server default (Primary here)
-        read_concern: None,  // omitted → the server default (Local here)
-        write_concern: None, // omitted → the database default (majority here)
-        transaction_id: 0,   // auto-commit
+        read_preference: 0,   // omitted → the server default (Primary here)
+        read_concern: None,   // omitted → the server default (Local here)
+        write_concern: None,  // omitted → the database default (majority here)
+        transaction_id: 0,    // auto-commit
+        ..Default::default()  // vector settings left to the server
     })
 }
 
@@ -120,6 +121,7 @@ fn cypher_request_in_txn(q: &str, transaction_id: u64) -> Request<query::Execute
         read_concern: None,
         write_concern: None,
         transaction_id,
+        ..Default::default()
     })
 }
 
@@ -759,6 +761,7 @@ async fn grpc_interactive_transaction_commit() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
     };
     let at_commit = svc
@@ -1521,6 +1524,7 @@ async fn causal_after_index_with_local_concern_rejected() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -1551,6 +1555,7 @@ async fn causal_after_index_with_linearizable_rejected() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -1587,6 +1592,7 @@ async fn causal_after_index_with_majority_standalone_succeeds() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -1634,6 +1640,7 @@ async fn causal_write_read_roundtrip_standalone() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -1739,6 +1746,7 @@ async fn raft_write_returns_own_committed_index() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("causal read after write");
@@ -1803,6 +1811,7 @@ async fn an_unnamed_read_concern_takes_the_server_default() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
     };
 
@@ -1845,6 +1854,7 @@ async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect_err("a w:1 default is not causal-safe");
@@ -1885,6 +1895,51 @@ async fn an_unknown_level_or_preference_is_refused_not_downgraded() {
     }
 }
 
+/// A session SET sent as a unary call is refused, and the database's setting
+/// is left as it was: a unary call has no session to hold the setting, and the
+/// database's own is every client's. Before, the call changed it for all of
+/// them.
+#[tokio::test]
+async fn a_unary_set_is_refused_and_reaches_no_other_client() {
+    use coordinode_core::graph::types::VectorConsistencyMode;
+
+    let (svc, _dir) = test_service();
+    let refused = svc
+        .execute_cypher(cypher_request("SET vector_consistency = 'exact'"))
+        .await
+        .expect_err("a SET has no session here");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("Session"), "{refused:?}");
+    assert_eq!(
+        svc.database().read().vector_consistency(),
+        VectorConsistencyMode::default()
+    );
+}
+
+/// The vector settings of one unary statement are read, and a value the server
+/// does not know is refused with the field named.
+#[tokio::test]
+async fn a_statement_names_its_vector_settings() {
+    use tonic_types::StatusExt;
+
+    let (svc, _dir) = test_service();
+    let mut exact = cypher_request("RETURN 1 AS one");
+    exact.get_mut().vector_consistency = replication::VectorConsistency::Exact as i32;
+    exact.get_mut().vector_build_wait_ms = Some(0);
+    svc.execute_cypher(exact).await.expect("known settings run");
+
+    let mut unknown = cypher_request("RETURN 1 AS one");
+    unknown.get_mut().vector_consistency = 9;
+    let refused = svc
+        .execute_cypher(unknown)
+        .await
+        .expect_err("an unknown mode is refused");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    let details = refused.get_error_details();
+    let violations = &details.bad_request().expect("BadRequest").field_violations;
+    assert_eq!(violations[0].field, "vector_consistency");
+}
+
 /// after_index = 0 with any readConcern level is always valid (no fence).
 #[tokio::test]
 async fn causal_after_index_zero_always_valid() {
@@ -1904,6 +1959,7 @@ async fn causal_after_index_zero_always_valid() {
                 }),
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             }))
             .await;
         assert!(
@@ -1936,6 +1992,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
             }),
             write_concern: None, // omitted → the majority default
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -1971,6 +2028,7 @@ async fn causal_write_with_w1_rejected() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -2008,6 +2066,7 @@ async fn causal_write_with_majority_accepted() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -2065,6 +2124,7 @@ async fn causal_gate_classifies_a_call_by_its_procedure_mode() {
             timeout_ms: 0,
         }),
         transaction_id: 0,
+        ..Default::default()
     };
 
     let refused = svc
@@ -2097,6 +2157,7 @@ async fn execute_cypher_lists_procedures_and_refuses_an_unknown_one() {
         read_concern: None,
         write_concern: None,
         transaction_id: 0,
+        ..Default::default()
     };
 
     let listed = svc
@@ -2142,6 +2203,7 @@ async fn causal_read_without_write_concern_accepted() {
             }),
             write_concern: None, // read-only — write_concern irrelevant
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 
@@ -2226,6 +2288,7 @@ async fn grpc_write_concern_majority_accepted_in_standalone() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("write should succeed");
@@ -2320,6 +2383,7 @@ async fn grpc_at_timestamp_rejected_without_snapshot_level() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
     let err = result.expect_err("must reject");
@@ -2360,6 +2424,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect_err("a read below the retention horizon is refused");
@@ -2392,6 +2457,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
     };
     let at_horizon = svc
@@ -2555,6 +2621,7 @@ async fn grpc_at_timestamp_max_sees_latest() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("snapshot read at u64::MAX")
@@ -2583,6 +2650,7 @@ async fn grpc_snapshot_without_at_timestamp_returns_latest() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("snapshot read");
@@ -2613,6 +2681,7 @@ async fn grpc_write_concern_memory_accepted() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("memory write should succeed");
@@ -2640,6 +2709,7 @@ async fn grpc_after_index_and_at_timestamp_mutually_exclusive() {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
     let err = result.expect_err("must reject combination");
@@ -2669,6 +2739,7 @@ async fn grpc_write_concern_journal_with_timeout_accepted() {
                 timeout_ms: 5_000,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("journaled write should succeed");
@@ -2692,6 +2763,7 @@ async fn grpc_write_concern_cache_accepted() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("cache write should succeed");
@@ -2795,6 +2867,7 @@ async fn capacity_exhausted_surfaces_as_resource_exhausted_through_grpc_handler(
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await;
 

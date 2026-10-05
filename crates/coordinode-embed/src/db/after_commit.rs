@@ -379,8 +379,10 @@ impl Database {
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             write_concern: coordinode_core::txn::write_concern::WriteConcern::default(),
-            // A trigger body follows its own query's consistency, not a session.
+            // A trigger body follows its own query's consistency, not a session,
+            // and waits for an index under the database's bound.
             vector_consistency: None,
+            vector_build_wait: self.vector_build_wait,
             after_commit_generation: generation,
         };
         let params = if params.is_empty() {

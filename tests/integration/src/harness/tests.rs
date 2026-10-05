@@ -40,6 +40,7 @@ async fn a_server_that_exits_during_startup_is_restarted_on_another_port() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .expect("the returned server answers");

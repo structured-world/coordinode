@@ -10,14 +10,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::read_concern::{
     ReadConcern as ExecutorReadConcern, ReadConcernLevel as ExecutorReadConcernLevel,
 };
 use coordinode_core::txn::write_concern::WriteConcern;
-use coordinode_embed::db::CypherResult;
+use coordinode_embed::db::{CypherResult, StatementOptions};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::QueryRegistry;
 use coordinode_query::advisor::nplus1::NPlus1Detector;
@@ -49,6 +49,12 @@ pub(crate) struct Requested {
     pub read_preference: Option<ReadPreference>,
     /// When the write is acknowledged; `None` takes the database's default.
     pub write_concern: Option<WriteConcern>,
+    /// Vector consistency below a hint in the query; `None` takes what the
+    /// query's read consistency implies.
+    pub vector_consistency: Option<VectorConsistencyMode>,
+    /// Bound on waiting for a vector index still being built, below a hint in
+    /// the query; `None` takes the server's.
+    pub vector_build_wait: Option<Duration>,
 }
 
 /// A statement whose settings are resolved and consistent, not yet fenced.
@@ -57,6 +63,8 @@ pub(crate) struct Checked {
     read_concern: ExecutorReadConcern,
     read_preference: ReadPreference,
     write_concern: Option<WriteConcern>,
+    vector_consistency: Option<VectorConsistencyMode>,
+    vector_build_wait: Option<Duration>,
 }
 
 /// A statement this node may run, with what the fence learned about it.
@@ -66,6 +74,11 @@ pub(crate) struct Admitted {
     pub read_concern: ExecutorReadConcern,
     /// The write concern the engine executes under; `None` = the database's.
     pub write_concern: Option<WriteConcern>,
+    /// Vector consistency below a hint in the query; `None` = the database's.
+    pub vector_consistency: Option<VectorConsistencyMode>,
+    /// Vector build-wait bound below a hint in the query; `None` = the
+    /// database's.
+    pub vector_build_wait: Option<Duration>,
     /// The applied log index the read was served at; zero outside a cluster.
     pub applied_index: u64,
     /// Whether this node led when it served the statement.
@@ -74,12 +87,24 @@ pub(crate) struct Admitted {
     pub read_as_of_ts: u64,
 }
 
+impl Admitted {
+    /// The per-statement settings the engine runs this statement under.
+    pub(crate) fn options(&self) -> StatementOptions {
+        StatementOptions {
+            read_concern: Some(self.read_concern.clone()),
+            write_concern: self.write_concern,
+            vector_consistency: self.vector_consistency,
+            vector_build_wait: self.vector_build_wait,
+        }
+    }
+}
+
 /// What to do with a checked statement.
 #[derive(Debug)]
 pub(crate) enum Admission {
     /// Run it here.
     Run(Admitted),
-    /// It needs the leader, which is this node: pass it there.
+    /// It needs the leader, which is another node: pass it there.
     Forward(u64),
 }
 
@@ -152,6 +177,15 @@ impl StatementExecutor {
     /// Resolve `requested` against the defaults and refuse a combination
     /// that cannot be served, before anything waits or runs.
     pub(crate) fn check(&self, query: &str, requested: &Requested) -> Result<Checked, Status> {
+        // A session SET changes the settings of the session that sends it.
+        // A session takes it before it gets here; on this path there is no
+        // session, and the database's own setting is every client's.
+        if Database::parse_session_set(query).is_some() {
+            return Err(Status::failed_precondition(
+                "SET changes the settings of a session, and this request has none: \
+                 send it on a Session, or name the setting for one query in a hint",
+            ));
+        }
         let level = requested.read_concern.unwrap_or(self.defaults.read_concern);
         let after_index = requested.after_index;
 
@@ -222,6 +256,8 @@ impl StatementExecutor {
                 .read_preference
                 .unwrap_or(self.defaults.read_preference),
             write_concern: requested.write_concern,
+            vector_consistency: requested.vector_consistency,
+            vector_build_wait: requested.vector_build_wait,
         })
     }
 
@@ -231,6 +267,8 @@ impl StatementExecutor {
         Admitted {
             read_concern: checked.read_concern,
             write_concern: checked.write_concern,
+            vector_consistency: checked.vector_consistency,
+            vector_build_wait: checked.vector_build_wait,
             applied_index: 0,
             served_by_leader: false,
             read_as_of_ts: 0,
@@ -284,6 +322,8 @@ impl StatementExecutor {
         Ok(Admission::Run(Admitted {
             read_concern: checked.read_concern,
             write_concern: checked.write_concern,
+            vector_consistency: checked.vector_consistency,
+            vector_build_wait: checked.vector_build_wait,
             applied_index,
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),
@@ -310,13 +350,8 @@ impl StatementExecutor {
         source: Option<&SourceContext>,
         admitted: &Admitted,
     ) -> Result<CypherResult, DatabaseError> {
-        self.writer.execute(
-            query,
-            params,
-            source,
-            Some(&admitted.read_concern),
-            admitted.write_concern.as_ref(),
-        )
+        self.writer
+            .execute(query, params, source, &admitted.options())
     }
 
     /// Record a finished statement for the advisor: its fingerprint, timing,

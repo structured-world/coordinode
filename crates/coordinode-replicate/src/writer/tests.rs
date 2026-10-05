@@ -6,13 +6,17 @@ fn writer() -> (ReplicatedWriter, tempfile::TempDir) {
     (ReplicatedWriter::new(Arc::new(RwLock::new(db))), dir)
 }
 
+fn defaults() -> StatementOptions {
+    StatementOptions::default()
+}
+
 /// A write through the embedded (non-replicated) path returns no
 /// committed index — `applied_index` is `None`, not a fabricated 0.
 #[test]
 fn embedded_write_has_no_committed_index() {
     let (w, _dir) = writer();
     let result = w
-        .execute("CREATE (n:Probe {v: 1}) RETURN n", None, None, None, None)
+        .execute("CREATE (n:Probe {v: 1}) RETURN n", None, None, &defaults())
         .expect("write should succeed");
     assert_eq!(result.write_stats.nodes_created, 1);
     assert_eq!(
@@ -25,30 +29,39 @@ fn embedded_write_has_no_committed_index() {
 #[test]
 fn read_only_has_no_committed_index() {
     let (w, _dir) = writer();
-    w.execute("CREATE (n:Probe {v: 1})", None, None, None, None)
+    w.execute("CREATE (n:Probe {v: 1})", None, None, &defaults())
         .expect("seed write");
     let result = w
-        .execute("MATCH (n:Probe) RETURN n.v", None, None, None, None)
+        .execute("MATCH (n:Probe) RETURN n.v", None, None, &defaults())
         .expect("read should succeed");
     assert!(!result.write_stats.has_mutations());
     assert_eq!(result.write_stats.applied_index, None);
 }
 
-/// The shared→exclusive fallback routes a session `SET` command to the
-/// `&mut` path instead of surfacing the rejection.
+/// A session `SET` sent through the writer is refused and leaves the
+/// database's setting as it was: the writer runs many clients' statements
+/// against one database, and a setting written there would reach every one
+/// of them. Before, it fell back to the exclusive path and changed the
+/// database for all clients.
 #[test]
-fn session_set_falls_back_to_exclusive() {
+fn a_session_set_does_not_reach_the_database() {
+    use coordinode_core::graph::types::VectorConsistencyMode;
+
     let (w, _dir) = writer();
     let result = w.execute(
         "SET vector_consistency = 'snapshot'",
         None,
         None,
-        None,
-        None,
+        &defaults(),
     );
     assert!(
-        result.is_ok(),
-        "session SET must route through exclusive access, got {:?}",
-        result.err()
+        matches!(result, Err(DatabaseError::Semantic(_))),
+        "refused, got {:?}",
+        result.map(|r| r.rows)
+    );
+    assert_eq!(
+        w.database().read().vector_consistency(),
+        VectorConsistencyMode::default(),
+        "the database keeps its own setting"
     );
 }

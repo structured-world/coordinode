@@ -30,20 +30,10 @@ pub mod proto {
         pub mod cdc {
             tonic::include_proto!("coordinode.v1.replication");
         }
-        // Re-export replication types at this level so generated code for other
-        // proto packages that import coordinode.v1.replication can resolve them
-        // via `super::replication::TypeName`.
-        pub use cdc::AcknowledgeSubscriptionRequest;
-        pub use cdc::CancelSubscriptionRequest;
-        pub use cdc::ChangeEvent;
-        pub use cdc::Journal;
-        pub use cdc::ReadConcern;
-        pub use cdc::ReadConcernLevel;
-        pub use cdc::ReadPreference;
-        pub use cdc::SubscribeRequest;
-        pub use cdc::WriteConcern;
-        pub use cdc::WriteConcernMode;
-        pub use cdc::write_concern;
+        // Every replication type at this level, so generated code for other
+        // proto packages that import coordinode.v1.replication resolves it via
+        // `super::replication::TypeName`, a type added to the package included.
+        pub use cdc::*;
     }
     pub mod admin {
         pub mod cluster {

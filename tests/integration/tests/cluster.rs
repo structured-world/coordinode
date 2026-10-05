@@ -235,6 +235,7 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
                 read_concern: None,
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .expect("the standalone server accepts the write");
@@ -276,6 +277,7 @@ async fn a_standalone_server_with_data_grows_into_a_cluster() {
                 }),
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .map(|r| r.into_inner().rows)
@@ -316,6 +318,7 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
                 read_concern: None,
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .expect("the standalone server accepts the write");
@@ -396,6 +399,7 @@ async fn a_machine_with_data_grows_to_three_and_shrinks_to_the_quorum_floor() {
                 }),
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .unwrap_or_else(|e| panic!("member {id} answers: {e}"))
@@ -430,6 +434,7 @@ async fn a_server_that_still_holds_data_is_refused_as_a_joiner() {
                 read_concern: None,
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .expect("the standalone server accepts the write");
@@ -475,6 +480,7 @@ async fn a_server_killed_after_a_write_is_refused_as_a_joiner() {
                 read_concern: None,
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .expect("the standalone server accepts the write");
@@ -567,6 +573,7 @@ async fn a_member_restarts_into_its_group_with_its_data() {
                     }),
                     write_concern: None,
                     transaction_id: 0,
+                    ..Default::default()
                 })
                 .await
                 .map(|r| r.into_inner().rows.len());
@@ -598,6 +605,7 @@ async fn cypher_on(
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .map(|r| r.into_inner().rows)
@@ -807,6 +815,7 @@ async fn a_text_index_created_on_the_leader_serves_searches_on_a_follower() {
                 }),
                 write_concern: None,
                 transaction_id: 0,
+                ..Default::default()
             })
             .await
             .map(|r| r.into_inner().rows.len());

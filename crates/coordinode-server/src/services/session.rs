@@ -29,8 +29,9 @@ use tonic::{Code, Request, Response, Status, Streaming};
 use self::engine::DatabaseCursorEngine;
 use super::cdc::{ChangeEventServiceImpl, Credit, Delivery, session_error};
 use super::cypher::{
-    proto_to_value_pub, read_concern_level, read_preference, value_to_proto_pub,
-    write_concern_from_proto, write_concern_to_proto,
+    build_wait, build_wait_ms, proto_to_value_pub, read_concern_level, read_preference,
+    value_to_proto_pub, vector_consistency, vector_consistency_to_proto, write_concern_from_proto,
+    write_concern_to_proto,
 };
 use super::statement::StatementExecutor;
 use crate::proto::query;
@@ -414,6 +415,12 @@ fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
             .map(|p| known_preference("read_preference", p))
             .transpose()?,
         drain_timeout_ms: c.drain_timeout_ms,
+        vector_consistency: c
+            .vector_consistency
+            .map(|mode| vector_consistency("vector_consistency", mode))
+            .transpose()?
+            .flatten(),
+        vector_build_wait: build_wait(c.vector_build_wait_ms),
     })
 }
 
@@ -440,6 +447,9 @@ fn statement_settings(e: &Execute) -> Result<ConnectionSettings, Status> {
             .transpose()?
             .filter(|&preference| preference != 0),
         drain_timeout_ms: None,
+        // A statement names its vector settings in a hint in its query.
+        vector_consistency: None,
+        vector_build_wait: None,
     })
 }
 
@@ -484,15 +494,21 @@ impl ClientApp {
 /// Render settings back for the client, so a Configure is confirmed by what is
 /// in effect rather than by what was asked for.
 fn settings_to_proto(s: &ConnectionSettings) -> Configure {
+    // A fence or a pin set without a level is still in effect, so the read
+    // concern is reported when any of its parts is.
+    let read_concern_set =
+        s.read_concern.is_some() || s.after_index.is_some() || s.at_timestamp.is_some();
     Configure {
-        read_concern: s.read_concern.map(|level| replication::ReadConcern {
-            level: level as i32,
+        read_concern: read_concern_set.then(|| replication::ReadConcern {
+            level: s.read_concern.map_or(0, i32::from),
             after_index: s.after_index.unwrap_or(0),
             at_timestamp: s.at_timestamp.unwrap_or(0),
         }),
         write_concern: s.write_concern.as_ref().map(write_concern_to_proto),
-        read_preference: s.read_preference.map(|p| p as i32),
+        read_preference: s.read_preference.map(i32::from),
         drain_timeout_ms: s.drain_timeout_ms,
+        vector_consistency: s.vector_consistency.map(vector_consistency_to_proto),
+        vector_build_wait_ms: s.vector_build_wait.map(build_wait_ms),
     }
 }
 

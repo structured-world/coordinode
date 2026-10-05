@@ -34,6 +34,7 @@ async fn cypher_raw(
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .expect("execute_cypher must succeed")

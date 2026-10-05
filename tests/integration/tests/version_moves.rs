@@ -86,6 +86,7 @@ async fn write_seq(port: u16, seq: i64) -> bool {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .is_ok()
@@ -107,6 +108,7 @@ async fn local_seqs(port: u16) -> Option<BTreeSet<i64>> {
             }),
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .ok()?

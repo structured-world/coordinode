@@ -56,6 +56,15 @@ pub trait CursorEngine: Send + Sync {
         source: Option<&StatementSource>,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
+    /// The change to its session's settings `query` makes, when it is a
+    /// dialect's session SET command; `None` for any other statement. Called
+    /// for every statement on the session's own task, so it must be cheap and
+    /// must not block: a SET takes effect before the next statement is
+    /// dispatched, as a Configure does.
+    fn session_setting(&self, _query: &str) -> Option<ConnectionSettings> {
+        None
+    }
+
     /// Open a new interactive transaction and return its handle. Subsequent
     /// `open_cursor` calls carrying this `txid` run inside it, reading its pinned
     /// snapshot and buffering writes until `commit_transaction`.

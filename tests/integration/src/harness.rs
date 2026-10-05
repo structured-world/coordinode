@@ -493,10 +493,11 @@ impl CoordinodeProcess {
                 .execute_cypher(ExecuteCypherRequest {
                     query: "RETURN 1".to_string(),
                     parameters: Default::default(),
-                    read_preference: 0, // PRIMARY
+                    read_preference: 0, // the server default
                     read_concern: None,
                     write_concern: None,
                     transaction_id: 0, // auto-commit (no interactive transaction)
+                    ..Default::default()
                 })
                 .await;
             if result.is_ok() {

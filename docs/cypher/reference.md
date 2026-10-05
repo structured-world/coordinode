@@ -877,6 +877,17 @@ silently dropped.
 being built under the `block` online-during-build policy; see
 [Online-during-build policy](./extensions.md#online-during-build-policy).
 
+### Session settings: `SET`
+
+`SET vector_consistency = '...'` and `SET vector_build_wait = '...'` change a
+setting of the session that sends them, below the query's own hint. An
+embedded database is one session. On a server the setting belongs to the
+client's Session stream and reaches only its statements; the Session's
+`Configure` frame changes the same two settings and reports them. A unary
+`ExecuteCypher` call has no session, so it refuses a `SET` with
+`FAILED_PRECONDITION`; it names the settings for that one statement in its
+`vector_consistency` and `vector_build_wait_ms` fields instead.
+
 ### `read_consistency`
 
 Governs whether graph, vector, full-text, document, and time-series reads inside a single query resolve against the **same HLC timestamp** `T`. Every modality on the serving shard waits until every write with `commit_ts ≤ T` has been applied to every index before the read dispatches. Orthogonal to `read_concern` (which governs replication durability).

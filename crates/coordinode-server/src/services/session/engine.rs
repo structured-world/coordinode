@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use coordinode_core::graph::types::Value;
 use coordinode_core::txn::transaction::CommitReceipt;
+use coordinode_embed::db::{SessionSetting, StatementOptions};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::source::{self, SourceContext, grpc_keys};
 use coordinode_query::executor::row::Row;
@@ -33,8 +34,8 @@ use parking_lot::RwLock;
 use super::failure;
 use crate::proto::{query, replication};
 use crate::services::cypher::{
-    db_error_to_status, proto_to_value_pub, read_concern_level, read_preference,
-    value_to_proto_pub, write_concern_to_proto,
+    build_wait_ms, db_error_to_status, proto_to_value_pub, read_concern_level, read_preference,
+    value_to_proto_pub, vector_consistency_to_proto, write_concern_to_proto,
 };
 use crate::services::statement::{Admission, Requested, StatementExecutor, leader_hint};
 
@@ -110,6 +111,19 @@ impl DatabaseCursorEngine {
 }
 
 impl CursorEngine for DatabaseCursorEngine {
+    fn session_setting(&self, query: &str) -> Option<ConnectionSettings> {
+        Database::parse_session_set(query).map(|setting| match setting {
+            SessionSetting::VectorConsistency(mode) => ConnectionSettings {
+                vector_consistency: Some(mode),
+                ..ConnectionSettings::default()
+            },
+            SessionSetting::VectorBuildWait(wait) => ConnectionSettings {
+                vector_build_wait: Some(wait),
+                ..ConnectionSettings::default()
+            },
+        })
+    }
+
     fn open_cursor(
         &self,
         query: &str,
@@ -126,12 +140,18 @@ impl CursorEngine for DatabaseCursorEngine {
         let source = source.and_then(source_context);
         // A statement of an interactive transaction reads at the snapshot
         // pinned when it began and buffers its writes until the commit: no
-        // fence and no commit of its own here.
+        // fence and no commit of its own here. Its session's vector settings
+        // still apply.
         if txid != 0 {
+            let options = StatementOptions {
+                vector_consistency: settings.vector_consistency,
+                vector_build_wait: settings.vector_build_wait,
+                ..StatementOptions::default()
+            };
             let rows = self
                 .database()
                 .read()
-                .execute_in_transaction(txid, query, params)
+                .execute_in_transaction_with(txid, query, params, &options)
                 .map_err(engine_error)?;
             let (columns, rows) = rows_to_values(&rows);
             return Ok(Box::new(MaterializedCursor {
@@ -278,6 +298,8 @@ fn requested(settings: &ConnectionSettings) -> Requested {
             .read_preference
             .and_then(|preference| read_preference("", i32::from(preference)).ok().flatten()),
         write_concern: settings.write_concern,
+        vector_consistency: settings.vector_consistency,
+        vector_build_wait: settings.vector_build_wait,
     }
 }
 
@@ -307,6 +329,10 @@ fn forwarded_request(
         read_concern,
         write_concern: settings.write_concern.as_ref().map(write_concern_to_proto),
         transaction_id: 0,
+        vector_consistency: settings
+            .vector_consistency
+            .map_or(0, vector_consistency_to_proto),
+        vector_build_wait_ms: settings.vector_build_wait.map(build_wait_ms),
     }
 }
 

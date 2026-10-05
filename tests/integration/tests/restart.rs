@@ -102,6 +102,7 @@ async fn cypher(
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -737,6 +738,7 @@ async fn write_acked(
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .map(drop)

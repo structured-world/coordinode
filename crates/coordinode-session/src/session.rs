@@ -22,7 +22,7 @@ use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
 use crate::types::{
     ConnectionSettings, ConnectionState, ErrorCode, Failure, Ordering, SessionEvent, SessionOp,
-    StatementSource,
+    SessionStats, StatementSource,
 };
 
 /// An inbound op tagged with its session-scoped request id.
@@ -183,6 +183,25 @@ impl Session {
         done_tx: &mpsc::Sender<u64>,
         out: &mpsc::Sender<OutEvent>,
     ) {
+        // A session SET changes this session's settings, on this task like a
+        // Configure so the next statement already runs under it, and answers
+        // with the empty result the statement has. Never the engine's own
+        // settings: those are every other session's too.
+        if let SessionOp::Execute { query, .. } = &op {
+            if let Some(change) = self.engine.session_setting(query) {
+                self.settings.lock().apply(&change);
+                let opened = SessionEvent::CursorOpen {
+                    columns: Vec::new(),
+                };
+                if out.send((request_id, opened)).await.is_ok() {
+                    let ended = SessionEvent::CursorEnd {
+                        stats: SessionStats::default(),
+                    };
+                    let _ = out.send((request_id, ended)).await;
+                }
+                return;
+            }
+        }
         match op {
             // A statement bound to an open transaction: route to its mailbox.
             // Its settings are taken now, so a Configure that arrives after it

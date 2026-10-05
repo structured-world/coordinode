@@ -550,13 +550,31 @@ impl PlanCache {
 /// service layer can shrink from "one Database mutex per request"
 /// to "Database held shared, only the actual write-paths take an
 /// exclusive lock".
-/// A session setting a `SET` command changes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SessionSet {
+/// A session setting a `SET` command changes. An embedded [`Database`] is one
+/// session and applies it to itself; a server holds it per client session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSetting {
     /// `SET vector_consistency = 'mode'`.
     VectorConsistency(VectorConsistencyMode),
     /// `SET vector_build_wait = '5s'`.
     VectorBuildWait(Duration),
+}
+
+/// What one statement runs under where its caller decides it, in place of
+/// the database's own settings: a server passes its client session's here,
+/// so one client's settings never reach another's statements. `None` keeps
+/// the database's setting.
+#[derive(Debug, Clone, Default)]
+pub struct StatementOptions {
+    /// Read concern of this statement.
+    pub read_concern: Option<coordinode_core::txn::read_concern::ReadConcern>,
+    /// Write concern of this statement.
+    pub write_concern: Option<coordinode_core::txn::write_concern::WriteConcern>,
+    /// Vector consistency, below a hint the query names.
+    pub vector_consistency: Option<VectorConsistencyMode>,
+    /// Bound on waiting for a vector index still being built, below a hint
+    /// the query names.
+    pub vector_build_wait: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +587,9 @@ struct QuerySession {
     write_concern: coordinode_core::txn::write_concern::WriteConcern,
     /// The session's vector consistency, when it set one.
     vector_consistency: Option<VectorConsistencyMode>,
+    /// How long the statement waits for a vector index still being built,
+    /// when the query names no bound of its own.
+    vector_build_wait: Duration,
     /// Async AFTER COMMIT cascade generation for this statement. `0` for user
     /// statements; set to the queued event's generation when the dispatcher
     /// runs a trigger body so enqueued child events are stamped `generation + 1`.
@@ -1584,6 +1605,7 @@ impl Database {
             snapshot_read_ts: self.snapshot_read_ts.take(),
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
+            vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
         }
     }
@@ -1597,12 +1619,12 @@ impl Database {
     /// can stay on `&self`; this method needs `&mut self` because it
     /// mutates the session default field.
     fn try_apply_session_set(&mut self, query: &str) -> bool {
-        match Self::try_parse_session_set(query) {
-            Some(SessionSet::VectorConsistency(mode)) => {
+        match Self::parse_session_set(query) {
+            Some(SessionSetting::VectorConsistency(mode)) => {
                 self.vector_consistency = Some(mode);
                 true
             }
-            Some(SessionSet::VectorBuildWait(wait)) => {
+            Some(SessionSetting::VectorBuildWait(wait)) => {
                 self.vector_build_wait = wait;
                 true
             }
@@ -1880,6 +1902,20 @@ impl Database {
         query: &str,
         params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
     ) -> Result<Vec<Row>, DatabaseError> {
+        self.execute_in_transaction_with(txn_id, query, params, &StatementOptions::default())
+    }
+
+    /// [`Self::execute_in_transaction`] with the vector settings in `options`
+    /// in place of the database's. Its read and write concerns are the
+    /// transaction's, fixed when it began and when it commits, so those
+    /// fields of `options` are not read here.
+    pub fn execute_in_transaction_with(
+        &self,
+        txn_id: u64,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        options: &StatementOptions,
+    ) -> Result<Vec<Row>, DatabaseError> {
         let state = {
             let mut reg = self
                 .interactive_txns
@@ -1894,7 +1930,8 @@ impl Database {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
             write_concern: self.write_concern,
-            vector_consistency: self.vector_consistency,
+            vector_consistency: options.vector_consistency.or(self.vector_consistency),
+            vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
         };
         let params = params.filter(|p| !p.is_empty());
@@ -2329,7 +2366,29 @@ impl Database {
         read_concern: Option<&coordinode_core::txn::read_concern::ReadConcern>,
         write_concern: Option<&coordinode_core::txn::write_concern::WriteConcern>,
     ) -> Result<CypherResult, DatabaseError> {
-        if Self::try_parse_session_set(query).is_some() {
+        self.execute_cypher_shared_with(
+            query,
+            params,
+            source,
+            &StatementOptions {
+                read_concern: read_concern.cloned(),
+                write_concern: write_concern.copied(),
+                ..StatementOptions::default()
+            },
+        )
+    }
+
+    /// [`Self::execute_cypher_shared`] with every per-statement setting in
+    /// `options`: what a server runs a client session's statement with, so
+    /// the session's settings apply to its own statements alone.
+    pub fn execute_cypher_shared_with(
+        &self,
+        query: &str,
+        params: Option<std::collections::HashMap<String, coordinode_core::graph::types::Value>>,
+        source: Option<&SourceContext>,
+        options: &StatementOptions,
+    ) -> Result<CypherResult, DatabaseError> {
+        if Self::parse_session_set(query).is_some() {
             return Err(DatabaseError::Semantic(
                 "session SET commands require exclusive Database access; \
                  use execute_cypher_full"
@@ -2341,17 +2400,18 @@ impl Database {
             read_concern: self.read_concern,
             snapshot_read_ts: None,
             write_concern: self.write_concern,
-            vector_consistency: self.vector_consistency,
+            vector_consistency: options.vector_consistency.or(self.vector_consistency),
+            vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
         };
-        if let Some(rc) = read_concern {
+        if let Some(rc) = &options.read_concern {
             rc.validate()
                 .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
             session.read_concern = rc.level;
             session.snapshot_read_ts = rc.at_timestamp;
         }
-        if let Some(wc) = write_concern {
-            session.write_concern = *wc;
+        if let Some(wc) = options.write_concern {
+            session.write_concern = wc;
         }
 
         let params = params.filter(|p| !p.is_empty());
@@ -2400,6 +2460,7 @@ impl Database {
             snapshot_read_ts: Some(pinned),
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
+            vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
         };
         let params = params.filter(|p| !p.is_empty());
@@ -2770,7 +2831,7 @@ impl Database {
                 registry: &self.vector_index_registry,
                 engine: &self.engine,
                 // The query's own bound wins over the session's.
-                build_wait: hinted_build_wait.unwrap_or(self.vector_build_wait),
+                build_wait: hinted_build_wait.unwrap_or(session.vector_build_wait),
             }),
             btree_index_registry: Some(&self.index_registry),
             // Extension-op handlers for this Database (empty by default). An
@@ -3868,18 +3929,19 @@ impl Database {
         self.oracle.next()
     }
 
-    /// Try to parse a session SET command.
+    /// The session setting `query` changes, when it is a session SET command.
     ///
     /// Supports `SET vector_consistency = 'mode'` and
     /// `SET vector_build_wait = '5s'`. `None` for anything else, including a
     /// value the setting cannot take: the text then goes to the Cypher parser,
-    /// which refuses it.
-    fn try_parse_session_set(query: &str) -> Option<SessionSet> {
+    /// which refuses it. Run on every statement, so a statement that is not a
+    /// SET costs a prefix comparison and no allocation.
+    pub fn parse_session_set(query: &str) -> Option<SessionSetting> {
         let trimmed = query.trim();
-
-        // Case-insensitive matching for SET <name> = '...'
-        let lower = trimmed.to_ascii_lowercase();
-        if !lower.starts_with("set ") {
+        if !trimmed
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("set "))
+        {
             return None;
         }
 
@@ -3897,14 +3959,13 @@ impl Database {
             value
         };
 
-        match name.trim().to_ascii_lowercase().as_str() {
-            "vector_consistency" => {
-                VectorConsistencyMode::from_str_opt(unquoted).map(SessionSet::VectorConsistency)
-            }
-            "vector_build_wait" => {
-                coordinode_query::cypher::parse_wait(unquoted).map(SessionSet::VectorBuildWait)
-            }
-            _ => None,
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("vector_consistency") {
+            VectorConsistencyMode::from_str_opt(unquoted).map(SessionSetting::VectorConsistency)
+        } else if name.eq_ignore_ascii_case("vector_build_wait") {
+            coordinode_query::cypher::parse_wait(unquoted).map(SessionSetting::VectorBuildWait)
+        } else {
+            None
         }
     }
 }

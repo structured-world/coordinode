@@ -4,18 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use coordinode_core::graph::types::Value;
-use coordinode_core::txn::read_concern::ReadConcern;
-use coordinode_core::txn::write_concern::WriteConcern;
-use coordinode_embed::db::CypherResult;
+use coordinode_embed::db::{CypherResult, StatementOptions};
 use coordinode_embed::{Database, DatabaseError};
 use coordinode_query::advisor::source::SourceContext;
 use parking_lot::RwLock;
-
-/// Substring of the `execute_cypher_shared` rejection for session `SET`
-/// commands. Matching it (rather than a typed error) keeps the embed API
-/// surface unchanged; the shared path returns `Semantic(..)` and we retry
-/// under exclusive access.
-const SET_REQUIRES_EXCLUSIVE: &str = "SET commands require exclusive Database access";
 
 /// Routes Cypher execution into the replicated write path and surfaces the
 /// committed Raft index of any write.
@@ -52,39 +44,25 @@ impl ReplicatedWriter {
         &self.database
     }
 
-    /// Execute a Cypher statement.
-    ///
-    /// Runs on the shared (parallel) path first; only session `SET`
-    /// commands, which mutate session config and need exclusive access,
-    /// fall back to the `&mut` path. The returned [`CypherResult`] carries
+    /// Execute a Cypher statement under `options`, on the shared (parallel)
+    /// path. The returned [`CypherResult`] carries
     /// `write_stats.applied_index` = the committed Raft index of the write
     /// (`None` for reads and for embedded / non-replicated mode).
+    ///
+    /// A session `SET` command is refused here: a server runs statements of
+    /// many clients against one database, so a setting belongs to the client
+    /// session that names it and is carried in `options`, never written into
+    /// the database where every other client's statements would read it.
     pub fn execute(
         &self,
         query: &str,
         params: Option<HashMap<String, Value>>,
         source: Option<&SourceContext>,
-        read_concern: Option<&ReadConcern>,
-        write_concern: Option<&WriteConcern>,
+        options: &StatementOptions,
     ) -> Result<CypherResult, DatabaseError> {
-        let shared = {
-            let db = self.database.read();
-            db.execute_cypher_shared(query, params.clone(), source, read_concern, write_concern)
-        };
-        match shared {
-            Ok(result) => Ok(result),
-            Err(DatabaseError::Semantic(msg)) if msg.contains(SET_REQUIRES_EXCLUSIVE) => {
-                let mut db = self.database.write();
-                db.execute_cypher_full(
-                    query,
-                    params,
-                    source,
-                    read_concern.cloned(),
-                    write_concern.cloned(),
-                )
-            }
-            Err(e) => Err(e),
-        }
+        self.database
+            .read()
+            .execute_cypher_shared_with(query, params, source, options)
     }
 }
 

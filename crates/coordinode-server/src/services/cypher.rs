@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
-use coordinode_core::graph::types::{PathRel, PathValue, Value};
+use coordinode_core::graph::types::{PathRel, PathValue, Value, VectorConsistencyMode};
 use coordinode_core::txn::read_concern::ReadConcernLevel as ExecutorReadConcernLevel;
 use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
 use coordinode_embed::{Database, DatabaseError};
@@ -571,6 +571,48 @@ pub(crate) fn read_concern_level(
     }
 }
 
+/// The vector consistency a request names in `field`: `None` for
+/// UNSPECIFIED, which leaves it to the session and then to the query's read
+/// consistency. A value this server does not know is refused.
+pub(crate) fn vector_consistency(
+    field: &str,
+    mode: i32,
+) -> Result<Option<VectorConsistencyMode>, Status> {
+    use replication::VectorConsistency as Wire;
+    match Wire::try_from(mode) {
+        Ok(Wire::Unspecified) => Ok(None),
+        Ok(Wire::Current) => Ok(Some(VectorConsistencyMode::Current)),
+        Ok(Wire::Snapshot) => Ok(Some(VectorConsistencyMode::Snapshot)),
+        Ok(Wire::Exact) => Ok(Some(VectorConsistencyMode::Exact)),
+        Err(_) => Err(super::error_details::invalid_field(
+            field,
+            format!("vector consistency {mode} is not one this server knows"),
+        )),
+    }
+}
+
+/// A vector consistency on the wire.
+pub(crate) fn vector_consistency_to_proto(mode: VectorConsistencyMode) -> i32 {
+    use replication::VectorConsistency as Wire;
+    match mode {
+        VectorConsistencyMode::Current => Wire::Current as i32,
+        VectorConsistencyMode::Snapshot => Wire::Snapshot as i32,
+        VectorConsistencyMode::Exact => Wire::Exact as i32,
+    }
+}
+
+/// A build-wait bound in milliseconds on the wire, as the engine takes it.
+pub(crate) fn build_wait(ms: Option<u32>) -> Option<std::time::Duration> {
+    ms.map(|ms| std::time::Duration::from_millis(u64::from(ms)))
+}
+
+/// A build-wait bound in whole milliseconds for the wire. A bound beyond
+/// what the field holds (about 49 days) is sent as the largest it holds,
+/// which waits as long in practice.
+pub(crate) fn build_wait_ms(wait: std::time::Duration) -> u32 {
+    u32::try_from(wait.as_millis()).unwrap_or(u32::MAX)
+}
+
 /// The read preference a request names in `field`: `None` for UNSPECIFIED,
 /// which leaves it to the session and then the server's default. A value this
 /// server does not know is refused rather than read as PRIMARY.
@@ -741,6 +783,8 @@ fn requested_from_proto(req: &query::ExecuteCypherRequest) -> Result<Requested, 
             .as_ref()
             .map(write_concern_from_proto)
             .transpose()?,
+        vector_consistency: vector_consistency("vector_consistency", req.vector_consistency)?,
+        vector_build_wait: build_wait(req.vector_build_wait_ms),
     })
 }
 

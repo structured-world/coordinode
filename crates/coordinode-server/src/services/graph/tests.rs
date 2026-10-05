@@ -392,10 +392,11 @@ async fn create_node_visible_via_cypher_service() {
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "MATCH (n:RegTest) RETURN n".to_string(),
             parameters: std::collections::HashMap::new(),
-            read_preference: 0, // UNSPECIFIED → Primary
-            read_concern: None, // UNSPECIFIED → Local
+            read_preference: 0, // unspecified → the server default
+            read_concern: None, // omitted → the server default
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         }))
         .await
         .expect("execute_cypher should succeed")

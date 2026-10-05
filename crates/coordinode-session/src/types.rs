@@ -5,8 +5,9 @@
 //! back to its frames; the session core only ever sees these.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use coordinode_core::graph::types::Value;
+use coordinode_core::graph::types::{Value, VectorConsistencyMode};
 use coordinode_core::txn::transaction::CommitReceipt;
 use coordinode_core::txn::write_concern::WriteConcern;
 
@@ -88,6 +89,11 @@ pub struct ConnectionSettings {
     /// Default reorder-buffer drain timeout for ordered transactions, in
     /// milliseconds.
     pub drain_timeout_ms: Option<u32>,
+    /// Vector consistency for statements whose query names none in a hint.
+    pub vector_consistency: Option<VectorConsistencyMode>,
+    /// How long a statement waits for a vector index still being built, when
+    /// its query names no bound in a hint.
+    pub vector_build_wait: Option<Duration>,
 }
 
 impl ConnectionSettings {
@@ -114,6 +120,12 @@ impl ConnectionSettings {
         }
         if change.drain_timeout_ms.is_some() {
             self.drain_timeout_ms = change.drain_timeout_ms;
+        }
+        if change.vector_consistency.is_some() {
+            self.vector_consistency = change.vector_consistency;
+        }
+        if change.vector_build_wait.is_some() {
+            self.vector_build_wait = change.vector_build_wait;
         }
     }
 

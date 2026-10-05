@@ -35,6 +35,7 @@ async fn cypher_q(proc: &CoordinodeProcess, query: &str) -> Vec<HashMap<String, 
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .expect("execute_cypher must succeed")
@@ -97,6 +98,7 @@ async fn causal_write_without_concern_uses_the_majority_default() {
             }),
             write_concern: None, // omitted → the majority default
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -132,6 +134,7 @@ async fn causal_write_with_w1_rejected() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -172,6 +175,7 @@ async fn causal_write_with_majority_accepted() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -202,6 +206,7 @@ async fn write_concern_volatile_journal_above_leader_rejected() {
                 timeout_ms: 0,
             }),
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -243,6 +248,7 @@ async fn causal_read_without_majority_accepted() {
             }),
             write_concern: None, // read-only — write_concern irrelevant
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -346,6 +352,7 @@ async fn set_after_delete_must_not_show_unwritten_value() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -577,6 +584,7 @@ async fn temporal_create_without_valid_from_rejected() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
 
@@ -957,6 +965,7 @@ async fn temporal_set_valid_from_rejected() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
     let status = result.expect_err("SET r.valid_from must be rejected on temporal edges");
@@ -988,6 +997,7 @@ async fn temporal_invalid_interval_rejected() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
     let status = result.expect_err("inverted interval must be rejected");
@@ -1064,6 +1074,7 @@ async fn temporal_merge_rejected() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await;
     let status = result.expect_err("MERGE on temporal edge type must be rejected");
@@ -1120,6 +1131,7 @@ async fn temporal_overlaps_with_parameters() {
             read_concern: None,
             write_concern: None,
             transaction_id: 0,
+            ..Default::default()
         })
         .await
         .expect("query must succeed")

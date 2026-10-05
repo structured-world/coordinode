@@ -333,6 +333,64 @@ fn a_session_statement_is_counted_where_it_was_issued() {
     }
 }
 
+/// A Cypher SET on a session changes that session's settings: the session
+/// reports the new setting, and the database's own, which every other client
+/// reads, stays as it was. Before, it changed the database for all clients.
+#[tokio::test]
+async fn a_cypher_set_changes_its_session_not_the_database() {
+    use coordinode_core::graph::types::VectorConsistencyMode;
+    use tokio::sync::mpsc;
+
+    let database = seeded_db(0);
+    let registry = Arc::new(coordinode_session::SessionRegistry::new(
+        std::time::Duration::from_secs(30),
+    ));
+    let manager = SessionManager::new(
+        Arc::new(DatabaseCursorEngine::new(Arc::clone(&database))),
+        registry,
+    );
+    let (op_tx, op_rx) = mpsc::channel(8);
+    let (ev_tx, mut ev_rx) = mpsc::channel(8);
+    let handle = tokio::spawn(manager.open("test".into()).run(op_rx, ev_tx));
+    op_tx
+        .send((
+            1,
+            SessionOp::Execute {
+                query: "SET vector_consistency = 'exact'".to_string(),
+                params: HashMap::new(),
+                txid: 0,
+                nonce: 0,
+                settings: unset(),
+                source: None,
+            },
+        ))
+        .await
+        .expect("send");
+    op_tx
+        .send((2, SessionOp::Configure(unset())))
+        .await
+        .expect("send");
+    drop(op_tx);
+
+    let mut status = None;
+    while let Some((request_id, event)) = ev_rx.recv().await {
+        if let (2, SessionEvent::ConnectionStatus { settings, .. }) = (request_id, event) {
+            status = Some(settings);
+        }
+    }
+    handle.await.expect("session task");
+    assert_eq!(
+        status.expect("a status").vector_consistency,
+        Some(VectorConsistencyMode::Exact),
+        "the session holds the setting"
+    );
+    assert_eq!(
+        database.read().vector_consistency(),
+        VectorConsistencyMode::default(),
+        "the database's own setting is untouched"
+    );
+}
+
 /// A session statement is checked with the settings it runs under, as a unary
 /// one is: a causal write under a concern that can be lost is refused before
 /// anything is written, and the same write under the majority default runs.

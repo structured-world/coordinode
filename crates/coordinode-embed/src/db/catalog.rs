@@ -430,6 +430,7 @@ impl Database {
             snapshot_read_ts: None,
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
+            vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
         };
         self.run_plan(

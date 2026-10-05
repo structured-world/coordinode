@@ -84,7 +84,7 @@ MATCH (p:Product)
 RETURN p.name, vector_distance(p.embedding, $q) AS d
 ORDER BY d LIMIT 10 /*+ vector_build_wait('5s') */
 
--- Every later query of this embedded session that names no bound.
+-- Every later query of this session that names no bound.
 SET vector_build_wait = '250ms'
 ```
 
@@ -92,8 +92,9 @@ Values are a whole number with a unit: `ms`, `s` or `m`; `'0ms'` refuses a
 building index at once. A malformed value is an error, not a hint quietly
 dropped. Without either, the wait is the server's `vector_build_wait_ms`
 (default 30 seconds; see [Configuration](../guide/configuration.md)). `SET`
-applies to an embedded database; over the network a client names its bound
-in the hint.
+applies to an embedded database and to a client's Session stream, each of
+which is one session; a unary call has none and names its bound in the hint
+or in its request (see [Session settings](./reference.md#session-settings-set)).
 
 A backfill that aborts (panic, write error) lands the index in the `Failed`
 state and every reader sees an error regardless of policy. A subsequent
