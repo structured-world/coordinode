@@ -187,6 +187,92 @@ fn vector_build_wait_parses_from_the_config_file() {
     assert_eq!(c.vector_build_wait_ms, Some(1500));
 }
 
+/// The statement defaults: a file that names none keeps the built-in local
+/// read from the leader and the majority journaled write.
+#[test]
+fn statement_defaults_are_the_builtins_when_unset() {
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_raft::read_fence::ReadPreference;
+
+    let d = ServerConfig::default().statement_defaults();
+    assert_eq!(d.read_concern, ReadConcernLevel::Local);
+    assert_eq!(d.read_preference, ReadPreference::Primary);
+    assert_eq!(d.write_concern, WriteConcern::majority());
+}
+
+/// Every statement default parses from the file, each key on its own: the
+/// write concern's unnamed fields keep their built-in values.
+#[test]
+fn statement_defaults_parse_from_the_config_file() {
+    use coordinode_core::txn::read_concern::ReadConcernLevel;
+    use coordinode_core::txn::write_concern::{Journal, WriteAck, WriteConcern};
+    use coordinode_raft::read_fence::ReadPreference;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "default_read_concern: majority\n\
+         default_read_preference: secondary_preferred\n\
+         default_write_concern:\n  w: 2\n  timeout_ms: 500\n",
+    )
+    .unwrap();
+    let d = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .statement_defaults();
+    assert_eq!(d.read_concern, ReadConcernLevel::Majority);
+    assert_eq!(d.read_preference, ReadPreference::SecondaryPreferred);
+    assert_eq!(
+        d.write_concern,
+        WriteConcern {
+            w: WriteAck::Acks(2),
+            journal: Journal::Journal,
+            timeout_ms: 500,
+        }
+    );
+
+    std::fs::write(
+        &path,
+        "default_write_concern: { w: majority, journal: journal }\n",
+    )
+    .unwrap();
+    let d = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .statement_defaults();
+    assert_eq!(d.write_concern, WriteConcern::majority());
+
+    std::fs::write(&path, "default_write_concern: { w: 1, journal: memory }\n").unwrap();
+    let d = ServerConfig::load(Some(path.to_str().unwrap()))
+        .unwrap()
+        .statement_defaults();
+    assert_eq!(d.write_concern, WriteConcern::memory());
+}
+
+/// A default the engine cannot honour fails the load, naming the key, rather
+/// than failing every write that later relies on it; so does a level the
+/// server does not know.
+#[test]
+fn statement_defaults_refuse_what_the_engine_cannot_honour() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    for (yaml, needle) in [
+        (
+            "default_write_concern: { w: majority, journal: memory }\n",
+            "default_write_concern",
+        ),
+        ("default_read_concern: eventual\n", "eventual"),
+        ("default_read_preference: fastest\n", "fastest"),
+        ("default_write_concern: { w: 1, fsync: true }\n", "fsync"),
+    ] {
+        std::fs::write(&path, yaml).unwrap();
+        let err = ServerConfig::load(Some(path.to_str().unwrap()))
+            .expect_err(yaml)
+            .to_string();
+        assert!(err.contains(needle), "{yaml}: {err}");
+    }
+}
+
 /// The vector indexes' retired-memory budget is a config-file setting: unset
 /// it leaves the index default, set it carries the bytes given.
 #[test]

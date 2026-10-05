@@ -1,8 +1,10 @@
 //! Server configuration: CLI args, config file, env vars.
 
 pub mod server;
+pub mod statement_defaults;
 
 pub use server::{CliOverrides, ServerConfig};
+pub use statement_defaults::StatementDefaults;
 
 /// Operational mode for the `coordinode` binary.
 ///

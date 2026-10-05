@@ -29,6 +29,10 @@ use coordinode_storage::engine::config::{
 use coordinode_storage::engine::partition::Partition;
 use serde::Deserialize;
 
+use super::statement_defaults::{
+    ReadConcernSetting, ReadPreferenceSetting, StatementDefaults, WriteConcernSetting,
+};
+
 /// Storage topology: the physical endpoints this node manages.
 ///
 /// An endpoint is one mount point with its own media, durability class, tier,
@@ -334,6 +338,15 @@ pub struct ServerConfig {
     /// Most bytes of log entries the change streams' shared reader keeps in
     /// memory for streams that have not read them yet (`None` = 64 MiB).
     pub cdc_buffer_bytes: Option<usize>,
+    /// Read concern of a statement that names none and whose session set
+    /// none (`None` = `local`).
+    pub default_read_concern: Option<ReadConcernSetting>,
+    /// Read preference of a statement that names none and whose session set
+    /// none (`None` = `primary`).
+    pub default_read_preference: Option<ReadPreferenceSetting>,
+    /// Write concern of a statement that names none and whose session set
+    /// none (`None` = majority, journal, no timeout).
+    pub default_write_concern: Option<WriteConcernSetting>,
     /// Interactive-transaction idle timeout in seconds.
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction.
@@ -453,6 +466,9 @@ impl Default for ServerConfig {
             cdc_heartbeat_interval_ms: None,
             cdc_batch_size: None,
             cdc_buffer_bytes: None,
+            default_read_concern: None,
+            default_read_preference: None,
+            default_write_concern: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
             wire_compression_level: 3,
@@ -540,6 +556,23 @@ impl ServerConfig {
                 .transpose()?,
             max_request_bytes,
         })
+    }
+
+    /// The consistency settings a statement falls back to, with the built-in
+    /// value for every key the file left out.
+    pub fn statement_defaults(&self) -> StatementDefaults {
+        let builtin = StatementDefaults::default();
+        StatementDefaults {
+            read_concern: self
+                .default_read_concern
+                .map_or(builtin.read_concern, Into::into),
+            read_preference: self
+                .default_read_preference
+                .map_or(builtin.read_preference, Into::into),
+            write_concern: self
+                .default_write_concern
+                .map_or(builtin.write_concern, |s| s.0),
+        }
     }
 
     /// Fold command-line overrides in last: any field the CLI set (`Some`)

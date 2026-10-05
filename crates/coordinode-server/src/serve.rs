@@ -153,6 +153,7 @@ pub(crate) async fn serve(
     // (config-file surface; applied to the Database / worker below).
     let trigger_dispatch_cfg = cfg.trigger_dispatch_config();
     let trigger_dispatch_interval = cfg.trigger_dispatch_interval();
+    let statement_defaults = cfg.statement_defaults();
     let config::ServerConfig {
         node_id,
         grpc_addr,
@@ -183,6 +184,10 @@ pub(crate) async fn serve(
         cdc_heartbeat_interval_ms,
         cdc_batch_size,
         cdc_buffer_bytes,
+        // Already captured above (statement_defaults) before the move.
+        default_read_concern: _,
+        default_read_preference: _,
+        default_write_concern: _,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
         peers: peers_vec,
@@ -714,6 +719,10 @@ pub(crate) async fn serve(
         // `usize::MAX` means.
         database.set_vector_retired_bytes_budget(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
+    // What a statement executes under when neither it nor its session names a
+    // concern.
+    database.set_read_concern(statement_defaults.read_concern);
+    database.set_write_concern(statement_defaults.write_concern);
     // no-std: spin::RwLock (drop-in).
     let database = Arc::new(parking_lot::RwLock::new(database));
 
@@ -1063,7 +1072,8 @@ pub(crate) async fn serve(
             Arc::clone(&database),
             Arc::clone(&query_registry),
             Arc::clone(&nplus1_detector),
-        );
+        )
+        .with_statement_defaults(statement_defaults);
         if let Some(ref rn) = raft_node_shared {
             svc.with_raft_node(Arc::clone(rn))
         } else {

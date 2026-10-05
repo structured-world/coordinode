@@ -105,9 +105,9 @@ fn cypher_request(q: &str) -> Request<query::ExecuteCypherRequest> {
     Request::new(query::ExecuteCypherRequest {
         query: q.to_string(),
         parameters: std::collections::HashMap::new(),
-        read_preference: 0,  // UNSPECIFIED → Primary
-        read_concern: None,  // UNSPECIFIED → Local
-        write_concern: None, // omitted → the majority default
+        read_preference: 0,  // omitted → the server default (Primary here)
+        read_concern: None,  // omitted → the server default (Local here)
+        write_concern: None, // omitted → the database default (majority here)
         transaction_id: 0,   // auto-commit
     })
 }
@@ -1741,6 +1741,107 @@ async fn raft_write_returns_own_committed_index() {
     );
 
     node.shutdown().await.expect("shutdown");
+}
+
+/// A request that names no read preference is fenced with the server's
+/// default: `secondary` refuses it on the leader, while a request on the same
+/// leader that names `primary` is served. Guards against the unnamed field
+/// falling back to the built-in `primary` regardless of the configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unnamed_read_preference_takes_the_server_default() {
+    let (svc, node, _dir) = test_service_raft().await;
+    let svc = svc.with_statement_defaults(StatementDefaults {
+        read_preference: ReadPreference::Secondary,
+        ..StatementDefaults::default()
+    });
+
+    let refused = svc
+        .execute_cypher(cypher_request("RETURN 1 AS one"))
+        .await
+        .expect_err("the leader refuses a secondary read");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("SECONDARY"),
+        "refused for the default preference, got: {}",
+        refused.message()
+    );
+
+    let mut named = cypher_request("RETURN 1 AS one");
+    named.get_mut().read_preference = 1; // PRIMARY
+    let served = svc
+        .execute_cypher(named)
+        .await
+        .expect("a named preference wins over the default")
+        .into_inner();
+    assert_eq!(served.rows.len(), 1);
+
+    node.shutdown().await.expect("shutdown");
+}
+
+/// A request that names no read concern level takes the server's default:
+/// with `majority` configured, a causal read (after_index set, level left
+/// unspecified) is accepted, where the built-in `local` refuses it.
+#[tokio::test]
+async fn an_unnamed_read_concern_takes_the_server_default() {
+    let causal = || {
+        Request::new(query::ExecuteCypherRequest {
+            query: "RETURN 1 AS one".to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 0, // unspecified
+                after_index: 1,
+                at_timestamp: 0,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+        })
+    };
+
+    let (builtin, _dir) = test_service();
+    let refused = builtin
+        .execute_cypher(causal())
+        .await
+        .expect_err("the built-in local default refuses a causal read");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+
+    let (svc, _dir2) = test_service();
+    let svc = svc.with_statement_defaults(StatementDefaults {
+        read_concern: ExecutorReadConcernLevel::Majority,
+        ..StatementDefaults::default()
+    });
+    let served = svc
+        .execute_cypher(causal())
+        .await
+        .expect("a majority default admits the causal read")
+        .into_inner();
+    assert_eq!(served.rows.len(), 1);
+}
+
+/// A causal write that names no write concern is checked against the one it
+/// will run under, the database's default: with `w:1` there it is refused
+/// rather than passed as if it carried the majority built-in.
+#[tokio::test]
+async fn an_unnamed_write_concern_is_checked_as_the_database_default() {
+    let (svc, _dir) = test_service();
+    svc.database.write().set_write_concern(WriteConcern::w1());
+    let refused = svc
+        .execute_cypher(Request::new(query::ExecuteCypherRequest {
+            query: "CREATE (n:DefaultWc) RETURN n".to_string(),
+            parameters: std::collections::HashMap::new(),
+            read_preference: 0,
+            read_concern: Some(crate::proto::replication::ReadConcern {
+                level: 2, // MAJORITY
+                after_index: 1,
+                at_timestamp: 0,
+            }),
+            write_concern: None,
+            transaction_id: 0,
+        }))
+        .await
+        .expect_err("a w:1 default is not causal-safe");
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("writeConcern"));
 }
 
 /// after_index = 0 with any readConcern level is always valid (no fence).

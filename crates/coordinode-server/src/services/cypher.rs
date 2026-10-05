@@ -22,6 +22,7 @@ use coordinode_raft::read_fence::{
 };
 use coordinode_replicate::ReplicatedWriter;
 
+use crate::config::StatementDefaults;
 use crate::proto::{common, query, replication};
 
 /// Extract source location context from gRPC request metadata.
@@ -566,6 +567,17 @@ fn read_concern_level_to_executor(level: i32) -> ExecutorReadConcernLevel {
     }
 }
 
+/// The read fence's view of an executor read concern level: the same four
+/// levels, checked before the statement runs.
+fn fence_concern(level: ExecutorReadConcernLevel) -> ReadConcern {
+    match level {
+        ExecutorReadConcernLevel::Local => ReadConcern::Local,
+        ExecutorReadConcernLevel::Majority => ReadConcern::Majority,
+        ExecutorReadConcernLevel::Linearizable => ReadConcern::Linearizable,
+        ExecutorReadConcernLevel::Snapshot => ReadConcern::Snapshot,
+    }
+}
+
 /// Translate a wire `WriteConcern` to the executor's.
 ///
 /// `w` unset is majority and `journal` unset is journaled, the same defaults
@@ -721,6 +733,10 @@ pub struct CypherServiceImpl {
     /// poison the entry; keeping them keyed by address means a leadership
     /// change costs a map lookup rather than a connection.
     peer_channels: Arc<parking_lot::Mutex<HashMap<String, tonic::transport::Channel>>>,
+    /// The read concern and preference a request that names none is fenced
+    /// with. Its write concern comes from the database, which the server
+    /// seeds with the same defaults.
+    defaults: StatementDefaults,
 }
 
 /// Marks a request that has already been forwarded once.
@@ -761,7 +777,15 @@ impl CypherServiceImpl {
             nplus1_detector,
             raft_node: None,
             peer_channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            defaults: StatementDefaults::default(),
         }
+    }
+
+    /// Fence a request that names no read concern or preference with these
+    /// instead of the built-in ones.
+    pub fn with_statement_defaults(mut self, defaults: StatementDefaults) -> Self {
+        self.defaults = defaults;
+        self
     }
 
     /// Attach a Raft node for read fence enforcement (cluster mode).
@@ -906,8 +930,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         // Extract causal fence parameters before entering the Raft block so that
         // validation can run in both cluster and standalone modes.
-        let concern_level = req.read_concern.as_ref().map(|rc| rc.level).unwrap_or(0);
-        let concern = ReadConcern::from_proto(concern_level);
+        let level = match req.read_concern.as_ref().map(|rc| rc.level) {
+            None | Some(0) => self.defaults.read_concern,
+            Some(level) => read_concern_level_to_executor(level),
+        };
+        let concern = fence_concern(level);
         let after_idx = req
             .read_concern
             .as_ref()
@@ -961,11 +988,11 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                     ast.is_write(&|name| db.procedures().writes(name))
                 };
                 if writes {
-                    // A request that names no concern gets the majority default
-                    // and is as safe here as one that asks for it.
+                    // A request that names no concern runs under the
+                    // database's default, so that is the one to check.
                     let concern = match req.write_concern.as_ref() {
                         Some(wc) => write_concern_from_proto(wc)?,
-                        None => WriteConcern::default(),
+                        None => self.database.read().write_concern(),
                     };
                     if !concern.is_causal_safe() {
                         return Err(Status::failed_precondition(
@@ -990,7 +1017,10 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // and applied_index is always 0 — causal fences are trivially satisfied.
         let (applied_index, served_by_leader, read_as_of_ts) =
             if let Some(ref raft) = self.raft_node {
-                let preference = ReadPreference::from_proto(req.read_preference);
+                let preference = match req.read_preference {
+                    0 => self.defaults.read_preference,
+                    named => ReadPreference::from_proto(named),
+                };
                 let mut fence = raft.read_fence();
                 if let Err(e) = fence.apply_default(preference, concern).await {
                     // The request needs the leader and this node is not it. Pass it
@@ -1042,18 +1072,13 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // at_timestamp only meaningful with SNAPSHOT level (see proto doc).
         // Reject misuse at the boundary rather than letting it silently slide
         // through to a non-snapshot read which would ignore the timestamp.
-        if at_ts_raw > 0
-            && !matches!(
-                read_concern_level_to_executor(concern_level),
-                ExecutorReadConcernLevel::Snapshot
-            )
-        {
+        if at_ts_raw > 0 && level != ExecutorReadConcernLevel::Snapshot {
             return Err(Status::failed_precondition(
                 "readConcern.at_timestamp is only valid with level=SNAPSHOT",
             ));
         }
         let executor_read_concern = ExecutorReadConcern {
-            level: read_concern_level_to_executor(concern_level),
+            level,
             after_index: if after_idx > 0 { Some(after_idx) } else { None },
             at_timestamp: if at_ts_raw > 0 { Some(at_ts_raw) } else { None },
         };
