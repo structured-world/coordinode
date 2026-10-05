@@ -189,6 +189,56 @@ fn a_build_outwaited_by_an_older_transaction_fails() {
     );
 }
 
+/// Two statements creating an index under one name at the same time, on
+/// different properties: exactly one wins, the loser is refused without an
+/// index of its own, and the winner's index alone is defined and built.
+/// Repeated so that the two publications actually overlap.
+#[test]
+fn concurrent_creates_of_one_index_name_have_one_winner() {
+    let (db, _dir) = open_db();
+    for round in 0..16 {
+        let name = format!("idx_{round}");
+        let statements = [
+            format!("CREATE INDEX {name} ON :User(email)"),
+            format!("CREATE INDEX {name} ON :User(name)"),
+        ];
+        let start = std::sync::Barrier::new(2);
+        let outcomes: Vec<Result<(), String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = statements
+                .iter()
+                .map(|statement| {
+                    let (db, start) = (&db, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        create_index(db, statement)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("the statement thread"))
+                .collect()
+        });
+
+        let winners: Vec<&str> = outcomes
+            .iter()
+            .zip(["email", "name"])
+            .filter(|(outcome, _)| outcome.is_ok())
+            .map(|(_, property)| property)
+            .collect();
+        assert_eq!(winners.len(), 1, "round {round}: {outcomes:?}");
+        let def = index_named(db.engine(), &name).expect("the winner's index");
+        assert_eq!(def.properties, [winners[0]], "round {round}");
+        assert_eq!(def.state, IndexState::Ready, "round {round}");
+        assert!(
+            status_of(&db, &name)
+                .and_then(|s| s.record)
+                .is_some_and(|r| r.state == BuildState::Published),
+            "round {round}"
+        );
+    }
+}
+
 /// A build its statement never saw finish, as after a crash, is taken up
 /// when the database opens again: the index ends ready and serves lookups.
 #[test]
