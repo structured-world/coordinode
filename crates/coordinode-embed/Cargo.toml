@@ -53,5 +53,9 @@ harness = false
 name = "index_write"
 harness = false
 
+[[bench]]
+name = "text_history"
+harness = false
+
 [lints]
 workspace = true

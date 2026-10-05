@@ -351,6 +351,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         LogicalOp::Extension { .. }
         | LogicalOp::NodeScan { .. }
         | LogicalOp::HnswScan { .. }
+        | LogicalOp::TextIndexScan { .. }
         | LogicalOp::Empty
         | LogicalOp::AlterLabel { .. }
         | LogicalOp::CreateTextIndex { .. }

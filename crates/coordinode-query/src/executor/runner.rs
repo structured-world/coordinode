@@ -3057,6 +3057,7 @@ pub(crate) fn plan_allows_varlen_target_dedup(root: &LogicalOp) -> bool {
             LogicalOp::NodeScan { .. }
             | LogicalOp::IndexScan { .. }
             | LogicalOp::HnswScan { .. }
+            | LogicalOp::TextIndexScan { .. }
             | LogicalOp::Empty => return found_qualifying,
             // Any branch / mutation / unrecognised op: stay safe, do not dedup.
             _ => return false,
@@ -3316,6 +3317,23 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             function,
             distance_alias.as_deref(),
             index_name,
+            ctx,
+        ),
+
+        // Index access path for text_match over one label: the index's
+        // matches are the row source; only those nodes are fetched.
+        LogicalOp::TextIndexScan {
+            label,
+            property,
+            binding,
+            query_string,
+            language,
+        } => execute_text_index_scan(
+            label,
+            property,
+            binding,
+            query_string,
+            language.as_deref(),
             ctx,
         ),
 
@@ -5353,6 +5371,59 @@ fn execute_hnsw_scan(
         results.push(row);
     }
     Ok(results)
+}
+
+/// Execute the `TextIndexScan` access path: every node the text index of
+/// `(label, property)` matches for `query`, as this statement reads the store
+/// (the same view `TextFilter` uses), fetched in one batch and shaped as the
+/// `NodeScan` rows it replaces, in node-id order, each carrying its score for
+/// `text_score()`.
+fn execute_text_index_scan(
+    label: &str,
+    property: &str,
+    binding: &str,
+    query: &str,
+    language: Option<&str>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    use coordinode_modality::NodeStore as _;
+
+    let Some(registry) = ctx.text_index_registry else {
+        return Err(text_match_missing_index_error(Some(label), Some(property)));
+    };
+    materialize_own_node_writes(ctx)?;
+    let matches = text_index_matches(registry, label, property, query, language, ctx)
+        .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+        // Dropped between planning and execution: refused as TextFilter does.
+        .ok_or_else(|| text_match_missing_index_error(Some(label), Some(property)))?;
+
+    let mut ids: Vec<NodeId> = matches.keys().map(|id| NodeId::from_raw(*id)).collect();
+    ids.sort_unstable();
+    let records = coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+    let mut rows = Vec::with_capacity(ids.len());
+    for (id, record) in ids.into_iter().zip(records) {
+        let Some(record) = record.filter(|r| r.has_label(label)) else {
+            continue;
+        };
+        let mut row = Row::new();
+        row.insert(binding.to_string(), Value::Int(id.as_raw() as i64));
+        for (field_id, value) in &record.props {
+            if let Some(field_name) = ctx.interner.resolve(*field_id) {
+                row.insert(format!("{binding}.{field_name}"), value.clone());
+            }
+        }
+        if let Some(extra) = &record.extra {
+            for (name, value) in extra {
+                row.insert(format!("{binding}.{name}"), value.clone());
+            }
+        }
+        let primary_label = insert_label_columns(&mut row, binding, &record);
+        inject_computed_properties(&mut row, binding, &primary_label, ctx);
+        let score = matches.get(&id.as_raw()).copied().unwrap_or_default();
+        row.insert("__text_score__".to_string(), Value::Float(f64::from(score)));
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// The scalar a vector ORDER BY function computes for `a` against `b`;

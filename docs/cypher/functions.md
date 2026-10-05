@@ -105,7 +105,7 @@ ORDER BY relevance DESC
 |----------|-----------|---------|-------|
 | `hybrid_score` | `hybrid_score(node, query [, weights])` | Float | Opinionated blend of vector + text scores cached on the row |
 
-`hybrid_score` is sugar for the arithmetic pattern `w_vec · (1 - vector_distance) + w_text · text_score`. It reads the vector score cached by `VectorFilter` (from `WHERE vector_distance(...) < X` / `vector_similarity(...) > X`) and the BM25 score cached by `TextFilter` (from `WHERE text_match(...)`), then blends them with default weights `{vector: 0.65, text: 0.35}` or an override map passed as the third argument.
+`hybrid_score` is sugar for the arithmetic pattern `w_vec · (1 - vector_distance) + w_text · text_score`. It reads the vector score cached by `VectorFilter` (from `WHERE vector_distance(...) < X` / `vector_similarity(...) > X`) and the BM25 score cached by the `text_match` read (`TextIndexScan` or `TextFilter`, from `WHERE text_match(...)`), then blends them with default weights `{vector: 0.65, text: 0.35}` or an override map passed as the third argument.
 
 Vector normalisation is automatic based on the metric used in `WHERE`:
 - `vector_similarity` (cosine) → used raw (already bounded to `[-1, 1]` / `[0, 1]`)

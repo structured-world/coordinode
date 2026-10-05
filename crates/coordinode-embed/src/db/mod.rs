@@ -2982,6 +2982,10 @@ impl Database {
             &self.vector_index_registry,
             plan.vector_consistency,
         );
+        // text_match over one label reads its matches from the text index
+        // instead of scanning the label to keep them.
+        plan.root =
+            planner::apply_text_index_scan_access_path(plan.root, &self.text_index_registry);
         // Every VectorFilter after a Traverse gets its strategy (graph_first /
         // acorn_filtered / vector_first) from the push-down cost model.
         plan.root = planner::optimize_push_down_lazy(plan.root, stats);

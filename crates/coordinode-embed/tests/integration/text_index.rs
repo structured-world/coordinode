@@ -18,6 +18,73 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+// ── Access path ─────────────────────────────────────────────────────
+
+/// `text_match` over one label reads its matches from the index instead of
+/// scanning the label: the plan names `TextIndexScan`, and the rows, columns
+/// and scores are those of the scan-and-filter plan, which an inline property
+/// filter keeps. The transaction's own uncommitted text is part of the
+/// answer, as on the filter path.
+#[test]
+fn text_match_over_one_label_reads_through_the_index() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    for (name, body) in [
+        ("a", "rust graph engine"),
+        ("b", "golang services"),
+        ("c", "rust rust storage"),
+    ] {
+        db.execute_cypher(&format!(
+            "CREATE (:Article {{name: '{name}', kind: 'post', body: '{body}'}})"
+        ))
+        .expect("create article");
+    }
+
+    let indexed = "MATCH (n:Article) WHERE text_match(n.body, 'rust') \
+                   RETURN n.name AS name, text_score(n.body, 'rust') AS score \
+                   ORDER BY name";
+    let scanned = "MATCH (n:Article {kind: 'post'}) WHERE text_match(n.body, 'rust') \
+                   RETURN n.name AS name, text_score(n.body, 'rust') AS score \
+                   ORDER BY name";
+    let plan = db.explain_cypher(indexed).expect("explain");
+    assert!(plan.contains("TextIndexScan"), "the index path:\n{plan}");
+    assert!(!plan.contains("NodeScan"), "no label scan:\n{plan}");
+    let plan = db.explain_cypher(scanned).expect("explain");
+    assert!(plan.contains("TextFilter"), "the filter path:\n{plan}");
+
+    let through_index = db.execute_cypher(indexed).expect("index path");
+    assert_eq!(
+        through_index,
+        db.execute_cypher(scanned).expect("filter path")
+    );
+    let names: Vec<_> = through_index
+        .iter()
+        .map(|r| r.get("name").cloned())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            Some(Value::String("a".into())),
+            Some(Value::String("c".into()))
+        ]
+    );
+
+    // An uncommitted article of the reading transaction is found.
+    let tx = db.begin_transaction();
+    db.execute_in_transaction(
+        tx,
+        "CREATE (:Article {name: 'd', kind: 'post', body: 'rust draft'})",
+        None,
+    )
+    .expect("own write");
+    let own = db
+        .execute_in_transaction(tx, indexed, None)
+        .expect("index path in the transaction");
+    assert_eq!(own.len(), 3, "{own:?}");
+    db.rollback_transaction(tx).expect("rollback");
+}
+
 // ── Transactional maintenance ──────────────────────────────────────
 
 /// A text change in a transaction that rolls back is never searchable: the

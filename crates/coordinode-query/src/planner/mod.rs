@@ -10,9 +10,9 @@ pub mod logical;
 pub mod push_down;
 
 pub use builder::{
-    PlanError, annotate_vector_top_k, apply_hnsw_scan_access_path, build_logical_plan,
-    optimize_index_selection, optimize_push_down, optimize_push_down_lazy,
-    vector_index_definition_from_clause,
+    PlanError, annotate_vector_top_k, apply_hnsw_scan_access_path,
+    apply_text_index_scan_access_path, build_logical_plan, optimize_index_selection,
+    optimize_push_down, optimize_push_down_lazy, vector_index_definition_from_clause,
 };
 pub use expr_lower::lower_expr;
 pub use logical::{

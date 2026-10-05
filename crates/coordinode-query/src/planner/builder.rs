@@ -1862,6 +1862,58 @@ fn annotate_top_k_index(op: LogicalOp, registry: &crate::index::VectorIndexRegis
     }
 }
 
+/// Access-path pass: replace `TextFilter { input: NodeScan }` over one label
+/// with the [`LogicalOp::TextIndexScan`] source when a text index covers that
+/// label and the matched property. The index answers which nodes match; the
+/// scan read every node of the label to keep those. A scan with inline
+/// property filters, or a text expression on another binding, keeps the
+/// filter: the access path fetches the matches alone.
+pub fn apply_text_index_scan_access_path(
+    op: LogicalOp,
+    registry: &crate::index::TextIndexRegistry,
+) -> LogicalOp {
+    use crate::plan::expr::Expr;
+
+    let op = op.map_inputs(|child| apply_text_index_scan_access_path(child, registry));
+    let LogicalOp::TextFilter {
+        input,
+        text_expr,
+        query_string,
+        language,
+    } = op
+    else {
+        return op;
+    };
+    if let (
+        LogicalOp::NodeScan {
+            variable,
+            labels,
+            property_filters,
+        },
+        Expr::Property { base, key },
+    ) = (input.as_ref(), &text_expr)
+    {
+        let on_scanned = matches!(base.as_ref(), Expr::Variable(v) if v == variable);
+        if let [label] = labels.as_slice() {
+            if on_scanned && property_filters.is_empty() && registry.has_index(label, key) {
+                return LogicalOp::TextIndexScan {
+                    label: label.clone(),
+                    property: key.clone(),
+                    binding: variable.clone(),
+                    query_string,
+                    language,
+                };
+            }
+        }
+    }
+    LogicalOp::TextFilter {
+        input,
+        text_expr,
+        query_string,
+        language,
+    }
+}
+
 /// Access-path pass: replace `VectorTopK { input: bare NodeScan }` with
 /// the [`LogicalOp::HnswScan`] SOURCE operator when the query is a pure
 /// vector top-K over one label with a registered HNSW index.

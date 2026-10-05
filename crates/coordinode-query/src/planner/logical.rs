@@ -901,6 +901,28 @@ pub enum LogicalOp {
         index_name: String,
     },
 
+    /// Full-text index access path: a SOURCE operator (peer of NodeScan).
+    ///
+    /// Replaces `TextFilter { input: NodeScan }` when a text index covers the
+    /// label and property: the executor asks the index for every match and
+    /// point-fetches only those nodes, instead of materialising the whole
+    /// label to keep the few rows the index names. Membership and scores are
+    /// the index view's, as for `TextFilter`; the score lands in each row the
+    /// same way, for `text_score()`.
+    TextIndexScan {
+        /// Label whose index serves the scan.
+        label: String,
+        /// Text property the index covers.
+        property: String,
+        /// Row binding name for the fetched node (the MATCH variable).
+        binding: String,
+        /// Query string literal.
+        query_string: String,
+        /// Optional language for query tokenization; the index's default
+        /// when None.
+        language: Option<String>,
+    },
+
     /// `FOREACH (variable IN list | body)`: for each input row and each element
     /// of `list` (evaluated per row), bind `variable` and run the `body`
     /// sub-plan of updating operators. Pass-through: the input rows continue
@@ -991,6 +1013,7 @@ impl LogicalOp {
             | LogicalOp::NodeScan { .. }
             | LogicalOp::IndexScan { .. }
             | LogicalOp::HnswScan { .. }
+            | LogicalOp::TextIndexScan { .. }
             | LogicalOp::Empty
             | LogicalOp::AlterLabel { .. }
             | LogicalOp::CreateTextIndex { .. }
@@ -1196,6 +1219,8 @@ impl LogicalOp {
             LogicalOp::HnswScan { query_vector, .. } => {
                 query_vector.substitute_params(params);
             }
+            // The query string is a literal the planner extracted.
+            LogicalOp::TextIndexScan { .. } => {}
             LogicalOp::VectorTopK {
                 input,
                 vector_expr,
@@ -1610,6 +1635,17 @@ fn estimate_op_cost(
         // source op when applicable — costed as k so the planner always
         // prefers it over a full NodeScan of the same label.
         LogicalOp::HnswScan { k, .. } => (*k as f64, *k as f64),
+
+        // TextIndexScan: the index's posting lists plus one point read per
+        // match. Rows as the TextFilter it replaces estimates them (about a
+        // tenth of the label), cost those reads alone, no label scan.
+        LogicalOp::TextIndexScan { label, .. } => {
+            let label_rows = stats
+                .and_then(|s| s.node_count_for_label(label))
+                .map_or(defaults.node_count / defaults.label_count, |n| n as f64);
+            let rows = (label_rows * 0.1).max(1.0);
+            (rows, rows)
+        }
 
         LogicalOp::Traverse {
             input,
@@ -2152,6 +2188,21 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 .unwrap_or_default();
             output.push_str(&format!(
                 "{prefix}HnswScan({binding}:{label} ON {index_name}({property}), {function} k={k}{alias_info})\n"
+            ));
+        }
+        LogicalOp::TextIndexScan {
+            label,
+            property,
+            binding,
+            query_string,
+            language,
+        } => {
+            let language = language
+                .as_deref()
+                .map(|l| format!(", language: \"{l}\""))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "{prefix}TextIndexScan({binding}:{label}({property}), text_match \"{query_string}\"{language})\n"
             ));
         }
         LogicalOp::Traverse {
