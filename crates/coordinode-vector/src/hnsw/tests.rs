@@ -2355,6 +2355,105 @@ fn a_single_large_insert_batch_keeps_recall() {
     );
 }
 
+/// Live nodes no path from the entry point reaches, over the edges of every
+/// layer: what a search can never return.
+fn unreachable_live_nodes(index: &HnswIndex) -> usize {
+    let Some((entry, _)) = index.entry_point.for_search() else {
+        return 0;
+    };
+    let n = index.node_len();
+    let mut reached = vec![false; n];
+    let mut stack = vec![entry];
+    reached[entry] = true;
+    while let Some(i) = stack.pop() {
+        for level in 0..index.node_levels(i) {
+            for nb in index.layer_snapshot(i, level) {
+                let nb = nb as usize;
+                if nb < n && !reached[nb] {
+                    reached[nb] = true;
+                    stack.push(nb);
+                }
+            }
+        }
+    }
+    (0..n)
+        .filter(|&i| !reached[i] && index.nodes().state(i) == data_level0::NodeState::Live)
+        .count()
+}
+
+/// A build batch on a wide thread pool leaves no node unreachable, and its
+/// self-recall stays near that of inserting one by one. Pruning a full
+/// list can drop a node's last incoming edge, and inserts in flight together
+/// never see each other, so before the reachability repair a 128-thread
+/// build of 600 points left nodes no search could return: self-recall fell
+/// to 505/600 against 576 serial. Many builds, since the loss depends on
+/// how the inserts interleave.
+#[test]
+fn a_build_batch_on_a_wide_pool_leaves_no_node_unreachable() {
+    let n = 600usize;
+    let dim = 20usize;
+    let items: Vec<(u64, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v = (0..dim)
+                .map(|d| {
+                    let seed = (i.wrapping_mul(2_654_435_761).wrapping_add(d * 6_700_417)) as u32;
+                    let bits = (seed ^ (seed >> 13)) & 0x00FF_FFFF;
+                    (bits as f32 / 16_777_216.0) - 0.5
+                })
+                .collect();
+            (i as u64, v)
+        })
+        .collect();
+    let cfg = || HnswConfig {
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        max_dimensions: 65_536,
+        ..Default::default()
+    };
+    let self_recall = |index: &HnswIndex| {
+        items
+            .iter()
+            .filter(|(id, v)| index.search(v, 1).first().is_some_and(|r| r.id == *id))
+            .count()
+    };
+    let mut serial = HnswIndex::new(cfg());
+    for (id, v) in items.clone() {
+        serial.insert(id, v);
+    }
+    // Reachability is exact; recall is approximate, and a concurrent build
+    // is a different graph from the serial one, so its self-recall varies
+    // around it (547-600 here). A graph that lost reachability fell far
+    // below this floor.
+    let floor = self_recall(&serial) * 9 / 10;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(128)
+        .build()
+        .unwrap();
+    for build in 0..12 {
+        for bulk in [false, true] {
+            let mut batched = HnswIndex::new(cfg());
+            pool.install(|| {
+                if bulk {
+                    batched.bulk_build(items.clone());
+                } else {
+                    batched.insert_batch(items.clone());
+                }
+            });
+            assert_eq!(
+                unreachable_live_nodes(&batched),
+                0,
+                "build {build} (bulk: {bulk}): a node no search can reach"
+            );
+            let got = self_recall(&batched);
+            assert!(
+                got >= floor,
+                "build {build} (bulk: {bulk}): self-recall {got}/{n} below {floor}"
+            );
+        }
+    }
+}
+
 #[test]
 fn insert_batch_below_threshold_runs_sequentially() {
     // Small batches (< 16 items) bypass rayon; the result must still

@@ -173,10 +173,11 @@ fn bulk_build_cache_optimized_yields_working_graph() {
         }
     }
     // This only asserts the end-to-end build path yields a functioning graph,
-    // not its quality. The parallel follower insert assigns node levels from a
-    // shared atomic RNG whose interleaving is nondeterministic, so the seeded
-    // approximate bulk-build self-recall varies run to run (observed ~68-88%
-    // here). A reorder-corrupted graph instead collapses self-recall toward
+    // not its quality. The parallel follower insert interleaves
+    // nondeterministically, so the approximate bulk-build self-recall varies
+    // run to run (every node stays reachable; quality is covered by
+    // `a_build_batch_on_a_wide_pool_leaves_no_node_unreachable`). A
+    // reorder-corrupted graph instead collapses self-recall toward
     // zero, so the bar sits well below the working-build floor and far above
     // collapse — it separates "working" from "corrupted". The exact-identity
     // correctness of reorder (results unchanged before/after) is covered

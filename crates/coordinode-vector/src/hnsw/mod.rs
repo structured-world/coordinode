@@ -1040,6 +1040,11 @@ impl HnswIndex {
     pub fn insert_batch_shared(&self, mut items: Vec<(u64, Vec<f32>)>) -> bool {
         use rayon::prelude::*;
         const SEED_DENSITY: usize = 64;
+        // A batch of at least a quarter of the graph runs the
+        // reachability repair after it.
+        const CONNECT_SHARE: usize = 4;
+        // Bound on repair passes; each finds fewer unreached nodes.
+        const CONNECT_PASSES: usize = 8;
 
         self.screen_dims(&mut items);
         // Concurrent inserts of one id finish in any order; keeping only the
@@ -1065,6 +1070,17 @@ impl HnswIndex {
         rest.par_iter().for_each(|(id, vector)| {
             self.insert_shared(*id, vector);
         });
+        // A batch this large is a build: one pass over the graph per node it
+        // adds four times over is cheap next to linking them.
+        if !rest.is_empty() && rest.len() * CONNECT_SHARE >= self.len() {
+            // A pass that found nothing unreached proves the graph whole; a
+            // later pass sees what an earlier one's edges reached.
+            for _ in 0..CONNECT_PASSES {
+                if self.connect_unreachable() == 0 {
+                    break;
+                }
+            }
+        }
         self.calibration_due()
     }
 
@@ -1751,6 +1767,131 @@ impl HnswIndex {
                 }
             }
         }
+    }
+
+    /// Make every live node reachable on layer 0 from the entry point again,
+    /// as Lucene's builder connects the components of a finished graph.
+    ///
+    /// Pruning a full list may drop a node's last incoming edge, and inserts
+    /// in flight together never see each other, so close nodes inserted at
+    /// once can end up linked only among themselves. A search cannot reach
+    /// such a node, whatever its ef. Each unreached node gets an edge from
+    /// the nearest reached node a search finds, preferring one with room; a
+    /// full list gives up its farthest neighbour that another reached node
+    /// also links. Everything the linked node reaches is then reached too, so
+    /// one edge connects a whole component.
+    ///
+    /// One pass over every list, so it runs after a batch that is a large
+    /// share of the graph (a build), not after each insert. Nodes whose f32
+    /// vector was offloaded cannot be searched for and are left as they are.
+    /// Returns how many live nodes were unreached when the pass began; a pass
+    /// that found none left nothing to repair.
+    fn connect_unreachable(&self) -> usize {
+        let Some((entry, _)) = self.entry_point.for_search() else {
+            return 0;
+        };
+        let store = self.nodes();
+        let n = self.node_len();
+        let live = |i: usize| store.state(i) == data_level0::NodeState::Live;
+        let mut list = Vec::new();
+        let mut reached = vec![false; n];
+        let mut frontier = Vec::new();
+        let mut reach_from = |start: usize, reached: &mut [bool], list: &mut Vec<u64>| {
+            if reached[start] {
+                return;
+            }
+            reached[start] = true;
+            frontier.push(start);
+            while let Some(i) = frontier.pop() {
+                // A search walks the upper layers before layer 0, so an
+                // edge on any layer of a reached node leads somewhere it
+                // can get to.
+                for level in 0..self.node_levels(i) {
+                    self.layer_snapshot_into(i, level, list);
+                    for &nb in list.iter() {
+                        let nb = nb as usize;
+                        if nb < n && !reached[nb] {
+                            reached[nb] = true;
+                            frontier.push(nb);
+                        }
+                    }
+                }
+            }
+        };
+        reach_from(entry, &mut reached, &mut list);
+        // Layer-0 edges from reached nodes only: an edge from a node no
+        // search gets to keeps nothing reachable.
+        let mut in_degree = vec![0u32; n];
+        for i in (0..n).filter(|&i| reached[i] && live(i)) {
+            self.layer_snapshot_into(i, 0, &mut list);
+            for &nb in &list {
+                if let Some(d) = in_degree.get_mut(nb as usize) {
+                    *d += 1;
+                }
+            }
+        }
+
+        let max_conn = self.config.m_max0;
+        let mut unreached = 0;
+        for u in 0..n {
+            if reached[u] || !live(u) {
+                continue;
+            }
+            unreached += 1;
+            let Some(vector) = self.read_node_f32(u) else {
+                continue;
+            };
+            let Some(plan) = self.plan_links(vector, 0) else {
+                return unreached;
+            };
+            let candidates: Vec<usize> = plan
+                .into_iter()
+                .find(|p| p.level == 0)
+                .map(|p| p.selected_idxs)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&p| p != u && p < n && reached[p] && live(p))
+                .collect();
+            let mut linked = false;
+            for p in candidates {
+                let mut evicted = None;
+                let published = self.layer_update(p, 0, |current| {
+                    evicted = None;
+                    if current.contains(&(u as u64)) {
+                        return None;
+                    }
+                    let mut next = current.to_vec();
+                    if next.len() >= max_conn {
+                        // Only a neighbour something else also reaches may
+                        // go, or the repair would orphan it.
+                        let w = next
+                            .iter()
+                            .copied()
+                            .filter(|&w| in_degree.get(w as usize).is_some_and(|&d| d > 1))
+                            .max_by(|&a, &b| {
+                                self.distance_between_nodes(p, a as usize)
+                                    .total_cmp(&self.distance_between_nodes(p, b as usize))
+                            })?;
+                        evicted = Some(w);
+                        next.retain(|&x| x != w);
+                    }
+                    next.push(u as u64);
+                    Some(next)
+                });
+                if published {
+                    if let Some(w) = evicted {
+                        in_degree[w as usize] -= 1;
+                    }
+                    linked = true;
+                    break;
+                }
+            }
+            if linked {
+                in_degree[u] += 1;
+                reach_from(u, &mut reached, &mut list);
+            }
+        }
+        unreached
     }
 
     /// Retire node `old`, removed or replaced by a newer node of the same id:
