@@ -221,7 +221,7 @@ Source: [structured-world/coordinode-python](https://github.com/structured-world
 
 ## Contributing
 
-Bug reports, features and documentation are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the [Contributor License Agreement](CLA.md). Security issues go to the address in [SECURITY.md](SECURITY.md).
+Bug reports, features and documentation are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Before a first pull request, contributors sign the Structured World [Contributor License Agreement](https://sw.foundation/cla) once; the `CLA` status on the pull request updates by itself. Security issues go to the address in [SECURITY.md](SECURITY.md).
 
 ## License
 

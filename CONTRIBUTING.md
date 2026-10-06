@@ -106,19 +106,16 @@ cargo nextest run --cargo-profile debugger -E 'test(name)'
 
 CoordiNode is dual-licensed. The Community Edition is AGPL-3.0-only, and the same code base is also distributed under a commercial licence as the Enterprise Edition. For that to stay possible, a contribution has to arrive with more than "the same licence as the project": the copyright holder needs the right to distribute it under both.
 
-Before a first pull request can be merged, you sign the [Contributor License Agreement](CLA.md). Signing happens in the pull request itself: a bot posts the request, you reply with the sentence it asks for, and the signature is recorded in `signatures/` in this repository. It is a one-time step per GitHub account.
+Before your first pull request, you sign the Structured World [Contributor License Agreement](https://sw.foundation/cla) once at https://sw.foundation/cla; the `CLA` status on your pull requests updates by itself. One signature covers every Structured World project.
 
 In short, the CLA says:
 
-- You keep the copyright in your contribution.
-- You grant the project's copyright holder (and any successor the copyright is assigned to) a perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to use, modify, distribute and sublicense your contribution under any terms, including AGPL-3.0-only and the commercial Enterprise Edition licence.
+- You keep the copyright in your contribution; the agreement is a licence, not a transfer.
+- You grant the maintainer (and any successor the agreement is assigned to) a perpetual, worldwide, non-exclusive, royalty-free, irrevocable licence to use, modify, distribute and sublicense your contribution under any terms, including AGPL-3.0-only and the commercial Enterprise Edition licence.
 - You grant a patent licence covering your contribution to the same extent.
 - You confirm you are entitled to make the grant: the work is yours, or your employer has authorised it.
 
-And the project promises in return:
-
-- Your contribution stays available under AGPL-3.0-only in the Community Edition. It is never withdrawn into a proprietary-only edition.
-- You remain free to use, license and redistribute your own contribution however you like.
+Separately from the CLA, this project commits (see [COPYRIGHT](COPYRIGHT)) that the Community Edition is never narrowed to create the Enterprise Edition: what is published here under AGPL-3.0-only stays published, and you remain free to use, license and redistribute your own contribution however you like.
 
 If your employer owns what you write, ask them to confirm they permit the contribution before you sign.
 
