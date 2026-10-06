@@ -2,6 +2,20 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(session)* per-statement settings and source; driver on the session
+- *(cluster)* serve a read-only member's reads as of its last commit
+- schema claims, event-driven background work
+
+### Fixed
+
+- *(session)* a Cypher SET changes its own session, not the database
+- *(session)* run statements under their settings on the unary path
+- *(session)* answer a failed statement with its real status
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

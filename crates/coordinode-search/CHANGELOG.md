@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+
+### Fixed
+
+- *(search)* score full-text against the live documents only
+- *(search)* answer unfolded writes exactly instead of waiting
+- *(search)* maintain text indexes from committed writes
+
 ## v0.6.0 - 2026-09-23
 
 ### Fixed

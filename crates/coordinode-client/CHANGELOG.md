@@ -2,6 +2,18 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(session)* per-statement settings and source; driver on the session
+- *(client)* subscribe to change streams over a persistent session
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+
+### Fixed
+
+- *(session)* a Cypher SET changes its own session, not the database
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

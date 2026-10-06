@@ -2,6 +2,36 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(cdc)* [**breaking**] explicit retention policy and acknowledged progress per consumer
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+
+### Documentation
+
+- drop internal ids from search, replicate, swarm, wire and timeseries
+- *(replicate)* stop linking a private constant from public docs
+
+### Fixed
+
+- *(session)* a Cypher SET changes its own session, not the database
+- *(cdc)* wake a parked stream when its registration changes
+- *(replicate)* keep heartbeats visible while their write is in flight
+- keep heartbeats of a failed flush, lsm-tree 5.11.10
+- *(replicate)* repair partitions at an exact raft position
+
+### Performance
+
+- *(cdc)* recheck a registration only after a write to it applies
+- *(replicate)* leave floor raises to the background sweep
+
+### Testing
+
+- *(replicate)* wait for the floor after a bounded consumer ends
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

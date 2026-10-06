@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Fixed
+
+- *(server,s3)* stop deleting chunks another blob still reads
+
 ## v0.6.0 - 2026-09-23
 
 ### Documentation

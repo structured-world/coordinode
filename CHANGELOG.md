@@ -1,5 +1,231 @@
 # Changelog
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(index)* enforce unique values while an index builds
+- *(index)* inspectable, tunable and fault-safe index builds
+- *(index)* run B-tree index builds as durable engine-owned operations
+- *(session)* per-statement settings and source; driver on the session
+- *(server)* configurable statement consistency defaults
+- *(session)* say when a subscription batch left events waiting
+- *(session)* serve change-stream subscriptions on the session
+- *(search)* answer text and vector searches at a named timestamp
+- *(cluster)* bring replicated text indexes live on every member
+- *(raft)* share one connection per peer across groups
+- *(raft)* name the consensus group in every raft message
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* serve a read-only member's reads as of its last commit
+- *(cluster)* report each member's version and the group's write pause
+- *(cluster)* match group members by version and move a group by majority
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(server)* configure storage block compression from the config file
+- *(query)* [**breaking**] procedure catalog with typed signatures
+- *(cdc)* [**breaking**] explicit retention policy and acknowledged progress per consumer
+- *(vector)* remove nodes and reuse their slots beside live search
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(server)* add a healthcheck command backed by a real /ready
+- *(query)* let the caller bound the wait for a building vector index
+- *(server)* [**breaking**] drop seqno-bounded incremental backups
+- *(client)* subscribe to change streams over a persistent session
+- *(query)* read temporal nodes at the statement's current time
+- *(index)* build full-text and vector indexes as member-owned builds
+- *(embed)* run a TTL reap pass on demand
+- *(modality)* insert vectors under the shared index lock
+- *(storage)* report local commits on the applied feed
+- *(vector)* insert through a shared borrow, concurrently with search
+- *(vector)* track whether each node is live
+
+### Documentation
+
+- *(server)* drop a pointer to an internal log from a test header
+- *(server)* drop internal ids and document paths
+- drop internal task and decision ids from four modules
+- state the rules in source comments instead of pointing at a local file
+- *(cluster)* drop internal ids and document paths
+- state design reasons instead of citing other codebases
+- drop internal ids from core, modality, site theme and examples
+- *(core,embed)* replace leftover document stand-ins in comments
+- *(core)* drop internal ids and document paths
+- *(cypher)* describe temporal reads and unique scope in the reference
+- *(embed)* resolve the RestoreError links in Database::restore
+- *(embed)* drop internal ids and document paths
+- *(modality)* drop internal ids and document paths
+- *(query)* drop internal ids and document paths
+- *(raft)* drop internal ids and document paths
+- drop internal ids from search, replicate, swarm, wire and timeseries
+- *(replicate)* stop linking a private constant from public docs
+- *(storage)* drop a public link to a private constant
+- *(storage)* state the durability invariants instead of their ids
+- *(storage)* drop internal ids and document paths
+- *(vector)* drop internal ids and document paths
+
+### Fixed
+
+- *(server)* record the consensus and compaction metrics the server describes
+- *(server)* record the query metrics the server describes
+- *(server)* record the gRPC and change-stream metrics the server describes
+- *(session)* a Cypher SET changes its own session, not the database
+- *(session)* run statements under their settings on the unary path
+- *(session)* answer a failed statement with its real status
+- *(cdc)* wake a parked stream when its registration changes
+- *(search)* answer unfolded writes exactly instead of waiting
+- *(server)* refresh index definitions only when one applies
+- *(vector)* maintain vector indexes from committed writes
+- *(search)* maintain text indexes from committed writes
+- *(raft)* take a snapshot when the log grew, never on a clock
+- *(schema)* hold every uniqueness as a constraint owning its index
+- *(cluster)* restart a member that holds its group's data
+- *(server)* stop reporting ready once consensus has stopped
+- *(server)* explain the plan ExecuteCypher runs
+- *(server)* report an auto-commit write conflict as retryable
+- *(cdc)* refuse a resume past purged log instead of skipping
+- *(restore)* [**breaking**] keep every NodeId, refuse issued ones, restore schema and indexes
+- *(build)* keep aws-lc out of the server binary
+- *(raft)* keep snapshots in a file, not in memory or the store
+- *(server)* refuse MiB sizes that do not fit instead of clamping
+- *(server)* refuse unknown schema enum values instead of guessing
+- *(raft)* wait for leadership transfers and checkpoints to finish
+- *(server)* bind the gRPC port before opening storage
+- *(server)* keep the hop count of a forwarded request
+- *(server,s3)* stop deleting chunks another blob still reads
+- *(server)* report an unusable storage topology instead of panicking
+- *(server)* roll back idle interactive transactions on a timer
+- *(raft)* bound the linearizable lease read by the fence timeout
+- *(cdc)* keep a slow reader registered; configure stream pacing
+- *(cdc)* stream applied Raft log entries from the log's own files
+- *(vector)* offline an index whose build cannot start
+- *(replicate)* repair partitions at an exact raft position
+- *(raft)* build snapshots from a capture at their log id
+- *(core)* draw proposal ids from a fresh range per process
+- *(cluster)* a member at an older version than its group is behind
+- *(raft)* keep acknowledged writes across a restart over a snapshot
+- *(schema)* hold a strict temporal label's schema on every version
+- *(query)* keep undeclared properties where reads find them
+- *(index)* release the build config lock before backfilling
+- *(search)* search a transaction's own uncommitted writes
+- *(search)* drop debug output from the text worker
+- *(query)* look up one property only in a full single-property index
+- *(query)* find the nodes of a write through the index
+- *(schema)* refuse the engine's temporal fields on every user input
+- *(storage)* return a transaction's prefix scan in key order
+- *(query)* match and write every label of a node pattern
+- *(query)* find an unlabelled temporal traversal target
+- *(query)* bind the TRANSFER EDGES edge variable during analysis
+- *(query)* say why a temporal write is refused, without internal ids
+- *(vector)* maintain replica indexes from applied entries
+- *(vector)* build indexes from a tap of applied writes
+- *(storage)* rebuild from what the checkpoint trees hold
+- *(storage)* survive a crash inside a partition rebuild
+- *(storage)* replay the embedded journal by per-partition coverage
+- *(deps)* require the lsm-tree release the code needs
+- *(schema)* read a schema's pointer and body from one snapshot
+- *(query)* finish a vector build under writes that never pause
+- *(raft)* settle membership and shutdown under load
+- *(query)* filter anonymous edges on inline properties
+- *(query)* treat Windows and Unix source paths as one call site
+- *(cluster)* count only reachable voters toward a version majority
+- *(storage)* record a directory's migration only when its open succeeds
+- *(raft)* let a purge below what is already purged do nothing
+- *(raft)* honour the limiter bypass for every write concern
+- *(raft)* publish the applied index when a snapshot is installed
+- *(raft)* stop without waiting on a group that is gone
+- *(raft)* wait out snapshot work on shutdown
+- *(storage)* [**breaking**] name the upgrade path from 0.6 stores
+- *(raft)* resume and purge the raft log by per-tree apply coverage
+- *(storage)* cover columnar tables in recovery and in snapshots
+- *(replicate)* keep heartbeats visible while their write is in flight
+- keep heartbeats of a failed flush, lsm-tree 5.11.10
+- *(search)* score full-text against the live documents only
+- *(storage)* sample the partition footprint without capacity limits
+- *(storage)* bound the time-travel horizon by data partitions only
+- *(storage)* read the oplog tail without decoding the last sealed segment
+- *(storage)* never serve a tiered-cache value a later write replaced
+- *(storage)* enforce version conditions on unwritten keys
+- *(storage)* skip delete-pending files in retention stats on Windows
+- *(storage)* keep the raft coverage reset tombstone below its base
+- *(vector)* leave no node unreachable after a build batch
+- *(vector)* stop a removed node being a result before its count drops
+- *(vector)* hand the entry point to an updated node, seed reorder at it
+- *(vector)* keep node metadata at stable addresses
+- *(vector)* recompute neighbour edits after a lost CAS
+- *(vector)* publish layer-0 neighbour lists whole
+- *(vector)* build large insert_batch in rounds
+- *(vector)* publish upper-layer neighbour lists whole
+- *(vector)* keep a reinserted HNSW node reachable
+
+### Performance
+
+- *(cdc)* recheck a registration only after a write to it applies
+- *(storage)* publish where the oplog starts instead of listing it
+- *(cdc)* read the log once for every change stream
+- *(index)* read uncovered nodes once per index per commit
+- *(query)* read text_match matches through the text index
+- *(query)* read a node pinned by id instead of scanning the shard
+- *(replicate)* leave floor raises to the background sweep
+- *(storage)* keep no time-travel history of system partitions
+- *(storage)* tail the oplog from where the last read stopped
+- *(storage)* measure the apply pauses of copies and installs
+- *(storage)* measure what apply coverage costs
+- *(vector)* keep publication counters on their own cache lines
+
+### Refactored
+
+- *(index)* name indexes by stable identity and generation
+- *(cluster)* one chunk table, shards numbered from 1
+- *(query)* pair the vector registry with its build engine
+- *(vector)* shard the id map for concurrent inserts
+- *(vector)* create the node stores through a shared borrow
+- *(vector)* keep node codes in the stable store
+- *(vector)* keep layer-0 nodes at stable addresses
+- *(vector)* keep only RaBitQ codes in the code block
+
+### Testing
+
+- follow member-owned vector readiness and the build executor
+- *(server)* draw the HNSW quality test's vectors independently
+- *(server)* CALL listing and refusal through ExecuteCypher
+- *(server)* cover version conditions through the public commit
+- *(server)* name schema proto enums instead of their integers
+- *(storage,raft)* cut power at every sync and write, and upgrade a v0.6.0 store
+- *(session)* keep a subscription's end that precedes the cancel answer
+- check index membership and a subscription's end exactly
+- *(schema)* cover constraint recreation, name races and snapshot transfer
+- reserve test ports across processes and catch failed starts
+- *(integration)* name tests by behaviour, not by ids
+- make the suites pass on any target dir and as root
+- *(index)* two concurrent creates of one index name
+- *(embed)* bench a unique-index point read as its node is rewritten
+- *(embed)* a reopened engine starts with a cold tiered cache
+- *(embed)* wait for the vector worker before calibrating from the graph
+- *(embed)* check past full-text reads against an index built from the snapshot
+- *(embed)* wait for the vector worker before reading the graph
+- *(query)* cover temporal reads after a correction and at signed instants
+- *(embed)* count live cold tables after a reopen
+- *(embed)* prove the temporal unique reservation by its reason
+- *(embed)* wait for a node to reach the HNSW graph
+- *(embed)* allow expect in the traversal and label tests
+- *(embed)* find checkpoint-shared tables by name, not inode
+- *(raft)* cover log retention, failed rebuilds and interrupted installs
+- time the watermark advance from the read it unblocks
+- *(cluster)* abandon a version move by re-adding the updated member
+- *(raft)* poll for snapshot builds instead of sleeping on them
+- *(raft)* pin the snapshot install's ordering guarantees
+- *(raft)* cut open replication streams in the partition nemesis
+- *(replicate)* wait for the floor after a bounded consumer ends
+- *(storage)* name the recorded metric type in the compaction metrics test
+- *(vector)* reuse one index across the removal-count rounds
+- *(vector)* wait for the build queue instead of sleeping
+- *(vector)* size the layer-0 replace race for miri
+
+### Bench
+
+- *(server)* add a mixed insert/update/delete/read mode
+- *(vector)* search during concurrent inserts
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

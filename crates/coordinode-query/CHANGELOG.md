@@ -2,6 +2,71 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(index)* enforce unique values while an index builds
+- *(index)* inspectable, tunable and fault-safe index builds
+- *(index)* build full-text and vector indexes as member-owned builds
+- *(index)* run B-tree index builds as durable engine-owned operations
+- *(search)* answer text and vector searches at a named timestamp
+- *(cluster)* match group members by version and move a group by majority
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(query)* read temporal nodes at the statement's current time
+- *(query)* [**breaking**] procedure catalog with typed signatures
+- *(embed)* run a TTL reap pass on demand
+- *(vector)* remove nodes and reuse their slots beside live search
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(query)* let the caller bound the wait for a building vector index
+
+### Documentation
+
+- state design reasons instead of citing other codebases
+- *(query)* drop internal ids and document paths
+
+### Fixed
+
+- *(index)* release the build config lock before backfilling
+- *(search)* search a transaction's own uncommitted writes
+- *(search)* answer unfolded writes exactly instead of waiting
+- *(vector)* maintain vector indexes from committed writes
+- *(search)* maintain text indexes from committed writes
+- *(schema)* hold every uniqueness as a constraint owning its index
+- *(query)* look up one property only in a full single-property index
+- *(query)* find the nodes of a write through the index
+- *(schema)* refuse the engine's temporal fields on every user input
+- *(schema)* hold a strict temporal label's schema on every version
+- *(query)* keep undeclared properties where reads find them
+- *(query)* match and write every label of a node pattern
+- *(query)* find an unlabelled temporal traversal target
+- *(raft)* settle membership and shutdown under load
+- *(query)* filter anonymous edges on inline properties
+- *(query)* bind the TRANSFER EDGES edge variable during analysis
+- *(query)* say why a temporal write is refused, without internal ids
+- *(vector)* maintain replica indexes from applied entries
+- *(query)* finish a vector build under writes that never pause
+- *(vector)* offline an index whose build cannot start
+- *(vector)* build indexes from a tap of applied writes
+- *(query)* treat Windows and Unix source paths as one call site
+
+### Performance
+
+- *(query)* read text_match matches through the text index
+- *(query)* read a node pinned by id instead of scanning the shard
+
+### Refactored
+
+- *(index)* name indexes by stable identity and generation
+- *(query)* pair the vector registry with its build engine
+
+### Testing
+
+- *(query)* cover temporal reads after a correction and at signed instants
+- time the watermark advance from the read it unblocks
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

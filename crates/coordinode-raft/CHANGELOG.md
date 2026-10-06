@@ -2,6 +2,71 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(raft)* share one connection per peer across groups
+- *(raft)* name the consensus group in every raft message
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* serve a read-only member's reads as of its last commit
+- *(cluster)* report each member's version and the group's write pause
+- *(cluster)* match group members by version and move a group by majority
+- *(query)* read temporal nodes at the statement's current time
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(server)* [**breaking**] drop seqno-bounded incremental backups
+
+### Documentation
+
+- state design reasons instead of citing other codebases
+- *(raft)* drop internal ids and document paths
+
+### Fixed
+
+- *(raft)* take a snapshot when the log grew, never on a clock
+- *(cluster)* a member at an older version than its group is behind
+- *(cluster)* restart a member that holds its group's data
+- *(cluster)* count only reachable voters toward a version majority
+- *(raft)* keep acknowledged writes across a restart over a snapshot
+- *(storage)* record a directory's migration only when its open succeeds
+- *(server)* stop reporting ready once consensus has stopped
+- *(raft)* let a purge below what is already purged do nothing
+- *(raft)* settle membership and shutdown under load
+- *(raft)* keep snapshots in a file, not in memory or the store
+- *(raft)* wait for leadership transfers and checkpoints to finish
+- *(raft)* bound the linearizable lease read by the fence timeout
+- *(raft)* honour the limiter bypass for every write concern
+- *(raft)* publish the applied index when a snapshot is installed
+- *(cdc)* stream applied Raft log entries from the log's own files
+- *(raft)* stop without waiting on a group that is gone
+- *(raft)* wait out snapshot work on shutdown
+- *(storage)* [**breaking**] name the upgrade path from 0.6 stores
+- *(replicate)* repair partitions at an exact raft position
+- *(raft)* build snapshots from a capture at their log id
+- *(raft)* resume and purge the raft log by per-tree apply coverage
+- *(storage)* cover columnar tables in recovery and in snapshots
+- *(storage)* replay the embedded journal by per-partition coverage
+
+### Performance
+
+- *(storage)* publish where the oplog starts instead of listing it
+
+### Refactored
+
+- *(index)* name indexes by stable identity and generation
+
+### Testing
+
+- *(cluster)* abandon a version move by re-adding the updated member
+- time the watermark advance from the read it unblocks
+- *(raft)* poll for snapshot builds instead of sleeping on them
+- *(raft)* pin the snapshot install's ordering guarantees
+- *(raft)* cut open replication streams in the partition nemesis
+- make the suites pass on any target dir and as root
+- *(raft)* cover log retention, failed rebuilds and interrupted installs
+- *(storage,raft)* cut power at every sync and write, and upgrade a v0.6.0 store
+
 ## v0.6.0 - 2026-09-23
 
 ### Added
