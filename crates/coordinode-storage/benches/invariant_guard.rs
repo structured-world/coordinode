@@ -467,6 +467,81 @@ fn unique_while_building(stored: u64, uncovered: u64, commits: usize) {
     );
 }
 
+/// One commit taking `values` free emails while the index is being built
+/// with `uncovered` stored users unread: the values of one index are decided
+/// by a single read of the uncovered nodes, not one read each.
+fn unique_values_in_one_commit(stored: u64, uncovered: u64, values: u64, commits: usize) {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::derive::tuples;
+    use coordinode_core::txn::invariant::UncoveredSource;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = open(&dir);
+    store_users(&engine, stored);
+    engine.persist().expect("flush");
+    let shard = engine.node_shard();
+    let interpretation = email_interpretation();
+    let wc = WriteConcern::default();
+
+    let started = Instant::now();
+    let samples: Vec<Duration> = (0..commits as u64)
+        .map(|c| {
+            let snap = engine.snapshot();
+            let mut txn = Transaction::new(
+                &engine,
+                Some(&oracle),
+                coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+                Some(snap),
+            );
+            let generation = txn.schema_generation();
+            for v in 0..values {
+                let id = 10 * stored + c * values + v;
+                let email = Value::String(format!("{id}@batch"));
+                let mut record = NodeRecord::new("User");
+                record.set(EMAIL, email.clone());
+                txn.put(
+                    Partition::Node,
+                    &encode_node_key(shard, NodeId::from_raw(id)),
+                    &record.to_msgpack().expect("encode"),
+                )
+                .expect("put");
+                for tuple in tuples(&[email]) {
+                    txn.claim(Claim::new(
+                        ClaimScope::UniqueValue {
+                            generation: interpretation.generation,
+                            tuple,
+                        },
+                        ClaimPredicate::UniqueHolder {
+                            node: NodeId::from_raw(id),
+                            uncovered: Some(Box::new(UncoveredSource {
+                                shard_id: shard,
+                                label: "User".into(),
+                                interpretation: interpretation.clone(),
+                                covered_through: Some(encode_node_key(
+                                    shard,
+                                    NodeId::from_raw(stored - uncovered),
+                                )),
+                                read_limit: u64::MAX,
+                            })),
+                        },
+                        generation,
+                    ));
+                }
+            }
+            let ctx = commit_ctx(&wc);
+            let at = Instant::now();
+            txn.commit(&ctx).expect("commit");
+            at.elapsed()
+        })
+        .collect();
+    report(
+        &format!("{values} values/commit, {uncovered} unread"),
+        samples,
+        started.elapsed(),
+    );
+}
+
 /// Writers that state no unique claim, committing beside one that reads
 /// `uncovered` stored nodes per commit: whether the read holds them up.
 fn bystanders_beside_unique_reads(stored: u64, uncovered: u64) {
@@ -553,6 +628,8 @@ fn main() {
     unique_while_building(STORED, 1_000, 1_000);
     unique_while_building(STORED, 10_000, 200);
     unique_while_building(STORED, 100_000, 30);
+    unique_values_in_one_commit(STORED, 10_000, 1, 50);
+    unique_values_in_one_commit(STORED, 10_000, 1_000, 20);
     bystanders_beside_unique_reads(STORED, 0);
     bystanders_beside_unique_reads(STORED, 10_000);
     bystanders_beside_unique_reads(STORED, 100_000);

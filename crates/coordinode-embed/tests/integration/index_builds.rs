@@ -292,6 +292,40 @@ fn a_unique_value_a_stored_node_holds_is_refused_during_the_build() {
     );
 }
 
+/// One statement taking many values while the index is being built is
+/// decided as a whole: a single held value among them refuses it and
+/// nothing of it is written; the free values alone are written.
+#[test]
+fn a_statement_taking_many_values_during_the_build_is_decided_whole() {
+    let (mut db, _dir) = open_db();
+    let many: Vec<String> = (0..200).map(|i| format!("'n{i}@x'")).collect();
+
+    while_unique_build_waits(&db, || {
+        let refused = write(
+            &db,
+            &format!(
+                "UNWIND [{}, 'b@x'] AS e CREATE (:User {{email: e}})",
+                many.join(", ")
+            ),
+        )
+        .expect_err("b@x is held");
+        assert!(refused.contains("unique constraint violated"), "{refused}");
+        write(
+            &db,
+            &format!(
+                "UNWIND [{}] AS e CREATE (:User {{email: e}})",
+                many.join(", ")
+            ),
+        )
+        .expect("free values");
+    })
+    .expect("the build publishes");
+
+    assert_eq!(holders(&mut db, "b@x"), 1);
+    assert_eq!(holders(&mut db, "n0@x"), 1);
+    assert_eq!(holders(&mut db, "n199@x"), 1);
+}
+
 /// The same refusals reach an interactive transaction at its commit: a
 /// value a stored node holds is a duplicate naming the index and the value,
 /// and past the read limit the commit is unresolved, not a duplicate.

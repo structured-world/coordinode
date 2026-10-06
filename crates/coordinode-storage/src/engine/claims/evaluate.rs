@@ -297,9 +297,13 @@ impl<'a> Evaluation<'a> {
                 ClaimPredicate::UniqueHolder { node, uncovered },
             ) => match uncovered {
                 None => Ok(Verdict::Holds),
-                Some(source) => {
-                    uncovered_holder(engine, tuple, *node, source, staged_points, node_deltas)
-                }
+                Some(source) => uncovered_holders(
+                    engine,
+                    &core::iter::once((tuple.as_slice(), *node)).collect(),
+                    source,
+                    staged_points,
+                    node_deltas,
+                ),
             },
 
             // An overlap this evaluator has no evidence for stays undecided, and
@@ -309,10 +313,16 @@ impl<'a> Evaluation<'a> {
     }
 }
 
-/// The verdict on a unique value `tuple` that `node` takes while the index
-/// is being built: `HeldBy` another node of `source`'s label whose post-state
-/// record holds the value, among the stored nodes after the key the build
-/// covered through and the attempt's own node writes; `Holds` when none does.
+/// The unique values an attempt takes in one index generation while it is
+/// being built, each keyed by its encoded tuple and naming the node taking it.
+pub type WantedValues<'a> = rustc_hash::FxHashMap<&'a [u8], NodeId>;
+
+/// The verdict on the unique values `wanted` while the index is being built:
+/// `HeldBy` a node of `source`'s label, other than the one taking the value,
+/// whose post-state record holds one of them, among the stored nodes after
+/// the key the build covered through and the attempt's own node writes;
+/// `Holds` when none does. One read decides every value of the generation,
+/// so a statement taking many values reads the uncovered nodes once.
 ///
 /// The nodes up to that key need no reading: the build committed their
 /// entries, which the attempt's entry key meets as any holder's does. A node
@@ -322,10 +332,9 @@ impl<'a> Evaluation<'a> {
 /// each other as they are staged. The read is bounded by `source.read_limit`
 /// stored rows; past it the claim is `OverLimit`, which is neither a pass nor
 /// a duplicate.
-fn uncovered_holder(
+pub fn uncovered_holders(
     engine: &StorageEngine,
-    tuple: &[u8],
-    node: NodeId,
+    wanted: &WantedValues<'_>,
     source: &UncoveredSource,
     staged_points: StagedPoints<'_>,
     node_deltas: &[(Vec<u8>, Vec<u8>)],
@@ -342,7 +351,7 @@ fn uncovered_holder(
         else {
             return Ok(None);
         };
-        if shard != source.shard_id || holder == node {
+        if shard != source.shard_id {
             return Ok(None);
         }
         let record = NodeRecord::from_msgpack(bytes)
@@ -353,7 +362,12 @@ fn uncovered_holder(
         let Some(values) = source.interpretation.record_membership(&record) else {
             return Ok(None);
         };
-        if !tuples(&values).iter().any(|t| t.as_slice() == tuple) {
+        // A node taking a value it already holds holds it still.
+        if !tuples(&values).iter().any(|t| {
+            wanted
+                .get(t.as_slice())
+                .is_some_and(|taker| *taker != holder)
+        }) {
             return Ok(None);
         }
         Ok(Some(Verdict::HeldBy { holder, values }))

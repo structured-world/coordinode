@@ -1399,3 +1399,137 @@ fn a_fire_and_forget_commit_never_writes_outside_the_pipeline() {
         "a refused commit left a local adjacency operand"
     );
 }
+
+/// Unique values taken while an index is being built, several in one commit.
+mod unique_while_building {
+    use super::*;
+    use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef, tuples};
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
+
+    const EMAIL: u32 = 7;
+
+    fn email(v: &str) -> Value {
+        Value::String(v.into())
+    }
+
+    fn record(value: &str) -> Vec<u8> {
+        let mut record = NodeRecord::new("User");
+        record.set(EMAIL, email(value));
+        record.to_msgpack().unwrap()
+    }
+
+    fn key(engine: &StorageEngine, id: u64) -> Vec<u8> {
+        encode_node_key(engine.node_shard(), NodeId::from_raw(id))
+    }
+
+    /// A claim on `value` taken by node `id`, the build covered through
+    /// stored node `covered`.
+    fn claim(engine: &StorageEngine, id: u64, value: &str, covered: Option<u64>) -> Claim {
+        let interpretation = IndexInterpretation {
+            codec: KEY_CODEC,
+            generation: GenerationId::from_raw(3),
+            unique: true,
+            sparse: false,
+            properties: vec![PropertyRef {
+                field: Some(EMAIL),
+                name: "email".into(),
+            }],
+            filter: None,
+        };
+        Claim::new(
+            ClaimScope::UniqueValue {
+                generation: interpretation.generation,
+                tuple: tuples(&[email(value)]).pop().unwrap(),
+            },
+            ClaimPredicate::UniqueHolder {
+                node: NodeId::from_raw(id),
+                uncovered: Some(Box::new(UncoveredSource {
+                    shard_id: engine.node_shard(),
+                    label: "User".into(),
+                    interpretation,
+                    covered_through: covered.map(|c| key(engine, c)),
+                    read_limit: 1_000,
+                })),
+            },
+            0,
+        )
+    }
+
+    fn commit_new_users(
+        engine: &StorageEngine,
+        oracle: &TimestampOracle,
+        users: &[(u64, &str, Option<u64>)],
+    ) -> Result<(), CommitError> {
+        let wc = WriteConcern::default();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: None,
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        let mut txn = mvcc_txn(engine, oracle);
+        for (id, value, covered) in users {
+            txn.put(Partition::Node, &key(engine, *id), &record(value))
+                .unwrap();
+            txn.claim(claim(engine, *id, value, *covered));
+        }
+        txn.commit(&ctx).map(|_| ())
+    }
+
+    /// Several values in one commit are decided together: a stored node
+    /// holding any one of them refuses the commit, naming it, and nothing of
+    /// the commit is applied; free values alone commit.
+    #[test]
+    fn one_held_value_among_many_refuses_the_commit() {
+        let (engine, oracle, _d) = test_engine();
+        engine
+            .put(Partition::Node, &key(&engine, 1), &record("b@x"))
+            .unwrap();
+
+        let err = commit_new_users(
+            &engine,
+            &oracle,
+            &[(10, "a@x", None), (11, "b@x", None), (12, "c@x", None)],
+        )
+        .expect_err("b@x is held");
+        assert!(
+            matches!(&err, CommitError::UniqueValueHeld { holder, .. } if holder.as_raw() == 1),
+            "{err:?}"
+        );
+        assert_eq!(
+            engine.get(Partition::Node, &key(&engine, 10)).unwrap(),
+            None
+        );
+
+        commit_new_users(&engine, &oracle, &[(10, "a@x", None), (12, "c@x", None)])
+            .expect("free values");
+    }
+
+    /// Claims of one index stating different cursors are decided from the
+    /// oldest: a node the newer cursor passed may not have its entry yet as
+    /// far as the older claim knows.
+    #[test]
+    fn claims_of_one_index_are_read_from_the_oldest_cursor() {
+        let (engine, oracle, _d) = test_engine();
+        for (id, value) in [(1, "a@x"), (3, "held@x"), (5, "e@x")] {
+            engine
+                .put(Partition::Node, &key(&engine, id), &record(value))
+                .unwrap();
+        }
+
+        let err = commit_new_users(
+            &engine,
+            &oracle,
+            &[(10, "held@x", Some(5)), (11, "free@x", None)],
+        )
+        .expect_err("node 3 is read from the older cursor");
+        assert!(
+            matches!(&err, CommitError::UniqueValueHeld { holder, .. } if holder.as_raw() == 3),
+            "{err:?}"
+        );
+    }
+}

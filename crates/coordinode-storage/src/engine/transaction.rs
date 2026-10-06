@@ -1026,18 +1026,12 @@ impl<'a> Transaction<'a> {
     /// passing it: an undecidable claim is not a satisfied one, and admitting
     /// it would mean the protection is absent exactly where the evidence is.
     ///
-    /// `before_admission` picks the claims decided before the commit takes
-    /// its timestamp (see [`decided_before_admission`]), the others are
-    /// decided after it.
-    fn evaluate_claims(&self, before_admission: bool) -> Result<(), CommitError> {
+    /// The claims [`decided_before_admission`] are left to
+    /// [`Self::decide_uncovered_uniques`].
+    fn evaluate_claims(&self) -> Result<(), CommitError> {
         use crate::engine::claims::evaluate::{Evaluation, Verdict};
 
-        if !self
-            .claims
-            .claims()
-            .iter()
-            .any(|claim| decided_before_admission(claim) == before_admission)
-        {
+        if self.claims.claims().iter().all(decided_before_admission) {
             return Ok(());
         }
         // The attempt's view as a sequence number, which is what "written
@@ -1055,7 +1049,7 @@ impl<'a> Transaction<'a> {
             .claims
             .claims()
             .iter()
-            .filter(|claim| decided_before_admission(claim) == before_admission)
+            .filter(|claim| !decided_before_admission(claim))
         {
             match evaluation.decide(claim)? {
                 Verdict::Holds => {}
@@ -1109,6 +1103,73 @@ impl<'a> Transaction<'a> {
                                 claim.predicate
                             ),
                         },
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decide the unique values this attempt takes in indexes still being
+    /// built, one read of the uncovered nodes per index generation for all
+    /// of its values together, so the read limit bounds what the commit
+    /// reads rather than what each value does.
+    fn decide_uncovered_uniques(&self) -> Result<(), CommitError> {
+        use crate::engine::claims::evaluate::{Verdict, WantedValues, uncovered_holders};
+        use coordinode_core::txn::invariant::{ClaimPredicate, ClaimScope, UncoveredSource};
+
+        // generation -> (the source with the least coverage, values wanted)
+        let mut groups: rustc_hash::FxHashMap<
+            coordinode_core::index::identity::GenerationId,
+            (UncoveredSource, WantedValues<'_>),
+        > = rustc_hash::FxHashMap::default();
+        for claim in self.claims.claims() {
+            let (
+                ClaimScope::UniqueValue { generation, tuple },
+                ClaimPredicate::UniqueHolder {
+                    node,
+                    uncovered: Some(source),
+                },
+            ) = (&claim.scope, &claim.predicate)
+            else {
+                continue;
+            };
+            let (group, wanted) = groups
+                .entry(*generation)
+                .or_insert_with(|| ((**source).clone(), WantedValues::default()));
+            // Coverage only grows, so the oldest cursor stated is a bound
+            // that holds for every claim of the group (no cursor sorts first).
+            if source.covered_through < group.covered_through {
+                group.covered_through = source.covered_through.clone();
+            }
+            wanted.insert(tuple.as_slice(), *node);
+        }
+        for (generation, (source, wanted)) in &groups {
+            match uncovered_holders(
+                self.engine,
+                wanted,
+                source,
+                &self.write_buffer,
+                &self.merge_node_deltas,
+            )? {
+                Verdict::HeldBy { holder, values } => {
+                    return Err(CommitError::UniqueValueHeld {
+                        generation: *generation,
+                        values,
+                        holder,
+                    });
+                }
+                Verdict::OverLimit { limit } => {
+                    return Err(CommitError::UniquenessUnresolved {
+                        generation: *generation,
+                        limit,
+                    });
+                }
+                Verdict::Holds => {}
+                // Not a verdict this read gives; not a pass either.
+                other @ (Verdict::Broken | Verdict::Undecidable) => {
+                    return Err(CommitError::InvariantRefused {
+                        reason: format!("unique values of {generation} decided {other:?}"),
                     });
                 }
             }
@@ -1528,7 +1589,7 @@ impl<'a> Transaction<'a> {
         }
         // Before the timestamp: every snapshot taken after it waits for this
         // commit to land, so a long read here would hold up all of them.
-        self.evaluate_claims(true)?;
+        self.decide_uncovered_uniques()?;
         let _reservation = if self.claims.is_empty() {
             None
         } else {
@@ -1609,7 +1670,7 @@ impl<'a> Transaction<'a> {
         // sufficient alone, and the evaluation reads storage, so it belongs
         // outside the tables rather than inside them.
         if !self.claims.is_empty() {
-            self.evaluate_claims(false)?;
+            self.evaluate_claims()?;
         }
 
         // Records written on the condition of their version. Checked here,

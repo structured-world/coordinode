@@ -356,6 +356,11 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   fails with `unique index ... is still being built` instead (gRPC
   `UNAVAILABLE` with reason `UNIQUENESS_UNRESOLVED`, SQLSTATE `53000`): the
   value may well be free, and the same write succeeds once the build is done.
+  The limit bounds what one commit reads per index, however many values it
+  takes. Which nodes the build has reached is known to the member running it;
+  after a change of leader the read starts from the first node again until
+  the resumed build covers them, so on a large label writes of new values can
+  be refused as unresolved for that while.
   A transaction that wrote to the label before a partial unique index existed
   is refused at its commit and retried under the new index.
 - **Build failure and cancellation.** `CREATE UNIQUE INDEX` over data that
