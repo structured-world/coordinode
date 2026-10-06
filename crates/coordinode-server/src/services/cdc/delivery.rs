@@ -52,11 +52,15 @@ impl Credit {
     pub(crate) fn grant(&self, events: u64) {
         // A client granting past u64::MAX in total has granted unlimited
         // credit; the clamp is that meaning.
-        let _ = self
-            .left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                Some(left.saturating_add(events))
-            });
+        let mut left = self.left.load(Ordering::Acquire);
+        while let Err(now) = self.left.compare_exchange_weak(
+            left,
+            left.saturating_add(events),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            left = now;
+        }
         self.granted.notify_one();
     }
 

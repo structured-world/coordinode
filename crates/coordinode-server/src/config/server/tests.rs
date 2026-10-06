@@ -297,16 +297,19 @@ fn index_build_settings_parse_from_the_config_file() {
     let d = ServerConfig::default();
     assert!(d.index_build_max_running.is_none());
     assert!(d.index_build_older_transactions_wait_secs.is_none());
+    assert!(d.index_build_unique_read_limit.is_none());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.yaml");
     std::fs::write(
         &path,
-        "index_build_max_running: 4\nindex_build_older_transactions_wait_secs: 300\n",
+        "index_build_max_running: 4\nindex_build_older_transactions_wait_secs: 300\n\
+         index_build_unique_read_limit: 5000\n",
     )
     .unwrap();
     let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
     assert_eq!(c.index_build_max_running.map(|v| v.get()), Some(4));
     assert_eq!(c.index_build_older_transactions_wait_secs, Some(300));
+    assert_eq!(c.index_build_unique_read_limit, Some(5000));
 
     std::fs::write(&path, "index_build_max_running: 0\n").unwrap();
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());

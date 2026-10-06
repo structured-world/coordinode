@@ -102,7 +102,13 @@ pub struct Backfill<'a> {
     /// Told where the backfill stands: waiting for older transactions,
     /// then the entries committed so far after every page.
     pub progress: Option<&'a dyn Fn(BackfillProgress)>,
+    /// Told, after every committed page, the last node key of the shard the
+    /// backfill has committed entries through.
+    pub covered: Option<CoveredThrough<'a>>,
 }
+
+/// What a backfill tells the key it has committed entries through.
+pub type CoveredThrough<'a> = &'a dyn Fn(&[u8]);
 
 /// Where a running backfill stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,21 +174,10 @@ impl<'a> Backfill<'a> {
             let mut read = Vec::with_capacity(page.rows.len());
             let mut staged = 0u64;
             for (key, bytes) in &page.rows {
-                // A temporal node has an entry per version, as its writers
-                // stage one for each version they write.
-                let owner = match decode_node_key(key) {
-                    Some((_, node_id)) => EntryOwner::node(node_id.as_raw()),
-                    None => match decode_temporal_node_key(key) {
-                        Some((_, node_id, valid_from)) => {
-                            EntryOwner::version(node_id.as_raw(), valid_from)
-                        }
-                        None => continue,
-                    },
+                let Some(owner) = stored_owner(key) else {
+                    continue;
                 };
-                let record = NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
-                    kind: "node record",
-                    message: e.to_string(),
-                })?;
+                let record = decode_record(bytes)?;
                 if record.primary_label() != index.label {
                     continue;
                 }
@@ -233,6 +228,9 @@ impl<'a> Backfill<'a> {
             }
             indexed += staged;
             report(BackfillProgress::Indexed(indexed));
+            if let (Some(covered), Some(last)) = (self.covered, page.last_key.as_deref()) {
+                covered(last);
+            }
             conflicts = 0;
             if page.exhausted {
                 return Ok(indexed);
@@ -240,6 +238,26 @@ impl<'a> Backfill<'a> {
             start_after = page.last_key;
         }
     }
+}
+
+/// The owner of the index entries of the stored node row under `key`: the
+/// node, or for a temporal node the version the key names, as its writers
+/// stage an entry for each version they write. `None` for a key that is not
+/// a node row.
+fn stored_owner(key: &[u8]) -> Option<EntryOwner> {
+    match decode_node_key(key) {
+        Some((_, node_id)) => Some(EntryOwner::node(node_id.as_raw())),
+        None => decode_temporal_node_key(key)
+            .map(|(_, node_id, valid_from)| EntryOwner::version(node_id.as_raw(), valid_from)),
+    }
+}
+
+/// A stored node row's record.
+fn decode_record(bytes: &[u8]) -> Result<NodeRecord, StoreError> {
+    NodeRecord::from_msgpack(bytes).map_err(|e| StoreError::Decode {
+        kind: "node record",
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]

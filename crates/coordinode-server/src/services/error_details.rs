@@ -124,6 +124,12 @@ pub enum Reason {
     /// `index` and `property` for a unique index. Terminal: the same write
     /// will be refused again.
     DuplicateKey,
+    /// A write takes a value of a unique index still being built, and
+    /// proving that no stored node the build has not reached holds it would
+    /// read more than the configured limit. Nothing was written; the value
+    /// may be free. Metadata carries `index` and `limit`. Retry once the
+    /// build is done.
+    UniquenessUnresolved,
     /// A statement tried to change a key column of an existing row. Metadata
     /// carries `table` and `column`. Terminal.
     KeyImmutable,
@@ -187,6 +193,7 @@ impl Reason {
             Reason::OutsideRetention => "OUTSIDE_RETENTION",
             Reason::InvalidWriteConcern => "INVALID_WRITE_CONCERN",
             Reason::DuplicateKey => "DUPLICATE_KEY",
+            Reason::UniquenessUnresolved => "UNIQUENESS_UNRESOLVED",
             Reason::KeyImmutable => "KEY_IMMUTABLE",
             Reason::ConstraintViolation => "CONSTRAINT_VIOLATION",
             Reason::RetentionLost => "RETENTION_LOST",
@@ -235,6 +242,9 @@ impl Reason {
             // Space comes back when someone frees it, not soon: a floor that
             // keeps clients from hammering a node that only serves reads.
             Reason::StorageFull => Some(std::time::Duration::from_secs(5)),
+            // The proof shrinks as the build covers more of the stored
+            // nodes; an immediate retry reads almost as much again.
+            Reason::UniquenessUnresolved => Some(std::time::Duration::from_secs(1)),
             _ => None,
         }
     }

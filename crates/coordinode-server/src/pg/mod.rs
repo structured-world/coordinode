@@ -160,7 +160,8 @@ fn command_tag(query: &str) -> Tag {
 /// `23514 check_violation`; changing a key column, which PostgreSQL permits
 /// and this server does not, is `42P10 invalid_column_reference`. A write
 /// conflict is `40001 serialization_failure`, the class drivers retry the
-/// whole transaction on; write pressure is `53000 insufficient_resources`;
+/// whole transaction on; write pressure, and a unique value not yet proved
+/// free while its index is being built, is `53000 insufficient_resources`;
 /// a write refused because the disk is below its reserve is `53100
 /// disk_full`;
 /// a write that reached a follower is `25006 read_only_sql_transaction`, what
@@ -200,8 +201,12 @@ fn sqlstate(error: &coordinode_embed::db::DatabaseError) -> &'static str {
         | DatabaseError::Execution(ExecutionError::Conflict(_)) => "40001",
         // insufficient_resources: the server catching up, and the same
         // statement succeeds once it has.
+        // A unique value not proved free while its index is being built is
+        // the same: the statement succeeds once the build has caught up.
         DatabaseError::WriteBackpressure
-        | DatabaseError::Execution(ExecutionError::Backpressure) => "53000",
+        | DatabaseError::Execution(
+            ExecutionError::Backpressure | ExecutionError::UniquenessUnresolved { .. },
+        ) => "53000",
         // disk_full: the disk is below its reserve, writes wait for space.
         DatabaseError::Storage(coordinode_storage::error::StorageError::OutOfSpace { .. })
         | DatabaseError::Execution(ExecutionError::Storage(

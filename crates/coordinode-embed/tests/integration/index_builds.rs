@@ -239,6 +239,112 @@ fn concurrent_creates_of_one_index_name_have_one_winner() {
     }
 }
 
+/// Run `body` while the build of the unique index on `:User(email)` waits
+/// for an older transaction: the index is registered with the writers, and
+/// none of the stored users has an entry yet. The build then finishes.
+fn while_unique_build_waits(db: &Database, body: impl FnOnce()) -> Result<(), String> {
+    let older = db.begin_transaction();
+    std::thread::scope(|s| {
+        let created =
+            s.spawn(|| create_index(db, "CREATE UNIQUE INDEX user_email ON :User(email)"));
+        await_held(db, "user_email");
+        body();
+        db.rollback_transaction(older)
+            .expect("end the older transaction");
+        created.join().expect("join")
+    })
+}
+
+fn write(db: &Database, statement: &str) -> Result<(), String> {
+    db.execute_cypher_shared(statement, None, None, None, None)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// While a unique index is being built, a value a stored node holds is
+/// refused as a duplicate naming its holder, though the build has not given
+/// that node an entry, whether the write creates a node or moves one onto
+/// the value; a free value is taken, and the index the build publishes holds
+/// each value once.
+#[test]
+fn a_unique_value_a_stored_node_holds_is_refused_during_the_build() {
+    let (mut db, _dir) = open_db();
+
+    while_unique_build_waits(&db, || {
+        let created = write(&db, "CREATE (:User {email: 'a@x'})").expect_err("held");
+        assert!(created.contains("unique constraint violated"), "{created}");
+        assert!(created.contains("a@x"), "{created}");
+        let moved =
+            write(&db, "MATCH (u:User {email: 'b@x'}) SET u.email = 'a@x'").expect_err("held");
+        assert!(moved.contains("unique constraint violated"), "{moved}");
+        write(&db, "CREATE (:User {email: 'c@x'})").expect("a free value");
+    })
+    .expect("the build publishes");
+
+    assert_eq!(holders(&mut db, "a@x"), 1);
+    assert_eq!(holders(&mut db, "b@x"), 1);
+    assert_eq!(holders(&mut db, "c@x"), 1);
+    assert_eq!(
+        index_named(db.engine(), "user_email")
+            .expect("defined")
+            .state,
+        IndexState::Ready
+    );
+}
+
+/// A write whose proof would read more stored nodes than the configured
+/// limit is refused as unresolved, not as a duplicate, and the same write
+/// succeeds once the build is done.
+#[test]
+fn a_unique_value_past_the_read_limit_is_unresolved_until_the_build_is_done() {
+    let (mut db, _dir) = open_db();
+    db.set_index_build_config(IndexBuildConfig {
+        unique_admission_read_limit: 1,
+        ..db.index_build_config()
+    });
+
+    while_unique_build_waits(&db, || {
+        let refused = write(&db, "CREATE (:User {email: 'z@x'})").expect_err("unresolved");
+        assert!(refused.contains("still being built"), "{refused}");
+        assert!(!refused.contains("unique constraint violated"), "{refused}");
+    })
+    .expect("the build publishes");
+
+    write(&db, "CREATE (:User {email: 'z@x'})").expect("the build is done");
+    assert_eq!(holders(&mut db, "z@x"), 1);
+}
+
+/// A transaction that wrote before a partial unique index existed keeps no
+/// entry of it and states no claim on its values, so its commit is refused
+/// once the index is published, rather than landing a second holder of a
+/// value under the build.
+#[test]
+fn a_writer_older_than_a_partial_unique_index_is_refused() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'p@x', active: true})")
+        .expect("the holder");
+    let older = db.begin_transaction();
+    db.execute_in_transaction(older, "CREATE (:User {email: 'p@x', active: true})", None)
+        .expect("written before the index");
+
+    std::thread::scope(|s| {
+        let created = s.spawn(|| {
+            create_index(
+                &db,
+                "CREATE UNIQUE INDEX active_email ON :User(email) WHERE n.active = true",
+            )
+        });
+        await_held(&db, "active_email");
+        assert!(
+            db.commit_transaction(older).is_err(),
+            "a writer older than the index committed"
+        );
+        created.join().expect("join").expect("the build publishes");
+    });
+
+    assert_eq!(holders(&mut db, "p@x"), 1);
+}
+
 /// A build its statement never saw finish, as after a crash, is taken up
 /// when the database opens again: the index ends ready and serves lookups.
 #[test]

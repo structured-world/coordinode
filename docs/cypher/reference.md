@@ -347,6 +347,17 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   for transactions opened before the index existed to end, then indexes the
   stored nodes a page at a time; a page that read a node a writer changed is
   read again.
+- **Unique values while building.** A unique index protects its values from
+  the commit that publishes it, before the build reaches the stored nodes. A
+  write taking a value that a stored node holds fails with `unique constraint
+  violated`, naming that node, even though the build has not indexed it yet.
+  To tell, the commit reads the stored nodes the build has not reached; when
+  that would read more than `index_build_unique_read_limit` nodes, the write
+  fails with `unique index ... is still being built` instead (gRPC
+  `UNAVAILABLE` with reason `UNIQUENESS_UNRESOLVED`, SQLSTATE `53000`): the
+  value may well be free, and the same write succeeds once the build is done.
+  A transaction that wrote to the label before a partial unique index existed
+  is refused at its commit and retried under the new index.
 - **Build failure and cancellation.** `CREATE UNIQUE INDEX` over data that
   already has a duplicate fails and leaves no index. A build of a new index
   that fails or is cancelled withdraws the index (and the constraint owning

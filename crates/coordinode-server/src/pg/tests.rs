@@ -266,6 +266,14 @@ fn retryable_refusals_carry_the_sqlstate_drivers_retry_on() {
             DatabaseError::Execution(ExecutionError::Backpressure),
             "53000",
         ),
+        // Not 23505: the value is not known to be held.
+        (
+            DatabaseError::Execution(ExecutionError::UniquenessUnresolved {
+                index: "user_email".to_string(),
+                limit: 1,
+            }),
+            "53000",
+        ),
         (DatabaseError::NotLeader { leader_id: Some(2) }, "25006"),
         (
             DatabaseError::Execution(ExecutionError::NotLeader { leader_id: None }),

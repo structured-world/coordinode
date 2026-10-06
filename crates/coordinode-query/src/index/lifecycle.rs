@@ -158,6 +158,10 @@ struct Shared {
     vacancy: parking_lot::Condvar,
     /// Where each build an executor of this process holds stands now.
     phases: parking_lot::Mutex<FxHashMap<GenerationId, BuildPhase>>,
+    /// The last node key each backfill of this process committed entries
+    /// through. Kept in memory: a build no executor here holds is taken as
+    /// covering nothing, which only makes a write read more.
+    covered: parking_lot::Mutex<FxHashMap<GenerationId, Vec<u8>>>,
 }
 
 /// How the engine runs its index builds.
@@ -169,13 +173,22 @@ pub struct IndexBuildConfig {
     /// How long a key-shaped backfill waits for the transactions opened
     /// before its index existed to end; a build that outwaits it fails.
     pub older_transactions_wait: Duration,
+    /// The most stored node rows a write reads to prove a value it takes in
+    /// a unique index still being built free; past it the write is refused
+    /// as unresolved, to be retried once the build is done.
+    pub unique_admission_read_limit: u64,
 }
+
+/// The most stored node rows a write reads by default to prove a value
+/// free in a unique index still being built.
+pub const DEFAULT_UNIQUE_ADMISSION_READ_LIMIT: u64 = 100_000;
 
 impl Default for IndexBuildConfig {
     fn default() -> Self {
         Self {
             max_running: 2,
             older_transactions_wait: super::build::DEFAULT_OLDER_TRANSACTIONS_WAIT,
+            unique_admission_read_limit: DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
         }
     }
 }
@@ -305,8 +318,16 @@ impl IndexBuildService {
                 running: parking_lot::Mutex::new(0),
                 vacancy: parking_lot::Condvar::new(),
                 phases: parking_lot::Mutex::new(FxHashMap::default()),
+                covered: parking_lot::Mutex::new(FxHashMap::default()),
             }),
         }
+    }
+
+    /// The last node key the backfill of `generation` running on this
+    /// process has committed entries through; `None` when no executor here
+    /// runs it or it has committed no page yet.
+    pub fn covered_through(&self, generation: GenerationId) -> Option<Vec<u8>> {
+        self.shared.covered.lock().get(&generation).cloned()
     }
 
     /// How the service runs builds now.
@@ -392,6 +413,7 @@ impl IndexBuildService {
                     Executed::Lost => Slot::Lost,
                 };
                 shared.phases.lock().remove(&generation);
+                shared.covered.lock().remove(&generation);
                 shared.slots.lock().insert(generation, slot);
                 shared.finished.notify_all();
             });
@@ -646,6 +668,9 @@ impl Shared {
                 },
             );
         };
+        let covered = |through: &[u8]| {
+            self.covered.lock().insert(generation, through.to_vec());
+        };
         Ok(Backfill {
             engine: env.engine(),
             oracle: env.oracle(),
@@ -655,6 +680,7 @@ impl Shared {
             definition_version: taken.def_version,
             older_transactions_wait: self.config.read().older_transactions_wait,
             progress: Some(&progress),
+            covered: Some(&covered),
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }

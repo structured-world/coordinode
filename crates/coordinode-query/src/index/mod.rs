@@ -23,8 +23,8 @@ pub use definition::{
     OnlineDuringBuild, ProfileSource, TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
 pub use lifecycle::{
-    BuildEnvironment, BuildError, BuildPhase, BuildStatus, IndexBuildConfig, IndexBuildOutcome,
-    IndexBuildService,
+    BuildEnvironment, BuildError, BuildPhase, BuildStatus, DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
+    IndexBuildConfig, IndexBuildOutcome, IndexBuildService,
 };
 pub use registry::{
     IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,

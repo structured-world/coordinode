@@ -530,6 +530,7 @@ fn a_build_outwaited_by_an_older_transaction_fails() {
     let builds = env.service_with(IndexBuildConfig {
         max_running: 1,
         older_transactions_wait: Duration::from_millis(50),
+        ..IndexBuildConfig::default()
     });
     let older = older_transaction(&env);
 

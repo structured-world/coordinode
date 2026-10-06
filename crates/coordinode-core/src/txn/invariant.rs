@@ -25,6 +25,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::graph::node::NodeId;
+use crate::index::derive::IndexInterpretation;
+use crate::index::identity::GenerationId;
 
 /// Which direction of an edge type a scope covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +81,36 @@ pub enum ClaimScope {
     /// The schema of one node label: what a node whose primary label it is
     /// must satisfy.
     LabelSchema(String),
+    /// One value of a unique index generation, as its entry key encodes it.
+    /// Every attempt that gives a node this value claims it, whatever
+    /// representation or maintenance epoch it writes through.
+    UniqueValue {
+        /// The index generation.
+        generation: GenerationId,
+        /// The value's encoded tuple.
+        tuple: Vec<u8>,
+    },
+}
+
+/// The stored nodes a unique index's build has not reached yet, which a
+/// claim on one of its values must still be decided against: until the build
+/// publishes the index, a value missing from it may be held by one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncoveredSource {
+    /// The shard whose nodes the index covers.
+    pub shard_id: u16,
+    /// The index's label; only nodes whose primary label it is hold values.
+    pub label: String,
+    /// What decides a stored node's values in the index.
+    pub interpretation: IndexInterpretation,
+    /// The last node key the build had committed entries through when the
+    /// claim was stated, if known: the nodes up to it are covered by the
+    /// index's entries. Coverage only grows, so an older key is a safe bound;
+    /// `None` reads every node.
+    pub covered_through: Option<Vec<u8>>,
+    /// The most stored node rows the decision reads. Past it the claim is
+    /// left undecided, never decided either way.
+    pub read_limit: u64,
 }
 
 /// What a claim asserts about its scope.
@@ -142,6 +174,16 @@ pub enum ClaimPredicate {
     SchemaActivated {
         /// The revision being activated.
         revision: u64,
+    },
+    /// The attempt gives `node` the unique value its scope names, and its
+    /// result depends on no other node holding it in the post-state. Two
+    /// attempts giving one value to the same node agree; to different nodes
+    /// they cannot both be admitted.
+    UniqueHolder {
+        /// The node taking the value.
+        node: NodeId,
+        /// The stored nodes still to be read, while the index is being built.
+        uncovered: Option<alloc::boxed::Box<UncoveredSource>>,
     },
 }
 
@@ -289,6 +331,12 @@ impl Claim {
             // Two activations of one label cannot both be the current one.
             (SchemaActivated { .. }, SchemaRead { .. } | SchemaActivated { .. }) => false,
 
+            // Two attempts taking one value both write its entry key, and the
+            // commit that lands second is refused there as a conflict its
+            // caller can explain by the holder. Refusing here would only
+            // answer the same race earlier, without the holder.
+            (UniqueHolder { .. }, UniqueHolder { .. }) => true,
+
             // An overlap this function does not recognise is not permission
             // to proceed.
             _ => false,
@@ -333,6 +381,16 @@ impl ClaimScope {
             ) => s1 == s2 && g1 == g2 && t1 == t2,
             (Record(a), Record(b)) => a == b,
             (LabelSchema(a), LabelSchema(b)) => a == b,
+            (
+                UniqueValue {
+                    generation: g1,
+                    tuple: t1,
+                },
+                UniqueValue {
+                    generation: g2,
+                    tuple: t2,
+                },
+            ) => g1 == g2 && t1 == t2,
 
             // A pair's edge is incident to both its endpoints, so it is
             // inside the incident scope of either one under the same type

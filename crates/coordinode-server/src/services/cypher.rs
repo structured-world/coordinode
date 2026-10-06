@@ -323,6 +323,16 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 ],
             );
         }
+        // Not a duplicate: the value may be free. UNAVAILABLE, since the
+        // same write succeeds once the build covers the stored nodes.
+        DatabaseError::Execution(ExecutionError::UniquenessUnresolved { index, limit }) => {
+            return status_with_reason(
+                Code::Unavailable,
+                rendered,
+                Reason::UniquenessUnresolved,
+                [("index", index.clone()), ("limit", limit.to_string())],
+            );
+        }
         DatabaseError::Execution(ExecutionError::ConstraintViolation {
             constraint,
             kind,

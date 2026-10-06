@@ -896,3 +896,200 @@ fn staged_writes_for_another_scope_are_ignored() {
     );
     let _ = encode_remove(0);
 }
+
+mod unique_while_building {
+    use super::*;
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef, tuples};
+    use coordinode_core::index::identity::GenerationId;
+    use coordinode_core::txn::invariant::UncoveredSource;
+
+    const SHARD: u16 = 1;
+    const EMAIL: u32 = 7;
+
+    fn interpretation() -> IndexInterpretation {
+        IndexInterpretation {
+            codec: KEY_CODEC,
+            generation: GenerationId::from_raw(3),
+            unique: true,
+            sparse: false,
+            properties: vec![PropertyRef {
+                field: Some(EMAIL),
+                name: "email".into(),
+            }],
+            filter: None,
+        }
+    }
+
+    fn email(v: &str) -> Value {
+        Value::String(v.into())
+    }
+
+    fn record(label: &str, value: Value) -> Vec<u8> {
+        let mut record = NodeRecord::new(label);
+        record.set(EMAIL, value);
+        record.to_msgpack().expect("encode")
+    }
+
+    fn store(engine: &StorageEngine, id: u64, label: &str, value: Value) {
+        engine
+            .put(
+                Partition::Node,
+                &encode_node_key(SHARD, node(id)),
+                &record(label, value),
+            )
+            .expect("put node");
+    }
+
+    fn claim(claimant: u64, value: Value, covered: Option<u64>, limit: u64) -> Claim {
+        let interpretation = interpretation();
+        let tuple = tuples(&[value]).pop().expect("one tuple");
+        Claim::new(
+            ClaimScope::UniqueValue {
+                generation: interpretation.generation,
+                tuple,
+            },
+            ClaimPredicate::UniqueHolder {
+                node: node(claimant),
+                uncovered: Some(Box::new(UncoveredSource {
+                    shard_id: SHARD,
+                    label: "User".into(),
+                    interpretation,
+                    covered_through: covered.map(|id| encode_node_key(SHARD, node(id))),
+                    read_limit: limit,
+                })),
+            },
+            GEN,
+        )
+    }
+
+    fn decide_with(
+        engine: &StorageEngine,
+        claim: &Claim,
+        points: &HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>,
+        deltas: &[(Vec<u8>, Vec<u8>)],
+    ) -> Verdict {
+        Evaluation::new(engine, &[], points, engine.snapshot())
+            .with_node_deltas(deltas)
+            .decide(claim)
+            .expect("decide")
+    }
+
+    /// A stored node the build has not reached holds the value: the claim is
+    /// refused naming it and the values it holds, although no entry exists.
+    #[test]
+    fn a_value_an_unreached_node_holds_is_held_by_it() {
+        let (engine, _d) = engine();
+        store(&engine, 1, "User", email("a@x"));
+
+        assert_eq!(
+            decide(&engine, &claim(2, email("a@x"), None, 1_000), &[]),
+            Verdict::HeldBy {
+                holder: node(1),
+                values: vec![email("a@x")],
+            }
+        );
+    }
+
+    /// A free value holds; the claimant's own node, a node of another label
+    /// and a node the build already covered do not count.
+    #[test]
+    fn the_claimant_other_labels_and_covered_nodes_do_not_hold() {
+        let (engine, _d) = engine();
+        store(&engine, 1, "User", email("a@x"));
+        store(&engine, 3, "Admin", email("c@x"));
+
+        for (claimant, value, covered) in [
+            (2, "b@x", None),
+            (1, "a@x", None),
+            (2, "c@x", None),
+            // Node 1 holds it, but its entry is the build's to commit, and
+            // the attempt meets that entry on the key both write.
+            (2, "a@x", Some(1)),
+        ] {
+            assert_eq!(
+                decide(&engine, &claim(claimant, email(value), covered, 1_000), &[]),
+                Verdict::Holds,
+                "{claimant} taking {value} covered through {covered:?}"
+            );
+        }
+    }
+
+    /// A list is indexed by each element, so a stored list holding the value
+    /// holds it.
+    #[test]
+    fn an_element_of_a_stored_list_is_held() {
+        let (engine, _d) = engine();
+        store(
+            &engine,
+            1,
+            "User",
+            Value::Array(vec![email("x"), email("y")]),
+        );
+
+        assert!(matches!(
+            decide(&engine, &claim(2, email("y"), None, 1_000), &[]),
+            Verdict::HeldBy { holder, .. } if holder == node(1)
+        ));
+    }
+
+    /// Rows the attempt deletes or rewrites are judged as it leaves them, and
+    /// rows it changes through document deltas are left to the entries it
+    /// maintained for them, not to their committed bytes.
+    #[test]
+    fn rows_the_attempt_changes_are_judged_by_its_post_state() {
+        let (engine, _d) = engine();
+        store(&engine, 1, "User", email("a@x"));
+        store(&engine, 3, "User", email("c@x"));
+        store(&engine, 5, "User", email("e@x"));
+        let mut points = HashMap::new();
+        points.insert((Partition::Node, encode_node_key(SHARD, node(1))), None);
+        points.insert(
+            (Partition::Node, encode_node_key(SHARD, node(3))),
+            Some(record("User", email("d@x"))),
+        );
+        let deltas = vec![(encode_node_key(SHARD, node(5)), Vec::new())];
+
+        for value in ["a@x", "c@x", "e@x"] {
+            assert_eq!(
+                decide_with(
+                    &engine,
+                    &claim(9, email(value), None, 1_000),
+                    &points,
+                    &deltas
+                ),
+                Verdict::Holds,
+                "{value}"
+            );
+        }
+        assert!(matches!(
+            decide_with(&engine, &claim(9, email("d@x"), None, 1_000), &points, &deltas),
+            Verdict::HeldBy { holder, .. } if holder == node(3)
+        ));
+    }
+
+    /// A decision that would read more stored rows than the limit is left
+    /// unresolved, never called a duplicate or a pass.
+    #[test]
+    fn a_decision_past_the_limit_is_over_limit() {
+        let (engine, _d) = engine();
+        for id in 1..=3 {
+            store(&engine, id, "User", email(&format!("{id}@x")));
+        }
+
+        assert_eq!(
+            decide(&engine, &claim(9, email("free@x"), None, 2), &[]),
+            Verdict::OverLimit { limit: 2 }
+        );
+        assert_eq!(
+            decide(&engine, &claim(9, email("free@x"), None, 3), &[]),
+            Verdict::Holds
+        );
+        // Rows the build covered are not read, so the same limit suffices.
+        assert_eq!(
+            decide(&engine, &claim(9, email("free@x"), Some(2), 1), &[]),
+            Verdict::Holds
+        );
+    }
+}

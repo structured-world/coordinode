@@ -171,6 +171,31 @@ pub enum CommitError {
         /// Which condition refused it, in the words of the condition.
         reason: String,
     },
+    /// A value this attempt gives a node in a unique index is held by
+    /// another node in the post-state. Nothing was applied.
+    #[error("a unique value of index generation {generation} is held by node {}", holder.as_raw())]
+    UniqueValueHeld {
+        /// The index generation.
+        generation: coordinode_core::index::identity::GenerationId,
+        /// The values the holder has in the index.
+        values: Vec<coordinode_core::graph::types::Value>,
+        /// The node holding it.
+        holder: coordinode_core::graph::node::NodeId,
+    },
+    /// Proving a value this attempt takes in a unique index still being
+    /// built free would read more than `limit` stored rows. Nothing was
+    /// applied; the value may be free, and the attempt can be retried once
+    /// the build is done.
+    #[error(
+        "proving a unique value of index generation {generation} free would read more than \
+         {limit} stored nodes; retry once the build is done"
+    )]
+    UniquenessUnresolved {
+        /// The index generation.
+        generation: coordinode_core::index::identity::GenerationId,
+        /// The most stored rows one proof reads.
+        limit: u64,
+    },
 }
 
 /// Map a storage [`Partition`] to its wire [`PartitionId`] for Raft proposals.
@@ -1000,10 +1025,19 @@ impl<'a> Transaction<'a> {
     /// A condition the evaluator cannot decide refuses the commit rather than
     /// passing it: an undecidable claim is not a satisfied one, and admitting
     /// it would mean the protection is absent exactly where the evidence is.
-    fn evaluate_claims(&self) -> Result<(), CommitError> {
+    ///
+    /// `before_admission` picks the claims decided before the commit takes
+    /// its timestamp (see [`decided_before_admission`]), the others are
+    /// decided after it.
+    fn evaluate_claims(&self, before_admission: bool) -> Result<(), CommitError> {
         use crate::engine::claims::evaluate::{Evaluation, Verdict};
 
-        if self.claims.is_empty() {
+        if !self
+            .claims
+            .claims()
+            .iter()
+            .any(|claim| decided_before_admission(claim) == before_admission)
+        {
             return Ok(());
         }
         // The attempt's view as a sequence number, which is what "written
@@ -1015,8 +1049,14 @@ impl<'a> Transaction<'a> {
         // applies as it goes.
         let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
         let evaluation =
-            Evaluation::new(self.engine, &self.merge_adj_ops, &self.write_buffer, view);
-        for claim in self.claims.claims() {
+            Evaluation::new(self.engine, &self.merge_adj_ops, &self.write_buffer, view)
+                .with_node_deltas(&self.merge_node_deltas);
+        for claim in self
+            .claims
+            .claims()
+            .iter()
+            .filter(|claim| decided_before_admission(claim) == before_admission)
+        {
             match evaluation.decide(claim)? {
                 Verdict::Holds => {}
                 Verdict::Broken => {
@@ -1033,6 +1073,42 @@ impl<'a> Transaction<'a> {
                             "{:?} on {:?} cannot be decided here, so it cannot be admitted",
                             claim.predicate, claim.scope
                         ),
+                    });
+                }
+                Verdict::HeldBy { holder, values } => {
+                    return Err(match &claim.scope {
+                        coordinode_core::txn::invariant::ClaimScope::UniqueValue {
+                            generation,
+                            ..
+                        } => CommitError::UniqueValueHeld {
+                            generation: *generation,
+                            values,
+                            holder,
+                        },
+                        scope => CommitError::InvariantRefused {
+                            reason: format!(
+                                "{:?} on {scope:?} is held by node {}",
+                                claim.predicate,
+                                holder.as_raw()
+                            ),
+                        },
+                    });
+                }
+                Verdict::OverLimit { limit } => {
+                    return Err(match &claim.scope {
+                        coordinode_core::txn::invariant::ClaimScope::UniqueValue {
+                            generation,
+                            ..
+                        } => CommitError::UniquenessUnresolved {
+                            generation: *generation,
+                            limit,
+                        },
+                        scope => CommitError::InvariantRefused {
+                            reason: format!(
+                                "{:?} on {scope:?} would read more than {limit} rows to decide",
+                                claim.predicate
+                            ),
+                        },
                     });
                 }
             }
@@ -1450,6 +1526,9 @@ impl<'a> Transaction<'a> {
                 self.claims.insert(read.clone());
             }
         }
+        // Before the timestamp: every snapshot taken after it waits for this
+        // commit to land, so a long read here would hold up all of them.
+        self.evaluate_claims(true)?;
         let _reservation = if self.claims.is_empty() {
             None
         } else {
@@ -1530,7 +1609,7 @@ impl<'a> Transaction<'a> {
         // sufficient alone, and the evaluation reads storage, so it belongs
         // outside the tables rather than inside them.
         if !self.claims.is_empty() {
-            self.evaluate_claims()?;
+            self.evaluate_claims(false)?;
         }
 
         // Records written on the condition of their version. Checked here,
@@ -1956,6 +2035,25 @@ pub struct PagedScan {
     pub last_key: Option<Vec<u8>>,
     /// True when the prefix has no rows beyond this page.
     pub exhausted: bool,
+}
+
+/// Whether `claim` is decided before its commit takes a timestamp rather
+/// than after.
+///
+/// A unique value held by a stored node a build has not reached is found by
+/// reading those nodes, which can take long. It need not wait for the
+/// timestamp: a node that takes the value after the read writes the value's
+/// entry key, as the claimant does, and one of the two commits is refused
+/// there; a writer older than the index is refused by the schema revision
+/// the index was published with.
+fn decided_before_admission(claim: &coordinode_core::txn::invariant::Claim) -> bool {
+    matches!(
+        claim.predicate,
+        coordinode_core::txn::invariant::ClaimPredicate::UniqueHolder {
+            uncovered: Some(_),
+            ..
+        }
+    )
 }
 
 /// The smallest key that sorts strictly after every key carrying `prefix`, for

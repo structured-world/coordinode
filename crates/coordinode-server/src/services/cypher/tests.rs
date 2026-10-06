@@ -2551,6 +2551,31 @@ fn a_duplicate_key_maps_to_already_exists_with_the_holder() {
     assert!(details.retry_info().is_none(), "terminal: no retry advice");
 }
 
+/// A unique value not proved free while its index is being built is
+/// UNAVAILABLE / UNIQUENESS_UNRESOLVED with the index and the limit, and a
+/// retry delay: it is not a duplicate, and the same write succeeds once the
+/// build is done.
+#[test]
+fn an_unresolved_unique_value_maps_to_unavailable_with_retry_advice() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(
+        ExecutionError::UniquenessUnresolved {
+            index: "user_email".into(),
+            limit: 100_000,
+        },
+    ));
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "UNIQUENESS_UNRESOLVED");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("index"), Some("user_email"));
+    assert_eq!(meta("limit"), Some("100000"));
+    assert!(details.retry_info().is_some(), "retryable: retry advice");
+}
+
 /// Changing a key column is FAILED_PRECONDITION / KEY_IMMUTABLE, naming the
 /// table and the column.
 #[test]

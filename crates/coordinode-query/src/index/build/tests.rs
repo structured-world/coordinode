@@ -67,6 +67,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         definition_version: None,
         older_transactions_wait: super::DEFAULT_OLDER_TRANSACTIONS_WAIT,
         progress: None,
+        covered: None,
     }
 }
 
@@ -195,6 +196,34 @@ fn a_backfill_reports_its_progress_per_page() {
             BackfillProgress::Indexed(PAGE as u64),
             BackfillProgress::Indexed(total),
         ]
+    );
+}
+
+/// After every committed page the backfill tells the last node key it read,
+/// so a writer knows which stored nodes already have their entries.
+#[test]
+fn a_backfill_tells_the_key_it_covered_through_per_page() {
+    let mut fx = fixture();
+    let total = PAGE as u64 + 3;
+    for id in 1..=total {
+        put_node(&mut fx, id, "User", &email(&format!("u{id}@x")));
+    }
+    let index = bound(crate::index::IndexDescriptor::btree(
+        "user_email",
+        "User",
+        "email",
+    ));
+    let covered = std::cell::RefCell::new(Vec::new());
+    let record = |key: &[u8]| covered.borrow_mut().push(key.to_vec());
+    let mut run = backfill(&fx);
+    run.covered = Some(&record);
+    run.run(&index, &mut |txn| commit(txn)).expect("backfill");
+
+    let node_key =
+        |id: u64| coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(id)).to_vec();
+    assert_eq!(
+        covered.into_inner(),
+        [node_key(PAGE as u64), node_key(total)]
     );
 }
 

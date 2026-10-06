@@ -551,6 +551,29 @@ fn label_schema(name: &str, predicate: ClaimPredicate) -> ClaimSet {
     )])
 }
 
+/// Two attempts taking one unique value, or two values, are not kept apart
+/// by the registry.
+#[test]
+fn two_holders_of_one_unique_value_are_left_to_its_entry_key() {
+    let holder = |id: u64, tuple: &[u8]| {
+        Claim::new(
+            ClaimScope::UniqueValue {
+                generation: crate::index::identity::GenerationId::from_raw(2),
+                tuple: tuple.to_vec(),
+            },
+            ClaimPredicate::UniqueHolder {
+                node: node(id),
+                uncovered: None,
+            },
+            GEN,
+        )
+    };
+    // Both write the value's entry key, and the commit that lands second is
+    // refused there with the holder to name; the registry adds nothing.
+    assert!(holder(1, b"a").compatible_with(&holder(2, b"a")));
+    assert!(holder(1, b"a").compatible_with(&holder(2, b"b")));
+}
+
 /// Writers of one label do not queue behind each other, whichever revision
 /// each of them read.
 #[test]

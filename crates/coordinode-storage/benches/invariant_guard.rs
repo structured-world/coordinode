@@ -349,6 +349,196 @@ fn refusal_latency() {
     report("refusal", samples, started.elapsed());
 }
 
+/// The field id the unique-value measurements index.
+const EMAIL: u32 = 1;
+
+/// A unique index over `:User(email)`, as a claim states it.
+fn email_interpretation() -> coordinode_core::index::derive::IndexInterpretation {
+    use coordinode_core::index::derive::{IndexInterpretation, KEY_CODEC, PropertyRef};
+    IndexInterpretation {
+        codec: KEY_CODEC,
+        generation: coordinode_core::index::identity::GenerationId::from_raw(3),
+        unique: true,
+        sparse: false,
+        properties: vec![PropertyRef {
+            field: Some(EMAIL),
+            name: "email".into(),
+        }],
+        filter: None,
+    }
+}
+
+/// `stored` users with distinct emails, as a unique index's build finds them.
+fn store_users(engine: &StorageEngine, stored: u64) {
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::graph::types::Value;
+    for id in 1..=stored {
+        let mut record = NodeRecord::new("User");
+        record.set(EMAIL, Value::String(format!("{id}@stored")));
+        let key = coordinode_core::graph::node::encode_node_key(
+            engine.node_shard(),
+            NodeId::from_raw(id),
+        );
+        engine
+            .put(Partition::Node, &key, &record.to_msgpack().expect("encode"))
+            .expect("put user");
+    }
+}
+
+/// One new user taking a free email while the index is being built, the
+/// build having covered all but the last `uncovered` of `stored` users.
+fn take_free_email(
+    engine: &StorageEngine,
+    oracle: &TimestampOracle,
+    id: u64,
+    stored: u64,
+    uncovered: u64,
+) -> Duration {
+    use coordinode_core::graph::node::{NodeRecord, encode_node_key};
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::index::derive::tuples;
+    use coordinode_core::txn::invariant::UncoveredSource;
+
+    let snap = engine.snapshot();
+    let mut txn = Transaction::new(
+        engine,
+        Some(oracle),
+        coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+        Some(snap),
+    );
+    let email = Value::String(format!("{id}@new"));
+    let mut record = NodeRecord::new("User");
+    record.set(EMAIL, email.clone());
+    let shard = engine.node_shard();
+    txn.put(
+        Partition::Node,
+        &encode_node_key(shard, NodeId::from_raw(id)),
+        &record.to_msgpack().expect("encode"),
+    )
+    .expect("put");
+    let interpretation = email_interpretation();
+    let generation = txn.schema_generation();
+    for tuple in tuples(&[email]) {
+        txn.claim(Claim::new(
+            ClaimScope::UniqueValue {
+                generation: interpretation.generation,
+                tuple,
+            },
+            ClaimPredicate::UniqueHolder {
+                node: NodeId::from_raw(id),
+                uncovered: Some(Box::new(UncoveredSource {
+                    shard_id: shard,
+                    label: "User".into(),
+                    interpretation: interpretation.clone(),
+                    covered_through: (uncovered < stored)
+                        .then(|| encode_node_key(shard, NodeId::from_raw(stored - uncovered))),
+                    read_limit: u64::MAX,
+                })),
+            },
+            generation,
+        ));
+    }
+    let wc = WriteConcern::default();
+    let ctx = commit_ctx(&wc);
+    let started = Instant::now();
+    txn.commit(&ctx).expect("commit");
+    started.elapsed()
+}
+
+/// What proving a unique value free costs a writer while the index is being
+/// built, by how many stored nodes the build has not reached: the commit
+/// reads exactly those. Users written by the measurement land after the
+/// stored ones, so they add to the read as a real build's concurrent writes
+/// would.
+fn unique_while_building(stored: u64, uncovered: u64, commits: usize) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = open(&dir);
+    store_users(&engine, stored);
+    engine.persist().expect("flush");
+
+    let started = Instant::now();
+    let samples: Vec<Duration> = (0..commits as u64)
+        .map(|i| take_free_email(&engine, &oracle, stored + 1 + i, stored, uncovered))
+        .collect();
+    report(
+        &format!("unique building, {uncovered}+{commits}/2 unread"),
+        samples,
+        started.elapsed(),
+    );
+}
+
+/// Writers that state no unique claim, committing beside one that reads
+/// `uncovered` stored nodes per commit: whether the read holds them up.
+fn bystanders_beside_unique_reads(stored: u64, uncovered: u64) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = open(&dir);
+    store_users(&engine, stored);
+    engine.persist().expect("flush");
+    let done = std::sync::atomic::AtomicBool::new(false);
+
+    let started = Instant::now();
+    let samples: Vec<Duration> = std::thread::scope(|scope| {
+        let claimant = {
+            let (engine, oracle, done) = (&engine, &oracle, &done);
+            scope.spawn(move || {
+                let mut id = 10 * stored;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    id += 1;
+                    take_free_email(engine, oracle, id, stored, uncovered);
+                }
+            })
+        };
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let engine = Arc::clone(&engine);
+                let oracle = Arc::clone(&oracle);
+                scope.spawn(move || {
+                    let wc = WriteConcern::default();
+                    // A node of another label: the claimant reads it and
+                    // passes over it.
+                    let doc = coordinode_core::graph::node::NodeRecord::new("Doc")
+                        .to_msgpack()
+                        .expect("encode");
+                    let mut local = Vec::with_capacity(COMMITS / WRITERS);
+                    for i in 0..COMMITS / WRITERS {
+                        // From the start of the transaction: a writer held up
+                        // waiting for its snapshot waits as surely as one held
+                        // up in its commit.
+                        let at = Instant::now();
+                        let snap = engine.snapshot();
+                        let mut txn = Transaction::new(
+                            engine.as_ref(),
+                            Some(oracle.as_ref()),
+                            coordinode_core::txn::timestamp::Timestamp::from_raw(snap),
+                            Some(snap),
+                        );
+                        let id = NodeId::from_raw((20 * stored) + (w * COMMITS + i) as u64);
+                        let key =
+                            coordinode_core::graph::node::encode_node_key(engine.node_shard(), id);
+                        txn.put(Partition::Node, &key, &doc).expect("put");
+                        let ctx = commit_ctx(&wc);
+                        txn.commit(&ctx).expect("commit");
+                        local.push(at.elapsed());
+                    }
+                    local
+                })
+            })
+            .collect();
+        let samples = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("writer"))
+            .collect();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        claimant.join().expect("claimant");
+        samples
+    });
+    report(
+        &format!("bystanders, claimant reads {uncovered}"),
+        samples,
+        started.elapsed(),
+    );
+}
+
 fn main() {
     println!("== invariant guard ==");
     skewed_node(false, true);
@@ -358,4 +548,12 @@ fn main() {
     one_label_writes(true);
     guard_memory();
     refusal_latency();
+    const STORED: u64 = 100_000;
+    unique_while_building(STORED, 0, 2_000);
+    unique_while_building(STORED, 1_000, 1_000);
+    unique_while_building(STORED, 10_000, 200);
+    unique_while_building(STORED, 100_000, 30);
+    bystanders_beside_unique_reads(STORED, 0);
+    bystanders_beside_unique_reads(STORED, 10_000);
+    bystanders_beside_unique_reads(STORED, 100_000);
 }

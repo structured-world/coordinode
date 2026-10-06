@@ -214,6 +214,22 @@ pub enum ExecutionError {
         element_id: String,
     },
 
+    /// A write takes a value of a unique index whose build has not reached
+    /// every stored node yet, and proving no stored node holds the value
+    /// would read more than the configured limit. Nothing was written; the
+    /// value may well be free, and the same write succeeds once the build
+    /// is done.
+    #[error(
+        "unique index `{index}` is still being built and proving the value free would read \
+         more than {limit} stored nodes; retry once the build is done"
+    )]
+    UniquenessUnresolved {
+        /// The unique index being built.
+        index: String,
+        /// The most stored node rows one proof reads.
+        limit: u64,
+    },
+
     /// A write would leave a node breaking a constraint of its label: a
     /// required property missing or null, or a value of the wrong type.
     /// Nothing was written.
@@ -1432,6 +1448,52 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// State the unique values claimed since the `from`th claim in indexes
+    /// still being built as conditions of the commit: the backfill has not
+    /// reached every stored node, so a missing entry does not prove a value
+    /// free, and the commit reads the stored nodes past the key the backfill
+    /// covered through, as they stand when it is decided.
+    fn claim_building_uniques(&mut self, from: usize) {
+        use coordinode_core::index::derive::tuples;
+        use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
+        let limit = self.index_builds.map_or(
+            crate::index::DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
+            |builds| builds.config().unique_admission_read_limit,
+        );
+        let revision = self.txn.schema_generation();
+        let interner: &FieldInterner = self.interner;
+        let field_of = |name: &str| interner.lookup(name);
+        let mut stated = Vec::new();
+        for claim in &self.key_claims.indexes[from..] {
+            if !matches!(claim.index.state, IndexState::Building { .. }) {
+                continue;
+            }
+            let generation = claim.index.generation;
+            let source = UncoveredSource {
+                shard_id: self.shard_id,
+                label: claim.index.label.clone(),
+                interpretation: claim.index.interpretation(&field_of),
+                covered_through: self
+                    .index_builds
+                    .and_then(|builds| builds.covered_through(generation)),
+                read_limit: limit,
+            };
+            for tuple in tuples(&claim.values) {
+                stated.push(Claim::new(
+                    ClaimScope::UniqueValue { generation, tuple },
+                    ClaimPredicate::UniqueHolder {
+                        node: claim.node_id,
+                        uncovered: Some(Box::new(source.clone())),
+                    },
+                    revision,
+                ));
+            }
+        }
+        for claim in stated {
+            self.txn.claim(claim);
+        }
+    }
+
     /// Stage the B-tree index entries of `record`, a node being created, or
     /// the version of a temporal node starting at `valid_from`. A unique
     /// value another node holds refuses the write.
@@ -1449,23 +1511,28 @@ impl<'a> ExecutionContext<'a> {
             return Ok(());
         }
         self.sync_txn_state();
-        let interner: &FieldInterner = self.interner;
-        let lookup = crate::index::registry::record_lookup(record, interner);
-        let field_of = |name: &str| interner.lookup(name);
-        registry
-            .on_node_created(
-                self.engine,
-                &mut self.txn,
-                &crate::index::registry::NodeState {
-                    node_id,
-                    valid_from,
-                    label,
-                    value_of: &lookup,
-                },
-                &field_of,
-                &mut self.key_claims.indexes,
-            )
-            .map_err(index_write_error)
+        let from = self.key_claims.indexes.len();
+        {
+            let interner: &FieldInterner = self.interner;
+            let lookup = crate::index::registry::record_lookup(record, interner);
+            let field_of = |name: &str| interner.lookup(name);
+            registry
+                .on_node_created(
+                    self.engine,
+                    &mut self.txn,
+                    &crate::index::registry::NodeState {
+                        node_id,
+                        valid_from,
+                        label,
+                        value_of: &lookup,
+                    },
+                    &field_of,
+                    &mut self.key_claims.indexes,
+                )
+                .map_err(index_write_error)?;
+        }
+        self.claim_building_uniques(from);
+        Ok(())
     }
 
     /// Move the B-tree index entries of the version of temporal node
@@ -1487,36 +1554,41 @@ impl<'a> ExecutionContext<'a> {
             return Ok(());
         }
         self.sync_txn_state();
-        let interner: &FieldInterner = self.interner;
-        let changed: Vec<&str> = before
-            .props
-            .keys()
-            .chain(after.props.keys())
-            .filter(|field| before.props.get(field) != after.props.get(field))
-            .filter_map(|field| interner.resolve(*field))
-            .collect();
-        if changed.is_empty() {
-            return Ok(());
+        let from = self.key_claims.indexes.len();
+        {
+            let interner: &FieldInterner = self.interner;
+            let changed: Vec<&str> = before
+                .props
+                .keys()
+                .chain(after.props.keys())
+                .filter(|field| before.props.get(field) != after.props.get(field))
+                .filter_map(|field| interner.resolve(*field))
+                .collect();
+            if changed.is_empty() {
+                return Ok(());
+            }
+            let before_of = crate::index::registry::record_lookup(before, interner);
+            let after_of = crate::index::registry::record_lookup(after, interner);
+            let field_of = |name: &str| interner.lookup(name);
+            registry
+                .on_property_changed(
+                    self.engine,
+                    &mut self.txn,
+                    &crate::index::PropertyChange {
+                        node_id,
+                        valid_from: Some(valid_from),
+                        label,
+                        properties: &changed,
+                        before: &before_of,
+                        after: &after_of,
+                    },
+                    &field_of,
+                    &mut self.key_claims.indexes,
+                )
+                .map_err(index_write_error)?;
         }
-        let before_of = crate::index::registry::record_lookup(before, interner);
-        let after_of = crate::index::registry::record_lookup(after, interner);
-        let field_of = |name: &str| interner.lookup(name);
-        registry
-            .on_property_changed(
-                self.engine,
-                &mut self.txn,
-                &crate::index::PropertyChange {
-                    node_id,
-                    valid_from: Some(valid_from),
-                    label,
-                    properties: &changed,
-                    before: &before_of,
-                    after: &after_of,
-                },
-                &field_of,
-                &mut self.key_claims.indexes,
-            )
-            .map_err(index_write_error)
+        self.claim_building_uniques(from);
+        Ok(())
     }
 
     /// Move the B-tree index entries of `record` as its `property` changes to
@@ -1537,32 +1609,37 @@ impl<'a> ExecutionContext<'a> {
             return Ok(());
         }
         self.sync_txn_state();
-        let interner: &FieldInterner = self.interner;
-        let before = crate::index::registry::record_lookup(record, interner);
-        let after = |name: &str| {
-            if name == property {
-                new_value.cloned()
-            } else {
-                before(name)
-            }
-        };
-        let field_of = |name: &str| interner.lookup(name);
-        registry
-            .on_property_changed(
-                self.engine,
-                &mut self.txn,
-                &crate::index::PropertyChange {
-                    node_id,
-                    valid_from: None,
-                    label,
-                    properties: &[property],
-                    before: &before,
-                    after: &after,
-                },
-                &field_of,
-                &mut self.key_claims.indexes,
-            )
-            .map_err(index_write_error)
+        let from = self.key_claims.indexes.len();
+        {
+            let interner: &FieldInterner = self.interner;
+            let before = crate::index::registry::record_lookup(record, interner);
+            let after = |name: &str| {
+                if name == property {
+                    new_value.cloned()
+                } else {
+                    before(name)
+                }
+            };
+            let field_of = |name: &str| interner.lookup(name);
+            registry
+                .on_property_changed(
+                    self.engine,
+                    &mut self.txn,
+                    &crate::index::PropertyChange {
+                        node_id,
+                        valid_from: None,
+                        label,
+                        properties: &[property],
+                        before: &before,
+                        after: &after,
+                    },
+                    &field_of,
+                    &mut self.key_claims.indexes,
+                )
+                .map_err(index_write_error)?;
+        }
+        self.claim_building_uniques(from);
+        Ok(())
     }
 
     /// Whether a node of `label` has B-tree index entries to keep, so a
@@ -1591,26 +1668,31 @@ impl<'a> ExecutionContext<'a> {
             return Ok(());
         }
         self.sync_txn_state();
-        let interner: &FieldInterner = self.interner;
-        let before_of = crate::index::registry::record_lookup(before, interner);
-        let after_of = crate::index::registry::record_lookup(after, interner);
-        let field_of = |name: &str| interner.lookup(name);
-        registry
-            .on_property_changed(
-                self.engine,
-                &mut self.txn,
-                &crate::index::PropertyChange {
-                    node_id,
-                    valid_from: None,
-                    label,
-                    properties,
-                    before: &before_of,
-                    after: &after_of,
-                },
-                &field_of,
-                &mut self.key_claims.indexes,
-            )
-            .map_err(index_write_error)
+        let from = self.key_claims.indexes.len();
+        {
+            let interner: &FieldInterner = self.interner;
+            let before_of = crate::index::registry::record_lookup(before, interner);
+            let after_of = crate::index::registry::record_lookup(after, interner);
+            let field_of = |name: &str| interner.lookup(name);
+            registry
+                .on_property_changed(
+                    self.engine,
+                    &mut self.txn,
+                    &crate::index::PropertyChange {
+                        node_id,
+                        valid_from: None,
+                        label,
+                        properties,
+                        before: &before_of,
+                        after: &after_of,
+                    },
+                    &field_of,
+                    &mut self.key_claims.indexes,
+                )
+                .map_err(index_write_error)?;
+        }
+        self.claim_building_uniques(from);
+        Ok(())
     }
 
     /// Move the B-tree index entries of a node whose declared properties go
@@ -1643,6 +1725,7 @@ impl<'a> ExecutionContext<'a> {
         let before = |name: &str| interner.lookup(name).and_then(|f| old.get(&f).cloned());
         let after = |name: &str| interner.lookup(name).and_then(|f| new.get(&f).cloned());
         let field_of = |name: &str| interner.lookup(name);
+        let from = self.key_claims.indexes.len();
         registry
             .on_property_changed(
                 self.engine,
@@ -1658,7 +1741,9 @@ impl<'a> ExecutionContext<'a> {
                 &field_of,
                 &mut self.key_claims.indexes,
             )
-            .map_err(index_write_error)
+            .map_err(index_write_error)?;
+        self.claim_building_uniques(from);
+        Ok(())
     }
 
     /// The nodes whose entry in the B-tree index `id` holds exactly `value`,
@@ -1811,6 +1896,47 @@ impl<'a> ExecutionContext<'a> {
         self.sync_txn_state();
         LocalTableKeyStore.release_all(&mut self.txn, table)?;
         Ok(())
+    }
+
+    /// Name the index and the value of a commit refused over a unique value
+    /// this statement claimed: a holder found becomes
+    /// [`ExecutionError::UniqueViolation`], an unresolved proof
+    /// [`ExecutionError::UniquenessUnresolved`]. Any other refusal is handed
+    /// back.
+    fn explain_unique_refusal(
+        &self,
+        error: coordinode_storage::engine::transaction::CommitError,
+    ) -> Result<ExecutionError, coordinode_storage::engine::transaction::CommitError> {
+        use coordinode_storage::engine::transaction::CommitError;
+        let explained = match &error {
+            CommitError::UniqueValueHeld {
+                generation,
+                values,
+                holder,
+            } => self
+                .key_claims
+                .indexes
+                .iter()
+                .find(|claim| claim.index.generation == *generation)
+                .map(|claim| {
+                    unique_violation(crate::index::UniqueViolation::new(
+                        &claim.index,
+                        values,
+                        *holder,
+                    ))
+                }),
+            CommitError::UniquenessUnresolved { generation, limit } => self
+                .key_claims
+                .indexes
+                .iter()
+                .find(|claim| claim.index.generation == *generation)
+                .map(|claim| ExecutionError::UniquenessUnresolved {
+                    index: claim.index.to_string(),
+                    limit: *limit,
+                }),
+            _ => None,
+        };
+        explained.ok_or(error)
     }
 
     /// Turn a commit refused for contention into [`ExecutionError::DuplicateKey`]
@@ -2631,7 +2757,13 @@ impl<'a> ExecutionContext<'a> {
         };
         let outcome = match self.txn.commit(&ctx) {
             Ok(outcome) => outcome,
-            Err(e) => return Err(self.explain_lost_key_race(commit_err_to_execution(e))),
+            Err(e) => {
+                let e = match self.explain_unique_refusal(e) {
+                    Ok(explained) => return Err(explained),
+                    Err(e) => e,
+                };
+                return Err(self.explain_lost_key_race(commit_err_to_execution(e)));
+            }
         };
         // operationTime spans every Raft entry the statement produced — `max`,
         // not assign: a statement may have issued an earlier in-execute
@@ -17226,7 +17358,16 @@ fn execute_create_btree_index(
     if let Some(f) = filter {
         descriptor = descriptor.with_filter(f.clone());
     }
-    let def = publish_index_build(descriptor, maintenance, ctx, |_| Ok(()))?;
+    let engine = ctx.engine;
+    let def = publish_index_build(descriptor, maintenance, ctx, |txn| {
+        if unique {
+            stage_label_fence(engine, txn, label)
+        } else {
+            Ok(())
+        }
+    });
+    ctx.label_schema_cache.remove(label);
+    let def = def?;
     let backfilled = await_index_build(&def, ctx)?;
     let maintenance = def.maintenance;
 
@@ -17856,6 +17997,39 @@ pub fn stage_constraint_withdrawal(
     store.release_constraint_name_txn(txn, name)
 }
 
+/// Stage a new revision of `label`'s schema that requires nothing new of a
+/// node, so a writer that read the current one is refused at its commit. A
+/// unique index without a constraint publishes with it: a writer validated
+/// before the index existed keeps no entry of it and states no claim on its
+/// values, so it could take a value another node takes meanwhile.
+///
+/// # Errors
+///
+/// The schema could not be read or staged.
+fn stage_label_fence(
+    engine: &StorageEngine,
+    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
+    label: &str,
+) -> Result<(), coordinode_modality::StoreError> {
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    let store = LocalSchemaStore::new(engine);
+    let next = match store.load_label_for_update_txn(txn, label)? {
+        Some(mut schema) => {
+            schema.schema_revision = next_revision(&schema).map_err(store_error)?;
+            schema
+        }
+        // A label without a schema is enforced as FLEXIBLE, which the schema
+        // created here keeps; a writer that read the absence is refused by
+        // its appearance.
+        None => {
+            let mut schema = LabelSchema::new_node_id(label);
+            schema.set_mode(SchemaMode::Flexible);
+            schema
+        }
+    };
+    store.save_label_admitting_txn(txn, &next)
+}
+
 /// The revision a change of `schema` is published at.
 fn next_revision(
     schema: &coordinode_core::schema::definition::LabelSchema,
@@ -18062,6 +18236,15 @@ fn commit_err_to_execution(
         // Also the same on retry: the statement has to change fewer entries.
         e @ CommitError::IndexFanOut { .. } => ExecutionError::Serialization(e.to_string()),
         CommitError::InvariantRefused { reason } => ExecutionError::InvariantRefused(reason),
+        // Named by generation here; an executor that holds the claim names
+        // the index and the value before this is reached.
+        e @ CommitError::UniqueValueHeld { .. } => ExecutionError::InvariantRefused(e.to_string()),
+        CommitError::UniquenessUnresolved { generation, limit } => {
+            ExecutionError::UniquenessUnresolved {
+                index: generation.to_string(),
+                limit,
+            }
+        }
         CommitError::RevisionMismatch { expected, current } => {
             ExecutionError::RevisionMismatch { expected, current }
         }

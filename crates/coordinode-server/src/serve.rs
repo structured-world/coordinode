@@ -202,6 +202,7 @@ pub(crate) async fn serve(
         vector_retired_bytes_budget,
         index_build_max_running,
         index_build_older_transactions_wait_secs,
+        index_build_unique_read_limit,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -730,6 +731,8 @@ pub(crate) async fn serve(
             defaults.older_transactions_wait,
             std::time::Duration::from_secs,
         ),
+        unique_admission_read_limit: index_build_unique_read_limit
+            .unwrap_or(defaults.unique_admission_read_limit),
     });
     // What a statement executes under when neither it nor its session names a
     // concern.

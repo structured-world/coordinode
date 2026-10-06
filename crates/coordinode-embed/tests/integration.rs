@@ -51,6 +51,7 @@ mod integration {
     mod temporal_traversal;
     mod text_index;
     mod tiered_cache;
+    mod unique_admission;
     mod validated_extra;
     mod vector_index_build_lifecycle;
     mod vector_index_ddl;

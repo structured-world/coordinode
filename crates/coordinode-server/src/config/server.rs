@@ -295,6 +295,10 @@ pub struct ServerConfig {
     /// How long an index build waits for the transactions opened before its
     /// index to end before it fails, in seconds (`None` = 60).
     pub index_build_older_transactions_wait_secs: Option<u64>,
+    /// The most stored node rows a commit reads to prove a value it takes in
+    /// a unique index still being built free (`None` = 100000); past it the
+    /// write is refused as unresolved.
+    pub index_build_unique_read_limit: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -455,6 +459,7 @@ impl Default for ServerConfig {
             vector_retired_bytes_budget: None,
             index_build_max_running: None,
             index_build_older_transactions_wait_secs: None,
+            index_build_unique_read_limit: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

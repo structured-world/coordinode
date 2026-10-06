@@ -19,7 +19,7 @@
 use coordinode_core::graph::edge::{PostingList, encode_adj_key_forward, encode_adj_key_reverse};
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::invariant::{
-    Adjacency, CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, Direction,
+    Adjacency, CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, Direction, UncoveredSource,
 };
 
 use lsm_tree::Guard;
@@ -45,7 +45,7 @@ pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
 pub type StagedPoints<'a> = &'a std::collections::HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>;
 
 /// Whether a claim still holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// The condition holds over the whole post-state.
     Holds,
@@ -55,6 +55,21 @@ pub enum Verdict {
     /// from it. A caller treats it as a refusal rather than as a pass: an
     /// undecidable condition is not a satisfied one.
     Undecidable,
+    /// A unique value the attempt takes is held by another node in the
+    /// post-state.
+    HeldBy {
+        /// The node holding it.
+        holder: NodeId,
+        /// The values the holder has in the index.
+        values: Vec<coordinode_core::graph::types::Value>,
+    },
+    /// Deciding the claim would read more than `limit` stored rows. Nothing
+    /// is concluded either way; the same attempt may be admitted once the
+    /// work needed shrinks.
+    OverLimit {
+        /// The most rows the decision reads.
+        limit: u64,
+    },
 }
 
 /// Decide `claim` against the engine's authoritative state plus the attempt's
@@ -78,6 +93,8 @@ pub struct Evaluation<'a> {
     engine: &'a StorageEngine,
     staged: StagedAdj<'a>,
     staged_points: StagedPoints<'a>,
+    /// Node rows the attempt changes through document deltas, keyed first.
+    node_deltas: &'a [(Vec<u8>, Vec<u8>)],
     read_ts: u64,
     edge_types: core::cell::OnceCell<Vec<String>>,
 }
@@ -94,9 +111,17 @@ impl<'a> Evaluation<'a> {
             engine,
             staged,
             staged_points,
+            node_deltas: &[],
             read_ts,
             edge_types: core::cell::OnceCell::new(),
         }
+    }
+
+    /// The node rows the attempt changes through document deltas, whose
+    /// committed bytes are not their post-state.
+    pub fn with_node_deltas(mut self, node_deltas: &'a [(Vec<u8>, Vec<u8>)]) -> Self {
+        self.node_deltas = node_deltas;
+        self
     }
 
     /// Every edge type the store has recorded, listed on first use.
@@ -129,6 +154,7 @@ impl<'a> Evaluation<'a> {
             engine,
             staged,
             staged_points,
+            node_deltas,
             read_ts,
             ..
         } = *self;
@@ -261,11 +287,128 @@ impl<'a> Evaluation<'a> {
                 label_schema_admits_stored_nodes(engine, label, *revision, staged_points)
             }
 
+            // A published index answers for the value through its entry key:
+            // every holder writes it, and the attempt writes it too, so a
+            // holder committed since the attempt's view meets it there. While
+            // the index is being built, a node the build has not reached holds
+            // its value without an entry, and only reading those nodes tells.
+            (
+                ClaimScope::UniqueValue { tuple, .. },
+                ClaimPredicate::UniqueHolder { node, uncovered },
+            ) => match uncovered {
+                None => Ok(Verdict::Holds),
+                Some(source) => {
+                    uncovered_holder(engine, tuple, *node, source, staged_points, node_deltas)
+                }
+            },
+
             // An overlap this evaluator has no evidence for stays undecided, and
             // a caller treats that as a refusal rather than a pass.
             _ => Ok(Verdict::Undecidable),
         }
     }
+}
+
+/// The verdict on a unique value `tuple` that `node` takes while the index
+/// is being built: `HeldBy` another node of `source`'s label whose post-state
+/// record holds the value, among the stored nodes after the key the build
+/// covered through and the attempt's own node writes; `Holds` when none does.
+///
+/// The nodes up to that key need no reading: the build committed their
+/// entries, which the attempt's entry key meets as any holder's does. A node
+/// the attempt changes through a document delta is not judged by its
+/// committed bytes, which are not its post-state: the attempt maintained that
+/// node's entries as it changed it, and its own entries are checked against
+/// each other as they are staged. The read is bounded by `source.read_limit`
+/// stored rows; past it the claim is `OverLimit`, which is neither a pass nor
+/// a duplicate.
+fn uncovered_holder(
+    engine: &StorageEngine,
+    tuple: &[u8],
+    node: NodeId,
+    source: &UncoveredSource,
+    staged_points: StagedPoints<'_>,
+    node_deltas: &[(Vec<u8>, Vec<u8>)],
+) -> StorageResult<Verdict> {
+    use coordinode_core::graph::node::{
+        NodeRecord, decode_node_key, decode_temporal_node_key, encode_node_key,
+    };
+    use coordinode_core::index::derive::tuples;
+
+    let holder = |key: &[u8], bytes: &[u8]| -> StorageResult<Option<Verdict>> {
+        // A temporal node holds the values of each of its versions.
+        let Some((shard, holder)) = decode_node_key(key)
+            .or_else(|| decode_temporal_node_key(key).map(|(shard, id, _)| (shard, id)))
+        else {
+            return Ok(None);
+        };
+        if shard != source.shard_id || holder == node {
+            return Ok(None);
+        }
+        let record = NodeRecord::from_msgpack(bytes)
+            .map_err(|e| crate::error::StorageError::Serialization(format!("node record: {e}")))?;
+        if record.primary_label() != source.label {
+            return Ok(None);
+        }
+        let Some(values) = source.interpretation.record_membership(&record) else {
+            return Ok(None);
+        };
+        if !tuples(&values).iter().any(|t| t.as_slice() == tuple) {
+            return Ok(None);
+        }
+        Ok(Some(Verdict::HeldBy { holder, values }))
+    };
+
+    // The rows the attempt writes are judged by their post-state, below, or
+    // not at all; looked up per stored row, so collected once.
+    let touched: rustc_hash::FxHashSet<&[u8]> = staged_points
+        .keys()
+        .filter(|(part, _)| *part == Partition::Node)
+        .map(|(_, key)| key.as_slice())
+        .chain(node_deltas.iter().map(|(key, _)| key.as_slice()))
+        .collect();
+
+    let prefix = encode_node_key(source.shard_id, NodeId::from_raw(0))[..8].to_vec();
+    let start = match &source.covered_through {
+        // The smallest key after the covered one.
+        Some(covered) => {
+            let mut start = covered.clone();
+            start.push(0);
+            start
+        }
+        None => prefix.clone(),
+    };
+    // Inclusive end past every node key of the shard: the keys are at most
+    // 25 bytes, the prefix 8.
+    let mut end = prefix.clone();
+    end.extend_from_slice(&[0xFF; 32]);
+    let mut read = 0u64;
+    for guard in engine.range_scan(Partition::Node, &start, &end)? {
+        let (key, value) = guard.into_inner()?;
+        if !key.starts_with(&prefix) || touched.contains(&*key) {
+            continue;
+        }
+        read += 1;
+        if read > source.read_limit {
+            return Ok(Verdict::OverLimit {
+                limit: source.read_limit,
+            });
+        }
+        if let Some(held) = holder(&key, &value)? {
+            return Ok(held);
+        }
+    }
+    for ((part, key), value) in staged_points.iter() {
+        if *part != Partition::Node || !key.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(bytes) = value {
+            if let Some(held) = holder(key, bytes)? {
+                return Ok(held);
+            }
+        }
+    }
+    Ok(Verdict::Holds)
 }
 
 /// Whether the incident set is still the one the attempt enumerated.

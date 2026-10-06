@@ -1992,6 +1992,45 @@ impl Database {
             CommitError::InvariantRefused { reason } => {
                 DatabaseError::InvariantRefused { id: txn_id, reason }
             }
+            // Not retryable: the value is held, by the node named. The
+            // statements that claimed it are gone, so the index is found by
+            // the generation the refusal names.
+            CommitError::UniqueValueHeld {
+                generation,
+                values,
+                holder,
+            } => match self
+                .index_registry
+                .all()
+                .into_iter()
+                .find(|index| index.generation == generation)
+            {
+                Some(index) => DatabaseError::Execution(
+                    coordinode_query::index::UniqueViolation::new(&index, &values, holder).into(),
+                ),
+                None => DatabaseError::InvariantRefused {
+                    id: txn_id,
+                    reason: format!(
+                        "a unique value of {generation} is held by node {}",
+                        holder.to_element_id()
+                    ),
+                },
+            },
+            // Retryable once the build is done.
+            CommitError::UniquenessUnresolved { generation, limit } => {
+                let index = self
+                    .index_registry
+                    .all()
+                    .into_iter()
+                    .find(|index| index.generation == generation)
+                    .map_or_else(|| generation.to_string(), |index| index.to_string());
+                DatabaseError::Execution(
+                    coordinode_query::executor::runner::ExecutionError::UniquenessUnresolved {
+                        index,
+                        limit,
+                    },
+                )
+            }
             // Retryable, but whether retrying is the right answer is the
             // caller's to decide: the record moved, and what that means
             // depends on what it was writing. The new version travels with

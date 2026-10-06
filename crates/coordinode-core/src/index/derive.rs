@@ -32,7 +32,7 @@ pub struct PropertyRef {
 
 /// A partial index's membership test on one property, with the typed
 /// equality of the filter it was declared with.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipFilter {
     /// The property is this string.
     EqualsString(PropertyRef, String),
@@ -68,7 +68,7 @@ impl MembershipFilter {
 /// Everything that decides a key-shaped B-tree index's entries: the sealed
 /// interpretation an effect carries, so that deriving it never consults the
 /// current catalog.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexInterpretation {
     /// Entry key layout, [`KEY_CODEC`] for every interpretation this build
     /// writes.
