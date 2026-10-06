@@ -390,6 +390,8 @@ jobs:
   # This avoids QEMU emulation (~90 min for arm64) — each platform builds natively (~15 min).
   docker-build:
     name: Build Docker image (${{ matrix.platform }})
+    # One leg runs on a self-hosted runner, which a fork never reaches.
+    if: github.repository_owner == 'structured-world'
     runs-on: ${{ matrix.runs-on }}
     strategy:
       matrix:

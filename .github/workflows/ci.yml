@@ -78,6 +78,10 @@ jobs:
     # GH-hosted ubuntu-latest has ~14 GB disk which the full workspace
     # debug build exceeds (linker hits "No space left on device"). Moved
     # to a self-hosted runner where target/ has room.
+    # A self-hosted runner sits inside the internal network, so a pull request
+    # from a fork never reaches it: a maintainer moves the branch into this
+    # repository or dispatches the workflow on the commit instead.
+    if: github.repository_owner == 'structured-world' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on:
       - self-hosted
       - coordinode
@@ -136,7 +140,8 @@ jobs:
     name: Test (cluster schemes)
     # The multi-node cluster tests bring up real Raft groups and run one at a
     # time, which holds a run for minutes; they run only when asked for.
-    if: github.event_name == 'workflow_dispatch'
+    # Fork pull requests never reach a self-hosted runner (see `test`).
+    if: github.event_name == 'workflow_dispatch' && github.repository_owner == 'structured-world' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on:
       - self-hosted
       - coordinode
@@ -184,6 +189,8 @@ jobs:
     # File locking, path handling and socket teardown differ on Windows, and a
     # divergence there shows up only when the suite runs on it. The runner's
     # label is its own, so the Linux-only jobs above never land on it.
+    # Fork pull requests never reach a self-hosted runner (see `test`).
+    if: github.repository_owner == 'structured-world' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on:
       - self-hosted
       - Windows
@@ -293,6 +300,8 @@ jobs:
     name: Build
     # See `test` job: the release build is even larger than debug and
     # won't fit on GH-hosted runner disk.
+    # Fork pull requests never reach a self-hosted runner (see `test`).
+    if: github.repository_owner == 'structured-world' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on:
       - self-hosted
       - coordinode

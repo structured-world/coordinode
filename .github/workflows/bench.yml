@@ -100,8 +100,9 @@ jobs:
     # queue a bench run. Use for yml-only / docs-only / non-perf edits
     # so the single self-hosted runner's queue is not serialised behind
     # benches that would measure identical engine code. The guard only
-    # applies to push triggers; workflow_dispatch always runs.
-    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip bench]') }}
+    # applies to push triggers; workflow_dispatch always runs. A fork has no
+    # access to the self-hosted runner, so its runs would only wait in a queue.
+    if: ${{ github.repository_owner == 'structured-world' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip bench]')) }}
     runs-on:
       - self-hosted
       - gpu-private-systems
