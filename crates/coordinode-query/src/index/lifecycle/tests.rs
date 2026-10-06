@@ -727,6 +727,162 @@ fn an_index_dropped_during_its_build_ends_the_build() {
 
 /// A build whose index was dropped before an executor took it ends
 /// cancelled without writing anything, and its record is removed.
+/// Create user `id` holding `email` while `def` is being built, as a write
+/// does: its entries staged through the registry, and each unique value it
+/// takes stated as a claim decided over the stored nodes past `covered`.
+fn take_while_building(
+    env: &TestEnv,
+    def: &IndexDefinition,
+    id: u64,
+    email: &str,
+    covered: Option<Vec<u8>>,
+) -> Result<(), String> {
+    use coordinode_core::index::derive::tuples;
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
+
+    let fields = env.fields_now();
+    let mut record = NodeRecord::new("User");
+    record.set(
+        fields.lookup("email").expect("email field"),
+        Value::String(email.into()),
+    );
+    let mut txn = env.begin();
+    LocalNodeStore
+        .put(&mut txn, 1, NodeId::from_raw(id), &record)
+        .expect("put");
+    let lookup = crate::index::registry::record_lookup(&record, &fields);
+    let field_of = |name: &str| fields.lookup(name);
+    let mut claims = Vec::new();
+    env.registry
+        .on_node_created(
+            &env.engine,
+            &mut txn,
+            &crate::index::registry::NodeState {
+                node_id: NodeId::from_raw(id),
+                valid_from: None,
+                label: "User",
+                value_of: &lookup,
+            },
+            &field_of,
+            &mut claims,
+        )
+        .map_err(|e| e.to_string())?;
+    let revision = txn.schema_generation();
+    for claim in claims {
+        for tuple in tuples(&claim.values) {
+            txn.claim(Claim::new(
+                ClaimScope::UniqueValue {
+                    generation: def.generation,
+                    tuple,
+                },
+                ClaimPredicate::UniqueHolder {
+                    node: NodeId::from_raw(id),
+                    uncovered: Some(Box::new(UncoveredSource {
+                        shard_id: 1,
+                        label: "User".into(),
+                        interpretation: def.interpretation(&field_of),
+                        covered_through: covered.clone(),
+                        read_limit: 100_000,
+                    })),
+                },
+                revision,
+            ));
+        }
+    }
+    commit(&mut txn).map_err(|e| e.to_string())
+}
+
+/// With the build stopped part way, the service tells the key its backfill
+/// covered through. A value held by a node before that key is refused on
+/// the entry the build committed; one held by a node after it, which has no
+/// entry yet, is refused by the commit reading the uncovered nodes. A free
+/// value is taken, and once the build ends the service tells no key.
+#[test]
+fn a_build_stopped_part_way_covers_some_owners_and_reads_the_rest() {
+    let env = env();
+    let total = 600;
+    for id in 1..=total {
+        env.put_user(id, &format!("u{id}@x"));
+    }
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email").unique(),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    env.hold_pages_after(1);
+    builds.submit(def.generation, 0).expect("submit");
+    env.await_held_page();
+
+    let covered = builds
+        .covered_through(def.generation)
+        .expect("the first page is covered");
+    let key =
+        |id: u64| coordinode_core::graph::node::encode_node_key(1, NodeId::from_raw(id)).to_vec();
+    assert!(key(1) <= covered && covered < key(total), "{covered:?}");
+
+    let early = take_while_building(&env, &def, 10_001, "u1@x", Some(covered.clone()))
+        .expect_err("held by a covered node");
+    assert!(early.contains("unique constraint violated"), "{early}");
+    let late = take_while_building(
+        &env,
+        &def,
+        10_002,
+        &format!("u{total}@x"),
+        Some(covered.clone()),
+    )
+    .expect_err("held by an uncovered node");
+    assert!(late.contains(&format!("node {total}")), "{late}");
+    take_while_building(&env, &def, 10_003, "free@x", Some(covered)).expect("free");
+
+    env.release_pages();
+    let outcome = builds.wait(def.generation, None).expect("wait");
+    assert!(
+        matches!(outcome, Some(IndexBuildOutcome::Published { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(builds.covered_through(def.generation), None);
+    assert_eq!(env.holders(&def, "free@x"), vec![10_003]);
+    assert_eq!(env.holders(&def, &format!("u{total}@x")), vec![total]);
+}
+
+/// The configuration is retuned and read while a build runs, here while it
+/// waits for an older transaction: neither waits for the build.
+#[test]
+fn the_config_is_retuned_and_read_while_a_build_runs() {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    let older = older_transaction(&env);
+    builds.submit(def.generation, 0).expect("submit");
+    await_phase(
+        &builds,
+        def.generation,
+        BuildPhase::AwaitingOlderTransactions,
+    );
+
+    let (done, retuned) = std::sync::mpsc::channel();
+    let tuner = builds.clone();
+    std::thread::spawn(move || {
+        tuner.set_config(IndexBuildConfig {
+            unique_admission_read_limit: 7,
+            ..tuner.config()
+        });
+        done.send(tuner.config().unique_admission_read_limit)
+            .expect("report");
+    });
+    let read = retuned
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the retune waited for the build");
+    assert_eq!(read, 7);
+
+    drop(older);
+    builds.wait(def.generation, None).expect("wait");
+}
+
 #[test]
 fn a_build_of_a_dropped_index_is_cancelled() {
     let env = env();

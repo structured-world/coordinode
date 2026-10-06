@@ -1069,6 +1069,64 @@ mod unique_while_building {
         ));
     }
 
+    /// A temporal node holds the values of each of its versions: a value
+    /// only an older version has is held, by the node.
+    #[test]
+    fn a_version_of_a_temporal_node_holds_its_value() {
+        use coordinode_core::graph::node::encode_temporal_node_key;
+        let (engine, _d) = engine();
+        for (valid_from, value) in [(100, "old@x"), (200, "new@x")] {
+            engine
+                .put(
+                    Partition::Node,
+                    &encode_temporal_node_key(SHARD, node(4), valid_from),
+                    &record("User", email(value)),
+                )
+                .expect("put version");
+        }
+
+        for value in ["old@x", "new@x"] {
+            assert_eq!(
+                decide(&engine, &claim(9, email(value), None, 1_000), &[]),
+                Verdict::HeldBy {
+                    holder: node(4),
+                    values: vec![email(value)],
+                },
+                "{value}"
+            );
+        }
+        assert_eq!(
+            decide(&engine, &claim(4, email("old@x"), None, 1_000), &[]),
+            Verdict::Holds,
+            "the node's own versions"
+        );
+    }
+
+    /// A stored row that is not a node record refuses the decision rather
+    /// than being passed over: a value it may hold cannot be proved free.
+    #[test]
+    fn an_undecodable_row_decides_nothing() {
+        let (engine, _d) = engine();
+        engine
+            .put(
+                Partition::Node,
+                &encode_node_key(SHARD, node(1)),
+                &[0xC1, 0xFF],
+            )
+            .expect("put bytes");
+
+        assert!(
+            evaluate(
+                &engine,
+                &claim(2, email("a@x"), None, 1_000),
+                &[],
+                &HashMap::new(),
+                engine.snapshot()
+            )
+            .is_err()
+        );
+    }
+
     /// A decision that would read more stored rows than the limit is left
     /// unresolved, never called a duplicate or a pass.
     #[test]

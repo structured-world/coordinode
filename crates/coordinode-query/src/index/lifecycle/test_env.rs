@@ -20,7 +20,17 @@ pub(crate) struct TestEnv {
     fields: parking_lot::Mutex<FieldInterner>,
     pub(crate) registry: IndexRegistry,
     fault: parking_lot::Mutex<Option<Fault>>,
+    hold: PageHold,
     _dir: Option<tempfile::TempDir>,
+}
+
+/// Backfill pages held before they commit, once a number of them has.
+#[derive(Default)]
+struct PageHold {
+    /// Pages committed so far, the count past which the next waits, and
+    /// whether one is waiting now.
+    state: parking_lot::Mutex<(usize, Option<usize>, bool)>,
+    moved: parking_lot::Condvar,
 }
 
 /// A fault a test member injects into the builds it runs.
@@ -62,6 +72,7 @@ impl TestEnv {
             fields: parking_lot::Mutex::new(FieldInterner::new()),
             registry: IndexRegistry::new(),
             fault: parking_lot::Mutex::new(None),
+            hold: PageHold::default(),
             _dir: Some(dir),
         })
     }
@@ -77,8 +88,30 @@ impl TestEnv {
             fields: parking_lot::Mutex::new(FieldInterner::new()),
             registry: IndexRegistry::new(),
             fault: parking_lot::Mutex::new(None),
+            hold: PageHold::default(),
             _dir: None,
         })
+    }
+
+    /// Hold every backfill page after the first `pages` before it commits,
+    /// until [`Self::release_pages`].
+    pub(crate) fn hold_pages_after(&self, pages: usize) {
+        self.hold.state.lock().1 = Some(pages);
+    }
+
+    /// Wait until a backfill page is held: every page before it is
+    /// committed and reported.
+    pub(crate) fn await_held_page(&self) {
+        let mut state = self.hold.state.lock();
+        while !state.2 {
+            self.hold.moved.wait(&mut state);
+        }
+    }
+
+    /// Let held backfill pages commit.
+    pub(crate) fn release_pages(&self) {
+        self.hold.state.lock().1 = None;
+        self.hold.moved.notify_all();
     }
 
     /// Make `fields` the dictionary builds resolve properties through.
@@ -170,7 +203,19 @@ impl BuildEnvironment for TestEnv {
         if matches!(*self.fault.lock(), Some(Fault::PanicOnPage)) {
             panic!("page commit broke");
         }
-        commit(txn)
+        {
+            let mut state = self.hold.state.lock();
+            while state.1.is_some_and(|after| state.0 >= after) {
+                // Tell a waiter the page is held, then wait for the release.
+                state.2 = true;
+                self.hold.moved.notify_all();
+                self.hold.moved.wait(&mut state);
+            }
+            state.2 = false;
+        }
+        commit(txn)?;
+        self.hold.state.lock().0 += 1;
+        Ok(())
     }
 
     fn commit_catalog(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {

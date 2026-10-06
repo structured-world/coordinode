@@ -292,6 +292,77 @@ fn a_unique_value_a_stored_node_holds_is_refused_during_the_build() {
     );
 }
 
+/// The same refusals reach an interactive transaction at its commit: a
+/// value a stored node holds is a duplicate naming the index and the value,
+/// and past the read limit the commit is unresolved, not a duplicate.
+#[test]
+fn an_interactive_commit_is_refused_like_a_statement_during_the_build() {
+    let (db, _dir) = open_db();
+
+    while_unique_build_waits(&db, || {
+        let txn = db.begin_transaction();
+        db.execute_in_transaction(txn, "CREATE (:User {email: 'a@x'})", None)
+            .expect("staged");
+        let held = db.commit_transaction(txn).expect_err("held").to_string();
+        assert!(held.contains("unique constraint violated"), "{held}");
+        assert!(held.contains("user_email"), "{held}");
+        assert!(held.contains("a@x"), "{held}");
+
+        db.set_index_build_config(IndexBuildConfig {
+            unique_admission_read_limit: 1,
+            ..db.index_build_config()
+        });
+        let txn = db.begin_transaction();
+        db.execute_in_transaction(txn, "CREATE (:User {email: 'z@x'})", None)
+            .expect("staged");
+        let unresolved = db
+            .commit_transaction(txn)
+            .expect_err("unresolved")
+            .to_string();
+        assert!(unresolved.contains("still being built"), "{unresolved}");
+        assert!(
+            !unresolved.contains("unique constraint violated"),
+            "{unresolved}"
+        );
+    })
+    .expect("the build publishes");
+}
+
+/// While a partial unique index is being built, only stored nodes its
+/// filter admits hold its values: a value an excluded node has is free, one
+/// an admitted node has is refused.
+#[test]
+fn a_partial_unique_index_holds_only_admitted_nodes_during_the_build() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE (:User {email: 'on@x', active: true}), (:User {email: 'off@x', active: false})",
+    )
+    .expect("seed");
+    let older = db.begin_transaction();
+
+    std::thread::scope(|s| {
+        let created = s.spawn(|| {
+            create_index(
+                &db,
+                "CREATE UNIQUE INDEX active_email ON :User(email) WHERE n.active = true",
+            )
+        });
+        await_held(&db, "active_email");
+        let held = write(&db, "CREATE (:User {email: 'on@x', active: true})").expect_err("held");
+        assert!(held.contains("unique constraint violated"), "{held}");
+        write(&db, "CREATE (:User {email: 'off@x', active: true})")
+            .expect("the stored holder is outside the filter");
+        write(&db, "CREATE (:User {email: 'on@x', active: false})")
+            .expect("the new node is outside the filter");
+        db.rollback_transaction(older)
+            .expect("end the older transaction");
+        created.join().expect("join").expect("the build publishes");
+    });
+
+    assert_eq!(holders(&mut db, "on@x"), 2);
+    assert_eq!(holders(&mut db, "off@x"), 2);
+}
+
 /// A write whose proof would read more stored nodes than the configured
 /// limit is refused as unresolved, not as a duplicate, and the same write
 /// succeeds once the build is done.

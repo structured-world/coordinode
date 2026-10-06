@@ -671,6 +671,10 @@ impl Shared {
         let covered = |through: &[u8]| {
             self.covered.lock().insert(generation, through.to_vec());
         };
+        // Read before the backfill starts: a guard taken inside the expression
+        // below would live as long as the whole build, and a retune waiting
+        // for it would hold up every reader of the configuration.
+        let older_transactions_wait = self.config.read().older_transactions_wait;
         Ok(Backfill {
             engine: env.engine(),
             oracle: env.oracle(),
@@ -678,7 +682,7 @@ impl Shared {
             shard_id: env.shard_id(),
             own_open,
             definition_version: taken.def_version,
-            older_transactions_wait: self.config.read().older_transactions_wait,
+            older_transactions_wait,
             progress: Some(&progress),
             covered: Some(&covered),
         }

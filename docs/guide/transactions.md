@@ -150,6 +150,8 @@ So every mutation states the conditions its result depends on, and the server ch
 
 Conditions that agree do not exclude each other. Any number of transactions may attach edges to one node at the same time: they all state that the node keeps its identity, which is compatible with itself, so a popular node does not serialise the writes that reference it. Only a mutation that destroys the identity excludes them.
 
+A unique index that is still being built is protected the same way. A transaction that takes one of its values has its commit read the stored nodes the build has not reached, and a node there holding the value refuses the commit as a duplicate naming that node (gRPC `ALREADY_EXISTS` / `DUPLICATE_KEY`; in the embedded API `ExecutionError::UniqueViolation`). That read is bounded by `index_build_unique_read_limit`; past it the commit is refused as unresolved, not as a duplicate (gRPC `UNAVAILABLE` / `UNIQUENESS_UNRESOLVED` with a retry delay; `ExecutionError::UniquenessUnresolved`), and the same transaction succeeds once the build is done. An interactive transaction is judged at its commit, as a single statement is.
+
 The exclusion holds in both orders. An edge attached to a node another transaction is deleting is refused when the deletion committed first, and the deletion is refused when the edge committed first: the deleting transaction decided on the edges it saw, and an edge that reached the node after it read them is one it never accounted for. This applies to `DETACH DELETE` too, for an edge of any type, including a type that did not exist when it read the node, so no edge is ever left pointing at a node that is gone.
 
 ## Durability
