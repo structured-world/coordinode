@@ -2,6 +2,40 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(index)* build full-text and vector indexes as member-owned builds
+- *(index)* run B-tree index builds as durable engine-owned operations
+- *(search)* answer text and vector searches at a named timestamp
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(query)* read temporal nodes at the statement's current time
+- *(vector)* remove nodes and reuse their slots beside live search
+- *(modality)* insert vectors under the shared index lock
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(query)* let the caller bound the wait for a building vector index
+
+### Documentation
+
+- drop internal ids from core, modality, site theme and examples
+- *(modality)* drop internal ids and document paths
+
+### Fixed
+
+- *(schema)* read a schema's pointer and body from one snapshot
+- *(restore)* [**breaking**] keep every NodeId, refuse issued ones, restore schema and indexes
+- *(query)* finish a vector build under writes that never pause
+- *(vector)* build indexes from a tap of applied writes
+- *(deps)* require the lsm-tree release the code needs
+
+### Refactored
+
+- *(index)* name indexes by stable identity and generation
+- *(query)* pair the vector registry with its build engine
+
 ## v0.6.0 - 2026-09-23
 
 ### Added

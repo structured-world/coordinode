@@ -2,6 +2,98 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.0 - 2026-10-06
+
+### Added
+
+- *(index)* enforce unique values while an index builds
+- *(index)* inspectable, tunable and fault-safe index builds
+- *(index)* build full-text and vector indexes as member-owned builds
+- *(index)* run B-tree index builds as durable engine-owned operations
+- *(search)* answer text and vector searches at a named timestamp
+- *(cluster)* bring replicated text indexes live on every member
+- *(storage)* pause writes when the disk runs low, keep serving reads
+- *(cluster)* match group members by version and move a group by majority
+- *(schema)* [**breaking**] replace the schema service with v2 and named constraints
+- *(query)* CREATE/DROP CONSTRAINT for node labels
+- *(query)* read temporal nodes at the statement's current time
+- *(query)* [**breaking**] procedure catalog with typed signatures
+- *(embed)* run a TTL reap pass on demand
+- *(vector)* remove nodes and reuse their slots beside live search
+- schema claims, event-driven background work
+- journal index writes, speed up the Raft path
+- *(query)* let the caller bound the wait for a building vector index
+
+### Documentation
+
+- *(cypher)* describe temporal reads and unique scope in the reference
+- *(embed)* resolve the RestoreError links in Database::restore
+- *(server)* drop internal ids and document paths
+- *(core,embed)* replace leftover document stand-ins in comments
+- *(embed)* drop internal ids and document paths
+- state the rules in source comments instead of pointing at a local file
+
+### Fixed
+
+- *(index)* release the build config lock before backfilling
+- *(session)* a Cypher SET changes its own session, not the database
+- *(search)* search a transaction's own uncommitted writes
+- *(search)* answer unfolded writes exactly instead of waiting
+- *(vector)* maintain vector indexes from committed writes
+- *(search)* drop debug output from the text worker
+- *(search)* maintain text indexes from committed writes
+- *(schema)* hold every uniqueness as a constraint owning its index
+- *(query)* look up one property only in a full single-property index
+- *(query)* find the nodes of a write through the index
+- *(schema)* refuse the engine's temporal fields on every user input
+- *(schema)* hold a strict temporal label's schema on every version
+- *(storage)* return a transaction's prefix scan in key order
+- *(server)* explain the plan ExecuteCypher runs
+- *(query)* keep undeclared properties where reads find them
+- *(query)* match and write every label of a node pattern
+- *(query)* find an unlabelled temporal traversal target
+- *(restore)* [**breaking**] keep every NodeId, refuse issued ones, restore schema and indexes
+- *(query)* bind the TRANSFER EDGES edge variable during analysis
+- *(query)* say why a temporal write is refused, without internal ids
+- *(vector)* maintain replica indexes from applied entries
+- *(vector)* offline an index whose build cannot start
+- *(vector)* build indexes from a tap of applied writes
+- *(storage)* rebuild from what the checkpoint trees hold
+- *(storage)* survive a crash inside a partition rebuild
+- *(core)* draw proposal ids from a fresh range per process
+- *(storage)* replay the embedded journal by per-partition coverage
+- *(deps)* require the lsm-tree release the code needs
+
+### Performance
+
+- *(index)* read uncovered nodes once per index per commit
+- *(query)* read text_match matches through the text index
+- *(query)* read a node pinned by id instead of scanning the shard
+
+### Refactored
+
+- *(index)* name indexes by stable identity and generation
+- *(query)* pair the vector registry with its build engine
+
+### Testing
+
+- *(index)* two concurrent creates of one index name
+- follow member-owned vector readiness and the build executor
+- *(embed)* bench a unique-index point read as its node is rewritten
+- *(embed)* a reopened engine starts with a cold tiered cache
+- *(embed)* wait for the vector worker before calibrating from the graph
+- *(embed)* check past full-text reads against an index built from the snapshot
+- check index membership and a subscription's end exactly
+- *(embed)* wait for the vector worker before reading the graph
+- *(query)* cover temporal reads after a correction and at signed instants
+- *(embed)* count live cold tables after a reopen
+- *(schema)* cover constraint recreation, name races and snapshot transfer
+- *(embed)* prove the temporal unique reservation by its reason
+- *(embed)* wait for a node to reach the HNSW graph
+- *(embed)* allow expect in the traversal and label tests
+- *(embed)* find checkpoint-shared tables by name, not inode
+- *(raft)* cover log retention, failed rebuilds and interrupted installs
+
 ## v0.6.0 - 2026-09-23
 
 ### Added
