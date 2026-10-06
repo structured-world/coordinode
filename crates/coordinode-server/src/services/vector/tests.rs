@@ -250,6 +250,50 @@ async fn vector_search_reports_ready_health_and_hlc_header() {
     assert_eq!(health.indexed_hlc, 4242);
 }
 
+/// A build that has handed its index to the writers and is still folding
+/// its tail does not mark the index ready when it ends. By then a rebuild
+/// may own the index; declaring it ready would serve the rebuild's partial
+/// graph at full recall and let writers insert beside the rebuild's scan.
+#[test]
+fn a_build_ending_leaves_a_later_rebuild_in_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut database = Database::open(dir.path()).expect("open database");
+    // Open before the handover, so the build waits in its tail for this
+    // transaction until it is rolled back.
+    let older = database.begin_transaction();
+    database
+        .execute_cypher(
+            "CREATE VECTOR INDEX tail_idx ON :Tail(embedding) \
+             OPTIONS {dimensions: 3, metric: \"l2\"}",
+        )
+        .expect("create vector index");
+    let registry = database.vector_index_registry();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !registry
+        .health_snapshot("Tail", "embedding")
+        .is_some_and(|h| h.is_ready())
+    {
+        assert!(std::time::Instant::now() < deadline, "never handed over");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    registry.report_health_rebuild("Tail", "embedding", 0.1, 1_000);
+    database.rollback_transaction(older).expect("rollback");
+    while !registry.running_builds().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let state = registry.health_snapshot("Tail", "embedding");
+    assert!(
+        state.as_ref().is_some_and(|h| h.is_rebuilding()),
+        "the rebuild started after the handover still owns the index, got {state:?}"
+    );
+}
+
 /// A rebuilding index under the partial-recall policy serves from the graph
 /// it holds and surfaces `Rebuilding{progress, indexed_hlc}` in the response
 /// metadata, so the caller sees what it was served from. (Under the default

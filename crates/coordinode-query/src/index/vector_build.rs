@@ -131,19 +131,7 @@ impl VectorBuild<'_> {
         if outcome == BuildOutcome::Cancelled {
             return Ok(outcome);
         }
-        // The scan is in the graphs: hand them to the writers, who insert
-        // what they write from here on. What landed during the scan, and what
-        // the transactions opened before this point leave, stays with the
-        // build through the tap. Handing over later would not make the index
-        // more complete (writes keep landing) but would leave every write in
-        // between to the build's folds, which under steady load grow with
-        // each other.
-        for target in self.targets {
-            target.health.mark_ready();
-        }
-        // A transaction opened past this boundary inserts its own vectors.
-        let boundary = self.engine.snapshot_boundary();
-        tracing::debug!(boundary, "vector build: handed over to the writers");
+        let mut boundary = self.hand_over();
         // Set once the transactions opened before the handover have ended:
         // the snapshot every write at or below which is in the graphs after
         // one more fold.
@@ -164,6 +152,13 @@ impl VectorBuild<'_> {
                         .rebase_tap(&tap)
                         .map_err(|e| format!("rebase the write tap: {e}"))?;
                     outcome = self.scan(at)?;
+                    // The scan put the indexes back to rebuilding, so the
+                    // writers left what they wrote meanwhile to the build:
+                    // hand over again, and wait for the transactions opened
+                    // before this handover instead.
+                    if outcome != BuildOutcome::Cancelled {
+                        boundary = self.hand_over();
+                    }
                     settled = None;
                     continue;
                 }
@@ -196,6 +191,26 @@ impl VectorBuild<'_> {
                 settled = Some(self.engine.snapshot());
             }
         }
+    }
+
+    /// Hand the scanned graphs to the writers, who insert what they write
+    /// from here on, and return the boundary past which a transaction does
+    /// so for itself.
+    ///
+    /// What landed during the scan, and what the transactions opened before
+    /// this point leave, stays with the build through the tap. Handing over
+    /// later would not make the index more complete (writes keep landing) but
+    /// would leave every write in between to the build's folds, which under
+    /// steady load grow with each other. This is the only point a build marks
+    /// its indexes ready: once it has handed over, the indexes may already
+    /// belong to a newer build, which a later mark would overrule.
+    fn hand_over(&self) -> u64 {
+        for target in self.targets {
+            target.health.mark_ready();
+        }
+        let boundary = self.engine.snapshot_boundary();
+        tracing::debug!(boundary, "vector build: handed over to the writers");
+        boundary
     }
 
     /// Scan the shard at `snapshot` and insert every member of every index.

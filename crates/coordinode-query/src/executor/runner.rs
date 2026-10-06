@@ -17188,13 +17188,15 @@ fn execute_create_vector_index(
                 .run()
             }));
             match outcome {
+                // The build marked the index ready when it handed it over;
+                // marking it again here would overrule a rebuild started
+                // since.
                 Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
                     tracing::info!(
                         index = %name_owned,
                         scanned,
                         "vector index backfill complete"
                     );
-                    health.mark_ready();
                 }
                 // Cancelled: the index is being dropped or replaced by
                 // whoever cancelled us, who owns it from here.

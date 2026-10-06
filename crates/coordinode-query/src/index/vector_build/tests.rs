@@ -241,6 +241,44 @@ fn a_build_whose_partition_is_replaced_scans_again() {
     );
 }
 
+/// A scan started over after the handover reports progress again, which
+/// puts the index back to rebuilding; the build hands it over again once
+/// that scan is in, so the index ends ready rather than rebuilding forever.
+/// The label is large enough for the scan to report progress, and the range
+/// removed is empty, so every node stays and is scanned again.
+// Removing a key range is a storage operation no store exposes.
+#[allow(clippy::disallowed_types)]
+#[test]
+fn a_build_that_scans_again_after_the_handover_ends_ready() {
+    let fx = fixture();
+    let nodes: Vec<Mutation> = (1..=1_500u64)
+        .map(|id| put(0, id, &record("Doc", fx.field, [id as f32, 1.0, 0.0])))
+        .collect();
+    fx.engine
+        .apply_proposal_at(&nodes, fx.oracle.next().as_raw())
+        .expect("apply");
+    let older = fx.open_transaction();
+
+    let outcome = fx.build_while(|health| {
+        await_handover(health);
+        let empty =
+            |shard| coordinode_core::graph::node::encode_node_key(shard, NodeId::from_raw(0));
+        fx.engine
+            .remove_range(
+                coordinode_storage::engine::partition::Partition::Node,
+                &empty(1),
+                &empty(2),
+            )
+            .expect("remove range");
+        drop(older);
+    });
+
+    assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
+    let state = fx.health().snapshot();
+    assert!(state.is_ready(), "the index ends ready, got {state:?}");
+    assert_eq!(fx.graph_len(), 1_500, "every node is in the graph once");
+}
+
 /// A cancelled build stops while it waits for older transactions, rather
 /// than holding the tap open until they end.
 #[test]
