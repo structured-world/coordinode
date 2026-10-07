@@ -315,6 +315,47 @@ fn an_unfinished_build_is_resumed() {
     assert!(builds.resume().expect("resume again").is_empty());
 }
 
+/// A shutdown stops a build waiting for older transactions without waiting
+/// them out and returns once its executor has ended: the build keeps its
+/// running record, nothing new starts on the stopped service, and a service
+/// started afterwards, as the next process opening the storage, finishes it.
+#[test]
+fn a_shutdown_stops_a_held_build_and_the_next_service_finishes_it() {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    let older = older_transaction(&env);
+    builds.submit(def.generation).expect("submit");
+    await_running(&env, &def, None);
+
+    let started = std::time::Instant::now();
+    builds.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited out the older transaction: {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(
+        env.record(&def).expect("record").state,
+        BuildState::Running { .. }
+    ));
+    assert!(builds.submit(def.generation).is_err(), "stopped for good");
+    drop(older);
+
+    let next = service(&env);
+    assert_eq!(next.resume().expect("resume"), [def.generation]);
+    let outcome = next.wait(def.generation, None).expect("wait");
+    assert!(
+        matches!(outcome, Some(IndexBuildOutcome::Published { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "a@x"), [1]);
+}
+
 /// Two executors of one build (a process that took it and the one that
 /// took it over, as after a leader change) cannot both finish it: the
 /// index is published once and holds each entry once.

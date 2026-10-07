@@ -172,6 +172,12 @@ struct Shared {
     /// through. Kept in memory: a build no executor here holds is taken as
     /// covering nothing, which only makes a write read more.
     covered: parking_lot::Mutex<FxHashMap<GenerationId, Vec<u8>>>,
+    /// Set by [`IndexBuildService::shutdown`]: executors stop between pages
+    /// and no new one starts.
+    stopping: core::sync::atomic::AtomicBool,
+    /// The executor threads started here, joined at shutdown so none
+    /// outlives the storage it holds.
+    executors: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// How the engine runs its index builds.
@@ -371,7 +377,37 @@ impl IndexBuildService {
                 vacancy: parking_lot::Condvar::new(),
                 phases: parking_lot::Mutex::new(FxHashMap::default()),
                 covered: parking_lot::Mutex::new(FxHashMap::default()),
+                stopping: core::sync::atomic::AtomicBool::new(false),
+                executors: parking_lot::Mutex::new(Vec::new()),
             }),
+        }
+    }
+
+    /// Stop every executor of this process and wait for each to end: a
+    /// backfill stops before its next page, a build waiting for a seat does
+    /// not start, and no new build starts. A build stopped this way keeps
+    /// its record running, and the next process to open the storage
+    /// finishes it. Call before the storage closes.
+    pub fn shutdown(&self) {
+        self.shared
+            .stopping
+            .store(true, core::sync::atomic::Ordering::Release);
+        {
+            // Under the lock the seat waiters check the flag with, so none
+            // misses this wake.
+            let _running = self.shared.running.lock();
+            self.shared.vacancy.notify_all();
+        }
+        let executors = std::mem::take(&mut *self.shared.executors.lock());
+        for executor in executors {
+            // The build itself runs under `catch_unwind`; a join error is a
+            // panic in settling it, which the next opening resumes from.
+            if let Err(panic) = executor.join() {
+                tracing::error!(
+                    panic = panic_message(&*panic),
+                    "an index build executor panicked while settling its build"
+                );
+            }
         }
     }
 
@@ -440,6 +476,13 @@ impl IndexBuildService {
         generation: GenerationId,
         work: impl FnOnce(&Arc<Shared>) -> Executed + Send + 'static,
     ) -> Result<(), String> {
+        if self
+            .shared
+            .stopping
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err("the index build service is shutting down".into());
+        }
         {
             let mut slots = self.shared.slots.lock();
             if matches!(slots.get(&generation), Some(Slot::Running)) {
@@ -467,11 +510,20 @@ impl IndexBuildService {
                 shared.slots.lock().insert(generation, slot);
                 shared.finished.notify_all();
             });
-        if let Err(e) = spawned {
-            self.shared.slots.lock().remove(&generation);
-            return Err(format!("start the build executor: {e}"));
+        match spawned {
+            Ok(executor) => {
+                let mut executors = self.shared.executors.lock();
+                // Ended executors leave the list here, so it holds only the
+                // ones a shutdown may have to wait for.
+                executors.retain(|e| !e.is_finished());
+                executors.push(executor);
+                Ok(())
+            }
+            Err(e) => {
+                self.shared.slots.lock().remove(&generation);
+                Err(format!("start the build executor: {e}"))
+            }
         }
-        Ok(())
     }
 
     /// The outcome of the build of `generation`, waiting up to `timeout`
@@ -705,6 +757,11 @@ impl Shared {
     /// outcome.
     fn execute(self: &Arc<Self>, generation: GenerationId) -> Executed {
         let _seat = self.seat(generation);
+        // A seat granted because the service is stopping starts nothing:
+        // the build stays as recorded for the next process.
+        if self.stopping.load(core::sync::atomic::Ordering::Acquire) {
+            return Executed::Lost;
+        }
         self.try_execute(generation)
             .unwrap_or_else(|e| Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(e))))
     }
@@ -724,6 +781,9 @@ impl Shared {
         match filled {
             Ok(Ok(Ok(indexed))) => self.publish(generation, &taken, indexed),
             Ok(Ok(Err(BackfillError::Superseded))) => self.lost_to_mover(generation, taken.token),
+            // The process is closing: the record stays running under this
+            // token, and the next process to open the storage takes it over.
+            Ok(Ok(Err(BackfillError::Stopped))) => Ok(Executed::Lost),
             Ok(Ok(Err(BackfillError::Duplicate(v)))) => {
                 self.fail(generation, &taken, BuildError::Duplicate(v))
             }
@@ -810,6 +870,7 @@ impl Shared {
             progress: Some(&progress),
             covered: Some(&covered),
             repair,
+            stop: Some(&self.stopping),
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }
@@ -1060,7 +1121,9 @@ impl Shared {
         let mut running = self.running.lock();
         if *running >= self.config.read().max_running {
             self.set_phase(generation, BuildPhase::AwaitingSeat);
-            while *running >= self.config.read().max_running {
+            while *running >= self.config.read().max_running
+                && !self.stopping.load(core::sync::atomic::Ordering::Acquire)
+            {
                 self.vacancy.wait(&mut running);
             }
         }

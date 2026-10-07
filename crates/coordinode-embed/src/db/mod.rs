@@ -756,9 +756,12 @@ impl Drop for Database {
         // Index builds are the one background task a Database can leave
         // behind: each holds an `Arc` on the engine and would go on inserting
         // into an index nobody can reach any more, against storage that is
-        // closing under it. Cancel and join them here, as the oplog worker
-        // does through its own Drop.
+        // closing under it, and keep the storage locked for the next
+        // opening. Stop and join them here, as the oplog worker does
+        // through its own Drop. A stopped key-shaped build stays recorded
+        // and the next opening finishes it.
         self.vector_index_registry.cancel_all_builds();
+        self.index_builds.shutdown();
     }
 }
 

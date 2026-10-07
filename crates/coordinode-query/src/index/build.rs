@@ -40,6 +40,10 @@ const MAX_PAGE_CONFLICTS: u32 = 64;
 /// index have ended.
 const OLDER_TRANSACTIONS_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// The longest a backfill waits for older transactions before it looks
+/// whether its process is closing.
+const STOP_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Why a backfill stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum BackfillError {
@@ -72,6 +76,10 @@ pub enum BackfillError {
     /// string, no free value was found, or the repair statement failed.
     #[error("the build could not repair a duplicate: {0}")]
     Repair(String),
+    /// The process running the backfill is closing: it stopped between
+    /// pages, leaving the build to whoever opens the storage next.
+    #[error("the index backfill stopped because its process is closing")]
+    Stopped,
 }
 
 impl From<IndexWriteError> for BackfillError {
@@ -111,6 +119,9 @@ pub struct Backfill<'a> {
     /// the page holding it does not commit, the repair runs, and the page is
     /// read again. `None` fails the backfill on the first duplicate.
     pub repair: Option<DuplicateRepairer<'a>>,
+    /// Set when the process is closing: the backfill stops before its next
+    /// page or wait slice with [`BackfillError::Stopped`].
+    pub stop: Option<&'a core::sync::atomic::AtomicBool>,
 }
 
 /// What a backfill does about a stored node whose value of a unique index
@@ -150,6 +161,16 @@ pub enum BackfillProgress {
 pub const DEFAULT_OLDER_TRANSACTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl<'a> Backfill<'a> {
+    /// [`BackfillError::Stopped`] once the process is closing.
+    fn check_stop(&self) -> Result<(), BackfillError> {
+        match self.stop {
+            Some(stop) if stop.load(core::sync::atomic::Ordering::Acquire) => {
+                Err(BackfillError::Stopped)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Stage and commit the entries of every stored node of `index`'s label,
     /// committing each page through `commit`. Returns the number of entries
     /// staged: one per node, and one per version of a temporal node.
@@ -171,13 +192,25 @@ impl<'a> Backfill<'a> {
         };
         let boundary = self.engine.snapshot_boundary();
         report(BackfillProgress::AwaitingOlderTransactions);
-        self.engine
-            .await_transactions_through(
-                boundary,
-                OLDER_TRANSACTIONS_POLL,
-                self.older_transactions_wait,
-            )
-            .map_err(BackfillError::OlderTransactions)?;
+        // In slices, so a closing process is not held for the whole wait.
+        let deadline = std::time::Instant::now() + self.older_transactions_wait;
+        loop {
+            self.check_stop()?;
+            // Past the deadline the time left is none, not negative.
+            let slice = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(STOP_SLICE);
+            match self
+                .engine
+                .await_transactions_through(boundary, OLDER_TRANSACTIONS_POLL, slice)
+            {
+                Ok(()) => break,
+                Err(open) if std::time::Instant::now() >= deadline => {
+                    return Err(BackfillError::OlderTransactions(open));
+                }
+                Err(_) => {}
+            }
+        }
         report(BackfillProgress::Indexed(0));
         let nodes = LocalNodeStore;
         let prefix = nodes.shard_scan_prefix(self.shard_id);
@@ -186,6 +219,7 @@ impl<'a> Backfill<'a> {
         let mut conflicts = 0u32;
         let mut page_repairs = 0usize;
         loop {
+            self.check_stop()?;
             let mut txn = match self.oracle {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
                 None => Transaction::new(self.engine, None, Timestamp::ZERO, None),

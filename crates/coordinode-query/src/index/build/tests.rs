@@ -68,6 +68,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         progress: None,
         covered: None,
         repair: None,
+        stop: None,
     }
 }
 

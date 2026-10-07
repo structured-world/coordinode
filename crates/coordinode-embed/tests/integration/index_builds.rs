@@ -489,6 +489,41 @@ fn an_interrupted_build_finishes_after_a_restart() {
     assert_eq!(rows[0].get("e"), Some(&Value::String("a@x".into())));
 }
 
+/// A database closed while one of its builds waits for an older transaction
+/// lets the storage go when it closes: the directory opens again at once,
+/// and the build, never finished, is finished by the new opening.
+#[test]
+fn closing_a_database_with_a_held_build_releases_its_storage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE (:User {email: 'a@x'})")
+            .expect("seed");
+        let _older = db.begin_transaction();
+        db.create_constraint(email_constraint(Duration::ZERO, false))
+            .expect("admitted");
+        await_held(&db, "user_email");
+    }
+
+    let started = Instant::now();
+    let mut db = Database::open(dir.path()).expect("the storage was released");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the close waited out the build: {:?}",
+        started.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while status_of(&db, "user_email")
+        .and_then(|s| s.record)
+        .map(|r| r.state)
+        != Some(BuildState::Published)
+    {
+        assert!(Instant::now() < deadline, "the build was never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(holders(&mut db, "a@x"), 1);
+}
+
 /// A uniqueness constraint over `:User(email)` named `user_email`, waiting
 /// `wait` for its build.
 fn email_constraint(wait: Duration, if_not_exists: bool) -> ConstraintDeclaration {
