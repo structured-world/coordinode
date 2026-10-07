@@ -160,6 +160,73 @@ async fn hand_over_a_held_build(from: &Member, to: &Member, name: &str, property
     }
 }
 
+/// A repair a build makes on the leader is a replicated write: a follower
+/// holds the renamed value, the build's repair record and count, and the
+/// index the build published, with each node's own value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repair_on_the_leader_reaches_a_follower() {
+    let (p1, p2) = (alloc_port(), alloc_port());
+    let m1 = open_member(1, p1, true).await;
+    let m2 = open_member(2, p2, false).await;
+    await_leader(&m1).await;
+    m1.node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    m1.node.change_membership(vec![1, 2]).await.unwrap();
+    m1.db
+        .write()
+        .execute_cypher("CREATE (:User {email: 'same@x'}), (:User {email: 'same@x'})")
+        .unwrap();
+
+    let db = Arc::clone(&m1.db);
+    let rows = tokio::task::spawn_blocking(move || {
+        db.read().execute_cypher_shared(
+            "CREATE UNIQUE INDEX user_email ON :User(email) ON DUPLICATE RENAME email",
+            None,
+            None,
+            None,
+            None,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let operation = match rows.rows.first().and_then(|r| r.get("operation")) {
+        Some(coordinode_core::graph::types::Value::Int(op)) => {
+            coordinode_query::index::GenerationId::from_raw(u64::try_from(*op).unwrap())
+        }
+        other => panic!("operation: {other:?}"),
+    };
+    await_build(&m2, "user_email", is_published).await;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let repairs = m2.db.read().index_build_repairs(operation).unwrap();
+        if repairs.len() == 1 {
+            let new = repairs[0].new.clone();
+            let rows = m2
+                .db
+                .write()
+                .execute_cypher(&format!("MATCH (u:User) WHERE u.email = '{new}' RETURN u"))
+                .unwrap();
+            assert_eq!(rows.len(), 1, "the follower holds the renamed node");
+            let same = m2
+                .db
+                .write()
+                .execute_cypher("MATCH (u:User) WHERE u.email = 'same@x' RETURN u")
+                .unwrap();
+            assert_eq!(same.len(), 1, "one holder keeps the value");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the repair never reached the follower"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A build the leader held when it handed the lead over is finished by the
 /// new leader. The lead then moves back with another build held, and the
 /// first member, leading for the second time, finishes that one: the

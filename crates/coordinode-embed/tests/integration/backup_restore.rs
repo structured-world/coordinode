@@ -780,10 +780,12 @@ fn restored_data_breaking_a_constraint_is_reported() {
 fn constraints_survive_a_restore_in_every_format() {
     use coordinode_core::schema::definition::ConstraintState;
     use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-    const CONSTRAINTS: [&str; 3] = [
+    use coordinode_query::index::definition::PartialFilter;
+    const CONSTRAINTS: [&str; 4] = [
         "CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE",
         "CREATE CONSTRAINT user_name FOR (u:User) REQUIRE u.name IS NOT NULL",
         "CREATE CONSTRAINT user_age FOR (u:User) REQUIRE u.age IS :: INTEGER",
+        "CREATE UNIQUE INDEX active_nick ON :User(nick) WHERE n.active = true",
     ];
     for format in OWN_FORMATS {
         let dir1 = tempfile::tempdir().unwrap();
@@ -791,8 +793,10 @@ fn constraints_survive_a_restore_in_every_format() {
         for statement in CONSTRAINTS {
             db1.execute_cypher(statement).unwrap();
         }
-        db1.execute_cypher("CREATE (:User {email: 'a@x', name: 'a', age: 1})")
-            .unwrap();
+        db1.execute_cypher(
+            "CREATE (:User {email: 'a@x', name: 'a', age: 1, nick: 'n', active: true})",
+        )
+        .unwrap();
 
         let dir2 = tempfile::tempdir().unwrap();
         let mut db2 = Database::open(dir2.path()).unwrap();
@@ -808,13 +812,27 @@ fn constraints_survive_a_restore_in_every_format() {
             .load_label("User")
             .unwrap()
             .unwrap_or_else(|| panic!("{format:?}: the schema is restored"));
-        for name in ["user_email", "user_name", "user_age"] {
+        for name in ["user_email", "user_name", "user_age", "active_nick"] {
             assert_eq!(
                 schema.constraint(name).map(|c| c.state),
                 Some(ConstraintState::Active),
                 "{format:?}: {name}"
             );
         }
+        assert_eq!(
+            schema
+                .constraint("active_nick")
+                .and_then(|c| c.scope.clone()),
+            Some(PartialFilter::PropertyEqualsBool {
+                property: "active".into(),
+                value: true,
+            }),
+            "{format:?}: the scope is restored"
+        );
+        db2.execute_cypher("CREATE (:User {email: 'n1@x', name: 'n1', nick: 'n', active: true})")
+            .expect_err("the restored value is held in scope");
+        db2.execute_cypher("CREATE (:User {email: 'n2@x', name: 'n2', nick: 'n', active: false})")
+            .unwrap_or_else(|e| panic!("{format:?}: out of scope: {e}"));
         db2.execute_cypher("CREATE (:User {email: 'a@x', name: 'b'})")
             .expect_err("the restored value is held by the unique constraint");
         db2.execute_cypher("CREATE (:User {email: 'b@x'})")
