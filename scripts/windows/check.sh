@@ -27,8 +27,11 @@ ssh_opts=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o Ser
 ssh() { command ssh "${ssh_opts[@]}" "$@"; }
 scp() { command scp "${ssh_opts[@]}" "$@"; }
 # A directory of this run's own: files another account left in a shared one
-# cannot be removed by this one and would fail the cleanup.
-run_dir="cn-check-$(date +%Y%m%d%H%M%S)-$$"
+# cannot be removed by this one and would fail the cleanup. Its name carries
+# this machine and this script's PID, so a later run can tell which
+# directories a killed run of this machine left behind.
+origin="$(hostname -s | tr -c 'A-Za-z0-9' '_')"
+run_dir="cn-check-$origin-$(date +%Y%m%d%H%M%S)-$$"
 remote_root="C:\\$run_dir"
 remote_scp="C:/$run_dir"
 ref='refs/check/windows'
@@ -63,6 +66,16 @@ while read -r key path; do
   git -C "$repo/$path" bundle create -q "$out/sub-$name.bundle" HEAD
 done < <(git -C "$repo" config -f .gitmodules --get-regexp '^submodule\..*\.path$' || true)
 
+# A run killed by a signal skips the cleanup at the end and leaves its
+# directory, with its build, on the host: remove those whose run from this
+# machine is gone.
+for stale in $(ssh "$host" "Get-ChildItem C:\\ -Directory -Filter 'cn-check-$origin-*' | ForEach-Object Name" | tr -d '\r'); do
+  pid="${stale##*-}"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "removing $stale, left on $host by a run that is gone" >&2
+    ssh "$host" "Remove-Item -Recurse -Force 'C:\\$stale' -ErrorAction SilentlyContinue"
+  fi
+done
 ssh "$host" "New-Item -ItemType Directory -Force -Path '$remote_root' | Out-Null"
 scp -q "$bundle" "$host:$remote_scp/tree.bundle"
 for sub in "$out"/sub-*.bundle; do
