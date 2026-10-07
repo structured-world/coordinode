@@ -326,6 +326,23 @@ fn claim_activation(txn: &mut Transaction, label: &str, revision: u64) {
     ));
 }
 
+/// The stored body of edge type `schema`. A temporal type always resolves
+/// to some discriminator; one without was handed over before
+/// [`EdgeTypeSchema::resolve_identity`] ran, and its writers would have no
+/// key shape to agree on, so every writer of the definition refuses it here.
+fn edge_type_body(schema: &EdgeTypeSchema) -> StoreResult<Vec<u8>> {
+    if schema.temporal && schema.discriminator().is_none() {
+        return Err(StoreError::Invariant(format!(
+            "edge type '{}' is temporal but its identity was never resolved",
+            schema.name
+        )));
+    }
+    schema.to_msgpack().map_err(|e| StoreError::Decode {
+        kind: "edge type schema",
+        message: format!("encode '{}': {e}", schema.name),
+    })
+}
+
 impl SchemaStore for LocalSchemaStore<'_> {
     fn load_label(&self, name: &str) -> StoreResult<Option<LabelSchema>> {
         // The pointer and the body it names are read from one complete
@@ -409,10 +426,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn save_edge_type(&self, schema: &EdgeTypeSchema) -> StoreResult<()> {
-        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "edge type schema",
-            message: format!("encode '{}': {e}", schema.name),
-        })?;
+        let body = edge_type_body(schema)?;
         let mut batch = WriteBatch::new(self.engine);
         batch.put(
             Partition::Schema,
@@ -622,19 +636,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         txn: &mut Transaction,
         schema: &EdgeTypeSchema,
     ) -> StoreResult<()> {
-        // A temporal type always resolves to some discriminator; one without
-        // was published before `resolve_identity` ran, and its writers would
-        // have no key shape to agree on.
-        if schema.temporal && schema.discriminator().is_none() {
-            return Err(StoreError::Invariant(format!(
-                "edge type '{}' is temporal but its identity was never resolved",
-                schema.name
-            )));
-        }
-        let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
-            kind: "edge type schema",
-            message: format!("encode '{}': {e}", schema.name),
-        })?;
+        let body = edge_type_body(schema)?;
         let schema_key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
         txn.put(Partition::Schema, &schema_key, &body)?;
         let pointer_key = encode_edge_type_current_revision_key(&schema.name);

@@ -189,6 +189,32 @@ fn edge_type_round_trip() {
     assert_eq!(loaded.name, "KNOWS");
 }
 
+/// A temporal edge type whose identity was never resolved is refused at the
+/// store, so no writer finds a published temporal type without a key shape;
+/// once resolved it is stored with its discriminator.
+#[test]
+fn a_temporal_edge_type_with_unresolved_identity_is_not_stored() {
+    let fx = open_engine();
+    let store = LocalSchemaStore::new(&fx.engine);
+    let mut schema = EdgeTypeSchema::new("WORKS_AT");
+    schema.set_temporal(true);
+
+    let refused = store.save_edge_type(&schema).expect_err("unresolved");
+    assert!(
+        matches!(&refused, StoreError::Invariant(why) if why.contains("never resolved")),
+        "{refused:?}"
+    );
+    assert!(store.load_edge_type("WORKS_AT").expect("load").is_none());
+
+    schema.resolve_identity(None).expect("resolve");
+    store.save_edge_type(&schema).expect("save");
+    let loaded = store
+        .load_edge_type("WORKS_AT")
+        .expect("load")
+        .expect("Some");
+    assert!(loaded.is_start_identified());
+}
+
 #[test]
 fn edge_type_revision_bump_preserves_history() {
     // Symmetric to the label revision-bump test: save v1, save
