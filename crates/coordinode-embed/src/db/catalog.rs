@@ -101,13 +101,6 @@ impl Database {
                 schema.name
             )));
         }
-        if let Some(p) = schema.properties.values().find(|p| p.unique) {
-            return Err(refused(format!(
-                "property `{}` of :{} is declared unique; uniqueness is a constraint, create it \
-                 with create_constraint",
-                p.name, schema.name
-            )));
-        }
         if let Some(p) = schema.properties.values().find(|p| {
             coordinode_core::schema::definition::TEMPORAL_ENGINE_FIELDS.contains(&p.name.as_str())
         }) {
@@ -193,15 +186,8 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The edge type already exists; the definition declares a unique
-    /// property; or the catalog could not be written.
+    /// The edge type already exists, or the catalog could not be written.
     pub fn define_edge_type(&self, schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
-        if let Some(p) = schema.properties.values().find(|p| p.unique) {
-            return Err(refused(format!(
-                "property `{}` of edge type '{}' is declared unique; uniqueness is a constraint",
-                p.name, schema.name
-            )));
-        }
         let name = schema.name.clone();
         self.commit_catalog(|txn| -> Result<(), DatabaseError> {
             let store = LocalSchemaStore::new(&self.engine);
@@ -226,20 +212,14 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// The definition declares a unique property; it changes the temporal
-    /// flag; or the catalog could not be written.
+    /// The definition changes the temporal flag, or the catalog could not be
+    /// written.
     pub fn create_edge_type_schema(
         &self,
         mut schema: EdgeTypeSchema,
     ) -> Result<u64, DatabaseError> {
         use coordinode_core::schema::definition::encode_edge_type_current_revision_key;
         use coordinode_storage::engine::partition::Partition;
-        if let Some(p) = schema.properties.values().find(|p| p.unique) {
-            return Err(refused(format!(
-                "property `{}` of edge type '{}' is declared unique; uniqueness is a constraint",
-                p.name, schema.name
-            )));
-        }
         self.commit_catalog(|txn| -> Result<(), DatabaseError> {
             let store = LocalSchemaStore::new(&self.engine);
             let pointer = encode_edge_type_current_revision_key(&schema.name);

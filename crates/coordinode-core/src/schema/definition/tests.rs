@@ -9,8 +9,6 @@ fn property_def_builder() {
     assert_eq!(prop.name, "email");
     assert!(matches!(prop.property_type, PropertyType::String));
     assert!(prop.not_null);
-    // Uniqueness is a constraint of the label, never a flag a definition sets.
-    assert!(!prop.unique);
     assert!(prop.default.is_some());
 }
 
@@ -468,7 +466,6 @@ fn computed_property_def() {
     );
     assert!(prop.is_computed());
     assert!(!prop.not_null);
-    assert!(!prop.unique);
     assert!(prop.default.is_none());
 }
 

@@ -222,20 +222,11 @@ fn a_replacement_stored_nodes_break_leaves_the_previous_definition() {
     assert_eq!(db.constraints().expect("list"), before);
 }
 
-/// A type definition never declares uniqueness or any other constraint, and
-/// defining a label twice is refused rather than replacing the first.
+/// A type definition never declares a constraint, and defining a label twice
+/// is refused rather than replacing the first.
 #[test]
 fn a_definition_carrying_constraints_or_defined_twice_is_refused() {
     let (db, _dir) = open();
-
-    let mut flagged = user_definition();
-    let mut email = PropertyDef::new("email", PropertyType::String);
-    email.unique = true;
-    flagged.add_property(email);
-    assert!(matches!(
-        catalog_error(db.define_label(flagged).unwrap_err()),
-        ExecutionError::CatalogRefused(_)
-    ));
 
     let mut carrying = user_definition();
     carrying.add_constraint(NodeConstraint {

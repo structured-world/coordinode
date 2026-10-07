@@ -13,9 +13,7 @@ use coordinode_raft::cluster::RaftNode;
 const RETRY: Duration = Duration::from_secs(5);
 
 /// Watch `raft_node`'s leadership and, each time this member becomes the
-/// leader, finish the builds left unfinished and make every unique index no
-/// constraint owns the constraint owning it (after the builds: an index is
-/// ready before it is adopted). Ends when the node is dropped.
+/// leader, finish the builds left unfinished. Ends when the node is dropped.
 pub(crate) fn spawn(
     database: Arc<parking_lot::RwLock<Database>>,
     raft_node: Arc<RaftNode>,
@@ -39,23 +37,12 @@ pub(crate) fn spawn(
                 continue;
             }
             let db = Arc::clone(&database);
-            match tokio::task::spawn_blocking(move || {
-                let db = db.read();
-                let resumed = db.resume_interrupted_index_builds()?;
-                db.adopt_unowned_unique_indexes()
-                    .map(|adopted| (resumed, adopted))
-            })
-            .await
+            match tokio::task::spawn_blocking(move || db.read().resume_interrupted_index_builds())
+                .await
             {
-                Ok(Ok((resumed, adopted))) => {
+                Ok(Ok(resumed)) => {
                     if resumed > 0 {
                         tracing::info!(resumed, "interrupted index builds finished");
-                    }
-                    if adopted > 0 {
-                        tracing::info!(
-                            adopted,
-                            "unique indexes became the constraints owning them"
-                        );
                     }
                     done_this_lead = true;
                 }

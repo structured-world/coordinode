@@ -34,11 +34,6 @@ pub struct PropertyDef {
 
     /// Default value (if any). Applied when the property is missing on read.
     pub default: Option<Value>,
-
-    /// A uniqueness flag that earlier releases stored with the property.
-    /// Never set now: uniqueness is a named constraint of the label, and a
-    /// definition that sets this flag is refused.
-    pub unique: bool,
 }
 
 impl PropertyDef {
@@ -49,7 +44,6 @@ impl PropertyDef {
             property_type,
             not_null: false,
             default: None,
-            unique: false,
         }
     }
 
@@ -79,7 +73,6 @@ impl PropertyDef {
             property_type: PropertyType::Computed(spec),
             not_null: false,
             default: None,
-            unique: false,
         }
     }
 }
