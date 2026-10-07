@@ -25,7 +25,6 @@ use coordinode_query::frontend::{CypherFrontend, QueryFrontend};
 use coordinode_query::planner;
 use coordinode_query::procedure::{Procedure, ProcedureError, ProcedureRegistry};
 use coordinode_raft::proposal::OwnedLocalProposalPipeline;
-use coordinode_storage::Guard;
 use coordinode_storage::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
@@ -993,7 +992,7 @@ impl Database {
             engine.clone(),
             &opened_view,
             1, /* shard_id */
-        ));
+        )?);
 
         // The rebuild above covered what the store held; the worker keeps the
         // indexes current with every entry applied from here on.
@@ -1022,7 +1021,7 @@ impl Database {
             &opened_view,
             1, /* shard_id */
             &text_index_base,
-        ));
+        )?);
         text_index_registry.set_coverage(Arc::clone(&text_coverage));
         let text_worker = crate::text_worker::TextIndexWorker::spawn(
             Arc::clone(&engine),
@@ -1193,52 +1192,33 @@ impl Database {
         engine: Arc<StorageEngine>,
         fields: &FieldInterner,
         shard_id: u16,
-    ) -> coordinode_query::index::VectorIndexRegistry {
+    ) -> Result<coordinode_query::index::VectorIndexRegistry, DatabaseError> {
         use coordinode_query::index::IndexType;
 
         // Tier-backed registry: every registered HNSW index gets a
         // VectorTierHandle scoped to its `(label_id, property_id)`.
         let registry =
             coordinode_query::index::VectorIndexRegistry::with_vector_tier(engine.clone());
-        let engine_arc = engine;
-        let engine = engine_arc.as_ref();
 
-        // Step 1: Scan schema:idx:* for HNSW index definitions.
-        let iter = match engine.prefix_scan(Partition::Schema, b"schema:idx:") {
-            Ok(it) => it,
-            Err(e) => {
-                tracing::warn!("failed to scan vector index definitions: {e}");
-                return registry;
-            }
-        };
-
-        let mut hnsw_defs = Vec::new();
-        for guard in iter {
-            let Ok((_key, value)) = guard.into_inner() else {
-                continue;
-            };
-            if let Ok(def) =
-                rmp_serde::from_slice::<coordinode_query::index::IndexDefinition>(&value)
-            {
-                if def.index_type == IndexType::Hnsw && def.vector_config.is_some() {
-                    hnsw_defs.push(def);
-                }
-            }
-        }
-
+        // A definition the listing cannot read refuses the open: the
+        // database is not served without one of its indexes.
+        let hnsw_defs: Vec<_> = coordinode_query::index::ops::list_index_definitions(&engine)?
+            .into_iter()
+            .filter(|def| def.index_type == IndexType::Hnsw && def.vector_config.is_some())
+            .collect();
         if hnsw_defs.is_empty() {
-            return registry;
+            return Ok(registry);
         }
 
         Self::register_and_populate_hnsw(
             &registry,
             fields,
-            &engine_arc,
+            &engine,
             shard_id,
             &hnsw_defs,
             PopulateMode::Blocking,
         );
-        registry
+        Ok(registry)
     }
 
     /// Discover vector index definitions that were replicated into the
@@ -1488,25 +1468,20 @@ impl Database {
         interner: &FieldInterner,
         shard_id: u16,
         base_dir: &Path,
-    ) -> coordinode_query::index::TextIndexRegistry {
+    ) -> Result<coordinode_query::index::TextIndexRegistry, DatabaseError> {
         use coordinode_query::index::IndexType;
 
         let registry = coordinode_query::index::TextIndexRegistry::new(base_dir);
 
-        let defs = match coordinode_query::index::ops::list_index_definitions(engine) {
-            Ok(defs) => defs,
-            Err(e) => {
-                tracing::warn!("failed to scan text index definitions: {e}");
-                return registry;
-            }
-        };
-        let text_defs: Vec<_> = defs
+        // A definition the listing cannot read refuses the open: the
+        // database is not served without one of its indexes.
+        let text_defs: Vec<_> = coordinode_query::index::ops::list_index_definitions(engine)?
             .into_iter()
             .filter(|def| def.index_type == IndexType::Text && def.text_config.is_some())
             .collect();
 
         Self::populate_text_indexes(&registry, engine, interner, shard_id, &text_defs);
-        registry
+        Ok(registry)
     }
 
     /// Register `text_defs` in `registry` and rebuild each from the nodes

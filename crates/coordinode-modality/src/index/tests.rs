@@ -651,3 +651,27 @@ fn a_new_generation_is_never_one_already_used() {
     commit(&mut t).unwrap();
     assert!(other.generation != rebuilt && other.generation != def.generation);
 }
+
+/// An index build record this build cannot read refuses the listing, naming
+/// the record. Skipping it left the build to nobody: opening the store resumes
+/// builds from this list, so an unread record was an index that never
+/// finished and never failed.
+#[test]
+fn an_unreadable_build_record_refuses_the_listing() {
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let key = IndexBuildRecord::key_of(GenerationId::from_raw(7));
+    engine
+        .put(Partition::Schema, &key, b"not-msgpack-bytes")
+        .expect("plant");
+
+    match LocalIndexStore::new(engine).list_builds() {
+        Err(StoreError::Storage(StorageError::UnreadableCatalog {
+            kind, key: named, ..
+        })) => {
+            assert_eq!(kind, "index build record");
+            assert_eq!(named, coordinode_storage::error::printable_key(&key));
+        }
+        other => panic!("expected the unreadable record to refuse the listing, got {other:?}"),
+    }
+}

@@ -419,7 +419,7 @@ impl LogStore {
         .map_err(|e| io::Error::other(e.to_string()))?
         .with_sync_method(settings.sync_method);
 
-        let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED);
+        let last_purged = Self::load_log_id_from_partition(&engine, KEY_PURGED)?;
         // The last entry in the segments; its recovery reads the last segment
         // (which a crash may have left without a footer). A log whose entries
         // are all purged ends where it was purged, as openraft expects of an
@@ -468,12 +468,14 @@ impl LogStore {
         }
     }
 
-    fn load_log_id_from_partition(engine: &StorageEngine, key: &[u8]) -> Option<LogId> {
-        engine
-            .get(Partition::Raft, key)
-            .ok()
-            .flatten()
-            .and_then(|bytes| rmp_serde::from_slice(&bytes).ok())
+    /// The log id stored at `key`, `None` when nothing is. A value that cannot
+    /// be read or decoded fails the open: taken as absent, a lost purge point
+    /// would let the log be read from entries that are gone.
+    fn load_log_id_from_partition(
+        engine: &StorageEngine,
+        key: &[u8],
+    ) -> Result<Option<LogId>, io::Error> {
+        load_stored(engine, Partition::Raft, key)
     }
 
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, io::Error> {
@@ -1197,6 +1199,26 @@ fn snapshot_capture_root(engine: &StorageEngine) -> std::path::PathBuf {
     engine.data_dir().join("snapshot-capture")
 }
 
+/// The consensus state stored at `key` in `partition`, `None` when nothing
+/// is. A read or decode failure is an error, never an absent value: the
+/// state it holds (a purge point, the applied membership) cannot be guessed.
+fn load_stored<T: serde::de::DeserializeOwned>(
+    engine: &StorageEngine,
+    partition: Partition,
+    key: &[u8],
+) -> Result<Option<T>, io::Error> {
+    let what = String::from_utf8_lossy(key);
+    let Some(bytes) = engine
+        .get(partition, key)
+        .map_err(|e| io::Error::other(format!("read {what}: {e}")))?
+    else {
+        return Ok(None);
+    };
+    rmp_serde::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| io::Error::other(format!("decode {what}: {e}")))
+}
+
 /// How many applied entries accumulate as coverage markers before the state
 /// machine folds them into every tree's base. The crate's own tests fold
 /// often, so their short workloads cross fold boundaries.
@@ -1262,7 +1284,7 @@ impl CoordinodeStateMachine {
                     };
                 (last_applied, Some(coverage))
             }
-            None if Self::load_log_id(&engine, KEY_SM_APPLIED).is_some() => {
+            None if Self::load_log_id(&engine, KEY_SM_APPLIED)?.is_some() => {
                 return Err(io::Error::other(
                     "this store applied Raft entries without an apply-coverage record, so \
                      nothing proves which of them each partition holds; dump it with the \
@@ -1291,7 +1313,7 @@ impl CoordinodeStateMachine {
         // removes markers from index 0.
         let folded = 0;
         let skip_until = replay_skip.as_ref().map_or(0, RaftCoverage::skip_until);
-        let last_membership = Self::load_membership(&engine);
+        let last_membership = Self::load_membership(&engine)?;
 
         // Initialize applied watermark from the resume point.
         let initial_index = last_applied.map(|id| id.index).unwrap_or(0);
@@ -1413,28 +1435,25 @@ impl CoordinodeStateMachine {
     fn load_log_id(
         engine: &StorageEngine,
         key: &[u8],
-    ) -> Option<openraft::type_config::alias::LogIdOf<TypeConfig>> {
+    ) -> Result<Option<openraft::type_config::alias::LogIdOf<TypeConfig>>, io::Error> {
         debug_assert!(
             key.starts_with(b"raft:"),
             "Raft state machine keys in Schema partition must use raft: prefix, got {:?}",
             String::from_utf8_lossy(key)
         );
-        engine
-            .get(Partition::Schema, key)
-            .ok()
-            .flatten()
-            .and_then(|bytes| rmp_serde::from_slice(&bytes).ok())
+        load_stored(engine, Partition::Schema, key)
     }
 
+    /// The membership the state machine last applied, the initial one when
+    /// none was. A stored one that cannot be read or decoded fails the open:
+    /// taken as the initial membership, the member would forget its group.
     fn load_membership(
         engine: &StorageEngine,
-    ) -> openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode> {
-        engine
-            .get(Partition::Schema, KEY_SM_MEMBERSHIP)
-            .ok()
-            .flatten()
-            .and_then(|bytes| rmp_serde::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    ) -> Result<
+        openraft::StoredMembership<CommittedLeaderId, u64, openraft::impls::BasicNode>,
+        io::Error,
+    > {
+        Ok(load_stored(engine, Partition::Schema, KEY_SM_MEMBERSHIP)?.unwrap_or_default())
     }
 
     fn save_membership(

@@ -498,6 +498,38 @@ fn a_store_that_applied_entries_without_coverage_is_refused() {
     );
 }
 
+/// The applied membership that does not decode fails the open. It was taken
+/// as the initial, empty membership: the member forgot its group and could
+/// elect itself alone.
+#[test]
+fn an_unreadable_applied_membership_refuses_the_open() {
+    let (_dir, engine) = test_engine();
+    engine
+        .put(Partition::Schema, KEY_SM_MEMBERSHIP, b"not-msgpack-bytes")
+        .unwrap();
+
+    let err = CoordinodeStateMachine::new(Arc::clone(&engine))
+        .err()
+        .expect("an unreadable membership must not open as an empty one");
+    assert!(err.to_string().contains("raft:sm:membership"), "got: {err}");
+}
+
+/// The purge point that does not decode fails the log's open. It was taken
+/// as no purge at all, so the log claimed to start at entries it no longer
+/// holds.
+#[test]
+fn an_unreadable_purge_point_refuses_the_log_open() {
+    let (_dir, engine) = test_engine();
+    engine
+        .put(Partition::Raft, KEY_PURGED, b"not-msgpack-bytes")
+        .unwrap();
+
+    let err = LogStore::open(engine)
+        .err()
+        .expect("an unreadable purge point must not open as none");
+    assert!(err.to_string().contains("raft:purged"), "got: {err}");
+}
+
 /// Readers waiting on the applied watermark (causal reads with an
 /// `after_index`, the change stream's bound) must see an installed snapshot
 /// at once: on an idle cluster no later apply would ever move it.
