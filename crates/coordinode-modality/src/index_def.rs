@@ -646,6 +646,17 @@ impl BuildState {
     }
 }
 
+/// What a build of a unique index may do about two stored nodes holding one
+/// value: `ON DUPLICATE RENAME property`. A policy of the build operation,
+/// not of the index: later writes are refused as duplicates as always.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateRepair {
+    /// The string property the build may change on a conflicting node, by
+    /// appending a random suffix to its value. One of the index's
+    /// properties.
+    pub property: String,
+}
+
 /// The durable record of one index build: the operation a CREATE or a
 /// rebuild admits, independent of the request, connection or thread that
 /// asked for it. Its generation is its identity: one build fills one
@@ -662,6 +673,12 @@ pub struct IndexBuildRecord {
     pub state: BuildState,
     /// Nodes indexed so far, reported by the executor; progress, not proof.
     pub indexed: u64,
+    /// Whether the build may repair a duplicate it meets, and through which
+    /// property; `None` fails the build on the first duplicate.
+    pub on_duplicate: Option<DuplicateRepair>,
+    /// Repairs committed so far. Each is a [`DuplicateRepairRecord`]
+    /// committed with the data change it records and with this count.
+    pub repaired: u64,
 }
 
 impl IndexBuildRecord {
@@ -669,7 +686,8 @@ impl IndexBuildRecord {
     /// definition and name prefixes.
     pub const PREFIX: &'static [u8] = b"schema:idxbuild:";
 
-    /// A build of `generation` of the index `index`, admitted and not taken.
+    /// A build of `generation` of the index `index`, admitted and not taken,
+    /// failing on the first duplicate it meets.
     pub fn accepted(index: IndexId, generation: GenerationId, on_failure: BuildFailure) -> Self {
         Self {
             generation,
@@ -677,7 +695,16 @@ impl IndexBuildRecord {
             on_failure,
             state: BuildState::Accepted,
             indexed: 0,
+            on_duplicate: None,
+            repaired: 0,
         }
+    }
+
+    /// This build, repairing the duplicates it meets as `repair` says.
+    #[must_use]
+    pub fn repairing(mut self, repair: Option<DuplicateRepair>) -> Self {
+        self.on_duplicate = repair;
+        self
     }
 
     /// The catalog key of the build of `generation`.
@@ -685,6 +712,44 @@ impl IndexBuildRecord {
         let mut key = Vec::with_capacity(Self::PREFIX.len() + 8);
         key.extend_from_slice(Self::PREFIX);
         key.extend_from_slice(&generation.as_raw().to_be_bytes());
+        key
+    }
+}
+
+/// One repair a build made: the value of `property` of `node` it replaced to
+/// end a duplicate. Committed in the transaction that changed the node, so
+/// the record exists exactly when the change does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateRepairRecord {
+    /// The build that made it.
+    pub generation: GenerationId,
+    /// The node it changed.
+    pub node: u64,
+    /// The property it changed.
+    pub property: String,
+    /// The value the node held, which another node held too.
+    pub old: String,
+    /// The value it holds since.
+    pub new: String,
+}
+
+impl DuplicateRepairRecord {
+    /// Prefix of every repair record in the schema catalog.
+    pub const PREFIX: &'static [u8] = b"schema:idxrepair:";
+
+    /// The prefix of the repairs of the build of `generation`.
+    pub fn prefix_of(generation: GenerationId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::PREFIX.len() + 8);
+        key.extend_from_slice(Self::PREFIX);
+        key.extend_from_slice(&generation.as_raw().to_be_bytes());
+        key
+    }
+
+    /// The catalog key of this repair: one per build and node, so a node
+    /// repaired twice by one build keeps its latest repair.
+    pub fn key(&self) -> Vec<u8> {
+        let mut key = Self::prefix_of(self.generation);
+        key.extend_from_slice(&self.node.to_be_bytes());
         key
     }
 }

@@ -2230,6 +2230,24 @@ impl Database {
         Ok(self.index_builds.status(operation, wait)?)
     }
 
+    /// The duplicates the index build `operation` repaired (`ON DUPLICATE
+    /// RENAME`), in node order: each node, property, and the value replaced
+    /// by which. Every one is a committed change of the node, kept whatever
+    /// the build's outcome.
+    ///
+    /// # Errors
+    ///
+    /// The records could not be read.
+    pub fn index_build_repairs(
+        &self,
+        operation: coordinode_query::index::GenerationId,
+    ) -> Result<Vec<coordinode_query::index::DuplicateRepairRecord>, DatabaseError> {
+        use coordinode_modality::IndexStore as _;
+        Ok(coordinode_modality::LocalIndexStore::new(&self.engine)
+            .list_repairs(operation)
+            .map_err(coordinode_query::executor::runner::ExecutionError::from)?)
+    }
+
     /// How index builds run: how many fill indexes at once and how long a
     /// backfill waits for the transactions opened before its index.
     pub fn index_build_config(&self) -> coordinode_query::index::IndexBuildConfig {

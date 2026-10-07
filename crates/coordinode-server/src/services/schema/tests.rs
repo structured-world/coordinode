@@ -53,6 +53,7 @@ fn unique(name: &str, label: &str, property: &str) -> schema::CreateConstraintRe
         property_type: None,
         if_not_exists: false,
         wait: None,
+        on_duplicate_rename: String::new(),
     }
 }
 
@@ -464,6 +465,52 @@ async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
         .await
         .expect_err("a negative wait");
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+}
+
+/// A CreateConstraint with on_duplicate_rename repairs the stored
+/// duplicate: the constraint is ACTIVE, its build reports the property and
+/// one repair, and ListIndexBuildRepairs names the node and both values.
+#[tokio::test]
+async fn a_constraint_build_repairs_a_duplicate_and_lists_it() {
+    let (svc, _dir) = test_service();
+    svc.database
+        .write()
+        .execute_cypher("CREATE (:Customer {email: 'same@x'}), (:Customer {email: 'same@x'})")
+        .expect("seed");
+
+    let mut request = unique("customer_email", "Customer", "email");
+    request.on_duplicate_rename = "email".into();
+    let created = svc
+        .create_constraint(Request::new(request))
+        .await
+        .expect("repaired")
+        .into_inner();
+    assert_eq!(created.state, schema::ConstraintState::Active as i32);
+    let build = created.build.expect("its build");
+    assert_eq!(build.rename_property, "email");
+    assert_eq!(build.repaired, 1);
+
+    let repairs = svc
+        .list_index_build_repairs(Request::new(schema::ListIndexBuildRepairsRequest {
+            operation: Some(build.operation),
+        }))
+        .await
+        .expect("repairs")
+        .into_inner()
+        .repairs;
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].property, "email");
+    assert_eq!(repairs[0].old_value, "same@x");
+    assert!(repairs[0].new_value.starts_with("same@x_"));
+    assert!(!repairs[0].element_id.is_empty());
+
+    let mut wrong = unique("other", "Customer", "email");
+    wrong.on_duplicate_rename = "name".into();
+    let refused = svc
+        .create_constraint(Request::new(wrong))
+        .await
+        .expect_err("not a covered property");
+    assert_eq!(reason(&refused), "CATALOG_CHANGE_REFUSED");
 }
 
 /// A uniqueness constraint is created apart from the type: it answers with

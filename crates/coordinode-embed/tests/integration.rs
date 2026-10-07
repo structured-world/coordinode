@@ -22,6 +22,7 @@ mod integration {
     mod cypher;
     mod document;
     mod drain;
+    mod duplicate_repair;
     mod encrypted_search;
     mod field_dictionary;
     mod from_engine;

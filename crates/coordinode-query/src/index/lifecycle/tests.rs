@@ -1,6 +1,6 @@
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::Value;
-use coordinode_modality::{LocalNodeStore, NodeStore as _};
+use coordinode_modality::{DuplicateRepairRecord, LocalNodeStore, NodeStore as _};
 
 use super::test_env::{Fault, TestEnv, commit};
 use super::*;
@@ -907,4 +907,205 @@ fn a_build_of_a_dropped_index_is_cancelled() {
     );
     assert!(env.record(&def).is_none());
     assert!(env.holders(&def, "a@x").is_empty());
+}
+
+// ── ON DUPLICATE RENAME ──────────────────────────────────────────────
+
+/// Admit a build of a new unique index on `:User(email)` that repairs the
+/// duplicates it meets by renaming `email`.
+fn admit_repairing(env: &TestEnv) -> IndexDefinition {
+    let store = LocalIndexStore::new(&env.engine);
+    let mut descriptor = IndexDescriptor::btree("user_email", "User", "email").unique();
+    descriptor.state = IndexState::Building {
+        written: 0,
+        estimated_total: 0,
+    };
+    let mut txn = env.begin();
+    let def = store
+        .publish_definition_txn(&mut txn, descriptor)
+        .expect("publish");
+    store
+        .put_build_txn(
+            &mut txn,
+            &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Withdraw).repairing(
+                Some(DuplicateRepair {
+                    property: "email".into(),
+                }),
+            ),
+            None,
+        )
+        .expect("admit build");
+    commit(&mut txn).expect("commit publication");
+    env.registry
+        .register_published(&env.engine, def.clone())
+        .expect("register");
+    def
+}
+
+/// The email node `id` holds now.
+fn email_of(env: &TestEnv, id: u64) -> Option<Value> {
+    let field = env.fields_now().lookup("email").expect("email field");
+    let txn = env.begin();
+    LocalNodeStore
+        .get(&txn, 1, NodeId::from_raw(id))
+        .expect("read node")
+        .and_then(|record| record.get(field).cloned())
+}
+
+/// A build allowed to rename meets a value two stored nodes hold: the node
+/// it reaches second gets the value plus a suffix, the build publishes the
+/// index with every node, and the repair is recorded with the old and the
+/// new value. The first holder and the other nodes are untouched.
+#[test]
+fn a_repairing_build_renames_the_second_holder_and_publishes() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    env.put_user(3, "other@x");
+    let def = admit_repairing(&env);
+    let builds = service(&env);
+
+    builds.submit(def.generation, 0).expect("submit");
+    let outcome = builds.wait(def.generation, None).expect("wait");
+
+    assert!(
+        matches!(
+            outcome,
+            Some(IndexBuildOutcome::Published { indexed: Some(3) })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(env.holders(&def, "same@x"), [1]);
+    assert_eq!(env.holders(&def, "other@x"), [3]);
+    let Some(Value::String(renamed)) = email_of(&env, 2) else {
+        panic!("node 2 keeps a string");
+    };
+    assert!(
+        renamed.starts_with("same@x_") && renamed.len() == "same@x_".len() + 8,
+        "{renamed}"
+    );
+    assert_eq!(env.holders(&def, &renamed), [2]);
+    let record = env.record(&def).expect("record");
+    assert_eq!(record.repaired, 1);
+    let repairs = LocalIndexStore::new(&env.engine)
+        .list_repairs(def.generation)
+        .expect("repairs");
+    assert_eq!(
+        repairs,
+        [DuplicateRepairRecord {
+            generation: def.generation,
+            node: 2,
+            property: "email".into(),
+            old: "same@x".into(),
+            new: renamed,
+        }]
+    );
+}
+
+/// A repair commits on its own, before the build ends: it is visible while
+/// the build still runs, and a cancellation of the build afterwards keeps
+/// it, with its record, while the index itself is withdrawn.
+#[test]
+fn a_repair_is_visible_before_the_build_ends_and_survives_its_cancellation() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    let def = admit_repairing(&env);
+    let builds = service(&env);
+    env.hold_pages_after(0);
+
+    builds.submit(def.generation, 0).expect("submit");
+    env.await_held_page();
+    let Some(Value::String(renamed)) = email_of(&env, 2) else {
+        panic!("node 2 keeps a string");
+    };
+    assert_ne!(renamed, "same@x", "repaired while the build runs");
+    assert_eq!(env.record(&def).expect("record").repaired, 1);
+
+    assert!(builds.cancel(def.generation).expect("cancel"));
+    env.release_pages();
+    let outcome = builds.wait(def.generation, None).expect("wait");
+    assert!(
+        matches!(outcome, Some(IndexBuildOutcome::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(env.stored(&def).is_none(), "the index is withdrawn");
+    assert_eq!(email_of(&env, 2), Some(Value::String(renamed.clone())));
+    assert_eq!(email_of(&env, 1), Some(Value::String("same@x".into())));
+    let repairs = LocalIndexStore::new(&env.engine)
+        .list_repairs(def.generation)
+        .expect("repairs");
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].new, renamed);
+}
+
+/// A duplicate value a suffix cannot be appended to fails the build: the
+/// index is withdrawn, no node is changed, and nothing is recorded.
+#[test]
+fn a_duplicate_that_is_not_a_string_fails_a_repairing_build() {
+    let env = env();
+    let field = env.fields_now().lookup("email").expect("email field");
+    for id in [1, 2] {
+        let mut record = NodeRecord::new("User");
+        record.set(field, Value::Int(7));
+        let mut txn = env.begin();
+        LocalNodeStore
+            .put(&mut txn, 1, NodeId::from_raw(id), &record)
+            .expect("put");
+        commit(&mut txn).expect("commit node");
+    }
+    let def = admit_repairing(&env);
+    let builds = service(&env);
+
+    builds.submit(def.generation, 0).expect("submit");
+    let outcome = builds.wait(def.generation, None).expect("wait");
+
+    assert!(
+        matches!(&outcome, Some(IndexBuildOutcome::Failed(BuildError::Other(why)))
+            if why.contains("only a string")),
+        "{outcome:?}"
+    );
+    assert!(env.stored(&def).is_none());
+    assert_eq!(email_of(&env, 1), Some(Value::Int(7)));
+    assert_eq!(email_of(&env, 2), Some(Value::Int(7)));
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .list_repairs(def.generation)
+            .expect("repairs")
+            .is_empty()
+    );
+}
+
+/// A repair decided from a value the node no longer holds (a writer
+/// changed it after the scan) writes nothing: the writer's value stays, and
+/// the backfill reads the node again.
+#[test]
+fn a_repair_of_a_value_changed_since_overwrites_nothing() {
+    let env = env();
+    env.put_user(2, "edited@x");
+    let def = admit_repairing(&env);
+    let builds = service(&env);
+
+    let repaired = super::super::repair::rename_duplicate(
+        &builds,
+        env.as_ref(),
+        &super::super::repair::RepairBuild {
+            generation: def.generation,
+            token: 0,
+            index: &def,
+            property: "email",
+        },
+        NodeId::from_raw(2),
+        Some(&Value::String("same@x".into())),
+    )
+    .expect("repair");
+
+    assert_eq!(repaired, super::super::repair::Repaired::Changed);
+    assert_eq!(email_of(&env, 2), Some(Value::String("edited@x".into())));
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .list_repairs(def.generation)
+            .expect("repairs")
+            .is_empty()
+    );
 }

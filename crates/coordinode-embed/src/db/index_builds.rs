@@ -75,4 +75,8 @@ impl BuildEnvironment for DatabaseBuilds {
     fn commit_catalog(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
         self.commit(txn)
     }
+
+    fn statement_log(&self) -> Option<(&dyn ProposalPipeline, &ProposalIdGenerator)> {
+        Some((self.pipeline.as_ref(), &self.proposal_id_gen))
+    }
 }

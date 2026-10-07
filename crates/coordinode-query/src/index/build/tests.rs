@@ -68,6 +68,7 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         older_transactions_wait: super::DEFAULT_OLDER_TRANSACTIONS_WAIT,
         progress: None,
         covered: None,
+        repair: None,
     }
 }
 

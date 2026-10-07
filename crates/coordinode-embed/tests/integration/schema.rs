@@ -21,6 +21,7 @@ fn require_unique(db: &Database, label: &str, property: &str) {
         kind: coordinode_core::schema::definition::ConstraintKind::Unique,
         if_not_exists: false,
         wait: None,
+        on_duplicate_rename: None,
     })
     .expect("create the uniqueness constraint");
 }

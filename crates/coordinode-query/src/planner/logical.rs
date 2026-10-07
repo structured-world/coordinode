@@ -463,6 +463,9 @@ pub enum LogicalOp {
         /// The index's own maintenance profile; `None` inherits the
         /// namespace default.
         maintenance: Option<crate::index::IndexProfile>,
+        /// `ON DUPLICATE RENAME prop`: the property the build may change to
+        /// repair a stored duplicate of a unique index.
+        on_duplicate_rename: Option<String>,
     },
 
     /// DROP INDEX: remove a B-tree index by name.
@@ -481,6 +484,9 @@ pub enum LogicalOp {
         /// How long the statement waits for the build of the index the
         /// constraint owns; `None` takes the engine's statement wait.
         wait: Option<core::time::Duration>,
+        /// `ON DUPLICATE RENAME n.prop`: the property the build of the owned
+        /// index may change to repair a stored duplicate.
+        on_duplicate_rename: Option<String>,
     },
 
     /// `DROP CONSTRAINT`: remove a constraint, and the index it owns.
@@ -2701,6 +2707,7 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             sparse,
             filter,
             maintenance,
+            on_duplicate_rename,
         } => {
             let mut flags = String::new();
             if *unique {
@@ -2718,8 +2725,12 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
                 Some(p) => format!(", maintenance={p:?}"),
                 None => String::new(),
             };
+            let rename_str = match on_duplicate_rename {
+                Some(p) => format!(", on_duplicate=RENAME {p}"),
+                None => String::new(),
+            };
             output.push_str(&format!(
-                "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str}{maintenance_str})\n"
+                "{prefix}CreateIndex({name}{flags} ON :{label}({property}){filter_str}{maintenance_str}{rename_str})\n"
             ));
         }
         LogicalOp::CreateConstraint {
@@ -2727,12 +2738,17 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             label,
             properties,
             kind,
+            on_duplicate_rename,
             ..
         } => {
             let name = name.as_deref().unwrap_or("<derived>");
             let properties = properties.join(", ");
+            let rename_str = match on_duplicate_rename {
+                Some(p) => format!(" ON DUPLICATE RENAME {p}"),
+                None => String::new(),
+            };
             output.push_str(&format!(
-                "{prefix}CreateConstraint({name} ON :{label}({properties}) {kind})\n"
+                "{prefix}CreateConstraint({name} ON :{label}({properties}) {kind}{rename_str})\n"
             ));
         }
         LogicalOp::DropConstraint { name, .. } => {

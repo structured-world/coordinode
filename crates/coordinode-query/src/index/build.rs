@@ -17,7 +17,8 @@
 //! cannot land.
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{NodeRecord, decode_node_key, decode_temporal_node_key};
+use coordinode_core::graph::node::{NodeId, NodeRecord, decode_node_key, decode_temporal_node_key};
+use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_modality::{IndexStore as _, LocalNodeStore, NodeStore, StoreError};
@@ -67,6 +68,10 @@ pub enum BackfillError {
     /// to fill, and it writes nothing more into it.
     #[error("the index definition changed while it was being built")]
     Superseded,
+    /// A duplicate the build may repair could not be: its value is not a
+    /// string, no free value was found, or the repair statement failed.
+    #[error("the build could not repair a duplicate: {0}")]
+    Repair(String),
 }
 
 impl From<IndexWriteError> for BackfillError {
@@ -105,7 +110,31 @@ pub struct Backfill<'a> {
     /// Told, after every committed page, the last node key of the shard the
     /// backfill has committed entries through.
     pub covered: Option<CoveredThrough<'a>>,
+    /// How a stored duplicate is repaired, when the build may repair one:
+    /// the page holding it does not commit, the repair runs, and the page is
+    /// read again. `None` fails the backfill on the first duplicate.
+    pub repair: Option<DuplicateRepairer<'a>>,
 }
+
+/// What a backfill does about a stored node whose value of a unique index
+/// another node holds.
+#[derive(Clone, Copy)]
+pub struct DuplicateRepairer<'a> {
+    /// The property the repair changes.
+    pub property: &'a str,
+    /// Repair node `node`, whose value of `property` is the one given, or
+    /// find that a writer changed it meanwhile; the page is read again
+    /// either way.
+    pub run: RepairNode<'a>,
+}
+
+/// What a backfill calls to repair one node: the node and its value of the
+/// repaired property.
+pub type RepairNode<'a> = &'a dyn Fn(NodeId, Option<&Value>) -> Result<(), BackfillError>;
+
+/// Repairs one page may need before it commits: each one ends a duplicate
+/// the page met, so a page meets at most one per node it holds.
+const MAX_PAGE_REPAIRS: usize = PAGE;
 
 /// What a backfill tells the key it has committed entries through.
 pub type CoveredThrough<'a> = &'a dyn Fn(&[u8]);
@@ -159,6 +188,7 @@ impl<'a> Backfill<'a> {
         let mut start_after: Option<Vec<u8>> = None;
         let mut indexed = 0u64;
         let mut conflicts = 0u32;
+        let mut page_repairs = 0usize;
         loop {
             let mut txn = match self.oracle {
                 Some(oracle) => Transaction::begin(self.engine, Some(oracle), oracle.next()),
@@ -173,6 +203,7 @@ impl<'a> Backfill<'a> {
             let mut claims = Vec::new();
             let mut read = Vec::with_capacity(page.rows.len());
             let mut staged = 0u64;
+            let mut duplicate = None;
             for (key, bytes) in &page.rows {
                 let Some(owner) = stored_owner(key) else {
                     continue;
@@ -183,7 +214,7 @@ impl<'a> Backfill<'a> {
                 }
                 let lookup = record_lookup(&record, self.interner);
                 let field_of = |name: &str| self.interner.lookup(name);
-                if stage_node_entry(
+                match stage_node_entry(
                     self.engine,
                     &mut txn,
                     index,
@@ -191,11 +222,31 @@ impl<'a> Backfill<'a> {
                     &lookup,
                     &field_of,
                     &mut claims,
-                )? {
-                    staged += 1;
+                ) {
+                    Ok(true) => staged += 1,
+                    Ok(false) => {}
+                    Err(IndexWriteError::Unique(_)) if self.repair.is_some() => {
+                        let property = self.repair.map_or("", |r| r.property);
+                        duplicate = Some((NodeId::from_raw(owner.node_id), lookup(property)));
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
                 read.push(key.clone());
             }
+            // A duplicate the build may repair: the page commits nothing, the
+            // node is repaired in a transaction of its own, and the page is
+            // read again over the repaired data.
+            if let (Some((node, value)), Some(repair)) = (duplicate, self.repair) {
+                drop(txn);
+                page_repairs += 1;
+                if page_repairs > MAX_PAGE_REPAIRS {
+                    return Err(BackfillError::Contended);
+                }
+                (repair.run)(node, value.as_ref())?;
+                continue;
+            }
+            page_repairs = 0;
             // The page's entries hold only if the rows they came from are
             // still the rows it read when the page commits.
             let unchanged = nodes.condition_unchanged(&mut txn, &read)?;

@@ -364,6 +364,9 @@ pub struct CreateIndexClause {
     /// `OPTIONS { maintenance: ... }`: the index's own profile, overriding
     /// the namespace default.
     pub maintenance: Option<ProfileChoice>,
+    /// `ON DUPLICATE RENAME prop`: the property the build may change to
+    /// repair a stored duplicate.
+    pub on_duplicate_rename: Option<String>,
 }
 
 /// A maintenance profile named in index DDL.
@@ -418,6 +421,9 @@ pub struct CreateConstraintClause {
     /// What the constraint requires: `IS UNIQUE`, `IS NOT NULL`,
     /// `IS NODE KEY`, or `IS :: TYPE` / `IS TYPED TYPE`.
     pub kind: coordinode_core::schema::definition::ConstraintKind,
+    /// `ON DUPLICATE RENAME n.prop`: the property the build of the owned
+    /// index may change to repair a stored duplicate.
+    pub on_duplicate_rename: Option<String>,
 }
 
 /// `DROP CONSTRAINT name [IF EXISTS]`.

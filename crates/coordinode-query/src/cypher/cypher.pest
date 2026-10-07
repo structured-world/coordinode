@@ -241,12 +241,18 @@ drop_vector_index_clause = { kw_drop ~ kw_vector ~ kw_index ~ identifier }
 // --- CREATE/DROP BTREE INDEX ---
 
 // CREATE [UNIQUE] [SPARSE] INDEX idx_name ON :Label(prop) [WHERE pred]
+//     [ON DUPLICATE RENAME prop]
 //     [OPTIONS { maintenance: 'resolved' | 'derived' }]
 create_index_clause = {
     kw_create ~ kw_unique? ~ kw_sparse? ~ kw_index ~ identifier ~ kw_on ~ ":" ~ identifier ~ "(" ~ identifier ~ ")"
     ~ where_inline?
+    ~ on_duplicate_rename?
     ~ (kw_options ~ index_options)?
 }
+
+// ON DUPLICATE RENAME [n.]prop: the build of a unique index may repair a
+// stored duplicate by appending a random suffix to `prop` of one holder.
+on_duplicate_rename = { kw_on ~ kw_duplicate ~ kw_rename ~ (variable ~ ".")? ~ identifier }
 
 // B-tree index OPTIONS map: { key: 'value', ... }
 index_options = { "{" ~ index_option ~ ("," ~ index_option)* ~ ","? ~ "}" }
@@ -260,6 +266,7 @@ drop_index_clause = { kw_drop ~ kw_index ~ identifier }
 //   CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
 //     REQUIRE n.p | (n.p, n.q, ...)
 //     IS UNIQUE | IS NOT NULL | IS NODE KEY | IS :: TYPE | IS TYPED TYPE
+//     [ON DUPLICATE RENAME n.p]
 //   DROP CONSTRAINT name [IF EXISTS]
 //
 // The name is optional, so it may not be one of the words that follow it.
@@ -267,6 +274,7 @@ create_constraint_clause = {
     kw_create ~ kw_constraint ~ (!(kw_if | kw_for) ~ identifier)? ~ if_not_exists?
     ~ kw_for ~ "(" ~ variable ~ ":" ~ identifier ~ ")"
     ~ kw_require ~ constraint_properties ~ constraint_predicate
+    ~ on_duplicate_rename?
 }
 if_not_exists          = { kw_if ~ kw_not ~ kw_exists }
 constraint_properties  = { constraint_property | "(" ~ constraint_property ~ ("," ~ constraint_property)* ~ ")" }
@@ -1028,6 +1036,7 @@ kw_require     = @{ ^"require" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_if          = @{ ^"if" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_for         = @{ ^"for" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_typed       = @{ ^"typed" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_rename      = @{ ^"rename" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // --- Identifiers ---
 

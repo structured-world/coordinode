@@ -47,8 +47,8 @@ use coordinode_storage::error::StorageError;
 
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
-    GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexProfile,
-    NamespaceIndexPolicy,
+    DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
+    IndexId, IndexProfile, NamespaceIndexPolicy,
 };
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
@@ -322,10 +322,30 @@ pub trait IndexStore {
         version: Option<u64>,
     ) -> StoreResult<()>;
 
+    /// Stage `repair` through the [`Transaction`] that makes the data change
+    /// it records, so the record exists exactly when the change does.
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
+    fn put_repair_txn(
+        &self,
+        txn: &mut Transaction,
+        repair: &DuplicateRepairRecord,
+    ) -> StoreResult<()>;
+
+    /// The repairs the build of `generation` committed, in node order.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn list_repairs(&self, generation: GenerationId) -> StoreResult<Vec<DuplicateRepairRecord>>;
+
     /// Stage the removal of the finished build records of the index `index`,
-    /// with the commit that drops it. A build still without an outcome is its
-    /// executor's to end: it finds the index gone and removes the record
-    /// itself, so the drop and the executor never write one record at once.
+    /// with the repairs they record, in the commit that drops it. A build
+    /// still without an outcome is its executor's to end: it finds the index
+    /// gone and removes the record itself, so the drop and the executor never
+    /// write one record at once.
     ///
     /// # Errors
     ///
@@ -815,6 +835,31 @@ impl IndexStore for LocalIndexStore<'_> {
         Ok(())
     }
 
+    fn put_repair_txn(
+        &self,
+        txn: &mut Transaction,
+        repair: &DuplicateRepairRecord,
+    ) -> StoreResult<()> {
+        txn.put(
+            Partition::Schema,
+            &repair.key(),
+            &encode("index build repair", repair)?,
+        )?;
+        Ok(())
+    }
+
+    fn list_repairs(&self, generation: GenerationId) -> StoreResult<Vec<DuplicateRepairRecord>> {
+        let mut out = Vec::new();
+        for guard in self.engine.prefix_scan(
+            Partition::Schema,
+            &DuplicateRepairRecord::prefix_of(generation),
+        )? {
+            let (key, value) = guard.into_inner()?;
+            out.push(decode_catalog("index build repair", &key, &value)?);
+        }
+        Ok(out)
+    }
+
     fn delete_finished_builds_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()> {
         for record in self.list_builds()? {
             if record.index == index && record.state.is_terminal() {
@@ -822,6 +867,7 @@ impl IndexStore for LocalIndexStore<'_> {
                     Partition::Schema,
                     &IndexBuildRecord::key_of(record.generation),
                 )?;
+                self.delete_repairs_txn(txn, record.generation)?;
             }
         }
         Ok(())
@@ -836,6 +882,25 @@ impl IndexStore for LocalIndexStore<'_> {
         let key = IndexBuildRecord::key_of(generation);
         txn.expect_version(Partition::Schema, &key, Some(version))?;
         txn.delete(Partition::Schema, &key)?;
+        self.delete_repairs_txn(txn, generation)
+    }
+}
+
+impl LocalIndexStore<'_> {
+    /// Stage the removal of the repair records of the build of `generation`,
+    /// which go with its build record. The data changes they record stay.
+    fn delete_repairs_txn(
+        &self,
+        txn: &mut Transaction,
+        generation: GenerationId,
+    ) -> StoreResult<()> {
+        for guard in self.engine.prefix_scan(
+            Partition::Schema,
+            &DuplicateRepairRecord::prefix_of(generation),
+        )? {
+            let (key, _) = guard.into_inner()?;
+            txn.delete(Partition::Schema, &key)?;
+        }
         Ok(())
     }
 }

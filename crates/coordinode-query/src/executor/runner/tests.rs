@@ -5558,6 +5558,7 @@ fn create_index_registers_and_backfills() {
             sparse: false,
             filter: None,
             maintenance: None,
+            on_duplicate_rename: None,
         },
         &mut ctx,
     )
@@ -5671,6 +5672,7 @@ fn drop_index_removes_from_registry() {
             sparse: false,
             filter: None,
             maintenance: None,
+            on_duplicate_rename: None,
         },
         &mut ctx,
     )
@@ -5744,6 +5746,7 @@ fn create_index_duplicate_name_returns_error() {
             sparse: false,
             filter: None,
             maintenance: None,
+            on_duplicate_rename: None,
         },
         &mut ctx,
     );
@@ -5919,6 +5922,7 @@ fn index_scan_returns_correct_node() {
             sparse: false,
             filter: None,
             maintenance: None,
+            on_duplicate_rename: None,
         },
         &mut ctx,
     )
@@ -6070,6 +6074,7 @@ fn index_scan_resolves_correlated_key() {
             sparse: false,
             filter: None,
             maintenance: None,
+            on_duplicate_rename: None,
         },
         &mut ctx,
     )

@@ -1137,6 +1137,7 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
     let mut identifiers: Vec<String> = Vec::new();
     let mut filter_expr: Option<Expr> = None;
     let mut maintenance = None;
+    let mut on_duplicate_rename_target = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1145,6 +1146,16 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
             Rule::identifier => identifiers.push(inner.as_str().to_string()),
             Rule::where_inline => {
                 filter_expr = Some(find_expression(inner)?);
+            }
+            Rule::on_duplicate_rename => {
+                let (owner, property) = on_duplicate_rename(inner);
+                if let Some(owner) = owner {
+                    return Err(ParseError::Invalid(format!(
+                        "CREATE INDEX: ON DUPLICATE RENAME names a property of the indexed \
+                         label, not '{owner}.{property}'"
+                    )));
+                }
+                on_duplicate_rename_target = Some(property);
             }
             Rule::index_options => maintenance = index_options(inner)?,
             _ => {}
@@ -1165,6 +1176,7 @@ fn build_create_index_clause(pair: Pair<'_, Rule>) -> Result<CreateIndexClause, 
         sparse,
         filter_expr,
         maintenance,
+        on_duplicate_rename: on_duplicate_rename_target,
     })
 }
 
@@ -1708,9 +1720,11 @@ fn build_create_constraint_clause(
     let mut label = String::new();
     let mut references: Vec<(String, String)> = Vec::new();
     let mut kind = None;
+    let mut rename = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
+            Rule::on_duplicate_rename => rename = Some(on_duplicate_rename(inner)),
             // The optional name precedes the pattern; the label follows it.
             Rule::identifier if variable.is_empty() => name = Some(inner.as_str().to_string()),
             Rule::identifier => label = inner.as_str().to_string(),
@@ -1781,13 +1795,39 @@ fn build_create_constraint_clause(
                 .into(),
         ));
     }
+    let on_duplicate_rename = match rename {
+        Some((Some(owner), key)) if owner != variable => {
+            return Err(ParseError::Invalid(format!(
+                "CREATE CONSTRAINT: ON DUPLICATE RENAME '{owner}.{key}' does not refer to the \
+                 constrained node '{variable}'"
+            )));
+        }
+        Some((_, key)) => Some(key),
+        None => None,
+    };
     Ok(crate::cypher::ast::CreateConstraintClause {
         name,
         if_not_exists,
         label,
         properties,
         kind,
+        on_duplicate_rename,
     })
+}
+
+/// The target of `ON DUPLICATE RENAME [n.]prop`: the variable it names,
+/// when it names one, and the property.
+fn on_duplicate_rename(pair: Pair<'_, Rule>) -> (Option<String>, String) {
+    let mut owner = None;
+    let mut property = String::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::variable => owner = Some(inner.as_str().to_string()),
+            Rule::identifier => property = inner.as_str().to_string(),
+            _ => {}
+        }
+    }
+    (owner, property)
 }
 
 /// Build `DROP CONSTRAINT name [IF EXISTS]`.

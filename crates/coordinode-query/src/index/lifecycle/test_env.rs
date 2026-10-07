@@ -221,4 +221,13 @@ impl BuildEnvironment for TestEnv {
     fn commit_catalog(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
         commit(txn)
     }
+
+    fn statement_log(
+        &self,
+    ) -> Option<(
+        &dyn coordinode_core::txn::proposal::ProposalPipeline,
+        &coordinode_core::txn::proposal::ProposalIdGenerator,
+    )> {
+        None
+    }
 }

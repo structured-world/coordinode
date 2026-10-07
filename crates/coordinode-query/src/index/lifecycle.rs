@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::intern::FieldInterner;
+use coordinode_core::txn::proposal::{ProposalIdGenerator, ProposalPipeline};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_modality::{
     BuildFailure, BuildState, IndexBuildRecord, IndexStore as _, LocalIndexStore, StoreError,
@@ -31,7 +32,11 @@ use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitError, Transaction};
 use rustc_hash::FxHashMap;
 
-use super::build::{Backfill, BackfillError, BackfillProgress};
+use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::types::Value;
+use coordinode_modality::DuplicateRepair;
+
+use super::build::{Backfill, BackfillError, BackfillProgress, DuplicateRepairer};
 use super::definition::{GenerationId, IndexDefinition, IndexState};
 use super::registry::{IndexRegistry, UniqueViolation};
 use super::text_registry::TextIndexRegistry;
@@ -88,6 +93,11 @@ pub trait BuildEnvironment: Send + Sync {
     ///
     /// The commit failed; a conflict means another move met this one.
     fn commit_catalog(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError>;
+
+    /// The log a statement the build runs commits through (a duplicate
+    /// repair), with the proposal ids it takes; `None` for a member whose
+    /// commits apply to its engine directly.
+    fn statement_log(&self) -> Option<(&dyn ProposalPipeline, &ProposalIdGenerator)>;
 }
 
 /// Why a build did not publish its index.
@@ -430,7 +440,7 @@ impl IndexBuildService {
     fn spawn(
         &self,
         generation: GenerationId,
-        work: impl FnOnce(&Shared) -> Executed + Send + 'static,
+        work: impl FnOnce(&Arc<Shared>) -> Executed + Send + 'static,
     ) -> Result<(), String> {
         {
             let mut slots = self.shared.slots.lock();
@@ -683,23 +693,29 @@ fn index_of(
 }
 
 /// What an executor took: the definition it fills, the version of its
-/// record every page is bound to, and the token the build record holds.
+/// record every page is bound to, the token the build record holds, and
+/// whether the build repairs the duplicates it meets.
 struct Taken {
     def: IndexDefinition,
     def_version: Option<u64>,
     token: u64,
+    repair: Option<DuplicateRepair>,
 }
 
 impl Shared {
     /// Take the build of `generation`, fill its generation and publish the
     /// outcome.
-    fn execute(&self, generation: GenerationId, own_open: usize) -> Executed {
+    fn execute(self: &Arc<Self>, generation: GenerationId, own_open: usize) -> Executed {
         let _seat = self.seat(generation);
         self.try_execute(generation, own_open)
             .unwrap_or_else(|e| Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(e))))
     }
 
-    fn try_execute(&self, generation: GenerationId, own_open: usize) -> Result<Executed, String> {
+    fn try_execute(
+        self: &Arc<Self>,
+        generation: GenerationId,
+        own_open: usize,
+    ) -> Result<Executed, String> {
         let taken = match self.take(generation)? {
             Ok(taken) => taken,
             Err(executed) => return Ok(executed),
@@ -738,13 +754,38 @@ impl Shared {
     /// Fill the generation `taken` holds. The outer error is the
     /// environment's, the inner the backfill's.
     fn fill(
-        &self,
+        self: &Arc<Self>,
         generation: GenerationId,
         taken: &Taken,
         own_open: usize,
     ) -> Result<Result<u64, BackfillError>, String> {
         let env = self.env.as_ref();
         let fields = env.fields()?;
+        // A repair is a statement of its own, whose unique admission reads
+        // how far this build has covered the label through the service.
+        let service = IndexBuildService {
+            shared: Arc::clone(self),
+        };
+        let repair_property = taken.repair.as_ref().map(|r| r.property.as_str());
+        let run_repair = |node: NodeId, old: Option<&Value>| {
+            super::repair::rename_duplicate(
+                &service,
+                env,
+                &super::repair::RepairBuild {
+                    generation,
+                    token: taken.token,
+                    index: &taken.def,
+                    property: repair_property.unwrap_or_default(),
+                },
+                node,
+                old,
+            )
+            .map(|_| ())
+        };
+        let repair = repair_property.map(|property| DuplicateRepairer {
+            property,
+            run: &run_repair,
+        });
         let progress = |p: BackfillProgress| {
             self.set_phase(
                 generation,
@@ -775,6 +816,7 @@ impl Shared {
             older_transactions_wait,
             progress: Some(&progress),
             covered: Some(&covered),
+            repair,
         }
         .run(&taken.def, &mut |txn| env.commit_page(txn)))
     }
@@ -825,6 +867,7 @@ impl Shared {
                         def,
                         def_version,
                         token,
+                        repair: record.on_duplicate,
                     }));
                 }
                 (Ok(()), None) => return Ok(Err(Executed::Outcome(IndexBuildOutcome::Cancelled))),

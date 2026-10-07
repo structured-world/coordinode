@@ -397,6 +397,32 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   `Database::index_build`, `Database::cancel_index_build`), and gRPC has
   `SchemaService.ListIndexBuilds`, `GetIndexBuild` and `CancelIndexBuild`; a
   `CreateConstraint` names its own wait in `wait`.
+- **Repairing duplicates while building.** Without a clause, a unique build
+  over stored duplicates fails. `ON DUPLICATE RENAME p` lets the build end
+  each duplicate it meets by appending `_` and eight random base-36 characters
+  to the string property `p` of the holder it reaches second:
+
+  ```cypher
+  CREATE UNIQUE INDEX user_email ON :User(email) ON DUPLICATE RENAME email
+  CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE
+    ON DUPLICATE RENAME u.email
+  ```
+
+  `p` must be one of the properties the uniqueness covers, and a string:
+  a property declared with another type, a computed one, a temporal label
+  (its versions keep every value they held) and a COLUMNAR table are refused
+  before anything is created. Each repair is an ordinary write of that node
+  (every index, constraint and change stream sees it), conditioned on the
+  node still holding the old value, committed on its own and visible at
+  once. A suffix another node holds is redrawn. A repair that committed
+  stays whatever the build's outcome: cancelling or failing the build undoes
+  none. A duplicate value that is not a string fails the build. The clause
+  belongs to the build: once the index is ready, a duplicate write is refused
+  as always. `CALL db.indexBuildRepairs(operation)` lists the repairs (node,
+  property, `oldValue`, `newValue`), and `db.indexBuild` reports
+  `renameProperty` and how many were `repaired`; the embedded API has
+  `Database::index_build_repairs` and `ConstraintDeclaration::on_duplicate_rename`,
+  gRPC `CreateConstraint.on_duplicate_rename` and `ListIndexBuildRepairs`.
 - **Member-local indexes.** A full-text index and a vector index are built by
   every member from the data it holds; their definitions replicate, their
   readiness is each member's own. A full-text index's backfill runs on the

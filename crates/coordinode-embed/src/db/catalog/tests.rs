@@ -23,6 +23,7 @@ fn declare(name: &str, property: &str, kind: ConstraintKind) -> ConstraintDeclar
         kind,
         if_not_exists: false,
         wait: None,
+        on_duplicate_rename: None,
     }
 }
 

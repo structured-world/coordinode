@@ -396,6 +396,13 @@ fn build_to_proto(status: &BuildStatus) -> schema::IndexBuild {
         phase: phase as i32,
         indexed: status.indexed().unwrap_or(0),
         failure: status.failure().unwrap_or_default().to_string(),
+        rename_property: status
+            .record
+            .as_ref()
+            .and_then(|r| r.on_duplicate.as_ref())
+            .map(|r| r.property.clone())
+            .unwrap_or_default(),
+        repaired: status.record.as_ref().map_or(0, |r| r.repaired),
     }
 }
 
@@ -528,6 +535,8 @@ fn declaration_from_proto(
     };
     Ok(ConstraintDeclaration {
         wait: wait_from_proto("wait", req.wait)?,
+        on_duplicate_rename: (!req.on_duplicate_rename.is_empty())
+            .then_some(req.on_duplicate_rename),
         name: (!req.name.is_empty()).then_some(req.name),
         label,
         properties: req.properties,
@@ -806,6 +815,37 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
             }
         })?;
         Ok(Response::new(build))
+    }
+
+    async fn list_index_build_repairs(
+        &self,
+        request: Request<schema::ListIndexBuildRepairsRequest>,
+    ) -> Result<Response<schema::ListIndexBuildRepairsResponse>, Status> {
+        let operation = operation_from_proto(request.into_inner().operation)?;
+        let repairs = super::blocking(|| {
+            let db = self.database.read();
+            if db
+                .index_build(operation, Duration::ZERO)
+                .map_err(db_error_to_status)?
+                .is_none()
+            {
+                return Err(unknown_build(operation));
+            }
+            db.index_build_repairs(operation)
+                .map_err(db_error_to_status)
+        })?;
+        Ok(Response::new(schema::ListIndexBuildRepairsResponse {
+            repairs: repairs
+                .into_iter()
+                .map(|r| schema::IndexBuildRepair {
+                    element_id: coordinode_core::graph::node::NodeId::from_raw(r.node)
+                        .to_element_id(),
+                    property: r.property,
+                    old_value: r.old,
+                    new_value: r.new,
+                })
+                .collect(),
+        }))
     }
 }
 

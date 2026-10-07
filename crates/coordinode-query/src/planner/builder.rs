@@ -770,6 +770,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 sparse: c.sparse,
                 filter,
                 maintenance: c.maintenance.map(index_profile),
+                on_duplicate_rename: c.on_duplicate_rename.clone(),
             })
         }
         Clause::DropIndex(c) => Ok(LogicalOp::DropIndex {
@@ -782,6 +783,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             properties: c.properties.clone(),
             kind: c.kind.clone(),
             wait: None,
+            on_duplicate_rename: c.on_duplicate_rename.clone(),
         }),
         Clause::DropConstraint(c) => Ok(LogicalOp::DropConstraint {
             name: c.name.clone(),

@@ -40,6 +40,11 @@ pub struct ConstraintDeclaration {
     /// that outwaits it returns the constraint validating, with its build
     /// still running.
     pub wait: Option<Duration>,
+    /// `ON DUPLICATE RENAME property`: a uniqueness or key constraint's build
+    /// may end a stored duplicate by appending a random suffix to this
+    /// string property of one holder, recording each repair. `None` fails
+    /// the build on the first duplicate.
+    pub on_duplicate_rename: Option<String>,
 }
 
 /// A constraint as the catalog holds it.
@@ -328,6 +333,7 @@ impl Database {
             kind,
             if_not_exists,
             wait,
+            on_duplicate_rename,
         } = declaration;
         let rows = self.run_catalog_statement(LogicalOp::CreateConstraint {
             name,
@@ -336,6 +342,7 @@ impl Database {
             properties,
             kind,
             wait,
+            on_duplicate_rename,
         })?;
         let created = rows
             .first()

@@ -23,6 +23,7 @@ pub(super) fn procedures() -> Vec<Arc<dyn Procedure>> {
         Arc::new(IndexBuildProcedure::new(Kind::List)),
         Arc::new(IndexBuildProcedure::new(Kind::Inspect)),
         Arc::new(IndexBuildProcedure::new(Kind::Cancel)),
+        Arc::new(IndexBuildProcedure::new(Kind::Repairs)),
     ]
 }
 
@@ -32,6 +33,7 @@ enum Kind {
     List,
     Inspect,
     Cancel,
+    Repairs,
 }
 
 struct IndexBuildProcedure {
@@ -49,6 +51,8 @@ fn with_status_columns(signature: ProcedureSignature) -> ProcedureSignature {
         .output("phase", ValueType::String)
         .output("indexed", ValueType::Integer)
         .output("failure", ValueType::String)
+        .output("renameProperty", ValueType::String)
+        .output("repaired", ValueType::Integer)
 }
 
 impl IndexBuildProcedure {
@@ -81,6 +85,17 @@ impl IndexBuildProcedure {
             .output("operation", ValueType::Integer)
             .output("cancelled", ValueType::Boolean)
             .output("state", ValueType::String),
+            Kind::Repairs => ProcedureSignature::new(
+                "db.indexBuildRepairs",
+                ProcedureMode::Read,
+                "The duplicates an index build repaired with ON DUPLICATE RENAME: each node, \
+                 and the value replaced by which.",
+            )
+            .input(FieldSignature::new("operation", ValueType::Integer))
+            .output("node", ValueType::Integer)
+            .output("property", ValueType::String)
+            .output("oldValue", ValueType::String)
+            .output("newValue", ValueType::String),
         };
         Self { kind, signature }
     }
@@ -112,6 +127,26 @@ impl Procedure for IndexBuildProcedure {
             Kind::Cancel => {
                 let operation = operation_arg(&self.signature.name, &args)?;
                 cancel(ctx, builds, &self.signature.name, operation)
+            }
+            Kind::Repairs => {
+                use coordinode_modality::{IndexStore as _, LocalIndexStore};
+                let operation = operation_arg(&self.signature.name, &args)?;
+                if builds.status(operation, Duration::ZERO)?.is_none() {
+                    return Err(unknown(&self.signature.name, operation));
+                }
+                Ok(LocalIndexStore::new(ctx.engine)
+                    .list_repairs(operation)?
+                    .into_iter()
+                    .map(|r| {
+                        vec![
+                            // The id as `id(n)` returns it.
+                            Value::Int(r.node as i64),
+                            Value::String(r.property),
+                            Value::String(r.old),
+                            Value::String(r.new),
+                        ]
+                    })
+                    .collect())
             }
         }
     }
@@ -172,6 +207,15 @@ fn status_row(status: &BuildStatus) -> Vec<Value> {
         status
             .failure()
             .map_or(Value::Null, |f| Value::String(f.to_string())),
+        status
+            .record
+            .as_ref()
+            .and_then(|r| r.on_duplicate.as_ref())
+            .map_or(Value::Null, |r| Value::String(r.property.clone())),
+        status
+            .record
+            .as_ref()
+            .map_or(Value::Null, |r| Value::Int(count(r.repaired))),
     ]
 }
 

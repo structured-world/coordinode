@@ -4194,6 +4194,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             sparse,
             filter,
             maintenance,
+            on_duplicate_rename,
         } => execute_create_btree_index(
             name,
             label,
@@ -4202,6 +4203,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             *sparse,
             filter.as_ref(),
             *maintenance,
+            on_duplicate_rename.as_deref(),
             ctx,
         ),
 
@@ -4214,6 +4216,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             properties,
             kind,
             wait,
+            on_duplicate_rename,
         } => execute_create_constraint(
             name.as_deref(),
             *if_not_exists,
@@ -4222,6 +4225,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             kind,
             OwnedIndexShape {
                 wait: *wait,
+                on_duplicate_rename: on_duplicate_rename.clone(),
                 ..OwnedIndexShape::default()
             },
             ctx,
@@ -17311,8 +17315,15 @@ fn execute_create_btree_index(
     sparse: bool,
     filter: Option<&crate::index::definition::PartialFilter>,
     maintenance: Option<crate::index::IndexProfile>,
+    on_duplicate_rename: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
+    if on_duplicate_rename.is_some() && !unique {
+        return Err(ExecutionError::CatalogRefused(
+            "ON DUPLICATE RENAME repairs duplicates of a unique index; this index is not unique"
+                .into(),
+        ));
+    }
     // Indexes and constraints share one namespace: a uniqueness constraint's
     // index carries the constraint's name.
     if ctx.constraint_label(name)?.is_some() {
@@ -17337,6 +17348,7 @@ fn execute_create_btree_index(
                 sparse: Some(sparse),
                 maintenance,
                 wait: None,
+                on_duplicate_rename: on_duplicate_rename.map(str::to_string),
             },
             ctx,
         )?;
@@ -17376,8 +17388,9 @@ fn execute_create_btree_index(
     if let Some(f) = filter {
         descriptor = descriptor.with_filter(f.clone());
     }
+    let repair = duplicate_repair(on_duplicate_rename, label, &[property.to_string()], ctx)?;
     let engine = ctx.engine;
-    let def = publish_index_build(descriptor, maintenance, ctx, |txn| {
+    let def = publish_index_build(descriptor, maintenance, repair, ctx, |txn| {
         if unique {
             stage_label_fence(engine, txn, label)
         } else {
@@ -17414,6 +17427,60 @@ fn name_taken(e: ExecutionError) -> ExecutionError {
     }
 }
 
+/// The repair `ON DUPLICATE RENAME target` lets the build of a unique index
+/// over `properties` of `label` make, refused before anything is published
+/// unless the build can make it: the target is one of the properties, and a
+/// string the label lets be rewritten in place.
+fn duplicate_repair(
+    target: Option<&str>,
+    label: &str,
+    properties: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<crate::index::DuplicateRepair>, ExecutionError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let refused = |why: String| {
+        Err(ExecutionError::CatalogRefused(format!(
+            "ON DUPLICATE RENAME {target}: {why}"
+        )))
+    };
+    if !properties.iter().any(|p| p == target) {
+        return refused(format!(
+            "the repaired property must be one the uniqueness covers ({})",
+            properties.join(", ")
+        ));
+    }
+    if let Some(schema) = ctx.load_current_label_schema(label)? {
+        if schema.temporal {
+            // Every version a temporal node held keeps its value, so a
+            // rewrite of the current one leaves the duplicate in the history
+            // the index covers.
+            return refused(format!(
+                ":{label} is temporal; a repair cannot rewrite the versions it keeps"
+            ));
+        }
+        if schema.is_columnar() {
+            return refused(format!(":{label} is a COLUMNAR table"));
+        }
+        match schema.properties.get(target).map(|p| &p.property_type) {
+            None | Some(PropertyType::String) => {}
+            Some(PropertyType::Computed(_)) => {
+                return refused(format!("`{target}` of :{label} is computed and read-only"));
+            }
+            Some(other) => {
+                return refused(format!(
+                    "`{target}` of :{label} is declared {other}; a repair appends a suffix to \
+                     a string"
+                ));
+            }
+        }
+    }
+    Ok(Some(crate::index::DuplicateRepair {
+        property: target.to_string(),
+    }))
+}
+
 /// Publish B-tree index `descriptor` as building, with its build admitted,
 /// in one catalog commit together with `with`: the catalog gives it a new
 /// identity and generation and binds its name, on the condition that no
@@ -17423,6 +17490,7 @@ fn name_taken(e: ExecutionError) -> ExecutionError {
 fn publish_index_build(
     mut descriptor: crate::index::IndexDescriptor,
     maintenance: Option<crate::index::IndexProfile>,
+    repair: Option<crate::index::DuplicateRepair>,
     ctx: &mut ExecutionContext<'_>,
     mut with: impl FnMut(
         &mut coordinode_storage::engine::transaction::Transaction<'_>,
@@ -17463,7 +17531,8 @@ fn publish_index_build(
                 def.id,
                 def.generation,
                 crate::index::BuildFailure::Withdraw,
-            ),
+            )
+            .repairing(repair.clone()),
             None,
         )?;
         published = Some(def);
@@ -17797,7 +17866,7 @@ fn constraint_row(
 
 /// How the index a uniqueness or key constraint owns is built, and how long
 /// the statement waits for that build.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct OwnedIndexShape {
     /// Leave nodes missing a value out of the index; `None` takes the
     /// constraint kind's own choice.
@@ -17807,6 +17876,9 @@ struct OwnedIndexShape {
     /// How long the statement waits for the build; `None` takes the
     /// engine's statement wait.
     wait: Option<Duration>,
+    /// `ON DUPLICATE RENAME prop`: the property the build may change to
+    /// repair a stored duplicate.
+    on_duplicate_rename: Option<String>,
 }
 
 /// The build operation of the index constraint `name` owns while it is
@@ -17857,6 +17929,13 @@ fn execute_create_constraint(
         kind: kind.clone(),
         state: ConstraintState::Validating,
     };
+    if shape.on_duplicate_rename.is_some() && !constraint.owns_index() {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "ON DUPLICATE RENAME repairs duplicates of a UNIQUE or NODE KEY constraint, not of \
+             an IS {kind} one"
+        )));
+    }
+    let repair = duplicate_repair(shape.on_duplicate_rename.as_deref(), label, properties, ctx)?;
 
     if let Some(holder) = ctx.constraint_label(&constraint.name)? {
         if if_not_exists {
@@ -18000,7 +18079,13 @@ fn execute_create_constraint(
     {
         descriptor = descriptor.sparse();
     }
-    let def = publish_index_build(descriptor, shape.maintenance, ctx, &mut stage_constraint);
+    let def = publish_index_build(
+        descriptor,
+        shape.maintenance,
+        repair,
+        ctx,
+        &mut stage_constraint,
+    );
     ctx.label_schema_cache.remove(label);
     let def = def?;
 
