@@ -44,16 +44,30 @@ fn set(claims: Vec<Claim>) -> ClaimSet {
 fn at_most_one() -> ClaimPredicate {
     ClaimPredicate::CardinalityBound {
         measure: CardinalityMeasure::EdgeInstances,
-        at_most: Some(1),
-        at_least: None,
+        bound: CardinalityBound::AtMostOne,
     }
 }
 
 fn at_least_one() -> ClaimPredicate {
     ClaimPredicate::CardinalityBound {
         measure: CardinalityMeasure::EdgeInstances,
-        at_most: None,
-        at_least: Some(1),
+        bound: CardinalityBound::AtLeastOne,
+    }
+}
+
+/// Each bound admits exactly the counts its name says, at the edges of its
+/// range and beyond.
+#[test]
+fn a_bound_admits_exactly_its_counts() {
+    use CardinalityBound::*;
+    for (bound, admitted) in [
+        (AtMostOne, [true, true, false, false]),
+        (ExactlyOne, [false, true, false, false]),
+        (AtLeastOne, [false, true, true, true]),
+    ] {
+        for (count, expected) in [0, 1, 2, u64::MAX].into_iter().zip(admitted) {
+            assert_eq!(bound.admits(count), expected, "{bound:?} at {count}");
+        }
     }
 }
 
@@ -438,8 +452,7 @@ fn the_two_cardinality_measures_do_not_stand_in_for_each_other() {
         scope.clone(),
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::EdgeInstances,
-            at_most: Some(3),
-            at_least: None,
+            bound: CardinalityBound::AtMostOne,
         },
         GEN,
     )]);
@@ -447,8 +460,7 @@ fn the_two_cardinality_measures_do_not_stand_in_for_each_other() {
         scope,
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::DistinctNeighbours,
-            at_most: Some(3),
-            at_least: None,
+            bound: CardinalityBound::AtMostOne,
         },
         GEN,
     )]);

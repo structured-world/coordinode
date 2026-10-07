@@ -35,6 +35,7 @@ test-format-bump = []
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 
 [[bench]]

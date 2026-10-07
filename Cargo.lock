@@ -895,6 +895,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "criterion",
+ "proptest",
  "rmp",
  "rmp-serde",
  "rmpv",

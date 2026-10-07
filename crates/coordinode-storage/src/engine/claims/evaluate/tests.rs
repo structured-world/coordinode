@@ -32,7 +32,9 @@ fn node(id: u64) -> NodeId {
     NodeId::from_raw(id)
 }
 
-fn bound(node_id: u64, at_most: Option<u32>, at_least: Option<u32>) -> Claim {
+use coordinode_core::txn::invariant::{CardinalityBound, CardinalityMeasure};
+
+fn bound(node_id: u64, bound: CardinalityBound) -> Claim {
     Claim::new(
         ClaimScope::Incident {
             node: node(node_id),
@@ -41,11 +43,70 @@ fn bound(node_id: u64, at_most: Option<u32>, at_least: Option<u32>) -> Claim {
         },
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::DistinctNeighbours,
-            at_most,
-            at_least,
+            bound,
         },
         GEN,
     )
+}
+
+/// A bound of `measure` on `node`'s `edge_type` edges in `direction`.
+fn counted(
+    node_id: u64,
+    edge_type: &str,
+    direction: Direction,
+    measure: CardinalityMeasure,
+    bound: CardinalityBound,
+) -> Claim {
+    Claim::new(
+        ClaimScope::Incident {
+            node: node(node_id),
+            edge_type: edge_type.to_string(),
+            direction,
+        },
+        ClaimPredicate::CardinalityBound { measure, bound },
+        GEN,
+    )
+}
+
+/// Publish the definition of `name`, discriminated by a string `context`
+/// when `discriminated`, temporal when `temporal`, at revision 1.
+fn define(engine: &StorageEngine, name: &str, discriminated: bool, temporal: bool) {
+    use coordinode_core::schema::definition::{
+        EdgeTypeSchema, PropertyDef, PropertyType, encode_edge_type_current_revision_key,
+        encode_edge_type_schema_key,
+    };
+    let mut schema = EdgeTypeSchema::new(name);
+    schema.set_temporal(temporal);
+    schema.add_property(PropertyDef::new("context", PropertyType::String).not_null());
+    schema
+        .resolve_identity(discriminated.then_some("context"))
+        .expect("resolve");
+    engine
+        .put(
+            Partition::Schema,
+            &encode_edge_type_schema_key(name, 1),
+            &schema.to_msgpack().expect("encode"),
+        )
+        .expect("definition");
+    engine
+        .put(
+            Partition::Schema,
+            &encode_edge_type_current_revision_key(name),
+            &1u64.to_be_bytes(),
+        )
+        .expect("pointer");
+}
+
+/// The edge-property key of the instance of `(source, target)` under
+/// `edge_type` identified by `disc`.
+fn instance_key(edge_type: &str, source: u64, target: u64, disc: &[u8]) -> Vec<u8> {
+    let mut key = coordinode_core::graph::edge::temporal_edgeprop_pair_prefix(
+        edge_type,
+        node(source),
+        node(target),
+    );
+    key.extend_from_slice(disc);
+    key
 }
 
 /// An adjacency posting that does not decode is an error, never an empty
@@ -100,7 +161,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
 
     // No edges: at-most-one holds.
     assert_eq!(
-        decide(&engine, &bound(1, Some(1), None), &[]),
+        decide(&engine, &bound(1, CardinalityBound::AtMostOne), &[]),
         Verdict::Holds
     );
 
@@ -108,7 +169,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
         .merge(Partition::Adj, &key, &encode_add(2))
         .expect("merge");
     assert_eq!(
-        decide(&engine, &bound(1, Some(1), None), &[]),
+        decide(&engine, &bound(1, CardinalityBound::AtMostOne), &[]),
         Verdict::Holds,
         "one neighbour is within at-most-one"
     );
@@ -117,7 +178,7 @@ fn an_upper_bound_is_decided_against_stored_adjacency() {
         .merge(Partition::Adj, &key, &encode_add(3))
         .expect("merge");
     assert_eq!(
-        decide(&engine, &bound(1, Some(1), None), &[]),
+        decide(&engine, &bound(1, CardinalityBound::AtMostOne), &[]),
         Verdict::Broken,
         "two neighbours are not"
     );
@@ -134,7 +195,7 @@ fn a_lower_bound_refuses_an_empty_result() {
         .expect("merge");
 
     assert_eq!(
-        decide(&engine, &bound(1, None, Some(1)), &[]),
+        decide(&engine, &bound(1, CardinalityBound::AtLeastOne), &[]),
         Verdict::Holds
     );
 
@@ -142,7 +203,7 @@ fn a_lower_bound_refuses_an_empty_result() {
     // would leave is what the bound is decided against, not the state before.
     let staged = vec![(key.clone(), AdjOp::Remove(2))];
     assert_eq!(
-        decide(&engine, &bound(1, None, Some(1)), &staged),
+        decide(&engine, &bound(1, CardinalityBound::AtLeastOne), &staged),
         Verdict::Broken,
         "the bound is decided against the post-state the attempt would leave"
     );
@@ -158,7 +219,7 @@ fn the_attempts_own_writes_are_part_of_the_post_state() {
 
     // Nothing stored: a lower bound is broken.
     assert_eq!(
-        decide(&engine, &bound(5, None, Some(1)), &[]),
+        decide(&engine, &bound(5, CardinalityBound::AtLeastOne), &[]),
         Verdict::Broken
     );
 
@@ -166,7 +227,7 @@ fn the_attempts_own_writes_are_part_of_the_post_state() {
     // and the intermediate absence is not a violation.
     let staged = vec![(key, AdjOp::Add(6))];
     assert_eq!(
-        decide(&engine, &bound(5, None, Some(1)), &staged),
+        decide(&engine, &bound(5, CardinalityBound::AtLeastOne), &staged),
         Verdict::Holds
     );
 }
@@ -183,14 +244,22 @@ fn staged_writes_are_applied_in_the_order_they_were_staged() {
         (key.clone(), AdjOp::Remove(2)),
     ];
     assert_eq!(
-        decide(&engine, &bound(1, None, Some(1)), &add_then_remove),
+        decide(
+            &engine,
+            &bound(1, CardinalityBound::AtLeastOne),
+            &add_then_remove
+        ),
         Verdict::Broken,
         "add then remove leaves the set empty"
     );
 
     let remove_then_add = vec![(key.clone(), AdjOp::Remove(2)), (key, AdjOp::Add(2))];
     assert_eq!(
-        decide(&engine, &bound(1, None, Some(1)), &remove_then_add),
+        decide(
+            &engine,
+            &bound(1, CardinalityBound::AtLeastOne),
+            &remove_then_add
+        ),
         Verdict::Holds,
         "remove then add leaves the member"
     );
@@ -718,24 +787,139 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
         "an overlap with no evidence behind it is not a pass"
     );
 
-    // An incoming instance count is not reachable from the target's side,
-    // and saying so is not the same as saying the bound holds.
-    let incoming_instances = Claim::new(
-        ClaimScope::Incident {
-            node: node(1),
-            edge_type: "OWNS".to_string(),
-            direction: Direction::Incoming,
-        },
-        ClaimPredicate::CardinalityBound {
-            measure: CardinalityMeasure::EdgeInstances,
-            at_most: Some(1),
-            at_least: None,
-        },
-        GEN,
+    // A temporal type's bound holds over valid time; a count at one instant
+    // decides nothing about it.
+    define(&engine, "HELD", false, true);
+    engine
+        .merge(
+            Partition::Adj,
+            &encode_adj_key_forward("HELD", node(1)),
+            &encode_add(2),
+        )
+        .expect("merge");
+    let temporal = counted(
+        1,
+        "HELD",
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
+    );
+    assert_eq!(decide(&engine, &temporal, &[]), Verdict::Undecidable);
+
+    // A discriminated pair adjacent with no identity behind it is evidence
+    // missing, not a count of zero that would admit anything.
+    define(&engine, "KNOWS", true, false);
+    engine
+        .merge(
+            Partition::Adj,
+            &encode_adj_key_forward("KNOWS", node(1)),
+            &encode_add(2),
+        )
+        .expect("merge");
+    for measure in [
+        CardinalityMeasure::EdgeInstances,
+        CardinalityMeasure::DistinctNeighbours,
+    ] {
+        let orphan = counted(
+            1,
+            "KNOWS",
+            Direction::Outgoing,
+            measure,
+            CardinalityBound::AtLeastOne,
+        );
+        assert_eq!(decide(&engine, &orphan, &[]), Verdict::Undecidable);
+    }
+}
+
+/// An ordinary edge with no properties is an instance: a single-edge pair is
+/// counted from its adjacency, not from a property row it does not have.
+#[test]
+fn a_property_less_single_edge_is_an_instance() {
+    let (engine, _d) = engine();
+    define(&engine, "OWNS", false, false);
+    engine
+        .merge(
+            Partition::Adj,
+            &encode_adj_key_forward("OWNS", node(1)),
+            &encode_add(2),
+        )
+        .expect("merge");
+    for measure in [
+        CardinalityMeasure::EdgeInstances,
+        CardinalityMeasure::DistinctNeighbours,
+    ] {
+        let exactly_one = counted(
+            1,
+            "OWNS",
+            Direction::Outgoing,
+            measure,
+            CardinalityBound::ExactlyOne,
+        );
+        assert_eq!(
+            decide(&engine, &exactly_one, &[]),
+            Verdict::Holds,
+            "{measure:?}"
+        );
+    }
+}
+
+/// The incoming side is counted like the outgoing one: from the target's
+/// reverse adjacency to each source, and through each source's pair entries
+/// for the identities.
+#[test]
+fn an_incoming_scope_counts_both_measures() {
+    let (engine, _d) = engine();
+    define(&engine, "KNOWS", true, false);
+    let reverse = encode_adj_key_reverse("KNOWS", node(9));
+    for source in [1u64, 2] {
+        engine
+            .merge(Partition::Adj, &reverse, &encode_add(source))
+            .expect("merge");
+    }
+    for (source, disc) in [(1u64, b"work".as_slice()), (1, b"golf"), (2, b"work")] {
+        engine
+            .put(
+                Partition::EdgeProp,
+                &instance_key("KNOWS", source, 9, disc),
+                b"props",
+            )
+            .expect("put");
+    }
+    let incoming = |measure, bound| counted(9, "KNOWS", Direction::Incoming, measure, bound);
+    assert_eq!(
+        decide(
+            &engine,
+            &incoming(
+                CardinalityMeasure::DistinctNeighbours,
+                CardinalityBound::AtMostOne
+            ),
+            &[]
+        ),
+        Verdict::Broken,
+        "two sources"
     );
     assert_eq!(
-        decide(&engine, &incoming_instances, &[]),
-        Verdict::Undecidable
+        decide(
+            &engine,
+            &incoming(
+                CardinalityMeasure::EdgeInstances,
+                CardinalityBound::AtLeastOne
+            ),
+            &[]
+        ),
+        Verdict::Holds
+    );
+    // Three identities: at most one fails on instances as well.
+    assert_eq!(
+        decide(
+            &engine,
+            &incoming(
+                CardinalityMeasure::EdgeInstances,
+                CardinalityBound::AtMostOne
+            ),
+            &[]
+        ),
+        Verdict::Broken
     );
 }
 
@@ -746,50 +930,36 @@ fn a_claim_without_evidence_here_is_undecidable_not_satisfied() {
 #[test]
 fn the_two_measures_count_different_things_on_one_adjacency() {
     let (engine, _d) = engine();
+    define(&engine, "KNOWS", true, false);
     let adj = encode_adj_key_forward("KNOWS", node(1));
     engine
         .merge(Partition::Adj, &adj, &encode_add(2))
         .expect("merge");
 
     // Two discriminated entries for the one pair: two logical identities.
-    for disc in [b"work", b"clge"] {
-        let mut key = Vec::new();
-        key.extend_from_slice(b"edgeprop:KNOWS:");
-        key.extend_from_slice(&node(1).as_raw().to_be_bytes());
-        key.push(b':');
-        key.extend_from_slice(&node(2).as_raw().to_be_bytes());
-        key.push(b':');
-        key.extend_from_slice(disc);
+    for disc in [b"work".as_slice(), b"clge"] {
         engine
-            .put(Partition::EdgeProp, &key, b"props")
+            .put(
+                Partition::EdgeProp,
+                &instance_key("KNOWS", 1, 2, disc),
+                b"props",
+            )
             .expect("put");
     }
 
-    let neighbours = Claim::new(
-        ClaimScope::Incident {
-            node: node(1),
-            edge_type: "KNOWS".to_string(),
-            direction: Direction::Outgoing,
-        },
-        ClaimPredicate::CardinalityBound {
-            measure: CardinalityMeasure::DistinctNeighbours,
-            at_most: Some(1),
-            at_least: None,
-        },
-        GEN,
+    let neighbours = counted(
+        1,
+        "KNOWS",
+        Direction::Outgoing,
+        CardinalityMeasure::DistinctNeighbours,
+        CardinalityBound::AtMostOne,
     );
-    let instances = Claim::new(
-        ClaimScope::Incident {
-            node: node(1),
-            edge_type: "KNOWS".to_string(),
-            direction: Direction::Outgoing,
-        },
-        ClaimPredicate::CardinalityBound {
-            measure: CardinalityMeasure::EdgeInstances,
-            at_most: Some(1),
-            at_least: None,
-        },
-        GEN,
+    let instances = counted(
+        1,
+        "KNOWS",
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
     );
 
     assert_eq!(
@@ -811,39 +981,25 @@ fn the_two_measures_count_different_things_on_one_adjacency() {
 #[test]
 fn an_instance_bound_counts_the_attempts_own_entries() {
     let (engine, _d) = engine();
+    define(&engine, "KNOWS", true, false);
     let adj = encode_adj_key_forward("KNOWS", node(1));
     engine
         .merge(Partition::Adj, &adj, &encode_add(2))
         .expect("merge");
 
-    let entry = |disc: &[u8]| {
-        let mut key = Vec::new();
-        key.extend_from_slice(b"edgeprop:KNOWS:");
-        key.extend_from_slice(&node(1).as_raw().to_be_bytes());
-        key.push(b':');
-        key.extend_from_slice(&node(2).as_raw().to_be_bytes());
-        key.push(b':');
-        key.extend_from_slice(disc);
-        key
-    };
+    let entry = |disc: &[u8]| instance_key("KNOWS", 1, 2, disc);
 
     let committed = entry(b"work");
     engine
         .put(Partition::EdgeProp, &committed, b"props")
         .expect("put");
 
-    let at_most_one = Claim::new(
-        ClaimScope::Incident {
-            node: node(1),
-            edge_type: "KNOWS".to_string(),
-            direction: Direction::Outgoing,
-        },
-        ClaimPredicate::CardinalityBound {
-            measure: CardinalityMeasure::EdgeInstances,
-            at_most: Some(1),
-            at_least: None,
-        },
-        GEN,
+    let at_most_one = counted(
+        1,
+        "KNOWS",
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
     );
     assert_eq!(decide(&engine, &at_most_one, &[]), Verdict::Holds);
 
@@ -890,7 +1046,7 @@ fn staged_writes_for_another_scope_are_ignored() {
     let staged = vec![(other, AdjOp::Remove(2))];
 
     assert_eq!(
-        decide(&engine, &bound(1, None, Some(1)), &staged),
+        decide(&engine, &bound(1, CardinalityBound::AtLeastOne), &staged),
         Verdict::Holds,
         "another scope's staged removal is not this scope's"
     );

@@ -56,8 +56,7 @@ fn two_attempts_deciding_one_bound_cannot_both_commit() {
             },
             ClaimPredicate::CardinalityBound {
                 measure: CardinalityMeasure::DistinctNeighbours,
-                at_most: Some(1),
-                at_least: None,
+                bound: coordinode_core::txn::invariant::CardinalityBound::AtMostOne,
             },
             0,
         )

@@ -29,7 +29,9 @@ use crate::index::derive::IndexInterpretation;
 use crate::index::identity::GenerationId;
 
 /// Which direction of an edge type a scope covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Direction {
     /// Edges leaving the node.
     Outgoing,
@@ -42,12 +44,38 @@ pub enum Direction {
 /// The two measures answer different questions about the same adjacency, and
 /// a claim for one is not evidence for the other: three parallel edges to one
 /// neighbour are three instances and one neighbour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum CardinalityMeasure {
     /// Every edge instance counts, including parallel edges to one neighbour.
     EdgeInstances,
     /// Each distinct neighbour counts once, however many edges reach it.
     DistinctNeighbours,
+}
+
+/// The bound a relationship cardinality constraint declares over its measure.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum CardinalityBound {
+    /// The count is 0 or 1.
+    AtMostOne,
+    /// The count is 1.
+    ExactlyOne,
+    /// The count is positive.
+    AtLeastOne,
+}
+
+impl CardinalityBound {
+    /// Whether `count` satisfies the bound.
+    pub fn admits(self, count: u64) -> bool {
+        match self {
+            Self::AtMostOne => count <= 1,
+            Self::ExactlyOne => count == 1,
+            Self::AtLeastOne => count >= 1,
+        }
+    }
 }
 
 /// The logical thing a claim covers. Two claims can only conflict if their
@@ -128,10 +156,8 @@ pub enum ClaimPredicate {
     CardinalityBound {
         /// What the bound counts.
         measure: CardinalityMeasure,
-        /// The largest count the bound admits, if it declares one.
-        at_most: Option<u32>,
-        /// The smallest count the bound admits, if it declares one.
-        at_least: Option<u32>,
+        /// The counts it admits.
+        bound: CardinalityBound,
     },
     /// The pair is adjacent, or is not, and the attempt's result depends on
     /// which. An insertion claims absence, a removal of the last qualifying

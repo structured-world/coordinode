@@ -19,7 +19,7 @@
 use coordinode_core::graph::edge::{PostingList, encode_adj_key_forward, encode_adj_key_reverse};
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::txn::invariant::{
-    Adjacency, CardinalityMeasure, Claim, ClaimPredicate, ClaimScope, Direction, UncoveredSource,
+    Adjacency, Claim, ClaimPredicate, ClaimScope, Direction, UncoveredSource,
 };
 
 use lsm_tree::Guard;
@@ -165,30 +165,14 @@ impl<'a> Evaluation<'a> {
                     edge_type,
                     direction,
                 },
-                ClaimPredicate::CardinalityBound {
-                    measure,
-                    at_most,
-                    at_least,
-                },
+                ClaimPredicate::CardinalityBound { measure, bound },
             ) => {
-                let count = match measure {
-                    CardinalityMeasure::DistinctNeighbours => {
-                        distinct_neighbours(engine, *node, edge_type, *direction, staged)?
-                    }
-                    CardinalityMeasure::EdgeInstances => {
-                        match edge_instances(engine, *node, edge_type, *direction, staged_points)? {
-                            Some(n) => n,
-                            // Instances are counted from the edge-property
-                            // entries of each pair, which an incoming scope
-                            // cannot enumerate without the neighbour set it is
-                            // being asked about.
-                            None => return Ok(Verdict::Undecidable),
-                        }
-                    }
+                let Some(count) =
+                    incident_count(engine, *node, edge_type, *direction, staged, staged_points)?
+                else {
+                    return Ok(Verdict::Undecidable);
                 };
-                let within_upper = at_most.is_none_or(|limit| count <= limit as usize);
-                let within_lower = at_least.is_none_or(|limit| count >= limit as usize);
-                Ok(if within_upper && within_lower {
+                Ok(if bound.admits(count.of(*measure)) {
                     Verdict::Holds
                 } else {
                     Verdict::Broken
@@ -918,70 +902,146 @@ fn adjacency(
     Ok(plist.as_slice().to_vec())
 }
 
-/// Distinct neighbours of the scope: the adjacency posting is a set of
-/// neighbours, so its size is the measure directly.
-fn distinct_neighbours(
+/// How the instances of an edge type's pairs are told apart, as its current
+/// definition resolved it.
+enum IdentityShape {
+    /// At most one edge per pair: the pair's adjacency is the instance.
+    Single,
+    /// One instance per discriminator value, each an edge-property entry
+    /// under the pair's prefix.
+    Discriminated,
+    /// A temporal type, whose instances apply over valid time; a count at one
+    /// instant is not what its bound is about.
+    Temporal,
+}
+
+/// The identity shape of `edge_type` by its current committed definition. A
+/// type with no definition, or only the marker an edge write leaves, is
+/// single-edge. A definition that does not decode is an error: guessing a
+/// shape for it would count by the wrong rule.
+fn identity_shape(engine: &StorageEngine, edge_type: &str) -> StorageResult<IdentityShape> {
+    use coordinode_core::schema::definition::{
+        EdgeTypeSchema, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    };
+
+    let unreadable = |key: &[u8], detail: String| crate::error::StorageError::UnreadableCatalog {
+        kind: "edge type",
+        key: crate::error::printable_key(key),
+        detail,
+    };
+    let pointer_key = encode_edge_type_current_revision_key(edge_type);
+    let Some(pointer) = engine.get(Partition::Schema, &pointer_key)? else {
+        return Ok(IdentityShape::Single);
+    };
+    let revision = u64::from_be_bytes((&pointer[..]).try_into().map_err(|_| {
+        unreadable(
+            &pointer_key,
+            format!("the pointer is {} bytes, not 8", pointer.len()),
+        )
+    })?);
+    let body_key = encode_edge_type_schema_key(edge_type, revision);
+    let Some(body) = engine.get(Partition::Schema, &body_key)? else {
+        return Err(unreadable(
+            &pointer_key,
+            format!("it points at revision {revision}, which is not stored"),
+        ));
+    };
+    if body.is_empty() {
+        return Ok(IdentityShape::Single);
+    }
+    let schema =
+        EdgeTypeSchema::from_msgpack(&body).map_err(|e| unreadable(&body_key, e.to_string()))?;
+    Ok(match (schema.temporal, schema.discriminator()) {
+        (true, _) => IdentityShape::Temporal,
+        (false, Some(_)) => IdentityShape::Discriminated,
+        (false, None) => IdentityShape::Single,
+    })
+}
+
+/// Both measures of one incident scope over the post-state the attempt would
+/// leave: the committed state with its staged adjacency and point writes
+/// applied. `None` when the scope cannot be counted exactly here: a temporal
+/// type, whose bound holds over valid time rather than at one instant, or a
+/// discriminated pair that is adjacent with no identity behind it, which is
+/// evidence missing, never a count of zero.
+///
+/// Each neighbour comes from the adjacency, which is the pair membership
+/// projection. A single-edge pair is one instance whether or not it carries
+/// properties; a discriminated pair has one instance per entry under its
+/// prefix. Counting property rows instead would miss every property-less
+/// edge, and reading the adjacency for instances would miss parallel ones.
+fn incident_count(
     engine: &StorageEngine,
     node: NodeId,
     edge_type: &str,
     direction: Direction,
     staged: StagedAdj<'_>,
-) -> StorageResult<usize> {
-    Ok(adjacency(engine, node, edge_type, direction, staged)?.len())
+    staged_points: StagedPoints<'_>,
+) -> StorageResult<Option<coordinode_core::graph::cardinality::IncidentCount>> {
+    use coordinode_core::graph::cardinality::{IncidentCount, IncidentInstance};
+    use coordinode_core::graph::edge::temporal_edgeprop_pair_prefix;
+
+    let neighbours = adjacency(engine, node, edge_type, direction, staged)?;
+    let shape = identity_shape(engine, edge_type)?;
+    let mut instances = Vec::with_capacity(neighbours.len());
+    for raw in neighbours {
+        let neighbour = NodeId::from_raw(raw);
+        match shape {
+            IdentityShape::Temporal => return Ok(None),
+            IdentityShape::Single => instances.push(IncidentInstance {
+                neighbour,
+                key: Vec::new(),
+            }),
+            IdentityShape::Discriminated => {
+                let (source, target) = match direction {
+                    Direction::Outgoing => (node, neighbour),
+                    Direction::Incoming => (neighbour, node),
+                };
+                let prefix = temporal_edgeprop_pair_prefix(edge_type, source, target);
+                let keys = pair_entries(engine, &prefix, staged_points)?;
+                if keys.is_empty() {
+                    return Ok(None);
+                }
+                instances.extend(
+                    keys.into_iter()
+                        .map(|key| IncidentInstance { neighbour, key }),
+                );
+            }
+        }
+    }
+    Ok(Some(IncidentCount::of_set(instances)))
 }
 
-/// Logical edge identities of the scope, counted from the edge-property
-/// entries of each neighbouring pair: a discriminated edge type stores one
-/// entry per discriminator value, so the entries are the identities.
-///
-/// Returns `None` for an incoming scope, whose pairs are keyed by their
-/// source and so are not reachable from the target's side by prefix.
-///
-/// The attempt's own entries count, and its own deletions do not: a bound is
-/// decided against the post-state the attempt would leave, and counting only
-/// what is committed would admit the instance that breaks it and refuse the
-/// deletion that repairs it.
-fn edge_instances(
+/// The identity suffixes of the entries under one pair's `prefix` in the
+/// post-state: committed entries the attempt does not tombstone, plus the
+/// ones it writes.
+fn pair_entries(
     engine: &StorageEngine,
-    node: NodeId,
-    edge_type: &str,
-    direction: Direction,
+    prefix: &[u8],
     staged_points: StagedPoints<'_>,
-) -> StorageResult<Option<usize>> {
-    if direction == Direction::Incoming {
-        return Ok(None);
-    }
-
-    let mut prefix = Vec::new();
-    prefix.extend_from_slice(b"edgeprop:");
-    prefix.extend_from_slice(edge_type.as_bytes());
-    prefix.push(b':');
-    prefix.extend_from_slice(&node.as_raw().to_be_bytes());
-
-    let mut count: usize = 0;
-    for guard in engine.prefix_scan(Partition::EdgeProp, &prefix)? {
+) -> StorageResult<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    for guard in engine.prefix_scan(Partition::EdgeProp, prefix)? {
         // A row that cannot be read is not a row that is absent: skipping it
         // would undercount and admit the instance that breaks the bound.
         let key = guard.key()?;
-        // A row this attempt tombstones is already gone as far as the bound
-        // is concerned; one it rewrites is still the same identity.
-        match staged_points.get(&(Partition::EdgeProp, key.to_vec())) {
-            Some(None) => {}
-            _ => count += 1,
+        if !matches!(
+            staged_points.get(&(Partition::EdgeProp, key.to_vec())),
+            Some(None)
+        ) {
+            keys.push(key[prefix.len()..].to_vec());
         }
     }
-
-    // Entries the attempt adds that the committed scan could not see.
     for ((part, key), value) in staged_points {
-        if *part != Partition::EdgeProp || value.is_none() || !key.starts_with(&prefix) {
-            continue;
-        }
-        if engine.get(Partition::EdgeProp, key)?.is_none() {
-            count += 1;
+        if *part == Partition::EdgeProp && value.is_some() && key.starts_with(prefix) {
+            keys.push(key[prefix.len()..].to_vec());
         }
     }
-
-    Ok(Some(count))
+    // A staged rewrite of a committed entry is the same identity; the count
+    // takes each once.
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
 }
 
 #[cfg(test)]
