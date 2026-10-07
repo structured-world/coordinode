@@ -389,6 +389,37 @@ fn drop_constraint_lifts_it_and_its_index() {
     assert!(err.to_string().contains("not found"), "{err}");
 }
 
+/// Creating and dropping a uniqueness constraint leaves the type definition
+/// of the property it covered as it was: its type, requiredness and default
+/// survive both, and only the constraint and its index come and go.
+#[test]
+fn dropping_a_uniqueness_keeps_the_property_definition() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef};
+    let (mut db, _dir) = open_db();
+    let mut user = LabelSchema::new_node_id("User");
+    let email = PropertyDef::new("email", PropertyType::String)
+        .not_null()
+        .with_default(Value::String("none@x".into()));
+    user.add_property(email.clone());
+    db.create_label_schema(user).expect("type");
+    let defined = |db: &Database| {
+        LocalSchemaStore::new(db.engine())
+            .load_label("User")
+            .expect("load schema")
+            .expect("the type stays")
+            .get_property("email")
+            .cloned()
+    };
+
+    db.execute_cypher("CREATE CONSTRAINT user_email FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect("unique");
+    assert_eq!(defined(&db).as_ref(), Some(&email), "creation keeps it");
+    db.execute_cypher("DROP CONSTRAINT user_email")
+        .expect("drop");
+    assert_eq!(defined(&db).as_ref(), Some(&email), "drop keeps it");
+    assert!(indexes_on(&db, "User").is_empty());
+}
+
 /// A uniqueness constraint dropped and created again under the same name is
 /// judged by the data as it is at the second creation: a duplicate written
 /// in between refuses it and leaves the name free, and once it is gone the
@@ -1203,6 +1234,51 @@ fn index_owner(db: &Database, name: &str) -> Option<String> {
         .expect("the index is defined")
         .descriptor
         .owner
+}
+
+/// The indexes defined on `label`, by name.
+fn indexes_on(db: &Database, label: &str) -> Vec<String> {
+    use coordinode_query::index::ops::list_index_definitions;
+    list_index_definitions(db.engine())
+        .expect("list indexes")
+        .into_iter()
+        .filter(|d| d.label == label)
+        .filter_map(|d| d.descriptor.name)
+        .collect()
+}
+
+/// A type definition never declares uniqueness: UNIQUE inline in CREATE
+/// NODE TYPE is refused with nothing written, and a type created through
+/// Cypher or the embedded API, required properties included, builds no
+/// index and declares no constraint. Uniqueness is a named constraint.
+#[test]
+fn a_type_definition_declares_no_uniqueness_and_builds_no_index() {
+    use coordinode_core::schema::definition::{LabelSchema, PropertyDef};
+    let (mut db, _dir) = open_db();
+
+    db.execute_cypher("CREATE NODE TYPE User WITH (email: string UNIQUE)")
+        .expect_err("UNIQUE is not a property modifier");
+    assert!(
+        LocalSchemaStore::new(db.engine())
+            .load_label("User")
+            .expect("load schema")
+            .is_none(),
+        "the refused definition left nothing"
+    );
+
+    db.execute_cypher("CREATE NODE TYPE User WITH (email: string NOT NULL, name: string)")
+        .expect("type");
+    let mut account = LabelSchema::new_node_id("Account");
+    account.add_property(PropertyDef::new("email", PropertyType::String).not_null());
+    db.create_label_schema(account).expect("embedded type");
+
+    assert!(db.constraints().expect("constraints").is_empty());
+    assert!(indexes_on(&db, "User").is_empty());
+    assert!(indexes_on(&db, "Account").is_empty());
+    db.execute_cypher("CREATE (:User {email: 'a@x'}), (:User {email: 'a@x'})")
+        .expect("no uniqueness without a constraint");
+    db.execute_cypher("CREATE (:Account {email: 'a@x'}), (:Account {email: 'a@x'})")
+        .expect("no uniqueness without a constraint");
 }
 
 /// `CREATE UNIQUE INDEX` declares the same invariant a uniqueness

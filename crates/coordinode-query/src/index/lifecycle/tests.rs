@@ -248,10 +248,13 @@ fn a_duplicate_withdraws_a_new_unique_index() {
         ),
         "{outcome:?}"
     );
-    assert!(matches!(
-        env.record(&def).expect("record").state,
-        BuildState::Failed { .. }
-    ));
+    // The duplicate is named by the stored outcome too, for whoever asks
+    // after the waiter is gone.
+    let state = env.record(&def).expect("record").state;
+    assert!(
+        matches!(&state, BuildState::Failed { reason } if reason.contains("same@x")),
+        "{state:?}"
+    );
     assert!(env.stored(&def).is_none());
     assert!(env.holders(&def, "same@x").is_empty());
 }
@@ -1111,16 +1114,19 @@ fn a_repair_of_a_value_changed_since_overwrites_nothing() {
 
 /// Run one repair of node 2, whose `same@x` node 1 also holds, while the
 /// build of `def` is running but has covered nothing yet, drawing suffixes
-/// from `suffixes` in turn (the last one repeats).
+/// from `suffixes` in turn (the last one repeats), as the executor holding
+/// the build or, with `stale`, as one the build no longer belongs to.
 fn repair_node_two(
     env: &Arc<TestEnv>,
     def: &IndexDefinition,
     suffixes: &[&str],
+    stale: bool,
 ) -> Result<super::super::repair::Repaired, BackfillError> {
     let builds = service(env);
     let older = older_transaction(env);
     builds.submit(def.generation).expect("submit");
-    let token = await_running(env, def, None);
+    let running = await_running(env, def, None);
+    let token = if stale { running + 1 } else { running };
     let drawn = std::cell::Cell::new(0usize);
     let next = || {
         let i = drawn.get();
@@ -1156,7 +1162,7 @@ fn a_repair_redraws_a_suffix_another_node_holds() {
     env.put_user(3, "same@x_aaaaaaaa");
     let def = admit_repairing(&env);
 
-    let repaired = repair_node_two(&env, &def, &["aaaaaaaa", "bbbbbbbb"]).expect("repair");
+    let repaired = repair_node_two(&env, &def, &["aaaaaaaa", "bbbbbbbb"], false).expect("repair");
 
     assert_eq!(repaired, super::super::repair::Repaired::Done);
     assert_eq!(
@@ -1185,7 +1191,7 @@ fn a_repair_that_finds_no_free_suffix_fails_without_writing() {
     env.put_user(3, "same@x_aaaaaaaa");
     let def = admit_repairing(&env);
 
-    let refused = repair_node_two(&env, &def, &["aaaaaaaa"]);
+    let refused = repair_node_two(&env, &def, &["aaaaaaaa"], false);
 
     assert!(
         matches!(&refused, Err(BackfillError::Repair(why))
@@ -1203,4 +1209,119 @@ fn a_repair_that_finds_no_free_suffix_fails_without_writing() {
             .iter()
             .all(|r| r.new != "same@x_aaaaaaaa")
     );
+}
+
+/// A repair prepared by an executor the build no longer belongs to (it was
+/// cancelled or taken over while the repair was being prepared) commits
+/// nothing: the node keeps its value and no repair is recorded for it.
+#[test]
+fn a_repair_by_an_executor_the_build_moved_from_writes_nothing() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    let def = admit_repairing(&env);
+
+    let refused = repair_node_two(&env, &def, &["cccccccc"], true);
+
+    assert!(
+        matches!(refused, Err(BackfillError::Superseded)),
+        "{refused:?}"
+    );
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .list_repairs(def.generation)
+            .expect("repairs")
+            .iter()
+            .all(|r| r.new != "same@x_cccccccc"),
+        "the stale repair is not recorded"
+    );
+    assert_ne!(
+        email_of(&env, 2),
+        Some(Value::String("same@x_cccccccc".into())),
+        "the stale repair changed no node"
+    );
+}
+
+/// A build that fails after it repaired a duplicate leaves the repair in
+/// place, value and record: a repair is its own committed change, and the
+/// failure of the build later is not a reason to undo it.
+#[test]
+fn a_build_failing_after_a_repair_keeps_the_repair() {
+    let env = env();
+    let field = env.fields_now().lookup("email").expect("email field");
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    for id in [3, 4] {
+        let mut record = NodeRecord::new("User");
+        record.set(field, Value::Int(7));
+        let mut txn = env.begin();
+        LocalNodeStore
+            .put(&mut txn, 1, NodeId::from_raw(id), &record)
+            .expect("put");
+        commit(&mut txn).expect("commit node");
+    }
+    let def = admit_repairing(&env);
+    let builds = service(&env);
+
+    builds.submit(def.generation).expect("submit");
+    let outcome = builds.wait(def.generation, None).expect("wait");
+
+    assert!(
+        matches!(&outcome, Some(IndexBuildOutcome::Failed(BuildError::Other(why)))
+            if why.contains("only a string")),
+        "{outcome:?}"
+    );
+    let Some(Value::String(renamed)) = email_of(&env, 2) else {
+        panic!("node 2 keeps a string");
+    };
+    assert!(renamed.starts_with("same@x_"), "{renamed}");
+    let repairs = LocalIndexStore::new(&env.engine)
+        .list_repairs(def.generation)
+        .expect("repairs");
+    assert_eq!(repairs.len(), 1, "{repairs:?}");
+    assert_eq!(repairs[0].new, renamed);
+    assert_eq!(env.record(&def).expect("the outcome stays").repaired, 1);
+}
+
+/// A build taken over after it repaired a duplicate (the executor lost, as
+/// after a leader change or a restart) is finished without renaming that
+/// node again: the new executor reads the repaired value and finds no
+/// duplicate left.
+#[test]
+fn a_build_taken_over_after_a_repair_renames_nothing_again() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    let def = admit_repairing(&env);
+    let first = service(&env);
+    let second = service(&env);
+    env.hold_pages_after(0);
+
+    first.submit(def.generation).expect("first takes it");
+    env.await_held_page();
+    let Some(Value::String(renamed)) = email_of(&env, 2) else {
+        panic!("node 2 keeps a string");
+    };
+    assert_ne!(renamed, "same@x", "repaired by the first executor");
+    let taken = await_running(&env, &def, None);
+    second.submit(def.generation).expect("second takes it over");
+    await_running(&env, &def, Some(taken));
+    env.release_pages();
+    first.wait(def.generation, None).expect("first wait");
+    let outcome = second.wait(def.generation, None).expect("second wait");
+
+    assert!(
+        matches!(
+            outcome,
+            Some(IndexBuildOutcome::Published { indexed: Some(2) })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(email_of(&env, 2), Some(Value::String(renamed.clone())));
+    assert_eq!(env.holders(&def, &renamed), [2]);
+    let repairs = LocalIndexStore::new(&env.engine)
+        .list_repairs(def.generation)
+        .expect("repairs");
+    assert_eq!(repairs.len(), 1, "{repairs:?}");
+    assert_eq!(env.record(&def).expect("record").repaired, 1);
 }
