@@ -5,6 +5,7 @@
 //! that go through the same catalog and admission as `CREATE CONSTRAINT` and
 //! `DROP CONSTRAINT` in a query.
 
+use core::time::Duration;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -20,11 +21,12 @@ use coordinode_core::schema::definition::{
     SchemaMode,
 };
 use coordinode_embed::{ConstraintDeclaration, Database, LabelConstraint};
+use coordinode_query::index::{BuildPhase, BuildState, BuildStatus, GenerationId};
 
 use crate::proto::v1::query::DistanceMetric;
 use crate::proto::v2::graph as schema;
 use crate::services::cypher::{db_error_to_status, proto_to_value_pub, value_to_proto_pub};
-use crate::services::error_details::invalid_field;
+use crate::services::error_details::{Reason, catalog_object_status, invalid_field};
 
 /// The largest vector a property may declare.
 const MAX_VECTOR_DIMENSIONS: u32 = 65_536;
@@ -368,7 +370,67 @@ fn edge_type_to_proto(s: &EdgeTypeSchema) -> schema::EdgeType {
     }
 }
 
-fn constraint_to_proto(c: &LabelConstraint) -> schema::Constraint {
+/// An index build as the wire shows it.
+fn build_to_proto(status: &BuildStatus) -> schema::IndexBuild {
+    use schema::{IndexBuildPhase as P, IndexBuildState as S};
+    let state = match status.record.as_ref().map(|r| &r.state) {
+        Some(BuildState::Accepted) => S::Accepted,
+        // A build a member runs for itself keeps no record.
+        Some(BuildState::Running { .. }) | None => S::Running,
+        Some(BuildState::Published) => S::Published,
+        Some(BuildState::Failed { .. }) => S::Failed,
+        Some(BuildState::Cancelled) => S::Cancelled,
+    };
+    let phase = match status.phase {
+        None => P::Unspecified,
+        Some(BuildPhase::AwaitingSeat) => P::AwaitingSeat,
+        Some(BuildPhase::AwaitingOlderTransactions) => P::AwaitingOlderTransactions,
+        Some(BuildPhase::Indexing { .. }) => P::Indexing,
+    };
+    let index = status.index.as_ref();
+    schema::IndexBuild {
+        operation: status.generation.as_raw(),
+        index: index.and_then(|i| i.name.clone()).unwrap_or_default(),
+        label: index.map(|i| i.label.clone()).unwrap_or_default(),
+        state: state as i32,
+        phase: phase as i32,
+        indexed: status.indexed().unwrap_or(0),
+        failure: status.failure().unwrap_or_default().to_string(),
+    }
+}
+
+/// `NOT_FOUND` for an index build operation no build has.
+fn unknown_build(operation: GenerationId) -> Status {
+    let operation = operation.as_raw().to_string();
+    catalog_object_status(
+        tonic::Code::NotFound,
+        format!("no index build has operation {operation}"),
+        Reason::CatalogObjectNotFound,
+        "index_build",
+        &operation,
+    )
+}
+
+/// The wait a request names, refusing a negative one.
+fn wait_from_proto(
+    field: &str,
+    wait: Option<prost_types::Duration>,
+) -> Result<Option<Duration>, Status> {
+    wait.map(|w| {
+        Duration::try_from(w).map_err(|_| invalid_field(field, "a wait is a non-negative duration"))
+    })
+    .transpose()
+}
+
+/// The build operation a request names. Operation 0 is a real build, so an
+/// absent field is refused rather than read as it.
+fn operation_from_proto(operation: Option<u64>) -> Result<GenerationId, Status> {
+    operation
+        .map(GenerationId::from_raw)
+        .ok_or_else(|| invalid_field("operation", "an operation is required"))
+}
+
+fn constraint_to_proto(c: &LabelConstraint, build: Option<&BuildStatus>) -> schema::Constraint {
     use schema::ConstraintKind as K;
     let (kind, property_type) = match &c.constraint.kind {
         ConstraintKind::Unique => (K::Unique, None),
@@ -387,6 +449,7 @@ fn constraint_to_proto(c: &LabelConstraint) -> schema::Constraint {
             ConstraintState::Active => schema::ConstraintState::Active,
         } as i32,
         backing_index: c.backing_index.clone().unwrap_or_default(),
+        build: build.map(build_to_proto),
     }
 }
 
@@ -464,6 +527,7 @@ fn declaration_from_proto(
         K::Unique | K::Unspecified => ConstraintKind::Unique,
     };
     Ok(ConstraintDeclaration {
+        wait: wait_from_proto("wait", req.wait)?,
         name: (!req.name.is_empty()).then_some(req.name),
         label,
         properties: req.properties,
@@ -625,13 +689,22 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         request: Request<schema::CreateConstraintRequest>,
     ) -> Result<Response<schema::Constraint>, Status> {
         let declaration = declaration_from_proto(request.into_inner())?;
-        let created = super::blocking(|| {
-            self.database
-                .write()
+        let created = super::blocking(|| -> Result<schema::Constraint, Status> {
+            // Shared: the call may wait for the build, and the database
+            // serves everyone else meanwhile.
+            let db = self.database.read();
+            let created = db
                 .create_constraint(declaration)
-                .map_err(db_error_to_status)
+                .map_err(db_error_to_status)?;
+            let build = match created.operation {
+                Some(operation) => db
+                    .index_build(operation, Duration::ZERO)
+                    .map_err(db_error_to_status)?,
+                None => None,
+            };
+            Ok(constraint_to_proto(&created, build.as_ref()))
         })?;
-        Ok(Response::new(constraint_to_proto(&created)))
+        Ok(Response::new(created))
     }
 
     async fn drop_constraint(
@@ -655,15 +728,84 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         &self,
         _request: Request<schema::ListConstraintsRequest>,
     ) -> Result<Response<schema::ListConstraintsResponse>, Status> {
-        let constraints = super::blocking(|| {
-            self.database
-                .read()
-                .constraints()
-                .map_err(db_error_to_status)
+        let constraints = super::blocking(|| -> Result<Vec<schema::Constraint>, Status> {
+            let db = self.database.read();
+            let constraints = db.constraints().map_err(db_error_to_status)?;
+            let builds: rustc_hash::FxHashMap<GenerationId, BuildStatus> = db
+                .index_build_status()
+                .map_err(db_error_to_status)?
+                .into_iter()
+                .map(|s| (s.generation, s))
+                .collect();
+            Ok(constraints
+                .iter()
+                .map(|c| constraint_to_proto(c, c.operation.and_then(|op| builds.get(&op))))
+                .collect())
         })?;
         Ok(Response::new(schema::ListConstraintsResponse {
-            constraints: constraints.iter().map(constraint_to_proto).collect(),
+            constraints,
         }))
+    }
+
+    async fn list_index_builds(
+        &self,
+        _request: Request<schema::ListIndexBuildsRequest>,
+    ) -> Result<Response<schema::ListIndexBuildsResponse>, Status> {
+        let builds = super::blocking(|| {
+            self.database
+                .read()
+                .index_build_status()
+                .map_err(db_error_to_status)
+        })?;
+        Ok(Response::new(schema::ListIndexBuildsResponse {
+            builds: builds.iter().map(build_to_proto).collect(),
+        }))
+    }
+
+    async fn get_index_build(
+        &self,
+        request: Request<schema::GetIndexBuildRequest>,
+    ) -> Result<Response<schema::IndexBuild>, Status> {
+        let req = request.into_inner();
+        let operation = operation_from_proto(req.operation)?;
+        let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
+        let build = super::blocking(|| {
+            self.database
+                .read()
+                .index_build(operation, wait)
+                .map_err(db_error_to_status)
+        })?
+        .ok_or_else(|| unknown_build(operation))?;
+        Ok(Response::new(build_to_proto(&build)))
+    }
+
+    async fn cancel_index_build(
+        &self,
+        request: Request<schema::CancelIndexBuildRequest>,
+    ) -> Result<Response<schema::IndexBuild>, Status> {
+        let req = request.into_inner();
+        let operation = operation_from_proto(req.operation)?;
+        let build = super::blocking(|| -> Result<schema::IndexBuild, Status> {
+            let db = self.database.read();
+            let cancelled = db
+                .cancel_index_build(operation)
+                .map_err(db_error_to_status)?;
+            match db
+                .index_build(operation, Duration::ZERO)
+                .map_err(db_error_to_status)?
+            {
+                Some(status) => Ok(build_to_proto(&status)),
+                // A vector build keeps no record: stopped here, nothing of
+                // it remains to inspect but the cancellation itself.
+                None if cancelled => Ok(schema::IndexBuild {
+                    operation: operation.as_raw(),
+                    state: schema::IndexBuildState::Cancelled as i32,
+                    ..Default::default()
+                }),
+                None => Err(unknown_build(operation)),
+            }
+        })?;
+        Ok(Response::new(build))
     }
 }
 

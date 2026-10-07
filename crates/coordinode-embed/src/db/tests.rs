@@ -724,6 +724,7 @@ fn require_unique(db: &Database, label: &str, property: &str) {
         properties: vec![property.into()],
         kind: coordinode_core::schema::definition::ConstraintKind::Unique,
         if_not_exists: false,
+        wait: None,
     })
     .expect("create the uniqueness constraint");
 }

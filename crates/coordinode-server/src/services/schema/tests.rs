@@ -52,6 +52,7 @@ fn unique(name: &str, label: &str, property: &str) -> schema::CreateConstraintRe
         kind: schema::ConstraintKind::Unique as i32,
         property_type: None,
         if_not_exists: false,
+        wait: None,
     }
 }
 
@@ -367,6 +368,104 @@ async fn a_label_is_defined_once() {
     assert_eq!(stored.mode, SchemaMode::Strict);
 }
 
+/// A CreateConstraint whose wait runs out first answers VALIDATING with its
+/// build, which goes on server-side: GetIndexBuild waits for its outcome and
+/// sees it published, the listed constraint is then ACTIVE, a cancellation
+/// afterwards keeps the published outcome, and an operation no build has, or
+/// an absent one, is refused.
+#[tokio::test]
+async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
+    let (svc, _dir) = test_service();
+    svc.database
+        .write()
+        .execute_cypher("CREATE (:Customer {email: 'a@x'})")
+        .expect("seed");
+    let older = svc.database.read().begin_transaction();
+
+    let mut request = unique("customer_email", "Customer", "email");
+    request.wait = Some(prost_types::Duration::default());
+    let created = svc
+        .create_constraint(Request::new(request))
+        .await
+        .expect("admitted")
+        .into_inner();
+    assert_eq!(created.state, schema::ConstraintState::Validating as i32);
+    let build = created.build.expect("its build");
+    assert_ne!(build.state, schema::IndexBuildState::Published as i32);
+    let operation = build.operation;
+
+    svc.database
+        .read()
+        .rollback_transaction(older)
+        .expect("end the older transaction");
+    let done = svc
+        .get_index_build(Request::new(schema::GetIndexBuildRequest {
+            operation: Some(operation),
+            wait: Some(prost_types::Duration {
+                seconds: 20,
+                nanos: 0,
+            }),
+        }))
+        .await
+        .expect("inspect")
+        .into_inner();
+    assert_eq!(done.state, schema::IndexBuildState::Published as i32);
+    let listed = svc
+        .list_constraints(Request::new(schema::ListConstraintsRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .constraints;
+    assert_eq!(listed[0].state, schema::ConstraintState::Active as i32);
+    assert_eq!(
+        listed[0].build.as_ref().map(|b| b.operation),
+        Some(operation)
+    );
+    let builds = svc
+        .list_index_builds(Request::new(schema::ListIndexBuildsRequest {}))
+        .await
+        .expect("list builds")
+        .into_inner()
+        .builds;
+    assert!(builds.iter().any(|b| b.operation == operation));
+
+    let kept = svc
+        .cancel_index_build(Request::new(schema::CancelIndexBuildRequest {
+            operation: Some(operation),
+        }))
+        .await
+        .expect("cancel")
+        .into_inner();
+    assert_eq!(kept.state, schema::IndexBuildState::Published as i32);
+
+    let missing = svc
+        .get_index_build(Request::new(schema::GetIndexBuildRequest {
+            operation: Some(operation + 1000),
+            wait: None,
+        }))
+        .await
+        .expect_err("no such build");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    assert_eq!(reason(&missing), "CATALOG_OBJECT_NOT_FOUND");
+    let absent = svc
+        .cancel_index_build(Request::new(schema::CancelIndexBuildRequest {
+            operation: None,
+        }))
+        .await
+        .expect_err("no operation");
+    assert_eq!(absent.code(), tonic::Code::InvalidArgument);
+    let mut negative = unique("other", "Customer", "email");
+    negative.wait = Some(prost_types::Duration {
+        seconds: -1,
+        nanos: 0,
+    });
+    let refused = svc
+        .create_constraint(Request::new(negative))
+        .await
+        .expect_err("a negative wait");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+}
+
 /// A uniqueness constraint is created apart from the type: it answers with
 /// its state and the index it owns, is listed, refuses a duplicate value,
 /// and dropping it leaves the type as it was.
@@ -390,6 +489,10 @@ async fn a_uniqueness_constraint_is_created_listed_enforced_and_dropped() {
     assert_eq!(created.state, schema::ConstraintState::Active as i32);
     assert_eq!(created.backing_index, "customer_email");
     assert_eq!(created.property_type, None);
+    let build = created.build.clone().expect("the backing index's build");
+    assert_eq!(build.state, schema::IndexBuildState::Published as i32);
+    assert_eq!(build.index, "customer_email");
+    assert_eq!(build.label, "Customer");
 
     let listed = svc
         .list_constraints(Request::new(schema::ListConstraintsRequest {}))

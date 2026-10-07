@@ -12,6 +12,7 @@
 //! time.
 
 mod builtin;
+mod index_builds;
 
 use core::fmt;
 use std::collections::BTreeMap;

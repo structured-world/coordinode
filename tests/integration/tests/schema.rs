@@ -168,6 +168,7 @@ async fn types_and_constraints_are_created_and_inspected_apart() {
             kind: ConstraintKind::Unique as i32,
             property_type: None,
             if_not_exists: false,
+            wait: None,
         })
         .await
         .expect("create constraint")

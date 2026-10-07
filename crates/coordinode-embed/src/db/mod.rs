@@ -2171,33 +2171,34 @@ impl Database {
         self.vector_index_registry.build_progress()
     }
 
-    /// Stop the vector-index build named `index`, waiting for it to finish.
+    /// Cancel the index build `operation` (the generation it fills, as a
+    /// creating statement and [`Self::index_build_status`] report it).
+    /// Returns whether a build was stopped; `false` when it already had an
+    /// outcome or no build has the operation.
     ///
-    /// Returns whether a build was actually running. The index keeps whatever
-    /// the build had already inserted: HNSW insert is an upsert, so a later
-    /// build re-covers the same nodes without duplicating them, and writes
-    /// that arrive meanwhile go into the graph through the normal write path.
-    /// What a cancelled build does NOT do is write its state afterwards — the
-    /// index is free the moment this returns.
-    pub fn cancel_index_build(&self, index: &str) -> bool {
-        // The name resolves to the index it binds now, and the build of the
-        // generation that index serves is the one stopped. A key-shaped
-        // index's build is cancelled through its record: the index it was
-        // creating is withdrawn, one it was rebuilding kept failed.
-        if let Some(def) = self.index_registry.get(index) {
-            if def.index_type == coordinode_query::index::IndexType::BTree {
-                return match self.index_builds.cancel(def.generation) {
-                    Ok(cancelled) => cancelled,
-                    Err(e) => {
-                        tracing::warn!(index, error = %e, "could not cancel the index build");
-                        false
-                    }
-                };
-            }
+    /// A key-shaped build is cancelled through its record, in the commit
+    /// that also withdraws the index it was creating with the constraint
+    /// that owns it, or keeps an index it was rebuilding, failed. It cannot
+    /// undo a publication that committed first. A vector build stops and is
+    /// joined: the index keeps what the build inserted (an insert is an
+    /// upsert, so a later build re-covers those nodes once) and the build
+    /// writes nothing afterwards.
+    ///
+    /// # Errors
+    ///
+    /// The cancellation could not be committed.
+    pub fn cancel_index_build(
+        &self,
+        operation: coordinode_query::index::GenerationId,
+    ) -> Result<bool, DatabaseError> {
+        if self
+            .index_builds
+            .cancel(operation)
+            .map_err(DatabaseError::Other)?
+        {
+            return Ok(true);
         }
-        self.vector_index_registry
-            .get_definition_by_name(index)
-            .is_some_and(|def| self.vector_index_registry.cancel_build(def.generation))
+        Ok(self.vector_index_registry.cancel_build(operation))
     }
 
     /// Every index build the catalog records or an executor of this process
@@ -2212,6 +2213,21 @@ impl Database {
         &self,
     ) -> Result<Vec<coordinode_query::index::BuildStatus>, DatabaseError> {
         Ok(self.index_builds.builds()?)
+    }
+
+    /// The index build `operation`, after waiting up to `wait` for its
+    /// outcome; `None` when no build has the operation. Waiting cancels
+    /// nothing: a waiter that gives up leaves the build running.
+    ///
+    /// # Errors
+    ///
+    /// The record could not be read.
+    pub fn index_build(
+        &self,
+        operation: coordinode_query::index::GenerationId,
+        wait: Duration,
+    ) -> Result<Option<coordinode_query::index::BuildStatus>, DatabaseError> {
+        Ok(self.index_builds.status(operation, wait)?)
     }
 
     /// How index builds run: how many fill indexes at once and how long a

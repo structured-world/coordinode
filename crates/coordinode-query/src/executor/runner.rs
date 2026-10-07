@@ -3,6 +3,7 @@
 //! Each operator produces a `Vec<Row>` from its input.
 //! Future optimization: streaming iterator model.
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -4212,13 +4213,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             label,
             properties,
             kind,
+            wait,
         } => execute_create_constraint(
             name.as_deref(),
             *if_not_exists,
             label,
             properties,
             kind,
-            OwnedIndexShape::default(),
+            OwnedIndexShape {
+                wait: *wait,
+                ..OwnedIndexShape::default()
+            },
             ctx,
         ),
 
@@ -17331,20 +17336,31 @@ fn execute_create_btree_index(
             OwnedIndexShape {
                 sparse: Some(sparse),
                 maintenance,
+                wait: None,
             },
             ctx,
         )?;
-        let indexed = constrained
-            .first()
-            .and_then(|r| r.get("nodes_indexed").cloned())
-            .unwrap_or(Value::Int(0));
         let mut row = Row::new();
         row.insert("index".to_string(), Value::String(name.to_string()));
         row.insert("label".to_string(), Value::String(label.to_string()));
         row.insert("property".to_string(), Value::String(property.to_string()));
         row.insert("unique".to_string(), Value::Bool(true));
         row.insert("sparse".to_string(), Value::Bool(sparse));
-        row.insert("nodes_indexed".to_string(), indexed);
+        // The constraint's build is the index's: the same operation, the
+        // index ready exactly when the constraint is active.
+        if let Some(constrained) = constrained.first() {
+            for column in ["operation", "nodes_indexed"] {
+                row.insert(
+                    column.to_string(),
+                    constrained.get(column).cloned().unwrap_or(Value::Null),
+                );
+            }
+            let state = match constrained.get("state") {
+                Some(Value::String(s)) if s == "ACTIVE" => "READY",
+                _ => "BUILDING",
+            };
+            row.insert("state".to_string(), Value::String(state.into()));
+        }
         if let Some(def) = ctx.btree_index_registry.and_then(|r| r.get(name)) {
             insert_maintenance(&mut row, &def.maintenance);
         }
@@ -17370,8 +17386,7 @@ fn execute_create_btree_index(
     });
     ctx.label_schema_cache.remove(label);
     let def = def?;
-    let backfilled = await_index_build(&def, ctx)?;
-    let maintenance = def.maintenance;
+    let waited = await_index_build(&def, None, ctx)?;
 
     let mut row = Row::new();
     row.insert("index".to_string(), Value::String(name.to_string()));
@@ -17379,8 +17394,9 @@ fn execute_create_btree_index(
     row.insert("property".to_string(), Value::String(property.to_string()));
     row.insert("unique".to_string(), Value::Bool(unique));
     row.insert("sparse".to_string(), Value::Bool(sparse));
-    row.insert("nodes_indexed".to_string(), Value::Int(backfilled as i64));
-    insert_maintenance(&mut row, &maintenance);
+    insert_build(&mut row, &def, waited);
+    row.insert("state".to_string(), index_state(waited));
+    insert_maintenance(&mut row, &def.maintenance);
     Ok(vec![row])
 }
 
@@ -17461,14 +17477,26 @@ fn publish_index_build(
     Ok(def)
 }
 
-/// Run the admitted build of `def` on the engine's executor and wait for
-/// its outcome: the number of nodes indexed once the index is published,
-/// or the error the statement fails with. The executor publishes the index
-/// ready, or withdraws it with the constraint that owns it, itself.
+/// How a statement's wait for the build of the index it created ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildWait {
+    /// The index was published ready, with this many nodes indexed.
+    Published(u64),
+    /// The wait ran out first. The build goes on without the statement and
+    /// is inspected, awaited or cancelled through its operation.
+    Running,
+}
+
+/// Run the admitted build of `def` on the engine's executor and wait up to
+/// `wait` (`None`: the engine's statement wait) for its outcome. A build
+/// that fails or is cancelled within the wait is the error the statement
+/// fails with. The executor publishes the index ready, or withdraws it with
+/// the constraint that owns it, itself, whether anyone still waits or not.
 fn await_index_build(
     def: &crate::index::IndexDefinition,
+    wait: Option<Duration>,
     ctx: &ExecutionContext<'_>,
-) -> Result<u64, ExecutionError> {
+) -> Result<BuildWait, ExecutionError> {
     use crate::index::{BuildError, IndexBuildOutcome};
     let builds = ctx.index_builds.ok_or_else(|| {
         ExecutionError::Unsupported("building an index requires the engine's index builds".into())
@@ -17478,8 +17506,11 @@ fn await_index_build(
     builds
         .submit(def.generation, 1)
         .map_err(ExecutionError::Unsupported)?;
-    match builds.wait(def.generation, None)? {
-        Some(IndexBuildOutcome::Published { indexed }) => Ok(indexed.unwrap_or(0)),
+    let wait = wait.unwrap_or_else(|| builds.config().statement_wait);
+    match builds.wait(def.generation, Some(wait))? {
+        Some(IndexBuildOutcome::Published { indexed }) => {
+            Ok(BuildWait::Published(indexed.unwrap_or(0)))
+        }
         Some(IndexBuildOutcome::Failed(BuildError::Duplicate(v))) => Err(unique_violation(v)),
         Some(IndexBuildOutcome::Failed(BuildError::Other(reason))) => {
             Err(ExecutionError::Unsupported(reason))
@@ -17487,10 +17518,47 @@ fn await_index_build(
         Some(IndexBuildOutcome::Cancelled) => Err(ExecutionError::Unsupported(format!(
             "the build of index '{def}' was cancelled"
         ))),
-        None => Err(ExecutionError::Unsupported(format!(
-            "the build of index '{def}' has no outcome yet"
-        ))),
+        None => Ok(BuildWait::Running),
     }
+}
+
+/// The result columns naming the build of an index a statement created:
+/// its operation, and the nodes it indexed once published (`Null` while it
+/// still runs).
+fn insert_build(row: &mut Row, def: &crate::index::IndexDefinition, wait: BuildWait) {
+    row.insert(
+        "operation".to_string(),
+        Value::Int(operation_value(def.generation)),
+    );
+    let indexed = match wait {
+        BuildWait::Published(indexed) => Value::Int(count_value(indexed)),
+        BuildWait::Running => Value::Null,
+    };
+    row.insert("nodes_indexed".to_string(), indexed);
+}
+
+/// The `state` column of an index a statement created.
+fn index_state(wait: BuildWait) -> Value {
+    Value::String(
+        match wait {
+            BuildWait::Published(_) => "READY",
+            BuildWait::Running => "BUILDING",
+        }
+        .into(),
+    )
+}
+
+/// A build operation as a query value: its generation.
+pub(crate) fn operation_value(generation: crate::index::GenerationId) -> i64 {
+    // Generations are allocated one at a time from one catalog counter
+    // starting at 0, so they stay far below `i64::MAX` for the life of a
+    // database.
+    i64::try_from(generation.as_raw()).unwrap_or(i64::MAX)
+}
+
+/// A count as a query value.
+fn count_value(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 /// The maintenance binding of an index as result columns: the effective
@@ -17719,8 +17787,36 @@ fn constraint_row(
         "kind".to_string(),
         Value::String(constraint.kind.to_string()),
     );
+    row.insert(
+        "state".to_string(),
+        Value::String(constraint.state.to_string()),
+    );
     row.insert(changed.0.to_string(), Value::Bool(changed.1));
     row
+}
+
+/// How the index a uniqueness or key constraint owns is built, and how long
+/// the statement waits for that build.
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnedIndexShape {
+    /// Leave nodes missing a value out of the index; `None` takes the
+    /// constraint kind's own choice.
+    sparse: Option<bool>,
+    /// The index's maintenance profile; `None` takes the namespace default.
+    maintenance: Option<crate::index::IndexProfile>,
+    /// How long the statement waits for the build; `None` takes the
+    /// engine's statement wait.
+    wait: Option<Duration>,
+}
+
+/// The build operation of the index constraint `name` owns while it is
+/// validating, as the result column `operation`; `Null` when no index of
+/// the name is published.
+fn owned_build_operation(name: &str, ctx: &ExecutionContext<'_>) -> Value {
+    ctx.btree_index_registry
+        .and_then(|r| r.get(name))
+        .filter(|d| d.owner.as_deref() == Some(name))
+        .map_or(Value::Null, |d| Value::Int(operation_value(d.generation)))
 }
 
 /// Execute `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE ...`.
@@ -17731,23 +17827,15 @@ fn constraint_row(
 /// later are refused and retried under the new one.
 ///
 /// A uniqueness or key constraint lands the same way, as validating, in the
-/// one commit that publishes the unique index it owns: writers enforce it
-/// from that commit on while the backfill checks the stored nodes, and a
-/// second commit, bound to the index definition the first published, makes
-/// both active. Stored duplicates withdraw both in one commit. A build
-/// interrupted in between leaves the constraint validating, enforced, and
-/// reported as unfinished until it is dropped.
-/// How the index a uniqueness or key constraint owns is built, when the
-/// statement declaring it says so (`CREATE UNIQUE INDEX`).
-#[derive(Debug, Clone, Copy, Default)]
-struct OwnedIndexShape {
-    /// Leave nodes missing a value out of the index; `None` takes the
-    /// constraint kind's own choice.
-    sparse: Option<bool>,
-    /// The index's maintenance profile; `None` takes the namespace default.
-    maintenance: Option<crate::index::IndexProfile>,
-}
-
+/// one commit that publishes the unique index it owns and admits its build:
+/// writers enforce it from that commit on while the build checks the stored
+/// nodes, and the build's last commit, bound to the index definition the
+/// first published, makes both active, or withdraws both when stored nodes
+/// break it. The statement waits for that outcome up to its bound; past it,
+/// it returns the constraint validating with the build's operation, and the
+/// build goes on without it. Asking again for the same constraint while it
+/// validates (`IF NOT EXISTS`, as after a lost reply) returns that same
+/// constraint and operation; no second build is admitted.
 fn execute_create_constraint(
     name: Option<&str>,
     if_not_exists: bool,
@@ -17771,25 +17859,17 @@ fn execute_create_constraint(
     };
 
     if let Some(holder) = ctx.constraint_label(&constraint.name)? {
-        let existing = ctx
-            .load_current_label_schema(&holder)?
-            .and_then(|s| s.constraint(&constraint.name).cloned());
-        if existing
-            .as_ref()
-            .is_some_and(|c| c.state == ConstraintState::Validating)
-        {
-            return Err(ExecutionError::CatalogRefused(format!(
-                "constraint '{}' exists on :{holder} but its validation did not finish; \
-                 drop it and create it again",
-                constraint.name
-            )));
-        }
         if if_not_exists {
-            return Ok(vec![constraint_row(
-                existing.as_ref().unwrap_or(&constraint),
-                &holder,
-                ("created", false),
-            )]);
+            let existing = ctx
+                .load_current_label_schema(&holder)?
+                .and_then(|s| s.constraint(&constraint.name).cloned());
+            let existing = existing.as_ref().unwrap_or(&constraint);
+            let mut row = constraint_row(existing, &holder, ("created", false));
+            row.insert(
+                "operation".to_string(),
+                owned_build_operation(&existing.name, ctx),
+            );
+            return Ok(vec![row]);
         }
         return Err(ExecutionError::CatalogObjectExists {
             object: CatalogObject::Constraint,
@@ -17802,15 +17882,13 @@ fn execute_create_constraint(
             .iter()
             .find(|c| c.same_requirement(&constraint))
     }) {
-        if existing.state == ConstraintState::Validating {
-            return Err(ExecutionError::CatalogRefused(format!(
-                "an equivalent constraint '{}' exists on :{label} but its validation did not \
-                 finish; drop it and create it again",
-                existing.name
-            )));
-        }
         if if_not_exists {
-            return Ok(vec![constraint_row(existing, label, ("created", false))]);
+            let mut row = constraint_row(existing, label, ("created", false));
+            row.insert(
+                "operation".to_string(),
+                owned_build_operation(&existing.name, ctx),
+            );
+            return Ok(vec![row]);
         }
         return Err(ExecutionError::CatalogObjectExists {
             object: CatalogObject::Constraint,
@@ -17904,7 +17982,10 @@ fn execute_create_constraint(
         let committed = ctx.commit_catalog_change(stage_constraint);
         ctx.label_schema_cache.remove(label);
         committed?;
-        return Ok(vec![constraint_row(&published, label, ("created", true))]);
+        // Checked on each node in the commit itself: no build, no operation.
+        let mut row = constraint_row(&published, label, ("created", true));
+        row.insert("operation".to_string(), Value::Null);
+        return Ok(vec![row]);
     }
 
     let mut descriptor =
@@ -17925,16 +18006,15 @@ fn execute_create_constraint(
 
     // The executor activates the constraint with the index, or withdraws it
     // with the index, in the commit that ends the build.
-    let indexed = await_index_build(&def, ctx);
+    let waited = await_index_build(&def, shape.wait, ctx);
     ctx.label_schema_cache.remove(label);
-    let indexed = indexed?;
+    let waited = waited?;
 
-    published.state = ConstraintState::Active;
+    if matches!(waited, BuildWait::Published(_)) {
+        published.state = ConstraintState::Active;
+    }
     let mut row = constraint_row(&published, label, ("created", true));
-    row.insert(
-        "nodes_indexed".to_string(),
-        Value::Int(i64::try_from(indexed).unwrap_or(i64::MAX)),
-    );
+    insert_build(&mut row, &def, waited);
     Ok(vec![row])
 }
 

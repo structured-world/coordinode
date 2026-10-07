@@ -6,6 +6,8 @@
 //! statement `CREATE CONSTRAINT` and `DROP CONSTRAINT` run as, so both reach
 //! one catalog through one admission path.
 
+use core::time::Duration;
+
 use coordinode_core::graph::types::VectorConsistencyMode;
 use coordinode_core::schema::definition::{
     ConstraintKind, EdgeTypeSchema, LabelSchema, NodeConstraint,
@@ -13,6 +15,7 @@ use coordinode_core::schema::definition::{
 use coordinode_core::txn::read_consistency::ReadConsistencyMode;
 use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
 use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+use coordinode_query::index::GenerationId;
 use coordinode_query::planner::logical::{LogicalOp, LogicalPlan};
 
 use super::{Database, DatabaseError, QuerySession, Statement, TxnMode};
@@ -32,6 +35,11 @@ pub struct ConstraintDeclaration {
     /// A constraint of the same name, or an equivalent one, already in place
     /// is returned instead of refused.
     pub if_not_exists: bool,
+    /// How long the call waits for the build of the index a uniqueness or
+    /// key constraint owns; `None` takes the engine's statement wait. A call
+    /// that outwaits it returns the constraint validating, with its build
+    /// still running.
+    pub wait: Option<Duration>,
 }
 
 /// A constraint as the catalog holds it.
@@ -44,6 +52,11 @@ pub struct LabelConstraint {
     /// The index it owns and is enforced through, for a uniqueness or key
     /// constraint whose index is published.
     pub backing_index: Option<String>,
+    /// The build of that index: the operation [`Database::index_build`]
+    /// inspects and [`Database::cancel_index_build`] cancels. While the
+    /// constraint validates, it is the build deciding whether it becomes
+    /// active.
+    pub operation: Option<GenerationId>,
 }
 
 /// What a label definition does to a label that already has one.
@@ -290,16 +303,19 @@ impl Database {
         Ok(names)
     }
 
-    /// Create a constraint, as `CREATE CONSTRAINT` does: a uniqueness or key
-    /// constraint returns once the index it owns is validated against the
-    /// stored nodes, or fails with nothing left behind. Returns the
-    /// constraint as the catalog holds it.
+    /// Create a constraint, as `CREATE CONSTRAINT` does. A uniqueness or key
+    /// constraint is published validating, enforced on every write, with
+    /// the build of the index it owns admitted as an engine operation; the
+    /// call waits up to the declaration's bound for that build. Returns the
+    /// constraint as the catalog holds it: active once the build published
+    /// it, validating with its operation when the wait ran out first.
     ///
     /// # Errors
     ///
     /// A constraint or index of the name, or an equivalent constraint,
     /// already exists (unless `if_not_exists`); the constraint cannot hold
-    /// under the label's definition; stored nodes break it; or the catalog
+    /// under the label's definition; stored nodes break it, or the build was
+    /// cancelled, within the wait (nothing is left behind); or the catalog
     /// could not be written.
     pub fn create_constraint(
         &self,
@@ -311,6 +327,7 @@ impl Database {
             properties,
             kind,
             if_not_exists,
+            wait,
         } = declaration;
         let rows = self.run_catalog_statement(LogicalOp::CreateConstraint {
             name,
@@ -318,6 +335,7 @@ impl Database {
             label,
             properties,
             kind,
+            wait,
         })?;
         let created = rows
             .first()
@@ -374,13 +392,16 @@ impl Database {
                 schema
                     .constraints()
                     .iter()
-                    .map(|constraint| LabelConstraint {
-                        label: label.clone(),
-                        backing_index: indexes
+                    .map(|constraint| {
+                        let owned = indexes
                             .iter()
-                            .find(|d| d.owner.as_deref() == Some(constraint.name.as_str()))
-                            .and_then(|d| d.name.clone()),
-                        constraint: constraint.clone(),
+                            .find(|d| d.owner.as_deref() == Some(constraint.name.as_str()));
+                        LabelConstraint {
+                            label: label.clone(),
+                            backing_index: owned.and_then(|d| d.name.clone()),
+                            operation: owned.map(|d| d.generation),
+                            constraint: constraint.clone(),
+                        }
                     })
                     .collect::<Vec<_>>()
             })

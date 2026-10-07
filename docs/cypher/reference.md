@@ -367,13 +367,36 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   already has a duplicate fails and leaves no index. A build of a new index
   that fails or is cancelled withdraws the index (and the constraint owning
   it); a rebuild of an existing one keeps it, marked failed. `DROP INDEX`
-  during a build ends the build without writing more entries. The embedded
-  API cancels a build (`Database::cancel_index_build`) and lists builds with
-  where each stands (`Database::index_build_status`: accepted, waiting for a
-  seat or for older transactions, indexing with the count so far, then
-  published, failed with its reason, or cancelled). How many builds run at
-  once and how long a build waits for older transactions are server settings
-  (`index_build_max_running`, `index_build_older_transactions_wait_secs`).
+  during a build ends the build without writing more entries. How many
+  builds run at once and how long a build waits for older transactions are
+  server settings (`index_build_max_running`,
+  `index_build_older_transactions_wait_secs`).
+- **Builds are operations.** A build belongs to the engine, not to the
+  statement that admitted it. `CREATE INDEX`, `CREATE UNIQUE INDEX` and
+  `CREATE CONSTRAINT` return its `operation` and wait for it up to
+  `index_build_statement_wait_secs` (60 by default). A statement that
+  outwaits it returns with the build still running: the index `BUILDING`,
+  a uniqueness or key constraint `VALIDATING` and already enforced on every
+  write. The build goes on, and its outcome makes the constraint `ACTIVE` or
+  withdraws it. `CREATE CONSTRAINT ... IF NOT EXISTS` while the constraint
+  validates (as after a lost reply) returns the same constraint and
+  operation, admitting no second build. The operation is inspected, awaited
+  and cancelled with procedures:
+
+  ```cypher
+  CALL db.indexBuilds()                  // every build
+  CALL db.indexBuild(operation, waitMs)  // one build, after waiting up to waitMs
+  CALL db.cancelIndexBuild(operation)    // cancel; an outcome already reached stays
+  ```
+
+  Each build row has `operation`, `index`, `label`, `state` (`ACCEPTED`,
+  `RUNNING`, `PUBLISHED`, `FAILED`, `CANCELLED`), `phase`
+  (`AWAITING_SEAT`, `AWAITING_OLDER_TRANSACTIONS`, `INDEXING` while running
+  on this member), `indexed` and `failure`. Waiting cancels nothing. The
+  embedded API has the same calls (`Database::index_build_status`,
+  `Database::index_build`, `Database::cancel_index_build`), and gRPC has
+  `SchemaService.ListIndexBuilds`, `GetIndexBuild` and `CancelIndexBuild`; a
+  `CreateConstraint` names its own wait in `wait`.
 - **Member-local indexes.** A full-text index and a vector index are built by
   every member from the data it holds; their definitions replicate, their
   readiness is each member's own. A full-text index's backfill runs on the

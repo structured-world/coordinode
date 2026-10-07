@@ -59,6 +59,7 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 tonic-prost = "0.14"
 prost = { workspace = true }
+prost-types = { workspace = true }
 tower = "0.5"
 http = "1"
 pin-project-lite = "0.2"

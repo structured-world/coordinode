@@ -478,6 +478,9 @@ pub enum LogicalOp {
         label: String,
         properties: Vec<String>,
         kind: coordinode_core::schema::definition::ConstraintKind,
+        /// How long the statement waits for the build of the index the
+        /// constraint owns; `None` takes the engine's statement wait.
+        wait: Option<core::time::Duration>,
     },
 
     /// `DROP CONSTRAINT`: remove a constraint, and the index it owns.

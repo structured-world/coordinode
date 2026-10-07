@@ -8,7 +8,8 @@
 use std::time::{Duration, Instant};
 
 use coordinode_core::graph::types::Value;
-use coordinode_embed::Database;
+use coordinode_core::schema::definition::{ConstraintKind, ConstraintState};
+use coordinode_embed::{ConstraintDeclaration, Database};
 use coordinode_modality::IndexState;
 use coordinode_query::index::{BuildPhase, BuildState, BuildStatus, IndexBuildConfig};
 
@@ -103,12 +104,14 @@ fn a_running_build_is_inspectable_and_publishes_the_index() {
 fn a_cancelled_build_withdraws_its_new_index() {
     let (mut db, _dir) = open_db();
     let older = db.begin_transaction();
+    let mut operation = None;
 
     std::thread::scope(|s| {
         let created = s.spawn(|| create_index(&db, "CREATE INDEX user_email ON :User(email)"));
-        await_held(&db, "user_email");
+        operation = Some(await_held(&db, "user_email").generation);
         assert!(
-            db.cancel_index_build("user_email"),
+            db.cancel_index_build(operation.expect("held"))
+                .expect("cancel"),
             "a running build cancels"
         );
         db.rollback_transaction(older)
@@ -119,7 +122,8 @@ fn a_cancelled_build_withdraws_its_new_index() {
 
     assert!(index_named(db.engine(), "user_email").is_none());
     assert!(
-        !db.cancel_index_build("user_email"),
+        !db.cancel_index_build(operation.expect("held"))
+            .expect("cancel again"),
         "nothing is left to cancel"
     );
     db.execute_cypher("CREATE INDEX user_email ON :User(email)")
@@ -483,4 +487,172 @@ fn an_interrupted_build_finishes_after_a_restart() {
         .execute_cypher("MATCH (u:User) WHERE u.email = 'a@x' RETURN u.email AS e")
         .expect("match");
     assert_eq!(rows[0].get("e"), Some(&Value::String("a@x".into())));
+}
+
+/// A uniqueness constraint over `:User(email)` named `user_email`, waiting
+/// `wait` for its build.
+fn email_constraint(wait: Duration, if_not_exists: bool) -> ConstraintDeclaration {
+    ConstraintDeclaration {
+        name: Some("user_email".into()),
+        label: "User".into(),
+        properties: vec!["email".into()],
+        kind: ConstraintKind::Unique,
+        if_not_exists,
+        wait: Some(wait),
+    }
+}
+
+/// A call whose wait runs out before the build ends returns the constraint
+/// validating, with its build's operation, and the build goes on: it is
+/// inspectable while held, enforces the constraint on writes meanwhile, and
+/// publishes the constraint active once the older transaction ends. Asking
+/// again with IF NOT EXISTS, as after a lost reply, returns the same
+/// operation and admits no second build.
+#[test]
+fn a_constraint_that_outwaits_its_call_validates_on_as_an_operation() {
+    let (mut db, _dir) = open_db();
+    let older = db.begin_transaction();
+
+    let created = db
+        .create_constraint(email_constraint(Duration::ZERO, false))
+        .expect("admitted");
+    assert_eq!(created.constraint.state, ConstraintState::Validating);
+    let operation = created.operation.expect("the build's operation");
+    let held = db
+        .index_build(operation, Duration::ZERO)
+        .expect("inspect")
+        .expect("the build is listed");
+    assert!(
+        !held.record.as_ref().expect("recorded").state.is_terminal(),
+        "{held:?}"
+    );
+    assert_eq!(
+        held.index.as_ref().and_then(|i| i.name.as_deref()),
+        Some("user_email")
+    );
+
+    let retried = db
+        .create_constraint(email_constraint(Duration::ZERO, true))
+        .expect("found");
+    assert_eq!(retried.operation, Some(operation), "the same build");
+    assert_eq!(retried.constraint.state, ConstraintState::Validating);
+    assert_eq!(
+        db.index_build_status().expect("inspect").len(),
+        1,
+        "no second build"
+    );
+    write(&db, "CREATE (:User {email: 'a@x'})").expect_err("enforced while validating");
+
+    db.rollback_transaction(older)
+        .expect("end the older transaction");
+    let done = db
+        .index_build(operation, Duration::from_secs(20))
+        .expect("inspect")
+        .expect("listed");
+    assert_eq!(done.record.map(|r| r.state), Some(BuildState::Published));
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed[0].constraint.state, ConstraintState::Active);
+    assert_eq!(listed[0].operation, Some(operation));
+    assert_eq!(holders(&mut db, "a@x"), 1);
+}
+
+/// Cancelling the build of a constraint whose call stopped waiting withdraws
+/// the constraint with its index in one catalog change, and a later
+/// cancellation of the same operation finds nothing left to stop.
+#[test]
+fn cancelling_a_validating_constraint_build_withdraws_the_constraint() {
+    let (db, _dir) = open_db();
+    let older = db.begin_transaction();
+    let operation = db
+        .create_constraint(email_constraint(Duration::ZERO, false))
+        .expect("admitted")
+        .operation
+        .expect("operation");
+
+    assert!(db.cancel_index_build(operation).expect("cancel"));
+    db.rollback_transaction(older)
+        .expect("end the older transaction");
+    assert!(db.constraints().expect("constraints").is_empty());
+    assert!(index_named(db.engine(), "user_email").is_none());
+    assert_eq!(
+        db.index_build(operation, Duration::ZERO)
+            .expect("inspect")
+            .and_then(|s| s.record)
+            .map(|r| r.state),
+        Some(BuildState::Cancelled)
+    );
+    assert!(
+        !db.cancel_index_build(operation).expect("cancel again"),
+        "an outcome stays"
+    );
+    write(&db, "CREATE (:User {email: 'a@x'})").expect("no constraint holds the value");
+}
+
+/// The same operations through CALL: db.indexBuild waits for the outcome
+/// the statement did not, db.indexBuilds lists the build, an unknown
+/// operation is refused, and db.cancelIndexBuild reports a build that
+/// already published as not cancelled.
+#[test]
+fn index_build_procedures_inspect_await_and_cancel() {
+    let (mut db, _dir) = open_db();
+    db.set_index_build_config(IndexBuildConfig {
+        statement_wait: Duration::ZERO,
+        ..db.index_build_config()
+    });
+    let older = db.begin_transaction();
+    let rows = db
+        .execute_cypher("CREATE INDEX user_email ON :User(email)")
+        .expect("admitted");
+    assert_eq!(
+        rows[0].get("state"),
+        Some(&Value::String("BUILDING".into()))
+    );
+    let Some(Value::Int(operation)) = rows[0].get("operation").cloned() else {
+        panic!("no operation: {rows:?}");
+    };
+    db.rollback_transaction(older)
+        .expect("end the older transaction");
+
+    let awaited = db
+        .execute_cypher(&format!(
+            "CALL db.indexBuild({operation}, 20000) YIELD state, index RETURN state, index"
+        ))
+        .expect("inspect");
+    assert_eq!(
+        awaited[0].get("state"),
+        Some(&Value::String("PUBLISHED".into()))
+    );
+    assert_eq!(
+        awaited[0].get("index"),
+        Some(&Value::String("user_email".into()))
+    );
+    let listed = db
+        .execute_cypher("CALL db.indexBuilds() YIELD operation RETURN operation")
+        .expect("list");
+    assert!(
+        listed
+            .iter()
+            .any(|r| r.get("operation") == Some(&Value::Int(operation)))
+    );
+    let cancelled = db
+        .execute_cypher(&format!(
+            "CALL db.cancelIndexBuild({operation}) YIELD cancelled, state RETURN cancelled, state"
+        ))
+        .expect("cancel");
+    assert_eq!(cancelled[0].get("cancelled"), Some(&Value::Bool(false)));
+    assert_eq!(
+        cancelled[0].get("state"),
+        Some(&Value::String("PUBLISHED".into()))
+    );
+    assert!(
+        db.execute_cypher("CALL db.indexBuild(999999) YIELD state RETURN state")
+            .is_err(),
+        "an unknown operation is refused"
+    );
+    assert_eq!(
+        index_named(db.engine(), "user_email")
+            .expect("defined")
+            .state,
+        IndexState::Ready
+    );
 }

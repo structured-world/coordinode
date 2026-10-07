@@ -299,6 +299,10 @@ pub struct ServerConfig {
     /// a unique index still being built free (`None` = 100000); past it the
     /// write is refused as unresolved.
     pub index_build_unique_read_limit: Option<u64>,
+    /// How long a statement or call creating an index waits for its build
+    /// when it names no bound, in seconds (`None` = 60); past it, it returns
+    /// with the build still running and its operation.
+    pub index_build_statement_wait_secs: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -460,6 +464,7 @@ impl Default for ServerConfig {
             index_build_max_running: None,
             index_build_older_transactions_wait_secs: None,
             index_build_unique_read_limit: None,
+            index_build_statement_wait_secs: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

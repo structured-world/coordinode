@@ -22,6 +22,7 @@ fn declare(name: &str, property: &str, kind: ConstraintKind) -> ConstraintDeclar
         properties: vec![property.into()],
         kind,
         if_not_exists: false,
+        wait: None,
     }
 }
 

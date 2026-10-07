@@ -781,6 +781,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             label: c.label.clone(),
             properties: c.properties.clone(),
             kind: c.kind.clone(),
+            wait: None,
         }),
         Clause::DropConstraint(c) => Ok(LogicalOp::DropConstraint {
             name: c.name.clone(),

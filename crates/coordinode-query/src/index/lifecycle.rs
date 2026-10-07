@@ -177,11 +177,19 @@ pub struct IndexBuildConfig {
     /// a unique index still being built free; past it the write is refused
     /// as unresolved, to be retried once the build is done.
     pub unique_admission_read_limit: u64,
+    /// How long a statement that creates an index waits for its build when
+    /// it names no bound of its own. A statement that outwaits it returns
+    /// with the build still running and the operation that identifies it;
+    /// the build goes on without the statement.
+    pub statement_wait: Duration,
 }
 
 /// The most stored node rows a write reads by default to prove a value
 /// free in a unique index still being built.
 pub const DEFAULT_UNIQUE_ADMISSION_READ_LIMIT: u64 = 100_000;
+
+/// How long a statement creating an index waits for its build by default.
+pub const DEFAULT_STATEMENT_WAIT: Duration = Duration::from_secs(60);
 
 impl Default for IndexBuildConfig {
     fn default() -> Self {
@@ -189,6 +197,7 @@ impl Default for IndexBuildConfig {
             max_running: 2,
             older_transactions_wait: super::build::DEFAULT_OLDER_TRANSACTIONS_WAIT,
             unique_admission_read_limit: DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
+            statement_wait: DEFAULT_STATEMENT_WAIT,
         }
     }
 }
@@ -225,12 +234,45 @@ pub enum BuildPhase {
 /// holds it, where it stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildStatus {
-    /// The generation the build fills.
+    /// The generation the build fills, and the operation that identifies
+    /// it.
     pub generation: GenerationId,
     /// The build's record in the catalog.
     pub record: Option<IndexBuildRecord>,
     /// Where it stands on this process's executor.
     pub phase: Option<BuildPhase>,
+    /// The index the record names, while its definition exists. `None`
+    /// once the index is withdrawn or dropped.
+    pub index: Option<BuildIndex>,
+}
+
+impl BuildStatus {
+    /// Nodes indexed so far: the executor's live count while it fills,
+    /// else the record's. Progress, not proof of coverage.
+    pub fn indexed(&self) -> Option<u64> {
+        match (&self.phase, &self.record) {
+            (Some(BuildPhase::Indexing { indexed: Some(n) }), _) => Some(*n),
+            (_, Some(record)) => Some(record.indexed),
+            (_, None) => None,
+        }
+    }
+
+    /// Why the build failed, once it has.
+    pub fn failure(&self) -> Option<&str> {
+        match self.record.as_ref().map(|r| &r.state) {
+            Some(BuildState::Failed { reason }) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// The index a build fills, as inspection names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIndex {
+    /// The index's name; `None` for an unnamed index.
+    pub name: Option<String>,
+    /// The label whose nodes it covers.
+    pub label: String,
 }
 
 /// The build of a full-text index over `properties` of `label`: each
@@ -572,24 +614,72 @@ impl IndexBuildService {
     ///
     /// The records could not be read.
     pub fn builds(&self) -> Result<Vec<BuildStatus>, StoreError> {
-        let records = LocalIndexStore::new(self.shared.env.engine()).list_builds()?;
+        let store = LocalIndexStore::new(self.shared.env.engine());
+        let records = store.list_builds()?;
         let mut phases = self.shared.phases.lock().clone();
-        let mut out: Vec<BuildStatus> = records
-            .into_iter()
-            .map(|record| BuildStatus {
+        let mut out = Vec::with_capacity(records.len() + phases.len());
+        for record in records {
+            out.push(BuildStatus {
                 generation: record.generation,
                 phase: phases.remove(&record.generation),
+                index: index_of(&store, &record)?,
                 record: Some(record),
-            })
-            .collect();
+            });
+        }
         out.extend(phases.into_iter().map(|(generation, phase)| BuildStatus {
             generation,
             record: None,
             phase: Some(phase),
+            index: None,
         }));
         out.sort_by_key(|s| s.generation);
         Ok(out)
     }
+
+    /// The build of `generation` as [`Self::builds`] shows it, after waiting
+    /// up to `wait` for it to reach an outcome; `None` when neither the
+    /// catalog records it nor an executor of this process holds it. Waiting
+    /// cancels nothing.
+    ///
+    /// # Errors
+    ///
+    /// The record could not be read.
+    pub fn status(
+        &self,
+        generation: GenerationId,
+        wait: Duration,
+    ) -> Result<Option<BuildStatus>, StoreError> {
+        if !wait.is_zero() {
+            self.wait(generation, Some(wait))?;
+        }
+        let store = LocalIndexStore::new(self.shared.env.engine());
+        let record = store.load_build(generation)?.map(|(record, _)| record);
+        let phase = self.shared.phases.lock().get(&generation).copied();
+        if record.is_none() && phase.is_none() {
+            return Ok(None);
+        }
+        let index = match &record {
+            Some(record) => index_of(&store, record)?,
+            None => None,
+        };
+        Ok(Some(BuildStatus {
+            generation,
+            record,
+            phase,
+            index,
+        }))
+    }
+}
+
+/// The index `record` builds, while its definition exists.
+fn index_of(
+    store: &LocalIndexStore<'_>,
+    record: &IndexBuildRecord,
+) -> Result<Option<BuildIndex>, StoreError> {
+    Ok(store.load_definition(record.index)?.map(|d| BuildIndex {
+        name: d.name.clone(),
+        label: d.label.clone(),
+    }))
 }
 
 /// What an executor took: the definition it fills, the version of its

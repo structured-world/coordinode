@@ -203,6 +203,7 @@ pub(crate) async fn serve(
         index_build_max_running,
         index_build_older_transactions_wait_secs,
         index_build_unique_read_limit,
+        index_build_statement_wait_secs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -733,6 +734,8 @@ pub(crate) async fn serve(
         ),
         unique_admission_read_limit: index_build_unique_read_limit
             .unwrap_or(defaults.unique_admission_read_limit),
+        statement_wait: index_build_statement_wait_secs
+            .map_or(defaults.statement_wait, std::time::Duration::from_secs),
     });
     // What a statement executes under when neither it nor its session names a
     // concern.

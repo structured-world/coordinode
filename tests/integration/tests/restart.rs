@@ -81,6 +81,7 @@ async fn require_unique(proc: &CoordinodeProcess, label: &str, property: &str) {
             kind: ConstraintKind::Unique as i32,
             property_type: None,
             if_not_exists: false,
+            wait: None,
         })
         .await
         .expect("create_constraint");

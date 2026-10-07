@@ -389,11 +389,21 @@ impl std::fmt::Display for ConstraintKind {
 pub enum ConstraintState {
     /// Published and enforced on every write, while its index is still being
     /// validated against the stored data: the guarantee over that data is
-    /// not established yet. A constraint left here by an interrupted build
-    /// stays enforced until it is dropped.
+    /// not established yet. The build doing it is an operation of its own:
+    /// an interrupted one is taken up again, and its outcome makes the
+    /// constraint active or withdraws it.
     Validating,
     /// Validated against the stored data and enforced on every write.
     Active,
+}
+
+impl core::fmt::Display for ConstraintState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Validating => "VALIDATING",
+            Self::Active => "ACTIVE",
+        })
+    }
 }
 
 /// A named constraint on the nodes whose primary label is the schema's label.

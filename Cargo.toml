@@ -77,6 +77,8 @@ tonic = "0.14"
 # reason rather than on the English text of a message.
 tonic-types = "0.14"
 prost = "0.14"
+# google.protobuf well-known types (Duration) the generated code refers to.
+prost-types = "0.14"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -172,6 +172,9 @@ fn builtins_are_registered_once_each() {
         "db.advisor.slowQueries",
         "db.advisor.dismiss",
         "db.advisor.reset",
+        "db.indexBuilds",
+        "db.indexBuild",
+        "db.cancelIndexBuild",
     ] {
         assert!(names.contains(&name), "{name} missing");
     }
