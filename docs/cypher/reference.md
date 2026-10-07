@@ -276,19 +276,25 @@ CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (
   valid_to:   TIMESTAMP
 )
 
--- Generalised multi-edge: schema-declared discriminator column.
--- Multiple edges of the same type between the same pair, distinguished
--- by the discriminator value. `TEMPORAL` is sugar for
--- `DISCRIMINATED BY (valid_from)` + interval semantics.
+-- Edge identity: the declared property that, with the two endpoints,
+-- identifies one edge, so one endpoint pair can hold several.
 CREATE EDGE TYPE KNOWS WITH (
   context:   STRING NOT NULL,
-  since:     DATE,
   intensity: FLOAT
 ) DISCRIMINATED BY (context)
+
+-- Identity and temporality are independent: a temporal type may name its
+-- own discriminator, before or after WITH (...).
+CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (assertion_key) WITH (
+  assertion_key: STRING NOT NULL
+)
 ```
 
 - `TEMPORAL` opts the type into bitemporal semantics. On `CREATE`, every instance must supply `valid_from`. The engine auto-populates `__ingestion_ts__` (HLC commit-ts, user-readable, immutable). See [Temporal Edges](./temporal-edges.md) for the full bitemporal model.
-- `DISCRIMINATED BY (col)` declares an edge type with multiple edges allowed per `(src, tgt)` pair, distinguished by the named column. The column must be `NOT NULL` and is auto-indexed. Discriminator equality predicates (`WHERE k.context = 'work'`) push down to a key-prefix lookup, not a property scan — `O(1)` per matched neighbour. Range predicates push down to bounded prefix scans. The discriminator is immutable per type — migration is "create new type, copy data, drop old".
+- `DISCRIMINATED BY (col)` names the property that, with the endpoints, identifies an edge. The column must be declared in `WITH (...)` as `NOT NULL` with type `INT`, `FLOAT`, `BOOL`, `TIMESTAMP`, `STRING` or `BLOB`; anything else is refused when the type is created, and nothing is written. Two edges are the same edge exactly when their discriminator values are equal: `-0.0` and `0.0` are one value, `NaN` is not accepted, and a `BLOB` is compared by its whole value.
+- A `TEMPORAL` type that names no discriminator is identified by `valid_from` (a `TIMESTAMP`, or an `INT` of Unix microseconds). The resolved discriminator is returned by the statement as `discriminator` and by the schema API.
+- What identifies an edge is fixed when the type is created; migration is "create new type, copy data, drop old".
+- Reading and writing edges of a type that names its own discriminator is not supported yet: a statement naming such a type is refused by name, and a statement ranging over every type (`MATCH (a)-[r]->(b)`) passes it over.
 - Non-temporal and temporal labels coexist in the same database out of the box — non-temporal pays zero per-node storage overhead.
 - The `TEMPORAL` flag is immutable: re-`CREATE` of an existing label/type is rejected. Migration path is "create new type, copy data, drop old".
 - Reserved engine-managed property names rejected at DDL time: `__ingestion_ts__`, `__src__`, `__tgt__`, `__type__`. `valid_from` and `valid_to` are user-supplied bitemporal axis fields (declarable, not reserved).
