@@ -43,6 +43,7 @@ use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::partition::Partition;
 use coordinode_storage::engine::transaction::Transaction;
+use coordinode_storage::error::StorageError;
 
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
@@ -408,6 +409,23 @@ fn decode<T: serde::de::DeserializeOwned>(kind: &'static str, bytes: &[u8]) -> S
     })
 }
 
+/// Decode a catalog record listed at `key`. One that does not decode refuses
+/// the listing: a catalog read without it would serve the database without
+/// that index, or that build, as if it had never been created.
+fn decode_catalog<T: serde::de::DeserializeOwned>(
+    kind: &'static str,
+    key: &[u8],
+    bytes: &[u8],
+) -> StoreResult<T> {
+    rmp_serde::from_slice(bytes).map_err(|e| {
+        StoreError::Storage(StorageError::UnreadableCatalog {
+            kind,
+            key: coordinode_storage::error::printable_key(key),
+            detail: e.to_string(),
+        })
+    })
+}
+
 fn decode_index_id(bytes: &[u8]) -> StoreResult<IndexId> {
     match <[u8; 8]>::try_from(bytes) {
         Ok(raw) => Ok(IndexId::from_raw(u64::from_be_bytes(raw))),
@@ -631,11 +649,8 @@ impl IndexStore for LocalIndexStore<'_> {
             .engine
             .prefix_scan(Partition::Schema, IndexDefinition::SCHEMA_PREFIX)?
         {
-            let (_key, value) = guard.into_inner()?;
-            match decode::<IndexDefinition>("index definition", &value) {
-                Ok(def) => out.push(def),
-                Err(e) => tracing::warn!("list_definitions: skipping corrupt index def: {e}"),
-            }
+            let (key, value) = guard.into_inner()?;
+            out.push(decode_catalog("index definition", &key, &value)?);
         }
         Ok(out)
     }
@@ -778,11 +793,8 @@ impl IndexStore for LocalIndexStore<'_> {
             .engine
             .prefix_scan(Partition::Schema, IndexBuildRecord::PREFIX)?
         {
-            let (_key, value) = guard.into_inner()?;
-            match decode::<IndexBuildRecord>("index build record", &value) {
-                Ok(record) => out.push(record),
-                Err(e) => tracing::warn!("list_builds: skipping corrupt build record: {e}"),
-            }
+            let (key, value) = guard.into_inner()?;
+            out.push(decode_catalog("index build record", &key, &value)?);
         }
         Ok(out)
     }

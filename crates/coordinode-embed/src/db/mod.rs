@@ -952,6 +952,12 @@ impl Database {
             }
         }
 
+        // The index catalog, before anything in this open writes: a definition
+        // this build cannot read refuses the open, rather than serving the
+        // database without that index and the uniqueness it enforces.
+        let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
+        index_registry.load_all(&engine)?;
+
         let proposal_id_gen = Arc::new(ProposalIdGenerator::with_base(fresh_proposal_id_base()));
 
         // The verified field dictionary, before anything reads stored data:
@@ -964,12 +970,6 @@ impl Database {
             Arc::clone(&oracle),
         )?);
         let opened_view = fields.current()?;
-
-        // Load index registry from storage for EXPLAIN SUGGEST accuracy.
-        let index_registry = Arc::new(coordinode_query::index::IndexRegistry::new());
-        if let Err(e) = index_registry.load_all(&engine) {
-            tracing::warn!("failed to load index registry: {e}, starting fresh");
-        }
 
         // Follow the applied commits (Raft entries, or the local commits of a
         // store without Raft) from before the rebuild below, so no commit

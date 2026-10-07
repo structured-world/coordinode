@@ -631,6 +631,55 @@ fn constraints_survive_a_restart() {
     expect_unique_violation(db.execute_cypher("CREATE (u:User {email: 'a@x'})"));
 }
 
+/// An index definition this build cannot read refuses the open, naming the
+/// record. The open used to skip it with a log line and serve the database
+/// without that index: a directory written by a development build with the
+/// earlier name-keyed catalog lost its unique indexes that way, and a
+/// duplicate the constraint forbids was then accepted.
+#[test]
+fn an_unreadable_index_definition_refuses_the_open() {
+    use coordinode_storage::Guard as _;
+    use coordinode_storage::engine::partition::Partition;
+    use coordinode_storage::error::StorageError;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let planted = {
+        let mut db = Database::open(dir.path()).expect("open");
+        db.execute_cypher("CREATE CONSTRAINT user_key FOR (u:User) REQUIRE u.email IS UNIQUE")
+            .expect("unique");
+        db.execute_cypher("CREATE (u:User {email: 'a@x'})")
+            .expect("create");
+        // The definition record in the shape the earlier catalog stored it:
+        // a MessagePack array opening with the index name.
+        let old_shape =
+            rmp_serde::to_vec(&("user_key", "User", vec!["email"], true)).expect("encode");
+        let key = db
+            .engine()
+            .prefix_scan(Partition::Schema, b"schema:idx:")
+            .expect("scan")
+            .next()
+            .expect("the constraint's index definition")
+            .into_inner()
+            .expect("read")
+            .0
+            .to_vec();
+        db.engine()
+            .put(Partition::Schema, &key, &old_shape)
+            .expect("plant");
+        db.persist().expect("persist");
+        key
+    };
+
+    match Database::open(dir.path()) {
+        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { kind, key, .. })) => {
+            assert_eq!(kind, "index definition");
+            assert_eq!(key, coordinode_storage::error::printable_key(&planted));
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("opened without the unique index it cannot read"),
+    }
+}
+
 /// A writer that validated under the schema before the constraint and
 /// commits after it cannot slip a breaking node in: the constraint, whose
 /// scan could not see the uncommitted node, is enabled, and the writer's

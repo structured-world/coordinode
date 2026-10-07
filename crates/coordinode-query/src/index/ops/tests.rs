@@ -83,26 +83,36 @@ fn list_index_definitions_empty_when_no_definitions_persisted() {
     assert!(listed.is_empty());
 }
 
-/// A corrupt definition record must not abort the listing: it is skipped
-/// with a warning so one bad definition does not take down the registry on
-/// open.
+/// A definition record this build cannot read refuses the listing, naming
+/// the record. Skipping it served the database without that index, and
+/// without the uniqueness it enforced, with only a log line to say so: a
+/// directory written by a development build with the earlier name-keyed
+/// catalog opened that way.
 #[test]
-fn list_index_definitions_skips_corrupt_bodies() {
+fn list_index_definitions_refuses_an_unreadable_record() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = test_engine(dir.path());
 
-    let real = publish(
+    publish(
         &engine,
         IndexDescriptor::btree("user_email", "User", "email"),
     );
+    let key = IndexDefinition::schema_key_of(crate::index::IndexId::from_raw(999));
     engine
         .put(
             coordinode_storage::engine::partition::Partition::Schema,
-            &IndexDefinition::schema_key_of(crate::index::IndexId::from_raw(999)),
+            &key,
             b"not-msgpack-bytes",
         )
         .expect("plant garbage");
 
-    let listed = list_index_definitions(&engine).expect("list");
-    assert_eq!(listed, vec![real], "corrupt entry skipped, real one kept");
+    match list_index_definitions(&engine) {
+        Err(StorageError::UnreadableCatalog {
+            kind, key: named, ..
+        }) => {
+            assert_eq!(kind, "index definition");
+            assert_eq!(named, coordinode_storage::error::printable_key(&key));
+        }
+        other => panic!("expected the unreadable record to refuse the listing, got {other:?}"),
+    }
 }

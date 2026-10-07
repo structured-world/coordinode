@@ -33,8 +33,10 @@ pub fn load_index_definition(
 
 /// List every persisted index definition in identity order.
 ///
-/// Skips entries whose body fails to decode rather than aborting the
-/// whole list (a corrupt index def shouldn't take out the registry).
+/// # Errors
+///
+/// [`StorageError::UnreadableCatalog`] for a definition this build cannot
+/// decode: the list never leaves one out.
 pub fn list_index_definitions(
     engine: &StorageEngine,
 ) -> Result<Vec<IndexDefinition>, StorageError> {
@@ -44,5 +46,5 @@ pub fn list_index_definitions(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;

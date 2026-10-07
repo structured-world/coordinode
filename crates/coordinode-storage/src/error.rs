@@ -163,6 +163,33 @@ pub enum StorageError {
         /// The engine format this release runs.
         runs: u32,
     },
+
+    /// A catalog record (an index definition, an index build) does not
+    /// decode in this build. Nothing is served without it: skipping it would
+    /// serve the database without that index and the uniqueness it enforces.
+    /// A directory written by a development build between releases carries
+    /// catalog records of an earlier layout and moves through a logical dump.
+    #[error(
+        "the {kind} record {key} does not decode in this build ({detail}); the data \
+         directory was written by another build or is damaged, and is not opened. A \
+         directory written by a development build is moved with a logical dump: \
+         `coordinode backup --format binary` with the build that wrote it, then \
+         `coordinode restore --format binary` with this one"
+    )]
+    UnreadableCatalog {
+        /// What the record is.
+        kind: &'static str,
+        /// The record's key, printable ([`printable_key`]).
+        key: String,
+        /// Why it does not decode.
+        detail: String,
+    },
+}
+
+/// `key` as text for a message: printable ASCII as it is, every other byte
+/// escaped.
+pub fn printable_key(key: &[u8]) -> String {
+    key.escape_ascii().to_string()
 }
 
 impl From<lsm_tree::Error> for StorageError {
