@@ -136,9 +136,29 @@ git submodule init -q
 ${sub_urls}git -c protocol.file.allow=always submodule update -q
 echo checkout=\$? > ../status.txt"
 
-if ! ssh "$host" "mkdir '$remote_root'"; then
-  echo "another check holds $remote_root on $host; if no run is in progress, remove it with: ssh $host rm -rf $remote_root" >&2
-  exit 1
+# The lock names its owner (this machine and this script's PID): a run killed
+# by a signal that skips the EXIT trap leaves the lock behind, and the next
+# run from the same machine finds the owner gone and takes the lock over.
+owner="$(hostname) $$"
+take_lock() {
+  ssh "$host" "mkdir '$remote_root' && echo '$owner' > '$remote_root/owner'"
+}
+if ! take_lock; then
+  held_by="$(ssh "$host" "cat '$remote_root/owner' 2>/dev/null" || true)"
+  held_host="${held_by% *}"
+  held_pid="${held_by##* }"
+  if [ "$held_host" = "$(hostname)" ] && [ -n "$held_pid" ] && ! kill -0 "$held_pid" 2>/dev/null &&
+    ! pgrep -f "$remote_root" >/dev/null; then
+    echo "the run that held $remote_root on $host (pid $held_pid) is gone; taking the lock over" >&2
+    ssh "$host" "rm -rf '$remote_root'"
+    take_lock || {
+      echo "another check took $remote_root on $host meanwhile" >&2
+      exit 1
+    }
+  else
+    echo "another check holds $remote_root on $host (owner: ${held_by:-unknown}); if no run is in progress, remove it with: ssh $host rm -rf $remote_root" >&2
+    exit 1
+  fi
 fi
 locked=1
 ssh "$host" "cat > '$remote_root/tree.bundle'" < "$bundle"
