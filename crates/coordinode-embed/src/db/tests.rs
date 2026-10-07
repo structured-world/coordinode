@@ -1825,3 +1825,56 @@ fn failed_planner_stats_are_cached_for_the_ttl() {
         "with no TTL the repaired counter is read at once"
     );
 }
+
+use coordinode_storage::error::StorageError;
+
+/// An engine with an index definition record this build cannot read.
+fn engine_with_unreadable_index_definition(dir: &Path) -> (Arc<StorageEngine>, Vec<u8>) {
+    let engine = Database::open(dir).expect("open").engine_shared();
+    let key = coordinode_query::index::IndexDefinition::schema_key_of(
+        coordinode_query::index::IndexId::from_raw(4242),
+    );
+    engine
+        .put(Partition::Schema, &key, b"not-msgpack-bytes")
+        .expect("plant");
+    (engine, key)
+}
+
+/// The vector index loader refuses an unreadable definition by itself, not
+/// only because the catalog load before it does: it used to scan the catalog
+/// on its own and skip what it could not decode, so an open that reached it
+/// served without that vector index.
+#[test]
+fn the_vector_index_loader_refuses_an_unreadable_definition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, key) = engine_with_unreadable_index_definition(dir.path());
+
+    match Database::load_vector_indexes(engine, &FieldInterner::new(), 1) {
+        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { key: named, .. })) => {
+            assert_eq!(named, coordinode_storage::error::printable_key(&key));
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("loaded without the definition it cannot read"),
+    }
+}
+
+/// The text index loader refuses an unreadable definition by itself; it used
+/// to start with no text indexes when the catalog listing failed.
+#[test]
+fn the_text_index_loader_refuses_an_unreadable_definition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, key) = engine_with_unreadable_index_definition(dir.path());
+
+    match Database::load_text_indexes(
+        &engine,
+        &FieldInterner::new(),
+        1,
+        &dir.path().join("text_indexes"),
+    ) {
+        Err(DatabaseError::Storage(StorageError::UnreadableCatalog { key: named, .. })) => {
+            assert_eq!(named, coordinode_storage::error::printable_key(&key));
+        }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("loaded without the definition it cannot read"),
+    }
+}
