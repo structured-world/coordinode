@@ -15,8 +15,8 @@
 #                   parallel-prune skew); QPS unchanged (search is
 #                   single-thread regardless of build pool).
 #   M-N-t4        - `num_threads: 4` matches the fixed-budget runs we
-#                   pin in our internal bench.yml CI smoke (i9-9900K
-#                   thread cap = 4) and competitors with explicit
+#                   pin in our internal bench.yml CI smoke (thread cap
+#                   = 4 on the bench host) and competitors with explicit
 #                   `num_threads=4` configs.
 #
 # Disabled by default to keep the per-PR sweep small; enable when

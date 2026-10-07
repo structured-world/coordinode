@@ -20,7 +20,7 @@ const ModalityTabs = defineAsyncComponent(() => import("./ModalityTabs.vue"));
 CoordiNode benchmarks use industry-standard suites (ann-benchmarks, LDBC SNB, YCSB, TSBS, Search Benchmark Game); every result is JSON-recorded with hardware fingerprint + Git SHA so the timeline is reproducible end-to-end.
 
 ::: tip Live data
-The charts below are generated from JSON files at [`bench-results/`](https://github.com/structured-world/coordinode/tree/main/bench-results) on every commit. CoordiNode results are produced automatically by CI on a dedicated bench host (Intel i9-9900K, 8C/16T) on every push to `main` — accumulating a full timeline. Competitor baselines (hnswlib, Faiss, MongoDB, etc.) are pinned to a specific version, run manually on the same host, and **replaced** when we re-bench against a newer build — no competitor history is kept in-repo, only the current head-to-head.
+The charts below are generated from JSON files at [`bench-results/`](https://github.com/structured-world/coordinode/tree/main/bench-results) on every commit. CoordiNode results are produced automatically by CI on a dedicated bench host on every push to `main`, accumulating a full timeline. Competitor baselines (hnswlib, Faiss, MongoDB, etc.) are pinned to a specific version, run manually on the bench host, and **replaced** when we re-bench against a newer build: no competitor history is kept in-repo, only the current head-to-head. Each result names the host it ran on (see below); compare numbers only between results from the same host.
 :::
 
 <ClientOnly>
@@ -35,13 +35,13 @@ The charts below are generated from JSON files at [`bench-results/`](https://git
 
 ## Hardware fingerprint
 
-Every bench JSON records the host:
+Every bench JSON records the host it ran on. Since October 2026 the bench host is:
 
 ```
-Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz  (8 cores / 16 threads, 64 GB RAM)
+Intel(R) Xeon(R) CPU E5-1650 v4 @ 3.60GHz  (6 cores / 12 threads, KVM guest, 32 GB RAM)
 ```
 
-This is intentionally **modest desktop-class hardware** — when CoordiNode reports a number on this CPU, the equivalent server-class run is going to be faster, not slower. The point is comparability: every engine runs on the same box.
+Earlier results were measured on an Intel i9-9900K desktop (8 cores / 16 threads, 64 GB RAM); their JSON says so. Both are intentionally **modest hardware**: when CoordiNode reports a number on these CPUs, the equivalent server-class run is going to be faster, not slower. The point is comparability: a head-to-head compares engines measured on the same host.
 
 ## Why every modality is on one page
 

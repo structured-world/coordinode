@@ -177,7 +177,7 @@ def main() -> int:
         "--threads",
         type=int,
         default=1,
-        help="Thread cap for both build (add_items) and search (knn_query). MUST match the CoordiNode side for apples-to-apples comparison. Bench host is 8C/16T i9-9900K; 1 = single-thread, 4 = stable multi-thread (leaves headroom for OS / OMP overhead — 8 saturates and produces noisy numbers).",
+        help="Thread cap for both build (add_items) and search (knn_query). MUST match the CoordiNode side for apples-to-apples comparison. 1 = single-thread, 4 = stable multi-thread on the bench host (leaves headroom for OS / OMP overhead; a cap near the host's core count saturates it and produces noisy numbers).",
     )
     p.add_argument(
         "--cn-sha",

@@ -432,7 +432,7 @@ const qpsChartOption = computed(() => {
     <p class="prompt">
       Pick your embedding model's dimension, then read off the chart.
       Higher is better.  Every line is measured on our bench host
-      (Intel i9-9900K, 8C/16T, 64 GB RAM) under the
+      (named in each result's hardware fingerprint) under the
       <a href="https://github.com/erikbern/ann-benchmarks">ann-benchmarks</a>
       Docker harness — no leaderboard citations, no projections.
     </p>

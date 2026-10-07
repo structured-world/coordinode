@@ -31,23 +31,19 @@ Dataset lives **permanently** on the runner — NEVER committed to the repo:
 
 ### One-time dataset placement
 
+[`scripts/fetch_datasets.sh`](scripts/fetch_datasets.sh) places the datasets the per-commit bench reads (SIFT1M under `sift/`, GloVe-100 under `glove-100-angular/`). It downloads them from ann-benchmarks.com and converts them to `.fvecs` / `.ivecs`. It needs `curl` and `python3` with `h5py` and `numpy`, and skips a dataset that is already in place. Run it as the runner's user:
+
 ```bash
-ssh <bench-runner>
-sudo mkdir -p <bench-data-root>/datasets/sift
-cd <bench-data-root>/datasets/sift
-curl -L -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
-tar xzf sift.tar.gz --strip-components=1
-rm sift.tar.gz
-# Now you should have sift_base.fvecs, sift_query.fvecs, sift_groundtruth.ivecs
-ls -lh
-sudo chown -R <runner-user>:<runner-user> <bench-data-root>
+DATASET_ROOT=<bench-data-root>/datasets benches/vector-ann/scripts/fetch_datasets.sh
 ```
+
+High-dimension tiers come from [`scripts/fetch_high_d.sh`](scripts/fetch_high_d.sh) the same way.
 
 **Why on-disk:** SIFT1M is ~520 MB total. Committing it to the repo would inflate clones by ~half a gig for everyone. The dataset is also identical across the world's ANN literature — placing it on the host once is the standard pattern.
 
-### Adding GloVe / Deep-Image / GIST later
+### Adding Deep-Image / GIST later
 
-Same `mkdir + curl + tar` pattern — point `--train` / `--query` / `--groundtruth` at the new files in the workflow YAML. The bench is dataset-agnostic; the harness reads any `.fvecs` / `.ivecs` pair.
+Add a `fetch` line for it to `fetch_datasets.sh`, then point `--train` / `--query` / `--groundtruth` at the new files in the workflow YAML. The bench is dataset-agnostic; the harness reads any `.fvecs` / `.ivecs` pair.
 
 ---
 
