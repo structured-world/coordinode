@@ -52,7 +52,10 @@ fn txn<'a>(f: &'a Fixture) -> Transaction<'a> {
 }
 
 fn commit(txn: &mut Transaction<'_>) -> Result<(), CommitError> {
-    let wc = WriteConcern::default();
+    commit_with(txn, WriteConcern::default())
+}
+
+fn commit_with(txn: &mut Transaction<'_>, wc: WriteConcern) -> Result<(), CommitError> {
     let ctx = CommitContext {
         write_concern: &wc,
         pipeline: None,
@@ -617,6 +620,170 @@ fn counts_survive_a_reopen() {
     remove(&mut t, 3, 2, Some(b"a"), true);
     commit(&mut t).unwrap();
     assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
+}
+
+/// A commit answered before it is in the log applies its writes on its own
+/// branch; the counts it derived land there with them.
+#[test]
+fn a_volatile_commit_keeps_its_counts() {
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, true, &ds);
+    cover(&f, &ds);
+
+    let mut t = txn(&f);
+    add(&mut t, 1, 2, Some(b"a"));
+    add(&mut t, 1, 2, Some(b"b"));
+    commit_with(&mut t, WriteConcern::memory()).unwrap();
+
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 2)]));
+    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
+    assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
+}
+
+/// An interactive transaction is parked between statements and resumed for
+/// the next; its counts are derived from everything it staged, once, when it
+/// commits.
+#[test]
+fn a_parked_transaction_counts_all_its_statements_at_commit() {
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, false, &ds);
+    cover(&f, &ds);
+
+    let mut first = txn(&f);
+    add(&mut first, 1, 2, None);
+    let parked = first.into_state();
+    let mut second = Transaction::resume(&f.engine, Some(&f.oracle), parked);
+    add(&mut second, 1, 3, None);
+    let parked = second.into_state();
+    let mut last = Transaction::resume(&f.engine, Some(&f.oracle), parked);
+    commit(&mut last).unwrap();
+
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 2)]));
+    assert_eq!(
+        kept(&f, &ds[3]),
+        BTreeMap::from([(node(2), 1), (node(3), 1)])
+    );
+}
+
+/// A failed commit leaves nothing a retry would count twice: the derived
+/// changes are taken anew by each attempt, not added to what the attempt
+/// staged.
+#[test]
+fn a_refused_attempt_retried_counts_once() {
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, false, &ds);
+    cover(&f, &ds);
+
+    // The attempt is conditioned on a record staying absent, which is
+    // checked after the counts are derived: a refusal there comes after the
+    // derivation, the case a retry could double.
+    let guard = b"node:guard".to_vec();
+    let mut t = txn(&f);
+    add(&mut t, 1, 2, None);
+    t.expect_version(Partition::Node, &guard, None).unwrap();
+    f.engine.put(Partition::Node, &guard, b"x").unwrap();
+    assert!(matches!(
+        commit(&mut t),
+        Err(CommitError::RevisionMismatch { .. })
+    ));
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::new(), "nothing landed");
+
+    f.engine.delete(Partition::Node, &guard).unwrap();
+    commit(&mut t).unwrap();
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 1)]));
+}
+
+/// A profile that does not decode is reported: skipping it would leave the
+/// constraint standing with its counts unkept.
+#[test]
+fn an_unreadable_profile_refuses_the_commit() {
+    let f = fixture();
+    f.engine
+        .put(
+            Partition::Schema,
+            &encode_cardinality_profile_key(OWNS),
+            &[0xC1, 0xFF],
+        )
+        .unwrap();
+    let mut t = txn(&f);
+    add(&mut t, 1, 2, None);
+    assert!(matches!(commit(&mut t), Err(CommitError::Storage(_))));
+    assert_eq!(
+        f.engine
+            .get(Partition::Adj, &encode_adj_key_forward(OWNS, node(1)))
+            .unwrap(),
+        None,
+        "nothing of the refused commit landed"
+    );
+}
+
+/// A kept count of the wrong width is corruption, never a number to decide
+/// a bound with.
+#[test]
+fn a_count_of_the_wrong_width_is_an_error() {
+    let f = fixture();
+    let d = descriptor(
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
+    );
+    declare(&f, false, std::slice::from_ref(&d));
+    cover(&f, std::slice::from_ref(&d));
+    f.engine
+        .put(Partition::Counter, &d.counter_key(node(1)), &[1, 2, 3])
+        .unwrap();
+    let none = FxHashMap::default();
+    assert!(kept_count(&f.engine, node(1), OWNS, d.direction, d.measure, &none).is_err());
+}
+
+/// A discriminated pair adjacent with no instance behind it has no count to
+/// build: the rebuild says so rather than counting it as nothing, and covers
+/// nothing.
+#[test]
+fn a_rebuild_over_a_dangling_pair_fails_and_covers_nothing() {
+    let f = fixture();
+    let d = descriptor(
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
+    );
+    declare(&f, true, std::slice::from_ref(&d));
+    f.engine
+        .merge(
+            Partition::Adj,
+            &encode_adj_key_forward(OWNS, node(1)),
+            &crate::engine::merge::encode_add(2),
+        )
+        .unwrap();
+    let mut t = txn(&f);
+    assert!(rebuild(&mut t, &d).is_err());
+    assert_eq!(
+        f.engine.get(Partition::Schema, &d.coverage_key()).unwrap(),
+        None
+    );
+}
+
+/// A rebuild of a descriptor the type does not declare is refused: its
+/// counts would be kept for a constraint nothing maintains.
+#[test]
+fn a_rebuild_of_an_undeclared_constraint_is_refused() {
+    let f = fixture();
+    let declared = descriptor(
+        Direction::Outgoing,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
+    );
+    declare(&f, false, std::slice::from_ref(&declared));
+    let other = descriptor(
+        Direction::Incoming,
+        CardinalityMeasure::EdgeInstances,
+        CardinalityBound::AtMostOne,
+    );
+    let mut t = txn(&f);
+    assert!(rebuild(&mut t, &other).is_err());
 }
 
 /// One step of a random history.
