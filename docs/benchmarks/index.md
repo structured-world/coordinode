@@ -35,13 +35,7 @@ The charts below are generated from JSON files at [`bench-results/`](https://git
 
 ## Hardware fingerprint
 
-Every bench JSON records the host it ran on. Since October 2026 the bench host is:
-
-```
-Intel(R) Xeon(R) CPU E5-1650 v4 @ 3.60GHz  (6 cores / 12 threads, KVM guest, 32 GB RAM)
-```
-
-Earlier results were measured on an Intel i9-9900K desktop (8 cores / 16 threads, 64 GB RAM); their JSON says so. Both are intentionally **modest hardware**: when CoordiNode reports a number on these CPUs, the equivalent server-class run is going to be faster, not slower. The point is comparability: a head-to-head compares engines measured on the same host.
+Every bench JSON records the host it ran on: CPU model, cores and threads, RAM, OS and architecture. Results up to October 2026 were measured on an Intel i9-9900K desktop (8 cores / 16 threads, 64 GB RAM); later ones on the Linux bench host their JSON names. The hosts are intentionally **modest hardware**: when CoordiNode reports a number on them, the equivalent server-class run is going to be faster, not slower. The point is comparability: a head-to-head compares engines measured on the same host, and Linux and Windows results are never compared with each other.
 
 ## Why every modality is on one page
 

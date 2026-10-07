@@ -1,8 +1,9 @@
 # Benchmark suite — all modalities, sequential, single self-hosted runner.
 #
-# CoordiNode benches ONE host at a time (the organisation's bench runner,
-# label `runner4`, in the runner group shared by the bench workflows of
-# coordinode, coordinode-lsm-tree and structured-zstd). Splitting per modality
+# CoordiNode benches ONE host at a time: a Linux runner labelled `bench`, from
+# the organisation's runner group for the bench workflows of coordinode,
+# coordinode-lsm-tree and structured-zstd. The label names the purpose, not a
+# machine, and every result records the host it ran on. Splitting per modality
 # into separate workflows is pointless: they share the box, the
 # datasets directory, the CPU cores, and the build cache. Running
 # them in one job means:
@@ -106,7 +107,10 @@ jobs:
     if: ${{ github.repository_owner == 'structured-world' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip bench]')) }}
     runs-on:
       - self-hosted
-      - runner4
+      - bench
+      # The steps are Linux shell; the Windows bench host gets a job of its
+      # own when there is one, since its numbers are not comparable.
+      - Linux
     timeout-minutes: 30
     # Benches need the reference machine, so when it is down this job cannot
     # run and there is nothing to fix in the code. Let it time out and report
@@ -121,8 +125,8 @@ jobs:
       # Secrets and variables → Actions → Variables.
       DATASET_ROOT: ${{ vars.BENCH_DATASET_ROOT }}
       # Pin rayon worker count for ALL bench runs (build + any
-      # parallel search path). The runner has 12 logical cores (Xeon
-      # E5-1650 v4, 6C/12T); without this cap rayon spawns 12 workers and:
+      # parallel search path). Without this cap rayon spawns one worker per
+      # logical core of the bench host and:
       #   1. contaminates wall-clock numbers when CI shares the host,
       #   2. produces a different HNSW graph than competitors built on
       #      ann-benchmarks defaults (single-thread or 4-thread).
@@ -684,7 +688,7 @@ jobs:
           COMMIT=$(git commit-tree "$TREE" \
             -m "chore(bench): results @ ${{ github.sha }}" \
             -m "Modalities: $MODALITIES" \
-            -m "Auto-committed by .github/workflows/bench.yml (runner: runner4)")
+            -m "Auto-committed by .github/workflows/bench.yml (Linux bench runner)")
           unset GIT_INDEX_FILE
 
           # Force-push by object id — overwrites history every run, which

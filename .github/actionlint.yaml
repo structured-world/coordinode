@@ -4,4 +4,4 @@ self-hosted-runner:
   labels:
     - coordinode
     - coordinode-windows
-    - runner4
+    - bench
