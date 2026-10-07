@@ -588,7 +588,30 @@ async fn a_member_restarts_into_its_group_with_its_data() {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
-    wait_for_voters(&mut leader, 3, Duration::from_secs(10)).await;
+    // Leadership may have moved during the restarts, and only the leader
+    // reports the membership, so every member is asked.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    'members: loop {
+        for member in [&n1, &n2, &n3] {
+            let mut client = member.cluster_client().await;
+            if let Ok(resp) = client.get_cluster_status(GetClusterStatusRequest {}).await {
+                let s = resp.into_inner();
+                let voters = s
+                    .nodes
+                    .iter()
+                    .filter(|n| n.role != NodeRole::Learner as i32)
+                    .count();
+                if s.nodes.len() == 3 && voters == 3 {
+                    break 'members;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no member reported 3 voters after the restarts"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// Run `query` on `node` as a primary read or write.
