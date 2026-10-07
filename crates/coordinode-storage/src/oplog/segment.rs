@@ -235,7 +235,7 @@ fn read_frame_prefix(data: &[u8]) -> FramePrefix {
 /// offset just past it; parsing stops at the first frame that is incomplete,
 /// fails its checksum or does not decode (a write in progress, or the footer
 /// of a sealed segment).
-fn parse_frames(data: &[u8], start: u64) -> Vec<(OplogEntry, u64)> {
+pub(crate) fn parse_frames(data: &[u8], start: u64) -> Vec<(OplogEntry, u64)> {
     let mut cursor = Cursor::new(data);
     cursor.set_position(start);
     let mut frames = Vec::new();
@@ -307,6 +307,78 @@ pub fn read_frames_from(path: &Path, offset: u64) -> StorageResult<Vec<(OplogEnt
         .into_iter()
         .map(|(entry, end)| (entry, offset + end))
         .collect())
+}
+
+/// Up to `len` bytes of the file at `path` from byte `offset`, fewer at its
+/// end.
+///
+/// # Errors
+///
+/// The file cannot be opened or read.
+pub(crate) fn read_span(path: &Path, offset: u64, len: u64) -> StorageResult<Vec<u8>> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| StorageError::Io(format!("seek segment {path:?}: {e}")))?;
+    let mut data = Vec::new();
+    file.take(len)
+        .read_to_end(&mut data)
+        .map_err(|e| StorageError::Io(format!("read segment {path:?}: {e}")))?;
+    Ok(data)
+}
+
+/// Refuse `bytes` (at least [`HEADER_SIZE`] of them) unless they open a
+/// segment of this format.
+///
+/// # Errors
+///
+/// Too short, a wrong magic, or another format version.
+pub(crate) fn check_header(bytes: &[u8], path: &Path) -> StorageResult<()> {
+    let header = read_header(&mut Cursor::new(bytes))?;
+    if header.version != FORMAT_VERSION {
+        return Err(StorageError::Io(format!(
+            "unsupported oplog version {} in {path:?}",
+            header.version
+        )));
+    }
+    Ok(())
+}
+
+/// The end of each complete frame at the start of `data` whose checksum
+/// holds, relative to `data`, without decoding the payloads. Stops where
+/// [`parse_frames`] would for a frame cut short or failing its checksum (a
+/// write in progress, or a sealed segment's footer).
+pub(crate) fn frame_ends(data: &[u8]) -> Vec<u64> {
+    let mut cursor = Cursor::new(data);
+    let mut ends = Vec::new();
+    let total_len = data.len() as u64;
+    while let Ok(payload_len) = decode_varint(&mut cursor) {
+        let payload_start = cursor.position();
+        let Some(frame_end) = payload_len
+            .checked_add(4)
+            .and_then(|n| payload_start.checked_add(n))
+        else {
+            break;
+        };
+        if frame_end > total_len {
+            break;
+        }
+        // Bounded by `total_len` just above.
+        let crc_at = (frame_end - 4) as usize;
+        let payload = &data[payload_start as usize..crc_at];
+        let crc = u32::from_le_bytes([
+            data[crc_at],
+            data[crc_at + 1],
+            data[crc_at + 2],
+            data[crc_at + 3],
+        ]);
+        if crc32fast::hash(payload) != crc {
+            break;
+        }
+        ends.push(frame_end);
+        cursor.set_position(frame_end);
+    }
+    ends
 }
 
 /// Decode `count` consecutive frames filling `data` exactly.

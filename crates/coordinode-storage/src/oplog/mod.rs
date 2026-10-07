@@ -22,9 +22,11 @@ pub mod entry;
 pub mod manager;
 pub mod segment;
 pub mod tailer;
+pub mod timeline;
 
 pub use convert::{mutation_to_op, mutations_to_ops};
 pub use entry::{OplogEntry, OplogOp, PreImage, ShardId};
 pub use manager::{OplogManager, RetainedFloor};
 pub use segment::{FOOTER_SIZE, HEADER_SIZE, MAGIC, SegmentReader, SegmentWriter, SyncHandle};
 pub use tailer::{CdcFilters, OplogTailer, ResumeToken};
+pub use timeline::OplogTimeline;

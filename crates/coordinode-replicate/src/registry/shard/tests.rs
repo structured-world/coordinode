@@ -34,6 +34,8 @@ struct FakeSource {
     unaccounted: AtomicBool,
     /// Whether the source is out of room for new retention.
     pressured: AtomicBool,
+    /// The last log floor the registry released below.
+    released: AtomicU64,
 }
 
 impl FakeSource {
@@ -75,6 +77,9 @@ impl RetentionSource for FakeSource {
     }
     fn admits(&self, _: ConsumerKind) -> bool {
         !self.pressured.load(Ordering::Acquire)
+    }
+    fn release_log_below(&self, position: u64) {
+        self.released.store(position, Ordering::Release);
     }
 }
 
@@ -973,6 +978,36 @@ async fn an_acknowledgement_raises_the_floor_through_the_sweep() {
     }
     assert_eq!(f.reg.shard_floor(), 250);
     bg.shutdown().await;
+    f.node.shutdown().await.expect("shutdown");
+}
+
+/// The source keeps what it needs to tell the age of acknowledged log
+/// positions; the registry tells it the lowest one any live log consumer can
+/// still be asked about, so it can let go of the rest (and of all of it once
+/// no log consumer is left).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_source_learns_the_lowest_acknowledged_log_position() {
+    let f = fixture(Arc::new(ManualClock::new(1_000))).await;
+    f.source.set_head(1_000);
+    let log = |id: &str, at: u64| ConsumerRegistration {
+        consumer_id: id.to_string(),
+        kind: ConsumerKind::OplogEvents,
+        scope: TopologyScope::Cluster,
+        initial_seqno: InitialSeqno::At(at),
+        retention: ConsumerRetentionPolicy::Strict,
+    };
+    let early = f.reg.register(log("early", 100)).expect("register early");
+    let late = f.reg.register(log("late", 250)).expect("register late");
+    assert_eq!(f.source.released.load(Ordering::Acquire), 100);
+
+    f.reg.checkpoint(&early, 300).expect("acknowledge");
+    f.reg.core.sweep_evictions().expect("sweep");
+    assert_eq!(f.source.released.load(Ordering::Acquire), 250);
+
+    f.reg.unregister(early).expect("cancel early");
+    f.reg.unregister(late).expect("cancel late");
+    f.reg.core.sweep_evictions().expect("sweep");
+    assert_eq!(f.source.released.load(Ordering::Acquire), u64::MAX);
     f.node.shutdown().await.expect("shutdown");
 }
 

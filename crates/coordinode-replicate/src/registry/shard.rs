@@ -354,6 +354,7 @@ impl RegistryCore {
         }
         self.floor.store(seqno_floor, Ordering::Release);
         self.oplog_index_floor.store(oplog_floor, Ordering::Release);
+        self.source.release_log_below(oplog_floor);
         for (kind, count) in ConsumerKind::ALL.iter().zip(counts) {
             metrics::gauge!("registry_consumer_count", "kind" => kind.label()).set(count as f64);
         }

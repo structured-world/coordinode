@@ -340,7 +340,7 @@ impl OplogTailer {
 }
 
 /// Every segment in `oplog_dirs`, as `(first index, path)` ascending.
-fn list_segments(oplog_dirs: &[PathBuf]) -> StorageResult<Vec<(u64, PathBuf)>> {
+pub(crate) fn list_segments(oplog_dirs: &[PathBuf]) -> StorageResult<Vec<(u64, PathBuf)>> {
     let mut segments: Vec<(u64, PathBuf)> = Vec::new();
     for dir in oplog_dirs {
         let entries = match std::fs::read_dir(dir) {

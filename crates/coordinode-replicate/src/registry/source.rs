@@ -38,4 +38,10 @@ pub trait RetentionSource: Send + Sync {
     /// now. `false` while its storage is behind on reclaiming what it already
     /// holds: the registration is refused as retryable backpressure.
     fn admits(&self, kind: ConsumerKind) -> bool;
+
+    /// The lowest checkpoint among live consumers in the log position space
+    /// is now `position` (`u64::MAX` with none): nothing below it will be
+    /// asked of [`Self::produced_at_ms`] again, so a source may drop what it
+    /// keeps to answer for it. A source that keeps nothing ignores it.
+    fn release_log_below(&self, _position: u64) {}
 }

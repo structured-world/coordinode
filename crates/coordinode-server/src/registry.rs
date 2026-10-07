@@ -19,8 +19,9 @@ use coordinode_replicate::{
     SystemClock,
 };
 use coordinode_storage::engine::core::{StorageEngine, WritePressure};
+use coordinode_storage::oplog::OplogTimeline;
 use coordinode_storage::oplog::RetainedFloor;
-use coordinode_storage::oplog::tailer::{CdcFilters, OplogTailer, ResumeToken, bytes_needed_from};
+use coordinode_storage::oplog::tailer::bytes_needed_from;
 
 /// The history this node holds for its consumers: the Raft log for oplog
 /// consumers, the MVCC store for the others.
@@ -33,6 +34,10 @@ pub(crate) struct NodeRetentionSource {
     floor: RetainedFloor,
     /// One past the last log entry this node has applied.
     applied: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// When each log entry was written: the bound checks ask the age of the
+    /// same acknowledged positions every sweep, and reading the segment that
+    /// holds one would cost its size on every ask.
+    timeline: OplogTimeline,
 }
 
 impl NodeRetentionSource {
@@ -46,6 +51,7 @@ impl NodeRetentionSource {
     ) -> Self {
         Self {
             engine,
+            timeline: OplogTimeline::new(oplog_dirs.clone()),
             oplog_dirs,
             floor,
             applied,
@@ -83,15 +89,18 @@ impl RetentionSource for NodeRetentionSource {
         if kind.is_seqno_space() {
             return None;
         }
-        let token = ResumeToken {
-            shard_id: 0,
-            segment_id: position,
-            entry_offset: 0,
-        };
-        let mut tailer = OplogTailer::new(&self.oplog_dirs, token).ok()?;
-        let batch = tailer.read_next(1, &CdcFilters::default(), u64::MAX).ok()?;
-        // An entry's timestamp is wall-clock microseconds.
-        batch.first().map(|(entry, _)| entry.ts / 1_000)
+        match self.timeline.written_at(position) {
+            // An entry's timestamp is wall-clock microseconds.
+            Ok(ts) => ts.map(|ts| ts / 1_000),
+            Err(e) => {
+                tracing::warn!(error = %e, position, "registry: oplog entry time unreadable");
+                None
+            }
+        }
+    }
+
+    fn release_log_below(&self, position: u64) {
+        self.timeline.release_below(position);
     }
 
     fn retained_bytes_from(&self, kind: ConsumerKind, position: u64) -> Option<u64> {

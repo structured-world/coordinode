@@ -193,6 +193,50 @@ fn node_source_measures_the_oplog_it_holds() {
     assert!(from_last_segment > 0, "the open segment is still kept");
 }
 
+/// The registry's bound sweep asks the age of every lagging BOUNDED
+/// consumer's checkpoint twice a sweep, every second. Each ask used to open a
+/// fresh reader that read and decoded the whole segment holding the
+/// checkpoint: tens of MB/s on a busy log with two consumers. Asking the same
+/// checkpoint again must read nothing, and a moved one only near it.
+#[test]
+fn node_source_answers_an_unmoved_checkpoint_without_reading_the_log() {
+    let (engine, _engine_dir) = open_engine(None);
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let _mgr = write_log(log_dir.path(), 3_000, &[]);
+    let source = NodeRetentionSource::new(
+        Arc::clone(&engine),
+        vec![log_dir.path().to_path_buf()],
+        empty_floor(),
+        Arc::new(|| 3_000),
+    );
+    let kind = ConsumerKind::OplogEvents;
+
+    assert_eq!(source.produced_at_ms(kind, 2_999), Some(3_000_000));
+    let scanned = source.timeline.bytes_read();
+    assert!(
+        scanned > 0,
+        "answered from the kept timeline, not a fresh read"
+    );
+    for _ in 0..50 {
+        assert_eq!(source.produced_at_ms(kind, 100), Some(101_000));
+    }
+    let first_ask = source.timeline.bytes_read() - scanned;
+    assert!(first_ask < 256 * 1024, "one ask read {first_ask} bytes");
+    assert_eq!(source.produced_at_ms(kind, 100), Some(101_000));
+    assert_eq!(
+        source.timeline.bytes_read() - scanned,
+        first_ask,
+        "an unmoved checkpoint reads nothing more"
+    );
+
+    // Released below a higher floor, the old checkpoint's answer goes and
+    // the segment holding the floor stays scanned.
+    source.release_log_below(2_000);
+    let before = source.timeline.bytes_read();
+    assert_eq!(source.produced_at_ms(kind, 2_500), Some(2_501_000));
+    assert!(source.timeline.bytes_read() - before < 256 * 1024);
+}
+
 /// A log with no segment keeps nothing below the head, so a new consumer
 /// cannot claim a position under it.
 #[test]
