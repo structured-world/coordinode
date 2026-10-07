@@ -254,6 +254,20 @@ fn edge_identity_refuses_what_cannot_identify_an_instance() {
     refused(&mut schema, Some("nullable"), "NOT NULL");
     refused(&mut schema, Some("map"), "is MAP");
     refused(&mut schema, Some("vector"), "is ARRAY<INT>");
+    // A computed value is evaluated when read, not stored: nothing to key.
+    schema.add_property(
+        PropertyDef::computed(
+            "_ttl",
+            crate::schema::computed::ComputedSpec::Ttl {
+                duration_secs: 60,
+                anchor_field: "created".into(),
+                scope: crate::schema::computed::TtlScope::Node,
+                target_field: None,
+            },
+        )
+        .not_null(),
+    );
+    refused(&mut schema, Some("_ttl"), "is COMPUTED");
 
     let mut temporal = EdgeTypeSchema::new("T");
     temporal.set_temporal(true);

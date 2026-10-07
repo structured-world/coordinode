@@ -647,6 +647,95 @@ fn element_id_roundtrip_for_real_database_node_ids() {
 
 // ── Edge identity ───────────────────────────────────────────────────
 
+/// The id of the `:P` node named `n`.
+fn p_id(db: &mut Database, n: &str) -> coordinode_core::graph::node::NodeId {
+    let rows = db
+        .execute_cypher(&format!("MATCH (p:P {{n: '{n}'}}) RETURN id(p) AS id"))
+        .expect("find");
+    let Some(coordinode_core::graph::types::Value::Int(id)) =
+        rows.first().and_then(|r| r.get("id"))
+    else {
+        unreachable!("node {n} has an integer id: {rows:?}");
+    };
+    coordinode_core::graph::node::NodeId::from_raw(*id as u64)
+}
+
+/// Store a KNOWS edge from `src` to `tgt` identified by `context` straight
+/// through the edge store, as a statement cannot write one yet.
+fn plant_knows(
+    db: &Database,
+    src: coordinode_core::graph::node::NodeId,
+    tgt: coordinode_core::graph::node::NodeId,
+    context: &str,
+) {
+    use coordinode_core::graph::edge::EdgeProperties;
+    use coordinode_core::graph::types::Value;
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let read_ts = oracle.next();
+    let mut txn = Transaction::begin(db.engine(), Some(&oracle), read_ts);
+    LocalEdgeStore
+        .put_edge_discriminated(
+            &mut txn,
+            "KNOWS",
+            src,
+            tgt,
+            &Value::String(context.into()),
+            &EdgeProperties::new(),
+        )
+        .expect("put");
+    let wc = WriteConcern::majority();
+    txn.commit(&CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    })
+    .expect("commit");
+}
+
+/// A node holding an edge of a type identified by its own discriminator is
+/// refused by every statement that would carry, copy or drop that edge as a
+/// single edge, and the refused statement changes nothing.
+#[test]
+fn a_statement_reaching_an_independently_identified_edge_is_refused_whole() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)",
+    )
+    .expect("categorical");
+    db.execute_cypher("CREATE (:P {n: 'a'}), (:P {n: 'b'}), (:P {n: 'c'})")
+        .expect("nodes");
+    let (a, b) = (p_id(&mut db, "a"), p_id(&mut db, "b"));
+    plant_knows(&db, a, b, "work");
+
+    for statement in [
+        "MATCH (a:P {n: 'a'}) CLONE NODE a AS x WITH EDGES",
+        "MATCH (a:P {n: 'a'}), (c:P {n: 'c'}) MERGE NODES (c, a) INTO c \
+         TRANSFER EDGES FROM a TO c",
+        "MATCH (a:P {n: 'a'}), (c:P {n: 'c'}) REDIRECT EDGES FROM a TO c",
+        "MATCH (a:P {n: 'a'}) DETACH DELETE a",
+        "MATCH (a:P {n: 'a'})-[r:KNOWS]->(b) RETURN r",
+    ] {
+        let error = db.execute_cypher(statement).expect_err(statement);
+        assert!(
+            error.to_string().contains("by 'context'"),
+            "{statement}: {error}"
+        );
+    }
+    assert_eq!(
+        db.execute_cypher("MATCH (p:P) RETURN p")
+            .expect("nodes")
+            .len(),
+        3,
+        "no node was cloned, merged away or deleted"
+    );
+}
+
 /// The discriminator `name`'s definition resolved to, if any.
 fn discriminator_of(db: &Database, name: &str) -> Option<String> {
     db.edge_type_schemas()

@@ -299,3 +299,49 @@ fn an_edge_type_is_defined_once() {
         vec!["KNOWS".to_string()]
     );
 }
+
+/// What identifies an edge is fixed when its type is created: a replacement
+/// naming another discriminator, or none, is refused and the published one
+/// stays; a replacement keeping it is accepted. A temporal definition handed
+/// over unresolved is resolved by the catalog to the start-identified
+/// shorthand.
+#[test]
+fn a_replacement_cannot_change_what_identifies_an_edge() {
+    let (db, _dir) = open();
+    let knows = |discriminator: Option<&str>| {
+        let mut schema = EdgeTypeSchema::new("KNOWS");
+        schema.add_property(PropertyDef::new("context", PropertyType::String).not_null());
+        schema.add_property(PropertyDef::new("kind", PropertyType::String).not_null());
+        schema.resolve_identity(discriminator).expect("resolve");
+        schema
+    };
+    db.create_edge_type_schema(knows(Some("context")))
+        .expect("define");
+
+    for other in [Some("kind"), None] {
+        let error = db.create_edge_type_schema(knows(other)).unwrap_err();
+        assert!(
+            matches!(catalog_error(error), ExecutionError::CatalogRefused(ref why)
+                if why.contains("fixed when it is created")),
+            "{other:?}"
+        );
+    }
+    db.create_edge_type_schema(knows(Some("context")))
+        .expect("same identity");
+    let stored = db.edge_type_schemas().expect("types");
+    assert_eq!(
+        stored[0].discriminator().map(|d| d.column.as_str()),
+        Some("context")
+    );
+
+    let mut works_at = EdgeTypeSchema::new("WORKS_AT");
+    works_at.set_temporal(true);
+    db.define_edge_type(works_at).expect("unresolved temporal");
+    let works_at = db
+        .edge_type_schemas()
+        .expect("types")
+        .into_iter()
+        .find(|s| s.name == "WORKS_AT")
+        .expect("defined");
+    assert!(works_at.is_start_identified());
+}
