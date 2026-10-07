@@ -142,5 +142,9 @@ harness = false
 name = "field_registration"
 harness = false
 
+[[bench]]
+name = "edge_cardinality"
+harness = false
+
 [lints]
 workspace = true

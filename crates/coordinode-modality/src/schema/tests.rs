@@ -412,3 +412,99 @@ fn list_edge_type_names_engine_includes_markers_and_dedups_versions() {
         "marker included, versions deduped to one KNOWS entry",
     );
 }
+
+/// The cardinality profile is kept beside the definition by both save
+/// paths: written while a constraint is declared, gone with the last one,
+/// and a withdrawn constraint takes its counts and coverage with it, so one
+/// declared again later is rebuilt rather than resumed from counts that
+/// stopped changing. Changing only the bound keeps the counts, which do not
+/// depend on it.
+#[test]
+fn edge_type_saves_keep_the_cardinality_profile_and_drop_withdrawn_counts() {
+    use coordinode_core::graph::cardinality::{
+        CardinalityBound, CardinalityDescriptor, CardinalityMeasure, CardinalityProfile, Direction,
+        encode_cardinality_profile_key,
+    };
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::txn::timestamp::Timestamp;
+    use coordinode_storage::engine::merge::encode_counter_delta;
+
+    let fx = open_engine();
+    let engine = &fx.engine;
+    let store = LocalSchemaStore::new(engine);
+    let descriptor = |bound| CardinalityDescriptor {
+        edge_type: "KNOWS".into(),
+        direction: Direction::Outgoing,
+        measure: CardinalityMeasure::DistinctNeighbours,
+        bound,
+        schema_generation: 1,
+    };
+    let profile = || -> Option<CardinalityProfile> {
+        engine
+            .get(Partition::Schema, &encode_cardinality_profile_key("KNOWS"))
+            .expect("get")
+            .map(|b| CardinalityProfile::from_msgpack(&b).expect("decode"))
+    };
+    let count_key = descriptor(CardinalityBound::AtMostOne).counter_key(NodeId::from_raw(7));
+    let coverage = descriptor(CardinalityBound::AtMostOne).coverage_key();
+
+    // Declared through the batch path.
+    let mut schema = sample_edge_type();
+    schema
+        .declare_cardinality(descriptor(CardinalityBound::AtMostOne))
+        .expect("declare");
+    store.save_edge_type(&schema).expect("save");
+    assert_eq!(
+        profile().expect("profile").descriptors,
+        vec![descriptor(CardinalityBound::AtMostOne)]
+    );
+    engine
+        .merge(Partition::Counter, &count_key, &encode_counter_delta(1))
+        .expect("count");
+    engine
+        .put(Partition::Schema, &coverage, b"")
+        .expect("coverage");
+
+    // Only the bound changes, through the transactional path.
+    let mut schema = sample_edge_type();
+    schema.schema_revision = 2;
+    schema
+        .declare_cardinality(descriptor(CardinalityBound::ExactlyOne))
+        .expect("declare");
+    // A direct transaction applies as it stages, which is all a schema
+    // save needs to be observed here.
+    let mut txn = Transaction::new(engine, None, Timestamp::from_raw(0), None);
+    store.save_edge_type_txn(&mut txn, &schema).expect("save");
+    assert!(
+        engine
+            .get(Partition::Counter, &count_key)
+            .expect("get")
+            .is_some(),
+        "a bound change keeps the counts"
+    );
+    assert!(
+        engine
+            .get(Partition::Schema, &coverage)
+            .expect("get")
+            .is_some()
+    );
+
+    // Withdrawn: the profile, the counts and the coverage go.
+    let mut schema = sample_edge_type();
+    schema.schema_revision = 3;
+    let mut txn = Transaction::new(engine, None, Timestamp::from_raw(0), None);
+    store.save_edge_type_txn(&mut txn, &schema).expect("save");
+    assert_eq!(profile(), None);
+    assert!(
+        engine
+            .get(Partition::Counter, &count_key)
+            .expect("get")
+            .is_none()
+    );
+    assert!(
+        engine
+            .get(Partition::Schema, &coverage)
+            .expect("get")
+            .is_none()
+    );
+}

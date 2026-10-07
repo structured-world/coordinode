@@ -706,6 +706,83 @@ fn posting_at_snapshot_returns_empty_present_list_not_none() {
 
 // -- Discriminated edges --
 
+/// The incident count reads logical identities in the transaction's own
+/// post-state: a property-less edge is one instance, two discriminated
+/// instances to one neighbour are two instances and one neighbour, and the
+/// staged writes count before they commit.
+#[test]
+fn incident_count_counts_identities_in_the_transactions_post_state() {
+    use crate::schema::{LocalSchemaStore, SchemaStore};
+    use coordinode_core::graph::cardinality::IncidentCount;
+    use coordinode_core::schema::definition::{EdgeTypeSchema, PropertyDef, PropertyType};
+    use coordinode_core::txn::invariant::Direction;
+
+    let db = open();
+    let mut knows = EdgeTypeSchema::new("KNOWS");
+    knows.add_property(PropertyDef::new("context", PropertyType::String).not_null());
+    knows.resolve_identity(Some("context")).unwrap();
+    LocalSchemaStore::new(&db.engine)
+        .save_edge_type(&knows)
+        .unwrap();
+
+    let a = NodeId::from_raw(10);
+    let b = NodeId::from_raw(20);
+    let c = NodeId::from_raw(30);
+    db.write(|s, t| {
+        s.put_edge(t, "FOLLOWS", a, b, None).unwrap();
+        for context in ["work", "college"] {
+            s.put_edge_discriminated(
+                t,
+                "KNOWS",
+                a,
+                b,
+                &Value::String(context.into()),
+                &props_with(1, 1),
+            )
+            .unwrap();
+        }
+        s.put_edge_discriminated(
+            t,
+            "KNOWS",
+            a,
+            c,
+            &Value::String("work".into()),
+            &props_with(1, 1),
+        )
+        .unwrap();
+        assert_eq!(
+            s.incident_count(t, a, "KNOWS", Direction::Outgoing)
+                .unwrap(),
+            Some(IncidentCount {
+                instances: 3,
+                neighbours: 2
+            }),
+            "staged instances count before the commit"
+        );
+    });
+    let r = db.read();
+    let store = LocalEdgeStore;
+    assert_eq!(
+        store
+            .incident_count(&r, a, "FOLLOWS", Direction::Outgoing)
+            .unwrap(),
+        Some(IncidentCount {
+            instances: 1,
+            neighbours: 1
+        }),
+        "an edge with no properties is an instance"
+    );
+    assert_eq!(
+        store
+            .incident_count(&r, b, "KNOWS", Direction::Incoming)
+            .unwrap(),
+        Some(IncidentCount {
+            instances: 2,
+            neighbours: 1
+        })
+    );
+}
+
 #[test]
 fn discriminated_put_get_roundtrip_and_absent_is_none() {
     let db = open();

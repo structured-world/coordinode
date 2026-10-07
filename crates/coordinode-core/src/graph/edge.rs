@@ -387,9 +387,20 @@ pub fn decode_discriminated_edgeprop_key(
     key: &[u8],
     kind: &PropertyType,
 ) -> Option<(String, NodeId, NodeId, PropertyValue)> {
+    let (edge_type, source, target, encoded) = split_discriminated_edgeprop_key(key)?;
+    let discriminator = decode_discriminator_value(encoded, kind)?;
+    Some((edge_type.to_string(), source, target, discriminator))
+}
+
+/// The parts of an instance key, `edgeprop:<type>:<src>:<tgt>:<identity>`,
+/// without decoding the identity: the type, the pair and the encoded
+/// discriminator. Edge type names carry no ':', so the type ends at the
+/// first one. A plain edge's facet key, which has no identity part, and keys
+/// of other families are `None`.
+pub fn split_discriminated_edgeprop_key(key: &[u8]) -> Option<(&str, NodeId, NodeId, &[u8])> {
     let rest = key.strip_prefix(b"edgeprop:")?;
     let type_end = rest.iter().position(|&b| b == b':')?;
-    let edge_type = std::str::from_utf8(&rest[..type_end]).ok()?.to_string();
+    let edge_type = std::str::from_utf8(&rest[..type_end]).ok()?;
     let tail = &rest[type_end + 1..];
     // src(8) ':' tgt(8) ':' <discriminator>
     if tail.len() < 8 + 1 + 8 + 1 {
@@ -400,12 +411,11 @@ pub fn decode_discriminated_edgeprop_key(
     }
     let source_id = u64::from_be_bytes(tail[0..8].try_into().ok()?);
     let target_id = u64::from_be_bytes(tail[9..17].try_into().ok()?);
-    let discriminator = decode_discriminator_value(&tail[18..], kind)?;
     Some((
         edge_type,
         NodeId::from_raw(source_id),
         NodeId::from_raw(target_id),
-        discriminator,
+        &tail[18..],
     ))
 }
 

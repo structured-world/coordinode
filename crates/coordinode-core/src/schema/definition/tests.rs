@@ -767,3 +767,104 @@ fn constraint_name_key_encoding() {
         b"schema:constraint:user_email".to_vec()
     );
 }
+
+fn owns(
+    direction: crate::graph::cardinality::Direction,
+    measure: crate::graph::cardinality::CardinalityMeasure,
+) -> crate::graph::cardinality::CardinalityDescriptor {
+    crate::graph::cardinality::CardinalityDescriptor {
+        edge_type: "OWNS".into(),
+        direction,
+        measure,
+        bound: crate::graph::cardinality::CardinalityBound::AtMostOne,
+        schema_generation: 1,
+    }
+}
+
+/// A type declares at most one constraint per direction and measure, both
+/// measures may constrain one side, and the declaration survives the
+/// definition's encoding into the profile a commit reads.
+#[test]
+fn cardinality_is_declared_per_direction_and_measure() {
+    use crate::graph::cardinality::{CardinalityMeasure as M, Direction as D};
+
+    let mut schema = EdgeTypeSchema::new("OWNS");
+    assert_eq!(schema.cardinality_profile(), None, "nothing declared");
+    schema
+        .declare_cardinality(owns(D::Outgoing, M::EdgeInstances))
+        .expect("instances");
+    schema
+        .declare_cardinality(owns(D::Outgoing, M::DistinctNeighbours))
+        .expect("neighbours, on the same side");
+    assert!(
+        schema
+            .declare_cardinality(owns(D::Outgoing, M::EdgeInstances))
+            .is_err(),
+        "a second constraint over one side and measure"
+    );
+    let mut other = owns(D::Incoming, M::EdgeInstances);
+    other.edge_type = "KNOWS".into();
+    assert!(schema.declare_cardinality(other).is_err(), "another type");
+
+    let restored =
+        EdgeTypeSchema::from_msgpack(&schema.to_msgpack().expect("encode")).expect("decode");
+    assert_eq!(restored.cardinality(), schema.cardinality());
+    let profile = restored.cardinality_profile().expect("declared");
+    assert!(!profile.discriminated);
+    assert_eq!(profile.descriptors.len(), 2);
+
+    assert_eq!(
+        schema.withdraw_cardinality(D::Outgoing, M::EdgeInstances),
+        Some(owns(D::Outgoing, M::EdgeInstances))
+    );
+    assert_eq!(
+        schema.withdraw_cardinality(D::Outgoing, M::EdgeInstances),
+        None
+    );
+    assert_eq!(schema.cardinality().len(), 1);
+}
+
+/// A temporal type's bound holds at every valid-time instant, which a count
+/// of its current edges does not decide, so it is refused here.
+#[test]
+fn a_temporal_type_declares_no_counted_cardinality() {
+    use crate::graph::cardinality::{CardinalityMeasure as M, Direction as D};
+
+    let mut schema = EdgeTypeSchema::new("OWNS");
+    schema.set_temporal(true);
+    schema.resolve_identity(None).expect("start-identified");
+    assert!(
+        schema
+            .declare_cardinality(owns(D::Outgoing, M::EdgeInstances))
+            .is_err()
+    );
+}
+
+/// The identity shape follows the resolved definition: no definition and an
+/// undiscriminated one are single-edge, a discriminator makes instances, a
+/// temporal type is temporal whatever identifies it.
+#[test]
+fn the_identity_shape_follows_the_definition() {
+    use crate::graph::cardinality::IdentityShape;
+
+    assert_eq!(IdentityShape::of(None), IdentityShape::Single);
+    let mut single = EdgeTypeSchema::new("OWNS");
+    single.resolve_identity(None).expect("single");
+    assert_eq!(IdentityShape::of(Some(&single)), IdentityShape::Single);
+
+    let mut discriminated = EdgeTypeSchema::new("KNOWS");
+    discriminated.add_property(PropertyDef::new("context", PropertyType::String).not_null());
+    discriminated
+        .resolve_identity(Some("context"))
+        .expect("discriminated");
+    assert_eq!(
+        IdentityShape::of(Some(&discriminated)),
+        IdentityShape::Discriminated
+    );
+    assert!(discriminated.cardinality_profile().is_none());
+
+    let mut temporal = EdgeTypeSchema::new("WORKS_AT");
+    temporal.set_temporal(true);
+    temporal.resolve_identity(None).expect("temporal");
+    assert_eq!(IdentityShape::of(Some(&temporal)), IdentityShape::Temporal);
+}

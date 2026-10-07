@@ -3,6 +3,7 @@
 pub mod applied;
 pub mod batch;
 pub mod capacity;
+pub mod cardinality;
 pub mod claims;
 pub(crate) mod compaction;
 pub mod config;

@@ -343,6 +343,63 @@ fn edge_type_body(schema: &EdgeTypeSchema) -> StoreResult<Vec<u8>> {
     })
 }
 
+/// The writes that keep edge type `schema`'s cardinality profile beside its
+/// definition: the profile to store (`None` to remove it), and the
+/// constraints the previous profile kept counts for that this definition
+/// no longer declares, whose counts and coverage go with it. A constraint
+/// declared again later starts from a rebuild, never from counts that
+/// stopped changing while it was gone.
+struct ProfileWrites {
+    profile: Option<Vec<u8>>,
+    withdrawn: Vec<coordinode_core::graph::cardinality::CardinalityDescriptor>,
+}
+
+fn profile_writes(previous: Option<&[u8]>, schema: &EdgeTypeSchema) -> StoreResult<ProfileWrites> {
+    use coordinode_core::graph::cardinality::CardinalityProfile;
+
+    let previous = match previous {
+        Some(bytes) => {
+            Some(
+                CardinalityProfile::from_msgpack(bytes).map_err(|e| StoreError::Decode {
+                    kind: "edge type cardinality profile",
+                    message: format!("decode '{}': {e}", schema.name),
+                })?,
+            )
+        }
+        None => None,
+    };
+    let profile = schema.cardinality_profile();
+    // A count belongs to its descriptor's key, not to its bound: changing
+    // only the bound keeps the counts.
+    let kept: Vec<Vec<u8>> = profile
+        .iter()
+        .flat_map(|p| p.descriptors.iter().map(|d| d.counter_prefix()))
+        .collect();
+    let withdrawn = previous
+        .map(|p| p.descriptors)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| !kept.contains(&d.counter_prefix()))
+        .collect();
+    let profile = profile
+        .map(|p| {
+            p.to_msgpack().map_err(|e| StoreError::Decode {
+                kind: "edge type cardinality profile",
+                message: format!("encode '{}': {e}", schema.name),
+            })
+        })
+        .transpose()?;
+    Ok(ProfileWrites { profile, withdrawn })
+}
+
+/// The exclusive end of the counts under `prefix`: each is the prefix and an
+/// eight-byte node, so nine 0xFF bytes past the prefix are beyond them all.
+fn counts_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    end.extend_from_slice(&[0xFF; 9]);
+    end
+}
+
 impl SchemaStore for LocalSchemaStore<'_> {
     fn load_label(&self, name: &str) -> StoreResult<Option<LabelSchema>> {
         // The pointer and the body it names are read from one complete
@@ -426,8 +483,22 @@ impl SchemaStore for LocalSchemaStore<'_> {
     }
 
     fn save_edge_type(&self, schema: &EdgeTypeSchema) -> StoreResult<()> {
+        use coordinode_core::graph::cardinality::encode_cardinality_profile_key;
+
         let body = edge_type_body(schema)?;
+        let profile_key = encode_cardinality_profile_key(&schema.name);
+        let previous = self.engine.get(Partition::Schema, &profile_key)?;
+        let profile = profile_writes(previous.as_deref(), schema)?;
         let mut batch = WriteBatch::new(self.engine);
+        for withdrawn in &profile.withdrawn {
+            let prefix = withdrawn.counter_prefix();
+            batch.remove_range(Partition::Counter, prefix.clone(), counts_end(&prefix));
+            batch.delete(Partition::Schema, withdrawn.coverage_key());
+        }
+        match profile.profile {
+            Some(bytes) => batch.put(Partition::Schema, profile_key, bytes),
+            None => batch.delete(Partition::Schema, profile_key),
+        }
         batch.put(
             Partition::Schema,
             encode_edge_type_schema_key(&schema.name, schema.schema_revision),
@@ -636,7 +707,21 @@ impl SchemaStore for LocalSchemaStore<'_> {
         txn: &mut Transaction,
         schema: &EdgeTypeSchema,
     ) -> StoreResult<()> {
+        use coordinode_core::graph::cardinality::encode_cardinality_profile_key;
+
         let body = edge_type_body(schema)?;
+        let profile_key = encode_cardinality_profile_key(&schema.name);
+        let previous = txn.get(Partition::Schema, &profile_key)?;
+        let profile = profile_writes(previous.as_deref(), schema)?;
+        for withdrawn in &profile.withdrawn {
+            let prefix = withdrawn.counter_prefix();
+            txn.remove_range(Partition::Counter, &prefix, &counts_end(&prefix))?;
+            txn.delete(Partition::Schema, &withdrawn.coverage_key())?;
+        }
+        match profile.profile {
+            Some(bytes) => txn.put(Partition::Schema, &profile_key, &bytes)?,
+            None => txn.delete(Partition::Schema, &profile_key)?,
+        }
         let schema_key = encode_edge_type_schema_key(&schema.name, schema.schema_revision);
         txn.put(Partition::Schema, &schema_key, &body)?;
         let pointer_key = encode_edge_type_current_revision_key(&schema.name);

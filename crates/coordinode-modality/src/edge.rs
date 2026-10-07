@@ -142,6 +142,22 @@ pub trait EdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Vec<NodeId>>;
 
+    /// Both cardinality measures of `node`'s `edge_type` edges in
+    /// `direction`, counted by logical identity over the committed edges
+    /// and the transaction's staged writes: a property-less edge is an
+    /// instance, parallel discriminated instances to one neighbour are
+    /// several instances and one neighbour. `None` when the scope cannot be
+    /// counted exactly (a temporal type, or a discriminated pair adjacent
+    /// with no instance). An observation: a result that depends on a bound
+    /// states it as a claim for the commit to decide.
+    fn incident_count(
+        &self,
+        txn: &Transaction,
+        node: NodeId,
+        edge_type: &str,
+        direction: coordinode_core::txn::invariant::Direction,
+    ) -> StoreResult<Option<coordinode_core::graph::cardinality::IncidentCount>>;
+
     /// Per-version write of edge properties for `(edge_type, src, tgt)`
     /// (temporal edges). Stores `props` under the temporal
     /// edgeprop key suffixed with `valid_from_ms`; multiple versions
@@ -705,6 +721,16 @@ impl EdgeStore for LocalEdgeStore {
         tgt: NodeId,
     ) -> StoreResult<Vec<NodeId>> {
         Self::read_posting(txn, &encode_adj_key_reverse(edge_type, tgt))
+    }
+
+    fn incident_count(
+        &self,
+        txn: &Transaction,
+        node: NodeId,
+        edge_type: &str,
+        direction: coordinode_core::txn::invariant::Direction,
+    ) -> StoreResult<Option<coordinode_core::graph::cardinality::IncidentCount>> {
+        Ok(txn.incident_count(node, edge_type, direction)?)
     }
 
     fn put_edge_temporal(

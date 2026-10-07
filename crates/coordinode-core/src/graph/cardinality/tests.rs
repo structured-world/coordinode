@@ -277,4 +277,116 @@ proptest! {
             }
         }
     }
+
+    /// The transition between two states of a pair is the one the effects
+    /// that lead from one to the other compose to: what a commit derives from
+    /// the pair before and after its writes equals summing those writes'
+    /// own transitions, for both measures.
+    #[test]
+    fn a_transition_between_states_is_the_sum_of_the_effects(
+        before in proptest::collection::btree_set(0u8..4, 0..4),
+        effects in proptest::collection::vec((any::<bool>(), 0u8..4), 0..8),
+    ) {
+        let start = PairInstances::from_keys(before.iter().map(|k| vec![*k]));
+        let mut pair = start.clone();
+        let mut summed = [0i64; 2];
+        for (add, key) in &effects {
+            let t = if *add { pair.upsert(vec![*key]) } else { pair.remove(&[*key]) };
+            summed[0] += t.delta(CardinalityMeasure::EdgeInstances);
+            summed[1] += t.delta(CardinalityMeasure::DistinctNeighbours);
+        }
+        let derived = start.transition_to(&pair);
+        prop_assert_eq!(derived.delta(CardinalityMeasure::EdgeInstances), summed[0]);
+        prop_assert_eq!(derived.delta(CardinalityMeasure::DistinctNeighbours), summed[1]);
+    }
+}
+
+/// The keys a descriptor's counts and coverage live under are its own:
+/// another direction, measure, generation or type gives another prefix, a
+/// node is read back from its count key, and a key of another descriptor is
+/// not taken for one of these.
+#[test]
+fn every_descriptor_keeps_its_counts_under_its_own_keys() {
+    let d = CardinalityDescriptor {
+        edge_type: "OWNS".into(),
+        direction: Direction::Outgoing,
+        measure: CardinalityMeasure::EdgeInstances,
+        bound: CardinalityBound::AtMostOne,
+        schema_generation: 3,
+    };
+    let key = d.counter_key(n(42));
+    assert!(key.starts_with(CARDINALITY_COUNTER_PREFIX));
+    assert_eq!(d.counter_node(&key), Some(n(42)));
+
+    let variants = [
+        CardinalityDescriptor {
+            direction: Direction::Incoming,
+            ..d.clone()
+        },
+        CardinalityDescriptor {
+            measure: CardinalityMeasure::DistinctNeighbours,
+            ..d.clone()
+        },
+        CardinalityDescriptor {
+            schema_generation: 4,
+            ..d.clone()
+        },
+        CardinalityDescriptor {
+            edge_type: "OWNS_X".into(),
+            ..d.clone()
+        },
+    ];
+    for other in &variants {
+        assert_ne!(other.counter_prefix(), d.counter_prefix(), "{other:?}");
+        assert_ne!(other.coverage_key(), d.coverage_key(), "{other:?}");
+        assert_eq!(d.counter_node(&other.counter_key(n(42))), None, "{other:?}");
+    }
+    // The bound is not part of what is counted.
+    let rebound = CardinalityDescriptor {
+        bound: CardinalityBound::ExactlyOne,
+        ..d.clone()
+    };
+    assert_eq!(rebound.counter_prefix(), d.counter_prefix());
+    // A coverage key never lands among the profiles.
+    assert!(!d.coverage_key().starts_with(CARDINALITY_PROFILE_PREFIX));
+}
+
+/// A discriminated instance's key reads back as its pair and identity; a
+/// single edge's facet key, which has no identity part, and keys of other
+/// families are not instance keys.
+#[test]
+fn instance_keys_read_back_as_their_pair() {
+    use crate::graph::edge::{
+        encode_edgeprop_key, split_discriminated_edgeprop_key as split,
+        temporal_edgeprop_pair_prefix,
+    };
+
+    // A target whose bytes are ':' does not move where the type ends.
+    let mut key = temporal_edgeprop_pair_prefix("KNOWS", n(1), n(0x3A3A));
+    key.extend_from_slice(b"work");
+    assert_eq!(split(&key), Some(("KNOWS", n(1), n(0x3A3A), &b"work"[..])));
+    assert_eq!(split(&encode_edgeprop_key("KNOWS", n(1), n(2))), None);
+    assert_eq!(split(b"adj:KNOWS:out:12345678"), None);
+    assert_eq!(split(b"edgeprop:KNOWS"), None);
+}
+
+/// The profile survives its encoding.
+#[test]
+fn a_profile_round_trips() {
+    let profile = CardinalityProfile {
+        discriminated: true,
+        descriptors: vec![CardinalityDescriptor {
+            edge_type: "OWNS".into(),
+            direction: Direction::Incoming,
+            measure: CardinalityMeasure::DistinctNeighbours,
+            bound: CardinalityBound::AtLeastOne,
+            schema_generation: 9,
+        }],
+    };
+    let bytes = profile.to_msgpack().unwrap();
+    assert_eq!(CardinalityProfile::from_msgpack(&bytes).unwrap(), profile);
+    assert_eq!(
+        encode_cardinality_profile_key("OWNS"),
+        b"schema:cardinality:OWNS".to_vec()
+    );
 }

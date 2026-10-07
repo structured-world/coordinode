@@ -26,13 +26,12 @@ use lsm_tree::Guard;
 
 use crate::engine::core::StorageEngine;
 use crate::engine::partition::Partition;
-use crate::engine::transaction::AdjOp;
 use crate::error::StorageResult;
 
 /// The attempt's own staged adjacency mutations, in the order they were
 /// staged, so the evaluation sees the post-state rather than the state before
 /// the attempt ran.
-pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
+pub type StagedAdj<'a> = crate::engine::cardinality::StagedAdj<'a>;
 
 /// The attempt's staged point writes, as the commit will apply them: `Some`
 /// for a value written, `None` for a row deleted.
@@ -42,7 +41,7 @@ pub type StagedAdj<'a> = &'a [(Vec<u8>, AdjOp)];
 /// are one valid post-state; reading only committed state would find the node
 /// absent and call the edge dangling, refusing the most ordinary write there
 /// is.
-pub type StagedPoints<'a> = &'a std::collections::HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>;
+pub type StagedPoints<'a> = crate::engine::cardinality::StagedPoints<'a>;
 
 /// Whether a claim still holds.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +94,8 @@ pub struct Evaluation<'a> {
     staged_points: StagedPoints<'a>,
     /// Node rows the attempt changes through document deltas, keyed first.
     node_deltas: &'a [(Vec<u8>, Vec<u8>)],
+    /// The changes to kept cardinality counts the attempt derived.
+    kept_counts: Option<&'a rustc_hash::FxHashMap<Vec<u8>, i64>>,
     read_ts: u64,
     edge_types: core::cell::OnceCell<Vec<String>>,
 }
@@ -112,9 +113,19 @@ impl<'a> Evaluation<'a> {
             staged,
             staged_points,
             node_deltas: &[],
+            kept_counts: None,
             read_ts,
             edge_types: core::cell::OnceCell::new(),
         }
+    }
+
+    /// The changes to kept cardinality counts the attempt derived from its
+    /// edge effects. A bound over a covered count is decided from the count
+    /// these leave; without them it is decided by enumeration, which reads
+    /// the same post-state.
+    pub fn with_kept_counts(mut self, kept: &'a rustc_hash::FxHashMap<Vec<u8>, i64>) -> Self {
+        self.kept_counts = Some(kept);
+        self
     }
 
     /// The node rows the attempt changes through document deltas, whose
@@ -167,17 +178,45 @@ impl<'a> Evaluation<'a> {
                 },
                 ClaimPredicate::CardinalityBound { measure, bound },
             ) => {
-                let Some(count) =
-                    incident_count(engine, *node, edge_type, *direction, staged, staged_points)?
-                else {
-                    return Ok(Verdict::Undecidable);
+                // A kept count is only as good as the changes derived for
+                // this attempt: an evaluation that was not handed them reads
+                // the scope instead.
+                let kept = match self.kept_counts {
+                    Some(kept) => crate::engine::cardinality::kept_count(
+                        engine, *node, edge_type, *direction, *measure, kept,
+                    )?,
+                    None => None,
                 };
-                Ok(if bound.admits(count.of(*measure)) {
+                let count = match kept {
+                    Some(Ok(count)) => count,
+                    // A count below zero or out of range is corruption: no
+                    // bound is decided from it.
+                    Some(Err(_)) => return Ok(Verdict::Undecidable),
+                    None => {
+                        let Some(count) = crate::engine::cardinality::enumerated_count(
+                            engine,
+                            *node,
+                            edge_type,
+                            *direction,
+                            staged,
+                            staged_points,
+                        )?
+                        else {
+                            return Ok(Verdict::Undecidable);
+                        };
+                        count.of(*measure)
+                    }
+                };
+                Ok(if bound.admits(count) {
                     Verdict::Holds
                 } else {
                     Verdict::Broken
                 })
             }
+
+            // A footprint: it keeps a second count of the pair out while this
+            // one is derived, and asserts nothing about the pair itself.
+            (ClaimScope::Pair { .. }, ClaimPredicate::PairCounted) => Ok(Verdict::Holds),
 
             (
                 ClaimScope::Pair {
@@ -211,9 +250,14 @@ impl<'a> Evaluation<'a> {
             // The registry excludes the reference rights still in flight; this
             // answers for the ones that already committed. A reference committed
             // after the attempt's view is one its decision to delete never saw.
-            (ClaimScope::Node(node), ClaimPredicate::EndpointDestroyed) => {
-                endpoint_unreferenced(engine, self.edge_types()?, *node, staged, read_ts)
-            }
+            (ClaimScope::Node(node), ClaimPredicate::EndpointDestroyed) => endpoint_unreferenced(
+                engine,
+                self.edge_types()?,
+                *node,
+                staged,
+                staged_points,
+                read_ts,
+            ),
 
             // An enumeration is proved by what it enumerated over: the attempt
             // read the whole incident set at its view, and the claim is that
@@ -848,6 +892,7 @@ fn endpoint_unreferenced(
     edge_types: &[String],
     node: NodeId,
     staged: StagedAdj<'_>,
+    staged_points: StagedPoints<'_>,
     read_ts: u64,
 ) -> StorageResult<Verdict> {
     for edge_type in edge_types {
@@ -857,191 +902,19 @@ fn endpoint_unreferenced(
                 Direction::Incoming => encode_adj_key_reverse(edge_type, node),
             };
             if engine.written_since_snapshot(Partition::Adj, &adj_key, read_ts)?
-                && !adjacency(engine, node, edge_type, direction, staged)?.is_empty()
+                && !crate::engine::cardinality::post_posting(
+                    engine,
+                    &adj_key,
+                    staged,
+                    staged_points,
+                )?
+                .is_empty()
             {
                 return Ok(Verdict::Broken);
             }
         }
     }
     Ok(Verdict::Holds)
-}
-
-/// The neighbour set of one incident scope, with the attempt's staged writes
-/// applied in the order they were staged.
-fn adjacency(
-    engine: &StorageEngine,
-    node: NodeId,
-    edge_type: &str,
-    direction: Direction,
-    staged: StagedAdj<'_>,
-) -> StorageResult<Vec<u64>> {
-    let key = match direction {
-        Direction::Outgoing => encode_adj_key_forward(edge_type, node),
-        Direction::Incoming => encode_adj_key_reverse(edge_type, node),
-    };
-
-    let mut plist = match engine.get(Partition::Adj, &key)? {
-        Some(bytes) => decode_posting(&bytes)?,
-        None => PostingList::new(),
-    };
-
-    for (staged_key, op) in staged {
-        if staged_key.as_slice() != key.as_slice() {
-            continue;
-        }
-        match op {
-            AdjOp::Add(uid) => {
-                plist.insert(*uid);
-            }
-            AdjOp::Remove(uid) => {
-                plist.remove(*uid);
-            }
-        }
-    }
-
-    Ok(plist.as_slice().to_vec())
-}
-
-/// How the instances of an edge type's pairs are told apart, as its current
-/// definition resolved it.
-enum IdentityShape {
-    /// At most one edge per pair: the pair's adjacency is the instance.
-    Single,
-    /// One instance per discriminator value, each an edge-property entry
-    /// under the pair's prefix.
-    Discriminated,
-    /// A temporal type, whose instances apply over valid time; a count at one
-    /// instant is not what its bound is about.
-    Temporal,
-}
-
-/// The identity shape of `edge_type` by its current committed definition. A
-/// type with no definition, or only the marker an edge write leaves, is
-/// single-edge. A definition that does not decode is an error: guessing a
-/// shape for it would count by the wrong rule.
-fn identity_shape(engine: &StorageEngine, edge_type: &str) -> StorageResult<IdentityShape> {
-    use coordinode_core::schema::definition::{
-        EdgeTypeSchema, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
-    };
-
-    let unreadable = |key: &[u8], detail: String| crate::error::StorageError::UnreadableCatalog {
-        kind: "edge type",
-        key: crate::error::printable_key(key),
-        detail,
-    };
-    let pointer_key = encode_edge_type_current_revision_key(edge_type);
-    let Some(pointer) = engine.get(Partition::Schema, &pointer_key)? else {
-        return Ok(IdentityShape::Single);
-    };
-    let revision = u64::from_be_bytes((&pointer[..]).try_into().map_err(|_| {
-        unreadable(
-            &pointer_key,
-            format!("the pointer is {} bytes, not 8", pointer.len()),
-        )
-    })?);
-    let body_key = encode_edge_type_schema_key(edge_type, revision);
-    let Some(body) = engine.get(Partition::Schema, &body_key)? else {
-        return Err(unreadable(
-            &pointer_key,
-            format!("it points at revision {revision}, which is not stored"),
-        ));
-    };
-    if body.is_empty() {
-        return Ok(IdentityShape::Single);
-    }
-    let schema =
-        EdgeTypeSchema::from_msgpack(&body).map_err(|e| unreadable(&body_key, e.to_string()))?;
-    Ok(match (schema.temporal, schema.discriminator()) {
-        (true, _) => IdentityShape::Temporal,
-        (false, Some(_)) => IdentityShape::Discriminated,
-        (false, None) => IdentityShape::Single,
-    })
-}
-
-/// Both measures of one incident scope over the post-state the attempt would
-/// leave: the committed state with its staged adjacency and point writes
-/// applied. `None` when the scope cannot be counted exactly here: a temporal
-/// type, whose bound holds over valid time rather than at one instant, or a
-/// discriminated pair that is adjacent with no identity behind it, which is
-/// evidence missing, never a count of zero.
-///
-/// Each neighbour comes from the adjacency, which is the pair membership
-/// projection. A single-edge pair is one instance whether or not it carries
-/// properties; a discriminated pair has one instance per entry under its
-/// prefix. Counting property rows instead would miss every property-less
-/// edge, and reading the adjacency for instances would miss parallel ones.
-fn incident_count(
-    engine: &StorageEngine,
-    node: NodeId,
-    edge_type: &str,
-    direction: Direction,
-    staged: StagedAdj<'_>,
-    staged_points: StagedPoints<'_>,
-) -> StorageResult<Option<coordinode_core::graph::cardinality::IncidentCount>> {
-    use coordinode_core::graph::cardinality::{IncidentCount, IncidentInstance};
-    use coordinode_core::graph::edge::temporal_edgeprop_pair_prefix;
-
-    let neighbours = adjacency(engine, node, edge_type, direction, staged)?;
-    let shape = identity_shape(engine, edge_type)?;
-    let mut instances = Vec::with_capacity(neighbours.len());
-    for raw in neighbours {
-        let neighbour = NodeId::from_raw(raw);
-        match shape {
-            IdentityShape::Temporal => return Ok(None),
-            IdentityShape::Single => instances.push(IncidentInstance {
-                neighbour,
-                key: Vec::new(),
-            }),
-            IdentityShape::Discriminated => {
-                let (source, target) = match direction {
-                    Direction::Outgoing => (node, neighbour),
-                    Direction::Incoming => (neighbour, node),
-                };
-                let prefix = temporal_edgeprop_pair_prefix(edge_type, source, target);
-                let keys = pair_entries(engine, &prefix, staged_points)?;
-                if keys.is_empty() {
-                    return Ok(None);
-                }
-                instances.extend(
-                    keys.into_iter()
-                        .map(|key| IncidentInstance { neighbour, key }),
-                );
-            }
-        }
-    }
-    Ok(Some(IncidentCount::of_set(instances)))
-}
-
-/// The identity suffixes of the entries under one pair's `prefix` in the
-/// post-state: committed entries the attempt does not tombstone, plus the
-/// ones it writes.
-fn pair_entries(
-    engine: &StorageEngine,
-    prefix: &[u8],
-    staged_points: StagedPoints<'_>,
-) -> StorageResult<Vec<Vec<u8>>> {
-    let mut keys = Vec::new();
-    for guard in engine.prefix_scan(Partition::EdgeProp, prefix)? {
-        // A row that cannot be read is not a row that is absent: skipping it
-        // would undercount and admit the instance that breaks the bound.
-        let key = guard.key()?;
-        if !matches!(
-            staged_points.get(&(Partition::EdgeProp, key.to_vec())),
-            Some(None)
-        ) {
-            keys.push(key[prefix.len()..].to_vec());
-        }
-    }
-    for ((part, key), value) in staged_points {
-        if *part == Partition::EdgeProp && value.is_some() && key.starts_with(prefix) {
-            keys.push(key[prefix.len()..].to_vec());
-        }
-    }
-    // A staged rewrite of a committed entry is the same identity; the count
-    // takes each once.
-    keys.sort_unstable();
-    keys.dedup();
-    Ok(keys)
 }
 
 #[cfg(test)]

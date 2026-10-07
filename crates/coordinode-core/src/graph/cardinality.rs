@@ -25,6 +25,34 @@ use serde::{Deserialize, Serialize};
 use crate::graph::node::NodeId;
 pub use crate::txn::invariant::{CardinalityBound, CardinalityMeasure, Direction};
 
+/// How the instances of an edge type's pairs are told apart, as its current
+/// definition resolved them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityShape {
+    /// At most one edge per pair: the pair's adjacency is the instance,
+    /// whether or not it carries properties.
+    Single,
+    /// One instance per discriminator value, each an edge-property entry
+    /// under the pair's prefix.
+    Discriminated,
+    /// A temporal type: its instances apply over valid time, so a count of
+    /// its current entries is not what a bound over it decides.
+    Temporal,
+}
+
+impl IdentityShape {
+    /// The shape `schema` resolved; a type without a definition is
+    /// single-edge.
+    pub fn of(schema: Option<&crate::schema::definition::EdgeTypeSchema>) -> Self {
+        match schema {
+            None => Self::Single,
+            Some(s) if s.temporal => Self::Temporal,
+            Some(s) if s.discriminator().is_some() => Self::Discriminated,
+            Some(_) => Self::Single,
+        }
+    }
+}
+
 /// The key that tells the instances of one ordered pair apart: the encoded
 /// discriminator for a discriminated type, empty for a single-edge type.
 pub type InstanceKey = Vec<u8>;
@@ -216,6 +244,24 @@ impl PairInstances {
         }
     }
 
+    /// What changes when this pair's instances become `after`'s: the
+    /// transition of an effect known only by the states it leaves, as a
+    /// commit sees the pair before and after its staged writes.
+    pub fn transition_to(&self, after: &PairInstances) -> PairTransition {
+        // Each set is held in memory, so its size fits a u64.
+        let added = after.keys.difference(&self.keys).count() as u64;
+        let removed = self.keys.difference(&after.keys).count() as u64;
+        PairTransition {
+            added,
+            removed,
+            membership: match (self.is_adjacent(), after.is_adjacent()) {
+                (false, true) => Membership::Joined,
+                (true, false) => Membership::Left,
+                _ => Membership::Unchanged,
+            },
+        }
+    }
+
     /// Move the instance `key` from this pair to `to`, keeping its identity:
     /// a redirect. The two transitions are the source's and the
     /// destination's. Moving an identity the source does not hold changes
@@ -262,6 +308,51 @@ pub struct CardinalityDescriptor {
 }
 
 impl CardinalityDescriptor {
+    /// The key prefix of every count this descriptor keeps:
+    /// `card:<type>:<direction><measure><generation BE>`. Edge type names
+    /// carry no ':', so the type ends at the first one.
+    pub fn counter_prefix(&self) -> Vec<u8> {
+        let mut key =
+            Vec::with_capacity(CARDINALITY_COUNTER_PREFIX.len() + self.edge_type.len() + 11);
+        key.extend_from_slice(CARDINALITY_COUNTER_PREFIX);
+        key.extend_from_slice(self.edge_type.as_bytes());
+        key.push(b':');
+        key.push(direction_byte(self.direction));
+        key.push(measure_byte(self.measure));
+        key.extend_from_slice(&self.schema_generation.to_be_bytes());
+        key
+    }
+
+    /// The key of the count kept for the scope of `node`.
+    pub fn counter_key(&self, node: NodeId) -> Vec<u8> {
+        let mut key = self.counter_prefix();
+        key.extend_from_slice(&node.as_raw().to_be_bytes());
+        key
+    }
+
+    /// The node a key under [`Self::counter_prefix`] counts for.
+    pub fn counter_node(&self, key: &[u8]) -> Option<NodeId> {
+        let rest = key.strip_prefix(self.counter_prefix().as_slice())?;
+        let raw: [u8; 8] = rest.try_into().ok()?;
+        Some(NodeId::from_raw(u64::from_be_bytes(raw)))
+    }
+
+    /// The schema key whose presence says every count of this descriptor
+    /// has been built: `schema:cardinality_covered:<type>:<direction>
+    /// <measure><generation BE>`. Without it a count is not evidence, and a
+    /// missing count is not zero.
+    pub fn coverage_key(&self) -> Vec<u8> {
+        let mut key =
+            Vec::with_capacity(CARDINALITY_COVERAGE_PREFIX.len() + self.edge_type.len() + 11);
+        key.extend_from_slice(CARDINALITY_COVERAGE_PREFIX);
+        key.extend_from_slice(self.edge_type.as_bytes());
+        key.push(b':');
+        key.push(direction_byte(self.direction));
+        key.push(measure_byte(self.measure));
+        key.extend_from_slice(&self.schema_generation.to_be_bytes());
+        key
+    }
+
     /// The neighbour an instance of pair `(source, target)` reaches in the
     /// scope of `node`, if the pair is incident to `node` on this
     /// descriptor's side.
@@ -277,6 +368,64 @@ impl CardinalityDescriptor {
             _ => None,
         }
     }
+}
+
+/// Key prefix of every maintained count, in the counter partition.
+pub const CARDINALITY_COUNTER_PREFIX: &[u8] = b"card:";
+
+/// Key prefix of the coverage markers, in the schema partition.
+pub const CARDINALITY_COVERAGE_PREFIX: &[u8] = b"schema:cardinality_covered:";
+
+/// Key prefix of the per-type profiles, in the schema partition.
+pub const CARDINALITY_PROFILE_PREFIX: &[u8] = b"schema:cardinality:";
+
+fn direction_byte(direction: Direction) -> u8 {
+    match direction {
+        Direction::Outgoing => 0,
+        Direction::Incoming => 1,
+    }
+}
+
+fn measure_byte(measure: CardinalityMeasure) -> u8 {
+    match measure {
+        CardinalityMeasure::EdgeInstances => 0,
+        CardinalityMeasure::DistinctNeighbours => 1,
+    }
+}
+
+/// What a commit needs to keep the declared counts of one edge type: how
+/// its pair instances are told apart and which counts are kept. Stored
+/// beside the type's definition, under [`encode_cardinality_profile_key`],
+/// only while the type declares a constraint, so a commit writing an
+/// unconstrained type finds nothing in one read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardinalityProfile {
+    /// Instances are told apart by a discriminator, one edge-property entry
+    /// each; otherwise the pair's adjacency is its one instance.
+    pub discriminated: bool,
+    /// The constraints whose counts are kept.
+    pub descriptors: Vec<CardinalityDescriptor>,
+}
+
+impl CardinalityProfile {
+    /// Serialize to MessagePack.
+    pub fn to_msgpack(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        rmp_serde::to_vec(self)
+    }
+
+    /// Deserialize from MessagePack.
+    pub fn from_msgpack(data: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(data)
+    }
+}
+
+/// The schema key holding edge type `edge_type`'s [`CardinalityProfile`]:
+/// `schema:cardinality:<type>`.
+pub fn encode_cardinality_profile_key(edge_type: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CARDINALITY_PROFILE_PREFIX.len() + edge_type.len());
+    key.extend_from_slice(CARDINALITY_PROFILE_PREFIX);
+    key.extend_from_slice(edge_type.as_bytes());
+    key
 }
 
 #[cfg(test)]

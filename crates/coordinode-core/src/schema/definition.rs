@@ -732,6 +732,10 @@ pub struct EdgeTypeSchema {
     /// [`Self::resolve_identity`]: `None` for a single-edge type.
     discriminator: Option<EdgeDiscriminator>,
 
+    /// The relationship cardinality constraints declared over this type,
+    /// one per direction and measure. Only these have their counts kept.
+    cardinality: Vec<crate::graph::cardinality::CardinalityDescriptor>,
+
     /// Placement policy for adjacency entries relative to endpoint nodes.
     /// Default `ColocateWithSource` matches the graph-default
     /// traversal pattern; alternative values opt into target-co-location or
@@ -752,9 +756,80 @@ impl EdgeTypeSchema {
             properties: BTreeMap::new(),
             temporal: false,
             discriminator: None,
+            cardinality: Vec::new(),
             placement: EdgePlacement::default(),
             schema_revision: 1,
         }
+    }
+
+    /// The cardinality constraints declared over this type.
+    pub fn cardinality(&self) -> &[crate::graph::cardinality::CardinalityDescriptor] {
+        &self.cardinality
+    }
+
+    /// Declare a cardinality constraint over this type.
+    ///
+    /// # Errors
+    ///
+    /// The descriptor names another edge type; the type is temporal, whose
+    /// bound holds at every applicable valid-time instant rather than over
+    /// one current set; or a constraint over the same direction and measure
+    /// is already declared.
+    pub fn declare_cardinality(
+        &mut self,
+        descriptor: crate::graph::cardinality::CardinalityDescriptor,
+    ) -> Result<(), String> {
+        let name = &self.name;
+        if descriptor.edge_type != *name {
+            return Err(format!(
+                "a cardinality constraint over '{}' cannot be declared on edge type '{name}'",
+                descriptor.edge_type
+            ));
+        }
+        if self.temporal {
+            return Err(format!(
+                "edge type '{name}' is temporal: its cardinality holds at every valid-time \
+                 instant, which a count of its current edges does not decide"
+            ));
+        }
+        if self
+            .cardinality
+            .iter()
+            .any(|d| d.direction == descriptor.direction && d.measure == descriptor.measure)
+        {
+            return Err(format!(
+                "edge type '{name}' already has a {:?} {:?} cardinality constraint",
+                descriptor.direction, descriptor.measure
+            ));
+        }
+        self.cardinality.push(descriptor);
+        Ok(())
+    }
+
+    /// Withdraw the cardinality constraint over `direction` and `measure`,
+    /// returning it if one was declared.
+    pub fn withdraw_cardinality(
+        &mut self,
+        direction: crate::graph::cardinality::Direction,
+        measure: crate::graph::cardinality::CardinalityMeasure,
+    ) -> Option<crate::graph::cardinality::CardinalityDescriptor> {
+        let at = self
+            .cardinality
+            .iter()
+            .position(|d| d.direction == direction && d.measure == measure)?;
+        Some(self.cardinality.remove(at))
+    }
+
+    /// What a commit needs to keep this type's declared counts; `None` when
+    /// it declares no constraint, and a commit then keeps nothing for it.
+    pub fn cardinality_profile(&self) -> Option<crate::graph::cardinality::CardinalityProfile> {
+        if self.cardinality.is_empty() {
+            return None;
+        }
+        Some(crate::graph::cardinality::CardinalityProfile {
+            discriminated: self.discriminator.is_some(),
+            descriptors: self.cardinality.clone(),
+        })
     }
 
     /// How instances of one endpoint pair are told apart; `None` for a

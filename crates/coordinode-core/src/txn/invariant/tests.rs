@@ -636,3 +636,53 @@ fn a_repeated_claim_is_stored_once() {
     s.insert(claim);
     assert_eq!(s.len(), 1);
 }
+
+/// Two counts of one pair cannot be decided together: both would take the
+/// pair's transition from the same state before them, so two first
+/// instances would both count the neighbour joining.
+#[test]
+fn two_counts_of_one_pair_conflict() {
+    let a = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let b = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    assert!(!a.compatible_with(&b));
+}
+
+/// Counts of different pairs, even of one node, are independent: what keeps
+/// a popular node's additions parallel is that only the same pair queues.
+#[test]
+fn counts_of_different_pairs_do_not_queue() {
+    let a = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let b = Claim::new(pair(1, 3, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let reference = Claim::new(
+        ClaimScope::Node(node(1)),
+        ClaimPredicate::EndpointAlive,
+        GEN,
+    );
+    assert!(a.compatible_with(&b));
+    assert!(a.compatible_with(&reference));
+}
+
+/// A count of a pair changes what a bound over either endpoint's scope and
+/// an enumeration of it read, and a node's destruction takes the pair, so
+/// each of those excludes it; the pair's own instance claims are decided by
+/// themselves.
+#[test]
+fn a_counted_pair_meets_the_bounds_and_scans_over_it() {
+    let counted = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let bound = Claim::new(incident(2, "OWNS", Direction::Incoming), at_most_one(), GEN);
+    let scan = Claim::new(
+        incident(1, "OWNS", Direction::Outgoing),
+        ClaimPredicate::IncidentSetComplete,
+        GEN,
+    );
+    let destroyed = Claim::new(
+        ClaimScope::Node(node(2)),
+        ClaimPredicate::EndpointDestroyed,
+        GEN,
+    );
+    let written = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairInstanceWritten, GEN);
+    assert!(!counted.compatible_with(&bound));
+    assert!(!counted.compatible_with(&scan));
+    assert!(!counted.compatible_with(&destroyed));
+    assert!(counted.compatible_with(&written));
+}

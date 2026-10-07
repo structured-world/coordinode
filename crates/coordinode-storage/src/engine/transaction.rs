@@ -353,6 +353,11 @@ pub struct Transaction<'a> {
     /// Commits even while storage sheds writes under pressure
     /// ([`Self::exempt_from_write_pressure`]).
     pressure_exempt: bool,
+    /// The changes to kept cardinality counts this commit derived from its
+    /// staged edge effects. Derived anew by each commit attempt rather than
+    /// added to [`Self::merge_counter_deltas`], so an attempt that fails
+    /// after deriving leaves nothing a later one would count twice.
+    kept_counts: rustc_hash::FxHashMap<Vec<u8>, i64>,
 }
 
 /// The borrow-free owned state of a [`Transaction`] — everything except the
@@ -550,6 +555,7 @@ impl<'a> Transaction<'a> {
             range_removals: Vec::new(),
             post_state_checks: Vec::new(),
             pressure_exempt: false,
+            kept_counts: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -680,6 +686,7 @@ impl<'a> Transaction<'a> {
             range_removals: state.range_removals,
             post_state_checks: state.post_state_checks,
             pressure_exempt: false,
+            kept_counts: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -1044,7 +1051,8 @@ impl<'a> Transaction<'a> {
         let view = self.snapshot.unwrap_or_else(|| self.engine.snapshot());
         let evaluation =
             Evaluation::new(self.engine, &self.merge_adj_ops, &self.write_buffer, view)
-                .with_node_deltas(&self.merge_node_deltas);
+                .with_node_deltas(&self.merge_node_deltas)
+                .with_kept_counts(&self.kept_counts);
         for claim in self
             .claims
             .claims()
@@ -1316,6 +1324,11 @@ impl<'a> Transaction<'a> {
         &self.expected_versions
     }
 
+    /// The engine this attempt reads and commits to.
+    pub(crate) fn engine(&self) -> &'a StorageEngine {
+        self.engine
+    }
+
     /// The schema generation this attempt evaluates its predicates under.
     ///
     /// A writer stamps it on every claim it states, which is why it is read
@@ -1336,6 +1349,38 @@ impl<'a> Transaction<'a> {
     /// The conditions stated so far.
     pub fn claims(&self) -> &ClaimSet {
         &self.claims
+    }
+
+    /// Both cardinality measures of the scope of `node`'s `edge_type` edges
+    /// in `direction`, as this attempt would leave it: the latest committed
+    /// edges with its staged writes applied, counted by logical identity.
+    /// `None` when the scope cannot be counted exactly: a temporal type,
+    /// whose bound holds over valid time, or a discriminated pair adjacent
+    /// with no instance behind it.
+    ///
+    /// The count is an observation, not a guarantee: a commit landing after
+    /// it can change it. An attempt whose result depends on a bound states a
+    /// `CardinalityBound` claim, which the commit decides against the state
+    /// it lands on.
+    ///
+    /// # Errors
+    ///
+    /// A stored posting, entry or definition does not decode, or a read
+    /// fails.
+    pub fn incident_count(
+        &self,
+        node: coordinode_core::graph::node::NodeId,
+        edge_type: &str,
+        direction: coordinode_core::txn::invariant::Direction,
+    ) -> StorageResult<Option<coordinode_core::graph::cardinality::IncidentCount>> {
+        crate::engine::cardinality::enumerated_count(
+            self.engine,
+            node,
+            edge_type,
+            direction,
+            &self.merge_adj_ops,
+            &self.write_buffer,
+        )
     }
 
     /// Replay this transaction's own staged adjacency operands onto `plist`,
@@ -1546,6 +1591,21 @@ impl<'a> Transaction<'a> {
             // No admission without a clock: the conditions are checked
             // against the state as it stands, as the writes are applied to it.
             self.check_expected_versions()?;
+            // Its point writes are already applied, so no state before them
+            // is left to count a transition from.
+            if !crate::engine::cardinality::plan(
+                self.engine,
+                &self.merge_adj_ops,
+                &self.write_buffer,
+            )?
+            .is_empty()
+            {
+                return Err(CommitError::InvariantRefused {
+                    reason: "an edge type with kept cardinality counts is written only by a \
+                             transactional commit"
+                        .to_string(),
+                });
+            }
             let staged = std::mem::take(&mut self.merge_adj_ops);
             for (key, operand) in encode_staged_adj(&staged) {
                 self.engine.merge(Partition::Adj, key, &operand)?;
@@ -1603,6 +1663,13 @@ impl<'a> Transaction<'a> {
             for read in std::mem::take(&mut self.schema_reads).claims() {
                 self.claims.insert(read.clone());
             }
+        }
+        // The pairs whose kept counts this commit changes, claimed with the
+        // rest so no other count of them is decided beside it.
+        let counts =
+            crate::engine::cardinality::plan(self.engine, &self.merge_adj_ops, &self.write_buffer)?;
+        for claim in counts.claims(self.schema_generation) {
+            self.claims.insert(claim);
         }
         // Before the timestamp: every snapshot taken after it waits for this
         // commit to land, so a long read here would hold up all of them.
@@ -1680,6 +1747,22 @@ impl<'a> Transaction<'a> {
                 }
             })?;
         let commit_ts = Timestamp::from_raw(commit_ts_raw);
+
+        // The count changes, taken against the pairs as they stand now that
+        // no other count of them can land: derived before the bounds are
+        // decided, which read the counts these changes leave.
+        self.kept_counts.clear();
+        if !counts.is_empty() {
+            match crate::engine::cardinality::deltas(
+                self.engine,
+                &counts,
+                &self.merge_adj_ops,
+                &self.write_buffer,
+            )? {
+                Ok(kept) => self.kept_counts = kept,
+                Err(reason) => return Err(CommitError::InvariantRefused { reason }),
+            }
+        }
 
         // Both halves of the condition check, now that the protection is
         // installed: the registry saw the attempts in flight beside this one,
@@ -1781,7 +1864,12 @@ impl<'a> Transaction<'a> {
             for (key, operand) in &self.merge_node_deltas {
                 self.engine.merge(Partition::Node, key, operand)?;
             }
-            for (key, delta) in self.merge_counter_deltas.iter().filter(|(_, d)| **d != 0) {
+            for (key, delta) in self
+                .merge_counter_deltas
+                .iter()
+                .chain(self.kept_counts.iter())
+                .filter(|(_, d)| **d != 0)
+            {
                 self.engine
                     .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
             }
@@ -1817,6 +1905,7 @@ impl<'a> Transaction<'a> {
                 self.merge_adj_ops.clear();
                 self.merge_node_deltas.clear();
                 self.merge_counter_deltas.clear();
+                self.kept_counts.clear();
                 self.derived = derived::DerivedLedger::default();
             }
 
@@ -1962,7 +2051,12 @@ impl<'a> Transaction<'a> {
                 operand,
             });
         }
-        for (key, delta) in self.merge_counter_deltas.drain().filter(|(_, d)| *d != 0) {
+        for (key, delta) in self
+            .merge_counter_deltas
+            .drain()
+            .chain(self.kept_counts.drain())
+            .filter(|(_, d)| *d != 0)
+        {
             mutations.push(Mutation::Merge {
                 partition: PartitionId::Counter,
                 key,

@@ -174,6 +174,12 @@ pub enum ClaimPredicate {
     /// with the last one the pair's adjacency. Its result depends on no
     /// instance having joined the pair since.
     PairInstancesComplete,
+    /// The attempt changes a pair of a type whose cardinality counts are
+    /// kept, and stages the change to those counts as the pair's state now
+    /// and after its writes differ. Two such attempts on one pair would each
+    /// derive from the same state before and count one transition twice: two
+    /// first instances would both make the pair adjacent.
+    PairCounted,
     /// The attempt enumerated the complete incident set of its scope and its
     /// result depends on nothing having been added to it since. This is what
     /// protects a scan against a member it never saw.
@@ -289,8 +295,24 @@ impl Claim {
             // every edge written to a popular node behind every pair change on
             // it. Destroying the node is what excludes pair changes, above.
             // Stated from both sides because both directions must agree.
-            (EndpointAlive, PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete)
-            | (PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete, EndpointAlive) => {
+            (
+                EndpointAlive,
+                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete | PairCounted,
+            )
+            | (
+                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete | PairCounted,
+                EndpointAlive,
+            ) => true,
+
+            // Each derives the pair's transition from the state the other
+            // is about to change.
+            (PairCounted, PairCounted) => false,
+
+            // What a pair's other claims protect is decided by those claims;
+            // counting the pair adds a condition only against another count
+            // of it. An attempt on the pair that counts holds this claim too.
+            (PairCounted, PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete)
+            | (PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete, PairCounted) => {
                 true
             }
 
@@ -307,6 +329,7 @@ impl Claim {
                 PairAdjacency { .. }
                 | PairInstanceWritten
                 | PairInstancesComplete
+                | PairCounted
                 | IncidentSetComplete,
             ) => false,
 
@@ -339,7 +362,8 @@ impl Claim {
                 IncidentSetComplete
                 | PairAdjacency { .. }
                 | PairInstanceWritten
-                | PairInstancesComplete,
+                | PairInstancesComplete
+                | PairCounted,
             ) => false,
 
             // The condition was evaluated against one version of the record;

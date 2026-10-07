@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, StorageConfig, Tier};
 use crate::engine::merge::{encode_add, encode_remove};
+use crate::engine::transaction::AdjOp;
 use coordinode_core::txn::invariant::ClaimScope;
 use std::collections::HashMap;
 use tempfile::TempDir;
