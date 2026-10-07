@@ -1097,6 +1097,7 @@ fn a_repair_of_a_value_changed_since_overwrites_nothing() {
         },
         NodeId::from_raw(2),
         Some(&Value::String("same@x".into())),
+        &super::super::repair::suffix,
     )
     .expect("repair");
 
@@ -1107,5 +1108,101 @@ fn a_repair_of_a_value_changed_since_overwrites_nothing() {
             .list_repairs(def.generation)
             .expect("repairs")
             .is_empty()
+    );
+}
+
+/// Run one repair of node 2, whose `same@x` node 1 also holds, while the
+/// build of `def` is running but has covered nothing yet, drawing suffixes
+/// from `suffixes` in turn (the last one repeats).
+fn repair_node_two(
+    env: &Arc<TestEnv>,
+    def: &IndexDefinition,
+    suffixes: &[&str],
+) -> Result<super::super::repair::Repaired, BackfillError> {
+    let builds = service(env);
+    let older = older_transaction(env);
+    builds.submit(def.generation, 0).expect("submit");
+    let token = await_running(env, def, None);
+    let drawn = std::cell::Cell::new(0usize);
+    let next = || {
+        let i = drawn.get();
+        drawn.set(i + 1);
+        suffixes[i.min(suffixes.len() - 1)].to_string()
+    };
+
+    let repaired = super::super::repair::rename_duplicate(
+        &builds,
+        env.as_ref(),
+        &super::super::repair::RepairBuild {
+            generation: def.generation,
+            token,
+            index: def,
+            property: "email",
+        },
+        NodeId::from_raw(2),
+        Some(&Value::String("same@x".into())),
+        &next,
+    );
+    drop(older);
+    builds.wait(def.generation, None).expect("wait");
+    repaired
+}
+
+/// A suffix whose result another node already holds is not taken: the
+/// repair draws another one and gives the node that value.
+#[test]
+fn a_repair_redraws_a_suffix_another_node_holds() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    env.put_user(3, "same@x_aaaaaaaa");
+    let def = admit_repairing(&env);
+
+    let repaired = repair_node_two(&env, &def, &["aaaaaaaa", "bbbbbbbb"]).expect("repair");
+
+    assert_eq!(repaired, super::super::repair::Repaired::Done);
+    assert_eq!(
+        email_of(&env, 2),
+        Some(Value::String("same@x_bbbbbbbb".into()))
+    );
+    assert_eq!(
+        email_of(&env, 3),
+        Some(Value::String("same@x_aaaaaaaa".into()))
+    );
+    let repairs = LocalIndexStore::new(&env.engine)
+        .list_repairs(def.generation)
+        .expect("repairs");
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].new, "same@x_bbbbbbbb");
+}
+
+/// When every suffix drawn gives a value another node holds, the repair
+/// gives up with an error naming the property and the value, and changes
+/// nothing.
+#[test]
+fn a_repair_that_finds_no_free_suffix_fails_without_writing() {
+    let env = env();
+    env.put_user(1, "same@x");
+    env.put_user(2, "same@x");
+    env.put_user(3, "same@x_aaaaaaaa");
+    let def = admit_repairing(&env);
+
+    let refused = repair_node_two(&env, &def, &["aaaaaaaa"]);
+
+    assert!(
+        matches!(&refused, Err(BackfillError::Repair(why))
+            if why.contains("no free value of `email`") && why.contains("same@x")),
+        "{refused:?}"
+    );
+    assert_ne!(
+        email_of(&env, 2),
+        Some(Value::String("same@x_aaaaaaaa".into()))
+    );
+    assert!(
+        LocalIndexStore::new(&env.engine)
+            .list_repairs(def.generation)
+            .expect("repairs")
+            .iter()
+            .all(|r| r.new != "same@x_aaaaaaaa")
     );
 }

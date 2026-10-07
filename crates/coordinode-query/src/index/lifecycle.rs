@@ -779,6 +779,7 @@ impl Shared {
                 },
                 node,
                 old,
+                &super::repair::suffix,
             )
             .map(|_| ())
         };

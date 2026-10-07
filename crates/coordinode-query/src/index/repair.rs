@@ -77,7 +77,8 @@ impl IdLeaseReserver for NoNewNodes {
 }
 
 /// Give `node`, whose value `old` of the repaired property another node
-/// holds, a value of its own.
+/// holds, a value of its own: `old` plus `_` and a suffix `suffixes` draws,
+/// redrawn while another node holds the result.
 ///
 /// # Errors
 ///
@@ -91,6 +92,7 @@ pub(crate) fn rename_duplicate(
     build: &RepairBuild<'_>,
     node: NodeId,
     old: Option<&Value>,
+    suffixes: &dyn Fn() -> String,
 ) -> Result<Repaired, BackfillError> {
     let Some(Value::String(old)) = old else {
         return Err(BackfillError::Repair(format!(
@@ -117,7 +119,7 @@ pub(crate) fn rename_duplicate(
         })?);
 
     for _ in 0..SUFFIX_ATTEMPTS {
-        let new = format!("{old}_{}", suffix());
+        let new = format!("{old}_{}", suffixes());
         let params = HashMap::from([
             ("node".to_string(), node_value.clone()),
             ("old".to_string(), Value::String(old.clone())),
@@ -289,7 +291,7 @@ fn attempt(
 }
 
 /// A random suffix of [`SUFFIX_LEN`] base-36 digits.
-fn suffix() -> String {
+pub(crate) fn suffix() -> String {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let mut n = rand::random::<u64>();
     let mut out = String::with_capacity(SUFFIX_LEN);
