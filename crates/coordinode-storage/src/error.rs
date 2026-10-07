@@ -78,9 +78,8 @@ pub enum StorageError {
     /// predates apply coverage; the store is left untouched.
     #[error(
         "store at {path} holds {entries} journal entries with no apply-coverage \
-         record; refusing to guess which of them are on disk. Dump it with the \
-         release that wrote it (`coordinode backup --format raft-snapshot`) and \
-         restore the dump with this one (`coordinode restore --format raft-snapshot`)"
+         record; refusing to guess which of them are on disk. It was written by \
+         an earlier release, which this one does not open"
     )]
     CoverageUnprovable { path: String, entries: usize },
 
@@ -167,14 +166,9 @@ pub enum StorageError {
     /// A catalog record (an index definition, an index build) does not
     /// decode in this build. Nothing is served without it: skipping it would
     /// serve the database without that index and the uniqueness it enforces.
-    /// A directory written by a development build between releases carries
-    /// catalog records of an earlier layout and moves through a logical dump.
     #[error(
         "the {kind} record {key} does not decode in this build ({detail}); the data \
-         directory was written by another build or is damaged, and is not opened. A \
-         directory written by a development build is moved with a logical dump: \
-         `coordinode backup --format binary` with the build that wrote it, then \
-         `coordinode restore --format binary` with this one"
+         directory was written by another build or is damaged, and is not opened"
     )]
     UnreadableCatalog {
         /// What the record is.

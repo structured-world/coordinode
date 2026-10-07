@@ -1262,8 +1262,8 @@ impl CoordinodeStateMachine {
     ///
     /// A store that applied Raft entries under a release without coverage
     /// records is refused: nothing in it proves which entries each tree
-    /// holds. It is moved to this release by a dump and a restore. A failed
-    /// coverage read or the first record's flush also fails the open.
+    /// holds. A failed coverage read, an unreadable applied membership or the
+    /// first record's flush also fails the open.
     pub fn with_oracle_and_watermark(
         engine: Arc<StorageEngine>,
         oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
@@ -1287,9 +1287,8 @@ impl CoordinodeStateMachine {
             None if Self::load_log_id(&engine, KEY_SM_APPLIED)?.is_some() => {
                 return Err(io::Error::other(
                     "this store applied Raft entries without an apply-coverage record, so \
-                     nothing proves which of them each partition holds; dump it with the \
-                     release that wrote it (`coordinode backup --format raft-snapshot`) and \
-                     restore the dump with this one (`coordinode restore --format raft-snapshot`)",
+                     nothing proves which of them each partition holds; it was written by an \
+                     earlier release, which this one does not open",
                 ));
             }
             None => {

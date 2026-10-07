@@ -1,13 +1,9 @@
 //! A store written by a released build (v0.6.0) predates apply coverage.
-//! This release refuses to open it, leaving it byte for byte as it was, and
-//! the way across is a dump taken with the released build, restored with
-//! this one.
+//! This release refuses to open it, leaving it byte for byte as it was.
 //!
 //! `tests/fixtures/v0.6.0/` holds what v0.6.0 itself wrote: `embedded/` (a
-//! journalled store: Alice-[:KNOWS]->Bob and Carol), `raft/` (a single-node
-//! Raft store with three applied proposals) and `embedded.snap` (a
-//! `coordinode backup --format raft-snapshot` of `embedded/`, taken with the
-//! v0.6.0 binary).
+//! journalled store: Alice-[:KNOWS]->Bob and Carol) and `raft/` (a
+//! single-node Raft store with three applied proposals).
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -102,45 +98,6 @@ fn a_released_raft_store_is_refused_untouched() {
     };
     assert!(
         err.to_string().contains("without an apply-coverage record"),
-        "the refusal names the reason and the way across, got: {err}"
+        "the refusal names the reason, got: {err}"
     );
-}
-
-#[test]
-fn a_dump_taken_with_the_released_build_restores_into_this_one() {
-    // The upgrade path end to end: the v0.6.0 dump, restored with this
-    // release's own `coordinode restore`, then read through the database.
-    let scratch = tempfile::tempdir().unwrap();
-    let store = scratch.path().join("restored");
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_coordinode"))
-        .arg("restore")
-        .arg("--data")
-        .arg(&store)
-        .arg("--input")
-        .arg(fixture("embedded.snap"))
-        .arg("--format")
-        .arg("raft-snapshot")
-        .status()
-        .expect("run coordinode restore");
-    assert!(
-        status.success(),
-        "restore of the v0.6.0 dump failed: {status}"
-    );
-
-    let mut db = Database::open(&store).expect("the restored store opens");
-    let users = db
-        .execute_cypher("MATCH (n:User) RETURN n.name AS name ORDER BY name")
-        .expect("match users");
-    let names: Vec<String> = users
-        .iter()
-        .map(|row| match row.get("name") {
-            Some(coordinode_core::graph::types::Value::String(s)) => s.clone(),
-            other => panic!("name is a string, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(names, ["Alice", "Bob", "Carol"]);
-    let knows = db
-        .execute_cypher("MATCH (:User {name: 'Alice'})-[:KNOWS]->(b:User) RETURN b.name AS name")
-        .expect("match edge");
-    assert_eq!(knows.len(), 1, "the edge survived the dump and restore");
 }

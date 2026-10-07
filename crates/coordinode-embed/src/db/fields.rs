@@ -73,8 +73,8 @@ impl FieldDictionary {
         {
             return Err(DictionaryError::Malformed(
                 "the store keeps its field dictionary in the whole-table format, whose \
-                 bindings cannot be proven complete; dump it with the release that wrote \
-                 it and restore the dump"
+                 bindings cannot be proven complete; it was written by an earlier release, \
+                 which this one does not open"
                     .into(),
             )
             .into());
