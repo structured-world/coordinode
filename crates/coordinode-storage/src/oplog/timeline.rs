@@ -4,7 +4,7 @@
 //! position, and a bound check asks it for every consumer, again and again.
 //! Answering by reading the segment that holds the position costs that
 //! segment's size on every ask. The timeline keeps instead, per segment, the
-//! byte offset of an entry at most every [`MARK_STRIDE`] bytes. A scan finds
+//! byte offset of an entry at most every 64 KiB. A scan finds
 //! them reading each byte of a segment once (the open segment only as it
 //! grows), and an answer reads at most a stride from the nearest mark. What
 //! it keeps below the lowest acknowledged position is released with

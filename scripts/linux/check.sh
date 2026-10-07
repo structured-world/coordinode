@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the CI gate (clippy, server build, nextest, doc tests) for the current
+# Run the CI gate (clippy, server build, nextest, doc tests, API docs) for the current
 # working tree on a Linux machine, uncommitted and untracked changes included,
 # without touching the local index, branches or working tree.
 #
@@ -242,9 +242,11 @@ cargo nextest run --all-features --workspace --no-fail-fast --status-level fail 
 echo nextest=\$? >> ../status.txt
 cargo test --doc --all-features > ../doctest.log 2>&1
 echo doctest=\$? >> ../status.txt
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --workspace --all-features > ../doc.log 2>&1
+echo doc=\$? >> ../status.txt
 echo done >> ../status.txt" || true
 
-for f in status.txt clippy.log build.log test.log doctest.log; do
+for f in status.txt clippy.log build.log test.log doctest.log doc.log; do
   ssh "$host" "cat '$remote_root/$f'" > "$out/$f" 2>/dev/null || true
 done
 
