@@ -63,7 +63,6 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
         oracle: Some(&fx.oracle),
         interner: &fx.interner,
         shard_id: 1,
-        own_open: 0,
         definition_version: None,
         older_transactions_wait: super::DEFAULT_OLDER_TRANSACTIONS_WAIT,
         progress: None,

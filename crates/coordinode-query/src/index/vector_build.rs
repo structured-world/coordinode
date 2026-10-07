@@ -182,7 +182,6 @@ impl VectorBuild<'_> {
                 .engine
                 .await_transactions_through(
                     boundary,
-                    0,
                     OLDER_TRANSACTIONS_POLL,
                     OLDER_TRANSACTIONS_SLICE,
                 )

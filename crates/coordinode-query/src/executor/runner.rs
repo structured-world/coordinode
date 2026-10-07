@@ -17556,16 +17556,19 @@ enum BuildWait {
 fn await_index_build(
     def: &crate::index::IndexDefinition,
     wait: Option<Duration>,
-    ctx: &ExecutionContext<'_>,
+    ctx: &mut ExecutionContext<'_>,
 ) -> Result<BuildWait, ExecutionError> {
     use crate::index::{BuildError, IndexBuildOutcome};
     let builds = ctx.index_builds.ok_or_else(|| {
         ExecutionError::Unsupported("building an index requires the engine's index builds".into())
     })?;
-    // The statement's own transaction is open while it waits; it writes no
-    // node, so the backfill does not wait for it.
+    // The statement's own transaction is open while it waits. Having staged
+    // nothing, it leaves the backfill's wait, which would otherwise wait for
+    // the statement waiting for it; one of an interactive transaction that
+    // already staged node writes stays, and the build ends after it does.
+    ctx.txn.release_from_schema_waits();
     builds
-        .submit(def.generation, 1)
+        .submit(def.generation)
         .map_err(ExecutionError::Unsupported)?;
     let wait = wait.unwrap_or_else(|| builds.config().statement_wait);
     match builds.wait(def.generation, Some(wait))? {

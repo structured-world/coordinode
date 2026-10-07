@@ -3318,23 +3318,23 @@ impl StorageEngine {
     }
 
     /// Wait until no transaction opened at or before `boundary` (a value of
-    /// [`Self::snapshot_boundary`]) is still open, other than the caller's
-    /// own `own` transactions opened before it, polling every `poll`, for at
-    /// most `timeout`. Returns how many are still open when the time ran out.
+    /// [`Self::snapshot_boundary`]) is still open, polling every `poll`, for
+    /// at most `timeout`. Returns how many are still open when the time ran
+    /// out. A caller waiting from inside a transaction of its own leaves the
+    /// count first ([`Transaction::release_from_schema_waits`](crate::engine::transaction::Transaction::release_from_schema_waits)).
     ///
     /// Only transactions are waited for: a long-lived reader (a backup, a
     /// CDC consumer) writes nothing and is not one.
     pub fn await_transactions_through(
         &self,
         boundary: lsm_tree::SeqNo,
-        own: usize,
         poll: std::time::Duration,
         timeout: std::time::Duration,
     ) -> Result<(), usize> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let open = self.open_transactions.open_through(boundary);
-            if open <= own {
+            if open == 0 {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {

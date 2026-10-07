@@ -130,7 +130,7 @@ fn an_admitted_build_runs_on_the_engine_and_publishes_the_index() {
     );
     let builds = service(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -165,7 +165,7 @@ fn a_waiter_that_gives_up_cancels_nothing() {
     let builds = service(&env);
     let older = older_transaction(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let taken_by = std::time::Instant::now() + Duration::from_secs(20);
     while !matches!(
         env.record(&def).expect("record").state,
@@ -201,7 +201,7 @@ fn a_cancelled_build_withdraws_the_index_it_was_creating() {
     );
     let builds = service(&env);
     let older = older_transaction(&env);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
 
     assert!(builds.cancel(def.generation).expect("cancel"));
     drop(older);
@@ -237,7 +237,7 @@ fn a_duplicate_withdraws_a_new_unique_index() {
     );
     let builds = service(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -269,7 +269,7 @@ fn a_refused_rebuild_keeps_its_index_failed() {
     );
     let builds = service(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -328,11 +328,9 @@ fn a_build_taken_over_is_finished_once() {
     let second = service(&env);
     let older = older_transaction(&env);
 
-    first.submit(def.generation, 0).expect("first takes it");
+    first.submit(def.generation).expect("first takes it");
     let taken = await_running(&env, &def, None);
-    second
-        .submit(def.generation, 0)
-        .expect("second takes it over");
+    second.submit(def.generation).expect("second takes it over");
     await_running(&env, &def, Some(taken));
     drop(older);
     let a = first.wait(def.generation, None).expect("first wait");
@@ -487,7 +485,7 @@ fn a_build_behind_an_older_transaction_shows_the_wait() {
     let builds = service(&env);
     let older = older_transaction(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     await_phase(
         &builds,
         def.generation,
@@ -534,7 +532,7 @@ fn a_build_outwaited_by_an_older_transaction_fails() {
     });
     let older = older_transaction(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
     drop(older);
 
@@ -635,7 +633,7 @@ fn a_taken_build_that_breaks_settles_failed(fault: Fault, cause: &str) {
     let builds = service(&env);
     env.inject(Some(fault));
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -701,7 +699,7 @@ fn an_index_dropped_during_its_build_ends_the_build() {
     );
     let builds = service(&env);
     let older = older_transaction(&env);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     await_running(&env, &def, None);
 
     let store = LocalIndexStore::new(&env.engine);
@@ -810,7 +808,7 @@ fn a_build_stopped_part_way_covers_some_owners_and_reads_the_rest() {
     );
     let builds = service(&env);
     env.hold_pages_after(1);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     env.await_held_page();
 
     let covered = builds
@@ -857,7 +855,7 @@ fn the_config_is_retuned_and_read_while_a_build_runs() {
     );
     let builds = service(&env);
     let older = older_transaction(&env);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     await_phase(
         &builds,
         def.generation,
@@ -898,7 +896,7 @@ fn a_build_of_a_dropped_index_is_cancelled() {
     drop(txn);
 
     let builds = service(&env);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -965,7 +963,7 @@ fn a_repairing_build_renames_the_second_holder_and_publishes() {
     let def = admit_repairing(&env);
     let builds = service(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -1014,7 +1012,7 @@ fn a_repair_is_visible_before_the_build_ends_and_survives_its_cancellation() {
     let builds = service(&env);
     env.hold_pages_after(0);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     env.await_held_page();
     let Some(Value::String(renamed)) = email_of(&env, 2) else {
         panic!("node 2 keeps a string");
@@ -1057,7 +1055,7 @@ fn a_duplicate_that_is_not_a_string_fails_a_repairing_build() {
     let def = admit_repairing(&env);
     let builds = service(&env);
 
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let outcome = builds.wait(def.generation, None).expect("wait");
 
     assert!(
@@ -1121,7 +1119,7 @@ fn repair_node_two(
 ) -> Result<super::super::repair::Repaired, BackfillError> {
     let builds = service(env);
     let older = older_transaction(env);
-    builds.submit(def.generation, 0).expect("submit");
+    builds.submit(def.generation).expect("submit");
     let token = await_running(env, def, None);
     let drawn = std::cell::Cell::new(0usize);
     let next = || {

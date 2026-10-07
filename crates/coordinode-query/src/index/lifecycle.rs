@@ -400,17 +400,15 @@ impl IndexBuildService {
     }
 
     /// Run the build of `generation` on an executor of this process, unless
-    /// one already has it. `own_open` is how many transactions the submitter
-    /// itself holds open while it waits (the statement that created the
-    /// index); the backfill does not wait for them to end.
+    /// one already has it. A submitter that waits for the build from inside a
+    /// transaction of its own releases it from the backfill's wait first
+    /// ([`Transaction::release_from_schema_waits`](coordinode_storage::engine::transaction::Transaction::release_from_schema_waits)).
     ///
     /// # Errors
     ///
     /// The executor thread could not be started.
-    pub fn submit(&self, generation: GenerationId, own_open: usize) -> Result<(), String> {
-        self.spawn(generation, move |shared| {
-            shared.execute(generation, own_open)
-        })
+    pub fn submit(&self, generation: GenerationId) -> Result<(), String> {
+        self.spawn(generation, move |shared| shared.execute(generation))
     }
 
     /// Run `build`, a build this member runs for itself, as the build of
@@ -610,7 +608,7 @@ impl IndexBuildService {
         let mut resumed = Vec::new();
         for record in store.list_builds().map_err(text)? {
             if !record.state.is_terminal() {
-                self.submit(record.generation, 0)?;
+                self.submit(record.generation)?;
                 resumed.push(record.generation);
             }
         }
@@ -705,17 +703,13 @@ struct Taken {
 impl Shared {
     /// Take the build of `generation`, fill its generation and publish the
     /// outcome.
-    fn execute(self: &Arc<Self>, generation: GenerationId, own_open: usize) -> Executed {
+    fn execute(self: &Arc<Self>, generation: GenerationId) -> Executed {
         let _seat = self.seat(generation);
-        self.try_execute(generation, own_open)
+        self.try_execute(generation)
             .unwrap_or_else(|e| Executed::Outcome(IndexBuildOutcome::Failed(BuildError::Other(e))))
     }
 
-    fn try_execute(
-        self: &Arc<Self>,
-        generation: GenerationId,
-        own_open: usize,
-    ) -> Result<Executed, String> {
+    fn try_execute(self: &Arc<Self>, generation: GenerationId) -> Result<Executed, String> {
         let taken = match self.take(generation)? {
             Ok(taken) => taken,
             Err(executed) => return Ok(executed),
@@ -724,7 +718,7 @@ impl Shared {
         // an error or a panic, settles it, or no waiter could trust the
         // outcome it is told and a restart would resume a failed build.
         let filled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.fill(generation, &taken, own_open)
+            self.fill(generation, &taken)
         }));
         let def = &taken.def;
         match filled {
@@ -757,7 +751,6 @@ impl Shared {
         self: &Arc<Self>,
         generation: GenerationId,
         taken: &Taken,
-        own_open: usize,
     ) -> Result<Result<u64, BackfillError>, String> {
         let env = self.env.as_ref();
         let fields = env.fields()?;
@@ -812,7 +805,6 @@ impl Shared {
             oracle: env.oracle(),
             interner: &fields,
             shard_id: env.shard_id(),
-            own_open,
             definition_version: taken.def_version,
             older_transactions_wait,
             progress: Some(&progress),

@@ -119,6 +119,12 @@ impl Procedure for IndexBuildProcedure {
             Kind::Inspect => {
                 let operation = operation_arg(&self.signature.name, &args)?;
                 let wait = wait_arg(&self.signature.name, args.get(1))?;
+                // A build that started after this statement opened waits for
+                // it to end; the statement, having staged nothing, leaves
+                // that wait rather than wait for the build waiting for it.
+                if !wait.is_zero() {
+                    ctx.txn.release_from_schema_waits();
+                }
                 let status = builds
                     .status(operation, wait)?
                     .ok_or_else(|| unknown(&self.signature.name, operation))?;

@@ -3331,7 +3331,7 @@ impl Database {
         self.index_registry
             .register_published(&self.engine, def.clone())?;
         self.index_builds
-            .submit(def.generation, 0)
+            .submit(def.generation)
             .map_err(DatabaseError::Other)?;
         self.build_outcome(&def)
     }

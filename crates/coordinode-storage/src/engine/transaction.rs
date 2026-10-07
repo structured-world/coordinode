@@ -1399,6 +1399,23 @@ impl<'a> Transaction<'a> {
             || !self.merge_counter_deltas.is_empty()
     }
 
+    /// Leave the open transactions a schema change waits for
+    /// ([`StorageEngine::await_transactions_through`](crate::engine::core::StorageEngine::await_transactions_through)),
+    /// when this transaction has staged nothing: a statement that waits for
+    /// the index build it started would otherwise wait for itself. A
+    /// transaction holding staged writes stays, since an index built past it
+    /// would miss them. Returns whether it left.
+    pub fn release_from_schema_waits(&mut self) -> bool {
+        let staged = !self.write_buffer.is_empty()
+            || self.has_pending_merges()
+            || !self.range_removals.is_empty();
+        if staged {
+            return false;
+        }
+        self.open = None;
+        true
+    }
+
     /// Borrow the buffered adjacency operands in the order they were staged.
     pub fn merge_adj_ops(&self) -> &[(Vec<u8>, AdjOp)] {
         &self.merge_adj_ops

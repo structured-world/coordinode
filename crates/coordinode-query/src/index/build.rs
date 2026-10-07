@@ -93,9 +93,6 @@ pub struct Backfill<'a> {
     pub interner: &'a FieldInterner,
     /// The shard whose nodes are indexed.
     pub shard_id: u16,
-    /// Transactions of the caller itself that are open while it runs the
-    /// backfill (the statement creating the index), not waited for.
-    pub own_open: usize,
     /// The version of the definition record the builder published. Each
     /// page commits only while the record is still at it, so a page of a
     /// build whose index was dropped or recreated meanwhile writes nothing.
@@ -177,7 +174,6 @@ impl<'a> Backfill<'a> {
         self.engine
             .await_transactions_through(
                 boundary,
-                self.own_open,
                 OLDER_TRANSACTIONS_POLL,
                 self.older_transactions_wait,
             )

@@ -520,8 +520,11 @@ fn a_constraint_that_outwaits_its_call_validates_on_as_an_operation() {
         .expect("admitted");
     assert_eq!(created.constraint.state, ConstraintState::Validating);
     let operation = created.operation.expect("the build's operation");
+    // Long enough for the build to look at the open transactions many times
+    // after the call's own transaction ended: that one never held the build,
+    // and its end must not let the build past the older one.
     let held = db
-        .index_build(operation, Duration::ZERO)
+        .index_build(operation, Duration::from_millis(300))
         .expect("inspect")
         .expect("the build is listed");
     assert!(
