@@ -34,6 +34,13 @@
 set -euo pipefail
 
 host="${COORDINODE_LINUX_HOST:?set COORDINODE_LINUX_HOST to the ssh target of the Linux machine}"
+
+# Every connection fails rather than waits: a wrong or unreachable host, or a
+# key the agent does not hold, would otherwise hang the run at its first call
+# with nothing printed, and a link that drops mid-run would hang it at the
+# step it was in.
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
+ssh() { command ssh "${ssh_opts[@]}" "$@"; }
 # One fixed directory per host, created atomically as the run's lock: the
 # compilation cache keys on absolute paths, so a path that differs per run
 # would never hit and every run would rebuild the workspace from nothing. A

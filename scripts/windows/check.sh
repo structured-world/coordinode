@@ -18,6 +18,14 @@
 set -euo pipefail
 
 host="${COORDINODE_WINDOWS_HOST:?set COORDINODE_WINDOWS_HOST to the ssh target of the Windows machine}"
+
+# Every connection fails rather than waits: a wrong or unreachable host, or a
+# key the agent does not hold, would otherwise hang the run at its first call
+# with nothing printed, and a link that drops mid-run would hang it at the
+# step it was in.
+ssh_opts=(-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
+ssh() { command ssh "${ssh_opts[@]}" "$@"; }
+scp() { command scp "${ssh_opts[@]}" "$@"; }
 # A directory of this run's own: files another account left in a shared one
 # cannot be removed by this one and would fail the cleanup.
 run_dir="cn-check-$(date +%Y%m%d%H%M%S)-$$"
