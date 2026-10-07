@@ -5099,3 +5099,172 @@ async fn a_member_bootstrapped_from_a_snapshot_continues_the_dictionary() {
         "TIMED OUT: a_member_bootstrapped_from_a_snapshot_continues_the_dictionary"
     );
 }
+
+/// The count a constraint keeps is replicated with the edges that changed
+/// it: every member holds the same counts and the same coverage, so a
+/// member that takes over leadership decides a bound from the state the old
+/// leader left rather than from nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_cardinality_counts_are_the_same_on_every_member() {
+    use coordinode_core::graph::cardinality::{
+        CardinalityBound, CardinalityDescriptor, CardinalityMeasure, Direction,
+        encode_cardinality_profile_key,
+    };
+    use coordinode_core::graph::edge::{
+        encode_adj_key_forward, encode_adj_key_reverse, temporal_edgeprop_pair_prefix,
+    };
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::schema::definition::{
+        EdgeTypeSchema, PropertyDef, PropertyType, encode_edge_type_current_revision_key,
+        encode_edge_type_schema_key,
+    };
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("openraft=off")
+        .with_test_writer()
+        .try_init();
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (n1, n2, n3, _, _, _) = bootstrap_3_node().await;
+        let pipeline = n1.node.pipeline();
+        let id_gen = ProposalIdGenerator::with_base(9u64 << 48);
+        let oracle = coordinode_core::txn::timestamp::TimestampOracle::new();
+        let wc = WriteConcern::majority();
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: Some(&pipeline),
+            id_gen: Some(&id_gen),
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        let begin = || {
+            let snap = n1.engine.snapshot();
+            Transaction::new(
+                &n1.engine,
+                Some(&oracle),
+                Timestamp::from_raw(snap),
+                Some(snap),
+            )
+        };
+
+        // The definition, discriminated by `context`, counted outgoing by
+        // instances and by neighbours; published through the log.
+        let instances = CardinalityDescriptor {
+            edge_type: "OWNS".into(),
+            direction: Direction::Outgoing,
+            measure: CardinalityMeasure::EdgeInstances,
+            bound: CardinalityBound::AtLeastOne,
+            schema_generation: 1,
+        };
+        let neighbours = CardinalityDescriptor {
+            measure: CardinalityMeasure::DistinctNeighbours,
+            ..instances.clone()
+        };
+        let mut schema = EdgeTypeSchema::new("OWNS");
+        schema.add_property(PropertyDef::new("context", PropertyType::String).not_null());
+        schema.resolve_identity(Some("context")).expect("identity");
+        schema
+            .declare_cardinality(instances.clone())
+            .expect("declare");
+        schema
+            .declare_cardinality(neighbours.clone())
+            .expect("declare");
+        let mut definition = begin();
+        definition
+            .put(
+                Partition::Schema,
+                &encode_edge_type_schema_key("OWNS", 1),
+                &schema.to_msgpack().expect("encode"),
+            )
+            .expect("body");
+        definition
+            .put(
+                Partition::Schema,
+                &encode_edge_type_current_revision_key("OWNS"),
+                &1u64.to_be_bytes(),
+            )
+            .expect("pointer");
+        definition
+            .put(
+                Partition::Schema,
+                &encode_cardinality_profile_key("OWNS"),
+                &schema
+                    .cardinality_profile()
+                    .expect("profile")
+                    .to_msgpack()
+                    .expect("encode"),
+            )
+            .expect("profile");
+        definition.commit(&ctx).expect("define");
+        for d in [&instances, &neighbours] {
+            let mut cover = begin();
+            coordinode_storage::engine::cardinality::rebuild(&mut cover, d).expect("rebuild");
+            cover.commit(&ctx).expect("cover");
+        }
+
+        // Two instances to one neighbour and one to another.
+        let mut edges = begin();
+        for (target, context) in [(2u64, "a"), (2, "b"), (3, "a")] {
+            edges.merge_adj_add(&encode_adj_key_forward("OWNS", NodeId::from_raw(1)), target);
+            edges.merge_adj_add(&encode_adj_key_reverse("OWNS", NodeId::from_raw(target)), 1);
+            let mut key = temporal_edgeprop_pair_prefix(
+                "OWNS",
+                NodeId::from_raw(1),
+                NodeId::from_raw(target),
+            );
+            key.extend_from_slice(context.as_bytes());
+            edges
+                .put(Partition::EdgeProp, &key, b"facets")
+                .expect("instance");
+        }
+        edges.commit(&ctx).expect("edges");
+
+        let read = |engine: &StorageEngine, d: &CardinalityDescriptor| -> Option<i64> {
+            engine
+                .get(Partition::Counter, &d.counter_key(NodeId::from_raw(1)))
+                .expect("read count")
+                .map(|bytes| {
+                    coordinode_storage::engine::merge::decode_counter(&bytes).expect("decode")
+                })
+        };
+        for (label, node) in [("n1", &n1), ("n2", &n2), ("n3", &n3)] {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let got = (
+                    read(&node.engine, &instances),
+                    read(&node.engine, &neighbours),
+                );
+                let covered = node
+                    .engine
+                    .get(Partition::Schema, &instances.coverage_key())
+                    .expect("read coverage")
+                    .is_some()
+                    && node
+                        .engine
+                        .get(Partition::Schema, &neighbours.coverage_key())
+                        .expect("read coverage")
+                        .is_some();
+                if got == (Some(3), Some(2)) && covered {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label}: counts {got:?}, covered {covered}; expected (3, 2) and covered"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        n1.node.shutdown().await.expect("shutdown 1");
+        n2.node.shutdown().await.expect("shutdown 2");
+        n3.node.shutdown().await.expect("shutdown 3");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: kept_cardinality_counts_are_the_same_on_every_member"
+    );
+}

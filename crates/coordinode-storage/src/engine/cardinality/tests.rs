@@ -380,7 +380,9 @@ fn two_first_instances_of_one_pair_count_one_neighbour() {
             target: node(2),
             edge_type: OWNS.to_string(),
         },
-        ClaimPredicate::PairCounted,
+        ClaimPredicate::PairCounted {
+            trend: CountTrend::Grows,
+        },
         first.schema_generation(),
     ));
     let held = f
@@ -472,6 +474,7 @@ fn bounds_are_decided_from_the_kept_count_of_the_post_state() {
             ClaimPredicate::CardinalityBound {
                 measure: CardinalityMeasure::EdgeInstances,
                 bound,
+                trend: CountTrend::Changes,
             },
             0,
         )
@@ -536,6 +539,7 @@ fn a_count_below_zero_decides_no_bound() {
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::EdgeInstances,
             bound: CardinalityBound::AtMostOne,
+            trend: CountTrend::Changes,
         },
         0,
     ));
@@ -784,6 +788,110 @@ fn a_rebuild_of_an_undeclared_constraint_is_refused() {
     );
     let mut t = txn(&f);
     assert!(rebuild(&mut t, &other).is_err());
+}
+
+/// The trend of a scope is read from the kind of every write that can reach
+/// it, on either side of the pair, and from nothing else.
+#[test]
+fn a_scope_trend_follows_the_writes_that_reach_it() {
+    use std::collections::HashMap;
+
+    let trend = |staged: &[(Vec<u8>, AdjOp)], points: &HashMap<_, _>| {
+        scope_trend(node(1), OWNS, Direction::Outgoing, staged, points)
+    };
+    let none = HashMap::new();
+    let fwd = |n| encode_adj_key_forward(OWNS, node(n));
+    let rev = |n| encode_adj_key_reverse(OWNS, node(n));
+
+    assert_eq!(trend(&[], &none), CountTrend::Unchanged);
+    assert_eq!(trend(&[(fwd(1), AdjOp::Add(2))], &none), CountTrend::Grows);
+    // The reverse side reaches the scope through the member it names.
+    assert_eq!(
+        trend(&[(rev(2), AdjOp::Remove(1))], &none),
+        CountTrend::Shrinks
+    );
+    assert_eq!(
+        trend(
+            &[(fwd(1), AdjOp::Add(2)), (fwd(1), AdjOp::Remove(3))],
+            &none
+        ),
+        CountTrend::Changes
+    );
+    // Another node, another type, another side's other members: untouched.
+    assert_eq!(
+        trend(
+            &[
+                (fwd(7), AdjOp::Remove(2)),
+                (encode_adj_key_forward("KNOWS", node(1)), AdjOp::Remove(2)),
+                (rev(2), AdjOp::Remove(9)),
+            ],
+            &none
+        ),
+        CountTrend::Unchanged
+    );
+    let instance = |value: Option<Vec<u8>>| {
+        HashMap::from([((Partition::EdgeProp, instance_key(1, 2, b"a")), value)])
+    };
+    assert_eq!(
+        trend(&[], &instance(Some(b"x".to_vec()))),
+        CountTrend::Grows
+    );
+    assert_eq!(trend(&[], &instance(None)), CountTrend::Shrinks);
+    // A whole posting dropped can only take; written whole, either way.
+    let posting = |value: Option<Vec<u8>>| HashMap::from([((Partition::Adj, fwd(1)), value)]);
+    assert_eq!(trend(&[], &posting(None)), CountTrend::Shrinks);
+    assert_eq!(trend(&[], &posting(Some(Vec::new()))), CountTrend::Changes);
+}
+
+/// Additions to one node, each deciding AT LEAST ONE over it, are admitted
+/// beside each other; a removal deciding the same bound is not admitted
+/// beside an addition, since it could break the adder's bound.
+#[test]
+fn additions_under_a_lower_bound_do_not_queue_but_a_removal_does() {
+    use coordinode_core::txn::invariant::{Claim, ClaimScope, ClaimSet};
+
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, false, &ds);
+    cover(&f, &ds);
+    let mut t = txn(&f);
+    add(&mut t, 1, 9, None);
+    commit(&mut t).unwrap();
+
+    let bound = |trend| {
+        Claim::new(
+            ClaimScope::Incident {
+                node: node(1),
+                edge_type: OWNS.to_string(),
+                direction: Direction::Outgoing,
+            },
+            ClaimPredicate::CardinalityBound {
+                measure: CardinalityMeasure::DistinctNeighbours,
+                bound: CardinalityBound::AtLeastOne,
+                trend,
+            },
+            0,
+        )
+    };
+    // Another adder is deciding the bound while these commit.
+    let mut adder = ClaimSet::new();
+    adder.insert(bound(CountTrend::Grows));
+    let held = f.engine.claim_registry().reserve_attempt(&adder).unwrap();
+
+    let mut addition = txn(&f);
+    add(&mut addition, 1, 2, None);
+    addition.claim(bound(CountTrend::Changes));
+    commit(&mut addition).expect("an addition cannot break a lower bound");
+
+    let mut removal = txn(&f);
+    remove(&mut removal, 1, 9, None, true);
+    removal.claim(bound(CountTrend::Changes));
+    let refused = commit(&mut removal).expect_err("a removal could break the adder's bound");
+    assert!(matches!(refused, CommitError::InvariantRefused { .. }));
+    drop(held);
+
+    commit(&mut removal).expect("alone, the removal leaves one neighbour");
+    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
 }
 
 /// One step of a random history.

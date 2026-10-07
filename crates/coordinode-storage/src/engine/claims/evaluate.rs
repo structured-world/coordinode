@@ -176,11 +176,26 @@ impl<'a> Evaluation<'a> {
                     edge_type,
                     direction,
                 },
-                ClaimPredicate::CardinalityBound { measure, bound },
+                ClaimPredicate::CardinalityBound { measure, bound, .. },
             ) => {
                 // A kept count is only as good as the changes derived for
                 // this attempt: an evaluation that was not handed them reads
                 // the scope instead.
+                // A kept count is never below zero, so an attempt that adds to
+                // the scope's count proves a lower bound by its own change,
+                // without folding the scope's count, which on a node many
+                // writers add to is a long chain of changes.
+                if *bound == coordinode_core::txn::invariant::CardinalityBound::AtLeastOne {
+                    if let Some(kept) = self.kept_counts {
+                        if crate::engine::cardinality::kept_change(
+                            engine, *node, edge_type, *direction, *measure, kept,
+                        )?
+                        .is_some_and(|change| change >= 1)
+                        {
+                            return Ok(Verdict::Holds);
+                        }
+                    }
+                }
                 let kept = match self.kept_counts {
                     Some(kept) => crate::engine::cardinality::kept_count(
                         engine, *node, edge_type, *direction, *measure, kept,
@@ -216,7 +231,7 @@ impl<'a> Evaluation<'a> {
 
             // A footprint: it keeps a second count of the pair out while this
             // one is derived, and asserts nothing about the pair itself.
-            (ClaimScope::Pair { .. }, ClaimPredicate::PairCounted) => Ok(Verdict::Holds),
+            (ClaimScope::Pair { .. }, ClaimPredicate::PairCounted { .. }) => Ok(Verdict::Holds),
 
             (
                 ClaimScope::Pair {

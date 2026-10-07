@@ -78,6 +78,50 @@ impl CardinalityBound {
     }
 }
 
+/// Which way an attempt's writes can move the counts of one scope or pair.
+///
+/// Read from what the attempt stages, not from the state it lands on, so it
+/// is known before the attempt is admitted. Two attempts whose movements
+/// cannot break each other's bounds are decided independently: a count that
+/// only grows cannot fall below a lower bound, one that only shrinks cannot
+/// pass an upper bound, and that is what keeps many additions to one node
+/// from queueing behind each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CountTrend {
+    /// The attempt does not touch what is counted.
+    Unchanged,
+    /// Only additions: no count can fall.
+    Grows,
+    /// Only removals: no count can rise.
+    Shrinks,
+    /// Either way, or the writes cannot tell.
+    Changes,
+}
+
+impl CountTrend {
+    /// The trend of an attempt that may add (`grows`) and may remove
+    /// (`shrinks`).
+    pub fn of(grows: bool, shrinks: bool) -> Self {
+        match (grows, shrinks) {
+            (false, false) => Self::Unchanged,
+            (true, false) => Self::Grows,
+            (false, true) => Self::Shrinks,
+            (true, true) => Self::Changes,
+        }
+    }
+
+    /// Whether a count moving this way can leave `bound` broken after it
+    /// was decided to hold.
+    pub fn can_break(self, bound: CardinalityBound) -> bool {
+        !matches!(
+            (self, bound),
+            (Self::Unchanged, _)
+                | (Self::Grows, CardinalityBound::AtLeastOne)
+                | (Self::Shrinks, CardinalityBound::AtMostOne)
+        )
+    }
+}
+
 /// The logical thing a claim covers. Two claims can only conflict if their
 /// scopes overlap, so this is what makes independent work independent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -158,6 +202,10 @@ pub enum ClaimPredicate {
         measure: CardinalityMeasure,
         /// The counts it admits.
         bound: CardinalityBound,
+        /// How the attempt's own writes move the scope's counts. A writer
+        /// states [`CountTrend::Changes`]; the commit replaces it with what
+        /// the staged writes show before the claim is reserved.
+        trend: CountTrend,
     },
     /// The pair is adjacent, or is not, and the attempt's result depends on
     /// which. An insertion claims absence, a removal of the last qualifying
@@ -179,7 +227,10 @@ pub enum ClaimPredicate {
     /// and after its writes differ. Two such attempts on one pair would each
     /// derive from the same state before and count one transition twice: two
     /// first instances would both make the pair adjacent.
-    PairCounted,
+    PairCounted {
+        /// How the attempt's writes move the pair's instances.
+        trend: CountTrend,
+    },
     /// The attempt enumerated the complete incident set of its scope and its
     /// result depends on nothing having been added to it since. This is what
     /// protects a scan against a member it never saw.
@@ -297,41 +348,72 @@ impl Claim {
             // Stated from both sides because both directions must agree.
             (
                 EndpointAlive,
-                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete | PairCounted,
+                PairAdjacency { .. }
+                | PairInstanceWritten
+                | PairInstancesComplete
+                | PairCounted { .. },
             )
             | (
-                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete | PairCounted,
+                PairAdjacency { .. }
+                | PairInstanceWritten
+                | PairInstancesComplete
+                | PairCounted { .. },
                 EndpointAlive,
             ) => true,
 
             // Each derives the pair's transition from the state the other
             // is about to change.
-            (PairCounted, PairCounted) => false,
+            (PairCounted { .. }, PairCounted { .. }) => false,
 
             // What a pair's other claims protect is decided by those claims;
             // counting the pair adds a condition only against another count
             // of it. An attempt on the pair that counts holds this claim too.
-            (PairCounted, PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete)
-            | (PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete, PairCounted) => {
-                true
+            (
+                PairCounted { .. },
+                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete,
+            )
+            | (
+                PairAdjacency { .. } | PairInstanceWritten | PairInstancesComplete,
+                PairCounted { .. },
+            ) => true,
+
+            // Two attempts deciding bounds over one scope are both right
+            // when neither one's writes can move the count past the other's
+            // bound: each decided against a state the other only moves the
+            // safe way, whichever lands first. Additions under lower bounds
+            // and removals under upper bounds therefore coexist; anything
+            // that can move a count past a bound excludes it.
+            (
+                CardinalityBound {
+                    bound: b1,
+                    trend: t1,
+                    ..
+                },
+                CardinalityBound {
+                    bound: b2,
+                    trend: t2,
+                    ..
+                },
+            ) => !t2.can_break(*b1) && !t1.can_break(*b2),
+
+            // A pair change is compatible with a bound it cannot break, by
+            // the same reasoning: a written instance only adds, an erase
+            // only removes. Which way an observed pair goes is not known.
+            (CardinalityBound { bound, .. }, PairCounted { trend })
+            | (PairCounted { trend }, CardinalityBound { bound, .. }) => !trend.can_break(*bound),
+            (CardinalityBound { bound, .. }, PairInstanceWritten)
+            | (PairInstanceWritten, CardinalityBound { bound, .. }) => {
+                !CountTrend::Grows.can_break(*bound)
+            }
+            (CardinalityBound { bound, .. }, PairInstancesComplete)
+            | (PairInstancesComplete, CardinalityBound { bound, .. }) => {
+                !CountTrend::Shrinks.can_break(*bound)
             }
 
-            // Two attempts that both change what a bound counts decide the
-            // same predicate, and only one of them can be right about the
-            // post-state it validated against.
-            (CardinalityBound { .. }, CardinalityBound { .. }) => false,
-
-            // A bound counts the adjacency a pair claim is about, and an
-            // enumeration of the incident set is what a bound is computed
-            // from, so neither can be decided without the other.
-            (
-                CardinalityBound { .. },
-                PairAdjacency { .. }
-                | PairInstanceWritten
-                | PairInstancesComplete
-                | PairCounted
-                | IncidentSetComplete,
-            ) => false,
+            // An enumeration of the incident set is what a bound is computed
+            // from, and an observed pair's direction is unknown, so neither
+            // can be decided without the other.
+            (CardinalityBound { .. }, PairAdjacency { .. } | IncidentSetComplete) => false,
 
             // Writers of instances into one pair do not depend on each other,
             // and erasers of one pair agree on what they leave.
@@ -363,7 +445,7 @@ impl Claim {
                 | PairAdjacency { .. }
                 | PairInstanceWritten
                 | PairInstancesComplete
-                | PairCounted,
+                | PairCounted { .. },
             ) => false,
 
             // The condition was evaluated against one version of the record;

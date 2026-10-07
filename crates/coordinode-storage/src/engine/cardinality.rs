@@ -28,7 +28,7 @@ use coordinode_core::graph::edge::{
     temporal_edgeprop_pair_prefix,
 };
 use coordinode_core::graph::node::NodeId;
-use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, Direction};
+use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, CountTrend, Direction};
 use lsm_tree::Guard;
 use rustc_hash::FxHashMap;
 
@@ -57,11 +57,46 @@ pub(crate) struct CountedPair {
 #[derive(Debug, Default)]
 pub(crate) struct CommitCounts {
     profiles: FxHashMap<String, CardinalityProfile>,
-    pairs: std::collections::BTreeSet<CountedPair>,
+    /// Each pair with whether the staged writes may add to it and may take
+    /// from it.
+    pairs: std::collections::BTreeMap<CountedPair, Movement>,
     dropped: Vec<(Vec<u8>, Vec<u64>)>,
 }
 
+/// Whether staged writes may add to something counted and may take from it.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Movement {
+    grows: bool,
+    shrinks: bool,
+}
+
+impl Movement {
+    fn trend(self) -> CountTrend {
+        CountTrend::of(self.grows, self.shrinks)
+    }
+}
+
 impl CommitCounts {
+    fn note(
+        &mut self,
+        edge_type: &str,
+        source: NodeId,
+        target: NodeId,
+        grows: bool,
+        shrinks: bool,
+    ) {
+        let movement = self
+            .pairs
+            .entry(CountedPair {
+                edge_type: edge_type.to_string(),
+                source,
+                target,
+            })
+            .or_default();
+        movement.grows |= grows;
+        movement.shrinks |= shrinks;
+    }
+
     /// Whether the commit changes nothing that is counted.
     pub(crate) fn is_empty(&self) -> bool {
         self.pairs.is_empty()
@@ -73,14 +108,16 @@ impl CommitCounts {
         let mut claims: Vec<Claim> = self
             .pairs
             .iter()
-            .map(|pair| {
+            .map(|(pair, movement)| {
                 Claim::new(
                     ClaimScope::Pair {
                         source: pair.source,
                         target: pair.target,
                         edge_type: pair.edge_type.clone(),
                     },
-                    ClaimPredicate::PairCounted,
+                    ClaimPredicate::PairCounted {
+                        trend: movement.trend(),
+                    },
                     schema_generation,
                 )
             })
@@ -246,15 +283,12 @@ pub(crate) fn plan(
         if !counts.profiles.contains_key(edge_type) {
             continue;
         }
-        let member = match op {
-            AdjOp::Add(uid) | AdjOp::Remove(uid) => *uid,
+        let (member, grows) = match op {
+            AdjOp::Add(uid) => (*uid, true),
+            AdjOp::Remove(uid) => (*uid, false),
         };
         let (source, target) = pair_of(direction, node, member);
-        counts.pairs.insert(CountedPair {
-            edge_type: edge_type.to_string(),
-            source,
-            target,
-        });
+        counts.note(edge_type, source, target, grows, !grows);
     }
     for ((part, key), value) in staged_points {
         match part {
@@ -272,13 +306,11 @@ pub(crate) fn plan(
                     Some(bytes) => decode_posting(key, bytes)?.as_slice().to_vec(),
                     None => Vec::new(),
                 };
+                // A drop only takes; a posting written whole may do either.
+                let grows = value.is_some();
                 for member in held.iter().chain(written.iter()) {
                     let (source, target) = pair_of(direction, node, *member);
-                    counts.pairs.insert(CountedPair {
-                        edge_type: edge_type.to_string(),
-                        source,
-                        target,
-                    });
+                    counts.note(edge_type, source, target, grows, true);
                 }
                 counts.dropped.push((key.clone(), held));
             }
@@ -292,17 +324,80 @@ pub(crate) fn plan(
                     .get(edge_type)
                     .is_some_and(|profile| profile.discriminated)
                 {
-                    counts.pairs.insert(CountedPair {
-                        edge_type: edge_type.to_string(),
-                        source,
-                        target,
-                    });
+                    // An instance written may be new or an upsert; one
+                    // deleted may be the pair's last.
+                    counts.note(edge_type, source, target, value.is_some(), value.is_none());
                 }
             }
             _ => {}
         }
     }
     Ok(counts)
+}
+
+/// Which way the staged writes can move the counts of the scope of `node`'s
+/// `edge_type` edges in `direction`. Read from the kind of each write that
+/// can reach the scope: an adjacency addition or a written instance can only
+/// add, a removal or a deleted instance can only take, a posting written
+/// whole may do either. Whether an instance write is new or an upsert does
+/// not matter: neither takes anything away.
+pub(crate) fn scope_trend(
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+    staged: StagedAdj<'_>,
+    staged_points: StagedPoints<'_>,
+) -> CountTrend {
+    let mut movement = Movement::default();
+    for (key, op) in staged {
+        let Some((t, side, owner)) = adj_parts(key) else {
+            continue;
+        };
+        let (member, grows) = match op {
+            AdjOp::Add(uid) => (*uid, true),
+            AdjOp::Remove(uid) => (*uid, false),
+        };
+        let reaches = t == edge_type
+            && if side == direction {
+                owner == node
+            } else {
+                member == node.as_raw()
+            };
+        if reaches {
+            movement.grows |= grows;
+            movement.shrinks |= !grows;
+        }
+    }
+    for ((part, key), value) in staged_points {
+        match part {
+            Partition::Adj => {
+                let Some((t, side, owner)) = adj_parts(key) else {
+                    continue;
+                };
+                // The opposite side's posting may hold the node anywhere in
+                // it, so a whole write there is taken as reaching the scope.
+                if t == edge_type && (side != direction || owner == node) {
+                    movement.grows |= value.is_some();
+                    movement.shrinks = true;
+                }
+            }
+            Partition::EdgeProp => {
+                let Some((t, source, target, _)) = split_discriminated_edgeprop_key(key) else {
+                    continue;
+                };
+                let ours = match direction {
+                    Direction::Outgoing => source == node,
+                    Direction::Incoming => target == node,
+                };
+                if t == edge_type && ours {
+                    movement.grows |= value.is_some();
+                    movement.shrinks |= value.is_none();
+                }
+            }
+            _ => {}
+        }
+    }
+    movement.trend()
 }
 
 /// Whether `pair` is adjacent as committed now and as the attempt leaves it.
@@ -429,7 +524,7 @@ pub(crate) fn deltas(
     }
 
     let mut out: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
-    for pair in &counts.pairs {
+    for pair in counts.pairs.keys() {
         let Some(profile) = counts.profiles.get(&pair.edge_type) else {
             continue;
         };
@@ -505,6 +600,27 @@ fn covered_descriptor(
         return Ok(None);
     }
     Ok(Some(descriptor))
+}
+
+/// The change the attempt stages to the covered count of `measure` over the
+/// scope of `node`; `None` when no covered count is kept for the scope.
+pub(crate) fn kept_change(
+    engine: &StorageEngine,
+    node: NodeId,
+    edge_type: &str,
+    direction: Direction,
+    measure: CardinalityMeasure,
+    staged_counts: &FxHashMap<Vec<u8>, i64>,
+) -> StorageResult<Option<i64>> {
+    let Some(descriptor) = covered_descriptor(engine, edge_type, direction, measure)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        staged_counts
+            .get(&descriptor.counter_key(node))
+            .copied()
+            .unwrap_or(0),
+    ))
 }
 
 /// The kept count of `measure` over the scope of `node`, in the post-state

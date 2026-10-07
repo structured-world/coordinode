@@ -15,6 +15,7 @@ fn bound_on(node: u64) -> ClaimSet {
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::EdgeInstances,
             bound: coordinode_core::txn::invariant::CardinalityBound::AtMostOne,
+            trend: coordinode_core::txn::invariant::CountTrend::Changes,
         },
         GEN,
     ));

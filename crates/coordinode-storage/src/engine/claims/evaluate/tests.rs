@@ -45,6 +45,7 @@ fn bound(node_id: u64, bound: CardinalityBound) -> Claim {
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::DistinctNeighbours,
             bound,
+            trend: coordinode_core::txn::invariant::CountTrend::Changes,
         },
         GEN,
     )
@@ -64,7 +65,11 @@ fn counted(
             edge_type: edge_type.to_string(),
             direction,
         },
-        ClaimPredicate::CardinalityBound { measure, bound },
+        ClaimPredicate::CardinalityBound {
+            measure,
+            bound,
+            trend: coordinode_core::txn::invariant::CountTrend::Changes,
+        },
         GEN,
     )
 }

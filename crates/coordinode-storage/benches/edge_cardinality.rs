@@ -209,6 +209,9 @@ fn hub(label: &str, counted: bool, bound: bool) {
                                     ClaimPredicate::CardinalityBound {
                                         measure: CardinalityMeasure::DistinctNeighbours,
                                         bound: CardinalityBound::AtLeastOne,
+                                        // Stated as a writer states it; the
+                                        // commit reads its writes.
+                                        trend: coordinode_core::txn::invariant::CountTrend::Changes,
                                     },
                                     generation,
                                 ));

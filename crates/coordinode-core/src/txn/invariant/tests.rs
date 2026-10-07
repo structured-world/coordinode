@@ -41,17 +41,21 @@ fn set(claims: Vec<Claim>) -> ClaimSet {
     s
 }
 
+/// A bound stated by a writer whose writes may move the count either way,
+/// which is how a writer states it before the commit reads its writes.
 fn at_most_one() -> ClaimPredicate {
-    ClaimPredicate::CardinalityBound {
-        measure: CardinalityMeasure::EdgeInstances,
-        bound: CardinalityBound::AtMostOne,
-    }
+    bounded(CardinalityBound::AtMostOne, CountTrend::Changes)
 }
 
 fn at_least_one() -> ClaimPredicate {
+    bounded(CardinalityBound::AtLeastOne, CountTrend::Changes)
+}
+
+fn bounded(bound: CardinalityBound, trend: CountTrend) -> ClaimPredicate {
     ClaimPredicate::CardinalityBound {
         measure: CardinalityMeasure::EdgeInstances,
-        bound: CardinalityBound::AtLeastOne,
+        bound,
+        trend,
     }
 }
 
@@ -168,13 +172,15 @@ fn destroying_a_node_excludes_writing_an_instance_of_its_pair() {
     assert!(!destroyed.compatible_with(&write));
 }
 
-/// An enumeration of the incident set and a bound over it are both changed by
-/// erasing a pair inside it, as they are by writing an instance into one.
+/// An enumeration of the incident set is changed by erasing a pair inside it,
+/// as it is by writing an instance into one; a bound over it is changed by
+/// whichever of the two moves the count toward breaking it: a written
+/// instance toward an upper bound, an erase toward a lower one.
 #[test]
 fn pair_changes_reach_the_incident_claims_of_both_ends() {
-    for predicate in [
-        ClaimPredicate::PairInstanceWritten,
-        ClaimPredicate::PairInstancesComplete,
+    for (predicate, breakable) in [
+        (ClaimPredicate::PairInstanceWritten, at_most_one()),
+        (ClaimPredicate::PairInstancesComplete, at_least_one()),
     ] {
         let change = set(vec![Claim::new(pair(1, 2, "AT"), predicate, GEN)]);
         let scan = set(vec![Claim::new(
@@ -184,7 +190,7 @@ fn pair_changes_reach_the_incident_claims_of_both_ends() {
         )]);
         let bound = set(vec![Claim::new(
             incident(1, "AT", Direction::Outgoing),
-            at_most_one(),
+            breakable,
             GEN,
         )]);
         assert!(!change.compatible_with(&scan));
@@ -453,6 +459,7 @@ fn the_two_cardinality_measures_do_not_stand_in_for_each_other() {
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::EdgeInstances,
             bound: CardinalityBound::AtMostOne,
+            trend: CountTrend::Changes,
         },
         GEN,
     )]);
@@ -461,6 +468,7 @@ fn the_two_cardinality_measures_do_not_stand_in_for_each_other() {
         ClaimPredicate::CardinalityBound {
             measure: CardinalityMeasure::DistinctNeighbours,
             bound: CardinalityBound::AtMostOne,
+            trend: CountTrend::Changes,
         },
         GEN,
     )]);
@@ -642,17 +650,21 @@ fn a_repeated_claim_is_stored_once() {
 /// instances would both count the neighbour joining.
 #[test]
 fn two_counts_of_one_pair_conflict() {
-    let a = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
-    let b = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
-    assert!(!a.compatible_with(&b));
+    let a = Claim::new(pair(1, 2, "OWNS"), counted(CountTrend::Grows), GEN);
+    let b = Claim::new(pair(1, 2, "OWNS"), counted(CountTrend::Grows), GEN);
+    assert!(!a.compatible_with(&b), "even two additions");
+}
+
+fn counted(trend: CountTrend) -> ClaimPredicate {
+    ClaimPredicate::PairCounted { trend }
 }
 
 /// Counts of different pairs, even of one node, are independent: what keeps
 /// a popular node's additions parallel is that only the same pair queues.
 #[test]
 fn counts_of_different_pairs_do_not_queue() {
-    let a = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
-    let b = Claim::new(pair(1, 3, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let a = Claim::new(pair(1, 2, "OWNS"), counted(CountTrend::Changes), GEN);
+    let b = Claim::new(pair(1, 3, "OWNS"), counted(CountTrend::Changes), GEN);
     let reference = Claim::new(
         ClaimScope::Node(node(1)),
         ClaimPredicate::EndpointAlive,
@@ -668,7 +680,7 @@ fn counts_of_different_pairs_do_not_queue() {
 /// themselves.
 #[test]
 fn a_counted_pair_meets_the_bounds_and_scans_over_it() {
-    let counted = Claim::new(pair(1, 2, "OWNS"), ClaimPredicate::PairCounted, GEN);
+    let counted = Claim::new(pair(1, 2, "OWNS"), counted(CountTrend::Changes), GEN);
     let bound = Claim::new(incident(2, "OWNS", Direction::Incoming), at_most_one(), GEN);
     let scan = Claim::new(
         incident(1, "OWNS", Direction::Outgoing),
@@ -685,4 +697,88 @@ fn a_counted_pair_meets_the_bounds_and_scans_over_it() {
     assert!(!counted.compatible_with(&scan));
     assert!(!counted.compatible_with(&destroyed));
     assert!(counted.compatible_with(&written));
+}
+
+/// Bounds over one scope coexist exactly when neither attempt's writes can
+/// move the count past the other's bound: additions under lower bounds,
+/// removals under upper bounds. Every other pairing excludes, including an
+/// addition beside a removal, any exact bound moved, and writes that may move
+/// the count either way.
+#[test]
+fn bounds_coexist_only_when_neither_side_can_break_the_other() {
+    use CardinalityBound::{AtLeastOne, AtMostOne, ExactlyOne};
+    use CountTrend::{Changes, Grows, Shrinks, Unchanged};
+
+    let scope = || incident(1, "OWNS", Direction::Outgoing);
+    let claim = |bound, trend| Claim::new(scope(), bounded(bound, trend), GEN);
+    let cases = [
+        ((AtLeastOne, Grows), (AtLeastOne, Grows), true),
+        // A removal can break the adder's lower bound: it is decided apart
+        // only when neither side can break the other's.
+        ((AtLeastOne, Grows), (AtLeastOne, Shrinks), false),
+        ((AtLeastOne, Shrinks), (AtLeastOne, Shrinks), false),
+        ((AtMostOne, Shrinks), (AtMostOne, Shrinks), true),
+        ((AtMostOne, Shrinks), (AtMostOne, Grows), false),
+        ((AtLeastOne, Unchanged), (AtMostOne, Unchanged), true),
+        ((AtMostOne, Grows), (AtMostOne, Grows), false),
+        ((AtLeastOne, Grows), (AtMostOne, Grows), false),
+        ((AtLeastOne, Shrinks), (AtMostOne, Shrinks), false),
+        ((ExactlyOne, Grows), (ExactlyOne, Grows), false),
+        ((ExactlyOne, Unchanged), (ExactlyOne, Unchanged), true),
+        ((AtLeastOne, Changes), (AtLeastOne, Grows), false),
+    ];
+    for ((b1, t1), (b2, t2), expected) in cases {
+        let (a, b) = (claim(b1, t1), claim(b2, t2));
+        assert_eq!(
+            a.compatible_with(&b),
+            expected,
+            "{b1:?}/{t1:?} vs {b2:?}/{t2:?}"
+        );
+        assert_eq!(b.compatible_with(&a), expected, "symmetric");
+    }
+}
+
+/// A pair change meets a bound over its endpoint's scope the same way: an
+/// added instance cannot break a lower bound, an erase cannot break an upper
+/// one, and a change either way can break any.
+#[test]
+fn a_pair_change_meets_a_bound_by_its_direction() {
+    let bound = |b| {
+        Claim::new(
+            incident(1, "OWNS", Direction::Outgoing),
+            bounded(b, CountTrend::Changes),
+            GEN,
+        )
+    };
+    let on_pair = |p| Claim::new(pair(1, 2, "OWNS"), p, GEN);
+
+    assert!(
+        on_pair(counted(CountTrend::Grows)).compatible_with(&bound(CardinalityBound::AtLeastOne))
+    );
+    assert!(
+        !on_pair(counted(CountTrend::Grows)).compatible_with(&bound(CardinalityBound::AtMostOne))
+    );
+    assert!(
+        on_pair(counted(CountTrend::Shrinks)).compatible_with(&bound(CardinalityBound::AtMostOne))
+    );
+    assert!(
+        !on_pair(counted(CountTrend::Changes))
+            .compatible_with(&bound(CardinalityBound::AtLeastOne))
+    );
+    assert!(
+        on_pair(ClaimPredicate::PairInstanceWritten)
+            .compatible_with(&bound(CardinalityBound::AtLeastOne))
+    );
+    assert!(
+        !on_pair(ClaimPredicate::PairInstanceWritten)
+            .compatible_with(&bound(CardinalityBound::ExactlyOne))
+    );
+    assert!(
+        on_pair(ClaimPredicate::PairInstancesComplete)
+            .compatible_with(&bound(CardinalityBound::AtMostOne))
+    );
+    assert!(
+        !on_pair(ClaimPredicate::PairInstancesComplete)
+            .compatible_with(&bound(CardinalityBound::AtLeastOne))
+    );
 }

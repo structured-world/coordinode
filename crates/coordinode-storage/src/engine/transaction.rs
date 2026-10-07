@@ -1205,6 +1205,49 @@ impl<'a> Transaction<'a> {
         ));
     }
 
+    /// Replace the trend each bound claim was stated with by the one this
+    /// attempt's staged writes show for its scope, so the registry admits it
+    /// beside attempts its writes cannot break and that cannot break it.
+    /// Taken from the writes, which is all the attempt can change, and again
+    /// on every commit attempt, since the writes are the same each time.
+    fn state_bound_trends(&mut self) {
+        use coordinode_core::txn::invariant::{ClaimPredicate, ClaimScope};
+
+        if !self
+            .claims
+            .claims()
+            .iter()
+            .any(|c| matches!(c.predicate, ClaimPredicate::CardinalityBound { .. }))
+        {
+            return;
+        }
+        let stated = std::mem::take(&mut self.claims);
+        for claim in stated.claims() {
+            let mut claim = claim.clone();
+            let Claim {
+                scope, predicate, ..
+            } = &mut claim;
+            if let (
+                ClaimScope::Incident {
+                    node,
+                    edge_type,
+                    direction,
+                },
+                ClaimPredicate::CardinalityBound { trend, .. },
+            ) = (&*scope, predicate)
+            {
+                *trend = crate::engine::cardinality::scope_trend(
+                    *node,
+                    edge_type,
+                    *direction,
+                    &self.merge_adj_ops,
+                    &self.write_buffer,
+                );
+            }
+            self.claims.insert(claim);
+        }
+    }
+
     /// Whether this attempt stages anything the commit would write.
     fn stages_writes(&self) -> bool {
         !self.write_buffer.is_empty()
@@ -1671,6 +1714,7 @@ impl<'a> Transaction<'a> {
         for claim in counts.claims(self.schema_generation) {
             self.claims.insert(claim);
         }
+        self.state_bound_trends();
         // Before the timestamp: every snapshot taken after it waits for this
         // commit to land, so a long read here would hold up all of them.
         self.decide_uncovered_uniques()?;
