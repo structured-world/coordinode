@@ -502,6 +502,8 @@ pub struct CreateEdgeTypeClause {
     pub temporal: bool,
     /// User-declared edge properties from the optional `WITH (...)` block.
     pub properties: Vec<EdgePropertyDecl>,
+    /// The property `DISCRIMINATED BY` names, as written.
+    pub discriminated_by: Option<String>,
 }
 
 /// `CREATE NODE TYPE <name> [TEMPORAL] [WITH (...)]` — bitemporal-capable

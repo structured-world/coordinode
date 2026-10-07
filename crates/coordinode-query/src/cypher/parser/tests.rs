@@ -2740,6 +2740,45 @@ fn create_edge_type_non_temporal_with_properties() {
     }
 }
 
+/// DISCRIMINATED BY names the identifying property, before WITH (...) as
+/// with an independent temporal discriminator or after it as with a
+/// categorical one; a type without it names none.
+#[test]
+fn create_edge_type_discriminated_by_in_either_position() {
+    let discriminator = |text: &str| match &parse_ok(text).clauses[0] {
+        Clause::CreateEdgeType(c) => (c.temporal, c.discriminated_by.clone(), c.properties.len()),
+        other => panic!("expected CreateEdgeType, got {other:?}"),
+    };
+    assert_eq!(
+        discriminator(
+            "CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (assertion_key) \
+             WITH (assertion_key: STRING NOT NULL)"
+        ),
+        (true, Some("assertion_key".to_string()), 1)
+    );
+    assert_eq!(
+        discriminator(
+            "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)"
+        ),
+        (false, Some("context".to_string()), 1)
+    );
+    assert_eq!(
+        discriminator("CREATE EDGE TYPE WORKS_AT TEMPORAL"),
+        (true, None, 0)
+    );
+}
+
+/// The clause is given once: a second DISCRIMINATED BY, or one without its
+/// property, does not parse.
+#[test]
+fn create_edge_type_discriminated_by_once() {
+    let _ = parse_err(
+        "CREATE EDGE TYPE KNOWS DISCRIMINATED BY (a) WITH (a: STRING NOT NULL) \
+         DISCRIMINATED BY (a)",
+    );
+    let _ = parse_err("CREATE EDGE TYPE KNOWS DISCRIMINATED BY ()");
+}
+
 #[test]
 fn create_edge_type_rejects_unknown_type() {
     // QUATERNION isn't in the property_type_name keyword set → parse error.

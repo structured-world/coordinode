@@ -3490,19 +3490,30 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // When edge_types is empty, expand over all schema-registered edge types.
             // This scans `schema:edge_type:<name>` keys (written on every CREATE edge)
             // plus any uncommitted registrations in the current transaction's write buffer.
+            // Hoist temporal flag per edge type once per traversal. A wildcard
+            // passes over the types no statement writes edges of; a named
+            // one is refused.
             let resolved_types: Vec<String>;
+            let mut edge_temporal: Vec<bool>;
             let effective_types: &[String] = if edge_types.is_empty() {
-                resolved_types = ctx.list_edge_types()?;
+                let all = ctx.list_edge_types()?;
+                let mut kept = Vec::with_capacity(all.len());
+                edge_temporal = Vec::with_capacity(all.len());
+                for et in all {
+                    if let Ok(temporal) = edge_type_shape(&et, ctx)? {
+                        edge_temporal.push(temporal);
+                        kept.push(et);
+                    }
+                }
+                resolved_types = kept;
                 &resolved_types
             } else {
+                edge_temporal = Vec::with_capacity(edge_types.len());
+                for et in edge_types {
+                    edge_temporal.push(lookup_edge_type_temporal(et, ctx)?);
+                }
                 edge_types
             };
-
-            // Hoist temporal flag per edge type once per traversal.
-            let mut edge_temporal: Vec<bool> = Vec::with_capacity(effective_types.len());
-            for et in effective_types {
-                edge_temporal.push(lookup_edge_type_temporal(et, ctx)?);
-            }
 
             // Edge properties are only materialised under an edge binding, so
             // an anonymous relationship with an inline property map
@@ -4278,7 +4289,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             name,
             temporal,
             properties,
-        } => execute_create_edge_type(name, *temporal, properties, ctx),
+            discriminated_by,
+        } => execute_create_edge_type(
+            name,
+            *temporal,
+            properties,
+            discriminated_by.as_deref(),
+            ctx,
+        ),
 
         LogicalOp::CreateNodeType {
             name,
@@ -13426,15 +13444,21 @@ fn clone_incident_edges(
         // mechanism is pending, so for now reject WITH EDGES when the source
         // has incident edges of a temporal type rather than writing an
         // adjacency with no per-version edgeprop (and a stale index).
-        if lookup_edge_type_temporal(et, ctx)? {
+        // A type identified by its own discriminator holds no edge a
+        // statement wrote; one there would be refused, not copied as single.
+        let shape = edge_type_shape(et, ctx)?;
+        if shape != Ok(false) {
             let has_incident =
                 ctx.adj_get_fwd(et, a_id)?.is_some() || ctx.adj_get_rev(et, a_id)?.is_some();
             if has_incident {
-                return Err(ExecutionError::Unsupported(format!(
-                    "CLONE NODE WITH EDGES does not yet clone temporal edge type '{et}' \
-                     (pending bitemporal index-maintenance); the node and its non-temporal \
-                     edges clone normally."
-                )));
+                return Err(match shape {
+                    Err(column) => independently_identified(et, &column),
+                    Ok(_) => ExecutionError::Unsupported(format!(
+                        "CLONE NODE WITH EDGES does not yet clone temporal edge type '{et}' \
+                         (pending bitemporal index-maintenance); the node and its non-temporal \
+                         edges clone normally."
+                    )),
+                });
             }
             continue;
         }
@@ -13795,7 +13819,9 @@ fn transfer_node_edges(
 
     let edge_types = ctx.list_edge_types()?;
     for edge_type in &edge_types {
-        let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+        // A type identified by its own discriminator holds no edge a
+        // statement wrote, so it is refused only when the node has one.
+        let shape = edge_type_shape(edge_type, ctx)?;
         for direction in [AdjDirection::Out, AdjDirection::In] {
             let Some(plist) = (match direction {
                 AdjDirection::Out => ctx.adj_get_fwd(edge_type, source_id),
@@ -13804,6 +13830,10 @@ fn transfer_node_edges(
             else {
                 continue;
             };
+            let temporal = shape
+                .as_ref()
+                .map(|t| *t)
+                .map_err(|column| independently_identified(edge_type, column))?;
 
             // Snapshot peers — iterating the live posting list while issuing
             // merge_remove on it during the loop would be safe (deferred) but
@@ -15521,21 +15551,47 @@ fn edge_type_schema_key(edge_type: &str) -> Vec<u8> {
     coordinode_core::schema::definition::encode_edge_type_schema_key(edge_type, 1)
 }
 
-/// Look up whether an edge type was declared with the TEMPORAL modifier.
+/// Whether instances of an edge type are identified by their `valid_from`
+/// (the start-identified temporal shorthand) rather than by the endpoints
+/// alone, read from the type's resolved discriminator.
 ///
-/// Reads `schema:edge_type:<name>` and attempts to decode the body as an
-/// `EdgeTypeSchema`. A zero-length body is a legacy idempotent marker written
-/// on first CREATE for the type (predates DDL) — treated as non-temporal.
-/// Missing key also returns `false`: an edge type used without a prior
-/// `CREATE EDGE TYPE` is implicitly non-temporal.
+/// An edge type without a definition, or with only the existence marker an
+/// edge create leaves, is single-edge. A type identified by any other
+/// property is refused: reading or writing it as single-edge or by
+/// `valid_from` would merge or split its instances.
 fn lookup_edge_type_temporal(
     edge_type: &str,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<bool, ExecutionError> {
-    Ok(ctx
-        .load_current_edge_type_schema(edge_type)?
-        .map(|s| s.temporal)
-        .unwrap_or(false))
+    edge_type_shape(edge_type, ctx)?.map_err(|column| independently_identified(edge_type, &column))
+}
+
+/// The refusal of a statement that reaches edges of a type identified by
+/// its own discriminator.
+fn independently_identified(edge_type: &str, column: &str) -> ExecutionError {
+    ExecutionError::Unsupported(format!(
+        "edge type '{edge_type}' identifies its instances by '{column}'; queries over it are \
+         not supported yet"
+    ))
+}
+
+/// Whether instances of an edge type are start-identified (`Ok(true)`) or
+/// single (`Ok(false)`), or the property they are identified by otherwise
+/// (`Err`). No statement writes an edge of the last kind, so a statement
+/// ranging over every type, rather than naming this one, passes it over
+/// without missing anything.
+fn edge_type_shape(
+    edge_type: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Result<bool, String>, ExecutionError> {
+    let Some(schema) = ctx.load_current_edge_type_schema(edge_type)? else {
+        return Ok(Ok(false));
+    };
+    Ok(match schema.discriminator() {
+        None => Ok(false),
+        Some(_) if schema.is_start_identified() => Ok(true),
+        Some(d) => Err(d.column.clone()),
+    })
 }
 
 /// Apply `SET r.<property> = <value>` to the matched edge.
@@ -16218,11 +16274,14 @@ fn execute_drop_table(
 /// against the declared properties; if `temporal == true`, the write path
 /// requires `valid_from` and stores per-version edgeprop entries.
 ///
-/// Returns one row: `{ name, temporal, version, properties }`.
+/// Returns one row: `{ name, temporal, discriminator, version, properties }`,
+/// `discriminator` being the property instances are identified by (null for
+/// a single-edge type).
 fn execute_create_edge_type(
     name: &str,
     temporal: bool,
     properties: &[crate::plan::PropertyDecl],
+    discriminated_by: Option<&str>,
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     // Reject if the edge type was registered before (either via explicit DDL,
@@ -16265,6 +16324,9 @@ fn execute_create_edge_type(
         }
         schema.add_property(prop);
     }
+    schema
+        .resolve_identity(discriminated_by)
+        .map_err(ExecutionError::CatalogRefused)?;
 
     // Persist new version + pointer atomically.
     ctx.save_current_edge_type_schema(&schema)?;
@@ -16272,6 +16334,12 @@ fn execute_create_edge_type(
     let mut row = Row::new();
     row.insert("name".to_string(), Value::String(name.to_string()));
     row.insert("temporal".to_string(), Value::Bool(temporal));
+    row.insert(
+        "discriminator".to_string(),
+        schema
+            .discriminator()
+            .map_or(Value::Null, |d| Value::String(d.column.clone())),
+    );
     row.insert(
         "version".to_string(),
         Value::Int(schema.schema_revision as i64),

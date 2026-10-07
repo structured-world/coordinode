@@ -1225,6 +1225,7 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
     let mut name = String::new();
     let mut temporal = false;
     let mut properties: Vec<EdgePropertyDecl> = Vec::new();
+    let mut discriminated_by = None;
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
@@ -1232,8 +1233,18 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
                 name = inner.as_str().to_string();
             }
             Rule::kw_temporal => temporal = true,
-            Rule::property_decl_list => {
-                for decl in inner.into_inner() {
+            Rule::edge_discriminated_by => {
+                discriminated_by = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::identifier)
+                    .map(|p| p.as_str().to_string());
+            }
+            Rule::edge_type_properties => {
+                let list = inner
+                    .into_inner()
+                    .filter(|p| p.as_rule() == Rule::property_decl_list)
+                    .flat_map(|p| p.into_inner());
+                for decl in list {
                     if decl.as_rule() == Rule::property_decl {
                         let mut prop_name = String::new();
                         let mut prop_type = String::new();
@@ -1276,6 +1287,7 @@ fn build_create_edge_type_clause(pair: Pair<'_, Rule>) -> Result<CreateEdgeTypeC
         name,
         temporal,
         properties,
+        discriminated_by,
     })
 }
 

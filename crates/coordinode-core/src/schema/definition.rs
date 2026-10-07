@@ -701,6 +701,20 @@ pub enum MigrationDocState {
     Migrated,
 }
 
+/// The property whose value, with the type and the two endpoints, identifies
+/// one instance of a discriminated edge type, and the type of its values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EdgeDiscriminator {
+    /// The discriminating property.
+    pub column: String,
+    /// The declared type of its values, which selects the key encoding.
+    pub value_type: PropertyType,
+}
+
+/// The property a temporal edge type without an explicit discriminator is
+/// identified by.
+pub const VALID_FROM: &str = "valid_from";
+
 /// Schema definition for an edge type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeTypeSchema {
@@ -710,8 +724,13 @@ pub struct EdgeTypeSchema {
     /// Property definitions for edge facets.
     pub properties: BTreeMap<String, PropertyDef>,
 
-    /// Whether this edge type supports temporal semantics.
+    /// Whether this edge type supports temporal semantics. Independent of
+    /// how its instances are identified.
     pub temporal: bool,
+
+    /// How instances of one endpoint pair are told apart, resolved once by
+    /// [`Self::resolve_identity`]: `None` for a single-edge type.
+    discriminator: Option<EdgeDiscriminator>,
 
     /// Placement policy for adjacency entries relative to endpoint nodes.
     /// Default `ColocateWithSource` matches the graph-default
@@ -732,9 +751,102 @@ impl EdgeTypeSchema {
             name: name.into(),
             properties: BTreeMap::new(),
             temporal: false,
+            discriminator: None,
             placement: EdgePlacement::default(),
             schema_revision: 1,
         }
+    }
+
+    /// How instances of one endpoint pair are told apart; `None` for a
+    /// single-edge type.
+    pub fn discriminator(&self) -> Option<&EdgeDiscriminator> {
+        self.discriminator.as_ref()
+    }
+
+    /// Whether instances are identified by their `valid_from`, the
+    /// start-identified temporal shorthand.
+    pub fn is_start_identified(&self) -> bool {
+        self.temporal
+            && self
+                .discriminator
+                .as_ref()
+                .is_some_and(|d| d.column == VALID_FROM)
+    }
+
+    /// Resolve how instances are identified, once, from the declared
+    /// properties: by `declared` when given, by `valid_from` for a temporal
+    /// type that names none (the start-identified shorthand), and by the
+    /// endpoints alone otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The discriminator is not a declared stored property, may be null, or
+    /// has a type that cannot identify an instance; a temporal type's
+    /// `valid_from` is declared with a type other than TIMESTAMP.
+    pub fn resolve_identity(&mut self, declared: Option<&str>) -> Result<(), String> {
+        let name = &self.name;
+        let discriminator = match declared {
+            Some(column) => {
+                let Some(def) = self.properties.get(column) else {
+                    return Err(format!(
+                        "edge type '{name}' is discriminated by '{column}', which it does not declare"
+                    ));
+                };
+                if !def.not_null {
+                    return Err(format!(
+                        "the discriminator '{column}' of edge type '{name}' must be NOT NULL"
+                    ));
+                }
+                if !matches!(
+                    def.property_type,
+                    PropertyType::Int
+                        | PropertyType::Float
+                        | PropertyType::Bool
+                        | PropertyType::Timestamp
+                        | PropertyType::String
+                        | PropertyType::Blob
+                ) {
+                    return Err(format!(
+                        "the discriminator '{column}' of edge type '{name}' is {}; an instance \
+                         is identified by an INT, FLOAT, BOOL, TIMESTAMP, STRING or BLOB value",
+                        def.property_type
+                    ));
+                }
+                Some(EdgeDiscriminator {
+                    column: column.to_string(),
+                    value_type: def.property_type.clone(),
+                })
+            }
+            None if self.temporal => {
+                // A start is a TIMESTAMP or an INT of Unix microseconds, the
+                // unit both time axes share; the two encode to one key.
+                let value_type = match self.properties.get(VALID_FROM) {
+                    None => PropertyType::Timestamp,
+                    Some(def)
+                        if matches!(
+                            def.property_type,
+                            PropertyType::Timestamp | PropertyType::Int
+                        ) =>
+                    {
+                        def.property_type.clone()
+                    }
+                    Some(def) => {
+                        return Err(format!(
+                            "edge type '{name}' is temporal, so its '{VALID_FROM}' is a TIMESTAMP \
+                             or an INT of Unix microseconds, not {}",
+                            def.property_type
+                        ));
+                    }
+                };
+                Some(EdgeDiscriminator {
+                    column: VALID_FROM.to_string(),
+                    value_type,
+                })
+            }
+            None => None,
+        };
+        self.discriminator = discriminator;
+        Ok(())
     }
 
     /// Add a property definition. Mutates the current snapshot; does not

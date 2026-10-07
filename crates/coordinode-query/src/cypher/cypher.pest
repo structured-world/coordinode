@@ -302,16 +302,20 @@ alter_namespace_clause = { kw_alter ~ kw_namespace ~ kw_set ~ kw_index ~ kw_main
 
 // --- CREATE EDGE TYPE ---
 
-// CREATE EDGE TYPE <name> [TEMPORAL] [WITH ( <property_decl_list> )]
+// CREATE EDGE TYPE <name> [TEMPORAL] [DISCRIMINATED BY (<col>)]
+//     [WITH ( <property_decl_list> )] [DISCRIMINATED BY (<col>)]
 //
-// TEMPORAL marks the edge type as bitemporal: every instance carries
-// (valid_from, valid_to) fields and multiple versions can coexist for the
-// same (source, target) pair. WITH (...) declares user-defined edge
-// properties.
+// TEMPORAL marks the edge type as bitemporal. DISCRIMINATED BY names the
+// declared property that, with the endpoints, identifies an instance, so one
+// endpoint pair can hold several; a TEMPORAL type naming none is identified
+// by valid_from. The clause may stand before or after WITH (...), once.
 create_edge_type_clause = {
     kw_create ~ kw_edge ~ kw_type ~ identifier ~ kw_temporal?
-    ~ (kw_with ~ "(" ~ property_decl_list ~ ")")?
+    ~ ( edge_discriminated_by ~ edge_type_properties?
+      | edge_type_properties? ~ edge_discriminated_by? )
 }
+edge_type_properties  = { kw_with ~ "(" ~ property_decl_list ~ ")" }
+edge_discriminated_by = { kw_discriminated ~ kw_by ~ "(" ~ identifier ~ ")" }
 
 // --- CREATE NODE TYPE ---
 //
@@ -984,6 +988,7 @@ kw_fail       = @{ ^"fail" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_edge       = @{ ^"edge" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_type       = @{ ^"type" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_temporal   = @{ ^"temporal" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_discriminated = @{ ^"discriminated" ~ !(ASCII_ALPHANUMERIC | "_") }
 // CREATE NODE TYPE — bitemporal node-label DDL.
 // Context keyword: `node` remains a valid identifier elsewhere.
 kw_node       = @{ ^"node" ~ !(ASCII_ALPHANUMERIC | "_") }

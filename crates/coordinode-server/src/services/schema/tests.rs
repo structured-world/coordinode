@@ -205,6 +205,7 @@ async fn unknown_enum_values_are_refused_not_defaulted() {
             name: "UNKNOWN".to_string(),
             properties: vec![unknown_type],
             temporal: false,
+            discriminator: String::new(),
         }))
         .await
         .expect_err("an unknown edge property type must be refused"),
@@ -811,6 +812,7 @@ async fn create_edge_type_persists_schema() {
             name: "FOLLOWS".to_string(),
             properties: vec![prop("since", schema::ScalarType::Timestamp, true)],
             temporal: true,
+            discriminator: String::new(),
         }))
         .await
         .expect("create_edge_type should succeed")
@@ -819,6 +821,10 @@ async fn create_edge_type_persists_schema() {
     assert!(et.declared && et.temporal);
     assert!(et.schema_revision > 0);
     assert!(et.properties[0].required);
+    assert_eq!(
+        et.discriminator, "valid_from",
+        "a temporal type naming none is start-identified"
+    );
 
     let listed = svc
         .list_edge_types(Request::new(schema::ListEdgeTypesRequest {}))
@@ -833,10 +839,100 @@ async fn create_edge_type_persists_schema() {
             name: "FOLLOWS".to_string(),
             properties: vec![],
             temporal: false,
+            discriminator: String::new(),
         }))
         .await
         .expect_err("defined once");
     assert_eq!(status.code(), tonic::Code::AlreadyExists);
+}
+
+/// An edge type names the property that identifies its edges, temporal or
+/// not, and lists it as given; a discriminator the type does not declare,
+/// may hold null or has a type that cannot identify an edge is refused
+/// with the field named and nothing created.
+#[tokio::test]
+async fn create_edge_type_declares_its_discriminator() {
+    let (svc, _dir) = test_service();
+    let invalid = |status: Status, field: &str| {
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert_eq!(reason(&status), "INVALID_FIELD");
+        let violations = status
+            .get_details_bad_request()
+            .expect("BadRequest")
+            .field_violations;
+        assert_eq!(violations[0].field, field, "{violations:?}");
+    };
+    let create =
+        |name: &str, properties, temporal, discriminator: &str| schema::CreateEdgeTypeRequest {
+            name: name.to_string(),
+            properties,
+            temporal,
+            discriminator: discriminator.to_string(),
+        };
+
+    let knows = svc
+        .create_edge_type(Request::new(create(
+            "KNOWS",
+            vec![prop("context", schema::ScalarType::String, true)],
+            false,
+            "context",
+        )))
+        .await
+        .expect("categorical discriminator")
+        .into_inner();
+    assert_eq!(knows.discriminator, "context");
+    assert!(!knows.temporal);
+    let asserts = svc
+        .create_edge_type(Request::new(create(
+            "ASSERTS",
+            vec![prop("assertion_key", schema::ScalarType::String, true)],
+            true,
+            "assertion_key",
+        )))
+        .await
+        .expect("temporal with an independent discriminator")
+        .into_inner();
+    assert_eq!(asserts.discriminator, "assertion_key");
+    assert!(asserts.temporal);
+
+    for (name, properties, discriminator) in [
+        (
+            "UNDECLARED",
+            vec![prop("context", schema::ScalarType::String, true)],
+            "missing",
+        ),
+        (
+            "NULLABLE",
+            vec![prop("context", schema::ScalarType::String, false)],
+            "context",
+        ),
+        (
+            "MAPPED",
+            vec![prop("context", schema::ScalarType::Map, true)],
+            "context",
+        ),
+    ] {
+        invalid(
+            svc.create_edge_type(Request::new(create(name, properties, false, discriminator)))
+                .await
+                .expect_err(name),
+            "discriminator",
+        );
+    }
+    let listed: Vec<String> = svc
+        .list_edge_types(Request::new(schema::ListEdgeTypesRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .edge_types
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        listed,
+        ["ASSERTS", "KNOWS"],
+        "the refused ones left nothing"
+    );
 }
 
 /// list_labels returns schema properties for declared labels.

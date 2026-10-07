@@ -622,6 +622,15 @@ impl SchemaStore for LocalSchemaStore<'_> {
         txn: &mut Transaction,
         schema: &EdgeTypeSchema,
     ) -> StoreResult<()> {
+        // A temporal type always resolves to some discriminator; one without
+        // was published before `resolve_identity` ran, and its writers would
+        // have no key shape to agree on.
+        if schema.temporal && schema.discriminator().is_none() {
+            return Err(StoreError::Invariant(format!(
+                "edge type '{}' is temporal but its identity was never resolved",
+                schema.name
+            )));
+        }
         let body = schema.to_msgpack().map_err(|e| StoreError::Decode {
             kind: "edge type schema",
             message: format!("encode '{}': {e}", schema.name),

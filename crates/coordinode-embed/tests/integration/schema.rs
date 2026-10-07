@@ -644,3 +644,146 @@ fn element_id_roundtrip_for_real_database_node_ids() {
         );
     }
 }
+
+// ── Edge identity ───────────────────────────────────────────────────
+
+/// The discriminator `name`'s definition resolved to, if any.
+fn discriminator_of(db: &Database, name: &str) -> Option<String> {
+    db.edge_type_schemas()
+        .expect("edge types")
+        .into_iter()
+        .find(|s| s.name == name)
+        .expect("defined")
+        .discriminator()
+        .map(|d| d.column.clone())
+}
+
+/// An edge type is identified by the property DISCRIMINATED BY names,
+/// whether or not it is temporal, and a temporal type naming none by
+/// valid_from; the resolved discriminator is what the catalog keeps, across
+/// a reopen.
+#[test]
+fn an_edge_type_keeps_the_discriminator_it_was_created_with() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let mut db = Database::open(dir.path()).expect("open");
+        let rows = db
+            .execute_cypher(
+                "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)",
+            )
+            .expect("categorical");
+        assert_eq!(
+            rows[0].get("discriminator"),
+            Some(&coordinode_core::graph::types::Value::String(
+                "context".into()
+            ))
+        );
+        db.execute_cypher(
+            "CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (assertion_key) \
+             WITH (assertion_key: STRING NOT NULL)",
+        )
+        .expect("independent temporal");
+        db.execute_cypher("CREATE EDGE TYPE WORKS_AT TEMPORAL WITH (role: STRING)")
+            .expect("start-identified");
+        db.execute_cypher("CREATE EDGE TYPE LIKES")
+            .expect("single-edge");
+    }
+    let db = Database::open(dir.path()).expect("reopen");
+    assert_eq!(discriminator_of(&db, "KNOWS").as_deref(), Some("context"));
+    assert_eq!(
+        discriminator_of(&db, "ASSERTS").as_deref(),
+        Some("assertion_key")
+    );
+    assert_eq!(
+        discriminator_of(&db, "WORKS_AT").as_deref(),
+        Some("valid_from")
+    );
+    assert_eq!(discriminator_of(&db, "LIKES"), None);
+}
+
+/// A discriminator that cannot identify an edge is refused before anything
+/// is written: one the type does not declare, one that may be null, one of
+/// a type that holds no single comparable value, and a temporal type's
+/// valid_from declared as anything but a timestamp.
+#[test]
+fn an_edge_type_whose_discriminator_cannot_identify_an_edge_is_refused() {
+    let (mut db, _dir) = open_db();
+    for (statement, why) in [
+        (
+            "CREATE EDGE TYPE A WITH (context: STRING NOT NULL) DISCRIMINATED BY (missing)",
+            "does not declare",
+        ),
+        (
+            "CREATE EDGE TYPE B WITH (context: STRING) DISCRIMINATED BY (context)",
+            "NOT NULL",
+        ),
+        (
+            "CREATE EDGE TYPE C WITH (context: MAP NOT NULL) DISCRIMINATED BY (context)",
+            "is MAP",
+        ),
+        (
+            "CREATE EDGE TYPE D TEMPORAL WITH (valid_from: STRING)",
+            "TIMESTAMP",
+        ),
+    ] {
+        let error = db.execute_cypher(statement).expect_err(statement);
+        assert!(error.to_string().contains(why), "{statement}: {error}");
+    }
+    assert!(db.edge_type_schemas().expect("edge types").is_empty());
+}
+
+/// Edges of a type identified by its own discriminator are not read or
+/// written as single edges or by valid_from, which would merge or split its
+/// instances: the statement is refused and nothing is written. A
+/// start-identified and a single-edge type are unaffected.
+#[test]
+fn edges_of_an_independently_identified_type_are_refused_not_misread() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)",
+    )
+    .expect("categorical");
+    db.execute_cypher("CREATE (:P {n: 'a'}), (:P {n: 'b'})")
+        .expect("nodes");
+
+    let error = db
+        .execute_cypher(
+            "MATCH (a:P {n: 'a'}), (b:P {n: 'b'}) CREATE (a)-[:KNOWS {context: 'work'}]->(b)",
+        )
+        .expect_err("not written as a single edge");
+    assert!(error.to_string().contains("'context'"), "{error}");
+    let found = db
+        .execute_cypher("MATCH (:P)-[k:KNOWS]->(:P) RETURN k")
+        .expect_err("not read as a single edge");
+    assert!(found.to_string().contains("'context'"), "{found}");
+
+    db.execute_cypher("CREATE EDGE TYPE LIKES").expect("single");
+    db.execute_cypher("MATCH (a:P {n: 'a'}), (b:P {n: 'b'}) CREATE (a)-[:LIKES]->(b)")
+        .expect("a single-edge type still writes");
+    assert_eq!(
+        db.execute_cypher("MATCH (:P)-[r:LIKES]->(:P) RETURN r")
+            .expect("read")
+            .len(),
+        1
+    );
+    // A traversal of every type still reads the others: the declared type
+    // holds no edge to misread.
+    for statement in [
+        "MATCH (:P)-[r]->(:P) RETURN r",
+        "MATCH (:P)<-[r]-(:P) RETURN r",
+        "MATCH (:P)-[r*1..2]->(:P) RETURN r",
+    ] {
+        assert_eq!(
+            db.execute_cypher(statement).expect(statement).len(),
+            1,
+            "{statement}"
+        );
+    }
+    db.execute_cypher("MATCH (p:P {n: 'b'}) DETACH DELETE p")
+        .expect("a detach ranges over every type");
+    assert!(
+        db.execute_cypher("MATCH (:P)-[r]->() RETURN r")
+            .expect("read")
+            .is_empty()
+    );
+}

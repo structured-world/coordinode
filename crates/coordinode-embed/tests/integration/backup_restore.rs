@@ -493,6 +493,49 @@ fn every_temporal_edge_instance_survives_every_format() {
     }
 }
 
+/// What identifies an edge travels with the schema a dump brings: a
+/// categorical discriminator, an independent temporal one and the
+/// start-identified shorthand come back as they were resolved.
+#[test]
+fn edge_discriminators_survive_every_format_with_a_schema() {
+    for format in [BackupFormat::Json, BackupFormat::Binary] {
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut db1 = Database::open(dir1.path()).unwrap();
+        for statement in [
+            "CREATE EDGE TYPE KNOWS WITH (context: STRING NOT NULL) DISCRIMINATED BY (context)",
+            "CREATE EDGE TYPE ASSERTS TEMPORAL DISCRIMINATED BY (key) WITH (key: BLOB NOT NULL)",
+            "CREATE EDGE TYPE WORKS_AT TEMPORAL",
+        ] {
+            db1.execute_cypher(statement).unwrap();
+        }
+        let dir2 = tempfile::tempdir().unwrap();
+        let db2 = Database::open(dir2.path()).unwrap();
+        db2.restore(format, &dump_of(&db1, format), &RestoreOptions::default())
+            .unwrap();
+
+        assert_eq!(
+            db2.edge_type_schemas().unwrap(),
+            db1.edge_type_schemas().unwrap(),
+            "{format:?}"
+        );
+        let resolved: Vec<_> = db2
+            .edge_type_schemas()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name.clone(), s.discriminator().map(|d| d.column.clone())))
+            .collect();
+        assert_eq!(
+            resolved,
+            [
+                ("ASSERTS".to_string(), Some("key".to_string())),
+                ("KNOWS".to_string(), Some("context".to_string())),
+                ("WORKS_AT".to_string(), Some("valid_from".to_string())),
+            ],
+            "{format:?}"
+        );
+    }
+}
+
 /// Every version of a temporal node comes back in every format, under its
 /// own identifier and valid_from: the text formats used to skip versions.
 #[test]

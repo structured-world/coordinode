@@ -368,6 +368,10 @@ fn edge_type_to_proto(s: &EdgeTypeSchema) -> schema::EdgeType {
         properties: s.properties.values().map(property_to_proto).collect(),
         temporal: s.temporal,
         schema_revision: s.schema_revision,
+        discriminator: s
+            .discriminator()
+            .map(|d| d.column.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -692,6 +696,9 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         for p in properties_from_proto("properties", &req.properties, &mut HashSet::new())? {
             definition.add_property(p);
         }
+        definition
+            .resolve_identity(Some(req.discriminator.as_str()).filter(|d| !d.is_empty()))
+            .map_err(|why| invalid_field("discriminator", why))?;
 
         let name = req.name;
         let edge_type = super::blocking(|| -> Result<schema::EdgeType, Status> {

@@ -191,6 +191,83 @@ fn edge_type_schema_temporal() {
     assert_eq!(schema.properties.len(), 3);
 }
 
+/// Identity resolves once from the declared properties: a temporal type
+/// naming no discriminator is start-identified, a named one identifies
+/// instances whether the type is temporal or not, and a type naming none
+/// that is not temporal is single-edge. The resolved discriminator survives
+/// serialization.
+#[test]
+fn edge_identity_resolves_from_the_declaration() {
+    let mut works_at = EdgeTypeSchema::new("WORKS_AT");
+    works_at.set_temporal(true);
+    works_at.resolve_identity(None).expect("shorthand");
+    assert!(works_at.is_start_identified());
+    assert_eq!(
+        works_at.discriminator(),
+        Some(&EdgeDiscriminator {
+            column: VALID_FROM.into(),
+            value_type: PropertyType::Timestamp,
+        })
+    );
+
+    for temporal in [false, true] {
+        let mut asserts = EdgeTypeSchema::new("ASSERTS");
+        asserts.set_temporal(temporal);
+        asserts.add_property(PropertyDef::new("key", PropertyType::Blob).not_null());
+        asserts.resolve_identity(Some("key")).expect("explicit");
+        assert_eq!(
+            asserts
+                .discriminator()
+                .map(|d| (d.column.as_str(), &d.value_type)),
+            Some(("key", &PropertyType::Blob))
+        );
+        assert!(!asserts.is_start_identified(), "temporal={temporal}");
+        let restored =
+            EdgeTypeSchema::from_msgpack(&asserts.to_msgpack().expect("encode")).expect("decode");
+        assert_eq!(restored, asserts);
+    }
+
+    let mut likes = EdgeTypeSchema::new("LIKES");
+    likes.resolve_identity(None).expect("single");
+    assert_eq!(likes.discriminator(), None);
+    assert!(!likes.is_start_identified());
+}
+
+/// A discriminator that cannot identify an instance is refused and leaves
+/// the schema unresolved: undeclared, nullable, of a type with no single
+/// comparable value, computed; and a temporal type's valid_from declared as
+/// anything but a timestamp.
+#[test]
+fn edge_identity_refuses_what_cannot_identify_an_instance() {
+    let refused = |schema: &mut EdgeTypeSchema, declared: Option<&str>, why: &str| {
+        let error = schema.resolve_identity(declared).expect_err(why);
+        assert!(error.contains(why), "{error}");
+        assert_eq!(schema.discriminator(), None);
+    };
+    let mut schema = EdgeTypeSchema::new("E");
+    schema.add_property(PropertyDef::new("nullable", PropertyType::String));
+    schema.add_property(PropertyDef::new("map", PropertyType::Map).not_null());
+    schema.add_property(
+        PropertyDef::new("vector", PropertyType::Array(Box::new(PropertyType::Int))).not_null(),
+    );
+    refused(&mut schema, Some("missing"), "does not declare");
+    refused(&mut schema, Some("nullable"), "NOT NULL");
+    refused(&mut schema, Some("map"), "is MAP");
+    refused(&mut schema, Some("vector"), "is ARRAY<INT>");
+
+    let mut temporal = EdgeTypeSchema::new("T");
+    temporal.set_temporal(true);
+    temporal.add_property(PropertyDef::new(VALID_FROM, PropertyType::String));
+    refused(&mut temporal, None, "TIMESTAMP");
+
+    // An INT start is Unix microseconds, the shared unit: identified by it.
+    let mut micros = EdgeTypeSchema::new("M");
+    micros.set_temporal(true);
+    micros.add_property(PropertyDef::new(VALID_FROM, PropertyType::Int));
+    micros.resolve_identity(None).expect("int start");
+    assert!(micros.is_start_identified());
+}
+
 #[test]
 fn edge_type_schema_msgpack_roundtrip() {
     let mut schema = EdgeTypeSchema::new("KNOWS");

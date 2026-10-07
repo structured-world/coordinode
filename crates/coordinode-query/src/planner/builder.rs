@@ -867,6 +867,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             name: c.name.clone(),
             temporal: c.temporal,
             properties: lower_property_decls(&c.properties),
+            discriminated_by: c.discriminated_by.clone(),
         }),
         Clause::CreateNodeType(c) => Ok(LogicalOp::CreateNodeType {
             name: c.name.clone(),

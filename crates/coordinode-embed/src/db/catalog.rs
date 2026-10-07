@@ -209,7 +209,8 @@ impl Database {
     /// # Errors
     ///
     /// The edge type already exists, or the catalog could not be written.
-    pub fn define_edge_type(&self, schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
+    pub fn define_edge_type(&self, mut schema: EdgeTypeSchema) -> Result<u64, DatabaseError> {
+        resolve_edge_identity(&mut schema)?;
         let name = schema.name.clone();
         self.commit_catalog(|txn| -> Result<(), DatabaseError> {
             let store = LocalSchemaStore::new(&self.engine);
@@ -227,21 +228,22 @@ impl Database {
     }
 
     /// Define edge type `schema`, or replace its definition at the next
-    /// revision, keeping its placement and temporal flag. The replacement is
-    /// conditioned on the definition it read, so a concurrent change of the
-    /// same edge type refuses it rather than being overwritten. Returns the
-    /// published schema revision.
+    /// revision, keeping its placement, temporal flag and discriminator. The
+    /// replacement is conditioned on the definition it read, so a concurrent
+    /// change of the same edge type refuses it rather than being overwritten.
+    /// Returns the published schema revision.
     ///
     /// # Errors
     ///
-    /// The definition changes the temporal flag, or the catalog could not be
-    /// written.
+    /// The definition changes the temporal flag or the discriminator, or the
+    /// catalog could not be written.
     pub fn create_edge_type_schema(
         &self,
         mut schema: EdgeTypeSchema,
     ) -> Result<u64, DatabaseError> {
         use coordinode_core::schema::definition::encode_edge_type_current_revision_key;
         use coordinode_storage::engine::partition::Partition;
+        resolve_edge_identity(&mut schema)?;
         self.commit_catalog(|txn| -> Result<(), DatabaseError> {
             let store = LocalSchemaStore::new(&self.engine);
             let pointer = encode_edge_type_current_revision_key(&schema.name);
@@ -252,6 +254,12 @@ impl Database {
                 if current.temporal != schema.temporal {
                     return Err(refused(format!(
                         "whether edge type '{}' is temporal is fixed when it is created",
+                        schema.name
+                    )));
+                }
+                if current.discriminator() != schema.discriminator() {
+                    return Err(refused(format!(
+                        "what identifies an edge of type '{}' is fixed when it is created",
                         schema.name
                     )));
                 }
@@ -467,6 +475,17 @@ impl Database {
 /// A catalog change refused by the catalog's current state.
 fn refused(reason: String) -> DatabaseError {
     DatabaseError::Execution(ExecutionError::CatalogRefused(reason))
+}
+
+/// Give `schema` its identity when the caller left it unresolved: a
+/// temporal type naming no discriminator is identified by `valid_from`. A
+/// caller declaring a discriminator resolves it with
+/// [`EdgeTypeSchema::resolve_identity`] before handing the schema over.
+fn resolve_edge_identity(schema: &mut EdgeTypeSchema) -> Result<(), DatabaseError> {
+    if schema.discriminator().is_none() {
+        schema.resolve_identity(None).map_err(refused)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

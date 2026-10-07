@@ -553,6 +553,9 @@ pub enum LogicalOp {
         name: String,
         temporal: bool,
         properties: Vec<crate::plan::PropertyDecl>,
+        /// The property `DISCRIMINATED BY` names; resolved against
+        /// `properties` when the type is created.
+        discriminated_by: Option<String>,
     },
 
     /// CREATE NODE TYPE: declare a node-label schema entry.
@@ -2791,10 +2794,14 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
             name,
             temporal,
             properties,
+            discriminated_by,
         } => {
             let temporal_marker = if *temporal { " TEMPORAL" } else { "" };
+            let discriminator = discriminated_by
+                .as_deref()
+                .map_or(String::new(), |d| format!(" DISCRIMINATED BY ({d})"));
             output.push_str(&format!(
-                "{prefix}CreateEdgeType({name}{temporal_marker}, props={})\n",
+                "{prefix}CreateEdgeType({name}{temporal_marker}{discriminator}, props={})\n",
                 properties.len()
             ));
         }
