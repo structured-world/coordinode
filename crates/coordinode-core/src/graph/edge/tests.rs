@@ -646,6 +646,26 @@ fn discriminator_float_identity_follows_equality() {
     );
 }
 
+/// Two instances of one endpoint pair with independent discriminators and
+/// equal starts have distinct keys: the start is not part of the identity.
+/// Under the start-identified shorthand the same two starts are one key.
+#[test]
+fn independent_discriminators_with_equal_starts_are_distinct_instances() {
+    let key = |d: PropertyValue| {
+        encode_discriminated_edgeprop_key("ASSERTS", NodeId::from_raw(1), NodeId::from_raw(2), &d)
+            .expect("supported")
+    };
+    let start = 1_710_000_000_000_000_i64;
+    assert_ne!(
+        key(PropertyValue::String("claim-a".into())),
+        key(PropertyValue::String("claim-b".into()))
+    );
+    assert_eq!(
+        key(PropertyValue::Timestamp(start)),
+        encode_temporal_edgeprop_key("ASSERTS", NodeId::from_raw(1), NodeId::from_raw(2), start)
+    );
+}
+
 #[test]
 fn unsupported_discriminator_type_is_none() {
     assert!(encode_discriminator_value(&PropertyValue::Null).is_none());
