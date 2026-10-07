@@ -135,6 +135,41 @@ fn a_unique_backfill_stops_at_a_duplicate() {
     );
 }
 
+/// A page whose repairs never end its duplicate (each one runs, and the page
+/// read again still holds the same two values) is refused once it has used
+/// the repairs a page may need, instead of repairing forever.
+#[test]
+fn a_page_whose_repairs_never_end_its_duplicate_is_refused() {
+    let mut fx = fixture();
+    put_node(&mut fx, 1, "User", &email("same@x"));
+    put_node(&mut fx, 2, "User", &email("same@x"));
+    let index = bound(crate::index::IndexDescriptor::btree("user_email", "User", "email").unique());
+    let calls = std::cell::Cell::new(0usize);
+    let run = |node: NodeId, value: Option<&Value>| {
+        assert_eq!(node, NodeId::from_raw(2));
+        assert_eq!(value, Some(&Value::String("same@x".into())));
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+
+    let err = Backfill {
+        repair: Some(DuplicateRepairer {
+            property: "email",
+            run: &run,
+        }),
+        ..backfill(&fx)
+    }
+    .run(&index, &mut commit)
+    .expect_err("the duplicate never ends");
+
+    assert!(matches!(err, BackfillError::Contended), "{err:?}");
+    assert_eq!(calls.get(), MAX_PAGE_REPAIRS, "bounded, then refused");
+    assert!(
+        lookup(&fx, &index, "same@x").is_empty(),
+        "the page committed nothing"
+    );
+}
+
 /// A sparse index skips a node missing the property.
 #[test]
 fn a_sparse_backfill_skips_missing_values() {
