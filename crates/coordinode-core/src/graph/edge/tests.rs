@@ -612,13 +612,38 @@ fn discriminator_bool_roundtrips() {
     }
 }
 
+/// A BLOB discriminator is identified by its complete value: two values that
+/// differ anywhere, including ones a digest would map alike, never share a
+/// key, and the key gives the value back.
 #[test]
-fn discriminator_blob_is_sha256_digest() {
-    let bytes = encode_discriminator_value(&PropertyValue::Blob(vec![1, 2, 3])).expect("blob");
-    assert_eq!(bytes.len(), 32);
-    // One-way: decodes to the digest, not the original blob bytes.
-    let back = decode_discriminator_value(&bytes, &PropertyType::Blob).expect("decode");
-    assert_eq!(back, PropertyValue::Blob(bytes));
+fn discriminator_blob_is_its_complete_value() {
+    let a = PropertyValue::Blob(vec![1, 2, 3]);
+    let b = PropertyValue::Blob(vec![1, 2, 3, 0]);
+    let ka = encode_discriminator_value(&a).expect("blob");
+    let kb = encode_discriminator_value(&b).expect("blob");
+    assert_ne!(ka, kb);
+    assert_eq!(
+        decode_discriminator_value(&ka, &PropertyType::Blob).expect("decode"),
+        a
+    );
+    assert_eq!(
+        decode_discriminator_value(&kb, &PropertyType::Blob).expect("decode"),
+        b
+    );
+}
+
+/// FLOAT identity follows `=`: negative and positive zero are one value and
+/// share one key; NaN, equal to nothing, cannot identify an instance.
+#[test]
+fn discriminator_float_identity_follows_equality() {
+    let zero = encode_discriminator_value(&PropertyValue::Float(0.0)).expect("zero");
+    let negative_zero = encode_discriminator_value(&PropertyValue::Float(-0.0)).expect("-zero");
+    assert_eq!(zero, negative_zero);
+    assert!(encode_discriminator_value(&PropertyValue::Float(f64::NAN)).is_none());
+    assert_eq!(
+        decode_discriminator_value(&negative_zero, &PropertyType::Float).expect("decode"),
+        PropertyValue::Float(0.0)
+    );
 }
 
 #[test]

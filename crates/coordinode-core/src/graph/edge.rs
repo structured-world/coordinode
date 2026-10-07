@@ -311,32 +311,33 @@ pub(crate) fn decode_f64_sortable(bytes: [u8; 8]) -> f64 {
 ///
 /// Supported discriminator types: `Int` / `Timestamp` (8-byte sign-flipped BE,
 /// byte-identical to temporal `valid_from`), `Float` (8-byte sortable), `Bool`
-/// (1 byte), `String` (raw UTF-8) and `Blob` (32-byte SHA-256 of the blob bytes).
-/// `String` uses raw UTF-8, not a length prefix: the discriminator is the last key
-/// component (so the encoding is unambiguous without one) and raw UTF-8 keeps
-/// byte-order == value-order, which the planner relies on for range push-down on
-/// the discriminator column. Returns `None` for any other (unsupported) `Value`.
+/// (1 byte), `String` (raw UTF-8) and `Blob` (the serialized blob reference).
+/// Every encoding is the complete value, so two keys are equal exactly when the
+/// values are equal; no digest stands in for a value. `String` and `Blob` carry
+/// no length prefix: the discriminator is the last key component (so the
+/// encoding is unambiguous without one) and raw bytes keep byte-order ==
+/// value-order, which the planner relies on for range push-down on the
+/// discriminator column. `Float` negative zero is positive zero, as `=` has it;
+/// NaN, equal to nothing, identifies nothing. Returns `None` for NaN and for
+/// any other (unsupported) `Value`.
 pub fn encode_discriminator_value(value: &PropertyValue) -> Option<Vec<u8>> {
     match value {
         PropertyValue::Int(v) | PropertyValue::Timestamp(v) => {
             Some(encode_valid_from_sortable(*v).to_vec())
         }
-        PropertyValue::Float(f) => Some(encode_f64_sortable(*f).to_vec()),
+        PropertyValue::Float(f) if f.is_nan() => None,
+        // `-0.0 + 0.0` is `+0.0`: one key for the two zeros `=` equates.
+        PropertyValue::Float(f) => Some(encode_f64_sortable(*f + 0.0).to_vec()),
         PropertyValue::Bool(b) => Some(vec![u8::from(*b)]),
         PropertyValue::String(s) => Some(s.as_bytes().to_vec()),
-        PropertyValue::Blob(bytes) => {
-            use sha2::{Digest, Sha256};
-            Some(Sha256::digest(bytes).to_vec())
-        }
+        PropertyValue::Blob(reference) => Some(reference.clone()),
         _ => None,
     }
 }
 
 /// Decode a discriminator key suffix back into a `Value`, given the declared
 /// discriminator [`PropertyType`] (read from the edge type schema by the caller —
-/// the store stays schema-agnostic). `Blob` is one-way (the suffix is a SHA-256,
-/// not the original bytes); it decodes to `Value::Blob(<32-byte digest>)`,
-/// sufficient for equality but not for recovering the original blob.
+/// the store stays schema-agnostic).
 pub fn decode_discriminator_value(bytes: &[u8], kind: &PropertyType) -> Option<PropertyValue> {
     match kind {
         PropertyType::Int => Some(PropertyValue::Int(decode_valid_from_sortable(
