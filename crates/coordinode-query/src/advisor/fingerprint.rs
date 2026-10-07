@@ -413,6 +413,11 @@ fn write_clause(buf: &mut String, clause: &Clause) {
                 }
                 buf.push(')');
             }
+            if let Some(column) = &c.discriminated_by {
+                buf.push_str(" DISCRIMINATED BY (");
+                buf.push_str(column);
+                buf.push(')');
+            }
         }
         Clause::CreateNodeType(c) => {
             buf.push_str("CREATE NODE TYPE ");

@@ -1,6 +1,25 @@
 use super::*;
 use crate::cypher::parse;
 
+/// Edge type DDL that differs only in what identifies an edge is two
+/// statements, not one: the discriminator is part of the normalized form.
+#[test]
+fn an_edge_type_discriminator_is_part_of_the_fingerprint() {
+    let form = |text: &str| normalize(&parse(text).expect("parse"));
+    let single = form("CREATE EDGE TYPE K WITH (c: STRING NOT NULL)");
+    let discriminated = form("CREATE EDGE TYPE K WITH (c: STRING NOT NULL) DISCRIMINATED BY (c)");
+    assert_ne!(single, discriminated);
+    assert!(
+        discriminated.contains("DISCRIMINATED BY (c)"),
+        "{discriminated}"
+    );
+    assert_eq!(
+        discriminated,
+        form("CREATE EDGE TYPE K DISCRIMINATED BY (c) WITH (c: STRING NOT NULL)"),
+        "the clause position is not a difference"
+    );
+}
+
 /// Normalization replaces literal values with `$` placeholder.
 #[test]
 fn normalize_strips_literals() {

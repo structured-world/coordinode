@@ -273,6 +273,24 @@ fn remove_property() {
 
 // -- EXPLAIN output --
 
+/// EXPLAIN of edge type DDL shows what identifies an edge, and shows
+/// nothing for a type naming no discriminator.
+#[test]
+fn explain_create_edge_type_shows_its_discriminator() {
+    let discriminated =
+        plan("CREATE EDGE TYPE K TEMPORAL DISCRIMINATED BY (c) WITH (c: STRING NOT NULL)")
+            .explain();
+    assert!(
+        discriminated.contains("CreateEdgeType(K TEMPORAL DISCRIMINATED BY (c), props=1)"),
+        "{discriminated}"
+    );
+    let plain = plan("CREATE EDGE TYPE K TEMPORAL").explain();
+    assert!(
+        plain.contains("CreateEdgeType(K TEMPORAL, props=0)"),
+        "{plain}"
+    );
+}
+
 #[test]
 fn explain_simple() {
     let p = plan("MATCH (n:User) RETURN n");
