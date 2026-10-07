@@ -469,6 +469,7 @@ fn flexible_with(constraints: &[(&str, &[&str], ConstraintKind)]) -> LabelSchema
             properties: properties.iter().map(|p| p.to_string()).collect(),
             kind: kind.clone(),
             state: ConstraintState::Active,
+            scope: None,
         });
     }
     schema

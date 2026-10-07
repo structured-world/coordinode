@@ -173,8 +173,10 @@ fn generate_input_types(label: &LabelSchema) -> String {
 }
 
 /// The declared properties that alone identify a node of `label`: each is the
-/// whole of a `UNIQUE` or `NODE KEY` constraint, so one value finds at most
-/// one node. A property only part of a composite key identifies nothing alone.
+/// whole of a `UNIQUE` or `NODE KEY` constraint over every node of the label,
+/// so one value finds at most one node. A property only part of a composite
+/// key, or unique only among the nodes a predicate admits, identifies
+/// nothing alone.
 fn unique_key_properties(
     label: &LabelSchema,
 ) -> Vec<(&String, &coordinode_core::schema::definition::PropertyDef)> {
@@ -185,6 +187,7 @@ fn unique_key_properties(
         .filter(|(name, _)| {
             label.constraints().iter().any(|c| {
                 matches!(c.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
+                    && c.scope.is_none()
                     && c.properties.len() == 1
                     && &c.properties[0] == *name
             })

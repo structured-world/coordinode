@@ -745,6 +745,7 @@ fn an_interrupted_validation_over_duplicates_is_withdrawn_on_open() {
             properties: vec!["email".into()],
             kind: ConstraintKind::Unique,
             state: ConstraintState::Validating,
+            scope: None,
         });
         LocalSchemaStore::new(db.engine())
             .save_label(&schema)
@@ -1256,18 +1257,73 @@ fn create_unique_index_keeps_its_stated_options() {
     assert_eq!(def.owner.as_deref(), Some("user_email"));
 }
 
-/// A partial unique index requires uniqueness only among the nodes its
-/// filter admits, which a constraint cannot state: it stays an index.
+/// A partial unique index declares a uniqueness among the nodes its filter
+/// admits: it is listed as a constraint with that scope, owning the index,
+/// so the catalog shows every uniqueness the engine enforces. Only nodes in
+/// scope are compared; the index goes with the constraint, never alone; a
+/// constraint over the same property for every node is a different one.
 #[test]
-fn a_partial_unique_index_stays_an_index() {
+fn a_partial_unique_index_is_a_scoped_constraint_owning_it() {
+    use coordinode_query::index::definition::PartialFilter;
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE UNIQUE INDEX active_email ON :User(email) WHERE n.active = true")
         .expect("partial unique index");
-    assert!(db.constraints().expect("constraints").is_empty());
-    assert_eq!(index_owner(&db, "active_email"), None);
+    let listed = db.constraints().expect("constraints");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].constraint.name, "active_email");
+    assert_eq!(listed[0].constraint.kind, ConstraintKind::Unique);
+    assert_eq!(listed[0].constraint.state, ConstraintState::Active);
+    assert_eq!(
+        listed[0].constraint.scope,
+        Some(PartialFilter::PropertyEqualsBool {
+            property: "active".into(),
+            value: true,
+        })
+    );
+    assert_eq!(listed[0].backing_index.as_deref(), Some("active_email"));
+    assert_eq!(
+        index_owner(&db, "active_email").as_deref(),
+        Some("active_email")
+    );
+
     db.execute_cypher("CREATE (:User {email: 'a@x', active: true})")
         .expect("first active");
     db.execute_cypher("CREATE (:User {email: 'a@x', active: false})")
-        .expect("an inactive node is outside the filter");
+        .expect("an inactive node is outside the scope");
     expect_unique_violation(db.execute_cypher("CREATE (:User {email: 'a@x', active: true})"));
+
+    let drop_index = db
+        .execute_cypher("DROP INDEX active_email")
+        .expect_err("the index belongs to its constraint");
+    assert!(
+        drop_index.to_string().contains("drop the constraint"),
+        "{drop_index}"
+    );
+    // Every node, not only the active ones: a different requirement.
+    db.execute_cypher("CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.email IS UNIQUE")
+        .expect_err("the stored inactive duplicate breaks the label-wide uniqueness");
+    db.execute_cypher("DROP CONSTRAINT active_email")
+        .expect("drop with its index");
+    assert!(db.constraints().expect("constraints").is_empty());
+    assert!(super::helpers::index_named(db.engine(), "active_email").is_none());
+    db.execute_cypher("CREATE (:User {email: 'a@x', active: true})")
+        .expect("nothing constrains the value any more");
+}
+
+/// A partial index scoped by a predicate it cannot hold is refused, never
+/// built over every node instead.
+#[test]
+fn a_partial_index_with_an_unsupported_predicate_is_refused() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE (:User {email: 'a@x', age: 3})")
+        .expect("seed");
+    for statement in [
+        "CREATE UNIQUE INDEX adult_email ON :User(email) WHERE n.age > 17",
+        "CREATE INDEX adult_email ON :User(email) WHERE n.age > 17",
+    ] {
+        let error = db.execute_cypher(statement).expect_err(statement);
+        assert!(error.to_string().contains("WHERE supports only"), "{error}");
+    }
+    assert!(db.constraints().expect("constraints").is_empty());
+    assert!(super::helpers::index_named(db.engine(), "adult_email").is_none());
 }

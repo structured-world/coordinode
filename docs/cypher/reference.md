@@ -336,8 +336,13 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   maintenance options the statement states. It is listed with the other
   constraints, a `CREATE CONSTRAINT ... IF NOT EXISTS` over the same property
   finds it instead of building a second index, `DROP INDEX` refuses it and
-  `DROP CONSTRAINT` removes both. A partial unique index (`WHERE`) stays an
-  index of its own, since a constraint has no filter.
+  `DROP CONSTRAINT` removes both. A partial unique index (`WHERE`) is the
+  uniqueness among the nodes its predicate admits: the constraint carries the
+  predicate as its scope (listed in the `scope` column, gRPC
+  `Constraint.scope`), only nodes in scope are compared, and a uniqueness over
+  every node of the label is a different constraint. The predicate is one of
+  `n.prop = <string | integer | boolean literal>` or `n.prop IS NOT NULL`;
+  any other `WHERE` is refused, never widened to every node.
 - **Building.** `CREATE INDEX` publishes the index and admits its build in one
   commit, then waits for the build, which indexes the nodes already stored,
   and returns once the index is ready. The build runs on the engine, not on

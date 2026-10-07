@@ -22,6 +22,7 @@ fn require_unique(db: &Database, label: &str, property: &str) {
         if_not_exists: false,
         wait: None,
         on_duplicate_rename: None,
+        scope: None,
     })
     .expect("create the uniqueness constraint");
 }

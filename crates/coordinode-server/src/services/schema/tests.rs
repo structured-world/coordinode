@@ -54,6 +54,7 @@ fn unique(name: &str, label: &str, property: &str) -> schema::CreateConstraintRe
         if_not_exists: false,
         wait: None,
         on_duplicate_rename: String::new(),
+        scope: None,
     }
 }
 
@@ -510,6 +511,51 @@ async fn a_constraint_build_repairs_a_duplicate_and_lists_it() {
         .create_constraint(Request::new(wrong))
         .await
         .expect_err("not a covered property");
+    assert_eq!(reason(&refused), "CATALOG_CHANGE_REFUSED");
+}
+
+/// A uniqueness declared with a scope holds only among the nodes it admits:
+/// it is listed with the scope, enforced inside it and not outside, and a
+/// scope on a constraint other than UNIQUE is refused.
+#[tokio::test]
+async fn a_scoped_uniqueness_is_declared_listed_and_enforced_in_scope() {
+    let (svc, _dir) = test_service();
+    let scope = schema::ConstraintScope {
+        property: "active".into(),
+        test: Some(schema::constraint_scope::Test::EqualsBool(true)),
+    };
+    let mut request = unique("active_email", "Customer", "email");
+    request.scope = Some(scope.clone());
+    let created = svc
+        .create_constraint(Request::new(request))
+        .await
+        .expect("scoped uniqueness")
+        .into_inner();
+    assert_eq!(created.scope, Some(scope));
+
+    {
+        let mut db = svc.database.write();
+        db.execute_cypher("CREATE (:Customer {email: 'a@x', active: true})")
+            .expect("first in scope");
+        db.execute_cypher("CREATE (:Customer {email: 'a@x', active: false})")
+            .expect("out of scope");
+        assert!(
+            db.execute_cypher("CREATE (:Customer {email: 'a@x', active: true})")
+                .is_err(),
+            "a second holder in scope is refused"
+        );
+    }
+
+    let mut not_null = unique("c", "Customer", "email");
+    not_null.kind = schema::ConstraintKind::NotNull as i32;
+    not_null.scope = Some(schema::ConstraintScope {
+        property: "active".into(),
+        test: Some(schema::constraint_scope::Test::Present(())),
+    });
+    let refused = svc
+        .create_constraint(Request::new(not_null))
+        .await
+        .expect_err("only a uniqueness takes a scope");
     assert_eq!(reason(&refused), "CATALOG_CHANGE_REFUSED");
 }
 

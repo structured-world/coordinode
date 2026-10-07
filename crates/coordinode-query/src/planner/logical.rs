@@ -487,6 +487,9 @@ pub enum LogicalOp {
         /// `ON DUPLICATE RENAME n.prop`: the property the build of the owned
         /// index may change to repair a stored duplicate.
         on_duplicate_rename: Option<String>,
+        /// For a uniqueness, the nodes it holds among; `None` for every
+        /// node of the label.
+        scope: Option<crate::index::definition::PartialFilter>,
     },
 
     /// `DROP CONSTRAINT`: remove a constraint, and the index it owns.

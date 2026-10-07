@@ -574,6 +574,7 @@ fn constraint(name: &str, properties: &[&str], kind: ConstraintKind) -> NodeCons
         properties: properties.iter().map(|p| p.to_string()).collect(),
         kind,
         state: ConstraintState::Active,
+        scope: None,
     }
 }
 

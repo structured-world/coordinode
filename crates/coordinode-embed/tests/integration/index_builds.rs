@@ -500,6 +500,7 @@ fn email_constraint(wait: Duration, if_not_exists: bool) -> ConstraintDeclaratio
         if_not_exists,
         wait: Some(wait),
         on_duplicate_rename: None,
+        scope: None,
     }
 }
 

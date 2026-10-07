@@ -170,6 +170,7 @@ async fn types_and_constraints_are_created_and_inspected_apart() {
             if_not_exists: false,
             wait: None,
             on_duplicate_rename: String::new(),
+            scope: None,
         })
         .await
         .expect("create constraint")

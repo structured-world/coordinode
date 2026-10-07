@@ -87,6 +87,12 @@ pub enum PlanError {
 
     #[error("failed to encode extension-op payload: {0}")]
     ExtensionPayloadEncode(String),
+
+    #[error(
+        "CREATE INDEX ... WHERE supports only `n.prop = <string | integer | boolean literal>` \
+         and `n.prop IS NOT NULL`"
+    )]
+    UnsupportedIndexFilter,
 }
 
 /// Build the optimized logical root for a single query branch (one clause
@@ -761,7 +767,15 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             name: c.name.clone(),
         }),
         Clause::CreateIndex(c) => {
-            let filter = c.filter_expr.as_ref().and_then(expr_to_partial_filter);
+            // A predicate the index cannot hold is refused: building the
+            // index over every node instead would index, and for a unique
+            // index constrain, nodes the statement left out.
+            let filter = match &c.filter_expr {
+                Some(expr) => {
+                    Some(expr_to_partial_filter(expr).ok_or(PlanError::UnsupportedIndexFilter)?)
+                }
+                None => None,
+            };
             Ok(LogicalOp::CreateIndex {
                 name: c.name.clone(),
                 label: c.label.clone(),
@@ -784,6 +798,7 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
             kind: c.kind.clone(),
             wait: None,
             on_duplicate_rename: c.on_duplicate_rename.clone(),
+            scope: None,
         }),
         Clause::DropConstraint(c) => Ok(LogicalOp::DropConstraint {
             name: c.name.clone(),

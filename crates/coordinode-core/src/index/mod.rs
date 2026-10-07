@@ -8,4 +8,5 @@
 
 pub mod derive;
 pub mod encoding;
+pub mod filter;
 pub mod identity;

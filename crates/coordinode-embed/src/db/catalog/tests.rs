@@ -24,6 +24,7 @@ fn declare(name: &str, property: &str, kind: ConstraintKind) -> ConstraintDeclar
         if_not_exists: false,
         wait: None,
         on_duplicate_rename: None,
+        scope: None,
     }
 }
 
@@ -236,6 +237,7 @@ fn a_definition_carrying_constraints_or_defined_twice_is_refused() {
         properties: vec!["email".into()],
         kind: ConstraintKind::Unique,
         state: ConstraintState::Active,
+        scope: None,
     });
     assert!(matches!(
         catalog_error(db.create_label_schema(carrying).unwrap_err()),

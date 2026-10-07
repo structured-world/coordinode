@@ -418,6 +418,10 @@ pub struct NodeConstraint {
     pub kind: ConstraintKind,
     /// Where it is in its life.
     pub state: ConstraintState,
+    /// The nodes it constrains, when not every node of the label: a
+    /// uniqueness declared by a partial unique index holds only among the
+    /// nodes its predicate admits, and the index it owns has that filter.
+    pub scope: Option<crate::index::filter::PartialFilter>,
 }
 
 impl NodeConstraint {
@@ -437,9 +441,10 @@ impl NodeConstraint {
         !matches!(self.kind, ConstraintKind::Unique)
     }
 
-    /// Whether `other` requires the same thing of the same properties.
+    /// Whether `other` requires the same thing of the same properties of
+    /// the same nodes.
     pub fn same_requirement(&self, other: &NodeConstraint) -> bool {
-        self.kind == other.kind && self.properties == other.properties
+        self.kind == other.kind && self.properties == other.properties && self.scope == other.scope
     }
 }
 

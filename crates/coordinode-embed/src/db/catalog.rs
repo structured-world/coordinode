@@ -45,6 +45,10 @@ pub struct ConstraintDeclaration {
     /// string property of one holder, recording each repair. `None` fails
     /// the build on the first duplicate.
     pub on_duplicate_rename: Option<String>,
+    /// For a uniqueness, the nodes it holds among: only nodes the predicate
+    /// admits are compared, and the index it owns holds only them. `None`
+    /// constrains every node of the label.
+    pub scope: Option<coordinode_query::index::definition::PartialFilter>,
 }
 
 /// A constraint as the catalog holds it.
@@ -334,6 +338,7 @@ impl Database {
             if_not_exists,
             wait,
             on_duplicate_rename,
+            scope,
         } = declaration;
         let rows = self.run_catalog_statement(LogicalOp::CreateConstraint {
             name,
@@ -343,6 +348,7 @@ impl Database {
             kind,
             wait,
             on_duplicate_rename,
+            scope,
         })?;
         let created = rows
             .first()

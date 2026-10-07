@@ -4217,6 +4217,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             kind,
             wait,
             on_duplicate_rename,
+            scope,
         } => execute_create_constraint(
             name.as_deref(),
             *if_not_exists,
@@ -4226,6 +4227,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             OwnedIndexShape {
                 wait: *wait,
                 on_duplicate_rename: on_duplicate_rename.clone(),
+                scope: scope.clone(),
                 ..OwnedIndexShape::default()
             },
             ctx,
@@ -17335,9 +17337,9 @@ fn execute_create_btree_index(
     // A unique index declares the invariant a uniqueness constraint does, so
     // it is that constraint, owning the index: the constraint catalog shows
     // every uniqueness the engine enforces, and a constraint declared later
-    // over the same property finds it. A partial index stays an index: a
-    // constraint has no filter.
-    if unique && filter.is_none() {
+    // over the same property finds it. A partial one is a uniqueness among
+    // the nodes its predicate admits: the constraint carries that scope.
+    if unique {
         let constrained = execute_create_constraint(
             Some(name),
             false,
@@ -17349,6 +17351,7 @@ fn execute_create_btree_index(
                 maintenance,
                 wait: None,
                 on_duplicate_rename: on_duplicate_rename.map(str::to_string),
+                scope: filter.cloned(),
             },
             ctx,
         )?;
@@ -17379,24 +17382,13 @@ fn execute_create_btree_index(
         return Ok(vec![row]);
     }
     let mut descriptor = crate::index::IndexDescriptor::btree(name, label, property);
-    if unique {
-        descriptor = descriptor.unique();
-    }
     if sparse {
         descriptor = descriptor.sparse();
     }
     if let Some(f) = filter {
         descriptor = descriptor.with_filter(f.clone());
     }
-    let repair = duplicate_repair(on_duplicate_rename, label, &[property.to_string()], ctx)?;
-    let engine = ctx.engine;
-    let def = publish_index_build(descriptor, maintenance, repair, ctx, |txn| {
-        if unique {
-            stage_label_fence(engine, txn, label)
-        } else {
-            Ok(())
-        }
-    });
+    let def = publish_index_build(descriptor, maintenance, None, ctx, |_| Ok(()));
     ctx.label_schema_cache.remove(label);
     let def = def?;
     let waited = await_index_build(&def, None, ctx)?;
@@ -17405,7 +17397,7 @@ fn execute_create_btree_index(
     row.insert("index".to_string(), Value::String(name.to_string()));
     row.insert("label".to_string(), Value::String(label.to_string()));
     row.insert("property".to_string(), Value::String(property.to_string()));
-    row.insert("unique".to_string(), Value::Bool(unique));
+    row.insert("unique".to_string(), Value::Bool(false));
     row.insert("sparse".to_string(), Value::Bool(sparse));
     insert_build(&mut row, &def, waited);
     row.insert("state".to_string(), index_state(waited));
@@ -17860,6 +17852,13 @@ fn constraint_row(
         "state".to_string(),
         Value::String(constraint.state.to_string()),
     );
+    row.insert(
+        "scope".to_string(),
+        constraint
+            .scope
+            .as_ref()
+            .map_or(Value::Null, |s| Value::String(s.to_string())),
+    );
     row.insert(changed.0.to_string(), Value::Bool(changed.1));
     row
 }
@@ -17879,6 +17878,9 @@ struct OwnedIndexShape {
     /// `ON DUPLICATE RENAME prop`: the property the build may change to
     /// repair a stored duplicate.
     on_duplicate_rename: Option<String>,
+    /// The nodes a uniqueness holds among (`CREATE UNIQUE INDEX ... WHERE`):
+    /// the constraint's scope and the filter of the index it owns.
+    scope: Option<crate::index::definition::PartialFilter>,
 }
 
 /// The build operation of the index constraint `name` owns while it is
@@ -17928,7 +17930,16 @@ fn execute_create_constraint(
         properties: properties.to_vec(),
         kind: kind.clone(),
         state: ConstraintState::Validating,
+        scope: shape.scope.clone(),
     };
+    // A scope narrows which nodes are compared with each other; a key also
+    // requires its values of every node, which a scope cannot narrow.
+    if constraint.scope.is_some() && constraint.kind != ConstraintKind::Unique {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "only a uniqueness can hold among the nodes a predicate admits, not an IS {kind} \
+             constraint"
+        )));
+    }
     if shape.on_duplicate_rename.is_some() && !constraint.owns_index() {
         return Err(ExecutionError::CatalogRefused(format!(
             "ON DUPLICATE RENAME repairs duplicates of a UNIQUE or NODE KEY constraint, not of \
@@ -18079,6 +18090,9 @@ fn execute_create_constraint(
     {
         descriptor = descriptor.sparse();
     }
+    if let Some(scope) = &constraint.scope {
+        descriptor = descriptor.with_filter(scope.clone());
+    }
     let def = publish_index_build(
         descriptor,
         shape.maintenance,
@@ -18162,39 +18176,6 @@ pub fn stage_constraint_withdrawal(
         }
     }
     store.release_constraint_name_txn(txn, name)
-}
-
-/// Stage a new revision of `label`'s schema that requires nothing new of a
-/// node, so a writer that read the current one is refused at its commit. A
-/// unique index without a constraint publishes with it: a writer validated
-/// before the index existed keeps no entry of it and states no claim on its
-/// values, so it could take a value another node takes meanwhile.
-///
-/// # Errors
-///
-/// The schema could not be read or staged.
-fn stage_label_fence(
-    engine: &StorageEngine,
-    txn: &mut coordinode_storage::engine::transaction::Transaction<'_>,
-    label: &str,
-) -> Result<(), coordinode_modality::StoreError> {
-    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-    let store = LocalSchemaStore::new(engine);
-    let next = match store.load_label_for_update_txn(txn, label)? {
-        Some(mut schema) => {
-            schema.schema_revision = next_revision(&schema).map_err(store_error)?;
-            schema
-        }
-        // A label without a schema is enforced as FLEXIBLE, which the schema
-        // created here keeps; a writer that read the absence is refused by
-        // its appearance.
-        None => {
-            let mut schema = LabelSchema::new_node_id(label);
-            schema.set_mode(SchemaMode::Flexible);
-            schema
-        }
-    };
-    store.save_label_admitting_txn(txn, &next)
 }
 
 /// The revision a change of `schema` is published at.

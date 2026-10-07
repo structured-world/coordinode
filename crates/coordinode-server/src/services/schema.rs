@@ -21,6 +21,7 @@ use coordinode_core::schema::definition::{
     SchemaMode,
 };
 use coordinode_embed::{ConstraintDeclaration, Database, LabelConstraint};
+use coordinode_query::index::definition::PartialFilter;
 use coordinode_query::index::{BuildPhase, BuildState, BuildStatus, GenerationId};
 
 use crate::proto::v1::query::DistanceMetric;
@@ -437,6 +438,46 @@ fn operation_from_proto(operation: Option<u64>) -> Result<GenerationId, Status> 
         .ok_or_else(|| invalid_field("operation", "an operation is required"))
 }
 
+/// A constraint's scope as the wire shows it.
+fn scope_to_proto(scope: &PartialFilter) -> schema::ConstraintScope {
+    use schema::constraint_scope::Test;
+    let (property, test) = match scope {
+        PartialFilter::PropertyEquals { property, value } => {
+            (property, Test::EqualsString(value.clone()))
+        }
+        PartialFilter::PropertyEqualsInt { property, value } => (property, Test::EqualsInt(*value)),
+        PartialFilter::PropertyEqualsBool { property, value } => {
+            (property, Test::EqualsBool(*value))
+        }
+        PartialFilter::PropertyExists { property } => (property, Test::Present(())),
+    };
+    schema::ConstraintScope {
+        property: property.clone(),
+        test: Some(test),
+    }
+}
+
+/// The scope a request declares, refusing one without a property or a test.
+fn scope_from_proto(
+    scope: Option<schema::ConstraintScope>,
+) -> Result<Option<PartialFilter>, Status> {
+    use schema::constraint_scope::Test;
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    if scope.property.is_empty() {
+        return Err(invalid_field("scope.property", "a property is required"));
+    }
+    let property = scope.property;
+    Ok(Some(match scope.test {
+        Some(Test::EqualsString(value)) => PartialFilter::PropertyEquals { property, value },
+        Some(Test::EqualsInt(value)) => PartialFilter::PropertyEqualsInt { property, value },
+        Some(Test::EqualsBool(value)) => PartialFilter::PropertyEqualsBool { property, value },
+        Some(Test::Present(())) => PartialFilter::PropertyExists { property },
+        None => return Err(invalid_field("scope.test", "a test is required")),
+    }))
+}
+
 fn constraint_to_proto(c: &LabelConstraint, build: Option<&BuildStatus>) -> schema::Constraint {
     use schema::ConstraintKind as K;
     let (kind, property_type) = match &c.constraint.kind {
@@ -457,6 +498,7 @@ fn constraint_to_proto(c: &LabelConstraint, build: Option<&BuildStatus>) -> sche
         } as i32,
         backing_index: c.backing_index.clone().unwrap_or_default(),
         build: build.map(build_to_proto),
+        scope: c.constraint.scope.as_ref().map(scope_to_proto),
     }
 }
 
@@ -534,6 +576,7 @@ fn declaration_from_proto(
         K::Unique | K::Unspecified => ConstraintKind::Unique,
     };
     Ok(ConstraintDeclaration {
+        scope: scope_from_proto(req.scope)?,
         wait: wait_from_proto("wait", req.wait)?,
         on_duplicate_rename: (!req.on_duplicate_rename.is_empty())
             .then_some(req.on_duplicate_rename),

@@ -83,6 +83,7 @@ async fn require_unique(proc: &CoordinodeProcess, label: &str, property: &str) {
             if_not_exists: false,
             wait: None,
             on_duplicate_rename: String::new(),
+            scope: None,
         })
         .await
         .expect("create_constraint");
