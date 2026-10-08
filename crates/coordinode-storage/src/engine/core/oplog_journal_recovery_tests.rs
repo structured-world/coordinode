@@ -611,6 +611,162 @@ fn recovery_twice_in_a_row_applies_each_merge_once() {
     }
 }
 
+/// Applies a commit's proposal the way the embedded pipeline does: journaled,
+/// then applied at its timestamp.
+struct JournaledPipeline<'e>(&'e StorageEngine);
+
+impl coordinode_core::txn::proposal::ProposalPipeline for JournaledPipeline<'_> {
+    fn propose_and_wait(
+        &self,
+        proposal: &coordinode_core::txn::proposal::RaftProposal,
+    ) -> Result<
+        coordinode_core::txn::proposal::ProposalOutcome,
+        coordinode_core::txn::proposal::ProposalError,
+    > {
+        self.0
+            .commit_journaled(&proposal.mutations, proposal.commit_ts.as_raw())
+            .map(|()| coordinode_core::txn::proposal::ProposalOutcome::local())
+            .map_err(|e| coordinode_core::txn::proposal::ProposalError::Storage(e.to_string()))
+    }
+}
+
+#[test]
+fn kept_cardinality_counts_are_replayed_once_after_a_power_cut() {
+    // Committed edges whose count changes reached only the journal come back
+    // with their counts, once: a count replayed twice, or not at all, would
+    // decide every later bound over the node from a wrong number.
+    use crate::engine::transaction::{CommitContext, CommitError, Transaction};
+    use coordinode_core::graph::cardinality::{
+        CardinalityBound, CardinalityDescriptor, CardinalityMeasure, Direction,
+        encode_cardinality_profile_key,
+    };
+    use coordinode_core::graph::edge::{encode_adj_key_forward, encode_adj_key_reverse};
+    use coordinode_core::graph::node::NodeId;
+    use coordinode_core::schema::definition::{
+        EdgeTypeSchema, encode_edge_type_current_revision_key, encode_edge_type_schema_key,
+    };
+    use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, CountTrend};
+    use coordinode_core::txn::timestamp::Timestamp;
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    let d = CardinalityDescriptor {
+        edge_type: "OWNS".into(),
+        direction: Direction::Outgoing,
+        measure: CardinalityMeasure::DistinctNeighbours,
+        bound: CardinalityBound::AtMostOne,
+        schema_generation: 1,
+    };
+    let wc = WriteConcern::default();
+    let commit = |engine: &StorageEngine, txn: &mut Transaction<'_>| -> Result<(), CommitError> {
+        let pipeline = JournaledPipeline(engine);
+        let ctx = CommitContext {
+            write_concern: &wc,
+            pipeline: Some(&pipeline),
+            id_gen: None,
+            drain_buffer: None,
+            nvme_write_buffer: None,
+        };
+        txn.commit(&ctx).map(|_| ())
+    };
+    /// A transaction deciding node 1's AT MOST ONE.
+    fn begin<'a>(engine: &'a StorageEngine, oracle: &'a TimestampOracle) -> Transaction<'a> {
+        let snap = engine.snapshot();
+        let mut txn = Transaction::new(engine, Some(oracle), Timestamp::from_raw(snap), Some(snap));
+        txn.claim(Claim::new(
+            ClaimScope::Incident {
+                node: NodeId::from_raw(1),
+                edge_type: "OWNS".to_string(),
+                direction: Direction::Outgoing,
+            },
+            ClaimPredicate::CardinalityBound {
+                measure: CardinalityMeasure::DistinctNeighbours,
+                bound: CardinalityBound::AtMostOne,
+                trend: CountTrend::Grows,
+            },
+            0,
+        ));
+        txn
+    }
+    let add = |txn: &mut Transaction<'_>, target: u64| {
+        txn.merge_adj_add(&encode_adj_key_forward("OWNS", NodeId::from_raw(1)), target);
+        txn.merge_adj_add(&encode_adj_key_reverse("OWNS", NodeId::from_raw(target)), 1);
+    };
+    let kept = |engine: &StorageEngine| {
+        engine
+            .get(Partition::Counter, &d.counter_key(NodeId::from_raw(1)))
+            .expect("read count")
+            .map(|bytes| crate::engine::merge::decode_counter(&bytes).expect("decode"))
+    };
+
+    let rig = PowerRig::new();
+    {
+        let (engine, oracle) = rig.open();
+        let mut schema = EdgeTypeSchema::new("OWNS");
+        schema.declare_cardinality(d.clone()).expect("declare");
+        let mut definition = Transaction::new(
+            &engine,
+            Some(&oracle),
+            Timestamp::from_raw(engine.snapshot()),
+            Some(engine.snapshot()),
+        );
+        for (key, value) in [
+            (
+                encode_edge_type_schema_key("OWNS", 1),
+                schema.to_msgpack().expect("encode"),
+            ),
+            (
+                encode_edge_type_current_revision_key("OWNS"),
+                1u64.to_be_bytes().to_vec(),
+            ),
+            (
+                encode_cardinality_profile_key("OWNS"),
+                schema
+                    .cardinality_profile()
+                    .expect("profile")
+                    .to_msgpack()
+                    .expect("encode"),
+            ),
+        ] {
+            definition
+                .put(Partition::Schema, &key, &value)
+                .expect("stage");
+        }
+        commit(&engine, &mut definition).expect("define");
+        let snap = engine.snapshot();
+        let mut cover = Transaction::new(
+            &engine,
+            Some(&oracle),
+            Timestamp::from_raw(snap),
+            Some(snap),
+        );
+        crate::engine::cardinality::rebuild(&mut cover, &d).expect("rebuild");
+        commit(&engine, &mut cover).expect("cover");
+        engine.persist().expect("persist the definition");
+
+        // The edge and its count change reach only the journal.
+        let mut first = begin(&engine, &oracle);
+        add(&mut first, 2);
+        commit(&engine, &mut first).expect("first edge");
+        assert_eq!(kept(&engine), Some(1));
+        rig.cut(engine);
+    }
+
+    for _ in 0..2 {
+        let (engine, oracle) = rig.open();
+        assert_eq!(kept(&engine), Some(1), "the count is back, once");
+        let mut second = begin(&engine, &oracle);
+        add(&mut second, 3);
+        assert!(
+            matches!(
+                commit(&engine, &mut second),
+                Err(CommitError::InvariantRefused { .. })
+            ),
+            "the recovered count still holds the bound"
+        );
+        rig.cut(engine);
+    }
+}
+
 #[test]
 fn late_finalized_point_and_range_batch_survives_a_crash() {
     // One entry carrying a range delete and a put, finalized behind a flushed
