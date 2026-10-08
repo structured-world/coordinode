@@ -310,6 +310,119 @@ fn every_entry_applied_across_a_build_reaches_the_index() {
     assert_eq!(indexed, expected);
 }
 
+/// A field dictionary that can be made unreadable, as a store that cannot be
+/// read for a while leaves it.
+struct FlakyFields {
+    inner: FixedFields,
+    failing: std::sync::atomic::AtomicBool,
+    /// How many times a view was asked for while failing.
+    refused: std::sync::atomic::AtomicUsize,
+}
+
+impl FieldRegistrar for FlakyFields {
+    fn register(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<u32>, coordinode_core::graph::intern::DictionaryError> {
+        self.inner.register(names)
+    }
+
+    fn adopt(
+        &self,
+        bindings: &coordinode_core::graph::intern::FieldInterner,
+    ) -> Result<(), coordinode_core::graph::intern::DictionaryError> {
+        self.inner.adopt(bindings)
+    }
+
+    fn view(
+        &self,
+    ) -> Result<
+        coordinode_core::graph::intern::FieldInterner,
+        coordinode_core::graph::intern::DictionaryError,
+    > {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.failing.load(SeqCst) {
+            self.refused.fetch_add(1, SeqCst);
+            return Err(
+                coordinode_core::graph::intern::DictionaryError::Registration("unavailable".into()),
+            );
+        }
+        self.inner.view()
+    }
+}
+
+/// A round the worker could neither fold nor rebuild advances nothing: not
+/// the freshness watermark, and not the released position when a later
+/// round folds, which would release the failed events with its own and
+/// leave their node to an index that never took it.
+#[test]
+fn a_failed_fold_advances_neither_the_watermark_nor_the_release() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let fx = fixture();
+    let fields = Arc::new(FlakyFields {
+        inner: FixedFields(fx.fields.0.clone()),
+        failing: std::sync::atomic::AtomicBool::new(true),
+        refused: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let applied = fx.engine.subscribe_applied_retained(Partition::Node, 1024);
+    let coverage = Arc::new(coordinode_query::index::IndexCoverage::new(
+        applied.position(),
+    ));
+    fx.registry.set_coverage(Arc::clone(&coverage));
+    let worker = VectorIndexWorker::spawn(
+        Arc::clone(&fx.engine),
+        applied,
+        Arc::clone(&fx.registry),
+        Arc::clone(&fields) as Arc<dyn FieldRegistrar>,
+        Arc::clone(&coverage),
+        SHARD,
+    );
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        for _ in 0..12_000 {
+            if done() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done(), "never: {what}");
+    };
+    let watermark = || {
+        fx.registry
+            .health_snapshot("Item", "embedding")
+            .and_then(|h| h.indexed_hlc())
+    };
+
+    // The fold and the rebuild after it both fail.
+    fx.apply(1, &[fx.put_item(1, 1.0)]);
+    wait("the fold and its rebuild were refused", &|| {
+        fields.refused.load(SeqCst) >= 2
+    });
+    assert_eq!(
+        watermark(),
+        Some(0),
+        "the watermark claims a write the index does not hold"
+    );
+
+    fields.failing.store(false, SeqCst);
+    fx.apply(2, &[fx.put_item(2, 2.0)]);
+    wait("the second write is folded", &|| {
+        !coverage.delta(SHARD).contains(NodeId::from_raw(2))
+    });
+    let indexed = fx
+        .registry
+        .get("Item", "embedding")
+        .unwrap()
+        .read()
+        .unwrap()
+        .contains(1);
+    worker.shutdown();
+    assert!(
+        indexed || coverage.delta(SHARD).contains(NodeId::from_raw(1)),
+        "node 1 is neither in the index nor answered from the store"
+    );
+}
+
 /// A worker that falls behind its queue loses no node: the applies drop the
 /// events it could not take and it rebuilds from the store, which holds them.
 #[test]

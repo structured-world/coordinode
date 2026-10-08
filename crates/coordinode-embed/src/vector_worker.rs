@@ -126,6 +126,13 @@ struct Worker {
 impl Worker {
     fn run(self) {
         tracing::info!("vector index worker started");
+        // Set while events the indexes do not hold are taken but unreleased:
+        // releasing a later batch would release them too, so every round
+        // rebuilds until one rebuild covers them.
+        let mut behind = false;
+        // The newest commit taken since the indexes last covered everything
+        // taken, which the watermark reaches once they do again.
+        let mut max_ts = 0u64;
         while !self.stop.is_cancelled() {
             // Asleep until an entry applies or the worker is stopped.
             let Some(first) = self.applied.next(None) else {
@@ -133,7 +140,6 @@ impl Worker {
             };
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
             let mut replaced = false;
-            let mut max_ts = 0u64;
             let mut last_seq = 0u64;
             let mut taken = 0usize;
             let mut event = Some(first);
@@ -159,7 +165,7 @@ impl Worker {
                 };
             }
 
-            let covered = if replaced {
+            let covered = if replaced || behind {
                 self.rebuild()
             } else {
                 match self.fold(keys) {
@@ -173,17 +179,20 @@ impl Worker {
                     }
                 }
             };
+            // A failed rebuild releases nothing and claims nothing: searches
+            // keep answering those nodes from the store until a later round's
+            // rebuild covers them.
+            let Some(seq) = covered else {
+                behind = true;
+                continue;
+            };
+            behind = false;
             // Every entry up to `max_ts` is now in the indexes, and so is
             // every write at or below it that these entries did not touch.
             if max_ts > 0 {
                 self.registry.advance_indexed_hlc_all(max_ts);
             }
-            // A failed rebuild releases nothing: searches keep answering those
-            // nodes from the store, and the full queue that follows brings
-            // the rebuild round again.
-            if let Some(seq) = covered {
-                self.coverage.release(seq);
-            }
+            self.coverage.release(seq);
         }
         tracing::info!("vector index worker stopped");
     }

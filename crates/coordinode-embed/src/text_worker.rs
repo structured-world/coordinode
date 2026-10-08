@@ -123,6 +123,10 @@ struct Worker {
 impl Worker {
     fn run(self) {
         tracing::info!("text index worker started");
+        // Set while events the indexes do not hold are taken but unreleased:
+        // releasing a later batch would release them too, so every round
+        // rebuilds until one rebuild covers them.
+        let mut behind = false;
         while !self.stop.load(Ordering::Acquire) {
             // Asleep until an entry applies or the worker is stopped.
             let Some(first) = self.applied.next(None) else {
@@ -151,7 +155,7 @@ impl Worker {
                 };
             }
 
-            let covered = if replaced {
+            let covered = if replaced || behind {
                 self.rebuild()
             } else {
                 match self.fold(&keys) {
@@ -166,10 +170,13 @@ impl Worker {
                 }
             };
             // A failed rebuild releases nothing: searches keep answering those
-            // nodes from the store, and the full queue that follows brings
-            // the rebuild round again.
-            if let Some(seq) = covered {
-                self.coverage.release(seq);
+            // nodes from the store until a later round's rebuild covers them.
+            match covered {
+                Some(seq) => {
+                    behind = false;
+                    self.coverage.release(seq);
+                }
+                None => behind = true,
             }
         }
         tracing::info!("text index worker stopped");
