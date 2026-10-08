@@ -563,6 +563,13 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// The change this transaction has staged to the counter `key` and not
+    /// committed yet: what its own reads of the counter add to the stored
+    /// value.
+    pub fn pending_counter_delta(&self, key: &[u8]) -> i64 {
+        self.merge_counter_deltas.get(key).copied().unwrap_or(0)
+    }
+
     /// Have the commit wait up to `wait` for the commits already admitted on
     /// its keys to land, instead of being refused by them, and reserve its
     /// keys meanwhile so later commits queue behind it.
@@ -2160,30 +2167,19 @@ impl<'a> Transaction<'a> {
     }
 
     /// MVCC-aware prefix scan: snapshot results overlaid with buffered writes
-    /// (a buffered value replaces the storage row for that key), in key
-    /// order. Snapshot keys other than our own buffered writes are
-    /// OCC-tracked. Legacy mode scans the engine directly and overlays the
-    /// (empty-in-legacy) buffer.
-    ///
-    /// Note: buffered tombstones (in-transaction deletes) do NOT hide a storage
-    /// row from the scan — this matches the established executor semantics
-    /// (read-your-own-writes covers point reads; scans surface the snapshot row
-    /// for keys without a buffered *value*). Preserved deliberately for
-    /// behavioural parity.
+    /// in key order, the same view [`Self::get`] gives one key at a time: a
+    /// buffered value replaces the storage row for its key, and a buffered
+    /// tombstone removes it. Legacy mode scans the engine directly and
+    /// overlays the (empty-in-legacy) buffer.
     pub fn prefix_scan(&mut self, part: Partition, prefix: &[u8]) -> StorageResult<Vec<KvPair>> {
-        // Own writes (buffered values, NOT tombstones) that match the prefix,
-        // in key order: the buffer is a hash map, so its iteration order is
-        // arbitrary, and readers group consecutive keys (a node's versions).
-        let mut buffer_matches: Vec<KvPair> = self
+        // Own writes under the prefix, values and tombstones, in key order:
+        // the buffer is a hash map, so its iteration order is arbitrary, and
+        // readers group consecutive keys (a node's versions).
+        let mut buffer_matches: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
             .write_buffer
             .iter()
-            .filter_map(|((p, k), v)| {
-                if *p == part && k.starts_with(prefix) {
-                    v.as_ref().map(|val| (k.clone(), val.clone()))
-                } else {
-                    None
-                }
-            })
+            .filter(|((p, k), _)| *p == part && k.starts_with(prefix))
+            .map(|((_, k), v)| (k.clone(), v.clone()))
             .collect();
         buffer_matches.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
@@ -2320,19 +2316,22 @@ fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
 
 /// `stored` rows overlaid with `overlay` rows, both in key order, into one
 /// list in key order: an overlay row replaces the stored row of its key.
-fn merge_overlay(stored: Vec<KvPair>, overlay: Vec<KvPair>) -> Vec<KvPair> {
+fn merge_overlay(stored: Vec<KvPair>, overlay: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Vec<KvPair> {
     if overlay.is_empty() {
         return stored;
     }
     let mut out = Vec::with_capacity(stored.len() + overlay.len());
     let mut stored = stored.into_iter().peekable();
-    for row in overlay {
-        while let Some(next) = stored.next_if(|(k, _)| *k < row.0) {
+    for (key, value) in overlay {
+        while let Some(next) = stored.next_if(|(k, _)| *k < key) {
             out.push(next);
         }
-        // The stored row of the same key, if any, is shadowed.
-        stored.next_if(|(k, _)| *k == row.0);
-        out.push(row);
+        // The stored row of the same key, if any, is shadowed: replaced by
+        // the buffered value, or removed by the buffered tombstone.
+        stored.next_if(|(k, _)| *k == key);
+        if let Some(value) = value {
+            out.push((key, value));
+        }
     }
     out.extend(stored);
     out

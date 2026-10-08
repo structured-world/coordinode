@@ -592,18 +592,13 @@ impl IndexStore for LocalIndexStore<'_> {
         let prefix = entry_value_prefix(index.generation, &tuple);
         let mut out = Vec::new();
         for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
-            // The scan overlays buffered values but not buffered tombstones:
-            // an entry this transaction removed is gone for it.
-            if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
-                continue;
-            }
             if let Some((id, _)) = decode_entry(index.generation, &key) {
                 out.push(NodeId::from_raw(id));
             }
         }
-        // A temporal node's versions holding the value are one node; the
-        // scan appends this transaction's own entries after the stored ones.
-        out.sort_unstable();
+        // A temporal node's versions holding the value are one node. Entries
+        // of one value come in key order, which orders them by node, so its
+        // versions are adjacent.
         out.dedup();
         Ok(Some(out))
     }
@@ -618,15 +613,9 @@ impl IndexStore for LocalIndexStore<'_> {
         } else {
             entries_prefix(index.generation)
         };
-        // The scan appends this transaction's own entries after the stored
-        // ones; key order is restored here.
-        let mut entries = txn.prefix_scan(Partition::Idx, &prefix)?;
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let entries = txn.prefix_scan(Partition::Idx, &prefix)?;
         let mut out = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            if matches!(txn.buffered(Partition::Idx, &key), Some(None)) {
-                continue;
-            }
             if index.unique {
                 out.push(decode_holder(&value)?);
             } else if let Some((id, _)) = decode_entry(index.generation, &key) {

@@ -987,16 +987,7 @@ impl EdgeStore for LocalEdgeStore {
         tgt: NodeId,
     ) -> StoreResult<usize> {
         let prefix = temporal_edgeprop_pair_prefix(edge_type, src, tgt);
-        let scan = txn.prefix_scan(Partition::EdgeProp, &prefix)?;
-        let mut remaining = 0_usize;
-        for (key, _) in scan {
-            // A version tombstoned in this transaction's write buffer is no
-            // longer live even though the snapshot still lists it.
-            if !matches!(txn.buffered(Partition::EdgeProp, &key), Some(None)) {
-                remaining += 1;
-            }
-        }
-        Ok(remaining)
+        Ok(txn.prefix_scan(Partition::EdgeProp, &prefix)?.len())
     }
 
     fn delete_all_versions(

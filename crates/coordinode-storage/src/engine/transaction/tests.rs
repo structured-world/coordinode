@@ -1155,26 +1155,26 @@ fn prefix_scan_returns_stored_and_own_rows_in_key_order() {
     }
 }
 
+/// A row this transaction deleted is gone for its scans as for its point
+/// reads: a scan that still listed it would hand a later statement a row
+/// the transaction already removed.
 #[test]
-fn prefix_scan_buffered_tombstone_does_not_hide_storage_row() {
-    // Behavioural parity with the executor: a buffered in-transaction
-    // delete does NOT remove a storage row from a prefix scan (only a
-    // buffered *value* overlays). Point reads still see the tombstone via
-    // `get`; scans surface the snapshot row.
+fn prefix_scan_hides_a_row_the_transaction_deleted() {
     let (engine, oracle, _d) = test_engine();
     engine.put(Partition::Node, b"p:x", b"v").unwrap();
+    engine.put(Partition::Node, b"p:y", b"w").unwrap();
     let mut txn = Transaction::begin(
         &engine,
         Some(&oracle),
         Timestamp::from_raw(engine.snapshot()),
     );
     txn.delete(Partition::Node, b"p:x").unwrap();
-    // Point read sees the tombstone (RYOW).
+    // A key deleted that storage never held hides nothing and adds nothing.
+    txn.delete(Partition::Node, b"p:z").unwrap();
     assert_eq!(txn.get(Partition::Node, b"p:x").unwrap(), None);
-    // Scan still surfaces the storage row (documented parity behaviour).
     assert_eq!(
         txn.prefix_scan(Partition::Node, b"p:").unwrap(),
-        vec![(b"p:x".to_vec(), b"v".to_vec())]
+        vec![(b"p:y".to_vec(), b"w".to_vec())]
     );
 }
 
