@@ -265,6 +265,60 @@ fn as_of_text_match_answers_the_snapshot() {
     assert!(at(&mut db, "newcomer", Some(before)).is_empty());
 }
 
+/// The same snapshot read over a temporal label, whose writes land as new
+/// versions of a node rather than in place: a node changed or deleted after
+/// the timestamp is answered with its state then.
+#[test]
+fn as_of_text_match_answers_the_snapshot_of_a_temporal_label() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, body: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    db.execute_cypher("CREATE TEXT INDEX emp_body ON :Emp(body)")
+        .expect("create text index");
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_micros() as i64
+        - 1_000_000;
+    commit(
+        &mut db,
+        &format!("CREATE (:Emp {{name: 'x', body: 'rust storage', valid_from: {since}}})"),
+    );
+    let before = commit(
+        &mut db,
+        &format!("CREATE (:Emp {{name: 'y', body: 'rust engines', valid_from: {since}}})"),
+    );
+    commit(
+        &mut db,
+        "MATCH (n:Emp {name: 'x'}) SET n.body = 'golang services'",
+    );
+    commit(&mut db, "MATCH (n:Emp {name: 'y'}) DELETE n");
+    commit(
+        &mut db,
+        &format!("CREATE (:Emp {{name: 'z', body: 'rust newcomer', valid_from: {since}}})"),
+    );
+
+    let at = |db: &mut Database, words: &str, as_of: Option<u64>| -> Vec<String> {
+        let as_of = as_of.map_or(String::new(), |ts| format!(" AS OF TIMESTAMP {ts}"));
+        let mut found = names(
+            &db.execute_cypher(&format!(
+                "MATCH (n:Emp) WHERE text_match(n.body, '{words}') \
+                 RETURN n.name AS name{as_of}"
+            ))
+            .expect("full-text read"),
+        );
+        found.sort();
+        found
+    };
+    assert_eq!(at(&mut db, "rust", None), ["z"]);
+    assert_eq!(at(&mut db, "golang", None), ["x"]);
+    assert_eq!(at(&mut db, "rust", Some(before)), ["x", "y"]);
+    assert!(at(&mut db, "golang", Some(before)).is_empty());
+    assert!(at(&mut db, "newcomer", Some(before)).is_empty());
+}
+
 /// Each document's BM25 score for `word`, by name, as `db` answers
 /// `text_match`, at `as_of` when given.
 fn text_scores(

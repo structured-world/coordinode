@@ -46,6 +46,11 @@ use crate::error::{StoreError, StoreResult};
 pub type ShardVisitor<'a> =
     dyn FnMut(NodeId, &[u8], &NodeRecord) -> StoreResult<core::ops::ControlFlow<()>> + 'a;
 
+/// Visitor for [`NodeStore::for_each_row_in_shard`]: receives each raw node
+/// row as `(key, value)`, returning
+/// [`ControlFlow::Break`](core::ops::ControlFlow::Break) to stop the walk early.
+pub type RowVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> StoreResult<core::ops::ControlFlow<()>> + 'a;
+
 /// Layer 4 node store. Reads/writes [`NodeRecord`] via shard-aware
 /// keys over a [`Transaction`]; supports temporal and non-temporal
 /// flavours.
@@ -315,6 +320,34 @@ pub trait NodeStore {
         shard_id: u16,
         since: u64,
     ) -> StoreResult<Vec<NodeId>>;
+
+    /// Every version of temporal node `node_id`, as `(valid_from, record)` in
+    /// ascending `valid_from` order, as `txn` sees them: its snapshot with
+    /// its own buffered writes over it. Untracked. Empty for a node without
+    /// a timeline.
+    fn versions(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> StoreResult<Vec<(i64, NodeRecord)>>;
+
+    /// Every node row of `shard_id` in key order, raw, streamed from
+    /// `engine` at the latest state: each node's own row and each version of
+    /// a temporal node, which sort together under the node's id. `visit`
+    /// returns [`ControlFlow::Break`] to stop early.
+    ///
+    /// [`ControlFlow::Break`]: core::ops::ControlFlow::Break
+    fn for_each_row_in_shard(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        visit: &mut RowVisitor<'_>,
+    ) -> StoreResult<()>;
+
+    /// Every node row of `shard_id` in key order, raw, as `txn` sees them:
+    /// its snapshot with its own buffered writes over it. Untracked.
+    fn shard_rows(&self, txn: &Transaction, shard_id: u16) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>>;
 
     /// Iterate every non-temporal node record in a shard, latest
     /// visible seqno. Yields `(NodeId, NodeRecord)` pairs in key
@@ -783,13 +816,55 @@ impl NodeStore for LocalNodeStore {
         shard_id: u16,
         since: u64,
     ) -> StoreResult<Vec<NodeId>> {
-        Ok(engine
+        // A temporal node's versions each have a key of their own: a write to
+        // any of them changes the node.
+        let mut nodes: Vec<NodeId> = engine
             .changed_keys_since(Partition::Node, since)?
             .iter()
-            .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+            .filter_map(|key| coordinode_core::graph::node::decode_written_node(key))
             .filter(|(shard, _)| *shard == shard_id)
             .map(|(_, id)| id)
-            .collect())
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        Ok(nodes)
+    }
+
+    fn versions(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> StoreResult<Vec<(i64, NodeRecord)>> {
+        let rows = txn.prefix_scan(Partition::Node, &temporal_node_id_prefix(shard_id, node_id))?;
+        let mut versions = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            if let Some((_, _, valid_from)) =
+                coordinode_core::graph::node::decode_temporal_node_key(&key)
+            {
+                versions.push((valid_from, Self::decode_record(&value)?));
+            }
+        }
+        Ok(versions)
+    }
+
+    fn for_each_row_in_shard(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        visit: &mut RowVisitor<'_>,
+    ) -> StoreResult<()> {
+        for guard in engine.prefix_scan(Partition::Node, &self.shard_scan_prefix(shard_id))? {
+            let (key, value) = guard.into_inner()?;
+            if visit(&key, &value)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn shard_rows(&self, txn: &Transaction, shard_id: u16) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(txn.prefix_scan(Partition::Node, &self.shard_scan_prefix(shard_id))?)
     }
 
     fn for_each_in_shard(

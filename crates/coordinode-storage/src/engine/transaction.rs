@@ -2171,7 +2171,7 @@ impl<'a> Transaction<'a> {
     /// buffered value replaces the storage row for its key, and a buffered
     /// tombstone removes it. Legacy mode scans the engine directly and
     /// overlays the (empty-in-legacy) buffer.
-    pub fn prefix_scan(&mut self, part: Partition, prefix: &[u8]) -> StorageResult<Vec<KvPair>> {
+    pub fn prefix_scan(&self, part: Partition, prefix: &[u8]) -> StorageResult<Vec<KvPair>> {
         // Own writes under the prefix, values and tombstones, in key order:
         // the buffer is a hash map, so its iteration order is arbitrary, and
         // readers group consecutive keys (a node's versions).

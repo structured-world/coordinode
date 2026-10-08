@@ -5624,7 +5624,7 @@ fn execute_text_index_scan(
         return Err(text_match_missing_index_error(Some(label), Some(property)));
     };
     materialize_own_node_writes(ctx)?;
-    let matches = text_index_matches(registry, label, property, query, language, ctx)
+    let matches = text_index_matches(registry, (binding, label, property), query, language, ctx)
         .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
         // Dropped between planning and execution: refused as TextFilter does.
         .ok_or_else(|| text_match_missing_index_error(Some(label), Some(property)))?;
@@ -5632,8 +5632,18 @@ fn execute_text_index_scan(
     let mut ids: Vec<NodeId> = matches.keys().map(|id| NodeId::from_raw(*id)).collect();
     ids.sort_unstable();
     let records = coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+    let at = ctx.instant_for(binding);
     let mut rows = Vec::with_capacity(ids.len());
     for (id, record) in ids.into_iter().zip(records) {
+        // A temporal node has no row of its own: its state at the instant
+        // the binding reads at, as the label scan projects it.
+        let record = match record {
+            Some(record) => Some(record),
+            None => ctx
+                .temporal_node_state(id, at)?
+                .positive()
+                .map(|(_, record)| record),
+        };
         let Some(record) = record.filter(|r| r.has_label(label)) else {
             continue;
         };
@@ -7717,7 +7727,7 @@ fn score_text_method(
                 .to_string(),
         )
     })?;
-    let scores = text_index_matches(registry, label, property, query_text, None, ctx)
+    let scores = text_index_matches(registry, (variable, label, property), query_text, None, ctx)
         .map_err(|e| ExecutionError::Unsupported(format!("rrf_score(): text search error: {e}")))?
         .ok_or_else(|| {
             ExecutionError::Unsupported(format!(
@@ -7845,7 +7855,7 @@ fn raw_scores_text_method(
             "hybrid fusion: text method requires a TextIndexRegistry".to_string(),
         )
     })?;
-    let scores = text_index_matches(registry, label, property, query_text, None, ctx)
+    let scores = text_index_matches(registry, (variable, label, property), query_text, None, ctx)
         .map_err(|e| ExecutionError::Unsupported(format!("hybrid fusion: text search: {e}")))?
         .ok_or_else(|| {
             ExecutionError::Unsupported(format!(
@@ -8317,7 +8327,7 @@ fn own_written_nodes(ctx: &ExecutionContext<'_>) -> Vec<NodeId> {
     let merged = ctx.txn.node_deltas().iter().map(|(key, _)| key.as_slice());
     buffered
         .chain(merged)
-        .filter_map(coordinode_core::graph::node::decode_node_key)
+        .filter_map(coordinode_core::graph::node::decode_written_node)
         .filter(|(shard, _)| *shard == ctx.shard_id)
         .map(|(_, id)| id)
         .collect()
@@ -8332,8 +8342,7 @@ fn own_written_nodes(ctx: &ExecutionContext<'_>) -> Vec<NodeId> {
 /// index.
 fn text_index_matches(
     registry: &crate::index::TextIndexRegistry,
-    label: &str,
-    property: &str,
+    (variable, label, property): (&str, &str, &str),
     query: &str,
     language: Option<&str>,
     ctx: &ExecutionContext<'_>,
@@ -8342,18 +8351,26 @@ fn text_index_matches(
     use coordinode_search::tantivy::pending::Matches;
 
     let also = read_delta(IndexDelta::Nodes(Default::default()), ctx).map_err(|e| e.to_string())?;
-    let Some(view) = registry.view(label, property, &ctx.txn, ctx.shard_id, ctx.interner, also)?
-    else {
-        return Ok(None);
-    };
-    let hits = view.find(
+    let Some(hits) = registry.find(
+        label,
+        property,
+        &ctx.txn,
+        ctx.shard_id,
+        ctx.interner,
+        also,
+        // A temporal node matches by its state at the instant this variable
+        // reads at, as a scan of the label projects it.
+        ctx.instant_for(variable),
         TextRequest::Terms {
             query,
             language,
             snippets: false,
         },
         Matches::All,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     Ok(Some(
         hits.into_iter()
             .map(|hit| (hit.node_id, hit.score))
@@ -8407,13 +8424,20 @@ fn execute_text_filter(
         _ => None,
     };
     let label = label_owned.as_deref();
+    let variable = match text_expr {
+        crate::plan::expr::Expr::Property { base, .. } => match base.as_ref() {
+            crate::plan::expr::Expr::Variable(var) => var.as_str(),
+            _ => "",
+        },
+        _ => "",
+    };
 
     let search_results: Vec<coordinode_search::tantivy::TextSearchResult> = if let Some(registry) =
         ctx.text_index_registry
     {
         if let (Some(l), Some(p)) = (label, property) {
             // Every match, not a top-K: the predicate is membership.
-            match text_index_matches(registry, l, p, query_string, language, ctx)
+            match text_index_matches(registry, (variable, l, p), query_string, language, ctx)
                 .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
             {
                 Some(matches) => matches

@@ -11,17 +11,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use coordinode_core::graph::intern::FieldInterner;
-use coordinode_core::graph::node::{NodeId, NodeRecord};
+use coordinode_core::graph::node::{NodeId, NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
 use coordinode_search::tantivy::multi_lang::{
     MultiLangConfig, MultiLanguageTextIndex, TextRequest,
 };
-use coordinode_search::tantivy::pending::{Matches, PendingDocuments};
+use coordinode_search::tantivy::pending::Matches;
+use coordinode_search::tantivy::validity::Validity;
 use coordinode_search::tantivy::{HighlightedResult, TextSearchResult};
 use coordinode_storage::engine::transaction::Transaction;
 
 use super::coverage::{IndexCoverage, IndexDelta};
 use super::definition::{IndexDefinition, TextIndexConfig};
+use crate::executor::temporal_read::{TimelineFields, state_span};
 
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
@@ -46,30 +48,216 @@ pub struct TextIndexRegistry {
     coverage: RwLock<Option<Arc<IndexCoverage>>>,
 }
 
-/// One search's reading of a text index: the index, and the current
-/// documents of the nodes it has not caught up with in place of its own.
-pub struct TextView {
-    handle: TextHandle,
-    pending: PendingDocuments,
+/// The stored rows of one node, as a text index reads them.
+#[derive(Debug, Clone)]
+pub enum NodeRows {
+    /// A node without a timeline: its record, if it exists.
+    Plain(Option<NodeRecord>),
+    /// A temporal node's versions in ascending `valid_from` order.
+    Timeline(Vec<(i64, NodeRecord)>),
 }
 
-impl TextView {
-    /// Run `request`, best score first, keeping `matches`.
-    ///
-    /// # Errors
-    ///
-    /// The query could not be parsed or run.
-    pub fn find(
-        &self,
-        request: TextRequest<'_>,
-        matches: Matches,
-    ) -> Result<Vec<HighlightedResult>, String> {
-        self.handle
-            .read()
-            .map_err(|_| "text index lock poisoned".to_string())?
-            .find(request, matches, &self.pending)
-            .map_err(|e| e.to_string())
+/// What a text index holds for one node at one valid-time instant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeText {
+    /// The node.
+    pub node_id: NodeId,
+    /// The indexed text, when the node has it at the instant.
+    pub text: Option<String>,
+    /// The valid time over which the node keeps that text, or its lack.
+    pub validity: Validity,
+}
+
+/// How a text index reads one property of one label off a node's rows.
+#[derive(Debug, Clone, Copy)]
+pub struct TextSource<'a> {
+    label: &'a str,
+    field_id: Option<u32>,
+    timeline: TimelineFields,
+}
+
+impl<'a> TextSource<'a> {
+    /// The text of `property` on `label`'s nodes, by the field ids of
+    /// `interner`.
+    pub fn new(interner: &FieldInterner, label: &'a str, property: &str) -> Self {
+        Self {
+            label,
+            field_id: interner.lookup(property),
+            timeline: TimelineFields {
+                valid_to: interner.lookup("valid_to"),
+                deleted: interner.lookup("__deleted__"),
+            },
+        }
     }
+
+    fn text(&self, record: &NodeRecord) -> Option<String> {
+        if record.primary_label() != self.label {
+            return None;
+        }
+        record
+            .props
+            .get(&self.field_id?)?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// What the index holds for `node_id`, stored as `rows`, at valid-time
+    /// instant `at`: a temporal node's state valid then, held over the
+    /// interval its timeline keeps that state.
+    pub fn at(&self, node_id: NodeId, rows: &NodeRows, at: i64) -> NodeText {
+        match rows {
+            NodeRows::Plain(record) => NodeText {
+                node_id,
+                text: record.as_ref().and_then(|r| self.text(r)),
+                validity: Validity::ALWAYS,
+            },
+            NodeRows::Timeline(versions) => {
+                let span = state_span(
+                    versions.iter().map(|(from, record)| (*from, record)),
+                    at,
+                    self.timeline,
+                );
+                // A timeline of another label never enters this index.
+                let ours = versions
+                    .first()
+                    .is_some_and(|(_, record)| record.primary_label() == self.label);
+                NodeText {
+                    node_id,
+                    text: span.state.positive().and_then(|(_, r)| self.text(r)),
+                    validity: if ours {
+                        Validity {
+                            from: span.from,
+                            until: span.until,
+                        }
+                    } else {
+                        Validity::ALWAYS
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// The rows of `ids` (sorted) as `read` sees them, its own writes included.
+///
+/// # Errors
+///
+/// The store could not be read or a row decoded.
+pub fn read_nodes(
+    read: &Transaction<'_>,
+    shard_id: u16,
+    ids: &[NodeId],
+) -> Result<Vec<(NodeId, NodeRows)>, String> {
+    let records = LocalNodeStore
+        .get_many(read, shard_id, ids)
+        .map_err(|e| format!("read {} written nodes: {e}", ids.len()))?;
+    let mut out = Vec::with_capacity(ids.len());
+    for (id, record) in ids.iter().copied().zip(records) {
+        if record.is_some() {
+            out.push((id, NodeRows::Plain(record)));
+            continue;
+        }
+        // No row of its own: a temporal node keeps only its versions.
+        let versions = LocalNodeStore
+            .versions(read, shard_id, id)
+            .map_err(|e| format!("read the versions of node {}: {e}", id.as_raw()))?;
+        out.push((
+            id,
+            if versions.is_empty() {
+                NodeRows::Plain(None)
+            } else {
+                NodeRows::Timeline(versions)
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// The visitor of [`NodeGrouper`]: a node and its rows.
+type NodeVisit<'v> = dyn FnMut(NodeId, NodeRows) -> Result<(), String> + 'v;
+
+/// Turns the node rows of a shard, in key order, into nodes with their rows:
+/// a temporal node's versions sort together under its id, so they are
+/// gathered and handed over whole when the next node's row comes.
+#[derive(Default)]
+struct NodeGrouper {
+    timeline: Option<(NodeId, Vec<(i64, NodeRecord)>)>,
+}
+
+impl NodeGrouper {
+    fn push(&mut self, key: &[u8], value: &[u8], visit: &mut NodeVisit<'_>) -> Result<(), String> {
+        let decode = |value: &[u8]| {
+            NodeRecord::from_msgpack(value).map_err(|e| format!("decode a node record: {e}"))
+        };
+        if let Some((_, id, valid_from)) = decode_temporal_node_key(key) {
+            let record = decode(value)?;
+            match &mut self.timeline {
+                Some((of, versions)) if *of == id => versions.push((valid_from, record)),
+                _ => {
+                    if let Some((of, versions)) =
+                        self.timeline.replace((id, vec![(valid_from, record)]))
+                    {
+                        visit(of, NodeRows::Timeline(versions))?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.flush(visit)?;
+        if let Some((_, id)) = decode_node_key(key) {
+            visit(id, NodeRows::Plain(Some(decode(value)?)))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, visit: &mut NodeVisit<'_>) -> Result<(), String> {
+        match self.timeline.take() {
+            Some((of, versions)) => visit(of, NodeRows::Timeline(versions)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Every node of `shard_id` with its rows, in id order, as `read` sees them.
+fn for_each_node_read(
+    read: &Transaction<'_>,
+    shard_id: u16,
+    visit: &mut NodeVisit<'_>,
+) -> Result<(), String> {
+    let rows = LocalNodeStore
+        .shard_rows(read, shard_id)
+        .map_err(|e| format!("scan the node rows: {e}"))?;
+    let mut grouper = NodeGrouper::default();
+    for (key, value) in &rows {
+        grouper.push(key, value, visit)?;
+    }
+    grouper.flush(visit)
+}
+
+/// Every node of `shard_id` with its rows, in id order, as `engine` holds
+/// them now, streamed.
+fn for_each_node_latest(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    shard_id: u16,
+    visit: &mut NodeVisit<'_>,
+) -> Result<(), String> {
+    let mut grouper = NodeGrouper::default();
+    let mut failure = None;
+    LocalNodeStore
+        .for_each_row_in_shard(engine, shard_id, &mut |key, value| {
+            Ok(match grouper.push(key, value, visit) {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(e) => {
+                    failure = Some(e);
+                    std::ops::ControlFlow::Break(())
+                }
+            })
+        })
+        .map_err(|e| format!("scan the node rows: {e}"))?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    grouper.flush(visit)
 }
 
 impl TextIndexRegistry {
@@ -97,16 +285,23 @@ impl TextIndexRegistry {
         self.coverage.read().ok().and_then(|r| r.clone())
     }
 
-    /// What a search of `(label, property)` on `shard_id` reads: the index,
-    /// and in place of its documents of the nodes written since its position
-    /// and of `also` (the reading transaction's uncommitted writes, or the
-    /// nodes written after a named read timestamp), their documents as `read`
-    /// sees them. `Ok(None)` when there is no such index.
+    /// Search the index of `(label, property)` on `shard_id` as `read` sees
+    /// the store at valid-time instant `at`: the index, and in place of its
+    /// documents of the nodes written since its position, of `also` (the
+    /// reading transaction's uncommitted writes, or the nodes written after a
+    /// named read timestamp) and of the nodes whose held state does not hold
+    /// at `at`, their documents as `read` sees them at `at`. `Ok(None)` when
+    /// there is no such index.
+    ///
+    /// The index stays read-locked from choosing those nodes to the end of
+    /// the search, so the documents and statistics it answers with are the
+    /// ones the choice was made against.
     ///
     /// # Errors
     ///
-    /// The nodes could not be read, or the pending documents not built.
-    pub fn view(
+    /// The nodes could not be read, or the query not run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find(
         &self,
         label: &str,
         property: &str,
@@ -114,83 +309,100 @@ impl TextIndexRegistry {
         shard_id: u16,
         interner: &FieldInterner,
         also: IndexDelta,
-    ) -> Result<Option<TextView>, String> {
+        at: i64,
+        request: TextRequest<'_>,
+        matches: Matches,
+    ) -> Result<Option<Vec<HighlightedResult>>, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
+        let failed = |e: &dyn std::fmt::Display| format!("text index :{label}({property}): {e}");
+        let index = handle.read().map_err(|_| failed(&"lock poisoned"))?;
         let delta = match self.coverage() {
             Some(coverage) => coverage.delta(shard_id),
             None => IndexDelta::Nodes(Default::default()),
         }
-        .union(also);
-        if delta.is_empty() {
-            return Ok(Some(TextView {
-                handle,
-                pending: PendingDocuments::none(),
-            }));
-        }
-        let field_id = interner.lookup(property);
-        // The text a node holds for this index, as the worker reads it.
-        let text = |record: &NodeRecord| -> Option<String> {
-            (record.primary_label() == label)
-                .then(|| record.props.get(&field_id?)?.as_str().map(str::to_string))
-                .flatten()
-        };
-        let (superseded, texts): (Option<Vec<u64>>, Vec<(NodeId, String)>) = match &delta {
+        .union(also)
+        .with_nodes(index.outside(at).into_iter().map(NodeId::from_raw));
+        let source = TextSource::new(interner, label, property);
+        let mut texts: Vec<(NodeId, String)> = Vec::new();
+        let superseded = match &delta {
+            IndexDelta::Nodes(nodes) if nodes.is_empty() => Some(Vec::new()),
             IndexDelta::Nodes(nodes) => {
                 let mut ids: Vec<NodeId> = nodes.iter().copied().collect();
                 ids.sort_unstable();
-                let records = LocalNodeStore
-                    .get_many(read, shard_id, &ids)
-                    .map_err(|e| format!("read {} written nodes: {e}", ids.len()))?;
-                let texts = ids
-                    .iter()
-                    .zip(&records)
-                    .filter_map(|(id, record)| Some((*id, text(record.as_ref()?)?)))
-                    .collect();
-                (Some(ids.iter().map(|id| id.as_raw()).collect()), texts)
+                for (id, rows) in read_nodes(read, shard_id, &ids)? {
+                    if let Some(text) = source.at(id, &rows, at).text {
+                        texts.push((id, text));
+                    }
+                }
+                Some(ids.iter().map(|id| id.as_raw()).collect::<Vec<u64>>())
             }
             IndexDelta::Unknown => {
-                let mut texts = Vec::new();
-                LocalNodeStore
-                    .for_each_in_shard(read, shard_id, &mut |id, record| {
-                        if let Some(text) = text(&record) {
-                            texts.push((id, text));
-                        }
-                        Ok(())
-                    })
-                    .map_err(|e| format!("scan the nodes of :{label}: {e}"))?;
-                (None, texts)
+                for_each_node_read(read, shard_id, &mut |id, rows| {
+                    if let Some(text) = source.at(id, &rows, at).text {
+                        texts.push((id, text));
+                    }
+                    Ok(())
+                })?;
+                None
             }
         };
         let documents = single_property_documents(property, &texts);
-        let pending = handle
-            .read()
-            .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?
+        let pending = index
             .pending(superseded.as_deref(), &documents)
-            .map_err(|e| format!("text index :{label}({property}): {e}"))?;
-        Ok(Some(TextView { handle, pending }))
+            .map_err(|e| failed(&e))?;
+        index
+            .find(request, matches, &pending)
+            .map(Some)
+            .map_err(|e| failed(&e))
+    }
+
+    /// The earliest instant at which some held state of a temporal node
+    /// stops holding, over every index: the next time a fold is due without a
+    /// write.
+    pub fn first_end(&self) -> Option<i64> {
+        let indexes = self.indexes.read().ok()?;
+        indexes
+            .values()
+            .filter_map(|handle| handle.read().ok()?.first_end())
+            .min()
+    }
+
+    /// The nodes whose held state in the index of `(label, property)` does
+    /// not hold at `at`.
+    pub fn outside(&self, label: &str, property: &str, at: i64) -> Vec<NodeId> {
+        self.get(label, property)
+            .and_then(|handle| Some(handle.read().ok()?.outside(at)))
+            .unwrap_or_default()
+            .into_iter()
+            .map(NodeId::from_raw)
+            .collect()
     }
 
     /// Apply one batch of changes to the index of `(label, property)` in one
-    /// commit: `upserts` replace a node's text, `removals` take a node out.
+    /// commit: a node with text has its document replaced, a node without is
+    /// taken out, and each node's validity is recorded with its document, so
+    /// a reader sees both or neither.
     pub fn apply_changes(
         &self,
         label: &str,
         property: &str,
-        upserts: &[(NodeId, String)],
-        removals: &[NodeId],
+        changes: &[NodeText],
     ) -> Result<(), String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(());
         };
-        let upserts = single_property_documents(property, upserts);
-        let removals: Vec<u64> = removals.iter().map(|id| id.as_raw()).collect();
+        let (upserts, removals) = split_changes(property, changes);
         let mut idx = handle
             .write()
             .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
         idx.apply_changes(&upserts, &removals)
-            .map_err(|e| format!("text index :{label}({property}): {e}"))
+            .map_err(|e| format!("text index :{label}({property}): {e}"))?;
+        for change in changes {
+            idx.set_validity(change.node_id.as_raw(), change.validity);
+        }
+        Ok(())
     }
 
     /// Rebuild the index of `(label, property)` from `scan`, the nodes'
@@ -204,7 +416,7 @@ impl TextIndexRegistry {
         &self,
         label: &str,
         property: &str,
-        scan: impl FnOnce() -> Result<Vec<(NodeId, String)>, String>,
+        scan: impl FnOnce() -> Result<Vec<NodeText>, String>,
     ) -> Result<usize, String> {
         let Some(handle) = self.get(label, property) else {
             return Ok(0);
@@ -212,9 +424,14 @@ impl TextIndexRegistry {
         let mut idx = handle
             .write()
             .map_err(|_| format!("text index :{label}({property}) lock poisoned"))?;
-        let documents = single_property_documents(property, &scan()?);
+        let scanned = scan()?;
+        let (documents, _) = split_changes(property, &scanned);
         idx.replace_all(&documents)
             .map_err(|e| format!("text index :{label}({property}): {e}"))?;
+        idx.clear_validities();
+        for node in &scanned {
+            idx.set_validity(node.node_id.as_raw(), node.validity);
+        }
         Ok(documents.len())
     }
 
@@ -426,38 +643,53 @@ impl TextIndexRegistry {
     }
 }
 
-/// The text of `property` on every node of `label` stored on `shard_id`, as
-/// the store holds it now: what a text index of `(label, property)` holds
-/// when it covers the store.
+/// What a text index of `(label, property)` holds when it covers the store
+/// as it stands now, at valid-time instant `at`: every node of `label` on
+/// `shard_id` with its text, and every temporal node of `label` with the
+/// interval its state at `at` holds over, text or not.
 ///
 /// # Errors
 ///
-/// The scan of the node partition failed.
+/// The scan of the node partition failed or a row did not decode.
 pub fn stored_texts(
     engine: &coordinode_storage::engine::core::StorageEngine,
     shard_id: u16,
-    interner: &coordinode_core::graph::intern::FieldInterner,
+    interner: &FieldInterner,
     label: &str,
     property: &str,
-) -> Result<Vec<(NodeId, String)>, String> {
-    use coordinode_modality::{LocalNodeStore, NodeStore as _};
-
-    // No binding: no stored node carries the property.
-    let Some(field_id) = interner.lookup(property) else {
-        return Ok(Vec::new());
-    };
+    at: i64,
+) -> Result<Vec<NodeText>, String> {
+    let source = TextSource::new(interner, label, property);
     let mut texts = Vec::new();
-    LocalNodeStore
-        .for_each_in_shard_at_snapshot(engine, None, shard_id, &mut |node_id, _key, record| {
-            if record.primary_label() == label {
-                if let Some(text) = record.props.get(&field_id).and_then(|v| v.as_str()) {
-                    texts.push((node_id, text.to_string()));
-                }
-            }
-            Ok(std::ops::ControlFlow::Continue(()))
-        })
-        .map_err(|e| format!("scan the nodes of :{label} for its text index: {e}"))?;
+    for_each_node_latest(engine, shard_id, &mut |id, rows| {
+        let held = source.at(id, &rows, at);
+        if held.text.is_some() || held.validity != Validity::ALWAYS {
+            texts.push(held);
+        }
+        Ok(())
+    })?;
     Ok(texts)
+}
+
+/// Documents to hold, by node, and the nodes to take out.
+type DocumentChanges = (Vec<(u64, HashMap<String, String>)>, Vec<u64>);
+
+/// `changes` as the documents the index takes for the nodes with text and
+/// the nodes to take out.
+fn split_changes(property: &str, changes: &[NodeText]) -> DocumentChanges {
+    let mut upserts = Vec::new();
+    let mut removals = Vec::new();
+    for change in changes {
+        match &change.text {
+            Some(text) => {
+                let mut props = HashMap::with_capacity(1);
+                props.insert(property.to_string(), text.clone());
+                upserts.push((change.node_id.as_raw(), props));
+            }
+            None => removals.push(change.node_id.as_raw()),
+        }
+    }
+    (upserts, removals)
 }
 
 /// `(node, text)` pairs as the per-node property maps the index takes, so

@@ -312,8 +312,9 @@ pub fn text_build(label: String, properties: Vec<String>) -> LocalBuild {
                         &fields,
                         &label,
                         property,
+                        crate::executor::runner::wall_clock_us(),
                     )?;
-                    nodes.extend(texts.iter().map(|(id, _)| *id));
+                    nodes.extend(texts.iter().filter(|t| t.text.is_some()).map(|t| t.node_id));
                     Ok(texts)
                 })
                 .map_err(|e| BuildError::Other(format!("backfill text index: {e}")))?;

@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use super::corpus::Corpus;
 use super::pending::{Matches, PendingDocuments};
 use super::tokenize;
+use super::validity::{Validities, Validity};
 use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
 
 /// What one write has done so far, so a node it touches twice is counted
@@ -128,6 +129,8 @@ impl MultiLangConfig {
 pub struct MultiLanguageTextIndex {
     inner: TextIndex,
     config: MultiLangConfig,
+    /// Where the held state of each node with a timeline holds.
+    validities: Validities,
 }
 
 impl MultiLanguageTextIndex {
@@ -151,7 +154,38 @@ impl MultiLanguageTextIndex {
     /// `inner` with its live documents counted.
     fn counted(mut inner: TextIndex, config: MultiLangConfig) -> Result<Self, TextSearchError> {
         inner.corpus = Some(inner.recount()?);
-        Ok(Self { inner, config })
+        Ok(Self::over(inner, config))
+    }
+
+    fn over(inner: TextIndex, config: MultiLangConfig) -> Self {
+        Self {
+            inner,
+            config,
+            validities: Validities::default(),
+        }
+    }
+
+    /// Record that the state held for `node_id` (its document, or the lack
+    /// of one) holds over `validity` of valid time; [`Validity::ALWAYS`] for
+    /// a node without a timeline. Set it with every change of the node.
+    pub fn set_validity(&mut self, node_id: u64, validity: Validity) {
+        self.validities.set(node_id, validity);
+    }
+
+    /// Forget every recorded validity, as for an index replaced whole.
+    pub fn clear_validities(&mut self) {
+        self.validities.clear();
+    }
+
+    /// The nodes whose held state does not hold at instant `at`: a search
+    /// at `at` reads them from their timelines instead.
+    pub fn outside(&self, at: i64) -> Vec<u64> {
+        self.validities.outside(at)
+    }
+
+    /// The earliest instant at which some node's held state stops holding.
+    pub fn first_end(&self) -> Option<i64> {
+        self.validities.first_end()
     }
 
     /// Create an empty index at `dir`, replacing whatever it held, with files
@@ -166,7 +200,7 @@ impl MultiLanguageTextIndex {
         // `open_or_create`.
         let mut inner = TextIndex::create_scratch(dir, heap_size_bytes, Some("none"))?;
         inner.corpus = Some(Corpus::default());
-        Ok(Self { inner, config })
+        Ok(Self::over(inner, config))
     }
 
     /// Wrap an existing `TextIndex` with multi-language support.
@@ -176,7 +210,7 @@ impl MultiLanguageTextIndex {
     /// Its documents were written without their tokens, so it scores with
     /// Tantivy's own statistics.
     pub fn wrap(inner: TextIndex, config: MultiLangConfig) -> Self {
-        Self { inner, config }
+        Self::over(inner, config)
     }
 
     /// Add a node's text fields to the index.

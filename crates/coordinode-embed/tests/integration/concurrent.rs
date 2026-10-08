@@ -393,7 +393,7 @@ fn a_reader_sees_a_thousand_write_commit_whole_or_not_at_all() {
         let reader = scope.spawn(|| {
             let mut reads = 0u64;
             while !done.load(Ordering::Acquire) {
-                let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+                let txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
                 let seen = txn
                     .prefix_scan(Partition::Node, PREFIX)
                     .expect("scan")
@@ -432,7 +432,7 @@ fn a_reader_sees_a_thousand_write_commit_whole_or_not_at_all() {
         );
     });
 
-    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+    let txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
     assert_eq!(
         txn.prefix_scan(Partition::Node, PREFIX)
             .expect("scan")

@@ -284,6 +284,8 @@ CREATE TEXT INDEX article_idx ON :Article {
 DROP TEXT INDEX doc_body
 ```
 
+**Temporal labels.** On a `TEMPORAL` node type a search matches each node by its state valid at the instant the query reads it at, the same state a plain `MATCH` returns: the statement's current instant, or the one `temporal_active_at(n, t)` names. A version that has ended, one not valid yet and one whose validity runs out with no later write are not matched, and BM25 scores use the corpus of the states valid at that instant. The index keeps each node's state valid when it last took it, with the interval that state holds over; a search at an instant outside that interval reads the node from its timeline instead, and the index takes the next state by itself once valid time passes the end of the interval.
+
 ### Query Syntax ✅
 
 ```cypher

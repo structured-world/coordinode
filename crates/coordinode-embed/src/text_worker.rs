@@ -19,23 +19,28 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use coordinode_core::graph::intern::FieldRegistrar;
-use coordinode_core::graph::node::NodeId;
+use coordinode_core::graph::node::{NodeId, decode_written_node};
 use coordinode_core::txn::timestamp::Timestamp;
-use coordinode_modality::{LocalNodeStore, NodeStore as _};
-use coordinode_query::index::text_registry::stored_texts;
+use coordinode_query::executor::runner::wall_clock_us;
+use coordinode_query::index::text_registry::{NodeText, TextSource, read_nodes, stored_texts};
 use coordinode_query::index::{IndexCoverage, TextIndexRegistry};
 use coordinode_storage::engine::applied::{
     AppliedEvent, AppliedPosition, AppliedStop, AppliedSubscription,
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::Transaction;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 /// Most applied entries folded together, bounding how long one fold holds
 /// the indexes' write locks and how much one Tantivy commit carries.
 const BATCH: usize = 256;
+
+/// The least wait before refolding ended temporal states again after an
+/// attempt failed.
+const REFOLD_RETRY: Duration = Duration::from_secs(1);
 
 /// Background thread that keeps this process's text indexes current with the
 /// entries applied on this node.
@@ -127,9 +132,20 @@ impl Worker {
         // releasing a later batch would release them too, so every round
         // rebuilds until one rebuild covers them.
         let mut behind = false;
+        let mut refold_failed = false;
         while !self.stop.load(Ordering::Acquire) {
-            // Asleep until an entry applies or the worker is stopped.
-            let Some(first) = self.applied.next(None) else {
+            // Asleep until an entry applies, a temporal node's indexed state
+            // stops holding, or the worker is stopped.
+            // After a failed refold the ended states stay due: wait a while
+            // before the next attempt instead of spinning on them.
+            let wait = match self.until_next_end() {
+                Some(wait) if refold_failed => Some(wait.max(REFOLD_RETRY)),
+                wait => wait,
+            };
+            let Some(first) = self.applied.next(wait) else {
+                if !self.stop.load(Ordering::Acquire) {
+                    refold_failed = self.refold_ended().is_err();
+                }
                 continue;
             };
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
@@ -182,56 +198,83 @@ impl Worker {
         tracing::info!("text index worker stopped");
     }
 
+    /// How long until the earliest indexed state of a temporal node stops
+    /// holding; `None` (no limit) when none ends.
+    fn until_next_end(&self) -> Option<Duration> {
+        let end = self.registry.first_end()?;
+        let now = wall_clock_us();
+        // `now` is never negative, so a later `end` minus it cannot overflow.
+        let wait = if end <= now { 0 } else { end - now };
+        Some(Duration::from_micros(wait.unsigned_abs()))
+    }
+
+    /// Fold again the temporal nodes whose indexed state no longer holds now,
+    /// with no write: valid time moved past the end of their state. Searches
+    /// read such nodes from their timelines meanwhile, so this only keeps
+    /// them from doing so for good.
+    fn refold_ended(&self) -> Result<(), String> {
+        let now = wall_clock_us();
+        let mut ids: Vec<NodeId> = self
+            .registry
+            .definitions()
+            .iter()
+            .flat_map(|def| {
+                def.properties
+                    .iter()
+                    .flat_map(|property| self.registry.outside(&def.label, property, now))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        self.fold_nodes(&ids).inspect_err(|e| {
+            // A later wake-up tries again; searches stay exact meanwhile.
+            tracing::warn!(error = %e, nodes = ids.len(), "text index worker could not refold ended states");
+        })
+    }
+
     /// Bring the documents of the nodes behind `keys` in line with their
     /// records in every text index.
     fn fold(&self, keys: &FxHashSet<Vec<u8>>) -> Result<(), String> {
-        // A store without text indexes pays no read for its commits.
-        let definitions = self.registry.definitions();
-        if definitions.is_empty() {
-            return Ok(());
-        }
-        let ids: Vec<NodeId> = keys
+        let mut ids: Vec<NodeId> = keys
             .iter()
-            .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+            .filter_map(|key| decode_written_node(key))
             .filter(|(shard, _)| *shard == self.shard_id)
             .map(|(_, id)| id)
             .collect();
-        if ids.is_empty() {
+        ids.sort_unstable();
+        ids.dedup();
+        self.fold_nodes(&ids)
+    }
+
+    /// Bring the documents of `ids` (sorted) in line with the store in every
+    /// text index: a temporal node at its state valid now, with the interval
+    /// that state holds over.
+    fn fold_nodes(&self, ids: &[NodeId]) -> Result<(), String> {
+        // A store without text indexes pays no read for its commits.
+        let definitions = self.registry.definitions();
+        if definitions.is_empty() || ids.is_empty() {
             return Ok(());
         }
         let read = Transaction::new(&self.engine, None, Timestamp::ZERO, None);
-        let records = LocalNodeStore
-            .get_many(&read, self.shard_id, &ids)
-            .map_err(|e| format!("read {} applied nodes: {e}", ids.len()))?;
+        let nodes = read_nodes(&read, self.shard_id, ids)?;
         let interner = self
             .fields
             .view()
             .map_err(|e| format!("read the field dictionary: {e}"))?;
-
-        // Per (label, property): the texts to index and the nodes to take out.
-        type Changes = (Vec<(NodeId, String)>, Vec<NodeId>);
-        let mut changes: FxHashMap<(&str, &str), Changes> = FxHashMap::default();
-        for (node_id, record) in ids.iter().copied().zip(&records) {
-            for def in &definitions {
-                for property in &def.properties {
-                    let text = record
-                        .as_ref()
-                        .filter(|r| r.primary_label() == def.label)
-                        .and_then(|r| r.props.get(&interner.lookup(property)?))
-                        .and_then(|v| v.as_str());
-                    let entry = changes.entry((&def.label, property)).or_default();
-                    match text {
-                        Some(text) => entry.0.push((node_id, text.to_string())),
-                        // Taken out only if the index holds it, so writes to
-                        // other labels cost the index nothing.
-                        None => entry.1.push(node_id),
-                    }
-                }
+        let now = wall_clock_us();
+        for def in &definitions {
+            for property in &def.properties {
+                let source = TextSource::new(&interner, &def.label, property);
+                // A node without text is taken out only if the index holds
+                // it, so writes to other labels cost the index nothing.
+                let changes: Vec<NodeText> = nodes
+                    .iter()
+                    .map(|(id, rows)| source.at(*id, rows, now))
+                    .collect();
+                self.registry
+                    .apply_changes(&def.label, property, &changes)?;
             }
-        }
-        for ((label, property), (upserts, removals)) in changes {
-            self.registry
-                .apply_changes(label, property, &upserts, &removals)?;
         }
         Ok(())
     }
@@ -257,7 +300,14 @@ impl Worker {
         for def in &definitions {
             for property in &def.properties {
                 let rebuilt = self.registry.rebuild_index(&def.label, property, || {
-                    stored_texts(&self.engine, self.shard_id, &interner, &def.label, property)
+                    stored_texts(
+                        &self.engine,
+                        self.shard_id,
+                        &interner,
+                        &def.label,
+                        property,
+                        wall_clock_us(),
+                    )
                 });
                 if let Err(e) = rebuilt {
                     tracing::warn!(error = %e, label = %def.label, property, "text index rebuild failed");

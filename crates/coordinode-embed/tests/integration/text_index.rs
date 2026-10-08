@@ -18,6 +18,64 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+/// Write one more version of temporal node `id` (label `Emp`) straight into
+/// storage, as a restore or a correction would.
+fn seed_version(
+    db: &Database,
+    id: u64,
+    props: &[(&str, &str)],
+    valid_from: i64,
+    valid_to: Option<i64>,
+) {
+    use coordinode_core::graph::node::{NodeId, NodeRecord};
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    use coordinode_storage::engine::transaction::{CommitContext, Transaction};
+
+    let interner = db.interner().expect("interner");
+    let field = |name: &str| interner.lookup(name).expect("declared field");
+    let mut record = NodeRecord::new("Emp");
+    for (name, value) in props {
+        record.set(field(name), Value::String((*value).into()));
+    }
+    record.set(field("valid_from"), Value::Int(valid_from));
+    if let Some(to) = valid_to {
+        record.set(field("valid_to"), Value::Int(to));
+    }
+    // Committed below the database's own clock so every later query
+    // snapshot sees it; the version keys are new, nothing is shadowed.
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut txn = Transaction::begin(db.engine(), Some(&oracle), oracle.next());
+    LocalNodeStore
+        .put_temporal(&mut txn, 1, NodeId::from_raw(id), valid_from, &record)
+        .expect("put version");
+    let wc = WriteConcern::majority();
+    txn.commit(&CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    })
+    .expect("commit version");
+}
+
+/// Index changes for nodes without a timeline: a text to hold, or `None` to
+/// take the node out.
+fn planted(texts: &[(u64, Option<&str>)]) -> Vec<coordinode_query::index::text_registry::NodeText> {
+    texts
+        .iter()
+        .map(
+            |(id, text)| coordinode_query::index::text_registry::NodeText {
+                node_id: coordinode_core::graph::node::NodeId::from_raw(*id),
+                text: text.map(str::to_string),
+                validity: coordinode_search::tantivy::validity::Validity::ALWAYS,
+            },
+        )
+        .collect()
+}
+
 // ── Access path ─────────────────────────────────────────────────────
 
 /// `text_match` over one label reads its matches from the index instead of
@@ -327,17 +385,10 @@ fn a_search_answers_unfolded_writes_from_the_store() {
         .apply_changes(
             "Article",
             "body",
-            &[
-                (
-                    coordinode_core::graph::node::NodeId::from_raw(a),
-                    "stale rust words".into(),
-                ),
-                (
-                    coordinode_core::graph::node::NodeId::from_raw(b),
-                    "doomed rust words".into(),
-                ),
-            ],
-            &[],
+            &planted(&[
+                (a, Some("stale rust words")),
+                (b, Some("doomed rust words")),
+            ]),
         )
         .expect("plant stale text");
 
@@ -370,11 +421,7 @@ fn an_unknown_delta_answers_from_the_store_alone() {
         .apply_changes(
             "Article",
             "body",
-            &[(
-                coordinode_core::graph::node::NodeId::from_raw(a),
-                "stale rust words".into(),
-            )],
-            &[],
+            &planted(&[(a, Some("stale rust words"))]),
         )
         .expect("plant stale text");
 
@@ -533,7 +580,7 @@ fn unfolded_writes_rank_as_an_index_holding_them() {
             db.execute_cypher(s).expect("write");
         },
     );
-    let before: Vec<(coordinode_core::graph::node::NodeId, String)> = live
+    let before: Vec<(u64, String)> = live
         .iter()
         .map(|(name, body)| {
             let rows = db
@@ -545,11 +592,12 @@ fn unfolded_writes_rank_as_an_index_holding_them() {
                 Some(Value::Int(id)) => *id as u64,
                 other => panic!("no id for {name}: {other:?}"),
             };
-            (
-                coordinode_core::graph::node::NodeId::from_raw(id),
-                body.clone(),
-            )
+            (id, body.clone())
         })
+        .collect();
+    let before: Vec<(u64, Option<&str>)> = before
+        .iter()
+        .map(|(id, body)| (*id, Some(body.as_str())))
         .collect();
 
     let held = HeldCoverage::hold(&db, 4096);
@@ -564,7 +612,7 @@ fn unfolded_writes_rank_as_an_index_holding_them() {
     );
     held.await_worker();
     db.text_index_registry()
-        .apply_changes("Doc", "body", &before, &[])
+        .apply_changes("Doc", "body", &planted(&before))
         .expect("plant the text before the churn");
 
     assert_ranks_as_built_from(&mut db, None, &live);
@@ -675,27 +723,15 @@ fn an_index_behind_the_store_at_a_crash_is_caught_up_on_reopen() {
             .apply_changes(
                 "Article",
                 "body",
-                &[
-                    (
-                        coordinode_core::graph::node::NodeId::from_raw(a),
-                        "stale rust words".into(),
-                    ),
-                    (
-                        coordinode_core::graph::node::NodeId::from_raw(b),
-                        "doomed rust words".into(),
-                    ),
-                ],
-                &[],
+                &planted(&[
+                    (a, Some("stale rust words")),
+                    (b, Some("doomed rust words")),
+                ]),
             )
             .expect("plant stale text");
         let c = node_id(&mut db, "c");
         db.text_index_registry()
-            .apply_changes(
-                "Article",
-                "body",
-                &[],
-                &[coordinode_core::graph::node::NodeId::from_raw(c)],
-            )
+            .apply_changes("Article", "body", &planted(&[(c, None)]))
             .expect("take the new node out");
         (a, b)
     };
@@ -1223,4 +1259,181 @@ fn non_matching_label_not_indexed() {
         rows[0].get("body"),
         Some(&Value::String("Rust graph database".into()))
     );
+}
+
+// ── Temporal labels ───────────────────────────────────────────────
+
+/// On a temporal label a search matches the state each node has now, the
+/// one a bare MATCH returns: a version that ended, one not yet valid, and
+/// one whose validity runs out with no later commit are not matched, on the
+/// index path and on the filter path alike.
+#[test]
+fn a_temporal_label_is_searched_at_its_state_valid_now() {
+    const YEAR: i64 = 365 * 24 * 3600 * 1_000_000;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_micros() as i64
+    };
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, kind: STRING, bio: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    db.execute_cypher("CREATE TEXT INDEX emp_bio ON :Emp(bio)")
+        .expect("create text index");
+    let t = now();
+    for (name, bio, from, to) in [
+        ("current", "golang", t - YEAR, None),
+        ("ended", "cobol", t - 2 * YEAR, Some(t - YEAR)),
+        ("not yet", "zig", t + YEAR, None),
+        ("expiring", "pascal", t - YEAR, Some(t + 2_000_000)),
+    ] {
+        let to = to.map_or(String::new(), |to| format!(", valid_to: {to}"));
+        db.execute_cypher(&format!(
+            "CREATE (:Emp {{name: '{name}', kind: 'e', bio: '{bio}', valid_from: {from}{to}}})"
+        ))
+        .expect("create");
+    }
+
+    let search = |db: &mut Database, word: &str| -> [Vec<Value>; 2] {
+        ["MATCH (n:Emp)", "MATCH (n:Emp {kind: 'e'})"].map(|head| {
+            db.execute_cypher(&format!(
+                "{head} WHERE text_match(n.bio, '{word}') RETURN n.name AS name ORDER BY name"
+            ))
+            .expect("search")
+            .iter()
+            .map(|r| r["name"].clone())
+            .collect()
+        })
+    };
+    let only = |name: &str| {
+        [
+            vec![Value::String(name.into())],
+            vec![Value::String(name.into())],
+        ]
+    };
+    let none: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
+
+    assert_eq!(search(&mut db, "golang"), only("current"));
+    assert_eq!(search(&mut db, "cobol"), none, "a version that ended");
+    assert_eq!(search(&mut db, "zig"), none, "a version not yet valid");
+    assert_eq!(search(&mut db, "pascal"), only("expiring"));
+
+    // A named instant reads each node's state then, through the index too.
+    let past = t - 3 * YEAR / 2;
+    let rows = db
+        .execute_cypher(&format!(
+            "MATCH (n:Emp) WHERE temporal_active_at(n, {past}) AND text_match(n.bio, 'cobol') \
+             RETURN n.name AS name"
+        ))
+        .expect("search the past");
+    assert_eq!(
+        rows.iter().map(|r| r["name"].clone()).collect::<Vec<_>>(),
+        [Value::String("ended".into())],
+        "the state valid at the named instant"
+    );
+
+    // Its validity runs out without another commit.
+    while now() < t + 2_500_000 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(search(&mut db, "pascal"), none, "a version that ran out");
+    assert_eq!(search(&mut db, "golang"), only("current"));
+
+    // The index catches up by itself: with no write, the ended state is
+    // folded out and searches stop reading that node from its timeline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !db
+        .text_index_registry()
+        .outside("Emp", "bio", now())
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the ended state was never refolded"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(search(&mut db, "pascal"), none);
+}
+
+/// A temporal label ranks as an index of the states valid now would: every
+/// score equals the one an ordinary label holding exactly those texts gets,
+/// so ended, future and superseded versions take no part in the corpus.
+#[test]
+fn a_temporal_label_ranks_as_its_states_valid_now() {
+    const YEAR: i64 = 365 * 24 * 3600 * 1_000_000;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_micros() as i64;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (name: STRING, bio: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    db.execute_cypher("CREATE TEXT INDEX emp_bio ON :Emp(bio)")
+        .expect("emp index");
+    db.execute_cypher("CREATE TEXT INDEX ref_bio ON :Ref(bio)")
+        .expect("reference index");
+    /// A version not valid now: its text, start and end in years from now.
+    type Other = (&'static str, i64, Option<i64>);
+    // (name, bio valid now or None, versions that are not valid now)
+    let people: [(&str, Option<&str>, &[Other]); 5] = [
+        (
+            "a",
+            Some("rust graph rust"),
+            &[("rust rust rust rust", -3, Some(-1))],
+        ),
+        ("b", Some("graph engine"), &[]),
+        ("c", None, &[("rust storage", -3, Some(-2))]),
+        ("d", None, &[("rust rust graph", 1, None)]),
+        ("e", Some("rust"), &[("engine engine", 2, None)]),
+    ];
+    // Every person is one node whose timeline holds all of its versions.
+    for (name, now_bio, others) in people {
+        let mut versions: Vec<(&str, i64, Option<i64>)> = others
+            .iter()
+            .map(|(bio, from, to)| (*bio, t + from * YEAR, to.map(|to| t + to * YEAR)))
+            .collect();
+        if let Some(bio) = now_bio {
+            versions.push((bio, t - YEAR / 2, Some(t + YEAR / 2)));
+            db.execute_cypher(&format!("CREATE (:Ref {{name: '{name}', bio: '{bio}'}})"))
+                .expect("reference node");
+        }
+        versions.sort_by_key(|(_, from, _)| *from);
+        let (bio, from, to) = versions[0];
+        let to_clause = to.map_or(String::new(), |to| format!(", valid_to: {to}"));
+        let rows = db
+            .execute_cypher(&format!(
+                "CREATE (n:Emp {{name: '{name}', bio: '{bio}', valid_from: {from}{to_clause}}}) RETURN n"
+            ))
+            .expect("first version");
+        let id = match rows[0].get("n") {
+            Some(Value::Int(id)) => *id as u64,
+            other => panic!("node id: {other:?}"),
+        };
+        for (bio, from, to) in &versions[1..] {
+            seed_version(&db, id, &[("name", name), ("bio", bio)], *from, *to);
+        }
+    }
+    let scores = |db: &mut Database, label: &str, word: &str| -> Vec<(Value, Value)> {
+        db.execute_cypher(&format!(
+            "MATCH (n:{label}) WHERE text_match(n.bio, '{word}') \
+             RETURN n.name AS name, text_score(n.bio, '{word}') AS score ORDER BY name"
+        ))
+        .expect("search")
+        .iter()
+        .map(|r| (r["name"].clone(), r["score"].clone()))
+        .collect()
+    };
+    for word in ["rust", "graph", "engine", "storage"] {
+        assert_eq!(
+            scores(&mut db, "Emp", word),
+            scores(&mut db, "Ref", word),
+            "scores for '{word}'"
+        );
+    }
 }

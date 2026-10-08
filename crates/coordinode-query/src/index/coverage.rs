@@ -112,7 +112,7 @@ impl IndexCoverage {
                 events
                     .iter()
                     .flat_map(|keys| keys.iter())
-                    .filter_map(|key| coordinode_core::graph::node::decode_node_key(key))
+                    .filter_map(|key| coordinode_core::graph::node::decode_written_node(key))
                     .filter(|(shard, _)| *shard == shard_id)
                     .map(|(_, id)| id)
                     .collect(),

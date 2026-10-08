@@ -15,6 +15,7 @@ pub mod pending;
 pub mod scratch_dir;
 pub mod segment_registry;
 pub mod tokenize;
+pub mod validity;
 
 use std::path::Path;
 use std::sync::RwLock;

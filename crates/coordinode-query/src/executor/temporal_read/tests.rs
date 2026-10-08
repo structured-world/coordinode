@@ -131,5 +131,65 @@ fn overlapping_versions_give_one_state() {
 /// An empty timeline has no state at any instant.
 #[test]
 fn an_empty_timeline_is_absent() {
-    assert_eq!(state_at(Vec::new(), 0, FIELDS), StateAt::Absent);
+    let empty = Vec::<(i64, NodeRecord)>::new;
+    assert_eq!(state_at(empty(), 0, FIELDS), StateAt::Absent);
+    let span = state_span(empty(), 0, FIELDS);
+    assert_eq!((span.from, span.until), (None, None), "absent forever");
+}
+
+/// The span around an instant is where the state stays the same: every
+/// instant inside it has that state, and on a well-formed timeline the
+/// instants just outside it have another one.
+#[test]
+fn a_span_is_exactly_where_the_state_holds() {
+    let timelines = [
+        vec![(10, version("a", Some(20))), (20, version("b", None))],
+        vec![(10, version("a", Some(20))), (40, version("b", None))],
+        vec![(10, version("a", Some(40))), (20, version("b", Some(30)))],
+        vec![(10, version("a", Some(20))), (20, tombstone())],
+        vec![(10, version("a", None))],
+        vec![(10, version("a", Some(20)))],
+    ];
+    for timeline in timelines {
+        for at in 0..50 {
+            let span = state_span(timeline.clone(), at, FIELDS);
+            assert_eq!(span.state, state_at(timeline.clone(), at, FIELDS));
+            let from = span.from.unwrap_or(0).max(0);
+            let until = span.until.unwrap_or(50).min(50);
+            assert!(from <= at && at < until, "{at} in [{from}, {until})");
+            for inside in from..until {
+                assert_eq!(
+                    state_at(timeline.clone(), inside, FIELDS),
+                    span.state,
+                    "{inside} inside the span of {at}"
+                );
+            }
+            if let Some(from) = span.from.filter(|f| *f > 0) {
+                assert_ne!(state_at(timeline.clone(), from - 1, FIELDS), span.state);
+            }
+            if let Some(until) = span.until.filter(|u| *u < 50) {
+                assert_ne!(state_at(timeline.clone(), until, FIELDS), span.state);
+            }
+        }
+    }
+}
+
+/// A version that ended before the instant leaves the node absent from its
+/// end until the next version, and a node before its first version is
+/// absent since forever.
+#[test]
+fn absence_is_bounded_by_the_versions_around_it() {
+    let timeline = || vec![(10, version("a", Some(20))), (40, version("b", None))];
+    let gap = state_span(timeline(), 30, FIELDS);
+    assert_eq!(
+        (gap.state, gap.from, gap.until),
+        (StateAt::Absent, Some(20), Some(40))
+    );
+    let before = state_span(timeline(), 5, FIELDS);
+    assert_eq!(
+        (before.state, before.from, before.until),
+        (StateAt::Absent, None, Some(10))
+    );
+    let last = state_span(timeline(), 45, FIELDS);
+    assert_eq!((last.from, last.until), (Some(40), None));
 }

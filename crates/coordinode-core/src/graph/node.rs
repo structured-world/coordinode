@@ -476,6 +476,13 @@ pub fn decode_temporal_node_key(key: &[u8]) -> Option<(u16, NodeId, i64)> {
     Some((shard_id, NodeId(node_id), valid_from))
 }
 
+/// The `(shard_id, node_id)` a node row's key belongs to, in either form: the
+/// node's own key or one version of a temporal node.
+pub fn decode_written_node(key: &[u8]) -> Option<(u16, NodeId)> {
+    decode_node_key(key)
+        .or_else(|| decode_temporal_node_key(key).map(|(shard_id, node_id, _)| (shard_id, node_id)))
+}
+
 /// Prefix matching every version of a given temporal `node_id` within a
 /// shard: `node:<shard>:<node_id>:`. Use for full-version enumeration on a
 /// temporal label (e.g. AS-OF reads, version history, post-delete invariant

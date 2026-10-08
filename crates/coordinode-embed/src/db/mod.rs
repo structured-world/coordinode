@@ -1506,7 +1506,12 @@ impl Database {
             for property in &def.properties {
                 let rebuilt = registry.rebuild_index(&def.label, property, || {
                     coordinode_query::index::text_registry::stored_texts(
-                        engine, shard_id, interner, &def.label, property,
+                        engine,
+                        shard_id,
+                        interner,
+                        &def.label,
+                        property,
+                        coordinode_query::executor::runner::wall_clock_us(),
                     )
                 });
                 match rebuilt {
@@ -3494,18 +3499,22 @@ impl Database {
         &self.text_index_registry
     }
 
-    /// What a search of the text index of `(label, property)` reads now: the
-    /// index together with the committed writes it has not folded yet, read
-    /// from the store. `Ok(None)` when there is no such index.
+    /// Search the text index of `(label, property)` as the store stands now:
+    /// the index together with the committed writes it has not folded yet,
+    /// read from the store, and temporal nodes at their state valid now.
+    /// `Ok(None)` when there is no such index.
     ///
     /// # Errors
     ///
-    /// The field dictionary or the written nodes could not be read.
-    pub fn text_view(
+    /// The field dictionary or the written nodes could not be read, or the
+    /// query not run.
+    pub fn text_search(
         &self,
         label: &str,
         property: &str,
-    ) -> Result<Option<coordinode_query::index::text_registry::TextView>, DatabaseError> {
+        request: coordinode_search::tantivy::multi_lang::TextRequest<'_>,
+        matches: coordinode_search::tantivy::pending::Matches,
+    ) -> Result<Option<Vec<coordinode_search::tantivy::HighlightedResult>>, DatabaseError> {
         let interner = self.fields.current()?;
         // The latest applied state, as the text worker reads it.
         let read = coordinode_storage::engine::transaction::Transaction::new(
@@ -3515,13 +3524,16 @@ impl Database {
             None,
         );
         self.text_index_registry
-            .view(
+            .find(
                 label,
                 property,
                 &read,
                 self.shard_id,
                 &interner,
                 coordinode_query::index::IndexDelta::Nodes(Default::default()),
+                coordinode_query::executor::runner::wall_clock_us(),
+                request,
+                matches,
             )
             .map_err(DatabaseError::Other)
     }

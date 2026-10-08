@@ -676,6 +676,23 @@ fn temporal_node_key_disjoint_from_non_temporal() {
     );
 }
 
+/// A write to either key form names its node: a reader that follows writes
+/// by key misses no temporal version.
+#[test]
+fn either_key_form_names_its_node() {
+    let nid = NodeId(99);
+    assert_eq!(
+        decode_written_node(&encode_node_key(5, nid)),
+        Some((5, nid))
+    );
+    assert_eq!(
+        decode_written_node(&encode_temporal_node_key(5, nid, -100)),
+        Some((5, nid))
+    );
+    assert_eq!(decode_written_node(b"node:xx"), None);
+    assert_eq!(decode_written_node(&encode_node_key(5, nid)[..15]), None);
+}
+
 #[test]
 fn node_write_key_picks_correct_form() {
     let nid = NodeId(42);

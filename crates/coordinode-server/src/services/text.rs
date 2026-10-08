@@ -149,29 +149,23 @@ impl TextServiceImpl {
         for property in &indexed_properties {
             // The index together with the committed writes it has not folded
             // yet, which are read from the store: nothing waits on the index.
-            let view = match db.text_view(&req.label, property) {
-                Ok(Some(view)) => view,
+            let results = match db.text_search(
+                &req.label,
+                property,
+                request,
+                Matches::Top(per_property_limit),
+            ) {
+                Ok(Some(results)) => results,
                 Ok(None) => continue,
                 Err(e) => return Err(Status::internal(format!("text_search: {e}"))),
             };
-            match view.find(request, Matches::Top(per_property_limit)) {
-                Ok(results) => {
-                    for r in results {
-                        let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
-                        if r.score > *current {
-                            *current = r.score;
-                            if !r.snippet_html.is_empty() {
-                                node_snippets.insert(r.node_id, r.snippet_html);
-                            }
-                        }
+            for r in results {
+                let current = node_scores.entry(r.node_id).or_insert(0.0_f32);
+                if r.score > *current {
+                    *current = r.score;
+                    if !r.snippet_html.is_empty() {
+                        node_snippets.insert(r.node_id, r.snippet_html);
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        label = %req.label,
-                        property = %property,
-                        "text_search error: {e}"
-                    );
                 }
             }
         }
