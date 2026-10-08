@@ -336,6 +336,10 @@ pub struct RaftProposalPipeline {
     /// before the write reaches the log: a log append that hit a full disk
     /// would fail its fsync and stop consensus for good.
     space: Option<Arc<coordinode_storage::engine::space::SpaceGuard>>,
+    /// The store whose commits this leader stamps each entry's closed bound
+    /// from (see [`crate::closure`]). Without it entries carry no bound, and
+    /// a member applying them can vouch for no cut of the log.
+    closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
 }
 
 impl RaftProposalPipeline {
@@ -348,7 +352,52 @@ impl RaftProposalPipeline {
             append_notifier: None,
             version: None,
             space: None,
+            closure: None,
         }
+    }
+
+    /// Stamp every entry with the closed bound of `engine`'s commits, the
+    /// store the group replicates.
+    pub fn with_closure(
+        mut self,
+        engine: Arc<coordinode_storage::engine::core::StorageEngine>,
+    ) -> Self {
+        self.closure = Some(engine);
+        self
+    }
+
+    /// `proposal` as the entry this leader hands to the log, stamped with
+    /// its closed bound, and a hold on the proposal's timestamp to keep
+    /// until the entry is handed over, for a hand-over in another task.
+    /// `attempt` counts the hand-overs of this proposal before this one.
+    async fn entry(
+        &self,
+        proposal: &RaftProposal,
+        attempt: u32,
+    ) -> Result<
+        (
+            Request,
+            Option<coordinode_storage::engine::pending::Unlogged>,
+        ),
+        ProposalError,
+    > {
+        let mut request = Request::single(proposal.clone());
+        let Some(engine) = &self.closure else {
+            return Ok((request, None));
+        };
+        match crate::closure::stamp(&self.raft, engine, &mut request).await {
+            Ok(()) => {}
+            // An earlier attempt is in the log, where it may commit or has:
+            // these refusals mean nothing was written only for a first one.
+            Err(ProposalError::BelowClosedBound { .. } | ProposalError::LeaderNotReady { .. })
+                if attempt > 0 =>
+            {
+                return Err(ProposalError::Timeout { retries: attempt });
+            }
+            Err(e) => return Err(e),
+        }
+        let hold = engine.pending_commits().hold(proposal.commit_ts.as_raw());
+        Ok((request, Some(hold)))
     }
 
     /// Refuse writes whenever `gate` says this member does not run its
@@ -399,6 +448,7 @@ impl RaftProposalPipeline {
             append_notifier: None,
             version: None,
             space: None,
+            closure: None,
         }
     }
 
@@ -455,10 +505,13 @@ impl RaftProposalPipeline {
         }
         let _permit = self.admit(proposal, 0).await?;
         let raft = Arc::clone(&self.raft);
-        let request = Request::single(proposal.clone());
+        let (request, hold) = self.entry(proposal, 0).await?;
         let id = proposal.id;
         self.spawn_handle()?.spawn(async move {
-            if let Err(e) = raft.client_write(request).await {
+            let written = raft.client_write(request).await;
+            // Handed to the log (or refused) by now.
+            drop(hold);
+            if let Err(e) = written {
                 tracing::warn!(proposal_id = %id, error = %e, "w:0 write did not commit");
             }
         });
@@ -507,10 +560,13 @@ impl RaftProposalPipeline {
         let mut appended = notifier.subscribe(proposal.id);
         let _permit = self.admit(proposal, 0).await?;
         let raft = Arc::clone(&self.raft);
-        let request = Request::single(proposal.clone());
-        let mut commit = self
-            .spawn_handle()?
-            .spawn(async move { raft.client_write(request).await });
+        let (request, hold) = self.entry(proposal, 0).await?;
+        let mut commit = self.spawn_handle()?.spawn(async move {
+            let written = raft.client_write(request).await;
+            // Handed to the log (or refused) by now.
+            drop(hold);
+            written
+        });
 
         // The entry's index: from the local append, or from the commit if
         // that lands first (a one-member group commits on append).
@@ -603,7 +659,6 @@ impl RaftProposalPipeline {
     ) -> Result<ProposalOutcome, ProposalError> {
         check_proposal(proposal)?;
         self.check_admission()?;
-        let request = Request::single(proposal.clone());
         let start = std::time::Instant::now();
 
         for attempt in 0..MAX_RETRIES {
@@ -615,9 +670,10 @@ impl RaftProposalPipeline {
             // backpressure from regular mutation proposals.
             let _permit = self.admit(proposal, attempt).await?;
 
-            // Submit to Raft with timeout
-            let result =
-                tokio::time::timeout(timeout, self.raft.client_write(request.clone())).await;
+            // Stamped per attempt: a retry is a new hand-over. The caller's
+            // own hold covers the timestamp until this returns.
+            let (request, _hold) = self.entry(proposal, attempt).await?;
+            let result = tokio::time::timeout(timeout, self.raft.client_write(request)).await;
 
             match result {
                 Ok(Ok(response)) => {

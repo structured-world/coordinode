@@ -122,10 +122,10 @@ impl VectorBuild<'_> {
                 return Ok(BuildOutcome::Cancelled);
             }
             self.hand_over();
-            // Every write below this snapshot landed before the take below:
-            // in the scan or in the tap. The last timestamp it covers is the
-            // freshness the indexes have once that take is folded.
-            let fresh = self.engine.snapshot().checked_sub(1);
+            // Every write at or below this cut landed before the take below:
+            // in the scan or in the tap. It is the freshness the indexes have
+            // once that take is folded.
+            let fresh = self.engine.complete_cut();
             match tap.take() {
                 // The partition was cleared or range-deleted: what it lost is
                 // not listed, so start over from a fresh snapshot, which puts

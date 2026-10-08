@@ -114,9 +114,20 @@ impl WaitForMajorityService {
     /// The drain task runs on the tokio runtime, collecting proposals
     /// from the channel and submitting batched Raft entries.
     pub fn spawn(raft: Arc<RaftInstance>, rate_limiter: RateLimiter, config: BatchConfig) -> Self {
+        Self::spawn_stamping(raft, rate_limiter, config, None)
+    }
+
+    /// [`Self::spawn`], stamping every batched entry with the closed bound
+    /// of `closure`'s commits when given (see [`crate::closure`]).
+    pub fn spawn_stamping(
+        raft: Arc<RaftInstance>,
+        rate_limiter: RateLimiter,
+        config: BatchConfig,
+        closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
 
-        let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config));
+        let handle = tokio::spawn(drain_loop(raft, rate_limiter, rx, config, closure));
 
         Self {
             tx,
@@ -200,6 +211,7 @@ async fn drain_loop(
     rate_limiter: RateLimiter,
     mut rx: mpsc::Receiver<BatchEntry>,
     config: BatchConfig,
+    closure: Option<Arc<coordinode_storage::engine::core::StorageEngine>>,
 ) {
     loop {
         // Step 1: Wait for the first proposal (blocks until work arrives).
@@ -247,7 +259,7 @@ async fn drain_loop(
 
         // Submit bypass batch (if any) — no rate limiter.
         if !bypass.is_empty() {
-            submit_batch(&raft, bypass, "bypass").await;
+            submit_batch(&raft, closure.as_deref(), bypass, "bypass").await;
         }
 
         // Submit normal batch (if any) — with rate limiter.
@@ -262,7 +274,7 @@ async fn drain_loop(
                     return;
                 }
             };
-            submit_batch(&raft, normal, "normal").await;
+            submit_batch(&raft, closure.as_deref(), normal, "normal").await;
         }
     }
 }
@@ -283,7 +295,12 @@ const BATCH_MAX_RETRIES: u32 = 3;
 ///
 /// Matches the retry strategy of `RaftProposalPipeline::propose_async`
 /// but applied at the batch level: one retry loop for N proposals.
-async fn submit_batch(raft: &RaftInstance, batch: Vec<BatchEntry>, kind: &str) {
+async fn submit_batch(
+    raft: &RaftInstance,
+    closure: Option<&coordinode_storage::engine::core::StorageEngine>,
+    batch: Vec<BatchEntry>,
+    kind: &str,
+) {
     let batch_size = batch.len();
     let proposals: Vec<RaftProposal> = batch.iter().map(|e| e.proposal.clone()).collect();
 
@@ -296,7 +313,29 @@ async fn submit_batch(raft: &RaftInstance, batch: Vec<BatchEntry>, kind: &str) {
 
     for attempt in 0..BATCH_MAX_RETRIES {
         let timeout = BATCH_BASE_TIMEOUT * (1 << attempt);
-        let request = Request::batch(proposals.clone());
+        let mut request = Request::batch(proposals.clone());
+        // Each submitter holds its timestamp until its submission returns,
+        // which is after this hand-over.
+        if let Some(engine) = closure {
+            if let Err(e) = crate::closure::stamp(raft, engine, &mut request).await {
+                // An earlier attempt is in the log, where it may commit or
+                // has: these refusals mean nothing was written only for a
+                // first one.
+                let e = match e {
+                    ProposalError::BelowClosedBound { .. }
+                    | ProposalError::LeaderNotReady { .. }
+                        if attempt > 0 =>
+                    {
+                        ProposalError::Timeout { retries: attempt }
+                    }
+                    e => e,
+                };
+                for entry in batch {
+                    let _ = entry.response_tx.send(Err(e.clone()));
+                }
+                return;
+            }
+        }
 
         let result = tokio::time::timeout(timeout, raft.client_write(request)).await;
 

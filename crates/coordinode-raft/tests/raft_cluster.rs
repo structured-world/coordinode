@@ -5268,3 +5268,640 @@ async fn kept_cardinality_counts_are_the_same_on_every_member() {
         "TIMED OUT: kept_cardinality_counts_are_the_same_on_every_member"
     );
 }
+
+// ── Closed bound ────────────────────────────────────────────────────
+
+/// A store opened with a clock of its own, which the leader stamps each
+/// entry's closed bound from.
+fn clocked_engine(
+    dir: &std::path::Path,
+) -> (
+    Arc<StorageEngine>,
+    Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+) {
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir,
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    (engine, oracle)
+}
+
+/// Propose one node write through `node`'s pipeline at a timestamp taken
+/// from `engine`'s clock and held as not yet logged until it is handed over,
+/// as a commit does; the timestamp.
+fn propose_held(
+    node: &RaftNode,
+    engine: &StorageEngine,
+    oracle: &coordinode_core::txn::timestamp::TimestampOracle,
+    key: &[u8],
+) -> u64 {
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let ids = ProposalIdGenerator::new();
+    node.pipeline()
+        .propose_and_wait(&RaftProposal {
+            id: ids.next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: key.to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts),
+            bypass_rate_limiter: false,
+        })
+        .expect("propose");
+    drop(held);
+    ts
+}
+
+/// A member whose store carries its own clock.
+struct Clocked {
+    id: u64,
+    node: RaftNode,
+    engine: Arc<StorageEngine>,
+    oracle: Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+    port: u16,
+}
+
+/// Open member `id` over `dir` on `port`: the first member of a new group
+/// initialises it, a restarted member resumes, any other one waits to be
+/// added. A port freed by a stopped member may be taken by another test for
+/// a moment, so the bind is retried.
+async fn open_clocked(id: u64, dir: &std::path::Path, port: u16, joining: bool) -> Clocked {
+    let (engine, oracle) = clocked_engine(dir);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+    let mut opened = None;
+    let mut last = None;
+    for _ in 0..20 {
+        let attempt = if joining {
+            RaftNode::open_joining(id, Arc::clone(&engine), addr).await
+        } else {
+            RaftNode::open_cluster(
+                id,
+                Arc::clone(&engine),
+                addr,
+                format!("http://127.0.0.1:{port}"),
+            )
+            .await
+        };
+        match attempt {
+            Ok(node) => {
+                opened = Some(node);
+                break;
+            }
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    let node = opened.unwrap_or_else(|| unreachable!("open member {id}: {last:?}"));
+    Clocked {
+        id,
+        node,
+        engine,
+        oracle,
+        port,
+    }
+}
+
+/// A group of one member per directory, the first leading.
+async fn clocked_group(dirs: &[tempfile::TempDir]) -> Vec<Clocked> {
+    let mut members = Vec::new();
+    for (i, dir) in dirs.iter().enumerate() {
+        let id = i as u64 + 1;
+        members.push(open_clocked(id, dir.path(), alloc_port(), i > 0).await);
+    }
+    await_leadership(&members[0].node).await;
+    for m in &members[1..] {
+        members[0]
+            .node
+            .add_node(m.id, format!("http://127.0.0.1:{}", m.port))
+            .await
+            .expect("add member");
+    }
+    members[0]
+        .node
+        .change_membership(members.iter().map(|m| m.id).collect::<Vec<_>>())
+        .await
+        .expect("membership");
+    members
+}
+
+/// The index of the member that leads and may stamp entries.
+async fn await_ready_leader(members: &[Clocked]) -> usize {
+    for _ in 0..150 {
+        for (i, m) in members.iter().enumerate() {
+            if m.node.is_leader().await {
+                return i;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    unreachable!("no member became leader")
+}
+
+/// Wait until every member's closed bound passes `ts`.
+async fn await_closed_past(members: &[Clocked], ts: u64, what: &str) {
+    await_condition(Duration::from_secs(15), what, || {
+        members.iter().all(|m| m.engine.closure_frontier() > ts)
+    })
+    .await;
+}
+
+/// A write's key, timestamp and outcome.
+type Written = (Vec<u8>, u64, Result<(), ProposalError>);
+
+/// Hand `count` writes to `leader`'s log from tasks of their own, each with
+/// a timestamp held as not yet logged until its proposal returns. The
+/// handles yield each write's key, timestamp and outcome.
+fn spawn_writes(
+    leader: &Clocked,
+    prefix: &str,
+    count: usize,
+) -> Vec<tokio::task::JoinHandle<Written>> {
+    let pipeline = Arc::new(leader.node.pipeline());
+    let ids = Arc::new(ProposalIdGenerator::with_base(leader.id << 48));
+    (0..count)
+        .map(|i| {
+            let (ts, held) = leader
+                .engine
+                .pending_commits()
+                .obligate(|| leader.oracle.next().as_raw());
+            let key = format!("node:{prefix}-{i}").into_bytes();
+            let pipeline = Arc::clone(&pipeline);
+            let ids = Arc::clone(&ids);
+            tokio::task::spawn_blocking(move || {
+                let outcome = pipeline
+                    .propose_and_wait(&RaftProposal {
+                        id: ids.next(),
+                        mutations: vec![Mutation::Put {
+                            partition: PartitionId::Node,
+                            key: key.clone(),
+                            value: b"v".to_vec(),
+                        }],
+                        commit_ts: Timestamp::from_raw(ts),
+                        start_ts: Timestamp::from_raw(ts),
+                        bypass_rate_limiter: false,
+                    })
+                    .map(|_| ());
+                drop(held);
+                (key, ts, outcome)
+            })
+        })
+        .collect()
+}
+
+/// A write refused as below the bound or before the leader was ready was
+/// never written; anything else may have been.
+fn is_refusal(outcome: &Result<(), ProposalError>) -> bool {
+    matches!(
+        outcome,
+        Err(ProposalError::BelowClosedBound { .. } | ProposalError::LeaderNotReady { .. })
+    )
+}
+
+/// The writes of a burst every member holds, once each member's bound is
+/// past all of them: the same set everywhere.
+fn agreed_writes(members: &[Clocked], keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let held = |m: &Clocked| {
+        keys.iter()
+            .filter(|k| m.engine.get(Partition::Node, k).expect("read").is_some())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let first = held(&members[0]);
+    for m in &members[1..] {
+        assert_eq!(held(m), first, "member {} holds other writes", m.id);
+    }
+    first
+}
+
+/// A leader that stops with writes handed to its log and not yet applied
+/// everywhere: the next leader stamps nothing until it applied its own
+/// term's first entry, so no member's bound moves back or passes a write it
+/// then applies, every member ends with the same writes, a write whose
+/// commit was confirmed is among them, and a write refused as never written
+/// is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_change_keeps_the_bound_over_an_unapplied_prefix() {
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let mut members = clocked_group(&dirs).await;
+        let first = propose_held(
+            &members[0].node,
+            &members[0].engine,
+            &members[0].oracle,
+            b"node:settled",
+        );
+        await_closed_past(&members, first, "every member closes past the first write").await;
+
+        // A burst in flight when the leader stops: some of it committed,
+        // some only in its log, some never handed over.
+        let burst = spawn_writes(&members[0], "burst", 16);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let old = members.remove(0);
+        old.node.shutdown().await.expect("stop the leader");
+        let mut outcomes = Vec::new();
+        for write in burst {
+            outcomes.push(write.await.expect("write task"));
+        }
+        drop(old);
+        let before: Vec<u64> = members
+            .iter()
+            .map(|m| m.engine.closure_frontier())
+            .collect();
+
+        let leader = await_ready_leader(&members).await;
+        let after = propose_held(
+            &members[leader].node,
+            &members[leader].engine,
+            &members[leader].oracle,
+            b"node:after",
+        );
+        let top = outcomes.iter().map(|(_, ts, _)| *ts).max().unwrap_or(0);
+        await_closed_past(
+            &members,
+            after.max(top),
+            "the survivors close past the burst",
+        )
+        .await;
+        for (m, was) in members.iter().zip(&before) {
+            assert!(
+                m.engine.closure_frontier() >= *was,
+                "member {} moved its bound back",
+                m.id
+            );
+        }
+
+        let keys: Vec<_> = outcomes.iter().map(|(k, _, _)| k.clone()).collect();
+        let held = agreed_writes(&members, &keys);
+        for (key, ts, outcome) in &outcomes {
+            if outcome.is_ok() {
+                assert!(held.contains(key), "a confirmed write at {ts} is gone");
+            }
+            if is_refusal(outcome) {
+                assert!(!held.contains(key), "a refused write at {ts} landed");
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_leader_change_keeps_the_bound_over_an_unapplied_prefix"
+    );
+}
+
+/// A write whose answer is lost (its leader stops with the write in its log
+/// and no quorum to commit it) is not a refusal: the group restarted either
+/// commits it or drops it, every member agrees which, and every bound
+/// passes its timestamp either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_whose_answer_is_lost_is_settled_the_same_everywhere() {
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let mut members = clocked_group(&dirs).await;
+        let first = propose_held(
+            &members[0].node,
+            &members[0].engine,
+            &members[0].oracle,
+            b"node:settled",
+        );
+        await_closed_past(&members, first, "every member closes past the first write").await;
+
+        // The leader loses its quorum, takes a write into its log alone,
+        // and stops before anyone answers.
+        let ports: Vec<u16> = members.iter().map(|m| m.port).collect();
+        for m in members.drain(1..) {
+            m.node.shutdown().await.expect("stop a follower");
+        }
+        let appended = members[0]
+            .node
+            .raft()
+            .metrics()
+            .borrow_watched()
+            .last_log_index;
+        let lost = spawn_writes(&members[0], "lost", 1);
+        await_condition(Duration::from_secs(5), "the write reaches the log", || {
+            members[0]
+                .node
+                .raft()
+                .metrics()
+                .borrow_watched()
+                .last_log_index
+                > appended
+        })
+        .await;
+        let leader = members.remove(0);
+        leader.node.shutdown().await.expect("stop the leader");
+        let (key, ts, outcome) = lost
+            .into_iter()
+            .next()
+            .expect("one write")
+            .await
+            .expect("task");
+        drop(leader);
+        assert!(
+            outcome.is_err() && !is_refusal(&outcome),
+            "a write in the log with no answer is neither confirmed nor refused: {outcome:?}"
+        );
+
+        let mut members = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            members.push(open_clocked(i as u64 + 1, dir.path(), ports[i], false).await);
+        }
+        let leader = await_ready_leader(&members).await;
+        let after = propose_held(
+            &members[leader].node,
+            &members[leader].engine,
+            &members[leader].oracle,
+            b"node:after",
+        );
+        await_closed_past(
+            &members,
+            after.max(ts),
+            "the restarted group closes past the write",
+        )
+        .await;
+        agreed_writes(&members, &[key]);
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_write_whose_answer_is_lost_is_settled_the_same_everywhere"
+    );
+}
+
+/// A member caught up by a snapshot holds the bound of the entries the
+/// snapshot covers, on an idle group where no later entry carries one, and
+/// keeps it across its restart, its clock resuming above it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_carries_the_closed_bound_across_install_and_restart() {
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let mut members = clocked_group(&dirs).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let lagging = members.pop().expect("third member");
+        let port = lagging.port;
+        lagging.node.shutdown().await.expect("stop member 3");
+        drop(lagging);
+
+        let mut last = 0;
+        for i in 0..5 {
+            last = propose_held(
+                &members[0].node,
+                &members[0].engine,
+                &members[0].oracle,
+                format!("node:snap-{i}").as_bytes(),
+            );
+        }
+        await_closed_past(&members, last, "the two members close past the writes").await;
+        let applied = members[0].node.applied_index();
+        members[0]
+            .node
+            .raft()
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger snapshot");
+        await_condition(Duration::from_secs(10), "leader snapshot", || {
+            members[0]
+                .node
+                .raft()
+                .metrics()
+                .borrow_watched()
+                .snapshot
+                .is_some_and(|id| id.index >= applied)
+        })
+        .await;
+        members[0]
+            .node
+            .raft()
+            .trigger()
+            .purge_log(applied)
+            .await
+            .expect("trigger purge");
+        await_condition(Duration::from_secs(10), "leader purges its log", || {
+            members[0]
+                .node
+                .raft()
+                .metrics()
+                .borrow_watched()
+                .purged
+                .is_some_and(|id| id.index >= applied)
+        })
+        .await;
+
+        let back = open_clocked(3, dirs[2].path(), port, false).await;
+        await_condition(
+            Duration::from_secs(20),
+            "member 3 installs the snapshot",
+            || {
+                back.node
+                    .raft()
+                    .metrics()
+                    .borrow_watched()
+                    .snapshot
+                    .is_some_and(|id| id.index >= applied)
+            },
+        )
+        .await;
+        assert!(
+            back.engine.closure_frontier() > last,
+            "the installed bound {} is not past the snapshot's last write {last}",
+            back.engine.closure_frontier()
+        );
+        let installed = back.engine.closure_frontier();
+        back.node.shutdown().await.expect("stop member 3");
+        drop(back);
+        let back = open_clocked(3, dirs[2].path(), port, false).await;
+        assert!(
+            back.engine.closure_frontier() >= installed,
+            "reopened at {} below the installed {installed}",
+            back.engine.closure_frontier()
+        );
+        assert!(
+            back.oracle.next().as_raw() >= installed,
+            "the clock resumes at or above the bound"
+        );
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_snapshot_carries_the_closed_bound_across_install_and_restart"
+    );
+}
+
+/// An idle group still tells its members the last commit landed: the entry
+/// carrying a commit stops its bound below that commit, and with nothing
+/// written after it the leader appends a closing entry, so a follower's
+/// closed bound passes the commit with no further write.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_group_closes_past_its_last_commit() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let (p1, p2) = (alloc_port(), alloc_port());
+        let (d1, d2) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let (e1, o1) = clocked_engine(d1.path());
+        let (e2, _o2) = clocked_engine(d2.path());
+        let n1 = RaftNode::open_cluster(
+            1,
+            Arc::clone(&e1),
+            format!("127.0.0.1:{p1}").parse().expect("addr"),
+            format!("http://127.0.0.1:{p1}"),
+        )
+        .await
+        .expect("leader");
+        let _n2 = RaftNode::open_joining(
+            2,
+            Arc::clone(&e2),
+            format!("127.0.0.1:{p2}").parse().expect("addr"),
+        )
+        .await
+        .expect("follower");
+        await_leadership(&n1).await;
+        n1.add_node(2, format!("http://127.0.0.1:{p2}"))
+            .await
+            .expect("add 2");
+        n1.change_membership(vec![1, 2]).await.expect("membership");
+
+        let ts = propose_held(&n1, &e1, &o1, b"node:closed");
+        let mut passed = false;
+        for _ in 0..100 {
+            if e2.closure_frontier() > ts {
+                passed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            passed,
+            "the follower's closed bound {} never passed the last commit {ts}",
+            e2.closure_frontier()
+        );
+        assert!(e2.complete_cut().is_some_and(|cut| cut >= ts));
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: an_idle_group_closes_past_its_last_commit"
+    );
+}
+
+/// A timestamp taken below a closed bound already in the log is refused
+/// before anything is proposed: an entry before it promised that no commit
+/// below the bound follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timestamp_below_the_closed_bound_is_refused() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, oracle) = clocked_engine(dir.path());
+        let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+            .await
+            .expect("open");
+        await_leadership(&node).await;
+        let ts = propose_held(&node, &engine, &oracle, b"node:first");
+        for _ in 0..100 {
+            if engine.closure_frontier() > ts {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let closed = engine.closure_frontier();
+        assert!(closed > ts, "the bound passed the commit");
+
+        let refused = node.pipeline().propose_and_wait(&RaftProposal {
+            id: ProposalIdGenerator::new().next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: b"node:late".to_vec(),
+                value: b"v".to_vec(),
+            }],
+            commit_ts: Timestamp::from_raw(ts),
+            start_ts: Timestamp::from_raw(ts),
+            bypass_rate_limiter: false,
+        });
+        assert!(
+            matches!(refused, Err(ProposalError::BelowClosedBound { commit_ts, closed_below })
+                if commit_ts == ts && closed_below == closed),
+            "{refused:?}"
+        );
+        assert!(
+            engine
+                .get(Partition::Node, b"node:late")
+                .expect("read")
+                .is_none(),
+            "nothing of the refused proposal landed"
+        );
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: a_timestamp_below_the_closed_bound_is_refused"
+    );
+}
+
+/// The closed bound a node applied survives its restart: it is read back
+/// from the store, so the node claims no less and allocates nothing below
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_closed_bound_survives_a_restart() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = {
+            let (engine, oracle) = clocked_engine(dir.path());
+            let node =
+                RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+                    .await
+                    .expect("open");
+            await_leadership(&node).await;
+            let ts = propose_held(&node, &engine, &oracle, b"node:kept");
+            for _ in 0..100 {
+                if engine.closure_frontier() > ts {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let closed = engine.closure_frontier();
+            assert!(closed > ts);
+            node.shutdown().await.expect("shutdown");
+            drop(node);
+            drop(engine);
+            closed
+        };
+
+        let (engine, oracle) = clocked_engine(dir.path());
+        let _node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+            .await
+            .expect("reopen");
+        assert!(
+            engine.closure_frontier() >= closed,
+            "reopened at {} below {closed}",
+            engine.closure_frontier()
+        );
+        assert!(
+            oracle.next().as_raw() >= closed,
+            "the clock resumes at or above the bound"
+        );
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "TIMED OUT: the_closed_bound_survives_a_restart"
+    );
+}

@@ -7,7 +7,7 @@
 //! ~0.2 recall while the leader answered with full recall. The
 //! follower's HNSW index does not reflect the replicated data.
 
-#![allow(clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,8 +58,9 @@ async fn open_node(node_id: u64, port: u16, leader: bool) -> ClusterNode {
     };
     let node = Arc::new(node);
 
-    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> =
-        Arc::new(RaftProposalPipeline::new(Arc::clone(node.raft())));
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
+        RaftProposalPipeline::new(Arc::clone(node.raft())).with_closure(Arc::clone(&engine)),
+    );
     let db =
         Database::from_engine(dir.path(), Arc::clone(&engine), oracle.clone(), pipeline).unwrap();
 
@@ -585,5 +586,163 @@ async fn follower_text_search_follows_leader_commits() {
     assert!(
         text_hits(&mut n2.db, "abandoned").is_empty(),
         "the follower finds text of a rolled-back transaction"
+    );
+}
+
+/// A follower's vector freshness watermark is a fence: a write at or below
+/// it is in the index. The leader can hold a commit whose timestamp is
+/// allocated and not yet in the log while a later-stamped commit replicates
+/// ahead of it; the follower applies the later one first and must not claim
+/// the earlier timestamp, since the commit stamped with it may still arrive.
+/// Checked on the follower's index registry and on what its vector search
+/// RPC reports to a client (body and `coordinode-indexed-hlc` header).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
+    use coordinode_server::proto::query::vector_service_server::VectorService as _;
+    use coordinode_server::proto::query::{VectorSearchRequest, VectorSearchResponse};
+    use coordinode_server::services::vector::VectorServiceImpl;
+    use coordinode_storage::engine::partition::Partition;
+
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+    let mut n1 = open_node(1, p1, true).await;
+    let ClusterNode {
+        db: n2_db,
+        engine: n2_engine,
+        _node: _n2_node,
+        _dir: _n2_dir,
+        ..
+    } = open_node(2, p2, false).await;
+    let n2_db = Arc::new(parking_lot::RwLock::new(n2_db));
+    let n2_rpc = VectorServiceImpl::new(Arc::clone(&n2_db));
+    // The watermark a client is served: the response body and its header
+    // must agree.
+    let served = |resp: tonic::Response<VectorSearchResponse>| {
+        let header: u64 = resp
+            .metadata()
+            .get("coordinode-indexed-hlc")
+            .expect("indexed-hlc header present")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body = resp
+            .into_inner()
+            .index_health
+            .expect("the follower serves a managed index")
+            .indexed_hlc;
+        assert_eq!(header, body, "header and body disagree");
+        body
+    };
+    let search = || {
+        tonic::Request::new(VectorSearchRequest {
+            label: "Item".to_string(),
+            property: "embedding".to_string(),
+            query_vector: Some(coordinode_server::proto::common::Vector {
+                values: vec![0.0, 0.0],
+            }),
+            top_k: 1,
+            metric: 0,
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1._node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    n1._node.change_membership(vec![1, 2]).await.unwrap();
+
+    n1.db
+        .execute_cypher(
+            "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
+             OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 2}",
+        )
+        .unwrap();
+    n1.db
+        .execute_cypher("CREATE (:Item {ext_id: 0, embedding: [0.0, 0.0]})")
+        .unwrap();
+    let watermark = |db: &Database| {
+        db.vector_index_registry()
+            .health_handle("Item", "embedding")
+            .map(|h| h.indexed_hlc())
+    };
+    // The follower brings the replicated index live and folds the first
+    // write into it.
+    let mut settled = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        n2_db.read().refresh_vector_indexes().unwrap();
+        if watermark(&n2_db.read()).is_some_and(|w| w > 0) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the follower never folded the first write");
+
+    // A commit the leader has stamped and not yet proposed, as one between
+    // its admission and its proposal is.
+    let held_key = coordinode_core::graph::node::encode_node_key(
+        1,
+        coordinode_core::graph::node::NodeId::from_raw(u64::MAX - 1),
+    );
+    let (held_ts, held) = n1
+        .engine
+        .pending_commits()
+        .admit_allocated(
+            || n1.oracle.next().as_raw(),
+            vec![(Partition::Node, held_key)],
+            vec![],
+        )
+        .expect("admit the held commit");
+
+    // A later-stamped commit replicates and applies on the follower first.
+    n1.db
+        .execute_cypher("CREATE (:Item {ext_id: 1, embedding: [1.0, 1.0]})")
+        .unwrap();
+    let mut applied = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let found = n2_engine.prefix_scan(Partition::Node, b"").unwrap().count();
+        if found >= 2 {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the later commit never reached the follower");
+    // Long enough for the follower's worker to fold what it applied.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let claimed = watermark(&n2_db.read()).expect("the follower holds the index");
+    assert!(
+        claimed < held_ts,
+        "the follower claims {claimed}, at or past {held_ts}, which the leader's held commit is stamped with"
+    );
+    let reported = served(n2_rpc.vector_search(search()).await.unwrap());
+    assert!(
+        reported < held_ts,
+        "the follower's RPC reports {reported}, at or past the held commit {held_ts}"
+    );
+
+    // Once the held commit is gone the follower's watermark moves past it.
+    drop(held);
+    n1.db
+        .execute_cypher("CREATE (:Item {ext_id: 2, embedding: [2.0, 2.0]})")
+        .unwrap();
+    let mut passed = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if watermark(&n2_db.read()).is_some_and(|w| w >= held_ts) {
+            passed = true;
+            break;
+        }
+    }
+    assert!(
+        passed,
+        "the follower watermark never passed the released commit"
+    );
+    let reported = served(n2_rpc.vector_search(search()).await.unwrap());
+    assert!(
+        reported >= held_ts,
+        "the follower's RPC still reports {reported}, below the released commit {held_ts}"
     );
 }

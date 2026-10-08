@@ -135,13 +135,13 @@ impl Worker {
             let Some(first) = self.applied.next(None) else {
                 continue;
             };
-            // A complete snapshot: every commit below it has landed, and a
-            // commit offers its event before it becomes visible, so each of
-            // theirs is among the events offered by now. Once those are in
-            // the indexes, so is every write below the snapshot, whatever
-            // order the commits took their timestamps in; the cut is the last
-            // timestamp it covers.
-            let cut = self.engine.snapshot().checked_sub(1);
+            // A complete cut: every commit at or below it has landed here,
+            // and a commit offers its event before it becomes visible, so
+            // each of theirs is among the events offered by now. Once those
+            // are in the indexes, so is every write at or below the cut,
+            // whatever order the commits took their timestamps in or reached
+            // this member's log in.
+            let cut = self.engine.complete_cut();
             let offered = self.position.delivered();
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
             let mut replaced = false;

@@ -75,6 +75,12 @@ const DEDUP_GC_INTERVAL_SECS: u64 = 300;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
     pub proposals: Vec<RaftProposal>,
+    /// The leader's closed bound when it handed this entry to the log: every
+    /// commit timestamp below it is in an earlier entry or never will be.
+    /// `0` carries none (an entry handed over before the leader could vouch
+    /// for its term's prefix). Exclusive, so a reader at T may rely on it
+    /// only for `T < closed_below`.
+    pub closed_below: u64,
 }
 
 impl Request {
@@ -82,12 +88,26 @@ impl Request {
     pub fn single(proposal: RaftProposal) -> Self {
         Self {
             proposals: vec![proposal],
+            closed_below: 0,
         }
     }
 
     /// Create a request from a batch of proposals (coalesced path).
     pub fn batch(proposals: Vec<RaftProposal>) -> Self {
-        Self { proposals }
+        Self {
+            proposals,
+            closed_below: 0,
+        }
+    }
+
+    /// An entry carrying only a closed bound: what a leader appends when the
+    /// last entries it handed over left timestamps uncovered and nothing
+    /// else is coming to cover them.
+    pub fn closing(closed_below: u64) -> Self {
+        Self {
+            proposals: Vec::new(),
+            closed_below,
+        }
     }
 }
 
@@ -512,7 +532,8 @@ impl LogStore {
                     .map(|p| encode_proposal(p).map(|frame| OplogOp::Unit { frame }))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(io::Error::other)?;
-                let envelope = Entry::new_normal(entry.log_id, Request::batch(Vec::new()));
+                let envelope =
+                    Entry::new_normal(entry.log_id, Request::closing(request.closed_below));
                 (rmp_serde::to_vec(&envelope), units)
             }
             _ => (rmp_serde::to_vec(entry), Vec::new()),
@@ -1298,6 +1319,14 @@ impl CoordinodeStateMachine {
                 (None, None)
             }
         };
+        // The closed bound the trees hold; the entries replayed above the
+        // resume point raise it again as they apply.
+        engine
+            .reload_closure_frontier()
+            .map_err(|e| io::Error::other(format!("read the closed bound: {e}")))?;
+        if let (Some(oracle), Some(at)) = (&oracle, engine.closure_frontier().checked_sub(1)) {
+            oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
+        }
         // A capture a crash left behind belongs to no build.
         match std::fs::remove_dir_all(snapshot_capture_root(&engine)) {
             Ok(()) => {}
@@ -1576,6 +1605,50 @@ impl CoordinodeStateMachine {
         })
     }
 
+    /// Record `closed_below`, the bound entry `index` carries, after its
+    /// proposals: every commit stamped below it applied here before it.
+    ///
+    /// The record lands as position `sub` of the entry, with its coverage
+    /// marker like a proposal, so a replay skips it where the Schema tree
+    /// holds it and a snapshot carries it. It is written at `closed_below -
+    /// 1`, below every commit the bound leaves open and above every earlier
+    /// bound. The oracle is raised to the same value, so this node, once it
+    /// leads, stamps nothing at or below a bound a past leader handed out.
+    fn apply_closure(
+        &self,
+        closed_below: u64,
+        index: u64,
+        sub: u32,
+        applies: &RaftApplyState,
+    ) -> Result<(), io::Error> {
+        // `closed_below > 0` at the caller.
+        let at = closed_below - 1;
+        let replay = self
+            .replay_skip
+            .as_ref()
+            .filter(|_| index < self.skip_until);
+        self.engine
+            .apply_raft_proposal(
+                &[Mutation::Put {
+                    partition: coordinode_core::txn::proposal::PartitionId::Schema,
+                    key: coordinode_storage::engine::core::CLOSURE_KEY.to_vec(),
+                    value: coordinode_storage::engine::core::encode_closure(closed_below),
+                }],
+                at,
+                index,
+                sub,
+                |part| {
+                    applies.skips(part, index) || replay.is_some_and(|c| c.holds(part, index, sub))
+                },
+            )
+            .map_err(|e| io::Error::other(format!("record the closed bound: {e}")))?;
+        self.engine.raise_closure_frontier(closed_below);
+        if let Some(ref oracle) = self.oracle {
+            oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
+        }
+        Ok(())
+    }
+
     /// The log index openraft re-delivers from when this state machine opens:
     /// one past the position every partition tree is known to hold.
     pub fn next_to_apply(&self) -> Result<u64, io::Error> {
@@ -1727,6 +1800,12 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
                     }
                     if records_pair {
                         self.refresh_group_pair()?;
+                    }
+                    if request.closed_below > 0 {
+                        let sub = u32::try_from(request.proposals.len()).map_err(|_| {
+                            io::Error::other(format!("entry {index} carries over 2^32 proposals"))
+                        })?;
+                        self.apply_closure(request.closed_below, index, sub, &gate.applies)?;
                     }
                     Response {
                         mutations_applied: total,
@@ -1919,6 +1998,15 @@ impl RaftStateMachine<TypeConfig> for CoordinodeStateMachine {
         gate.applies.reset(next);
         gate.last = meta.last_log_id;
         self.refresh_group_pair()?;
+        // The snapshot carries the bound of the entries it holds.
+        self.engine
+            .reload_closure_frontier()
+            .map_err(|e| io::Error::other(format!("read the installed closed bound: {e}")))?;
+        if let Some(ref oracle) = self.oracle {
+            if let Some(at) = self.engine.closure_frontier().checked_sub(1) {
+                oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
+            }
+        }
 
         *self
             .last_applied

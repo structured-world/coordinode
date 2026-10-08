@@ -131,9 +131,12 @@ fn version_gate(
 fn spawn_version_watch(
     raft: Arc<RaftInstance>,
     gate: Arc<VersionGate>,
+    engine: Arc<StorageEngine>,
     oracle: Option<Arc<coordinode_core::txn::timestamp::TimestampOracle>>,
-    space: Arc<coordinode_storage::engine::space::SpaceGuard>,
-) -> tokio::task::JoinHandle<()> {
+) -> BackgroundTasks {
+    let closer =
+        crate::closure::spawn_closer(Arc::clone(&raft), Arc::clone(&engine), CLOSURE_SETTLE);
+    let space = Arc::clone(engine.space());
     // An engine opened without an oracle stamps writes from a counter; the
     // record then takes a wall-clock stamp of its own.
     let oracle =
@@ -141,7 +144,7 @@ fn spawn_version_watch(
     let ids = coordinode_core::txn::proposal::ProposalIdGenerator::with_base(
         coordinode_core::txn::proposal::fresh_proposal_id_base(),
     );
-    tokio::spawn(async move {
+    let watch = tokio::spawn(async move {
         use openraft::rt::watch::WatchReceiver;
         let mut metrics = raft.metrics();
         // The term this node last recorded its pair in, so a refused or
@@ -174,8 +177,23 @@ fn spawn_version_watch(
                 waits_for_space = recorded_in != Some(term) && !room;
                 if recorded_in != Some(term) && room {
                     if let Some(pair) = gate.pair_to_record() {
-                        let request = record_pair_request(pair, ids.next(), oracle.next());
-                        match raft.client_write(request).await {
+                        // Held as not yet logged until it is handed over, so
+                        // no entry's bound passes over it meanwhile.
+                        let (at, held) =
+                            engine.pending_commits().obligate(|| oracle.next().as_raw());
+                        let mut request = record_pair_request(
+                            pair,
+                            ids.next(),
+                            coordinode_core::txn::timestamp::Timestamp::from_raw(at),
+                        );
+                        let written = match crate::closure::stamp(&raft, &engine, &mut request)
+                            .await
+                        {
+                            Ok(()) => raft.client_write(request).await.map_err(|e| e.to_string()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        drop(held);
+                        match written {
                             Ok(_) => {
                                 tracing::info!(%pair, term, "recorded the group's version pair");
                                 recorded_in = Some(term);
@@ -202,12 +220,56 @@ fn spawn_version_watch(
                 break;
             }
         }
-    })
+    });
+    BackgroundTasks {
+        running: parking_lot::Mutex::new(vec![watch, closer]),
+    }
+}
+
+/// The node's own background tasks, stopped together when it shuts down:
+/// the version watch (follows leadership, records the group's version pair)
+/// and the closer (appends a closing entry when commits are left without a
+/// bound). Both hold the engine.
+struct BackgroundTasks {
+    running: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl BackgroundTasks {
+    /// Abort the tasks and wait until they are gone: an abort only marks a
+    /// task, which lets go of the engine when the runtime next drops it.
+    async fn stop(&self) {
+        let tasks = core::mem::take(&mut *self.running.lock());
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            match task.await {
+                Err(e) if !e.is_cancelled() => {
+                    tracing::warn!(error = %e, "background task ended abnormally");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        for task in self.running.get_mut().iter() {
+            task.abort();
+        }
+    }
 }
 
 /// How often a leader that owes the group's version record looks again for
 /// the disk space to write it.
 const SPACE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a leader waits after a commit lands for a following entry to
+/// carry its bound before it appends a closing entry of its own: long enough
+/// that a steady stream of writes covers itself, short against how long a
+/// member's cut may trail an idle group's last commit.
+const CLOSURE_SETTLE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The entry recording `pair` as the group's.
 fn record_pair_request(
@@ -296,7 +358,7 @@ pub struct RaftNode {
     /// This member's version view, shared with its network and handler.
     version: Arc<VersionGate>,
     /// Keeps the gate's leader current and records the group's pair.
-    version_watch: tokio::task::JoinHandle<()>,
+    version_watch: BackgroundTasks,
     /// How long a membership change waits for the previous one to settle,
     /// in ms. See [`Self::set_membership_settle_timeout`].
     membership_settle_timeout_ms: core::sync::atomic::AtomicU64,
@@ -520,8 +582,8 @@ impl RaftNode {
         let version_watch = spawn_version_watch(
             Arc::clone(&raft),
             Arc::clone(&version),
+            Arc::clone(&engine),
             oracle,
-            Arc::clone(engine.space()),
         );
 
         Ok(Self {
@@ -710,8 +772,8 @@ impl RaftNode {
         let version_watch = spawn_version_watch(
             Arc::clone(&raft),
             Arc::clone(&version),
+            Arc::clone(&engine),
             engine.oracle(),
-            Arc::clone(engine.space()),
         );
 
         Ok(Self {
@@ -873,8 +935,8 @@ impl RaftNode {
         let version_watch = spawn_version_watch(
             Arc::clone(&raft),
             Arc::clone(&version),
+            Arc::clone(&engine),
             engine.oracle(),
-            Arc::clone(engine.space()),
         );
 
         let node = Self {
@@ -988,8 +1050,8 @@ impl RaftNode {
         let version_watch = spawn_version_watch(
             Arc::clone(&raft),
             Arc::clone(&version),
+            Arc::clone(&engine),
             engine.oracle(),
-            Arc::clone(engine.space()),
         );
 
         tracing::info!(
@@ -1133,8 +1195,8 @@ impl RaftNode {
         let version_watch = spawn_version_watch(
             Arc::clone(&raft),
             Arc::clone(&version),
+            Arc::clone(&engine),
             engine.oracle(),
-            Arc::clone(engine.space()),
         );
 
         Ok(Self {
@@ -1509,6 +1571,7 @@ impl RaftNode {
         )
         .with_version_gate(Arc::clone(&self.version))
         .with_space_guard(Arc::clone(self.engine.space()))
+        .with_closure(Arc::clone(&self.engine))
     }
 
     /// This member's version view: its pair, its group's, and whether it
@@ -1550,14 +1613,18 @@ impl RaftNode {
     /// [`WaitForMajorityService::shutdown()`] before dropping for
     /// graceful cleanup.
     pub fn batch_pipeline(&self) -> WaitForMajorityService {
-        WaitForMajorityService::spawn_default(Arc::clone(&self.raft), RateLimiter::default())
-            .with_space_guard(Arc::clone(self.engine.space()))
+        self.batch_pipeline_with_config(BatchConfig::default())
     }
 
     /// Create a [`WaitForMajorityService`] with custom batch configuration.
     pub fn batch_pipeline_with_config(&self, config: BatchConfig) -> WaitForMajorityService {
-        WaitForMajorityService::spawn(Arc::clone(&self.raft), RateLimiter::default(), config)
-            .with_space_guard(Arc::clone(self.engine.space()))
+        WaitForMajorityService::spawn_stamping(
+            Arc::clone(&self.raft),
+            RateLimiter::default(),
+            config,
+            Some(Arc::clone(&self.engine)),
+        )
+        .with_space_guard(Arc::clone(self.engine.space()))
     }
 
     /// Get the current applied log index (non-blocking).
@@ -2075,7 +2142,7 @@ impl RaftNode {
     /// gracefully, handing leadership over if it leads; a node alone just
     /// stops.
     pub async fn shutdown(&self) -> Result<(), RaftNodeError> {
-        self.version_watch.abort();
+        self.version_watch.stop().await;
         let has_peers = self.has_voter_peers();
 
         let result = if has_peers {

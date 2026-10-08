@@ -27,6 +27,7 @@
 //! promise is the prepared-participant mechanism, with its own lifetime.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
@@ -61,6 +62,18 @@ struct Table {
     /// same identity. Their keys turn away newcomers, so a waiter is not
     /// overtaken forever by writers that keep arriving.
     reserved: HashMap<u64, Admitted>,
+    /// Timestamps allocated for log entries that are not in the log yet, by
+    /// the same identity: a commit applied locally and drained to the log
+    /// later, or metadata proposed outside a commit. They do not hold back
+    /// this node's own snapshots, only the closed bound.
+    unlogged: HashMap<u64, u64>,
+    /// The highest bound handed out for a log entry.
+    last_closed: u64,
+    /// The highest timestamp withdrawn from the table: a timestamp at or
+    /// above `last_closed` is in the log, but no entry says so yet.
+    max_released: u64,
+    /// How many timestamps were withdrawn, for a waiter on the next one.
+    withdrawals: u64,
 }
 
 /// The commits this leader has admitted but not yet applied.
@@ -377,14 +390,135 @@ impl PendingCommits {
         self.inner.lock().admitted.len()
     }
 
+    /// Allocate a timestamp for a log entry and hold it as not yet logged
+    /// until the returned [`Unlogged`] is dropped, which the caller does once
+    /// the entry is handed to the log (or will never be). Allocation and
+    /// registration take one lock, so no bound computed in between can pass
+    /// over the timestamp.
+    pub fn obligate(self: &Arc<Self>, allocate: impl FnOnce() -> u64) -> (u64, Unlogged) {
+        let mut table = self.inner.lock();
+        let commit_ts = allocate();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.unlogged.insert(id, commit_ts);
+        (
+            commit_ts,
+            Unlogged {
+                pending: Arc::clone(self),
+                id,
+            },
+        )
+    }
+
+    /// Hold `commit_ts` as not yet logged past the hold the caller has on it
+    /// now (an [`Admission`] or another [`Unlogged`]): a commit applied
+    /// locally whose entry reaches the log later, or an entry handed to the
+    /// log from another task. Taking it while that hold stands leaves no
+    /// moment in which a bound can pass over it.
+    pub fn hold(self: &Arc<Self>, commit_ts: u64) -> Unlogged {
+        let mut table = self.inner.lock();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        table.unlogged.insert(id, commit_ts);
+        Unlogged {
+            pending: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// The bound a log entry handed to the log now carries: every timestamp
+    /// below it is in the log before that entry, or never will be.
+    ///
+    /// A timestamp still admitted or not yet logged is at or above it. Any
+    /// other allocated timestamp was withdrawn after its entry was handed to
+    /// the log, which takes entries in the order they are handed over, or
+    /// was refused before it was. Read under the lock that allocates, so the
+    /// clock cannot pass a timestamp between its allocation and its
+    /// registration.
+    pub fn stamp_closed_below(&self, read_clock: impl FnOnce() -> u64) -> u64 {
+        let mut table = self.inner.lock();
+        let bound = Self::closed_below_of(&table, read_clock());
+        table.last_closed = table.last_closed.max(bound);
+        bound
+    }
+
+    /// The bound a closing entry would carry now, when it covers a
+    /// timestamp withdrawn since the last bound was handed out; `None` when
+    /// it would cover nothing new. A closing entry carries no timestamp of
+    /// its own, so stamping it does not make another one due.
+    pub fn closure_due(&self, read_clock: impl FnOnce() -> u64) -> Option<u64> {
+        let table = self.inner.lock();
+        let bound = Self::closed_below_of(&table, read_clock());
+        (table.max_released >= table.last_closed && bound > table.last_closed).then_some(bound)
+    }
+
+    /// Wait until more than `seen` withdrawals have happened, or until
+    /// `timeout`; the count then. A closing entry can only become due
+    /// through a withdrawal.
+    pub fn await_withdrawal(&self, seen: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        let mut table = self.inner.lock();
+        while table.withdrawals <= seen {
+            if self.finished.wait_until(&mut table, deadline).timed_out() {
+                break;
+            }
+        }
+        table.withdrawals
+    }
+
+    fn closed_below_of(table: &Table, latest: u64) -> u64 {
+        let held = table
+            .admitted
+            .values()
+            .map(|a| a.commit_ts)
+            .chain(table.unlogged.values().copied())
+            .min();
+        // A clock in microseconds since the epoch is far below u64::MAX, so
+        // the bound one past it cannot overflow.
+        held.unwrap_or(latest + 1)
+    }
+
     fn withdraw(&self, id: u64) {
-        self.inner.lock().admitted.remove(&id);
+        let mut table = self.inner.lock();
+        if let Some(admitted) = table.admitted.remove(&id) {
+            table.max_released = table.max_released.max(admitted.commit_ts);
+            table.withdrawals += 1;
+        }
+        drop(table);
         // Every waiter is woken rather than one: they are waiting on
         // different timestamps, and the one this commit unblocks is not
         // necessarily the one a single wake would reach.
         self.finished.notify_all();
     }
+
+    fn withdraw_unlogged(&self, id: u64) {
+        let mut table = self.inner.lock();
+        if let Some(commit_ts) = table.unlogged.remove(&id) {
+            table.max_released = table.max_released.max(commit_ts);
+            table.withdrawals += 1;
+        }
+        drop(table);
+        self.finished.notify_all();
+    }
 }
+
+/// A timestamp allocated for a log entry that is not in the log yet.
+/// Withdraws it on drop: hand the entry to the log first.
+#[derive(Debug)]
+pub struct Unlogged {
+    pending: Arc<PendingCommits>,
+    id: u64,
+}
+
+impl Drop for Unlogged {
+    fn drop(&mut self) {
+        self.pending.withdraw_unlogged(self.id);
+    }
+}
+
+impl coordinode_core::txn::drain::DrainHold for Unlogged {}
 
 /// An admitted commit's registration. Withdraws it on drop, so a commit that
 /// fails after admission holds nothing, and one that succeeds holds nothing

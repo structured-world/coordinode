@@ -854,6 +854,18 @@ impl Database {
         oracle: Arc<TimestampOracle>,
         pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline>,
     ) -> Result<Self, DatabaseError> {
+        // The engine stamps log entries with a bound read from its clock, and
+        // the database takes commit timestamps from `oracle`: two clocks would
+        // let a bound pass over a commit the other one just took.
+        if engine
+            .oracle()
+            .is_some_and(|clock| !Arc::ptr_eq(&clock, &oracle))
+        {
+            return Err(DatabaseError::Other(
+                "the database's timestamp oracle is not the one its engine was opened with"
+                    .to_string(),
+            ));
+        }
         let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
             "default",
             path.as_ref(),
@@ -1083,6 +1095,13 @@ impl Database {
                         DatabaseError::Other(format!("NVMe write buffer recovery failed: {e}"))
                     })?;
             for entry in recovered {
+                // A fresh timestamp, held until the entry is drained: bounds
+                // handed out since the crash may have passed the old one, and
+                // the entry was never in the log, only in this node's
+                // volatile state.
+                let (commit_ts, hold) =
+                    engine.pending_commits().obligate(|| oracle.next().as_raw());
+                let entry = entry.restamped(Timestamp::from_raw(commit_ts), Box::new(hold));
                 drain_buffer.append(entry).map_err(|e| {
                     DatabaseError::Other(format!(
                         "failed to re-inject recovered w:cache entry: {e}"

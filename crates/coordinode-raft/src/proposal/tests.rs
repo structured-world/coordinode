@@ -602,3 +602,62 @@ async fn propose_and_wait_works_from_a_plain_thread() {
 
     assert!(outcome.is_ok(), "proposal failed: {outcome:?}");
 }
+
+/// A retry hands over a proposal an earlier attempt already handed to the
+/// log, where it may have committed. A closed bound past its timestamp then
+/// says nothing about that attempt, so the retry answers with an unknown
+/// outcome, never with the refusal that tells the caller nothing was written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_below_the_closed_bound_is_not_a_refusal() {
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine =
+        Arc::new(StorageEngine::open_with_oracle(&config, Arc::clone(&oracle)).expect("open"));
+    let node = RaftNode::open_with_oracle(1, Arc::clone(&engine), Some(Arc::clone(&oracle)))
+        .await
+        .expect("open raft node");
+    let pipeline = node.pipeline();
+    let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
+    let proposal = RaftProposal {
+        id: ProposalIdGenerator::new().next(),
+        mutations: vec![Mutation::Put {
+            partition: PartitionId::Node,
+            key: b"node:1:retried".to_vec(),
+            value: b"v".to_vec(),
+        }],
+        commit_ts: Timestamp::from_raw(ts),
+        start_ts: Timestamp::from_raw(ts),
+        bypass_rate_limiter: false,
+    };
+    pipeline.propose_async(&proposal).await.expect("commit");
+    drop(held);
+    for _ in 0..100 {
+        if engine.closure_frontier() > ts {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        engine.closure_frontier() > ts,
+        "the bound passed the commit"
+    );
+
+    let first = pipeline.entry(&proposal, 0).await.map(|_| ());
+    assert!(
+        matches!(first, Err(ProposalError::BelowClosedBound { .. })),
+        "a first hand-over below the bound is refused: {first:?}"
+    );
+    let retry = pipeline.entry(&proposal, 1).await.map(|_| ());
+    assert!(
+        matches!(retry, Err(ProposalError::Timeout { retries: 1 })),
+        "a retry below the bound has an unknown outcome: {retry:?}"
+    );
+    node.shutdown().await.expect("shutdown");
+}

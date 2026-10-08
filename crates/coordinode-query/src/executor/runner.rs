@@ -1859,13 +1859,22 @@ impl<'a> ExecutionContext<'a> {
             use coordinode_modality::{IndexStore as _, LocalIndexStore};
             return Ok(LocalIndexStore::new(self.engine).apply_unreplicated(&mutations)?);
         };
+        // Held as not yet logged until the entry is handed over, so no
+        // closed bound passes over it meanwhile.
+        let (commit_ts, _held) = match self.mvcc_oracle {
+            Some(oracle) => {
+                let (ts, held) = self
+                    .engine
+                    .pending_commits()
+                    .obligate(|| oracle.next().as_raw());
+                (Timestamp::from_raw(ts), Some(held))
+            }
+            None => (self.mvcc_read_ts, None),
+        };
         let proposal = coordinode_core::txn::proposal::RaftProposal {
             id: id_gen.next(),
             mutations,
-            commit_ts: self
-                .mvcc_oracle
-                .map(|o| o.next())
-                .unwrap_or(self.mvcc_read_ts),
+            commit_ts,
             start_ts: self.mvcc_read_ts,
             bypass_rate_limiter: false,
         };

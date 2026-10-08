@@ -484,10 +484,17 @@ impl Database {
         if mutations.is_empty() {
             return Ok(());
         }
+        // A timestamp of its own, held as not yet logged until the entry is
+        // handed over: the queue's changes are ordered with every other
+        // commit, and no closed bound passes over them meanwhile.
+        let (commit_ts, _held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| self.oracle.next().as_raw());
         let proposal = RaftProposal {
             id: self.proposal_id_gen.next(),
             mutations,
-            commit_ts: Timestamp::from_raw(0),
+            commit_ts: Timestamp::from_raw(commit_ts),
             start_ts: Timestamp::from_raw(0),
             bypass_rate_limiter: true,
         };

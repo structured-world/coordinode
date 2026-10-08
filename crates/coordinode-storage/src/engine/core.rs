@@ -129,6 +129,10 @@ pub struct StorageEngine {
     /// state, which is exactly what these are not part of yet, so they are
     /// consulted beside it.
     pending_commits: Arc<crate::engine::pending::PendingCommits>,
+    /// The closed bound of the Raft log applied here: every commit timestamp
+    /// below it is in an entry applied on this node. `0` while no entry
+    /// carrying one has applied. Mirrors [`CLOSURE_KEY`].
+    closure_frontier: AtomicU64,
     /// How long a snapshot waits for those commits before stepping behind
     /// them. Runtime-settable: it trades read latency against freshness, and
     /// which side a deployment wants is not known at compile time.
@@ -1005,6 +1009,7 @@ impl StorageEngine {
             field_dictionary_generation: AtomicU64::new(0),
             field_dictionary_epoch: AtomicU64::new(0),
             pending_commits,
+            closure_frontier: AtomicU64::new(0),
             snapshot_wait: std::sync::atomic::AtomicU64::new(config.snapshot_wait_ms),
             node_shard: std::sync::atomic::AtomicU16::new(config.node_shard),
             flush_policy: config.flush_policy,
@@ -2731,7 +2736,7 @@ impl StorageEngine {
     /// exists in which another writer sees neither its effect nor the
     /// obligation to account for it. A reader consults the same table to know
     /// whether a snapshot is complete.
-    pub fn pending_commits(&self) -> &crate::engine::pending::PendingCommits {
+    pub fn pending_commits(&self) -> &Arc<crate::engine::pending::PendingCommits> {
         &self.pending_commits
     }
 
@@ -3224,6 +3229,57 @@ impl StorageEngine {
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
         )
+    }
+
+    /// The last commit timestamp whose every write, and every write below
+    /// it, is applied here: a cut a derived structure that has folded what
+    /// it took can claim. `None` while nothing is known to be complete.
+    ///
+    /// A standalone store learns of every commit before it lands, so its
+    /// [`Self::snapshot`] is such a cut. A Raft member also applies commits
+    /// stamped by a leader in log order, which need not be timestamp order:
+    /// a commit stamped lower can still be on its way behind one stamped
+    /// higher. Its cut is bounded by the closed bound of the entries applied
+    /// here, below which every commit is already in the log before them.
+    pub fn complete_cut(&self) -> Option<u64> {
+        let snapshot = self.snapshot();
+        let bound = if self.raft_fence().is_some() {
+            snapshot.min(self.closure_frontier())
+        } else {
+            snapshot
+        };
+        bound.checked_sub(1)
+    }
+
+    /// The closed bound of the Raft entries applied here; see
+    /// [`Self::complete_cut`].
+    pub fn closure_frontier(&self) -> u64 {
+        self.closure_frontier
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Raise the closed bound to `below` once the entry carrying it has
+    /// applied, its [`CLOSURE_KEY`] record included.
+    pub fn raise_closure_frontier(&self, below: u64) {
+        self.closure_frontier
+            .fetch_max(below, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Read the closed bound from its stored record: when the store opens
+    /// and when a snapshot replaced it. A store whose applied entries carried
+    /// none knows of no bound.
+    ///
+    /// # Errors
+    ///
+    /// The record cannot be read or is malformed.
+    pub fn reload_closure_frontier(&self) -> StorageResult<()> {
+        let below = match self.get(Partition::Schema, CLOSURE_KEY)? {
+            Some(bytes) => decode_closure(&bytes)?,
+            None => 0,
+        };
+        self.closure_frontier
+            .store(below, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Open a tap on `partition` and return it with a snapshot: every write
@@ -4021,6 +4077,27 @@ fn claim_checkpoint_dir(target: &Path) -> StorageResult<()> {
 /// Directory under the data dir holding one empty file per partition whose
 /// rebuild is in progress, named after the partition.
 const REBUILD_INTENT_DIR: &str = "rebuild";
+
+/// Schema record of the Raft log's closed bound as applied here, written by
+/// the apply of the entry carrying it. It is replicated data, so a snapshot
+/// carries it and a restart finds it with the entries its tree holds.
+pub const CLOSURE_KEY: &[u8] = b"closure:below";
+
+/// The stored form of a closed bound.
+#[must_use]
+pub fn encode_closure(below: u64) -> Vec<u8> {
+    below.to_be_bytes().to_vec()
+}
+
+fn decode_closure(bytes: &[u8]) -> StorageResult<u64> {
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        StorageError::Serialization(format!(
+            "the closed bound record holds {} bytes, not 8",
+            bytes.len()
+        ))
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
 
 /// A journalled op applied without deriving its entry first: the entry's
 /// DERIVED work would otherwise be skipped silently.

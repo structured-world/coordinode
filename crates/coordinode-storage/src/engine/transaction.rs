@@ -233,6 +233,11 @@ fn proposal_err_to_commit(err: ProposalError) -> CommitError {
         // the leader, and it needs the id to do that.
         ProposalError::NotLeader { leader_id } => CommitError::NotLeader { leader_id },
         ProposalError::Mismatched(m) => CommitError::Mismatched(m),
+        // Nothing was proposed, and a new attempt takes a new timestamp: the
+        // answer is the one to a conflict.
+        e @ (ProposalError::BelowClosedBound { .. } | ProposalError::LeaderNotReady { .. }) => {
+            CommitError::Conflict(e.to_string())
+        }
         ProposalError::OutOfSpace {
             path,
             available_bytes,
@@ -1953,6 +1958,14 @@ impl<'a> Transaction<'a> {
                     .merge(Partition::Counter, key, &encode_counter_delta(*delta))?;
             }
 
+            // The entry reaches the log only when it is drained: until then
+            // its timestamp stays registered as not yet logged, taken while
+            // the admission still holds it, so no closed bound passes over it.
+            let unlogged = ctx
+                .drain_buffer
+                .is_some()
+                .then(|| self.engine.pending_commits().hold(commit_ts.as_raw()));
+
             // The writes are local state now, so the registration has done its
             // work: from here a validating writer finds them by reading, and a
             // reader's snapshot may cover this timestamp. What remains is
@@ -1962,7 +1975,10 @@ impl<'a> Transaction<'a> {
             // Step 2: Buffer for drain (if drain buffer is available).
             if let Some(drain_buf) = ctx.drain_buffer {
                 let mutations = self.seal_unit(wb);
-                let entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
+                let mut entry = DrainEntry::new(mutations, commit_ts, self.read_ts);
+                if let Some(unlogged) = unlogged {
+                    entry = entry.holding(Box::new(unlogged));
+                }
 
                 // j:cache: persist to NVMe before ACK for process-crash recovery.
                 // j:memory skips this: data loss on crash is the explicit contract.

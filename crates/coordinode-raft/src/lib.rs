@@ -1,3 +1,4 @@
+pub mod closure;
 pub mod cluster;
 mod log_sync;
 pub mod proposal;

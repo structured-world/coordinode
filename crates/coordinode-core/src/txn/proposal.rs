@@ -497,8 +497,9 @@ pub enum ProposalError {
     #[error("invalid write concern: {0}")]
     InvalidWriteConcern(String),
 
-    /// All retries exhausted. Proposal was not committed within the
-    /// timeout window (3 attempts: 4s, 8s, 16s).
+    /// The proposal was handed to the log and not seen committed: all
+    /// retries timed out (3 attempts: 4s, 8s, 16s), or a retry could not be
+    /// handed over again. The outcome is unknown; it may still commit.
     #[error("proposal timed out after {retries} retries")]
     Timeout { retries: u32 },
 
@@ -548,6 +549,27 @@ pub enum ProposalError {
     /// or carries DERIVED work no member could derive. Nothing was proposed.
     #[error("proposal refused before the log: {0}")]
     Unencodable(#[from] crate::txn::frame::FrameError),
+
+    /// The proposal's commit timestamp is below a closed bound already in
+    /// the log: entries there promise that no commit below it follows, so it
+    /// cannot be appended. It was taken before this node learned the bound
+    /// (a leader change). Nothing was proposed; retrying takes a new one.
+    #[error("commit timestamp {commit_ts} is below the log's closed bound {closed_below}")]
+    BelowClosedBound {
+        /// The proposal's timestamp.
+        commit_ts: u64,
+        /// The bound already applied here.
+        closed_below: u64,
+    },
+
+    /// This node leads but has not applied an entry of its own term yet, so
+    /// it cannot vouch for the commits of earlier terms; nothing was
+    /// proposed.
+    #[error("the leader has not applied its term's first entry within {waited_ms} ms")]
+    LeaderNotReady {
+        /// How long the proposal waited.
+        waited_ms: u64,
+    },
 }
 
 /// Outcome of a successfully applied proposal.

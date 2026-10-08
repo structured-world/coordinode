@@ -251,7 +251,9 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         // In real crash, Drop wouldn't run and oplog entries are safe (fsynced).
         node.shutdown().await.expect("shutdown");
         // Once shutdown returns nothing but the node and this test holds
-        // the engine, or the reopen below finds the directory locked.
+        // the engine, or the reopen below finds the directory locked. The
+        // pipeline stamps closed bounds from the engine, so it goes too.
+        drop(pipeline);
         drop(node);
         assert_eq!(
             Arc::strong_count(&engine_read),

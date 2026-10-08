@@ -59,6 +59,16 @@ impl Default for DrainConfig {
     }
 }
 
+/// What keeps a drained entry's commit timestamp from being passed over by
+/// a closed bound until the entry is handed to the log: the store registers
+/// the timestamp as not yet logged for as long as this lives.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not hold a timestamp as not yet logged",
+    label = "not a drain hold",
+    note = "the store's pending-commit table hands one out (`PendingCommits::hold`)"
+)]
+pub trait DrainHold: Send + Sync + core::fmt::Debug {}
+
 /// A buffered volatile write entry waiting for drain.
 ///
 /// Contains the mutations from one transaction, already applied to local
@@ -74,6 +84,8 @@ pub struct DrainEntry {
     pub start_ts: Timestamp,
     /// Approximate size in bytes (for capacity tracking).
     size_bytes: usize,
+    /// Kept until the entry is handed to the log; see [`DrainHold`].
+    hold: Option<Box<dyn DrainHold>>,
 }
 
 impl DrainEntry {
@@ -85,7 +97,25 @@ impl DrainEntry {
             commit_ts,
             start_ts,
             size_bytes,
+            hold: None,
         }
+    }
+
+    /// This entry, keeping `hold` until it is handed to the log.
+    #[must_use]
+    pub fn holding(mut self, hold: Box<dyn DrainHold>) -> Self {
+        self.hold = Some(hold);
+        self
+    }
+
+    /// This entry at a new commit timestamp held by `hold`: an entry
+    /// recovered after a crash, whose old timestamp a closed bound handed out
+    /// since may have passed.
+    #[must_use]
+    pub fn restamped(mut self, commit_ts: Timestamp, hold: Box<dyn DrainHold>) -> Self {
+        self.commit_ts = commit_ts;
+        self.hold = Some(hold);
+        self
     }
 }
 
@@ -382,9 +412,13 @@ fn drain_once(
     let mut current_mutations: Vec<Mutation> = Vec::new();
     let mut current_commit_ts = Timestamp::from_raw(0);
     let mut current_start_ts = Timestamp::from_raw(0);
+    // The holds of the entries in the current batch, released once the batch
+    // is handed to the log.
+    let mut current_holds: Vec<Box<dyn DrainHold>> = Vec::new();
     let mut all_ok = true;
 
-    for entry in entries {
+    for mut entry in entries {
+        let hold = entry.hold.take();
         // A unit with DERIVED index work is proposed on its own: its record
         // sources are positions within the unit, and the entries it derives
         // apply after the unit's other writes, so joined to another unit it
@@ -397,7 +431,8 @@ fn drain_once(
         // If this entry would exceed batch size, flush current batch first.
         if !current_mutations.is_empty()
             && (derives || current_mutations.len() + entry.mutations.len() > batch_max as usize)
-            && submit_proposal(
+        {
+            if submit_proposal(
                 pipeline,
                 id_gen,
                 std::mem::take(&mut current_mutations),
@@ -405,8 +440,10 @@ fn drain_once(
                 current_start_ts,
             )
             .is_err()
-        {
-            all_ok = false;
+            {
+                all_ok = false;
+            }
+            current_holds.clear();
         }
 
         if derives {
@@ -421,8 +458,10 @@ fn drain_once(
             {
                 all_ok = false;
             }
+            drop(hold);
             continue;
         }
+        current_holds.extend(hold);
 
         // Use the latest commit_ts in the batch (highest = most recent).
         if entry.commit_ts.as_raw() > current_commit_ts.as_raw() {
@@ -448,6 +487,7 @@ fn drain_once(
     {
         all_ok = false;
     }
+    drop(current_holds);
 
     // If all proposals committed, the checkpoint is no longer needed for
     // crash recovery — the data is now in the Raft oplog.

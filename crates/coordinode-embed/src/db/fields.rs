@@ -137,11 +137,17 @@ impl FieldDictionary {
     }
 
     fn propose(&self, command: MetadataCommand) -> Result<(), DictionaryError> {
+        // Held as not yet logged until the entry is handed over, so no
+        // closed bound passes over it meanwhile.
+        let (commit_ts, _held) = self
+            .engine
+            .pending_commits()
+            .obligate(|| self.oracle.next().as_raw());
         self.pipeline
             .propose_and_wait(&RaftProposal {
                 id: self.proposal_ids.next(),
                 mutations: vec![Mutation::Command(command)],
-                commit_ts: self.oracle.next(),
+                commit_ts: Timestamp::from_raw(commit_ts),
                 start_ts: Timestamp::from_raw(0),
                 bypass_rate_limiter: false,
             })

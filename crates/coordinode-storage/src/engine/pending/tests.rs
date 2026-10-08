@@ -453,3 +453,88 @@ fn a_waiter_gives_up_at_its_deadline_and_releases_its_keys() {
     admit_guarded(&pending, 11, Vec::new(), key(Partition::Schema, b"def"))
         .expect("no reservation is left behind");
 }
+
+/// The closed bound stops at the lowest timestamp not yet in the log,
+/// admitted or held as unlogged alike, and passes the clock once nothing is.
+#[test]
+fn the_closed_bound_stops_below_every_timestamp_not_yet_logged() {
+    let pending = Arc::new(table());
+    assert_eq!(pending.stamp_closed_below(|| 50), 51, "nothing held");
+
+    let admitted = admit_at(&pending, 60, key(Partition::Node, b"a")).expect("admit");
+    let (held_ts, held) = pending.obligate(|| 55);
+    assert_eq!(held_ts, 55);
+    assert_eq!(
+        pending.stamp_closed_below(|| 70),
+        55,
+        "the unlogged one is lowest"
+    );
+
+    drop(held);
+    assert_eq!(pending.stamp_closed_below(|| 70), 60, "the admitted one");
+    // Taken while the admission still holds it, the hold outlives it.
+    let kept = pending.hold(60);
+    drop(admitted);
+    assert_eq!(pending.stamp_closed_below(|| 70), 60, "still not logged");
+    drop(kept);
+    assert_eq!(pending.stamp_closed_below(|| 70), 71);
+}
+
+/// A closing entry is due only when it would cover a timestamp withdrawn
+/// since the last bound; stamping it makes none due again, so closing
+/// entries do not breed more of themselves.
+#[test]
+fn a_closing_entry_is_due_once_per_uncovered_withdrawal() {
+    let pending = Arc::new(table());
+    pending.stamp_closed_below(|| 10);
+    assert_eq!(pending.closure_due(|| 10), None, "nothing withdrawn");
+
+    let (_, held) = pending.obligate(|| 20);
+    let bound = pending.stamp_closed_below(|| 20);
+    assert_eq!(bound, 20, "the entry carrying it stops below it");
+    drop(held);
+    assert_eq!(
+        pending.closure_due(|| 20),
+        Some(21),
+        "now in the log, uncovered"
+    );
+
+    assert_eq!(pending.stamp_closed_below(|| 20), 21, "the closing entry");
+    assert_eq!(
+        pending.closure_due(|| 25),
+        None,
+        "it covered the withdrawal"
+    );
+}
+
+/// A closing entry is not due while a timestamp below the would-be bound is
+/// still held: the bound could not pass it, so the entry would cover
+/// nothing new.
+#[test]
+fn a_held_timestamp_keeps_a_closing_entry_from_being_due() {
+    let pending = Arc::new(table());
+    let (_, low) = pending.obligate(|| 30);
+    let (_, high) = pending.obligate(|| 40);
+    pending.stamp_closed_below(|| 40);
+    drop(high);
+    assert_eq!(pending.closure_due(|| 40), None, "30 still holds the bound");
+    drop(low);
+    assert_eq!(pending.closure_due(|| 40), Some(41));
+}
+
+/// A waiter for withdrawals wakes on the next one, and on its deadline
+/// without one.
+#[test]
+fn a_withdrawal_wakes_its_waiter() {
+    let pending = Arc::new(table());
+    let seen = pending.await_withdrawal(0, std::time::Duration::from_millis(10));
+    assert_eq!(seen, 0, "the deadline, with nothing withdrawn");
+    let (_, held) = pending.obligate(|| 5);
+    let waiter = {
+        let pending = Arc::clone(&pending);
+        std::thread::spawn(move || pending.await_withdrawal(0, std::time::Duration::from_secs(10)))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    drop(held);
+    assert_eq!(waiter.join().expect("waiter"), 1);
+}
