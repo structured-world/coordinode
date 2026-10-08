@@ -6,6 +6,7 @@ use coordinode_core::schema::definition::{
     EdgeTypeSchema, PropertyDef, PropertyType, encode_edge_type_current_revision_key,
     encode_edge_type_schema_key,
 };
+use coordinode_core::txn::invariant::{Claim, ClaimScope};
 use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
 use coordinode_core::txn::write_concern::WriteConcern;
 use std::collections::{BTreeMap, BTreeSet};
@@ -945,6 +946,142 @@ fn first_instances_into_different_pairs_share_an_upper_bound() {
     let refused = commit(&mut second).expect_err("the node already has its one neighbour");
     assert!(matches!(refused, CommitError::InvariantRefused { .. }));
     assert_eq!(kept(&f, &d), BTreeMap::from([(node(1), 1)]));
+}
+
+/// Run `writers` commits at once, each staged by `stage(i)` and claiming
+/// `claim(i)` when given, retrying a refusal until it either lands or is
+/// refused for its bound (`InvariantRefused` with no other commit in
+/// flight would refuse it again). Returns how many landed.
+fn race(
+    f: &Fixture,
+    writers: u64,
+    stage: impl Fn(&mut Transaction<'_>, u64) + Sync,
+    claim: impl Fn(u64) -> Option<Claim> + Sync,
+) -> u64 {
+    let barrier = std::sync::Barrier::new(writers as usize);
+    let landed = std::sync::atomic::AtomicU64::new(0);
+    let unexpected = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for i in 0..writers {
+            let (barrier, landed, unexpected, stage, claim) =
+                (&barrier, &landed, &unexpected, &stage, &claim);
+            s.spawn(move || {
+                barrier.wait();
+                // Bounded: a refusal under contention is retried, one the
+                // committed state alone causes ends the writer.
+                for _ in 0..200 {
+                    let mut t = txn(f);
+                    stage(&mut t, i);
+                    if let Some(c) = claim(i) {
+                        t.claim(c);
+                    }
+                    match commit(&mut t) {
+                        Ok(()) => {
+                            landed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        Err(CommitError::InvariantRefused { .. } | CommitError::Conflict(_)) => {
+                            std::thread::yield_now();
+                        }
+                        Err(other) => {
+                            unexpected.lock().unwrap().push(format!("{other:?}"));
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let unexpected = unexpected.into_inner().unwrap();
+    assert!(unexpected.is_empty(), "unexpected refusals: {unexpected:?}");
+    landed.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Writers on threads of their own, each adding a first edge from one node
+/// to a different neighbour under its AT MOST ONE, through the whole commit
+/// pipeline at once: exactly one lands, and the kept count agrees with the
+/// stored adjacency.
+#[test]
+fn concurrent_first_edges_under_one_upper_bound_land_once() {
+    let f = fixture();
+    let d = descriptor(
+        Direction::Outgoing,
+        CardinalityMeasure::DistinctNeighbours,
+        CardinalityBound::AtMostOne,
+    );
+    declare(&f, false, std::slice::from_ref(&d));
+    cover(&f, std::slice::from_ref(&d));
+    let landed = race(
+        &f,
+        8,
+        |t, i| add(t, 1, 10 + i, None),
+        |_| {
+            Some(Claim::new(
+                ClaimScope::Incident {
+                    node: node(1),
+                    edge_type: OWNS.to_string(),
+                    direction: Direction::Outgoing,
+                },
+                ClaimPredicate::CardinalityBound {
+                    measure: CardinalityMeasure::DistinctNeighbours,
+                    bound: CardinalityBound::AtMostOne,
+                    trend: CountTrend::Grows,
+                },
+                0,
+            ))
+        },
+    );
+    assert_eq!(landed, 1);
+    assert_eq!(kept(&f, &d), BTreeMap::from([(node(1), 1)]));
+    let none = std::collections::HashMap::new();
+    let stored = enumerated_count(&f.engine, node(1), OWNS, d.direction, &[], &none)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.of(d.measure), 1);
+}
+
+/// Writers on threads of their own, each adding a first instance of the same
+/// discriminated pair, all landing: the pair is one neighbour and as many
+/// instances as writers, whatever order the commits took.
+#[test]
+fn concurrent_first_instances_of_one_pair_count_one_neighbour() {
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, true, &ds);
+    cover(&f, &ds);
+    let landed = race(&f, 8, |t, i| add(t, 1, 2, Some(&[b'k', i as u8])), |_| None);
+    assert_eq!(landed, 8);
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 8)]));
+    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
+    assert_eq!(kept(&f, &ds[3]), BTreeMap::from([(node(2), 1)]));
+}
+
+/// Writers on threads of their own, each removing one instance of a pair
+/// and taking the adjacency only if it believes its instance is the last:
+/// none believes so, so at most all but the last land, and the counts never
+/// leave a pair adjacent with no instance or count one that is gone.
+#[test]
+fn concurrent_removals_of_the_last_instances_keep_the_pair_consistent() {
+    let f = fixture();
+    let ds = all_descriptors();
+    declare(&f, true, &ds);
+    cover(&f, &ds);
+    let mut t = txn(&f);
+    for i in 0..4u8 {
+        add(&mut t, 1, 2, Some(&[b'k', i]));
+    }
+    commit(&mut t).unwrap();
+
+    let landed = race(
+        &f,
+        4,
+        |t, i| remove(t, 1, 2, Some(&[b'k', i as u8]), false),
+        |_| None,
+    );
+    // The last one would leave the pair adjacent with nothing behind it.
+    assert_eq!(landed, 3);
+    assert_eq!(kept(&f, &ds[0]), BTreeMap::from([(node(1), 1)]));
+    assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
 }
 
 /// One step of a random history.
