@@ -444,6 +444,22 @@ fn prefix_wildcard_via_highlights() {
     assert_eq!(results[0].node_id, 1);
 }
 
+/// The successor bounds exactly the strings with the prefix: it is above all
+/// of them and no string outside the prefix falls between.
+#[test]
+fn prefix_successor_bounds_exactly_the_prefixed_strings() {
+    assert_eq!(super::prefix_successor(b"abc"), Some(b"abd".to_vec()));
+    assert_eq!(super::prefix_successor(b"ab\xff"), Some(b"ac".to_vec()));
+    assert_eq!(super::prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()));
+    assert_eq!(super::prefix_successor(b"\xff\xff"), None);
+    assert_eq!(super::prefix_successor(b""), None);
+    let next = super::prefix_successor(b"zeta").unwrap();
+    for inside in [&b"zeta"[..], b"zeta000q", b"zeta\xff\xff\xff"] {
+        assert!(inside < next.as_slice(), "{inside:?} below the bound");
+    }
+    assert!(b"zetb".as_slice() >= next.as_slice());
+}
+
 // -- extract_prefix_terms unit tests --
 
 #[test]

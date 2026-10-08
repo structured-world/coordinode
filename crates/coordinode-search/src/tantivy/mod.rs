@@ -533,15 +533,29 @@ impl TextIndex {
     }
 
     /// A `prefix*` query matching every indexed word that starts with
-    /// `prefix`. Tantivy expands a prefix to at most 50 words by default,
-    /// which silently drops matches once a segment holds more and lets the
-    /// words written later decide which earlier ones survive; membership has
-    /// no such cutoff, so the expansion is unbounded.
-    fn prefix_query(&self, prefix: &str) -> tantivy::query::PhrasePrefixQuery {
-        let term = tantivy::Term::from_field_text(self.body_field, prefix);
-        let mut query = tantivy::query::PhrasePrefixQuery::new(vec![term]);
-        query.set_max_expansions(u32::MAX);
-        query
+    /// `prefix`: the words in `[prefix, next)`, where `next` is the first
+    /// byte string after every word with that prefix.
+    ///
+    /// A phrase-prefix query would stop after a fixed number of words per
+    /// segment, silently dropping matches and letting words written later
+    /// decide which earlier ones survive. The range has no such cutoff: it
+    /// streams the segment's term dictionary over the range and marks the
+    /// matching documents in one bitset of the segment's size, so its memory
+    /// does not grow with the number of words and its work is the postings of
+    /// the matching words. Every match scores the same, as a single-word
+    /// prefix did before.
+    fn prefix_query(&self, prefix: &str) -> tantivy::query::RangeQuery {
+        use std::ops::Bound;
+        let start = tantivy::Term::from_field_text(self.body_field, prefix);
+        let end = match prefix_successor(prefix.as_bytes()) {
+            Some(next) => {
+                let mut end = tantivy::Term::from_field_text(self.body_field, "");
+                end.append_bytes(&next);
+                Bound::Excluded(end)
+            }
+            None => Bound::Unbounded,
+        };
+        tantivy::query::RangeQuery::new(Bound::Included(start), end)
     }
 
     fn build_query_inner(
@@ -1030,6 +1044,17 @@ impl TextIndex {
 
         Ok(results)
     }
+}
+
+/// The least byte string greater than every string starting with `prefix`:
+/// `prefix` with its trailing 0xFF bytes dropped and its last byte raised by
+/// one; `None` when every byte is 0xFF (no such string, the range is open).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != u8::MAX)?;
+    let mut next = prefix[..=last].to_vec();
+    // A byte below 0xFF, so raising it cannot overflow.
+    next[last] += 1;
+    Some(next)
 }
 
 /// Extract `word*` prefix terms from a query string.
