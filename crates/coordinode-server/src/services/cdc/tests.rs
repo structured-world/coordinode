@@ -973,9 +973,14 @@ async fn stream_follows_a_raft_node() {
         .expect("subscribe")
         .into_inner();
 
+    // Each commit takes its timestamp from the store's clock, as a commit
+    // does: the leader refuses one below a bound already in its log.
+    let oracle = engine.oracle().expect("the store has a clock");
     let raft_pipeline = node.pipeline();
     let ids = ProposalIdGenerator::new();
+    let mut committed = Vec::new();
     for i in 1..=3u64 {
+        let (ts, held) = engine.pending_commits().obligate(|| oracle.next().as_raw());
         raft_pipeline
             .propose_and_wait(&RaftProposal {
                 id: ids.next(),
@@ -984,11 +989,13 @@ async fn stream_follows_a_raft_node() {
                     key: format!("cdc-{i}").into_bytes(),
                     value: b"v".to_vec(),
                 }],
-                commit_ts: Timestamp::from_raw(5000 + i),
-                start_ts: Timestamp::from_raw(4999 + i),
+                commit_ts: Timestamp::from_raw(ts),
+                start_ts: Timestamp::from_raw(ts),
                 bypass_rate_limiter: false,
             })
             .expect("propose");
+        drop(held);
+        committed.push(ts);
     }
 
     let mut seen = Vec::new();
@@ -998,12 +1005,12 @@ async fn stream_follows_a_raft_node() {
             .expect("an event for every committed proposal")
             .expect("stream open")
             .expect("event");
-        if (5001..=5003).contains(&event.ts) {
+        if committed.contains(&event.ts) {
             assert!(event.term >= 1, "the leader's term, got {}", event.term);
             seen.push(event.ts);
         }
     }
-    assert_eq!(seen, vec![5001, 5002, 5003]);
+    assert_eq!(seen, committed);
 
     drop(stream);
     node.shutdown().await.expect("shutdown");
