@@ -1748,7 +1748,7 @@ impl<'a> Transaction<'a> {
         // Before the timestamp: every snapshot taken after it waits for this
         // commit to land, so a long read here would hold up all of them.
         self.decide_uncovered_uniques()?;
-        let _reservation = if self.claims.is_empty() {
+        let reservation = if self.claims.is_empty() {
             None
         } else {
             let engine: &'a StorageEngine = self.engine;
@@ -1969,8 +1969,11 @@ impl<'a> Transaction<'a> {
             // The writes are local state now, so the registration has done its
             // work: from here a validating writer finds them by reading, and a
             // reader's snapshot may cover this timestamp. What remains is
-            // durability, which is not what the floor is about.
+            // durability, which is not what the floor is about. The claims go
+            // with it: an attempt after this one is judged against the state
+            // these writes left.
             drop(admission);
+            drop(reservation);
 
             // Step 2: Buffer for drain (if drain buffer is available).
             if let Some(drain_buf) = ctx.drain_buffer {
@@ -2066,8 +2069,11 @@ impl<'a> Transaction<'a> {
         // validating against committed state and being part of it; holding it
         // through a replication wait would pin every reader's snapshot on this
         // node for as long as the slowest member takes to acknowledge, which
-        // is durability, not visibility.
+        // is durability, not visibility. The claims are released at the same
+        // point: held through the fsync below, they refused an attempt that
+        // only had to be judged against the state these writes left.
         drop(admission);
+        drop(reservation);
 
         // j:journal on a member without a Raft log (legacy / embedded direct
         // write): force the fsync after commit. With FlushPolicy::SyncPerBatch
