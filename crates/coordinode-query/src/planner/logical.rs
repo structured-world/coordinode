@@ -214,6 +214,23 @@ pub enum LogicalOp {
         value_expr: crate::plan::expr::Expr,
     },
 
+    /// The number of nodes carrying `label`, read from the per-label counter
+    /// the write path keeps in the same transaction as the nodes, instead of
+    /// scanning them. Replaces `Aggregate { count }` over a bare one-label
+    /// `NodeScan`; `fallback` is that aggregate, run when the counter cannot
+    /// answer at execution time (a temporal label exists, which counts a
+    /// node's versions, or the read is at a past timestamp).
+    ///
+    /// EXPLAIN display: `NodeCountFromCounter(:Label AS column)`
+    NodeCountFromCounter {
+        /// The counted label.
+        label: String,
+        /// The result column, named as the aggregate it replaces names it.
+        column: String,
+        /// The aggregate over the scan, for when the counter cannot answer.
+        fallback: Box<LogicalOp>,
+    },
+
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<LogicalOp>,
@@ -1010,6 +1027,7 @@ impl LogicalOp {
             | LogicalOp::RankFuse { input, .. }
             | LogicalOp::DocScore { input, .. }
             | LogicalOp::MaxSimTopK { input, .. } => apply(input),
+            LogicalOp::NodeCountFromCounter { fallback, .. } => apply(fallback),
             LogicalOp::CartesianProduct { left, right }
             | LogicalOp::LeftOuterJoin { left, right } => {
                 apply(left);
@@ -1089,6 +1107,9 @@ impl LogicalOp {
             }
             LogicalOp::IndexScan { value_expr, .. } => {
                 value_expr.substitute_params(params);
+            }
+            LogicalOp::NodeCountFromCounter { fallback, .. } => {
+                fallback.substitute_params(params);
             }
             LogicalOp::Filter { input, predicate } => {
                 input.substitute_params(params);
@@ -1650,6 +1671,9 @@ fn estimate_op_cost(
         // IndexScan is a point-lookup: O(log N) cost, ~1 result row on average.
         LogicalOp::IndexScan { .. } => (1.0, 1.0),
 
+        // One counter read, one row.
+        LogicalOp::NodeCountFromCounter { .. } => (1.0, 1.0),
+
         // HnswScan: O(ef * log N) graph walk + k point reads. Cheapest
         // source op when applicable — costed as k so the planner always
         // prefers it over a full NodeScan of the same label.
@@ -2189,6 +2213,11 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         } => {
             output.push_str(&format!(
                 "{prefix}IndexScan({variable}:{label} ON {index_name}({property}))\n"
+            ));
+        }
+        LogicalOp::NodeCountFromCounter { label, column, .. } => {
+            output.push_str(&format!(
+                "{prefix}NodeCountFromCounter(:{label} AS {column})\n"
             ));
         }
         LogicalOp::HnswScan {

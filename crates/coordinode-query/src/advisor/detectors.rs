@@ -420,6 +420,9 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::AlterIndexMaintenance { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::IndexScan { .. } => vec![],
+        // A counter read: its fallback scan runs only when the counter
+        // cannot answer, so it is not the access path to advise on.
+        LogicalOp::NodeCountFromCounter { .. } => vec![],
     }
 }
 

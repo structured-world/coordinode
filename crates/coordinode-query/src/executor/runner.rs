@@ -3427,6 +3427,19 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             property_filters,
         } => execute_node_scan(variable, labels, property_filters, ctx),
 
+        LogicalOp::NodeCountFromCounter {
+            label,
+            column,
+            fallback,
+        } => match counted_nodes(label, ctx)? {
+            Some(n) => {
+                let mut row = Row::new();
+                row.insert(column.clone(), Value::Int(n));
+                Ok(vec![row])
+            }
+            None => execute_op(fallback, ctx),
+        },
+
         LogicalOp::IndexScan {
             variable,
             label,
@@ -4631,6 +4644,58 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 }
 
 /// Scan nodes from storage, optionally filtering by label.
+/// Whether the node counter of `label` equals what a scan of the label
+/// counts, by the catalog as committed now. A counter counts stored node
+/// rows, and a temporal node keeps one row per version under every label it
+/// carries (a temporal label in any position makes the node temporal), so no
+/// counter stands for a scan while any temporal label exists. A columnar
+/// label's rows live in its table, outside the node rows the counters follow.
+///
+/// # Errors
+///
+/// The catalog could not be read.
+pub fn node_counter_answers_scan(
+    engine: &coordinode_storage::engine::core::StorageEngine,
+    label: &str,
+) -> Result<bool, ExecutionError> {
+    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
+    let labels = LocalSchemaStore::new(engine).list_labels()?;
+    Ok(!labels
+        .iter()
+        .any(|schema| schema.temporal || (schema.name == label && schema.is_columnar())))
+}
+
+/// The number of nodes carrying `label` as this statement reads them, from
+/// the label's counter at the statement's snapshot plus what its own
+/// transaction staged, or `None` when the counter cannot stand for a scan:
+/// a read at a past timestamp (the catalog of then is not the one asked),
+/// a catalog [`node_counter_answers_scan`] refuses, or a counter below zero,
+/// which no sequence of committed writes leaves and so is not trusted.
+fn counted_nodes(
+    label: &str,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Option<i64>, ExecutionError> {
+    if ctx.snapshot_ts.is_some() || !node_counter_answers_scan(ctx.engine, label)? {
+        return Ok(None);
+    }
+    let key = coordinode_core::graph::stats::label_count_key(label);
+    ctx.sync_txn_state();
+    let stored = match ctx.txn.get(Partition::Counter, &key)? {
+        Some(bytes) => coordinode_storage::engine::merge::decode_counter(&bytes).map_err(|e| {
+            ExecutionError::Serialization(format!("node counter of label {label}: {e}"))
+        })?,
+        None => 0,
+    };
+    let count = stored.checked_add(ctx.txn.pending_counter_delta(&key));
+    match count {
+        Some(n) if n >= 0 => Ok(Some(n)),
+        _ => {
+            tracing::warn!(label, stored, "node counter out of range; counting by scan");
+            Ok(None)
+        }
+    }
+}
+
 fn execute_node_scan(
     variable: &str,
     labels: &[String],

@@ -32,6 +32,7 @@ mod integration {
     mod index_builds;
     mod index_profiles;
     mod interactive_txn;
+    mod label_count;
     mod merge_stress;
     mod multi_endpoint;
     mod multi_label;

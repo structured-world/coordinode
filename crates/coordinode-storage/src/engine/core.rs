@@ -867,6 +867,7 @@ impl StorageEngine {
             let interval = std::time::Duration::from_secs(5);
             Some(
                 crate::engine::capacity::CapacityScanner::start(interval, move || {
+                    publish_label_counts(&trees_c, &seqno_c);
                     if !tracked {
                         publish_footprint(&trees_c);
                         return;
@@ -3667,6 +3668,46 @@ fn publish_footprint(trees: &HashMap<Partition, lsm_tree::AnyTree>) {
             }
             Err(e) => {
                 tracing::warn!(partition = part.name(), error = %e, "retained-history scan failed");
+            }
+        }
+    }
+}
+
+/// Publish the stored nodes per label (`coordinode_graph_nodes_total`), from
+/// the counters the write path keeps on the same transaction as the nodes:
+/// one read per label, sampled on the capacity-scan cadence. A counter below
+/// zero is not published; no sequence of committed writes leaves one.
+fn publish_label_counts(
+    trees: &HashMap<Partition, lsm_tree::AnyTree>,
+    seqno: &lsm_tree::SharedSequenceNumberGenerator,
+) {
+    use coordinode_core::graph::stats::LABEL_KEY_PREFIX;
+    use lsm_tree::{AbstractTree, Guard as _};
+
+    let Some(tree) = trees.get(&Partition::Counter) else {
+        return;
+    };
+    for guard in tree.prefix(LABEL_KEY_PREFIX, seqno.get(), None) {
+        let (key, value) = match guard.into_inner() {
+            Ok(kv) => kv,
+            Err(e) => {
+                tracing::warn!(error = %e, "label counter scan failed");
+                return;
+            }
+        };
+        let Ok(label) = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..]) else {
+            continue;
+        };
+        match crate::engine::merge::decode_counter(&value) {
+            Ok(count) if count >= 0 => {
+                metrics::gauge!("coordinode_graph_nodes_total", "label" => label.to_owned())
+                    .set(count as f64);
+            }
+            Ok(count) => {
+                tracing::warn!(label, count, "label counter below zero; not published");
+            }
+            Err(e) => {
+                tracing::warn!(label, error = %e, "label counter does not decode");
             }
         }
     }

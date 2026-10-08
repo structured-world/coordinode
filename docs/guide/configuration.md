@@ -643,7 +643,10 @@ horizon for both time-travel reads and lagging-consumer recovery.
   install and drains to zero by itself; a figure that stays high is worth
   investigating. Both refresh every five seconds (the capacity-scan
   cadence) on every deployment, whether or not an endpoint sets a capacity
-  limit.
+  limit. On the same cadence `coordinode_graph_nodes_total{label}` reports
+  the stored nodes per label, read from counters that change in the same
+  transaction as the nodes (a temporal node counts once per stored
+  version).
 - `registry_heartbeat_ms` and `registry_eviction_ms` tune the
   consumer-retention registry's background service: the window over which
   buffered consumer heartbeats are coalesced into one proposal (opened by the

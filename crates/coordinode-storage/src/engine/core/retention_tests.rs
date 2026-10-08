@@ -1124,6 +1124,65 @@ fn footprint_gauges_are_sampled_without_capacity_limits() {
     );
 }
 
+/// The engine's background sampling publishes the stored nodes per label
+/// from the label counters, and leaves out a counter below zero.
+#[test]
+fn node_counts_per_label_are_sampled() {
+    use coordinode_core::graph::stats::{counter_delta_operand, label_count_key};
+
+    let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    metrics::set_global_recorder(GaugeCapture(Arc::clone(&sink))).expect("recorder");
+
+    let dir = TempDir::new().expect("tempdir");
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let engine = StorageEngine::open(&config).expect("open");
+    engine
+        .merge(
+            Partition::Counter,
+            &label_count_key("Project"),
+            &counter_delta_operand(3),
+        )
+        .expect("count Project");
+    engine
+        .merge(
+            Partition::Counter,
+            &label_count_key("Broken"),
+            &counter_delta_operand(-1),
+        )
+        .expect("an underflowed counter");
+
+    let gauge = |label: &str| {
+        sink.lock()
+            .iter()
+            .rev()
+            .find(|(name, labels, _)| {
+                name == "coordinode_graph_nodes_total"
+                    && labels.iter().any(|(k, v)| k == "label" && v == label)
+            })
+            .map(|(_, _, value)| *value)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while gauge("Project").is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no node count sample within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(gauge("Project"), Some(3.0));
+    assert_eq!(
+        gauge("Broken"),
+        None,
+        "a counter below zero is not published"
+    );
+}
+
 /// The capacity refresh publishes the two gauges per partition with the
 /// values `retained_history` reports, under the `partition` label.
 #[test]

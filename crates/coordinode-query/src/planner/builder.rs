@@ -1935,6 +1935,61 @@ pub fn apply_text_index_scan_access_path(
     }
 }
 
+/// Access-path pass: answer `count(n)` / `count(*)` over a bare one-label
+/// scan from that label's node counter ([`LogicalOp::NodeCountFromCounter`]).
+/// Only that exact shape: no inline property filter, no group key, the one
+/// aggregate counting the scanned rows themselves. `eligible` says whether
+/// the catalog lets the counter stand for the scan; the executor asks again,
+/// since the plan may be cached past a catalog change, and runs the
+/// aggregate it replaced when the answer has become no.
+pub fn apply_node_count_from_counter(op: LogicalOp, eligible: &dyn Fn(&str) -> bool) -> LogicalOp {
+    use crate::plan::expr::Expr;
+
+    let op = op.map_inputs(|child| apply_node_count_from_counter(child, eligible));
+    let LogicalOp::Aggregate {
+        input,
+        group_by,
+        aggregates,
+    } = &op
+    else {
+        return op;
+    };
+    let LogicalOp::NodeScan {
+        variable,
+        labels,
+        property_filters,
+    } = input.as_ref()
+    else {
+        return op;
+    };
+    let ([label], [item]) = (labels.as_slice(), aggregates.as_slice()) else {
+        return op;
+    };
+    // count(n) over the scanned nodes counts every row (a node is never
+    // null, and nodes are distinct, so DISTINCT changes nothing); count(*)
+    // counts the rows outright.
+    let counts_rows = match &item.arg {
+        Expr::Star => true,
+        Expr::Variable(v) => v == variable,
+        _ => false,
+    };
+    if !group_by.is_empty()
+        || !property_filters.is_empty()
+        || !item.function.eq_ignore_ascii_case("count")
+        || !counts_rows
+        || !eligible(label)
+    {
+        return op;
+    }
+    let label = label.clone();
+    let column = item.alias.clone().unwrap_or_else(|| item.function.clone());
+    LogicalOp::NodeCountFromCounter {
+        label,
+        column,
+        fallback: Box::new(op),
+    }
+}
+
 /// Access-path pass: replace `VectorTopK { input: bare NodeScan }` with
 /// the [`LogicalOp::HnswScan`] SOURCE operator when the query is a pure
 /// vector top-K over one label with a registered HNSW index.

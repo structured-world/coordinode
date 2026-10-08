@@ -767,6 +767,21 @@ ddl:         CREATE INDEX user_email ON User(email)
 
 Returns the logical plan for a query without executing it. Available via the `CypherService.Explain` RPC.
 
+#### Counting the nodes of one label ✅
+
+`MATCH (n:Label) RETURN count(n)` and `count(*)` over a single label, with no
+property filter, WHERE or grouping, are answered from a per-label node
+counter instead of scanning the label; EXPLAIN shows
+`NodeCountFromCounter(:Label AS column)`. The counter changes in the same
+transaction as the nodes, so the answer is exact at the query's snapshot and
+includes the transaction's own uncommitted creates and deletes.
+
+The query is counted by scan instead, with the same result, while any
+`TEMPORAL` node type exists (a temporal node keeps a row per version, which
+the counter counts), for a read at a past timestamp, and for a columnar
+label. Any other shape, such as `count(n.prop)` or a filtered match, counts
+by scan as before.
+
 ---
 
 ### CALL (Procedures) ✅

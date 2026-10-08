@@ -3032,6 +3032,13 @@ impl Database {
         // instead of scanning the label to keep them.
         plan.root =
             planner::apply_text_index_scan_access_path(plan.root, &self.text_index_registry);
+        // count over one bare label reads the label's node counter instead
+        // of scanning the label, where the catalog lets the counter stand
+        // for the scan. A catalog that cannot be read keeps the scan.
+        plan.root = planner::apply_node_count_from_counter(plan.root, &|label| {
+            coordinode_query::executor::runner::node_counter_answers_scan(&self.engine, label)
+                .unwrap_or(false)
+        });
         // Every VectorFilter after a Traverse gets its strategy (graph_first /
         // acorn_filtered / vector_first) from the push-down cost model.
         plan.root = planner::optimize_push_down_lazy(plan.root, stats);
