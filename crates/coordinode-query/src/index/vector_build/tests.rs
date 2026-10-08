@@ -19,6 +19,7 @@ struct Fixture {
     oracle: Arc<TimestampOracle>,
     registry: VectorIndexRegistry,
     field: u32,
+    fields: FieldInterner,
     _dir: tempfile::TempDir,
 }
 
@@ -67,12 +68,14 @@ fn fixture() -> Fixture {
         .health_handle("Doc", "embedding")
         .expect("health")
         .report_rebuild_progress(0.0, 0);
-    let field = FieldInterner::new().intern("embedding");
+    let mut fields = FieldInterner::new();
+    let field = fields.intern("embedding");
     Fixture {
         engine,
         oracle,
         registry,
         field,
+        fields,
         _dir: dir,
     }
 }
@@ -150,6 +153,89 @@ impl Fixture {
         .run()
     }
 
+    /// What the indexes' maintainer (the worker following the applied
+    /// commits) does with an applied write of node `id` on shard 0: reconcile
+    /// every index with the record as it stands. The registry leaves it to a
+    /// build that owns the index, as it does for the worker.
+    fn maintain(&self, fields: &FieldInterner, id: u64) {
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        let read = Transaction::new(
+            &self.engine,
+            None,
+            coordinode_core::txn::timestamp::Timestamp::ZERO,
+            None,
+        );
+        let record = LocalNodeStore
+            .get_many(&read, 0, &[NodeId::from_raw(id)])
+            .expect("read")
+            .pop()
+            .flatten();
+        for def in self.registry.all_definitions() {
+            let property = def.property();
+            let vector = record
+                .as_ref()
+                .filter(|r| r.primary_label() == def.label)
+                .and_then(|r| r.props.get(&fields.lookup(property)?))
+                .and_then(coordinode_core::graph::types::try_extract_vector);
+            match vector {
+                Some(vector) => self.registry.on_vectors_written(
+                    &def.label,
+                    property,
+                    vec![(NodeId::from_raw(id), vector)],
+                ),
+                None => self
+                    .registry
+                    .on_vector_removed(&def.label, property, NodeId::from_raw(id)),
+            }
+        }
+    }
+
+    /// Run a build of `targets` with its scan held at its first insert into
+    /// `held` (which needs a member to insert), run `during` while it waits,
+    /// with the tap open and the index still the build's, then let it go.
+    fn build_with_scan_held(
+        &self,
+        held: &std::sync::RwLock<coordinode_vector::hnsw::HnswIndex>,
+        targets: &[BuildTarget<'_>],
+        during: impl FnOnce(),
+    ) -> Result<BuildOutcome, String> {
+        let token = self.registry.new_build_token();
+        std::thread::scope(|scope| {
+            let lock = held.write().expect("graph");
+            let build = scope.spawn(|| {
+                VectorBuild {
+                    engine: &self.engine,
+                    token: &token,
+                    shard_id: 0,
+                    targets,
+                }
+                .run()
+            });
+            // The build opens its tap and starts the scan, whose first insert
+            // waits for this lock; nothing else is waited for.
+            std::thread::sleep(Duration::from_millis(200));
+            during();
+            drop(lock);
+            build.join().expect("build thread")
+        })
+    }
+
+    /// `build_with_scan_held` over the `Doc.embedding` index alone.
+    fn build_doc_with_scan_held(&self, during: impl FnOnce()) -> Result<BuildOutcome, String> {
+        let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
+        let health = self.health();
+        self.build_with_scan_held(
+            &hnsw,
+            &[BuildTarget {
+                hnsw: &hnsw,
+                health: &health,
+                label: "Doc",
+                field_id: self.field,
+            }],
+            during,
+        )
+    }
+
     fn indexed(&self, query: [f32; 3], id: u64) -> bool {
         let hnsw = self.registry.get("Doc", "embedding").expect("hnsw");
         let graph = hnsw.read().expect("hnsw");
@@ -178,36 +264,20 @@ fn put(shard: u16, id: u64, record: &NodeRecord) -> Mutation {
     }
 }
 
-/// Wait until the build has handed maintenance to the writers and is
-/// waiting for the transactions older than the handover.
-fn await_handover(health: &HealthSignal) {
-    // The handover follows the scan, which inserts every vector into the graph
-    // of an unoptimised build: seconds alone, several times that on a CI host
-    // shared with other builds. The bound only turns a hang into a failure.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while health.snapshot().is_rebuilding() {
-        assert!(Instant::now() < deadline, "the build never handed over");
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 /// A write that lands while the index is being built reaches it, whatever
 /// its commit timestamp. The one here was timestamped before the build
-/// started and applies once the build has scanned and handed over: below
-/// every snapshot the build took, so no timestamp selects it, and its writer
-/// left the vector to the build. A transaction open before the handover
-/// keeps the build folding until it ends.
+/// started and applies during the scan: below every snapshot the build took,
+/// so no timestamp selects it, and its maintainer leaves it to the build,
+/// whose tap holds it.
 #[test]
 fn a_write_landing_below_every_build_snapshot_reaches_the_index() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     let early = fx.oracle.next().as_raw();
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         fx.apply_doc_at(7, [1.0, 0.0, 0.0], early);
-        drop(older);
+        fx.maintain(&fx.fields, 7);
     });
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
@@ -223,15 +293,13 @@ fn a_write_landing_below_every_build_snapshot_reaches_the_index() {
 #[test]
 fn a_build_whose_partition_is_replaced_scans_again() {
     let fx = fixture();
-    let older = fx.open_transaction();
+    fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         fx.engine
             .clear_partition(coordinode_storage::engine::partition::Partition::Node)
             .expect("clear");
         fx.apply_doc_at(9, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
-        drop(older);
     });
 
     assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
@@ -241,15 +309,15 @@ fn a_build_whose_partition_is_replaced_scans_again() {
     );
 }
 
-/// A scan started over after the handover reports progress again, which
-/// puts the index back to rebuilding; the build hands it over again once
-/// that scan is in, so the index ends ready rather than rebuilding forever.
-/// The label is large enough for the scan to report progress, and the range
-/// removed is empty, so every node stays and is scanned again.
+/// A scan started over reports progress again, which keeps the index
+/// rebuilding; the build hands it over once that scan is in, so the index
+/// ends ready rather than rebuilding forever. The label is large enough for
+/// the scan to report progress, and the range removed is empty, so every
+/// node stays and is scanned again.
 // Removing a key range is a storage operation no store exposes.
 #[allow(clippy::disallowed_types)]
 #[test]
-fn a_build_that_scans_again_after_the_handover_ends_ready() {
+fn a_build_that_scans_again_ends_ready() {
     let fx = fixture();
     let nodes: Vec<Mutation> = (1..=1_500u64)
         .map(|id| put(0, id, &record("Doc", fx.field, [id as f32, 1.0, 0.0])))
@@ -257,10 +325,8 @@ fn a_build_that_scans_again_after_the_handover_ends_ready() {
     fx.engine
         .apply_proposal_at(&nodes, fx.oracle.next().as_raw())
         .expect("apply");
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         let empty =
             |shard| coordinode_core::graph::node::encode_node_key(shard, NodeId::from_raw(0));
         fx.engine
@@ -270,7 +336,6 @@ fn a_build_that_scans_again_after_the_handover_ends_ready() {
                 &empty(2),
             )
             .expect("remove range");
-        drop(older);
     });
 
     assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
@@ -279,33 +344,15 @@ fn a_build_that_scans_again_after_the_handover_ends_ready() {
     assert_eq!(fx.graph_len(), 1_500, "every node is in the graph once");
 }
 
-/// A cancelled build stops while it waits for older transactions, rather
-/// than holding the tap open until they end.
+/// A build ends on its own, marks the index ready, and publishes a freshness
+/// watermark covering the store as it stood. A transaction left open does
+/// not hold it: whatever that transaction commits, the maintainer inserts.
 #[test]
-fn a_cancelled_build_stops_while_it_waits() {
-    let fx = fixture();
-    let _older = fx.open_transaction();
-    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
-    let health = fx.health();
-    let token = fx.registry.new_build_token();
-
-    let outcome = std::thread::scope(|scope| {
-        let build = scope.spawn(|| fx.build(&hnsw, &health, &token));
-        await_handover(&health);
-        token.cancel();
-        build.join().expect("build thread")
-    });
-    assert_eq!(outcome, Ok(BuildOutcome::Cancelled));
-}
-
-/// With no transaction older than the handover the build ends on its own,
-/// marks the index ready, and publishes a freshness watermark covering the
-/// store as it stood.
-#[test]
-fn a_build_with_nothing_to_wait_for_ends_ready_and_fresh() {
+fn a_build_ends_ready_and_fresh() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     let before = fx.engine.snapshot();
+    let _open = fx.open_transaction();
 
     let outcome = fx.build_while(|_| {});
 
@@ -439,25 +486,27 @@ fn a_write_during_the_scan_is_in_the_graph_before_the_index_is_ready() {
     );
 }
 
-/// Thousands of writes landing after the handover are folded in more than one
-/// chunk: every one of them is a member when the build ends, beside every
-/// scanned node.
+/// Thousands of writes landing during the scan are folded in more than one
+/// chunk, and the writes after the handover are their maintainer's: every
+/// one of them is a member when the build ends, beside every scanned node.
 #[test]
-fn every_node_written_after_the_handover_is_a_member() {
+fn every_node_written_across_the_build_is_a_member() {
     let fx = fixture();
     let v = |id: u64| [1.0, id as f32, (id % 7) as f32];
     for id in 1..=3000u64 {
         fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
     }
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
-        for id in 3001..=5000u64 {
+    let outcome = fx.build_doc_with_scan_held(|| {
+        for id in 3001..=4500u64 {
             fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
+            fx.maintain(&fx.fields, id);
         }
-        drop(older);
     });
+    for id in 4501..=5000u64 {
+        fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
+        fx.maintain(&fx.fields, id);
+    }
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 3000 }));
     let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
@@ -476,14 +525,14 @@ fn a_node_leaving_the_index_during_the_build_is_removed() {
     for id in 1..=4 {
         fx.apply_doc_at(id, [0.0, 1.0, id as f32], fx.oracle.next().as_raw());
     }
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         fx.delete_node(1);
         fx.apply_record(0, 2, &record("Other", fx.field, [0.0, 1.0, 2.0]));
         fx.apply_record(0, 3, &NodeRecord::new("Doc"));
-        drop(older);
+        for id in 1..=3 {
+            fx.maintain(&fx.fields, id);
+        }
     });
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 4 }));
@@ -503,12 +552,10 @@ fn a_vector_rewritten_during_the_build_is_indexed_at_its_new_value() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
     fx.apply_doc_at(2, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         fx.apply_record(0, 1, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
-        drop(older);
+        fx.maintain(&fx.fields, 1);
     });
 
     assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
@@ -523,12 +570,9 @@ fn a_vector_rewritten_during_the_build_is_indexed_at_its_new_value() {
 fn a_write_to_another_shard_is_not_folded() {
     let fx = fixture();
     fx.apply_doc_at(1, [0.0, 1.0, 0.0], fx.oracle.next().as_raw());
-    let older = fx.open_transaction();
 
-    let outcome = fx.build_while(|health| {
-        await_handover(health);
+    let outcome = fx.build_doc_with_scan_held(|| {
         fx.apply_record(1, 5, &record("Doc", fx.field, [1.0, 0.0, 0.0]));
-        drop(older);
     });
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 1 }));
@@ -597,37 +641,29 @@ fn one_build_fills_every_index_of_the_shard() {
     let imgs = fx.registry.get("Img", "pixels").expect("imgs");
     let doc_health = fx.health();
     let img_health = fx.registry.health_handle("Img", "pixels").expect("health");
-    let token = fx.registry.new_build_token();
-    let older = fx.open_transaction();
 
-    let outcome = std::thread::scope(|scope| {
-        let build = scope.spawn(|| {
-            VectorBuild {
-                engine: &fx.engine,
-                token: &token,
-                shard_id: 0,
-                targets: &[
-                    BuildTarget {
-                        hnsw: &docs,
-                        health: &doc_health,
-                        label: "Doc",
-                        field_id: fx.field,
-                    },
-                    BuildTarget {
-                        hnsw: &imgs,
-                        health: &img_health,
-                        label: "Img",
-                        field_id: pixels,
-                    },
-                ],
-            }
-            .run()
-        });
-        await_handover(&doc_health);
-        fx.apply_record(0, 3, &record("Img", pixels, [1.0, 0.0, 0.0]));
-        drop(older);
-        build.join().expect("build thread")
-    });
+    // The scan reaches the Doc node first and waits there.
+    let outcome = fx.build_with_scan_held(
+        &docs,
+        &[
+            BuildTarget {
+                hnsw: &docs,
+                health: &doc_health,
+                label: "Doc",
+                field_id: fx.field,
+            },
+            BuildTarget {
+                hnsw: &imgs,
+                health: &img_health,
+                label: "Img",
+                field_id: pixels,
+            },
+        ],
+        || {
+            fx.apply_record(0, 3, &record("Img", pixels, [1.0, 0.0, 0.0]));
+            fx.maintain(&interner, 3);
+        },
+    );
 
     assert_eq!(outcome, Ok(BuildOutcome::Complete { scanned: 2 }));
     let docs = docs.read().expect("docs");

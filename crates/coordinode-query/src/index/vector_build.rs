@@ -8,7 +8,6 @@
 //! share a build: one tap, one scan, one fold.
 
 use std::sync::RwLock;
-use std::time::Duration;
 
 use coordinode_core::graph::node::{NodeId, NodeRecord};
 use coordinode_core::graph::types::try_extract_vector;
@@ -20,15 +19,8 @@ use coordinode_vector::hnsw::HnswIndex;
 
 use crate::index::BuildToken;
 
-/// How long the build waits, between folds, for the transactions opened
-/// before the writers took over.
-const OLDER_TRANSACTIONS_SLICE: Duration = Duration::from_millis(50);
-
-/// How often that wait checks whether they have ended.
-const OLDER_TRANSACTIONS_POLL: Duration = Duration::from_millis(2);
-
 /// Nodes folded per hold of the graphs' write locks, bounding how long a fold
-/// keeps searches waiting.
+/// keeps a partial-recall search of a rebuilding index waiting.
 const TAP_FOLD_CHUNK: usize = 1024;
 
 /// Nodes scanned between two progress reports and cancellation checks.
@@ -87,9 +79,8 @@ pub struct VectorBuild<'a> {
 }
 
 impl VectorBuild<'_> {
-    /// Build the indexes beside live writes: scan, fold what the write tap
-    /// delivered, hand maintenance to the writers, wait out the transactions
-    /// that did not see the handover, fold again.
+    /// Build the indexes beside live writes: scan, hand maintenance to the
+    /// writers, fold what the write tap delivered meanwhile, mark ready.
     ///
     /// Writes are selected by where they landed, not by timestamp: an entry
     /// applies at its own commit timestamp, which can sit below any snapshot
@@ -98,21 +89,19 @@ impl VectorBuild<'_> {
     /// before the scan delivers every write that lands after it, and the
     /// scan's snapshot holds every one that landed before.
     ///
-    /// While an index rebuilds, writers leave it to the build, which inserts
-    /// the scan in batches far cheaper per vector than a write at a time.
-    /// Once the scan is in, the indexes are marked ready and writers insert
-    /// for themselves; the build folds what landed during the scan, and a
-    /// transaction opened before the handover may still leave its vector to
-    /// the build, so the tap stays open until every transaction opened at or
-    /// before the handover's boundary has ended (the wait PostgreSQL's
-    /// concurrent index build makes for older snapshots), and one more fold
-    /// takes what they wrote. Nothing waits for the tap to run dry, which
-    /// under writes that never pause it would not. The writers are never
-    /// paused, and the freshness watermark is published only at the end.
+    /// While an index rebuilds, the index's maintainer (the worker that
+    /// follows the applied commits) leaves each write to the build, which
+    /// inserts the scan in batches far cheaper per vector than a write at a
+    /// time. Once the scan is in, the build hands the indexes over: every
+    /// write the maintainer takes from then on it inserts itself, and every
+    /// one it left to the build landed before the next take of the tap,
+    /// which the build then folds. The indexes are complete after that fold
+    /// and turn ready; nothing after it is the build's, so no fold runs on a
+    /// graph that serves searches. Nothing waits for the tap to run dry,
+    /// which under writes that never pause it would not.
     ///
     /// Blocks until done, and on a Raft store pauses the applies for an
-    /// instant at the start: call it off the async runtime, and never from a
-    /// thread whose own transaction is open (it would wait for itself).
+    /// instant at the start: call it off the async runtime.
     ///
     /// # Errors
     ///
@@ -128,96 +117,56 @@ impl VectorBuild<'_> {
         );
         let mut outcome = self.scan(at)?;
         tracing::debug!(?outcome, "vector build: scanned");
-        if outcome == BuildOutcome::Cancelled {
-            return Ok(outcome);
-        }
-        let mut boundary = self.hand_over();
-        // Set once the transactions opened before the handover have ended:
-        // the snapshot every write at or below which is in the graphs after
-        // one more fold.
-        let mut settled: Option<u64> = None;
         loop {
             if outcome == BuildOutcome::Cancelled || self.token.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled);
             }
-            // Fold what the tap holds. It never has to run dry: under writes
-            // that do not pause it would not, and the writers insert for
-            // themselves.
+            self.hand_over();
+            // Every write at or below this snapshot landed before the take
+            // below: in the scan, in the tap, or (after the handover)
+            // inserted by its maintainer before it reached this point.
+            let fresh = self.engine.snapshot();
             match tap.take() {
                 // The partition was cleared or range-deleted: what it lost is
-                // not listed, so start over from a fresh snapshot.
+                // not listed, so start over from a fresh snapshot, which puts
+                // the indexes back to rebuilding.
                 Tapped::Replaced => {
                     let at = self
                         .engine
                         .rebase_tap(&tap)
                         .map_err(|e| format!("rebase the write tap: {e}"))?;
                     outcome = self.scan(at)?;
-                    // The scan put the indexes back to rebuilding, so the
-                    // writers left what they wrote meanwhile to the build:
-                    // hand over again, and wait for the transactions opened
-                    // before this handover instead.
-                    if outcome != BuildOutcome::Cancelled {
-                        boundary = self.hand_over();
-                    }
-                    settled = None;
-                    continue;
                 }
                 Tapped::Keys(keys) => {
                     if !keys.is_empty() {
                         tracing::debug!(keys = keys.len(), "vector build: folding tapped writes");
                         self.fold(&keys)?;
                     }
+                    drop(tap);
                     // This take came after the handover, so it held every
-                    // write the writers left to the build: those landed
-                    // before it. They are in the graphs now, and the indexes
-                    // are complete for every write the feed has released.
+                    // write the maintainer left to the build. They are in the
+                    // graphs now; the maintainer has every later one.
                     for target in self.targets {
-                        target.health.mark_ready_after_handover();
+                        if target.health.mark_ready_after_handover() {
+                            target.health.advance_indexed_hlc(fresh);
+                        }
                     }
+                    return Ok(outcome);
                 }
-            }
-            // The fold after the older transactions ended took everything
-            // they wrote: whatever lands from here on, its writer inserts.
-            if let Some(fresh) = settled {
-                drop(tap);
-                for target in self.targets {
-                    target.health.advance_indexed_hlc(fresh);
-                }
-                return Ok(outcome);
-            }
-            if self
-                .engine
-                .await_transactions_through(
-                    boundary,
-                    OLDER_TRANSACTIONS_POLL,
-                    OLDER_TRANSACTIONS_SLICE,
-                )
-                .is_ok()
-            {
-                settled = Some(self.engine.snapshot());
             }
         }
     }
 
-    /// Hand the scanned graphs to the writers, who insert what they write
-    /// from here on, and return the boundary past which a transaction does
-    /// so for itself.
-    ///
-    /// What landed during the scan, and what the transactions opened before
-    /// this point leave, stays with the build through the tap. Handing over
-    /// later would not make the index more complete (writes keep landing) but
-    /// would leave every write in between to the build's folds, which under
-    /// steady load grow with each other. The indexes turn ready after the
-    /// next fold, which takes what the writers left to the build; only from
-    /// the handed-over state, so a newer build that has started meanwhile is
-    /// not overruled.
-    fn hand_over(&self) -> u64 {
+    /// Hand the scanned graphs to their maintainer, which inserts what it
+    /// takes from here on. What landed before stays with the build through
+    /// the tap; the indexes turn ready after the fold that takes it, and only
+    /// from the handed-over state, so a newer build that has started
+    /// meanwhile is not overruled.
+    fn hand_over(&self) {
         for target in self.targets {
             target.health.hand_over();
         }
-        let boundary = self.engine.snapshot_boundary();
-        tracing::debug!(boundary, "vector build: handed over to the writers");
-        boundary
+        tracing::debug!("vector build: handed over to the maintainer");
     }
 
     /// Scan the shard at `snapshot` and insert every member of every index.

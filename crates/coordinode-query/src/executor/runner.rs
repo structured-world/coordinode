@@ -10563,10 +10563,8 @@ fn gate_vector_index_read(
     };
 
     // The health turns ready once the build has handed maintenance to the
-    // writers and folded what they left to it during the scan; the build
-    // then keeps folding in the writes of the transactions opened before
-    // the handover, this one among them, so a reader waits for the handover
-    // and that fold, never for the build's end.
+    // worker and folded what the worker left to it during the scan, which is
+    // where the build ends: a reader waits for the scan and that fold.
     let wait = indexes.build_wait;
     // A wait too long to add to the clock is no bound at all.
     let deadline = std::time::Instant::now().checked_add(wait);
@@ -17339,9 +17337,9 @@ fn execute_create_vector_index(
                 .run()
             }));
             match outcome {
-                // The build marked the index ready when it handed it over;
-                // marking it again here would overrule a rebuild started
-                // since.
+                // The build marked the index ready after its last fold, only
+                // from the handed-over state; marking it again here would
+                // overrule a rebuild started since.
                 Ok(Ok(crate::index::BuildOutcome::Complete { scanned })) => {
                     tracing::info!(
                         index = %name_owned,
