@@ -175,20 +175,78 @@ fn registry_min_max_matches_committed_timestamps() {
 #[allow(dead_code)]
 const _: fn(Visibility) -> bool = |v| matches!(v, Visibility::All);
 
-/// Legacy `add_document` writes commit_ts=0 → visible to every snapshot.
+/// A document written without a birth time is not taken as born at 0: a
+/// birth-filtered read of the index is refused, and its segment has no
+/// bounds in the registry.
 #[test]
-fn legacy_writes_are_visible_to_every_snapshot() {
+fn a_document_without_a_birth_time_refuses_a_read_at_a_timestamp() {
     let dir = TempDir::new().unwrap();
     let mut idx = open(&dir);
 
-    idx.add_document(1, "legacy doc without commit_ts").unwrap();
+    idx.add_document_at(1, "timed doc", 10).unwrap();
+    idx.add_document(2, "untimed doc").unwrap();
 
-    // Snapshot at T=0, T=1, T=u64::MAX all see the doc.
-    assert_eq!(idx.search_at("legacy", 10, 0).unwrap().len(), 1);
-    assert_eq!(idx.search_at("legacy", 10, 1).unwrap().len(), 1);
+    for at in [0, 10, u64::MAX] {
+        assert!(
+            matches!(
+                idx.search_at("doc", 10, at),
+                Err(coordinode_search::tantivy::TextSearchError::BirthTimesUnknown)
+            ),
+            "a read at {at} must be refused"
+        );
+    }
     assert_eq!(
-        idx.search_at("legacy", 10, u64::MAX).unwrap().len(),
+        idx.registry_snapshot().len(),
         1,
-        "commit_ts=0 docs remain visible at any T"
+        "only the timed segment has bounds"
     );
+    // A search of the index as it stands is unaffected.
+    assert_eq!(idx.search("doc", 10).unwrap().len(), 2);
+}
+
+/// Zero is a birth time like any other, told apart from a missing one: a
+/// document born at 0 is visible at 0, one born later is not.
+#[test]
+fn a_birth_time_of_zero_is_a_birth_time() {
+    let dir = TempDir::new().unwrap();
+    let mut idx = open(&dir);
+
+    idx.add_document_at(1, "zero doc", 0).unwrap();
+    idx.add_document_at(2, "later doc", 5).unwrap();
+
+    let ids = |at| -> Vec<u64> {
+        idx.search_at("doc", 10, at)
+            .unwrap()
+            .iter()
+            .map(|r| r.node_id)
+            .collect()
+    };
+    assert_eq!(ids(0), [1]);
+    let mut at_5 = ids(5);
+    at_5.sort_unstable();
+    assert_eq!(at_5, [1, 2]);
+}
+
+/// The multi-language index holds current states whose birth commit is not
+/// known: reaching its raw index does not turn that into a timestamp read.
+#[test]
+fn a_current_state_index_refuses_a_read_at_a_timestamp() {
+    use coordinode_search::tantivy::multi_lang::{MultiLangConfig, MultiLanguageTextIndex};
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let mut idx =
+        MultiLanguageTextIndex::create_scratch(dir.path(), 15_000_000, MultiLangConfig::default())
+            .unwrap();
+    idx.add_node(
+        1,
+        &HashMap::from([("body".to_string(), "graph engine".to_string())]),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        idx.inner().search_at("graph", 10, u64::MAX),
+        Err(coordinode_search::tantivy::TextSearchError::BirthTimesUnknown)
+    ));
+    assert!(idx.inner().registry_snapshot().is_empty());
 }

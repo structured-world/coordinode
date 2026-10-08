@@ -118,6 +118,13 @@ pub enum TextSearchError {
 
     #[error("index not found or corrupted: {0}")]
     IndexCorrupted(String),
+
+    /// The index holds documents written without a birth time, so a read
+    /// filtered by birth time cannot tell which of them a snapshot sees.
+    #[error(
+        "the index holds documents without a birth time; it cannot answer a read at a timestamp"
+    )]
+    BirthTimesUnknown,
 }
 
 /// A scored search result from the text index.
@@ -159,9 +166,9 @@ pub struct TextIndex {
     node_id_field: Field,
     /// Schema field for the text body (indexed + stored).
     body_field: Field,
-    /// Fast field carrying each document's originating Raft proposal commit_ts.
-    /// Legacy `add_document` paths write 0, which is ≤ any valid snapshot T
-    /// so such documents remain visible to all snapshot readers.
+    /// Fast field carrying each document's birth time: the commit_ts of the
+    /// write that produced it. A document written without one carries no
+    /// value, and [`TextIndex::search_at`] then refuses to answer.
     commit_ts_field: Field,
     /// Stored-only tokens of a pre-tokenized body (see [`encode_tokens`]).
     tokens_field: Field,
@@ -429,10 +436,10 @@ impl TextIndex {
     ///
     /// Commits synchronously — the document is searchable after return.
     ///
-    /// Equivalent to `add_document_at(node_id, text, 0)`. Commit_ts 0 means
-    /// the document is visible to every snapshot reader (0 ≤ any T).
+    /// The document carries no birth time, so the index no longer answers
+    /// [`Self::search_at`]; use [`Self::add_document_at`] for that.
     pub fn add_document(&mut self, node_id: u64, text: &str) -> Result<(), TextSearchError> {
-        self.add_document_at(node_id, text, 0)
+        self.add_documents(&[(node_id, text)], None)
     }
 
     /// MVCC-aware single-document add. `commit_ts` is the originating Raft
@@ -444,26 +451,15 @@ impl TextIndex {
         text: &str,
         commit_ts: u64,
     ) -> Result<(), TextSearchError> {
-        let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
-        self.writer.delete_term(node_id_term);
-
-        self.writer.add_document(doc!(
-            self.node_id_field => node_id,
-            self.body_field => text,
-            self.commit_ts_field => commit_ts,
-        ))?;
-
-        self.writer.commit()?;
-        self.reader.reload()?;
-        self.reconcile_registry()?;
-        Ok(())
+        self.add_documents(&[(node_id, text)], Some(commit_ts))
     }
 
-    /// Add multiple documents in a single batch commit.
+    /// Add multiple documents in a single batch commit, without birth times
+    /// (see [`Self::add_document`]).
     ///
     /// More efficient than individual add_document calls for bulk inserts.
     pub fn add_documents_batch(&mut self, docs: &[(u64, &str)]) -> Result<(), TextSearchError> {
-        self.add_documents_batch_at_uniform(docs, 0)
+        self.add_documents(docs, None)
     }
 
     /// MVCC-aware batch add: all documents share a single `commit_ts`.
@@ -473,15 +469,28 @@ impl TextIndex {
         docs: &[(u64, &str)],
         commit_ts: u64,
     ) -> Result<(), TextSearchError> {
+        self.add_documents(docs, Some(commit_ts))
+    }
+
+    /// Replace the documents of `docs` in one commit, each born at
+    /// `commit_ts` when it is known.
+    fn add_documents(
+        &mut self,
+        docs: &[(u64, &str)],
+        commit_ts: Option<u64>,
+    ) -> Result<(), TextSearchError> {
         for &(node_id, text) in docs {
             let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
             self.writer.delete_term(node_id_term);
 
-            self.writer.add_document(doc!(
+            let mut doc = doc!(
                 self.node_id_field => node_id,
                 self.body_field => text,
-                self.commit_ts_field => commit_ts,
-            ))?;
+            );
+            if let Some(commit_ts) = commit_ts {
+                doc.add_u64(self.commit_ts_field, commit_ts);
+            }
+            self.writer.add_document(doc)?;
         }
 
         self.writer.commit()?;
@@ -791,14 +800,15 @@ impl TextIndex {
     /// tokenizers — essential for multi-language indexes.
     ///
     /// If `language` is `"auto_detect"`, whatlang-rs detects the language from
-    /// the text content. If `"none"`, no stemming is applied.
+    /// the text content. If `"none"`, no stemming is applied. The document
+    /// carries no birth time (see [`Self::add_document`]).
     pub fn add_document_with_language(
         &mut self,
         node_id: u64,
         text: &str,
         language: &str,
     ) -> Result<(), TextSearchError> {
-        self.add_document_with_language_at(node_id, text, language, 0)
+        self.add_documents_with_language(&[(node_id, text, language)], None)
     }
 
     /// MVCC-aware variant of `add_document_with_language`. See
@@ -810,28 +820,11 @@ impl TextIndex {
         language: &str,
         commit_ts: u64,
     ) -> Result<(), TextSearchError> {
-        let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
-        self.writer.delete_term(node_id_term);
-
-        let tokens = tokenize::tokenize_text(text, language);
-        let pretokenized = PreTokenizedString {
-            text: text.to_string(),
-            tokens,
-        };
-
-        let mut doc = TantivyDocument::new();
-        doc.add_field_value(self.node_id_field, &OwnedValue::U64(node_id));
-        doc.add_field_value(self.body_field, &OwnedValue::PreTokStr(pretokenized));
-        doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
-        self.writer.add_document(doc)?;
-
-        self.writer.commit()?;
-        self.reader.reload()?;
-        self.reconcile_registry()?;
-        Ok(())
+        self.add_documents_with_language(&[(node_id, text, language)], Some(commit_ts))
     }
 
-    /// Add multiple documents with per-document language overrides.
+    /// Add multiple documents with per-document language overrides, without
+    /// birth times (see [`Self::add_document`]).
     ///
     /// Each tuple is (node_id, text, language). More efficient than
     /// individual `add_document_with_language` calls for bulk inserts.
@@ -839,7 +832,7 @@ impl TextIndex {
         &mut self,
         docs: &[(u64, &str, &str)],
     ) -> Result<(), TextSearchError> {
-        self.add_documents_batch_with_language_at_uniform(docs, 0)
+        self.add_documents_with_language(docs, None)
     }
 
     /// MVCC-aware multi-language batch: all documents share one `commit_ts`.
@@ -847,6 +840,15 @@ impl TextIndex {
         &mut self,
         docs: &[(u64, &str, &str)],
         commit_ts: u64,
+    ) -> Result<(), TextSearchError> {
+        self.add_documents_with_language(docs, Some(commit_ts))
+    }
+
+    /// [`Self::add_documents`] with each text tokenized by its language.
+    fn add_documents_with_language(
+        &mut self,
+        docs: &[(u64, &str, &str)],
+        commit_ts: Option<u64>,
     ) -> Result<(), TextSearchError> {
         for &(node_id, text, language) in docs {
             let node_id_term = tantivy::Term::from_field_u64(self.node_id_field, node_id);
@@ -861,7 +863,9 @@ impl TextIndex {
             let mut doc = TantivyDocument::new();
             doc.add_field_value(self.node_id_field, &OwnedValue::U64(node_id));
             doc.add_field_value(self.body_field, &OwnedValue::PreTokStr(pretokenized));
-            doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
+            if let Some(commit_ts) = commit_ts {
+                doc.add_field_value(self.commit_ts_field, &OwnedValue::U64(commit_ts));
+            }
             self.writer.add_document(doc)?;
         }
 
@@ -957,13 +961,19 @@ impl TextIndex {
         self.collect(&query, Matches::Top(limit), &PendingDocuments::none(), true)
     }
 
-    /// MVCC snapshot search: returns only documents whose originating Raft
-    /// proposal `commit_ts ≤ snapshot_ts`.
+    /// Birth-time filtered search: returns only the held documents whose
+    /// originating commit has `commit_ts ≤ snapshot_ts`.
     ///
-    /// Correctness: every document carries its `commit_ts` as a fast field
-    /// (set at write time by the MVCC-aware write path; legacy writers use 0
-    /// which is ≤ any valid T). A `FilterCollector` wrapping the standard
-    /// `TopDocs` collector applies the predicate during BM25 scoring.
+    /// This filters by birth time and nothing else: a document replaced or
+    /// deleted after `snapshot_ts` is not brought back, and scores use the
+    /// statistics of the documents held now. It is not a read of the index
+    /// as it stood at `snapshot_ts`.
+    ///
+    /// # Errors
+    ///
+    /// [`TextSearchError::BirthTimesUnknown`] when any document of the index
+    /// was written without a birth time: which of them the filter keeps
+    /// cannot be told, so the read is refused rather than guessed.
     ///
     /// Merge safety: tantivy merges preserve per-doc fast-field values, so
     /// a merged segment's documents retain their original `commit_ts` — no
@@ -980,6 +990,19 @@ impl TextIndex {
         snapshot_ts: u64,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
         let searcher = self.reader.searcher();
+        // A column holding a value for every document of its segment is
+        // full; anything less means some document has no birth time.
+        for segment in searcher.segment_readers() {
+            let column = segment.fast_fields().u64(COMMIT_TS_FIELD)?;
+            if segment.max_doc() > 0
+                && !matches!(
+                    column.get_cardinality(),
+                    tantivy::columnar::Cardinality::Full
+                )
+            {
+                return Err(TextSearchError::BirthTimesUnknown);
+            }
+        }
         let query = self.build_query(query_str, None)?;
 
         let inner = TopDocs::with_limit(limit).order_by_score();

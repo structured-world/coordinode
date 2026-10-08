@@ -59,8 +59,9 @@ impl SegmentRegistry {
     /// Reconcile the registry against the current searcher.
     ///
     /// For each segment present in the searcher but absent from the registry,
-    /// scan its `commit_ts` fast-field column to compute `(min, max)`.
-    /// Segments no longer present (consumed by merges) are evicted.
+    /// scan its `commit_ts` fast-field column to compute `(min, max)`; a
+    /// segment with a document lacking one gets no entry and classifies as
+    /// unknown. Segments no longer present (consumed by merges) are evicted.
     ///
     /// Runs in O(total_new_docs) the first time a segment is seen and O(0)
     /// thereafter. Called after every `reader.reload()`.
@@ -82,6 +83,14 @@ impl SegmentRegistry {
             let ff_reader = seg_reader.fast_fields();
             let column = ff_reader.u64(commit_ts_field_name)?;
             let max_doc = seg_reader.max_doc();
+            // A segment holding a document without a birth time has no
+            // bounds: it stays unknown rather than reading the gap as 0.
+            if !matches!(
+                column.get_cardinality(),
+                tantivy::columnar::Cardinality::Full
+            ) {
+                continue;
+            }
 
             let mut min_ts = u64::MAX;
             let mut max_ts = u64::MIN;
@@ -94,7 +103,10 @@ impl SegmentRegistry {
                     }
                 }
                 any_alive = true;
-                let ts = column.first(doc_id).unwrap_or(0);
+                // Full cardinality: every document has its value.
+                let Some(ts) = column.first(doc_id) else {
+                    continue;
+                };
                 if ts < min_ts {
                     min_ts = ts;
                 }

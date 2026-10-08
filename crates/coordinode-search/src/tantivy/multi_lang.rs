@@ -442,10 +442,10 @@ impl MultiLanguageTextIndex {
             self.inner.body_field,
             &tantivy::schema::OwnedValue::PreTokStr(pretokenized),
         );
-        doc.add_field_value(
-            self.inner.commit_ts_field,
-            &tantivy::schema::OwnedValue::U64(0),
-        );
+        // No birth time: this index holds each node's current state as read
+        // from the store, not the version some commit wrote, so the commit
+        // that produced it is not known. A birth-filtered read of it is
+        // refused (see `TextIndex::search_at`).
         doc.add_field_value(
             self.inner.tokens_field,
             &tantivy::schema::OwnedValue::Bytes(super::encode_tokens(&token_texts)),
@@ -497,9 +497,9 @@ impl MultiLanguageTextIndex {
 
     /// Commit the staged changes and make them visible to readers.
     fn publish(&mut self) -> Result<(), TextSearchError> {
+        // No birth-time bounds to keep: the documents carry none.
         self.inner.writer.commit()?;
         self.inner.reader.reload()?;
-        self.inner.reconcile_registry()?;
         Ok(())
     }
 
