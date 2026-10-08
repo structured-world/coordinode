@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 
 use tonic::{Request, Response, Status};
 
-use coordinode_core::graph::types::{Value, VectorMetric};
+use coordinode_core::graph::types::VectorMetric;
 use coordinode_core::schema::computed::{ComputedSpec, DecayFormula, TtlScope};
 use coordinode_core::schema::definition::{
     ConstraintKind, ConstraintState, EdgeTypeSchema, LabelSchema, PropertyDef, PropertyType,
@@ -657,26 +657,20 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
         _request: Request<schema::ListLabelsRequest>,
     ) -> Result<Response<schema::ListLabelsResponse>, Status> {
         let labels = super::blocking(|| -> Result<Vec<schema::Label>, Status> {
-            let mut db = self.database.write();
+            let db = self.database.read();
             let mut labels: std::collections::BTreeMap<String, schema::Label> = db
                 .label_schemas()
                 .map_err(db_error_to_status)?
                 .iter()
                 .map(|s| (s.name.clone(), label_to_proto(s)))
                 .collect();
-            // Labels the stored nodes carry without a definition.
-            let rows = db
-                .execute_cypher("MATCH (n) RETURN DISTINCT n.__label__ AS lbl")
-                .map_err(db_error_to_status)?;
-            for row in rows {
-                if let Some(Value::String(name)) = row.get("lbl") {
-                    if !name.is_empty() {
-                        labels.entry(name.clone()).or_insert_with(|| schema::Label {
-                            name: name.clone(),
-                            ..Default::default()
-                        });
-                    }
-                }
+            // Labels the stored nodes carry without a definition, from the
+            // per-label node counters rather than a scan of every node.
+            for name in db.label_counts().map_err(db_error_to_status)?.into_keys() {
+                labels.entry(name.clone()).or_insert_with(|| schema::Label {
+                    name,
+                    ..Default::default()
+                });
             }
             Ok(labels.into_values().collect())
         })?;

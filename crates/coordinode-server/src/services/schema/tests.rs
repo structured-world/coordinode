@@ -1,6 +1,7 @@
 use super::*;
 use crate::proto::v2::graph::schema_service_server::SchemaService;
 use crate::services::error_details::ERROR_DOMAIN;
+use coordinode_core::graph::types::Value;
 use tonic_types::StatusExt;
 
 fn test_service() -> (SchemaServiceImpl, tempfile::TempDir) {
@@ -109,6 +110,77 @@ async fn list_labels_returns_existing_labels() {
             .unwrap_or_else(|| panic!("{name} missing from {labels:?}"));
         assert!(!found.declared, "{name} has no definition");
     }
+}
+
+/// Listing labels only reads: it answers while another reader holds the
+/// database, instead of queueing every request behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_labels_answers_while_the_database_is_read() {
+    let (svc, _dir) = test_service();
+    svc.database
+        .write()
+        .execute_cypher("CREATE (n:Person {name: 'Alice'})")
+        .expect("create");
+
+    // Another reader holds the database on a thread of its own until told.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let database = Arc::clone(&svc.database);
+        std::thread::spawn(move || {
+            let _held = database.read();
+            held_tx.send(()).expect("signal held");
+            release_rx.recv().ok();
+        })
+    };
+    held_rx.recv().expect("reader holds the database");
+    // On a task of its own: a handler blocked on the database blocks its
+    // worker thread, and the timeout here must still run.
+    let svc = Arc::new(svc);
+    let call = {
+        let svc = Arc::clone(&svc);
+        tokio::spawn(async move {
+            svc.list_labels(Request::new(schema::ListLabelsRequest {}))
+                .await
+        })
+    };
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(5), call).await;
+    release_tx.send(()).expect("release the reader");
+    reader.join().expect("reader thread");
+    let labels = listed
+        .expect("list_labels waited for the other reader")
+        .expect("the call's task")
+        .expect("list_labels")
+        .into_inner()
+        .labels;
+    assert_eq!(
+        labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+        ["Person"]
+    );
+}
+
+/// A label whose nodes are all gone is not listed: only labels the stored
+/// nodes carry, or that have a definition, are.
+#[tokio::test]
+async fn list_labels_drops_a_label_once_its_nodes_are_gone() {
+    let (svc, _dir) = test_service();
+    {
+        let mut db = svc.database.write();
+        db.execute_cypher("CREATE (n:Gone {name: 'a'}), (m:Kept {name: 'b'})")
+            .expect("create");
+        db.execute_cypher("MATCH (n:Gone) DELETE n")
+            .expect("delete");
+    }
+    let labels = svc
+        .list_labels(Request::new(schema::ListLabelsRequest {}))
+        .await
+        .expect("list_labels")
+        .into_inner()
+        .labels;
+    assert_eq!(
+        labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+        ["Kept"]
+    );
 }
 
 /// list_edge_types returns empty on a fresh database.

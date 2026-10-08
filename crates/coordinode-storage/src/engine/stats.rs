@@ -71,18 +71,7 @@ impl StorageStatsComputer {
                 None => 0,
             };
 
-        let mut label_counts: HashMap<String, u64> = HashMap::new();
-        for guard in engine.snapshot_prefix_iter(&snapshot, Partition::Counter, LABEL_KEY_PREFIX)? {
-            let (key, value) = guard.into_inner()?;
-            // Zero or below means every row with the label is gone, and a
-            // label with no rows is absent, as a scan of the rows reports it.
-            let Ok(count @ 1..) = u64::try_from(decode_counter(&key, &value)?) else {
-                continue;
-            };
-            let label = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..])
-                .map_err(|_| corrupt(Partition::Counter, &key, "label name is not UTF-8"))?;
-            label_counts.insert(label.to_owned(), count);
-        }
+        let label_counts = label_counts_at(engine, snapshot)?;
 
         let (edge_type_fan_outs, overall_avg_fan_out) = sample_fan_out(engine, snapshot)?;
         let num_labels = label_counts.len() as u64;
@@ -95,6 +84,39 @@ impl StorageStatsComputer {
             num_labels,
         })
     }
+}
+
+/// The stored node rows per label, from the counters the write path keeps
+/// on the same transaction as the rows: a handful of counter reads, never a
+/// scan of the nodes. A label with no rows left is absent, as a scan of the
+/// rows reports it.
+///
+/// # Errors
+///
+/// [`StorageError::Serialization`] naming the key when a counter or a label
+/// name does not decode, and any error the read itself returns.
+pub fn label_counts(engine: &StorageEngine) -> StorageResult<HashMap<String, u64>> {
+    // Pinned so the watermark cannot pass the snapshot mid-walk.
+    let (snapshot, _pin) = engine.pin_latest_snapshot();
+    label_counts_at(engine, snapshot)
+}
+
+fn label_counts_at(
+    engine: &StorageEngine,
+    snapshot: lsm_tree::SeqNo,
+) -> StorageResult<HashMap<String, u64>> {
+    let mut label_counts = HashMap::new();
+    for guard in engine.snapshot_prefix_iter(&snapshot, Partition::Counter, LABEL_KEY_PREFIX)? {
+        let (key, value) = guard.into_inner()?;
+        // Zero or below means every row with the label is gone.
+        let Ok(count @ 1..) = u64::try_from(decode_counter(&key, &value)?) else {
+            continue;
+        };
+        let label = std::str::from_utf8(&key[LABEL_KEY_PREFIX.len()..])
+            .map_err(|_| corrupt(Partition::Counter, &key, "label name is not UTF-8"))?;
+        label_counts.insert(label.to_owned(), count);
+    }
+    Ok(label_counts)
 }
 
 /// Decode a statistics counter, reporting a value of the wrong width.

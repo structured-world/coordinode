@@ -3126,6 +3126,21 @@ impl Database {
         plan.explain_suggest_with_stats(stats_ref, Some(&self.index_registry))
     }
 
+    /// The stored nodes per label, every label that has any, as of the
+    /// latest commit. Read from counters the write path keeps on the same
+    /// transaction as the nodes, so it costs a few reads however many nodes
+    /// there are; `MATCH (n:L) RETURN count(n)` scans them. A temporal node
+    /// counts once per stored version.
+    ///
+    /// # Errors
+    ///
+    /// A counter that does not decode, or a failed read.
+    pub fn label_counts(&self) -> Result<std::collections::HashMap<String, u64>, DatabaseError> {
+        Ok(coordinode_storage::engine::stats::label_counts(
+            &self.engine,
+        )?)
+    }
+
     /// Compute storage statistics for the cost estimator (with TTL cache).
     ///
     /// Returns a cached snapshot if it is younger than `stats_ttl`.

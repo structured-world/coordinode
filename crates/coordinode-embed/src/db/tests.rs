@@ -1,5 +1,38 @@
 use super::*;
 
+/// The per-label counts agree with counting the nodes, follow creates,
+/// deletes and label changes, and leave out a label with no nodes left.
+#[test]
+fn label_counts_match_the_stored_nodes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    assert!(db.label_counts().expect("counts").is_empty());
+
+    db.execute_cypher("UNWIND range(1, 5) AS i CREATE (:Project {i: i})")
+        .expect("projects");
+    db.execute_cypher("CREATE (:Gone), (:Moved)")
+        .expect("others");
+    db.execute_cypher("MATCH (n:Project) WHERE n.i <= 2 DELETE n")
+        .expect("delete two projects");
+    db.execute_cypher("MATCH (n:Gone) DELETE n")
+        .expect("delete gone");
+    db.execute_cypher("MATCH (n:Moved) REMOVE n:Moved SET n:Arrived")
+        .expect("relabel");
+
+    let counts = db.label_counts().expect("counts");
+    let counted = db
+        .execute_cypher("MATCH (n:Project) RETURN count(n) AS n")
+        .expect("count");
+    assert_eq!(
+        counted[0].get("n"),
+        Some(&coordinode_core::graph::types::Value::Int(3))
+    );
+    assert_eq!(
+        counts,
+        std::collections::HashMap::from([("Project".to_string(), 3), ("Arrived".to_string(), 1)])
+    );
+}
+
 #[test]
 fn plan_cache_hit_returns_same_plan() {
     // Same query string twice → second call must observe the cache
