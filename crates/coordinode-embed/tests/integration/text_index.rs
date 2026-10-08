@@ -1261,6 +1261,33 @@ fn non_matching_label_not_indexed() {
     );
 }
 
+// ── Retrieval completeness ────────────────────────────────────────
+
+/// A prefix matches every document holding a word it starts, however many
+/// distinct words that is: membership has no expansion cutoff, through the
+/// index and through the unfolded writes alike.
+#[test]
+fn a_prefix_matches_every_word_it_starts() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    const WORDS: usize = 80;
+    // One statement, so the words land in one segment of the index, where a
+    // per-segment expansion limit would bite.
+    let rows: Vec<String> = (0..WORDS)
+        .map(|i| format!("{{name: 'n{i}', body: 'zeta{i:03}q'}}"))
+        .collect();
+    db.execute_cypher(&format!(
+        "UNWIND [{}] AS r CREATE (:Article {{name: r.name, body: r.body}})",
+        rows.join(", ")
+    ))
+    .expect("create");
+    let rows = db
+        .execute_cypher("MATCH (n:Article) WHERE text_match(n.body, 'zeta*') RETURN n.name AS name")
+        .expect("prefix search");
+    assert_eq!(rows.len(), WORDS, "every word the prefix starts");
+}
+
 // ── Temporal labels ───────────────────────────────────────────────
 
 /// On a temporal label a search matches the state each node has now, the

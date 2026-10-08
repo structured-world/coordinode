@@ -532,14 +532,24 @@ impl TextIndex {
         self.build_query_inner(query_str, boost, true)
     }
 
+    /// A `prefix*` query matching every indexed word that starts with
+    /// `prefix`. Tantivy expands a prefix to at most 50 words by default,
+    /// which silently drops matches once a segment holds more and lets the
+    /// words written later decide which earlier ones survive; membership has
+    /// no such cutoff, so the expansion is unbounded.
+    fn prefix_query(&self, prefix: &str) -> tantivy::query::PhrasePrefixQuery {
+        let term = tantivy::Term::from_field_text(self.body_field, prefix);
+        let mut query = tantivy::query::PhrasePrefixQuery::new(vec![term]);
+        query.set_max_expansions(u32::MAX);
+        query
+    }
+
     fn build_query_inner(
         &self,
         query_str: &str,
         boost: Option<f32>,
         fuzzy: bool,
     ) -> Result<Box<dyn tantivy::query::Query>, TextSearchError> {
-        use tantivy::query::PhrasePrefixQuery;
-
         let (prefix_terms, remainder) = extract_prefix_terms(query_str);
 
         // Case 1: no prefix terms — delegate entirely to QueryParser.
@@ -561,9 +571,7 @@ impl TextIndex {
         // Build prefix sub-queries.
         let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
         for prefix in &prefix_terms {
-            let term = tantivy::Term::from_field_text(self.body_field, prefix);
-            let pq = PhrasePrefixQuery::new(vec![term]);
-            subqueries.push((Occur::Must, Box::new(pq)));
+            subqueries.push((Occur::Must, Box::new(self.prefix_query(prefix))));
         }
 
         // Case 2: only prefix terms, no remainder.
@@ -915,8 +923,6 @@ impl TextIndex {
     /// pipeline, its terms OR-ed together, `word*` terms as phrase prefixes;
     /// `None` when it leaves nothing to search for.
     fn language_query(&self, query_str: &str, language: &str) -> Option<BooleanQuery> {
-        use tantivy::query::PhrasePrefixQuery;
-
         let (prefix_terms, remainder) = extract_prefix_terms(query_str);
         let tokens = tokenize::tokenize_text(remainder.trim(), language);
         if tokens.is_empty() && prefix_terms.is_empty() {
@@ -934,9 +940,7 @@ impl TextIndex {
             })
             .collect();
         for prefix in &prefix_terms {
-            let term = tantivy::Term::from_field_text(self.body_field, prefix);
-            let pq = PhrasePrefixQuery::new(vec![term]);
-            subqueries.push((Occur::Should, Box::new(pq)));
+            subqueries.push((Occur::Should, Box::new(self.prefix_query(prefix))));
         }
         Some(BooleanQuery::new(subqueries))
     }
