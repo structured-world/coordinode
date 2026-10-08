@@ -737,3 +737,28 @@ fn pending_documents_carry_snippets() {
         hits[0].snippet_html
     );
 }
+
+/// A write that fails on storage the index can no longer reach returns an
+/// error every time it is retried, rather than panicking once the writer
+/// was lost to the failed rollback of an earlier attempt.
+#[test]
+fn writes_to_a_lost_directory_keep_failing_without_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx");
+    let mut idx =
+        MultiLanguageTextIndex::create_scratch(&path, 15_000_000, MultiLangConfig::default())
+            .unwrap();
+    idx.add_node(1, &props(&[("body", "graph engine")]))
+        .unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    for attempt in 0..3 {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_node(2, &props(&[("body", "lost write")]))
+        }));
+        assert!(outcome.is_ok(), "attempt {attempt} panicked");
+        assert!(
+            outcome.is_ok_and(|result| result.is_err()),
+            "attempt {attempt} succeeded"
+        );
+    }
+}

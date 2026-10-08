@@ -131,6 +131,10 @@ pub struct MultiLanguageTextIndex {
     config: MultiLangConfig,
     /// Where the held state of each node with a timeline holds.
     validities: Validities,
+    /// Why the writer is gone: a failed write's rollback could not recreate
+    /// it, and a writer left without its directory lock panics on the next
+    /// rollback. Every later write is refused with this reason instead.
+    writer_lost: Option<String>,
 }
 
 impl MultiLanguageTextIndex {
@@ -162,6 +166,7 @@ impl MultiLanguageTextIndex {
             inner,
             config,
             validities: Validities::default(),
+            writer_lost: None,
         }
     }
 
@@ -274,6 +279,9 @@ impl MultiLanguageTextIndex {
         &mut self,
         work: impl FnOnce(&mut Self, &mut Batch) -> Result<bool, TextSearchError>,
     ) -> Result<(), TextSearchError> {
+        if let Some(reason) = &self.writer_lost {
+            return Err(TextSearchError::IndexCorrupted(reason.clone()));
+        }
         let mut batch = Batch::new(self.inner.reader.searcher());
         let outcome = match work(self, &mut batch) {
             Ok(true) => self.publish(),
@@ -281,7 +289,11 @@ impl MultiLanguageTextIndex {
             Err(e) => Err(e),
         };
         if outcome.is_err() {
-            self.inner.writer.rollback()?;
+            if let Err(e) = self.inner.writer.rollback() {
+                let reason = format!("the index writer is gone after a failed rollback: {e}");
+                self.writer_lost = Some(reason.clone());
+                return Err(TextSearchError::IndexCorrupted(reason));
+            }
             if self.inner.corpus.is_some() {
                 self.inner.corpus = Some(self.inner.recount()?);
             }
