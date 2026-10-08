@@ -130,14 +130,19 @@ impl Worker {
         // releasing a later batch would release them too, so every round
         // rebuilds until one rebuild covers them.
         let mut behind = false;
-        // The newest commit taken since the indexes last covered everything
-        // taken, which the watermark reaches once they do again.
-        let mut max_ts = 0u64;
         while !self.stop.is_cancelled() {
             // Asleep until an entry applies or the worker is stopped.
             let Some(first) = self.applied.next(None) else {
                 continue;
             };
+            // A complete snapshot: every commit below it has landed, and a
+            // commit offers its event before it becomes visible, so each of
+            // theirs is among the events offered by now. Once those are in
+            // the indexes, so is every write below the snapshot, whatever
+            // order the commits took their timestamps in; the cut is the last
+            // timestamp it covers.
+            let cut = self.engine.snapshot().checked_sub(1);
+            let offered = self.position.delivered();
             let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
             let mut replaced = false;
             let mut last_seq = 0u64;
@@ -146,12 +151,8 @@ impl Worker {
             while let Some(current) = event {
                 match current {
                     AppliedEvent::Keys {
-                        seq,
-                        commit_ts,
-                        keys: written,
-                        ..
+                        seq, keys: written, ..
                     } => {
-                        max_ts = max_ts.max(commit_ts);
                         last_seq = last_seq.max(seq);
                         keys.extend(written.iter().cloned());
                     }
@@ -187,10 +188,11 @@ impl Worker {
                 continue;
             };
             behind = false;
-            // Every entry up to `max_ts` is now in the indexes, and so is
-            // every write at or below it that these entries did not touch.
-            if max_ts > 0 {
-                self.registry.advance_indexed_hlc_all(max_ts);
+            // The watermark reaches the cut only when this round covered
+            // every event offered when it was taken; otherwise a later round
+            // does.
+            if let Some(cut) = cut.filter(|_| seq >= offered) {
+                self.registry.advance_indexed_hlc_all(cut);
             }
             self.coverage.release(seq);
         }

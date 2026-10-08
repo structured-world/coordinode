@@ -670,12 +670,10 @@ impl VectorIndexRegistry {
     }
 
     /// Advance the freshness watermark of every maintained index to `hlc`
-    /// (monotonic). Called by the oplog-tailing maintenance worker after it
-    /// applies an entry (or batch) at commit HLC `hlc`: once the worker has
-    /// consumed that entry, every index it maintains for the shard has seen
-    /// all writes up to `hlc` — the ones with no vector-write at `hlc` are
-    /// still current as of `hlc`. This is the per-shard read-your-writes
-    /// fence surfaced per index.
+    /// (monotonic). The maintenance worker calls it with a cut every write at
+    /// or below which it has folded, whatever order those commits took their
+    /// timestamps in; indexes no write touched are current as of the cut too.
+    /// This is the per-shard read-your-writes fence surfaced per index.
     pub fn advance_indexed_hlc_all(&self, hlc: u64) {
         for h in self
             .health

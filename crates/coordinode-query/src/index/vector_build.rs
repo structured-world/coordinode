@@ -122,10 +122,10 @@ impl VectorBuild<'_> {
                 return Ok(BuildOutcome::Cancelled);
             }
             self.hand_over();
-            // Every write at or below this snapshot landed before the take
-            // below: in the scan, in the tap, or (after the handover)
-            // inserted by its maintainer before it reached this point.
-            let fresh = self.engine.snapshot();
+            // Every write below this snapshot landed before the take below:
+            // in the scan or in the tap. The last timestamp it covers is the
+            // freshness the indexes have once that take is folded.
+            let fresh = self.engine.snapshot().checked_sub(1);
             match tap.take() {
                 // The partition was cleared or range-deleted: what it lost is
                 // not listed, so start over from a fresh snapshot, which puts
@@ -148,7 +148,9 @@ impl VectorBuild<'_> {
                     // graphs now; the maintainer has every later one.
                     for target in self.targets {
                         if target.health.mark_ready_after_handover() {
-                            target.health.advance_indexed_hlc(fresh);
+                            if let Some(fresh) = fresh {
+                                target.health.advance_indexed_hlc(fresh);
+                            }
                         }
                     }
                     return Ok(outcome);

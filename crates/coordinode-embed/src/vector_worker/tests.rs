@@ -61,14 +61,19 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
+    // Oracle-backed, as every deployment's engine: an apply lands at its
+    // commit timestamp, which is what the freshness watermark is in.
     let engine = Arc::new(
-        StorageEngine::open(&StorageConfig::with_endpoints(vec![EndpointConfig::new(
-            "default",
-            dir.path(),
-            Media::Hdd,
-            Durability::Durable,
-            Tier::Warm,
-        )]))
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new()),
+        )
         .unwrap(),
     );
     let registry = Arc::new(VectorIndexRegistry::new());
@@ -162,7 +167,7 @@ impl Fixture {
 }
 
 /// Entries applied after the worker started reach the index, and the
-/// freshness watermark reaches the last one's commit timestamp.
+/// freshness watermark covers the last one's commit timestamp.
 #[test]
 fn applied_entries_reach_the_index() {
     let fx = fixture();
@@ -173,14 +178,24 @@ fn applied_entries_reach_the_index() {
     }
 
     let indexed = fx.await_indexed(20);
-    worker.shutdown();
-    assert_eq!(indexed, 20, "every applied node reaches the index");
-    assert_eq!(
+    let watermark = || {
         fx.registry
             .health_snapshot("Item", "embedding")
-            .and_then(|h| h.indexed_hlc()),
-        Some(20),
-        "the watermark covers the last applied entry"
+            .and_then(|h| h.indexed_hlc())
+            .unwrap_or(0)
+    };
+    for _ in 0..100 {
+        if watermark() >= 20 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    worker.shutdown();
+    assert_eq!(indexed, 20, "every applied node reaches the index");
+    assert!(
+        watermark() >= 20,
+        "the watermark covers the last applied entry: {}",
+        watermark()
     );
     let handle = fx.registry.get("Item", "embedding").unwrap();
     let nearest = handle.read().unwrap().search(&[5.0, 0.0, 0.0, 0.0], 1);
@@ -420,6 +435,91 @@ fn a_failed_fold_advances_neither_the_watermark_nor_the_release() {
     assert!(
         indexed || coverage.delta(SHARD).contains(NodeId::from_raw(1)),
         "node 1 is neither in the index nor answered from the store"
+    );
+}
+
+/// The freshness watermark is a read-your-writes fence: a writer whose
+/// commit is at or below it is served an index holding that write. A commit
+/// that took its timestamp first and lands after a later one must not be
+/// covered by the later one's: the watermark stays below it until it has
+/// landed and the worker has folded it.
+#[test]
+fn the_watermark_stays_below_a_commit_still_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = Arc::new(
+        StorageEngine::open_with_oracle(
+            &StorageConfig::with_endpoints(vec![EndpointConfig::new(
+                "default",
+                dir.path(),
+                Media::Hdd,
+                Durability::Durable,
+                Tier::Warm,
+            )]),
+            Arc::clone(&oracle),
+        )
+        .unwrap(),
+    );
+    // A snapshot steps behind a commit in flight at once.
+    engine.set_snapshot_wait_ms(0);
+    let fx = Fixture {
+        engine,
+        ..fixture()
+    };
+    let worker = fx.spawn(1024);
+    let watermark = || {
+        fx.registry
+            .health_snapshot("Item", "embedding")
+            .and_then(|h| h.indexed_hlc())
+            .unwrap_or(0)
+    };
+
+    // The early commit has its timestamp and holds its key, not yet landed.
+    let early_key = encode_node_key(SHARD, NodeId::from_raw(5));
+    let (early, admission) = fx
+        .engine
+        .pending_commits()
+        .admit_allocated(
+            || oracle.next().as_raw(),
+            vec![(Partition::Node, early_key)],
+            Vec::new(),
+        )
+        .expect("admit the early commit");
+    // A later commit lands and is folded.
+    let late = oracle.next().as_raw();
+    fx.engine
+        .apply_proposal_at(&[fx.put_item(1, 1.0)], late)
+        .unwrap();
+    assert_eq!(fx.await_indexed(1), 1);
+    // Give a wrongly advanced watermark the time to show.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        watermark() < early,
+        "the watermark {} covers the commit at {early}, which has not landed",
+        watermark()
+    );
+
+    fx.engine
+        .apply_proposal_at(&[fx.put_item(5, 5.0)], early)
+        .unwrap();
+    drop(admission);
+    // Another commit wakes the worker after the early one is visible.
+    let after = oracle.next().as_raw();
+    fx.engine
+        .apply_proposal_at(&[fx.put_item(6, 6.0)], after)
+        .unwrap();
+    assert_eq!(fx.await_indexed(3), 3);
+    for _ in 0..100 {
+        if watermark() >= late {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    worker.shutdown();
+    assert!(
+        watermark() >= late,
+        "the watermark never covered the commits that landed: {}",
+        watermark()
     );
 }
 

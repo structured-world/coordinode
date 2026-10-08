@@ -13,13 +13,15 @@
 //!
 //! # Freshness watermark (read-your-writes)
 //!
-//! `indexed_hlc` is the HLC (wall-clock-microsecond commit timestamp)
-//! of the last oplog entry the index-maintenance worker has applied to the
-//! local graph. A client that just wrote at HLC `W` can carry `W` into a
-//! follow-up query; comparing it against the served `indexed_hlc` tells the
-//! coordinator whether this replica has caught up (`indexed_hlc >= W`) or is
-//! lagging — the Pinecone LSN-header pattern. `last_committed_hlc -
-//! indexed_hlc` is the per-shard lag.
+//! `indexed_hlc` is an HLC (wall-clock-microsecond commit timestamp) at or
+//! below which every write committed on this member is in the local graph:
+//! a cut of a complete snapshot whose writes the index-maintenance worker
+//! has folded, not the timestamp of the last entry it saw, which a commit
+//! that took an earlier timestamp and landed later would leave uncovered. A
+//! client that just wrote at HLC `W` can carry `W` into a follow-up query;
+//! comparing it against the served `indexed_hlc` tells whether this replica
+//! has caught up (`indexed_hlc >= W`) or is lagging, the Pinecone LSN-header
+//! pattern. `last_committed_hlc - indexed_hlc` is the per-shard lag.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,15 +40,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexHealthState {
     /// Index is fully built and serving queries at the documented recall.
-    /// `indexed_hlc` is the HLC of the last applied write (0 if none yet).
+    /// Every write at or below `indexed_hlc` is in it (0 if none yet).
     Ready {
-        /// HLC watermark of the last applied write (read-your-writes fence).
+        /// Read-your-writes fence: every write at or below it is indexed.
         indexed_hlc: u64,
     },
     /// Index is currently being (re)built. `progress` ∈ [0.0, 1.0]; `eta_ms`
     /// is a best-effort estimate of remaining build time in milliseconds;
-    /// `indexed_hlc` is the HLC of the last write folded into the partial
-    /// graph so far.
+    /// `indexed_hlc` is the fence the index held before the rebuild.
     ///
     /// Callers consult `VECTOR_REBUILD_POLICY` on the label to decide
     /// whether to (a) return `IndexNotReady`, (b) serve from the partial
@@ -56,7 +57,7 @@ pub enum IndexHealthState {
         progress: f32,
         /// Best-effort estimate of remaining build time, in milliseconds.
         eta_ms: u64,
-        /// HLC watermark of the last write folded into the partial graph.
+        /// The fence the index held before the rebuild.
         indexed_hlc: u64,
     },
     /// Index is unavailable. `reason` is a short human-readable string
@@ -95,8 +96,8 @@ impl IndexHealthState {
     }
 
     /// The freshness watermark for this state, or `None` when offline.
-    /// `Ready` / `Rebuilding` expose the HLC of the last applied write;
-    /// `Offline` has no meaningful watermark.
+    /// `Ready` / `Rebuilding` expose the cut every write at or below which
+    /// is in the graph; `Offline` has no meaningful watermark.
     pub fn indexed_hlc(&self) -> Option<u64> {
         match self {
             IndexHealthState::Ready { indexed_hlc }
@@ -129,12 +130,12 @@ const STATE_HANDED_OVER: u32 = 3;
 ///   write publishes both fields consistently.
 /// * `eta_ms: AtomicU64` — best-effort ETA in milliseconds. Read after the
 ///   discriminant; a slight skew vs `state` is acceptable for an estimate.
-/// * `indexed_hlc: AtomicU64` — freshness watermark (HLC of the last applied
-///   write). Advanced monotonically via [`HealthSignal::advance_indexed_hlc`]
-///   (`fetch_max`), so out-of-order or replayed applies never move it
-///   backwards. Independent of the lifecycle discriminant: a rebuild keeps
-///   advancing it as it folds writes, and a ready index keeps advancing it as
-///   the maintenance worker applies the live oplog.
+/// * `indexed_hlc: AtomicU64` — freshness watermark: every write committed at
+///   or below it is in the graph. Advanced monotonically via
+///   [`HealthSignal::advance_indexed_hlc`] (`fetch_max`), so a replayed
+///   claim never moves it backwards. Independent of the lifecycle
+///   discriminant: a build sets it when it turns the index ready, and the
+///   maintenance worker advances it as it folds the applied commits.
 /// * `offline_reason: Mutex<Option<String>>` — only touched on transition
 ///   to/from `Offline`. Locked from the search path only in the rare
 ///   `Offline` branch; locked from the build path only on transition.
@@ -198,9 +199,9 @@ impl HealthSignal {
         }
     }
 
-    /// The current freshness watermark (HLC of the last applied write), read
-    /// without touching the lifecycle discriminant. 0 means nothing applied
-    /// yet.
+    /// The current freshness watermark (every write at or below it is in the
+    /// graph), read without touching the lifecycle discriminant. 0 means
+    /// nothing is claimed yet.
     pub fn indexed_hlc(&self) -> u64 {
         self.indexed_hlc.load(Ordering::Acquire)
     }
@@ -208,7 +209,7 @@ impl HealthSignal {
     /// Advance the freshness watermark to `hlc` if it is newer. Monotonic
     /// (`fetch_max`): a replayed or out-of-order apply can never move the
     /// watermark backwards, so a `read-your-writes` fence built on it is
-    /// sound. Call after the write at `hlc` has been folded into the graph.
+    /// sound. Call only once every write at or below `hlc` is in the graph.
     pub fn advance_indexed_hlc(&self, hlc: u64) {
         self.indexed_hlc.fetch_max(hlc, Ordering::Release);
     }
