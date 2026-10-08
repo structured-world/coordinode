@@ -1824,6 +1824,12 @@ impl<'a> ExecutionContext<'a> {
             None => Transaction::new(self.engine, None, Timestamp::ZERO, None),
         };
         stage(&mut txn)?;
+        // Every writer of a catalogued object conditions its commit on the
+        // record a change rewrites, so a change refused by them would lose
+        // under steady writes. It waits for the ones already admitted (a
+        // registration lasts from validation to apply) and makes later ones
+        // queue behind it.
+        txn.wait_for_overlapping_commits(CATALOG_ADMISSION_WAIT);
         let write_concern = self.write_concern;
         let outcome = txn
             .commit(&CommitContext {
@@ -18406,6 +18412,12 @@ fn execute_procedure_call(
     }
     Ok(out)
 }
+
+/// How long a catalog change waits for the commits already admitted on its
+/// keys. They hold their registration from validation to apply, including a
+/// majority write, so this covers a slow replica rather than a stuck one; past
+/// it the change is refused as before.
+const CATALOG_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The error a catalog change fails with when its commit is refused: a record
 /// it was conditioned on, or a key it wrote, changed concurrently, which a

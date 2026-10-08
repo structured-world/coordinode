@@ -349,3 +349,107 @@ fn the_ceiling_admits_again_once_a_commit_finishes() {
     }
     admit_at(&pending, 12, key(Partition::Node, b"b")).expect("the table has room again");
 }
+
+/// A waiting commit lands after the commit holding its key instead of being
+/// refused by it, and takes its timestamp only then.
+#[test]
+fn a_waiter_is_admitted_once_the_holder_lands() {
+    let pending = table();
+    let holder = admit_guarded(&pending, 10, Vec::new(), key(Partition::Schema, b"def"))
+        .expect("a writer conditioned on the record");
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            pending
+                .admit_allocated_waiting(
+                    || 20,
+                    key(Partition::Schema, b"def"),
+                    Vec::new(),
+                    Duration::from_secs(10),
+                )
+                .map(|(ts, _)| ts)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished(), "the waiter waits for the holder");
+        drop(holder);
+        assert_eq!(waiter.join().expect("waiter thread"), Ok(20));
+    });
+}
+
+/// While a commit waits, its keys turn away later commits on them, so a
+/// stream of new writers cannot keep it waiting; a second waiter on the same
+/// key is turned away too, instead of queueing behind the first's retries.
+#[test]
+fn a_waiter_reserves_its_keys_against_later_commits() {
+    let pending = table();
+    let holder = admit_guarded(&pending, 10, Vec::new(), key(Partition::Schema, b"def"))
+        .expect("the first writer");
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            pending
+                .admit_allocated_waiting(
+                    || 20,
+                    key(Partition::Schema, b"def"),
+                    Vec::new(),
+                    Duration::from_secs(10),
+                )
+                .map(|(ts, _)| ts)
+        });
+        // The reservation is visible once the waiter blocks on the holder.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let later = loop {
+            match admit_guarded(&pending, 11, Vec::new(), key(Partition::Schema, b"def")) {
+                Err(refusal @ Refusal::Reserved { .. }) => break refusal,
+                Ok(admitted) => drop(admitted),
+                Err(other) => panic!("unexpected refusal {other:?}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the waiter never reserved its key"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            later,
+            Refusal::Reserved {
+                partition: Partition::Schema,
+                key: b"def".to_vec()
+            }
+        );
+        let second = pending.admit_allocated_waiting(
+            || 30,
+            key(Partition::Schema, b"def"),
+            Vec::new(),
+            Duration::from_secs(10),
+        );
+        assert!(
+            matches!(second, Err(Refusal::Reserved { .. })),
+            "{:?}",
+            second.map(|(ts, _)| ts)
+        );
+        // Another key is untouched by the reservation.
+        admit_at(&pending, 12, key(Partition::Node, b"other")).expect("unrelated key");
+        drop(holder);
+        assert_eq!(waiter.join().expect("waiter thread"), Ok(20));
+    });
+}
+
+/// A waiter whose holder outlasts the wait is refused with the overlap, and
+/// its reservation goes with it.
+#[test]
+fn a_waiter_gives_up_at_its_deadline_and_releases_its_keys() {
+    let pending = table();
+    let _holder = admit_guarded(&pending, 10, Vec::new(), key(Partition::Schema, b"def"))
+        .expect("a writer that does not land");
+    let refused = pending
+        .admit_allocated_waiting(
+            || 20,
+            key(Partition::Schema, b"def"),
+            Vec::new(),
+            Duration::from_millis(50),
+        )
+        .map(|(ts, _)| ts)
+        .expect_err("the holder outlasts the wait");
+    assert_eq!(holder_of(&refused), 10);
+    admit_guarded(&pending, 11, Vec::new(), key(Partition::Schema, b"def"))
+        .expect("no reservation is left behind");
+}

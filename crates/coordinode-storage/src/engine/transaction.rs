@@ -353,6 +353,9 @@ pub struct Transaction<'a> {
     /// Commits even while storage sheds writes under pressure
     /// ([`Self::exempt_from_write_pressure`]).
     pressure_exempt: bool,
+    /// How long admission waits for the commits in flight on its keys
+    /// instead of refusing ([`Self::wait_for_overlapping_commits`]).
+    overlap_wait: Option<std::time::Duration>,
     /// The changes to kept cardinality counts this commit derived from its
     /// staged edge effects. Derived anew by each commit attempt rather than
     /// added to [`Self::merge_counter_deltas`], so an attempt that fails
@@ -555,8 +558,22 @@ impl<'a> Transaction<'a> {
             range_removals: Vec::new(),
             post_state_checks: Vec::new(),
             pressure_exempt: false,
+            overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
         }
+    }
+
+    /// Have the commit wait up to `wait` for the commits already admitted on
+    /// its keys to land, instead of being refused by them, and reserve its
+    /// keys meanwhile so later commits queue behind it.
+    ///
+    /// For a catalog change: every writer of the catalogued object conditions
+    /// its commit on the record the change rewrites, so under steady writes
+    /// the change would lose to whichever writer came first, every time.
+    /// Writers admitted before it land under the old record; writers arriving
+    /// while it waits are refused and retry against the new one.
+    pub fn wait_for_overlapping_commits(&mut self, wait: std::time::Duration) {
+        self.overlap_wait = Some(wait);
     }
 
     /// Let this transaction commit while storage sheds writes under pressure.
@@ -686,6 +703,7 @@ impl<'a> Transaction<'a> {
             range_removals: state.range_removals,
             post_state_checks: state.post_state_checks,
             pressure_exempt: false,
+            overlap_wait: None,
             kept_counts: rustc_hash::FxHashMap::default(),
         }
     }
@@ -1763,33 +1781,43 @@ impl<'a> Transaction<'a> {
             .filter(|(part, key, _)| !scope.iter().any(|(p, k)| p == part && k == key))
             .map(|(part, key, _)| (*part, key.clone()))
             .collect();
-        let (commit_ts_raw, admission) = self
-            .engine
-            .pending_commits()
-            .admit_allocated(|| oracle.next().as_raw(), scope, guards)
-            .map_err(|refusal| match refusal {
-                crate::engine::pending::Refusal::Overlap {
-                    partition,
-                    holder_ts,
-                    ..
-                } => CommitError::Conflict(format!(
-                    "write conflict: a key in the {partition:?} partition is already \
+        let pending = self.engine.pending_commits();
+        let admitted = match self.overlap_wait {
+            Some(wait) => {
+                pending.admit_allocated_waiting(|| oracle.next().as_raw(), scope, guards, wait)
+            }
+            None => pending.admit_allocated(|| oracle.next().as_raw(), scope, guards),
+        };
+        let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
+            crate::engine::pending::Refusal::Overlap {
+                partition,
+                holder_ts,
+                ..
+            } => CommitError::Conflict(format!(
+                "write conflict: a key in the {partition:?} partition is already \
                      being written by a transaction committing at {holder_ts}. \
                      Nothing was applied; retry the whole transaction."
-                )),
-                // Not a conflict with anyone in particular: the node is
-                // holding more unfinished commits than it admits, and the
-                // answer is the same one backpressure gives, a retry after a
-                // delay rather than an immediate one that bounces off the
-                // same ceiling.
-                crate::engine::pending::Refusal::AtCapacity { limit } => {
-                    tracing::warn!(
-                        limit,
-                        "commit refused: more commits are in flight than this node admits"
-                    );
-                    CommitError::Backpressure
-                }
-            })?;
+            )),
+            crate::engine::pending::Refusal::Reserved { partition, .. } => {
+                CommitError::Conflict(format!(
+                    "write conflict: a key in the {partition:?} partition is reserved by a \
+                     catalog change waiting to commit. Nothing was applied; retry the whole \
+                     transaction, which then runs after it."
+                ))
+            }
+            // Not a conflict with anyone in particular: the node is
+            // holding more unfinished commits than it admits, and the
+            // answer is the same one backpressure gives, a retry after a
+            // delay rather than an immediate one that bounces off the
+            // same ceiling.
+            crate::engine::pending::Refusal::AtCapacity { limit } => {
+                tracing::warn!(
+                    limit,
+                    "commit refused: more commits are in flight than this node admits"
+                );
+                CommitError::Backpressure
+            }
+        })?;
         let commit_ts = Timestamp::from_raw(commit_ts_raw);
 
         // The count changes, taken against the pairs as they stand now that

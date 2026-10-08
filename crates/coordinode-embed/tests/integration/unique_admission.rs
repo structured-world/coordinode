@@ -136,6 +136,45 @@ fn concurrent_inserts_across_a_profile_handover_leave_one_holder() {
     assert_eq!(holders(&mut db, "U", "email", "same"), 1);
 }
 
+/// A handover against a writer whose commit is already admitted under the
+/// old epoch: the handover waits for that commit to land and then takes
+/// effect, instead of being refused because the writer came first.
+#[test]
+fn a_handover_waits_for_a_writer_admitted_under_the_old_epoch() {
+    use coordinode_storage::engine::partition::Partition;
+
+    let (db, _dir) = open_db();
+    run(&db, "CREATE UNIQUE INDEX u_email ON :U(email)").expect("index");
+    let before = index_named(db.engine(), "u_email").expect("index");
+    let key = coordinode_modality::IndexDefinition::schema_key_of(before.id);
+    // A writer in flight: admitted, conditioned on the definition as every
+    // index writer's commit is, not yet applied. Its timestamp sits past the
+    // clock, so no read waits for it.
+    let (_, writer) = db
+        .engine()
+        .pending_commits()
+        .admit_allocated(|| u64::MAX, Vec::new(), vec![(Partition::Schema, key)])
+        .expect("the writer is admitted");
+
+    std::thread::scope(|s| {
+        let handover = s.spawn(|| run(&db, "ALTER INDEX u_email SET MAINTENANCE DERIVED"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!handover.is_finished(), "the handover waits for the writer");
+        drop(writer);
+        handover
+            .join()
+            .expect("the handover thread")
+            .expect("the handover");
+    });
+
+    let after = index_named(db.engine(), "u_email").expect("index");
+    assert_eq!(after.maintenance.epoch, before.maintenance.epoch + 1);
+    assert_eq!(
+        after.maintenance.profile,
+        coordinode_modality::IndexProfile::Derived
+    );
+}
+
 /// A writer replacing the holder of a value (delete, then reinsert under a
 /// new node) races a writer inserting the value: whichever lands, one node
 /// holds it.

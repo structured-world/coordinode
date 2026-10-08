@@ -47,16 +47,26 @@ struct Admitted {
     guards: Vec<(Partition, Vec<u8>)>,
 }
 
-/// The commits this leader has admitted but not yet applied.
-#[derive(Debug)]
-pub struct PendingCommits {
+/// The admitted commits and the keys reserved by commits waiting to be.
+#[derive(Debug, Default)]
+struct Table {
     /// Keyed by an identity of its own rather than by the commit timestamp.
     /// Two commits sharing a timestamp are not something the clock produces,
     /// but a table that assumes it silently drops one of them and releases
     /// the other's registration early, which is a lost update arriving
     /// through the mechanism that exists to prevent it. The assumption is
     /// cheaper to remove than to rely on.
-    inner: Mutex<HashMap<u64, Admitted>>,
+    admitted: HashMap<u64, Admitted>,
+    /// Commits waiting for the admitted ones they overlap to land, by the
+    /// same identity. Their keys turn away newcomers, so a waiter is not
+    /// overtaken forever by writers that keep arriving.
+    reserved: HashMap<u64, Admitted>,
+}
+
+/// The commits this leader has admitted but not yet applied.
+#[derive(Debug)]
+pub struct PendingCommits {
+    inner: Mutex<Table>,
     next_id: std::sync::atomic::AtomicU64,
     /// Woken whenever a commit finishes, so a reader waiting for the view it
     /// asked for does not have to poll for it.
@@ -77,6 +87,14 @@ pub enum Refusal {
         /// The timestamp the commit holding it will land at.
         holder_ts: u64,
     },
+    /// A commit waiting for its turn has reserved a key this one writes or
+    /// conditions on; retried, this one lands after it.
+    Reserved {
+        /// The key both commits touch.
+        partition: Partition,
+        /// The key itself, for the message the caller has to produce.
+        key: Vec<u8>,
+    },
     /// The table is at its bound. Admitting more would let the memory the
     /// guard holds grow with load, so the commit is refused while it can
     /// still be retried, rather than the bound being discovered later as
@@ -91,7 +109,7 @@ impl PendingCommits {
     /// An empty table admitting at most `max_in_flight` commits at once.
     pub fn new(max_in_flight: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Table::default()),
             next_id: std::sync::atomic::AtomicU64::new(0),
             finished: Condvar::new(),
             max_in_flight,
@@ -115,6 +133,7 @@ impl PendingCommits {
         let mut table = self.inner.lock();
         loop {
             let Some(blocking) = table
+                .admitted
                 .values()
                 .map(|a| a.commit_ts)
                 .filter(|c| *c <= ts)
@@ -153,53 +172,149 @@ impl PendingCommits {
         guards: Vec<(Partition, Vec<u8>)>,
     ) -> Result<(u64, Admission<'p>), Refusal> {
         let mut table = self.inner.lock();
+        let candidate = Admitted {
+            commit_ts: 0,
+            scope,
+            guards,
+        };
+        Self::refuse_reserved(&table, &candidate)?;
+        if let Some(refusal) = Self::overlap(&table, &candidate) {
+            return Err(refusal);
+        }
+        self.insert_admitted(&mut table, allocate, candidate)
+    }
 
+    /// [`Self::admit_allocated`] for a commit that waits its turn instead of
+    /// being refused by commits already admitted on its keys: a catalog
+    /// change, which every writer of the catalogued object conditions on and
+    /// which would otherwise lose to whichever of them came first.
+    ///
+    /// While it waits its keys are reserved, so a commit arriving later on
+    /// them is refused and retried after it rather than overtaking it. The
+    /// timestamp is taken only once the overlapping commits have landed, so
+    /// this commit is ordered after them. A wait past `wait` gives up with
+    /// the overlap still standing; a reservation by another waiter is
+    /// refused at once, as two waiters on one key would only queue behind
+    /// each other's retries.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Reserved`] when another waiter holds one of its keys,
+    /// [`Refusal::Overlap`] when an admitted commit still holds one at the
+    /// deadline, [`Refusal::AtCapacity`] at the table's bound.
+    pub fn admit_allocated_waiting<'p>(
+        &'p self,
+        allocate: impl FnOnce() -> u64,
+        scope: Vec<(Partition, Vec<u8>)>,
+        guards: Vec<(Partition, Vec<u8>)>,
+        wait: Duration,
+    ) -> Result<(u64, Admission<'p>), Refusal> {
+        let deadline = Instant::now() + wait;
+        let mut table = self.inner.lock();
+        let candidate = Admitted {
+            commit_ts: 0,
+            scope,
+            guards,
+        };
+        Self::refuse_reserved(&table, &candidate)?;
+        let mut reservation = None;
+        while Self::overlap(&table, &candidate).is_some() {
+            if reservation.is_none() {
+                let id = self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                table.reserved.insert(
+                    id,
+                    Admitted {
+                        commit_ts: 0,
+                        scope: candidate.scope.clone(),
+                        guards: candidate.guards.clone(),
+                    },
+                );
+                reservation = Some(id);
+            }
+            if self.finished.wait_until(&mut table, deadline).timed_out() {
+                if let Some(refusal) = Self::overlap(&table, &candidate) {
+                    if let Some(id) = reservation {
+                        table.reserved.remove(&id);
+                    }
+                    return Err(refusal);
+                }
+            }
+        }
+        if let Some(id) = reservation {
+            table.reserved.remove(&id);
+        }
+        self.insert_admitted(&mut table, allocate, candidate)
+    }
+
+    /// Register `candidate` under a freshly allocated timestamp.
+    fn insert_admitted<'p>(
+        &'p self,
+        table: &mut Table,
+        allocate: impl FnOnce() -> u64,
+        mut candidate: Admitted,
+    ) -> Result<(u64, Admission<'p>), Refusal> {
         // Accounted before the timestamp is taken: a number allocated and then
         // refused is a hole in the clock nobody closes.
-        if table.len() >= self.max_in_flight {
+        if table.admitted.len() >= self.max_in_flight {
             return Err(Refusal::AtCapacity {
                 limit: self.max_in_flight,
             });
         }
-
-        let commit_ts = allocate();
-
-        let holds = |keys: &[(Partition, Vec<u8>)], partition: &Partition, key: &[u8]| {
-            keys.iter().any(|(p, k)| p == partition && k == key)
-        };
-        for other in table.values() {
-            for (partition, key) in &scope {
-                if holds(&other.scope, partition, key) || holds(&other.guards, partition, key) {
-                    return Err(Refusal::Overlap {
-                        partition: *partition,
-                        key: key.clone(),
-                        holder_ts: other.commit_ts,
-                    });
-                }
-            }
-            for (partition, key) in &guards {
-                if holds(&other.scope, partition, key) {
-                    return Err(Refusal::Overlap {
-                        partition: *partition,
-                        key: key.clone(),
-                        holder_ts: other.commit_ts,
-                    });
-                }
-            }
-        }
-
+        candidate.commit_ts = allocate();
+        let commit_ts = candidate.commit_ts;
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        table.insert(
-            id,
-            Admitted {
-                commit_ts,
-                scope,
-                guards,
-            },
-        );
+        table.admitted.insert(id, candidate);
         Ok((commit_ts, Admission { pending: self, id }))
+    }
+
+    /// The first admitted commit `candidate` collides with: a key it writes
+    /// that the other writes or conditions on, or a key it conditions on that
+    /// the other writes.
+    fn overlap(table: &Table, candidate: &Admitted) -> Option<Refusal> {
+        table.admitted.values().find_map(|other| {
+            Self::colliding_key(candidate, other).map(|(partition, key)| Refusal::Overlap {
+                partition,
+                key,
+                holder_ts: other.commit_ts,
+            })
+        })
+    }
+
+    /// Refuse `candidate` when a waiter reserved a key it collides with.
+    fn refuse_reserved(table: &Table, candidate: &Admitted) -> Result<(), Refusal> {
+        match table
+            .reserved
+            .values()
+            .find_map(|waiter| Self::colliding_key(candidate, waiter))
+        {
+            Some((partition, key)) => Err(Refusal::Reserved { partition, key }),
+            None => Ok(()),
+        }
+    }
+
+    /// A key `candidate` writes that `other` writes or conditions on, or a
+    /// key `candidate` conditions on that `other` writes. The relation is
+    /// symmetric: a key one side conditions on and the other writes collides
+    /// whichever side is asked first.
+    fn colliding_key(candidate: &Admitted, other: &Admitted) -> Option<(Partition, Vec<u8>)> {
+        let holds = |keys: &[(Partition, Vec<u8>)], partition: &Partition, key: &[u8]| {
+            keys.iter().any(|(p, k)| p == partition && k == key)
+        };
+        candidate
+            .scope
+            .iter()
+            .find(|(p, k)| holds(&other.scope, p, k) || holds(&other.guards, p, k))
+            .or_else(|| {
+                candidate
+                    .guards
+                    .iter()
+                    .find(|(p, k)| holds(&other.scope, p, k))
+            })
+            .cloned()
     }
 
     /// The highest snapshot that covers no commit still in flight, given the
@@ -233,7 +348,7 @@ impl PendingCommits {
         let mut table = self.inner.lock();
         loop {
             let latest = read_clock();
-            if table.is_empty() {
+            if table.admitted.is_empty() {
                 return latest;
             }
             let floor = Self::floor_of(&table, latest);
@@ -247,8 +362,9 @@ impl PendingCommits {
         }
     }
 
-    fn floor_of(table: &HashMap<u64, Admitted>, latest: u64) -> u64 {
+    fn floor_of(table: &Table, latest: u64) -> u64 {
         table
+            .admitted
             .values()
             .map(|a| a.commit_ts)
             .filter(|ts| *ts <= latest)
@@ -258,11 +374,11 @@ impl PendingCommits {
 
     /// How many commits are admitted and not yet applied.
     pub fn in_flight(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock().admitted.len()
     }
 
     fn withdraw(&self, id: u64) {
-        self.inner.lock().remove(&id);
+        self.inner.lock().admitted.remove(&id);
         // Every waiter is woken rather than one: they are waiting on
         // different timestamps, and the one this commit unblocks is not
         // necessarily the one a single wake would reach.
