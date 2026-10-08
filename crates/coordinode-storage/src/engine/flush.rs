@@ -76,6 +76,10 @@ struct FlushRequest {
     partition: Partition,
     /// GC watermark seqno: versions with seqno ≤ this value may be evicted.
     gc_watermark: u64,
+    /// Set by the monitor when it queued this request, cleared by the worker
+    /// once the flush returned, so the monitor asks again for a partition
+    /// whose sealed memtables are still there and nobody is flushing.
+    queued: Arc<AtomicBool>,
 }
 
 /// Background memtable → SST flush worker pool.
@@ -229,6 +233,10 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
     let start = Instant::now();
     let mut last_rotate: HashMap<Partition, Instant> =
         trees.iter().map(|(p, _)| (*p, start)).collect();
+    let queued: Vec<Arc<AtomicBool>> = trees
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
 
     while !cfg.shutdown.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -237,34 +245,43 @@ fn flush_monitor_loop(trees: Vec<(Partition, lsm_tree::AnyTree)>, cfg: FlushMoni
         // idle engine sleeps until a write wakes it.
         let mut next_due: Option<Duration> = None;
 
-        for (partition, tree) in &trees {
+        for ((partition, tree), queued) in trees.iter().zip(&queued) {
             let active_bytes = tree.active_memtable().size();
-            let sealed_count = tree.sealed_memtable_count();
             let age = now.saturating_duration_since(*last_rotate.get(partition).unwrap_or(&start));
             let age_triggered = cfg.max_memtable_age_secs > 0 && active_bytes > 0 && age >= max_age;
 
-            let needs_flush = active_bytes > cfg.flush_threshold_bytes
-                || sealed_count > cfg.max_sealed
+            let rotate = active_bytes > cfg.flush_threshold_bytes
+                || tree.sealed_memtable_count() > cfg.max_sealed
                 || age_triggered;
 
-            if needs_flush {
+            if rotate {
                 // Rotate: atomically seal the active memtable → it joins the sealed list.
                 // A fresh empty memtable becomes the new active.
                 tree.rotate_memtable();
                 last_rotate.insert(*partition, now);
+            } else if cfg.max_memtable_age_secs > 0 && active_bytes > 0 {
+                let remaining = max_age.saturating_sub(age);
+                next_due = Some(next_due.map_or(remaining, |due| due.min(remaining)));
+            }
 
+            // Every sealed memtable is flushed, not only one sealed just now:
+            // a request turned away while the workers were busy leaves its
+            // memtable sealed, and an idle partition never trips the gates
+            // above again. One request per partition at a time, because a
+            // flush takes every sealed memtable of its tree.
+            if tree.sealed_memtable_count() > 0 && !queued.load(Ordering::Acquire) {
                 let req = FlushRequest {
                     tree: tree.clone(),
                     partition: *partition,
                     gc_watermark: cfg.gc_watermarks.for_partition(*partition),
+                    queued: Arc::clone(queued),
                 };
-
-                // Non-blocking: if channel is full, workers are busy.
-                // The sealed memtable stays in the sealed list until the next flush call.
-                let _ = cfg.sender.try_send(req);
-            } else if cfg.max_memtable_age_secs > 0 && active_bytes > 0 {
-                let remaining = max_age.saturating_sub(age);
-                next_due = Some(next_due.map_or(remaining, |due| due.min(remaining)));
+                queued.store(true, Ordering::Release);
+                // Non-blocking: with the workers busy the request waits for
+                // the next pass, which a finished flush wakes.
+                if cfg.sender.try_send(req).is_err() {
+                    queued.store(false, Ordering::Release);
+                }
             }
         }
 
@@ -281,11 +298,16 @@ fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, flushed: &Wake, co
         tree,
         partition,
         gc_watermark,
+        queued,
     }) = receiver.recv()
     {
         // get_flush_lock() is not Send: it is acquired and used in this thread.
         let flush_lock = tree.get_flush_lock();
-        match tree.flush(&flush_lock, gc_watermark) {
+        let result = tree.flush(&flush_lock, gc_watermark);
+        drop(flush_lock);
+        // Before the wake below, so the pass it starts may ask again.
+        queued.store(false, Ordering::Release);
+        match result {
             Ok(Some(bytes)) => {
                 tracing::debug!(
                     partition = partition.name(),
@@ -304,6 +326,10 @@ fn flush_worker_loop(receiver: flume::Receiver<FlushRequest>, flushed: &Wake, co
                     error = %e,
                     "memtable flush failed"
                 );
+                // Retried on the monitor's next pass, which the next write or
+                // flush starts; waking it now would retry a failing disk in a
+                // loop.
+                continue;
             }
         }
         // The sealed backlog moved; a request the monitor could not queue

@@ -217,6 +217,80 @@ fn flush_manager_age_trigger_rotates_idle_memtable() {
     );
 }
 
+/// A memtable sealed while the workers' queue was full is flushed once the
+/// workers free up, even when its partition then stays idle: the monitor's
+/// size, backlog and age gates no longer see it (the active memtable is
+/// empty and one sealed memtable is under the backlog limit), so only the
+/// sealed memtable itself can bring it back.
+#[test]
+fn a_memtable_sealed_while_the_queue_was_full_is_flushed_later() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let seqno: lsm_tree::SharedSequenceNumberGenerator =
+        Arc::new(lsm_tree::SequenceNumberCounter::default());
+    // More partitions due at once than one busy worker and its queue of 8
+    // can take: one request has to be turned away.
+    let partitions = [
+        Partition::Node,
+        Partition::Adj,
+        Partition::EdgeProp,
+        Partition::Blob,
+        Partition::BlobRef,
+        Partition::Schema,
+        Partition::Idx,
+        Partition::Counter,
+        Partition::VectorF32,
+        Partition::Registry,
+    ];
+    let mut trees = HashMap::new();
+    for partition in partitions {
+        let tree = lsm_tree::Config::new_with_generators(
+            dir.path().join(partition.name()),
+            Arc::clone(&seqno),
+            Arc::clone(&seqno),
+        )
+        .open()
+        .expect("open tree");
+        tree.insert(b"k", b"value over the threshold", seqno.next());
+        trees.insert(partition, tree);
+    }
+    let gc_watermark = Arc::new(AtomicU64::new(0));
+
+    // Every flush waits on its tree's flush lock, so the one worker holds
+    // its first request while the monitor seals all ten and fills the queue.
+    let held: Vec<_> = trees.values().map(|tree| tree.get_flush_lock()).collect();
+    // Size trigger at 1 byte, backlog limit above one sealed memtable, no
+    // age trigger: once sealed, an idle partition is due by nothing else.
+    let (mgr, _wake) = start(&trees, &gc_watermark, 1, 4, 1, 0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while trees.values().any(|tree| tree.active_memtable().size() > 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the monitor never sealed every memtable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    drop(held);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let left: Vec<&str> = trees
+            .iter()
+            .filter(|(_, tree)| tree.sealed_memtable_count() > 0)
+            .map(|(partition, _)| partition.name())
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sealed memtables never flushed: {left:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(mgr);
+}
+
 #[test]
 fn flush_manager_age_zero_disables_time_based_trigger() {
     // max_memtable_age_secs == 0 disables the age trigger: size and
