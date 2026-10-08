@@ -180,6 +180,10 @@ fn peers_of(ports: [u16; 3], i: usize) -> Vec<u16> {
 struct Observed {
     acked: Vec<(i64, Instant)>,
     refused_reads: Vec<(u16, Instant)>,
+    /// Write attempts that took long: the member, when, how long, and
+    /// whether it was acknowledged. They tell a member that answered slowly
+    /// from a group that did not write.
+    slow_writes: Vec<(u16, Instant, Duration, bool)>,
 }
 
 /// Move a group of three from format bump 0 to 1, member 3 first, member 2
@@ -195,15 +199,53 @@ async fn move_under_workload(kill_completing: bool) {
         let (stop, observed) = (Arc::clone(&stop), Arc::clone(&observed));
         tokio::spawn(async move {
             let mut seq = 0i64;
+            let mut stragglers = Vec::new();
             while !stop.load(Ordering::Acquire) {
+                // Each write goes to every member at once: the group writes
+                // as long as one path does. An attempt held by a member that
+                // can no longer commit (a leader whose followers moved on
+                // waits out its proposal timeout) must not hold the next
+                // write back, or the workload would measure that timeout
+                // instead of the group. Two members can hold at once (that
+                // leader and one just restarted), so the next write starts
+                // once one attempt acknowledged, every attempt finished, or
+                // `HELD` passed, whichever is first; held attempts keep
+                // running and count if they land. A `seq` written twice is
+                // absorbed by the set-based checks below.
+                const HELD: Duration = Duration::from_millis(300);
+                seq += 1;
+                let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
                 for port in ports {
-                    seq += 1;
-                    if write_seq(port, seq).await {
-                        observed.lock().unwrap().acked.push((seq, Instant::now()));
-                        break;
-                    }
+                    let (observed, done_tx) = (Arc::clone(&observed), done_tx.clone());
+                    stragglers.push(tokio::spawn(async move {
+                        let at = Instant::now();
+                        let ok = write_seq(port, seq).await;
+                        let took = at.elapsed();
+                        {
+                            let mut observed = observed.lock().unwrap();
+                            if took > Duration::from_millis(250) {
+                                observed.slow_writes.push((port, at, took, ok));
+                            }
+                            if ok {
+                                observed.acked.push((seq, Instant::now()));
+                            }
+                        }
+                        // The round may have moved on; nobody to tell then.
+                        done_tx.send(ok).ok();
+                    }));
                 }
+                drop(done_tx);
+                let held_until = tokio::time::Instant::now() + HELD;
+                while let Ok(Some(false)) =
+                    tokio::time::timeout_at(held_until, done_rx.recv()).await
+                {}
+                stragglers.retain(|attempt| !attempt.is_finished());
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Attempts still held when the workload stops finish before the
+            // checks read what was acknowledged.
+            for attempt in stragglers {
+                attempt.await.expect("write attempt");
             }
         })
     };
@@ -260,7 +302,9 @@ async fn move_under_workload(kill_completing: bool) {
     stop.store(true, Ordering::Release);
     writer.await.expect("writer");
     reader.await.expect("reader");
-    let observed = std::mem::take(&mut *observed.lock().unwrap());
+    let mut observed = std::mem::take(&mut *observed.lock().unwrap());
+    // Held attempts land out of order; the pause check reads acks in time.
+    observed.acked.sort_by_key(|(_, at)| *at);
 
     // No acknowledged write is lost, and the member updated last catches up.
     let acked: BTreeSet<i64> = observed.acked.iter().map(|(seq, _)| *seq).collect();
@@ -300,22 +344,78 @@ async fn move_under_workload(kill_completing: bool) {
         );
     }
 
-    // Exactly one write pause, about as long as the completing update.
-    let pauses: Vec<Duration> = observed
+    // Exactly one write pause, while the completing member restarts. Away
+    // from it the workload acknowledges within a couple hundred
+    // milliseconds even across the other restarts, and the pause itself
+    // runs about a second, so half a second tells them apart.
+    const PAUSE: Duration = Duration::from_millis(500);
+    // Every gap between consecutive acknowledgements as (from, to), from
+    // the first update's start.
+    let gaps: Vec<(Duration, Duration)> = observed
         .acked
         .windows(2)
-        .map(|w| w[1].1 - w[0].1)
-        .filter(|gap| *gap > Duration::from_millis(1500))
+        .map(|w| {
+            (
+                w[0].1.duration_since(started),
+                w[1].1.duration_since(started),
+            )
+        })
         .collect();
-    assert_eq!(pauses.len(), 1, "one write pause, got {pauses:?}");
-    assert!(
-        pauses[0] <= update_time + Duration::from_secs(20),
-        "pause {:?} against an update of {update_time:?}",
-        pauses[0]
+    let pauses: Vec<(Duration, Duration)> = gaps
+        .iter()
+        .copied()
+        .filter(|(from, to)| *to - *from > PAUSE)
+        .collect();
+    let mut largest: Vec<Duration> = gaps.iter().map(|(from, to)| *to - *from).collect();
+    largest.sort_unstable_by(|a, b| b.cmp(a));
+    largest.truncate(4);
+    let windows: Vec<String> = down
+        .iter()
+        .map(|(port, from, to)| {
+            format!(
+                "{port}: {:?}..{:?}",
+                from.duration_since(started),
+                to.duration_since(started)
+            )
+        })
+        .collect();
+    // Attempts at a member that is down time out by the hundred; only
+    // those overlapping a pause say anything about it.
+    let slow: Vec<String> = observed
+        .slow_writes
+        .iter()
+        .filter(|(_, at, took, _)| {
+            let begin = at.duration_since(started);
+            pauses
+                .iter()
+                .any(|(from, to)| begin < *to && begin + *took > *from)
+        })
+        .take(20)
+        .map(|(port, at, took, ok)| {
+            format!(
+                "{port} at {:?} took {took:?} {}",
+                at.duration_since(started),
+                if *ok { "acked" } else { "failed" }
+            )
+        })
+        .collect();
+    let seen = format!(
+        "write pauses {pauses:?}, largest gaps {largest:?}; restarts {windows:?} \
+         (ports {ports:?}); slow writes {slow:?}"
     );
-    eprintln!(
-        "write pause {:?}, completing member's update {update_time:?}",
-        pauses[0]
+    eprintln!("{seen}");
+    assert_eq!(pauses.len(), 1, "one write pause: {seen}");
+    let (from, to) = pauses[0];
+    let (_, completing_from, completing_to) = down[1];
+    assert!(
+        from <= completing_to.duration_since(started)
+            && to >= completing_from.duration_since(started),
+        "the pause lies on the completing member's update: {seen}"
+    );
+    assert!(
+        to - from <= update_time + Duration::from_secs(20),
+        "pause {:?} against an update of {update_time:?}",
+        to - from
     );
 }
 
