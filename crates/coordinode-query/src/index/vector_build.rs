@@ -167,6 +167,13 @@ impl VectorBuild<'_> {
                         tracing::debug!(keys = keys.len(), "vector build: folding tapped writes");
                         self.fold(&keys)?;
                     }
+                    // This take came after the handover, so it held every
+                    // write the writers left to the build: those landed
+                    // before it. They are in the graphs now, and the indexes
+                    // are complete for every write the feed has released.
+                    for target in self.targets {
+                        target.health.mark_ready_after_handover();
+                    }
                 }
             }
             // The fold after the older transactions ended took everything
@@ -200,12 +207,13 @@ impl VectorBuild<'_> {
     /// this point leave, stays with the build through the tap. Handing over
     /// later would not make the index more complete (writes keep landing) but
     /// would leave every write in between to the build's folds, which under
-    /// steady load grow with each other. This is the only point a build marks
-    /// its indexes ready: once it has handed over, the indexes may already
-    /// belong to a newer build, which a later mark would overrule.
+    /// steady load grow with each other. The indexes turn ready after the
+    /// next fold, which takes what the writers left to the build; only from
+    /// the handed-over state, so a newer build that has started meanwhile is
+    /// not overruled.
     fn hand_over(&self) -> u64 {
         for target in self.targets {
-            target.health.mark_ready();
+            target.health.hand_over();
         }
         let boundary = self.engine.snapshot_boundary();
         tracing::debug!(boundary, "vector build: handed over to the writers");

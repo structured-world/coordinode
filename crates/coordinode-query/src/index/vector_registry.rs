@@ -714,7 +714,7 @@ impl VectorIndexRegistry {
     /// partial index under the documented rebuild policy until the build ends.
     fn build_owns_writes(&self, label: &str, property: &str) -> bool {
         self.health_handle(label, property)
-            .is_some_and(|h| h.snapshot().is_rebuilding())
+            .is_some_and(|h| h.build_owns_writes())
     }
 
     /// Mint a cancellation token for a build that is about to start.

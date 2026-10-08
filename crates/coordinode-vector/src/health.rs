@@ -110,6 +110,10 @@ impl IndexHealthState {
 const STATE_READY: u32 = 0;
 const STATE_REBUILDING: u32 = 1;
 const STATE_OFFLINE: u32 = 2;
+/// The scan is in and the writers maintain the index, but writes the build
+/// took over during the scan are not all folded: still `Rebuilding` to every
+/// reader, no longer the build's to insert.
+const STATE_HANDED_OVER: u32 = 3;
 
 /// Atomic lifecycle signal — read on every search call, written by the build
 /// path. The `Ready` and `Rebuilding` cases are encoded entirely in atomics
@@ -174,7 +178,7 @@ impl HealthSignal {
             STATE_READY => IndexHealthState::Ready {
                 indexed_hlc: self.indexed_hlc.load(Ordering::Relaxed),
             },
-            STATE_REBUILDING => IndexHealthState::Rebuilding {
+            STATE_REBUILDING | STATE_HANDED_OVER => IndexHealthState::Rebuilding {
                 progress: progress_fp as f32 / 10_000.0,
                 eta_ms: self.eta_ms.load(Ordering::Relaxed),
                 indexed_hlc: self.indexed_hlc.load(Ordering::Relaxed),
@@ -219,8 +223,47 @@ impl HealthSignal {
         }
     }
 
+    /// Hand maintenance of a rebuilding index to its writers: the scan is
+    /// in, writes from here on insert themselves, and the index still reads
+    /// as `Rebuilding` until [`Self::mark_ready_after_handover`] confirms the
+    /// writes the build took over meanwhile are in.
+    pub fn hand_over(&self) {
+        self.state
+            .store(encode(STATE_HANDED_OVER, 10_000), Ordering::Release);
+        self.eta_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether a build owns the index's writes: it is rebuilding and has not
+    /// handed them over.
+    pub fn build_owns_writes(&self) -> bool {
+        decode(self.state.load(Ordering::Acquire)).0 == STATE_REBUILDING
+    }
+
+    /// Turn `Ready` if the index is still handed over, and report whether it
+    /// did. A newer build that started meanwhile has put it back to
+    /// rebuilding, and the older build's mark leaves it so.
+    pub fn mark_ready_after_handover(&self) -> bool {
+        let handed = encode(STATE_HANDED_OVER, 10_000);
+        let turned = self
+            .state
+            .compare_exchange(
+                handed,
+                encode(STATE_READY, 0),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if turned {
+            if let Ok(mut g) = self.offline_reason.lock() {
+                *g = None;
+            }
+        }
+        turned
+    }
+
     /// Update the rebuild progress. `progress` clamped to `[0.0, 1.0]`.
-    /// Also transitions to `Rebuilding` if currently in another state.
+    /// Also transitions to `Rebuilding` if currently in another state, the
+    /// build owning the index's writes again.
     pub fn report_rebuild_progress(&self, progress: f32, eta_ms: u64) {
         let clamped = progress.clamp(0.0, 1.0);
         let progress_fp = (clamped * 10_000.0) as u32;

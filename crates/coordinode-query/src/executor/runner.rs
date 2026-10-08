@@ -10562,10 +10562,11 @@ fn gate_vector_index_read(
         return Ok(());
     };
 
-    // The health turns ready when the build hands maintenance to the
-    // writers; the build then keeps folding in the writes of the
-    // transactions opened before the handover, this one among them, so a
-    // reader waits for the handover, never for the build's end.
+    // The health turns ready once the build has handed maintenance to the
+    // writers and folded what they left to it during the scan; the build
+    // then keeps folding in the writes of the transactions opened before
+    // the handover, this one among them, so a reader waits for the handover
+    // and that fold, never for the build's end.
     let wait = indexes.build_wait;
     // A wait too long to add to the clock is no bound at all.
     let deadline = std::time::Instant::now().checked_add(wait);

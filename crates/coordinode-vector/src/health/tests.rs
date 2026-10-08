@@ -24,6 +24,46 @@ fn rebuilding_publishes_progress_and_eta() {
     }
 }
 
+/// A handed-over index reads as rebuilding at full progress, the build no
+/// longer owns its writes, and it turns ready only from that state.
+#[test]
+fn a_handed_over_index_is_rebuilding_until_marked_ready() {
+    let h = HealthSignal::new_rebuilding();
+    assert!(h.build_owns_writes());
+    assert!(
+        !h.mark_ready_after_handover(),
+        "a build still scanning is not marked ready"
+    );
+    assert!(h.snapshot().is_rebuilding());
+
+    h.hand_over();
+    assert!(!h.build_owns_writes(), "the writers maintain it now");
+    match h.snapshot() {
+        IndexHealthState::Rebuilding { progress, .. } => assert_eq!(progress, 1.0),
+        other => panic!("expected rebuilding, got {other:?}"),
+    }
+
+    assert!(h.mark_ready_after_handover());
+    assert!(h.snapshot().is_ready());
+    assert!(!h.build_owns_writes());
+    assert!(
+        !h.mark_ready_after_handover(),
+        "only a handed-over index turns ready"
+    );
+}
+
+/// A newer build that starts after an older one handed over takes the
+/// writes back, and the older build's mark leaves it rebuilding.
+#[test]
+fn a_newer_build_is_not_overruled_by_an_older_mark() {
+    let h = HealthSignal::new_rebuilding();
+    h.hand_over();
+    h.report_rebuild_progress(0.0, 0);
+    assert!(h.build_owns_writes());
+    assert!(!h.mark_ready_after_handover());
+    assert!(h.snapshot().is_rebuilding());
+}
+
 #[test]
 fn report_progress_clamps_out_of_range() {
     let h = HealthSignal::new_rebuilding();

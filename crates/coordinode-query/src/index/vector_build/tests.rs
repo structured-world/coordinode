@@ -371,6 +371,74 @@ fn a_build_finishes_under_writes_that_never_pause() {
     assert!(fx.health().snapshot().is_ready());
 }
 
+/// A write that lands while the scan runs is in the graph before the index
+/// is marked ready. The writers leave it to the build while the index
+/// rebuilds and the feed releases it, so a search of a ready index finds it
+/// only in the graph. The test holds a read of the graph, which keeps the
+/// build's fold out, and watches whether the index turns ready meanwhile
+/// without the node.
+#[test]
+fn a_write_during_the_scan_is_in_the_graph_before_the_index_is_ready() {
+    let fx = fixture();
+    let v = |id: u64| [1.0, id as f32, (id % 7) as f32];
+    for id in 1..=5000u64 {
+        fx.apply_doc_at(id, v(id), fx.oracle.next().as_raw());
+    }
+    let hnsw = fx.registry.get("Doc", "embedding").expect("hnsw");
+
+    let ready_without_it = std::sync::atomic::AtomicBool::new(false);
+    let outcome = fx.build_while(|health| {
+        // Mid-scan: the first progress report comes after a thousand nodes.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !matches!(
+            health.snapshot(),
+            coordinode_vector::health::IndexHealthState::Rebuilding { progress, .. } if progress > 0.0
+        ) {
+            assert!(Instant::now() < deadline, "the scan never reported progress");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        fx.apply_doc_at(9_999, [0.0, 0.0, 1.0], fx.oracle.next().as_raw());
+        // Held until the index turns ready, or long enough to know that it
+        // waits for the fold this read keeps out.
+        let graph = hnsw.read().expect("graph");
+        let watch = Instant::now() + Duration::from_secs(120);
+        let mut held_ready = false;
+        while Instant::now() < watch {
+            if !health.snapshot().is_rebuilding() {
+                ready_without_it.store(
+                    !graph.contains(9_999),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                break;
+            }
+            if !held_ready && graph.len() >= 5000 {
+                // The scan is in; a correct build now waits on this read.
+                held_ready = true;
+                let settle = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < settle && health.snapshot().is_rebuilding() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if health.snapshot().is_rebuilding() {
+                    break;
+                }
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    assert!(matches!(outcome, Ok(BuildOutcome::Complete { .. })));
+    assert!(
+        !ready_without_it.load(std::sync::atomic::Ordering::Relaxed),
+        "the index was ready while a write of the scan was not in the graph"
+    );
+    let graph = hnsw.read().expect("graph");
+    assert!(
+        graph.contains(9_999),
+        "the write of the scan never reached the graph"
+    );
+}
+
 /// Thousands of writes landing after the handover are folded in more than one
 /// chunk: every one of them is a member when the build ends, beside every
 /// scanned node.
