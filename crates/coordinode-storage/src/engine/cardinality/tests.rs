@@ -894,6 +894,59 @@ fn additions_under_a_lower_bound_do_not_queue_but_a_removal_does() {
     assert_eq!(kept(&f, &ds[1]), BTreeMap::from([(node(1), 1)]));
 }
 
+/// First instances into different pairs of one node do not share a pair to
+/// queue on, but they share the node's AT MOST ONE: while one is deciding
+/// it the other is refused, and once the first landed the retry sees the
+/// bound already met.
+#[test]
+fn first_instances_into_different_pairs_share_an_upper_bound() {
+    use coordinode_core::txn::invariant::{Claim, ClaimScope, ClaimSet};
+
+    let f = fixture();
+    let d = descriptor(
+        Direction::Outgoing,
+        CardinalityMeasure::DistinctNeighbours,
+        CardinalityBound::AtMostOne,
+    );
+    declare(&f, false, std::slice::from_ref(&d));
+    cover(&f, std::slice::from_ref(&d));
+    let bound = || {
+        Claim::new(
+            ClaimScope::Incident {
+                node: node(1),
+                edge_type: OWNS.to_string(),
+                direction: Direction::Outgoing,
+            },
+            ClaimPredicate::CardinalityBound {
+                measure: CardinalityMeasure::DistinctNeighbours,
+                bound: CardinalityBound::AtMostOne,
+                trend: CountTrend::Grows,
+            },
+            0,
+        )
+    };
+
+    let mut first = txn(&f);
+    let mut second = txn(&f);
+    add(&mut first, 1, 2, None);
+    first.claim(bound());
+    add(&mut second, 1, 3, None);
+    second.claim(bound());
+
+    // The first is deciding the bound while the second commits.
+    let mut held = ClaimSet::new();
+    held.insert(bound());
+    let reservation = f.engine.claim_registry().reserve_attempt(&held).unwrap();
+    let refused = commit(&mut second).expect_err("both could pass alone and break it together");
+    assert!(matches!(refused, CommitError::InvariantRefused { .. }));
+    drop(reservation);
+
+    commit(&mut first).unwrap();
+    let refused = commit(&mut second).expect_err("the node already has its one neighbour");
+    assert!(matches!(refused, CommitError::InvariantRefused { .. }));
+    assert_eq!(kept(&f, &d), BTreeMap::from([(node(1), 1)]));
+}
+
 /// One step of a random history.
 #[derive(Debug, Clone)]
 enum Step {
