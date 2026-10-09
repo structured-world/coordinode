@@ -86,37 +86,39 @@ impl Backup {
     }
 }
 
-/// The store at `data` and each checkpoint inside it: the directories that
-/// carry an engine format marker. A directory without one is never opened,
-/// since opening it would create a store there.
+/// Every store under `data`, `data` itself included: each directory that
+/// carries an engine format marker, wherever the server keeps it (the data
+/// directory, its checkpoints, the capture a Raft snapshot is served from).
+/// A directory without one is never opened, since opening it would create a
+/// store there; the backup of earlier runs is not searched.
 ///
 /// # Errors
 ///
-/// The checkpoint directory cannot be listed.
+/// A directory cannot be listed.
 pub fn stores(data: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    use anyhow::Context as _;
-    let marked = |dir: &Path| dir.join(coordinode_storage::format::MARKER_FILE).is_file();
     let mut stores = Vec::new();
-    if marked(data) {
-        stores.push(data.to_path_buf());
-    }
-    let checkpoints = data.join("checkpoints");
-    if checkpoints.is_dir() {
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(&checkpoints)
-            .with_context(|| format!("list {}", checkpoints.display()))?
-        {
-            let path = entry
-                .with_context(|| format!("list {}", checkpoints.display()))?
-                .path();
-            if marked(&path) {
-                found.push(path);
-            }
-        }
-        found.sort();
-        stores.extend(found);
-    }
+    find_stores(data, &data.join(BACKUP_DIR), &mut stores)?;
+    stores.sort();
     Ok(stores)
+}
+
+fn find_stores(dir: &Path, backup: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    if dir.join(coordinode_storage::format::MARKER_FILE).is_file() {
+        out.push(dir.to_path_buf());
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("list {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("list {}", dir.display()))?;
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_dir();
+        if is_dir && path != backup {
+            find_stores(&path, backup, out)?;
+        }
+    }
+    Ok(())
 }
 
 /// Open the store at `dir` as a plain engine: no journal is replayed and

@@ -95,6 +95,38 @@ fn a_crashed_directory_of_the_old_shape_is_brought_current() {
     );
 }
 
+/// Every directory with an engine format marker is a store to migrate,
+/// wherever the server keeps it: the data directory, its checkpoints, and
+/// the capture a Raft snapshot is served from. A directory without the
+/// marker and the run's own backup are not stores.
+#[test]
+fn every_marked_store_under_the_data_directory_is_found() {
+    use coordinode_storage::format::MARKER_FILE;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path();
+    let mark = |p: &std::path::Path| {
+        std::fs::create_dir_all(p).expect("dir");
+        std::fs::write(p.join(MARKER_FILE), b"x").expect("marker");
+    };
+    mark(data);
+    mark(&data.join("checkpoints/ckpt-1"));
+    mark(&data.join("raft-snapshot/0001-0010.capt"));
+    mark(&data.join(BACKUP_DIR).join("run1"));
+    std::fs::create_dir_all(data.join("snapshot-capture")).expect("dir");
+    std::fs::create_dir_all(data.join("node/tables")).expect("dir");
+
+    let mut found = crate::stores(data).expect("stores");
+    found.sort();
+    let mut expected = vec![
+        data.to_path_buf(),
+        data.join("checkpoints/ckpt-1"),
+        data.join("raft-snapshot/0001-0010.capt"),
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+}
+
 /// A segment holding an entry of an unknown shape stops the run before
 /// anything is written, naming the segment and the entry.
 #[test]
