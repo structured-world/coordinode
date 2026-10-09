@@ -65,6 +65,19 @@ impl PendingDocuments {
     }
 }
 
+/// Which words a search's snippets highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Highlight<'a> {
+    /// No snippets.
+    Off,
+    /// The terms of the query.
+    Query,
+    /// The words of each match within one edit of a word of this query text,
+    /// as an edit-1 fuzzy query matches them: its terms are the typed words,
+    /// not the ones it found.
+    NearWords(&'a str),
+}
+
 /// How many matches a search keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matches {
@@ -118,13 +131,13 @@ impl TextIndex {
     }
 
     /// Run `query` over the index and `pending`, best score first (ties by
-    /// node id), with highlighted snippets when `snippets` is set.
+    /// node id), with snippets highlighting what `highlight` says.
     pub(crate) fn collect(
         &self,
         query: &dyn Query,
         matches: Matches,
         pending: &PendingDocuments,
-        snippets: bool,
+        highlight: Highlight<'_>,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
         let searcher = self.reader.searcher();
         // One corpus for both sides, so their scores rank on one scale and a
@@ -152,7 +165,7 @@ impl TextIndex {
             removed: &removed,
         };
         let mut hits = match &pending.superseded {
-            Superseded::None => self.hits(&searcher, query, matches, &statistics, snippets)?,
+            Superseded::None => self.hits(&searcher, query, matches, &statistics, highlight)?,
             Superseded::Nodes(nodes) => {
                 let terms = nodes
                     .iter()
@@ -161,12 +174,12 @@ impl TextIndex {
                     (Occur::Must, query.box_clone()),
                     (Occur::MustNot, Box::new(TermSetQuery::new(terms))),
                 ]);
-                self.hits(&searcher, &current, matches, &statistics, snippets)?
+                self.hits(&searcher, &current, matches, &statistics, highlight)?
             }
             Superseded::All => Vec::new(),
         };
         if let Some(segment) = &pending.segment {
-            hits.extend(self.hits(segment, query, matches, &statistics, snippets)?);
+            hits.extend(self.hits(segment, query, matches, &statistics, highlight)?);
             hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node_id.cmp(&b.node_id)));
             if let Matches::Top(n) = matches {
                 hits.truncate(n);
@@ -182,7 +195,7 @@ impl TextIndex {
         query: &dyn Query,
         matches: Matches,
         statistics: &CorpusStatistics<'_>,
-        snippets: bool,
+        highlight: Highlight<'_>,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
         let found = match matches {
             Matches::Top(0) => return Ok(Vec::new()),
@@ -195,17 +208,23 @@ impl TextIndex {
                 searcher.search_with_statistics_provider(query, &AllMatches, statistics)?
             }
         };
-        let snippet_gen = if snippets {
-            Some(SnippetGenerator::create(searcher, query, self.body_field)?)
-        } else {
-            None
-        };
-        let mut hits = Vec::with_capacity(found.len());
+        let mut docs = Vec::with_capacity(found.len());
         for (score, address) in found {
             let doc: TantivyDocument = searcher.doc(address)?;
-            let Some(node_id) = doc.get_first(self.node_id_field).and_then(|v| v.as_u64()) else {
-                continue;
-            };
+            if let Some(node_id) = doc.get_first(self.node_id_field).and_then(|v| v.as_u64()) {
+                docs.push((score, node_id, doc));
+            }
+        }
+        let snippet_gen = match highlight {
+            Highlight::Off => None,
+            Highlight::Query => Some(SnippetGenerator::create(searcher, query, self.body_field)?),
+            Highlight::NearWords(text) => {
+                let near = self.near_words(searcher, text, docs.iter().map(|(_, _, doc)| doc));
+                Some(SnippetGenerator::create(searcher, &near, self.body_field)?)
+            }
+        };
+        let mut hits = Vec::with_capacity(docs.len());
+        for (score, node_id, doc) in docs {
             let snippet_html = snippet_gen
                 .as_ref()
                 .map(|g| g.snippet_from_doc(&doc).to_html())
@@ -218,6 +237,83 @@ impl TextIndex {
         }
         Ok(hits)
     }
+
+    /// A query of the words in `docs`, as the body's analyzer reads them,
+    /// within one edit of a word of `text`: what a snippet highlights for an
+    /// edit-1 fuzzy search of `text`. Bounded by the matches being shown.
+    fn near_words<'d>(
+        &self,
+        searcher: &Searcher,
+        text: &str,
+        docs: impl Iterator<Item = &'d TantivyDocument>,
+    ) -> BooleanQuery {
+        let typed: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        let mut near = std::collections::BTreeSet::new();
+        if let Ok(mut analyzer) = searcher.index().tokenizer_for_field(self.body_field) {
+            for doc in docs {
+                for value in doc.get_all(self.body_field) {
+                    let Some(body) = value.as_str() else { continue };
+                    let mut stream = analyzer.token_stream(body);
+                    while let Some(token) = stream.next() {
+                        if typed.iter().any(|w| within_one_edit(w, &token.text)) {
+                            near.insert(token.text.clone());
+                        }
+                    }
+                }
+            }
+        }
+        BooleanQuery::new(
+            near.into_iter()
+                .map(|word| {
+                    let term = Term::from_field_text(self.body_field, &word);
+                    let query: Box<dyn Query> = Box::new(tantivy::query::TermQuery::new(
+                        term,
+                        tantivy::schema::IndexRecordOption::Basic,
+                    ));
+                    (Occur::Should, query)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Whether `a` becomes `b` by at most one insertion, deletion, substitution
+/// or swap of two adjacent characters: the edit-1 distance a fuzzy term
+/// query matches with transpositions counted as one edit.
+fn within_one_edit(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let common = short
+        .iter()
+        .zip(long.iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+    if common == long.len() {
+        return true;
+    }
+    if short.len() == long.len() {
+        // A substitution at `common`, or a swap of `common` and the next.
+        let rest_equal = |from: usize| short[from..] == long[from..];
+        return rest_equal(common + 1)
+            || (common + 1 < short.len()
+                && short[common] == long[common + 1]
+                && short[common + 1] == long[common]
+                && rest_equal(common + 2));
+    }
+    // One character of the longer word inserted at `common`.
+    short[common..] == long[common + 1..]
 }
 
 /// What a search's corpus starts from before the pending documents change it.

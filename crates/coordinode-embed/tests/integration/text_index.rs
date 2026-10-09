@@ -398,6 +398,66 @@ fn a_search_answers_unfolded_writes_from_the_store() {
     assert!(titles(&mut db, "doomed").is_empty());
 }
 
+/// A fuzzy search and a search with highlighted snippets answer unfolded
+/// writes as the plain one does: the edit-1 neighbourhood and the snippet
+/// come from the text the store holds now, never from the stale document
+/// the index still has.
+#[test]
+fn fuzzy_and_snippet_searches_answer_unfolded_writes_from_the_store() {
+    use coordinode_search::tantivy::multi_lang::TextRequest;
+    use coordinode_search::tantivy::pending::Matches;
+
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'stale rust words'})")
+        .expect("create a");
+    let a = node_id(&mut db, "a");
+
+    let held = HeldCoverage::hold(&db, 1024);
+    db.execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'fresh golang words'")
+        .expect("rewrite a");
+    held.await_worker();
+    db.text_index_registry()
+        .apply_changes(
+            "Article",
+            "body",
+            &planted(&[(a, Some("stale rust words"))]),
+        )
+        .expect("plant stale text");
+
+    let search = |request| {
+        db.text_search("Article", "body", request, Matches::Top(10))
+            .expect("search")
+            .expect("the index exists")
+    };
+    let fuzzy = |query| TextRequest::Fuzzy {
+        query,
+        snippets: true,
+    };
+    // One edit away from the new word, and from the stale one.
+    let found = search(fuzzy("golanf"));
+    assert_eq!(found.iter().map(|r| r.node_id).collect::<Vec<_>>(), [a]);
+    assert!(
+        found[0].snippet_html.contains("<b>golang</b>"),
+        "the snippet is the store's text: {}",
+        found[0].snippet_html
+    );
+    assert!(search(fuzzy("rusq")).is_empty(), "the stale text is gone");
+
+    let found = search(TextRequest::Terms {
+        query: "golang",
+        language: None,
+        snippets: true,
+    });
+    assert_eq!(found.iter().map(|r| r.node_id).collect::<Vec<_>>(), [a]);
+    assert!(
+        found[0].snippet_html.contains("fresh"),
+        "{}",
+        found[0].snippet_html
+    );
+}
+
 /// When the writes the index lacks are not known (an event was dropped), a
 /// search reads every node of the label from the store instead of trusting
 /// the index for any of them.

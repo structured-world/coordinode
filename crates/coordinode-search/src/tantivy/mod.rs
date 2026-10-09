@@ -688,7 +688,7 @@ impl TextIndex {
             &*query,
             Matches::Top(limit),
             &PendingDocuments::none(),
-            true,
+            pending::Highlight::NearWords(query_str),
         )
     }
 
@@ -923,7 +923,7 @@ impl TextIndex {
                 &query,
                 Matches::Top(limit),
                 &PendingDocuments::none(),
-                false,
+                pending::Highlight::Off,
             )?
             .into_iter()
             .map(|hit| TextSearchResult {
@@ -976,7 +976,12 @@ impl TextIndex {
         let Some(query) = self.language_query(query_str, language) else {
             return Ok(Vec::new());
         };
-        self.collect(&query, Matches::Top(limit), &PendingDocuments::none(), true)
+        self.collect(
+            &query,
+            Matches::Top(limit),
+            &PendingDocuments::none(),
+            pending::Highlight::Query,
+        )
     }
 
     /// Birth-time filtered search: returns only the held documents whose

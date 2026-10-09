@@ -948,6 +948,11 @@ fn search_with_highlights_fuzzy_finds_typo() {
     );
     assert_eq!(results[0].node_id, 1);
     assert!(results[0].score > 0.0);
+    assert!(
+        results[0].snippet_html.contains("<b>graph</b>"),
+        "the snippet highlights the word the typo matched: {:?}",
+        results[0].snippet_html
+    );
 }
 
 #[test]

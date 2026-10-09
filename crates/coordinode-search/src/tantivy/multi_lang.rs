@@ -17,7 +17,7 @@ use std::path::Path;
 use std::collections::HashSet;
 
 use super::corpus::Corpus;
-use super::pending::{Matches, PendingDocuments};
+use super::pending::{Highlight, Matches, PendingDocuments};
 use super::tokenize;
 use super::validity::{Validities, Validity};
 use super::{HighlightedResult, TextIndex, TextSearchError, TextSearchResult};
@@ -495,14 +495,26 @@ impl MultiLanguageTextIndex {
                 snippets,
             } => {
                 let language = language.unwrap_or(&self.config.default_language);
+                let highlight = if snippets {
+                    Highlight::Query
+                } else {
+                    Highlight::Off
+                };
                 match self.inner.language_query(query, language) {
-                    Some(query) => self.inner.collect(&query, matches, pending, snippets),
+                    Some(query) => self.inner.collect(&query, matches, pending, highlight),
                     None => Ok(Vec::new()),
                 }
             }
             TextRequest::Fuzzy { query, snippets } => {
+                // A fuzzy query's terms are the typed words, so the snippet
+                // highlights the words it matched instead.
+                let highlight = if snippets {
+                    Highlight::NearWords(query)
+                } else {
+                    Highlight::Off
+                };
                 let query = self.inner.build_query_fuzzy(query, None)?;
-                self.inner.collect(&*query, matches, pending, snippets)
+                self.inner.collect(&*query, matches, pending, highlight)
             }
         }
     }
