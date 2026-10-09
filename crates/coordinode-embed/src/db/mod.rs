@@ -174,11 +174,6 @@ pub struct ResumedIndexBuilds {
     pub untaken: usize,
 }
 
-/// Applied Raft entries queued for the vector index worker before it is
-/// behind: past this the applies do not wait, the queue drops, and the
-/// worker rebuilds its indexes from the store.
-const APPLIED_QUEUE_CAPACITY: usize = 16_384;
-
 /// Canonical f32-vector coercion (handles `Value::Vector` and numeric
 /// `Value::Array`). Re-exported so `crate::db::try_extract_vector` callers
 /// keep resolving; the single definition lives in `coordinode-core`.
@@ -1004,7 +999,10 @@ impl Database {
         // takes a committed deletion out of the graph.
         // The events stay until the worker has folded them: a vector search
         // answers the nodes they wrote from the store instead of waiting.
-        let applied = engine.subscribe_applied_retained(Partition::Node, APPLIED_QUEUE_CAPACITY);
+        // Past the configured capacity the applies do not wait: the queue
+        // drops and the worker rebuilds its indexes from the store.
+        let applied =
+            engine.subscribe_applied_retained(Partition::Node, engine.index_feed_capacity());
         let vector_coverage = Arc::new(coordinode_query::index::IndexCoverage::new(
             applied.position(),
         ));
@@ -1037,7 +1035,7 @@ impl Database {
         // commit falls between the two, and searches answer the writes the
         // worker has not folded from the store.
         let text_applied =
-            engine.subscribe_applied_retained(Partition::Node, APPLIED_QUEUE_CAPACITY);
+            engine.subscribe_applied_retained(Partition::Node, engine.index_feed_capacity());
         let text_coverage = Arc::new(coordinode_query::index::IndexCoverage::new(
             text_applied.position(),
         ));

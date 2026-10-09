@@ -334,6 +334,10 @@ pub struct ServerConfig {
     /// Free disk space, in bytes, below which every write is refused before
     /// it reaches the disk; reads go on (`None` = 1 GiB).
     pub min_free_bytes: Option<u64>,
+    /// Applied commits each text and vector index worker holds until it has
+    /// folded them (`None` = 16384); past it the worker rebuilds from the
+    /// store and searches read the whole label meanwhile.
+    pub index_feed_capacity: Option<usize>,
     /// Free disk space, in bytes, needed before refused writes are admitted
     /// again (`None` = 2 GiB; at least `min_free_bytes`).
     pub resume_free_bytes: Option<u64>,
@@ -481,6 +485,7 @@ impl Default for ServerConfig {
             max_commits_in_flight: None,
             snapshot_wait_ms: None,
             min_free_bytes: None,
+            index_feed_capacity: None,
             resume_free_bytes: None,
             node_shard: None,
             registry_heartbeat_ms: None,
@@ -772,6 +777,9 @@ impl ServerConfig {
         }
         if let Some(limit) = self.max_commits_in_flight {
             cfg.max_commits_in_flight = limit;
+        }
+        if let Some(capacity) = self.index_feed_capacity {
+            cfg.index_feed_capacity = capacity;
         }
         if let Some(bytes) = self.min_free_bytes {
             cfg.min_free_bytes = bytes;

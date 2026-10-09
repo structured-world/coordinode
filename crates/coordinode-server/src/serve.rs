@@ -177,6 +177,7 @@ pub(crate) async fn serve(
         max_commits_in_flight: _,
         snapshot_wait_ms: _,
         min_free_bytes: _,
+        index_feed_capacity: _,
         resume_free_bytes: _,
         node_shard: _,
         registry_heartbeat_ms,

@@ -236,6 +236,9 @@ pub struct StorageEngine {
     /// Consumers following the Raft entries as they apply (see
     /// [`Self::subscribe_applied`]).
     applied_feed: Arc<crate::engine::applied::AppliedFeed>,
+    /// How many applied commits a derived-index worker's subscription holds
+    /// ([`StorageConfig::index_feed_capacity`]).
+    index_feed_capacity: usize,
     /// The transactions open here (see [`Self::await_transactions_through`]).
     open_transactions: Arc<crate::engine::open_txns::OpenTransactions>,
     /// Refuses new writes while the disk under a durable endpoint is below
@@ -1041,6 +1044,7 @@ impl StorageEngine {
             partition_captures: AtomicU64::new(0),
             write_taps: Arc::new(crate::engine::tap::WriteTaps::default()),
             applied_feed: Arc::new(crate::engine::applied::AppliedFeed::default()),
+            index_feed_capacity: config.index_feed_capacity.max(1),
             open_transactions: Arc::new(crate::engine::open_txns::OpenTransactions::default()),
             space: Arc::new(crate::engine::space::SpaceGuard::new(config)),
         })
@@ -3383,6 +3387,12 @@ impl StorageEngine {
         capacity: usize,
     ) -> crate::engine::applied::AppliedSubscription {
         self.applied_feed.subscribe(partition, capacity, true)
+    }
+
+    /// How many applied commits a derived-index worker's retained
+    /// subscription holds ([`StorageConfig::index_feed_capacity`]).
+    pub fn index_feed_capacity(&self) -> usize {
+        self.index_feed_capacity
     }
 
     /// Run `hook` between each entry's store write and its publication to

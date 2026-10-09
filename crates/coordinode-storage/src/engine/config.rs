@@ -609,6 +609,13 @@ pub struct StorageConfig {
     /// Block cache size in bytes. Default: 64MB.
     pub block_cache_bytes: u64,
 
+    /// Applied commits each derived-index worker (text, vector) holds until
+    /// it has folded them. Searches answer those commits' nodes from the
+    /// store meanwhile; past this many the queue drops, the worker rebuilds
+    /// its indexes from the store, and until it has, searches read the whole
+    /// label from the store. Default: 16384.
+    pub index_feed_capacity: usize,
+
     /// Maximum write buffer size in bytes. Default: 64MB.
     pub max_write_buffer_bytes: u64,
 
@@ -922,6 +929,7 @@ impl StorageConfig {
             flush_policy: FlushPolicy::default(),
             compression: CompressionConfig::default(),
             block_cache_bytes: 64 * 1024 * 1024,
+            index_feed_capacity: 16_384,
             max_write_buffer_bytes: 64 * 1024 * 1024,
             partition_compression: None,
             cache: TieredCacheConfig::default(),

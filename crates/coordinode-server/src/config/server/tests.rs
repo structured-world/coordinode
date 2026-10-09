@@ -174,6 +174,34 @@ fn planner_stats_ttl_parses_from_the_config_file() {
     assert_eq!(c.planner_stats_ttl_secs, Some(5));
 }
 
+/// The index feed capacity is a config-file setting carried into the storage
+/// configuration: unset it keeps the engine default.
+#[test]
+fn index_feed_capacity_reaches_the_storage_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = ServerConfig {
+        data_dir: dir.path().to_str().unwrap().into(),
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        default
+            .resolve_storage_config()
+            .expect("valid topology")
+            .index_feed_capacity,
+        16_384
+    );
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "index_feed_capacity: 4096\n").unwrap();
+    let mut c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    c.data_dir = dir.path().to_str().unwrap().into();
+    assert_eq!(
+        c.resolve_storage_config()
+            .expect("valid topology")
+            .index_feed_capacity,
+        4096
+    );
+}
+
 /// The slow-statement bound is a config-file setting: unset it leaves the
 /// built-in 100 ms, set it carries the milliseconds given, 0 included.
 #[test]
