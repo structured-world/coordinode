@@ -1419,6 +1419,12 @@ impl<'a> Transaction<'a> {
         self.schema_changed = true;
     }
 
+    /// Whether this attempt carries private catalog changes. A stateless
+    /// parallel reader cannot resolve those through committed storage alone.
+    pub fn has_schema_changes(&self) -> bool {
+        self.schema_changed
+    }
+
     /// The conditions stated so far.
     pub fn claims(&self) -> &ClaimSet {
         &self.claims

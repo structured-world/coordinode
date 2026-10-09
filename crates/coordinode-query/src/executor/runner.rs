@@ -4968,7 +4968,7 @@ fn node_row_if_matching(
         }
     }
     let primary_label = insert_label_columns(&mut row, variable, record);
-    inject_computed_properties(&mut row, variable, &primary_label, ctx);
+    inject_computed_properties(&mut row, variable, &primary_label, ctx)?;
 
     // Inline property filters. Inside a correlated join (e.g. `UNWIND ... AS
     // e MATCH (a {p: e.x})`) a filter value can reference outer bindings, so
@@ -5595,7 +5595,7 @@ fn execute_hnsw_scan(
             }
         }
         let primary_label = insert_label_columns(&mut row, binding, &record);
-        inject_computed_properties(&mut row, binding, &primary_label, ctx);
+        inject_computed_properties(&mut row, binding, &primary_label, ctx)?;
 
         if let Some(alias) = distance_alias {
             let score = exact.or_else(|| {
@@ -5669,7 +5669,7 @@ fn execute_text_index_scan(
             }
         }
         let primary_label = insert_label_columns(&mut row, binding, &record);
-        inject_computed_properties(&mut row, binding, &primary_label, ctx);
+        inject_computed_properties(&mut row, binding, &primary_label, ctx)?;
         let score = matches.get(&id.as_raw()).copied().unwrap_or_default();
         row.insert("__text_score__".to_string(), Value::Float(f64::from(score)));
         rows.push(row);
@@ -5970,7 +5970,7 @@ fn build_target_rows(
         }
 
         // Inject COMPUTED property values from schema.
-        inject_computed_properties(&mut out_row, target_variable, &target_label, ctx);
+        inject_computed_properties(&mut out_row, target_variable, &target_label, ctx)?;
 
         materialised_rows.push(out_row);
     }
@@ -6127,6 +6127,11 @@ struct ParallelCtx<'a> {
     shard_id: u16,
     mvcc_snapshot: Option<StorageSnapshot>,
     chunk_size: usize,
+    /// Same bound evaluation instant as the sequential execution path.
+    evaluation_time: i64,
+    /// Unique schema dependencies discovered by chunk-local caches. Merged
+    /// into the owning transaction once, rather than locking for each row.
+    schema_reads: parking_lot::Mutex<HashMap<String, u64>>,
     /// OCC read-set keys collected during parallel processing. When `Some`,
     /// parallel workers push each read's raw key into the matching per-partition
     /// buffer; the caller merges them into `ExecutionContext::occ_scope` via the
@@ -6157,7 +6162,7 @@ fn process_targets_parallel(
     params: &TraverseParams<'_>,
     pctx: &ParallelCtx<'_>,
     unresolved: &Mutex<Vec<(u64, u64, usize)>>,
-) -> Result<Vec<Row>, EvalError> {
+) -> Result<Vec<Row>, ExecutionError> {
     let target_variable = params.target_variable;
     let target_labels = params.target_labels;
     let target_filters = params.target_filters;
@@ -6168,164 +6173,193 @@ fn process_targets_parallel(
     neighbors
         .par_chunks(pctx.chunk_size.max(1))
         .flat_map_iter(|chunk| {
-            chunk.iter().filter_map(|(src_uid, tgt_uid, et_idx)| {
-                let target_id = NodeId::from_raw(*tgt_uid);
+            let mut schemas = HashMap::<String, Option<LabelSchema>>::new();
+            let rows: Vec<_> = chunk
+                .iter()
+                .filter_map(|(src_uid, tgt_uid, et_idx)| {
+                    let target_id = NodeId::from_raw(*tgt_uid);
 
-                // Stateless snapshot read through the Layer-4 store: the
-                // snapshot seqno (a Copy value) is the shared unit across
-                // rayon workers, so no &mut Transaction crosses threads. The
-                // store owns key encoding and hands the key back for OCC.
-                use coordinode_modality::{LocalNodeStore, NodeStore as _};
-                let (target_key, bytes) = LocalNodeStore
-                    .read_at_snapshot(pctx.engine, pctx.mvcc_snapshot, pctx.shard_id, target_id)
-                    .ok()?;
-                let Some(bytes) = bytes else {
-                    if let Ok(mut guard) = unresolved.lock() {
-                        guard.push((*src_uid, *tgt_uid, *et_idx));
+                    // Stateless snapshot read through the Layer-4 store: the
+                    // snapshot seqno (a Copy value) is the shared unit across
+                    // rayon workers, so no &mut Transaction crosses threads. The
+                    // store owns key encoding and hands the key back for OCC.
+                    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+                    let (target_key, bytes) = LocalNodeStore
+                        .read_at_snapshot(pctx.engine, pctx.mvcc_snapshot, pctx.shard_id, target_id)
+                        .ok()?;
+                    let Some(bytes) = bytes else {
+                        if let Ok(mut guard) = unresolved.lock() {
+                            guard.push((*src_uid, *tgt_uid, *et_idx));
+                        }
+                        return None;
+                    };
+
+                    // Track the node key in the OCC read-set: each worker records
+                    // into the shared accumulator; merged into the statement's
+                    // read-set after the parallel section.
+                    if let Some(ref keys) = pctx.occ_read_keys {
+                        if let Ok(mut guard) = keys.node.lock() {
+                            guard.push(target_key);
+                        }
                     }
-                    return None;
-                };
 
-                // Track the node key in the OCC read-set: each worker records
-                // into the shared accumulator; merged into the statement's
-                // read-set after the parallel section.
-                if let Some(ref keys) = pctx.occ_read_keys {
-                    if let Ok(mut guard) = keys.node.lock() {
-                        guard.push(target_key);
+                    let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
+
+                    if !has_all_labels(&target_record, target_labels) {
+                        return None;
                     }
-                }
 
-                let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
+                    let mut out_row = input_row.clone();
+                    // Update source in row so a deeper hop looks its edge
+                    // properties up from the actual source, not the start node.
+                    out_row.insert(source.to_string(), Value::Int(*src_uid as i64));
+                    out_row.insert(target_variable.to_string(), Value::Int(*tgt_uid as i64));
 
-                if !has_all_labels(&target_record, target_labels) {
-                    return None;
-                }
-
-                let mut out_row = input_row.clone();
-                // Update source in row so a deeper hop looks its edge
-                // properties up from the actual source, not the start node.
-                out_row.insert(source.to_string(), Value::Int(*src_uid as i64));
-                out_row.insert(target_variable.to_string(), Value::Int(*tgt_uid as i64));
-
-                // Resolve property names from interner (read-only, thread-safe)
-                for (field_id, value) in &target_record.props {
-                    if let Some(field_name) = pctx.interner.resolve(*field_id) {
-                        let col_name = format!("{target_variable}.{field_name}");
-                        out_row.insert(col_name, value.clone());
+                    // Resolve property names from interner (read-only, thread-safe)
+                    for (field_id, value) in &target_record.props {
+                        if let Some(field_name) = pctx.interner.resolve(*field_id) {
+                            let col_name = format!("{target_variable}.{field_name}");
+                            out_row.insert(col_name, value.clone());
+                        }
                     }
-                }
-                if let Some(extra) = &target_record.extra {
-                    for (name, value) in extra {
-                        let col_name = format!("{target_variable}.{name}");
-                        out_row.insert(col_name, value.clone());
+                    if let Some(extra) = &target_record.extra {
+                        for (name, value) in extra {
+                            let col_name = format!("{target_variable}.{name}");
+                            out_row.insert(col_name, value.clone());
+                        }
                     }
-                }
 
-                let target_label =
-                    insert_label_columns(&mut out_row, target_variable, &target_record);
+                    let target_label =
+                        insert_label_columns(&mut out_row, target_variable, &target_record);
 
-                // Inject COMPUTED property values in parallel path
-                inject_computed_from_engine(
-                    &mut out_row,
-                    target_variable,
-                    &target_label,
-                    pctx.engine,
-                );
-
-                // Edge variable: type + edge properties
-                let edge_type = params.edge_types.get(*et_idx).map(|s| s.as_str());
-                if let Some(ev) = edge_variable {
-                    if let Some(et) = edge_type {
-                        out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
-                        // Store the relationship variable itself for count(r) support
-                        out_row.insert(ev.to_string(), Value::String(et.to_string()));
-
+                    if !schemas.contains_key(&target_label) {
+                        let Some(snapshot) = pctx.mvcc_snapshot else {
+                            return Some(Err(ExecutionError::Unsupported(
+                                "parallel schema evaluation requires a bound snapshot".into(),
+                            )));
+                        };
+                        let schema = match coordinode_modality::LocalSchemaStore::new(pctx.engine)
+                            .load_label_at(snapshot, &target_label)
                         {
-                            let (ep_src, ep_tgt) = match direction {
-                                Direction::Outgoing | Direction::Both => {
-                                    (NodeId::from_raw(*src_uid), target_id)
+                            Ok(schema) => schema,
+                            Err(error) => return Some(Err(error.into())),
+                        };
+                        schemas.insert(target_label.clone(), schema);
+                    }
+                    if let Some(Some(schema)) = schemas.get(&target_label) {
+                        inject_computed_from_schema(
+                            &mut out_row,
+                            target_variable,
+                            schema,
+                            pctx.evaluation_time,
+                        );
+                    }
+
+                    // Edge variable: type + edge properties
+                    let edge_type = params.edge_types.get(*et_idx).map(|s| s.as_str());
+                    if let Some(ev) = edge_variable {
+                        if let Some(et) = edge_type {
+                            out_row.insert(format!("{ev}.__type__"), Value::String(et.to_string()));
+                            // Store the relationship variable itself for count(r) support
+                            out_row.insert(ev.to_string(), Value::String(et.to_string()));
+
+                            {
+                                let (ep_src, ep_tgt) = match direction {
+                                    Direction::Outgoing | Direction::Both => {
+                                        (NodeId::from_raw(*src_uid), target_id)
+                                    }
+                                    Direction::Incoming => (target_id, NodeId::from_raw(*src_uid)),
+                                };
+                                // Hidden metadata for downstream SET / DELETE on r.
+                                out_row.insert(
+                                    format!("{ev}.__src__"),
+                                    Value::Int(ep_src.as_raw() as i64),
+                                );
+                                out_row.insert(
+                                    format!("{ev}.__tgt__"),
+                                    Value::Int(ep_tgt.as_raw() as i64),
+                                );
+                                // Stateless snapshot read via the Layer-4 store
+                                // (Variant A): shared snapshot seqno, no &mut txn
+                                // across rayon threads; the store returns the key
+                                // for the worker's OCC accumulator.
+                                use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
+                                let (ep_key, ep_bytes) = LocalEdgeStore
+                                    .edgeprop_at_snapshot(
+                                        pctx.engine,
+                                        pctx.mvcc_snapshot,
+                                        et,
+                                        ep_src,
+                                        ep_tgt,
+                                    )
+                                    .unwrap_or((Vec::new(), None));
+                                // Track the EdgeProp key in the OCC read-set.
+                                if let Some(ref keys) = pctx.occ_read_keys {
+                                    if let Ok(mut guard) = keys.edge_prop.lock() {
+                                        guard.push(ep_key);
+                                    }
                                 }
-                                Direction::Incoming => (target_id, NodeId::from_raw(*src_uid)),
-                            };
-                            // Hidden metadata for downstream SET / DELETE on r.
-                            out_row.insert(
-                                format!("{ev}.__src__"),
-                                Value::Int(ep_src.as_raw() as i64),
-                            );
-                            out_row.insert(
-                                format!("{ev}.__tgt__"),
-                                Value::Int(ep_tgt.as_raw() as i64),
-                            );
-                            // Stateless snapshot read via the Layer-4 store
-                            // (Variant A): shared snapshot seqno, no &mut txn
-                            // across rayon threads; the store returns the key
-                            // for the worker's OCC accumulator.
-                            use coordinode_modality::{EdgeStore as _, LocalEdgeStore};
-                            let (ep_key, ep_bytes) = LocalEdgeStore
-                                .edgeprop_at_snapshot(
-                                    pctx.engine,
-                                    pctx.mvcc_snapshot,
-                                    et,
-                                    ep_src,
-                                    ep_tgt,
-                                )
-                                .unwrap_or((Vec::new(), None));
-                            // Track the EdgeProp key in the OCC read-set.
-                            if let Some(ref keys) = pctx.occ_read_keys {
-                                if let Ok(mut guard) = keys.edge_prop.lock() {
-                                    guard.push(ep_key);
-                                }
-                            }
-                            if let Some(ep_bytes) = ep_bytes {
-                                if let Ok(prop_map) = decode_edge_props(&ep_bytes) {
-                                    for (field_id, value) in prop_map {
-                                        if let Some(field_name) = pctx.interner.resolve(field_id) {
-                                            out_row.insert(format!("{ev}.{field_name}"), value);
+                                if let Some(ep_bytes) = ep_bytes {
+                                    if let Ok(prop_map) = decode_edge_props(&ep_bytes) {
+                                        for (field_id, value) in prop_map {
+                                            if let Some(field_name) =
+                                                pctx.interner.resolve(field_id)
+                                            {
+                                                out_row.insert(format!("{ev}.{field_name}"), value);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // Apply target inline property filters. A failed evaluation is
-                // yielded as an item rather than swallowed, so the collect
-                // below turns it into the whole call's error; `None` keeps its
-                // one meaning, "this row does not match".
-                for (prop_name, filter_expr) in target_filters {
-                    let actual = out_row
-                        .get(&format!("{target_variable}.{prop_name}"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    let expected = match eval_neutral(filter_expr, &out_row) {
-                        Ok(v) => v,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    if actual != expected {
-                        return None;
-                    }
-                }
-
-                // Apply inline edge property filters
-                if let Some(ev) = edge_variable {
-                    for (prop_name, filter_expr) in params.edge_filters {
+                    // Apply target inline property filters. A failed evaluation is
+                    // yielded as an item rather than swallowed, so the collect
+                    // below turns it into the whole call's error; `None` keeps its
+                    // one meaning, "this row does not match".
+                    for (prop_name, filter_expr) in target_filters {
                         let actual = out_row
-                            .get(&format!("{ev}.{prop_name}"))
+                            .get(&format!("{target_variable}.{prop_name}"))
                             .cloned()
                             .unwrap_or(Value::Null);
                         let expected = match eval_neutral(filter_expr, &out_row) {
                             Ok(v) => v,
-                            Err(e) => return Some(Err(e)),
+                            Err(e) => return Some(Err(e.into())),
                         };
                         if actual != expected {
                             return None;
                         }
                     }
-                }
 
-                Some(Ok(out_row))
-            })
+                    // Apply inline edge property filters
+                    if let Some(ev) = edge_variable {
+                        for (prop_name, filter_expr) in params.edge_filters {
+                            let actual = out_row
+                                .get(&format!("{ev}.{prop_name}"))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            let expected = match eval_neutral(filter_expr, &out_row) {
+                                Ok(v) => v,
+                                Err(e) => return Some(Err(e.into())),
+                            };
+                            if actual != expected {
+                                return None;
+                            }
+                        }
+                    }
+
+                    Some(Ok(out_row))
+                })
+                .collect();
+            // One merge per chunk, including an absent schema's revision 0.
+            // A read-only attempt has no validation cost at commit; a writer
+            // must retain exactly the interpretation these rows used.
+            let mut reads = pctx.schema_reads.lock();
+            for (label, schema) in schemas {
+                reads.insert(label, schema.map_or(0, |schema| schema.schema_revision));
+            }
+            rows
         })
         .collect()
 }
@@ -6366,6 +6400,7 @@ fn execute_single_hop_traverse(
         // Switch to parallel when fan-out exceeds threshold. A requested path
         // projection forces the sequential path so the route is bound exactly.
         if use_parallel
+            && !ctx.txn.has_schema_changes()
             && !has_temporal
             && !target_has_temporal
             && params.path_variable.is_none()
@@ -6381,8 +6416,13 @@ fn execute_single_hop_traverse(
                 engine: ctx.engine,
                 interner: ctx.interner,
                 shard_id: ctx.shard_id,
-                mvcc_snapshot: ctx.mvcc_snapshot,
+                // The engine-only executor also binds a statement adjacency
+                // snapshot at entry. Use that same view for target records
+                // and schema; never choose a fresh view inside a worker.
+                mvcc_snapshot: ctx.mvcc_snapshot.or(ctx.txn.adj_snapshot()),
                 chunk_size: ctx.adaptive.parallel_chunk_size,
+                evaluation_time: ctx.valid_now,
+                schema_reads: parking_lot::Mutex::new(HashMap::new()),
                 // Read keys are not collected: the default conflict level
                 // validates writes only, so commit never consults a read set.
                 // FOR UPDATE / the serializable level re-enable collection
@@ -6398,6 +6438,9 @@ fn execute_single_hop_traverse(
             let unresolved = Mutex::new(Vec::new());
             let parallel_rows =
                 process_targets_parallel(&with_src, row, params, &pctx, &unresolved)?;
+            for (label, revision) in pctx.schema_reads.lock().iter() {
+                ctx.txn.note_label_schema_read(label, *revision);
+            }
             // Merge OCC read keys from parallel workers into the Layer-3 scope
             // via the typed per-partition extends.
             if let Some(ref keys) = pctx.occ_read_keys {
@@ -6695,6 +6738,7 @@ fn execute_varlen_traverse(
                     .is_some_and(|s| s.temporal)
             });
             let use_parallel = ctx.adaptive.enabled
+                && !ctx.txn.has_schema_changes()
                 && !has_temporal
                 && !target_has_temporal
                 && params.path_variable.is_none()
@@ -6717,8 +6761,12 @@ fn execute_varlen_traverse(
                     engine: ctx.engine,
                     interner: ctx.interner,
                     shard_id: ctx.shard_id,
-                    mvcc_snapshot: ctx.mvcc_snapshot,
+                    // Both executor modes have already bound the statement
+                    // adjacency view; reuse it for records and schema.
+                    mvcc_snapshot: ctx.mvcc_snapshot.or(ctx.txn.adj_snapshot()),
                     chunk_size: ctx.adaptive.parallel_chunk_size,
+                    evaluation_time: ctx.valid_now,
+                    schema_reads: parking_lot::Mutex::new(HashMap::new()),
                     // See the single-hop site: reads are not conflict-tracked
                     // at the default level, so nothing collects here either.
                     occ_read_keys: None,
@@ -6726,6 +6774,9 @@ fn execute_varlen_traverse(
                 let unresolved = Mutex::new(Vec::new());
                 let parallel_rows =
                     process_targets_parallel(&depth_neighbors, row, params, &pctx, &unresolved)?;
+                for (label, revision) in pctx.schema_reads.lock().iter() {
+                    ctx.txn.note_label_schema_read(label, *revision);
+                }
                 // Merge OCC read keys from parallel workers into the Layer-3
                 // scope via the typed per-partition extends.
                 if let Some(ref keys) = pctx.occ_read_keys {
@@ -15620,30 +15671,6 @@ fn cascade_delete_source_node(
     Ok(())
 }
 
-/// Load the current `LabelSchema` for `name` via the schema partition pointer
-/// (`schema:current_revision:label:<name>` → `schema:label:<name>:<revision>`),
-/// directly through a `StorageEngine` handle without MVCC visibility.
-///
-/// Used by code paths that only have engine access (parallel scans, background
-/// helpers) and don't need RYOW semantics. MVCC-aware callers should use
-/// [`ExecutionContext::load_current_label_schema`] instead.
-///
-/// Returns `None` for missing pointer, missing schema body, corrupt pointer,
-/// or msgpack decode error — never errors. This is a best-effort read used
-/// for non-blocking schema enrichment (computed properties, vector index
-/// dispatch). Hard failures show up at the next MVCC read.
-fn load_current_label_schema_from_engine(
-    engine: &StorageEngine,
-    name: &str,
-) -> Option<LabelSchema> {
-    use coordinode_modality::{LocalSchemaStore, SchemaStore as _};
-    // Best-effort engine-direct (untracked) read: any error → None.
-    LocalSchemaStore::new(engine)
-        .load_label(name)
-        .ok()
-        .flatten()
-}
-
 /// Build the Schema-partition key for a given edge type name (test fixtures
 /// that plant/inspect raw edge-type markers). Production code goes through
 /// [`coordinode_modality::SchemaStore`].
@@ -15932,34 +15959,28 @@ pub(crate) fn edgeprop_write_key(
 /// Extract node ID from a node key (after the "node:XXXX:" prefix).
 /// Inject COMPUTED property values into a row for a given node.
 ///
-/// Loads the label schema, finds COMPUTED properties, evaluates each using
-/// the node's anchor field value and current time. Injected values appear
-/// in the row as regular `{variable}.{property}` entries.
-///
-/// ~10ns per computed field (formula evaluation only; schema lookup amortized).
+/// Resolve each declaration (including absence) once in the statement's
+/// transactional view, then evaluate at its already bound instant. No fresh
+/// engine snapshot is acquired while materializing an individual row.
 fn inject_computed_properties(
     row: &mut Row,
     variable: &str,
     label: &str,
-    ctx: &ExecutionContext<'_>,
-) {
-    inject_computed_from_engine(row, variable, label, ctx.engine);
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<(), ExecutionError> {
+    if !ctx.label_schema_cache.contains_key(label) {
+        let schema = ctx.load_current_label_schema(label)?;
+        ctx.label_schema_cache.insert(label.to_string(), schema);
+    }
+    if let Some(Some(schema)) = ctx.label_schema_cache.get(label) {
+        inject_computed_from_schema(row, variable, schema, ctx.valid_now);
+    }
+    Ok(())
 }
 
-/// Inject COMPUTED properties using direct engine access (no ExecutionContext needed).
-/// Used by both the sequential path (via inject_computed_properties) and the
-/// parallel path (process_targets_parallel).
-fn inject_computed_from_engine(row: &mut Row, variable: &str, label: &str, engine: &StorageEngine) {
-    let schema = match load_current_label_schema_from_engine(engine, label) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-
+/// Pure enrichment shared by sequential and parallel readers. The caller
+/// supplies the same view-bound interpretation and evaluation instant.
+fn inject_computed_from_schema(row: &mut Row, variable: &str, schema: &LabelSchema, now_us: i64) {
     for (prop_name, prop_def) in &schema.properties {
         let spec = match &prop_def.property_type {
             coordinode_core::schema::definition::PropertyType::Computed(s) => s,

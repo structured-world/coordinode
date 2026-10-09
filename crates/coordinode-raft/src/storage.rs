@@ -1642,10 +1642,10 @@ impl CoordinodeStateMachine {
                 },
             )
             .map_err(|e| io::Error::other(format!("record the closed bound: {e}")))?;
-        self.engine.raise_closure_frontier(closed_below);
         if let Some(ref oracle) = self.oracle {
             oracle.advance_to(coordinode_core::txn::timestamp::Timestamp::from_raw(at));
         }
+        self.engine.raise_closure_frontier(closed_below, index);
         Ok(())
     }
 

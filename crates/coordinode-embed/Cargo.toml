@@ -61,5 +61,9 @@ harness = false
 name = "index_rewrites"
 harness = false
 
+[[bench]]
+name = "snapshot_scan"
+harness = false
+
 [lints]
 workspace = true

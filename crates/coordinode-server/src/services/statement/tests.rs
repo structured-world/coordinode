@@ -47,6 +47,98 @@ pub(crate) async fn raft() -> (StatementExecutor, Arc<RaftNode>, tempfile::TempD
     (executor, node, dir)
 }
 
+/// A committed entry held before apply must not turn LOCAL routing (or its
+/// response metadata) into a linearizable wait. Only LINEARIZABLE waits for
+/// that entry, and its own timeout must cover the entire authority check.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_admission_does_not_wait_for_linearizable_apply() {
+    let (executor, node, _dir) = raft().await;
+    let engine = executor.database().read().engine_shared();
+    let gate = engine.raft_fence().expect("Raft apply gate");
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        let mut held_tx = Some(held_tx);
+        gate.with_applies_paused(&mut |_, _| {
+            held_tx.take().expect("one callback").send(()).unwrap();
+            release_rx.recv().expect("release apply");
+            Ok(())
+        })
+        .expect("hold apply");
+    });
+    held_rx.await.expect("apply is held");
+    let before = node.applied_index();
+    let raft = Arc::clone(node.raft());
+    let proposal = tokio::spawn(async move {
+        raft.client_write(coordinode_raft::storage::Request::closing(0))
+            .await
+    });
+    let committed = node
+        .raft()
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |m| {
+                m.local_committed
+                    .as_ref()
+                    .is_some_and(|id| id.index > before)
+            },
+            "the held entry committed",
+        )
+        .await;
+    let mut fence = node.read_fence();
+    let local = tokio::time::timeout(
+        Duration::from_secs(1),
+        fence.apply(
+            ReadPreference::Nearest,
+            ReadConcern::Local,
+            Duration::from_millis(100),
+        ),
+    )
+    .await;
+    let mut fence = node.read_fence();
+    let linearizable = tokio::time::timeout(
+        Duration::from_secs(1),
+        fence.apply(
+            ReadPreference::Nearest,
+            ReadConcern::Linearizable,
+            Duration::from_millis(100),
+        ),
+    )
+    .await;
+    let admitted = tokio::time::timeout(
+        Duration::from_secs(1),
+        executor.admit(
+            "RETURN 1",
+            &Requested {
+                read_preference: Some(ReadPreference::Nearest),
+                read_concern: Some(ExecutorReadConcernLevel::Local),
+                ..Default::default()
+            },
+            false,
+        ),
+    )
+    .await;
+    // Release before asserting: even a red test leaves no blocked worker.
+    release_tx.send(()).expect("release");
+    holder.await.expect("holder");
+    proposal
+        .await
+        .expect("proposal task")
+        .expect("apply proposal");
+    assert!(committed.is_ok(), "entry never committed: {committed:?}");
+    assert!(matches!(local, Ok(Ok(()))), "LOCAL waited: {local:?}");
+    assert!(
+        matches!(linearizable, Ok(Err(ReadFenceError::LeaseTimeout { .. }))),
+        "LINEARIZABLE did not honor its timeout: {linearizable:?}"
+    );
+    let Ok(Ok(Admission::Run(admitted))) = admitted else {
+        panic!("response metadata waited: {admitted:?}");
+    };
+    assert!(admitted.served_by_leader);
+    assert_eq!(admitted.applied_index, before);
+    node.shutdown().await.expect("shutdown");
+}
+
 /// Every executed statement is counted under what it did: a write that
 /// committed, a read, or a failure, which also counts as an error.
 #[test]

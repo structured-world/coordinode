@@ -17,6 +17,53 @@ fn open_db() -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
+/// An unrelated pending commit must not cause a fresh schema-snapshot wait
+/// per row, including when the bound label has no schema declaration. Keep
+/// the commit held until the deadline, then release it before joining so a
+/// regression reports a failure rather than leaving a blocked test thread.
+#[test]
+fn a_scan_reuses_bound_schema_while_an_unrelated_commit_is_pending() {
+    use coordinode_storage::engine::partition::Partition;
+    use std::time::Duration;
+
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("UNWIND range(0, 63) AS i CREATE (:Probe {i: i})")
+        .expect("seed");
+    let query = "MATCH (n:Probe) RETURN n.i AS i ORDER BY i";
+    db.execute_cypher(query).expect("warm plan");
+    let engine = db.engine_shared();
+    engine.set_snapshot_wait_ms(100);
+    let oracle = engine.oracle().expect("oracle");
+    let (_, held) = engine
+        .pending_commits()
+        .admit_allocated(
+            || oracle.next().as_raw(),
+            vec![(Partition::Node, b"unrelated-held-commit".to_vec())],
+            Vec::new(),
+        )
+        .expect("hold");
+    std::thread::scope(|scope| {
+        let (finished, received) = std::sync::mpsc::channel();
+        let db = &db;
+        let reader = scope.spawn(move || {
+            let result = db.execute_cypher_shared(query, None, None, None, None);
+            let _ = finished.send(());
+            result
+        });
+        let completed_while_held = received.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(held);
+        let result = reader.join().expect("reader").expect("read");
+        assert_eq!(result.rows.len(), 64);
+        for (i, row) in result.rows.iter().enumerate() {
+            assert_eq!(row.get("i"), Some(&Value::Int(i as i64)));
+        }
+        assert!(
+            completed_while_held,
+            "scan repeated freshness waits per row"
+        );
+    });
+}
+
 /// Persist a `LabelSchema` directly through the shared engine, writing both
 /// the versioned key and the current_revision pointer. Required for any test
 /// that bypasses `Database::create_label_schema` — pointer-based readers

@@ -3259,10 +3259,16 @@ impl StorageEngine {
     }
 
     /// Raise the closed bound to `below` once the entry carrying it has
-    /// applied, its [`CLOSURE_KEY`] record included.
-    pub fn raise_closure_frontier(&self, below: u64) {
-        self.closure_frontier
+    /// applied, its [`CLOSURE_KEY`] record included. Notify every partition's
+    /// applied consumers afterwards, even if the entry changed no keys there.
+    pub fn raise_closure_frontier(&self, below: u64, index: u64) {
+        debug_assert!(below > 0);
+        let previous = self
+            .closure_frontier
             .fetch_max(below, std::sync::atomic::Ordering::AcqRel);
+        if below > previous {
+            self.applied_feed.closed(index, below - 1);
+        }
     }
 
     /// Read the closed bound from its stored record: when the store opens

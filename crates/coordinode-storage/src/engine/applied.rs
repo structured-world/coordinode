@@ -49,7 +49,8 @@ pub enum AppliedEvent {
         /// The commit timestamp the entry applied at.
         commit_ts: u64,
         /// The keys the entry wrote in the subscribed partition, shared with
-        /// the copy a retained subscription keeps.
+        /// the copy a retained subscription keeps. Empty when an applied
+        /// closure control entry advanced history without changing its keys.
         keys: Arc<[Vec<u8>]>,
     },
     /// The partition was replaced wholesale, or events were dropped: the
@@ -307,6 +308,24 @@ impl AppliedFeed {
             return;
         }
         self.deliver(index, commit_ts, mutations);
+    }
+
+    /// A persisted control entry closed history without changing this
+    /// partition's keys. Queue it after publishing the bound, so an idle
+    /// derived-index consumer can certify the entries it already folded.
+    pub(crate) fn closed(&self, index: u64, at: u64) {
+        if self.open.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let keys: Arc<[Vec<u8>]> = Arc::from([]);
+        for subscriber in self.subscribers.read().iter() {
+            send(subscriber, |seq| AppliedEvent::Keys {
+                seq,
+                index,
+                commit_ts: at,
+                keys: Arc::clone(&keys),
+            });
+        }
     }
 
     /// Report that `partition` was replaced wholesale, or every partition

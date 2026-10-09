@@ -254,6 +254,23 @@ impl ReadFence {
         self.read_only().map(|m| m.as_of)
     }
 
+    /// This member's locally observed role, for routing and response metadata.
+    ///
+    /// This is not proof of authority or freshness. Those checks belong to
+    /// the requested read concern; asking them here would make even LOCAL
+    /// reads wait for a committed entry that has not applied yet. A frozen
+    /// member cannot serve as its group's leader.
+    pub fn locally_leads(&self) -> bool {
+        use openraft::async_runtime::watch::WatchReceiver as _;
+
+        if self.read_only().is_some() {
+            return false;
+        }
+        let receiver = self.raft.metrics();
+        let metrics = receiver.borrow_watched();
+        metrics.state.is_leader() && metrics.current_leader == Some(metrics.id)
+    }
+
     /// Inject a specific lag value for `staleness_entries()`.
     ///
     /// Used by integration tests to trigger `StaleReplica` without needing
@@ -302,7 +319,7 @@ impl ReadFence {
             }
             return Ok(());
         }
-        let is_leader = self.check_is_leader().await;
+        let is_leader = self.locally_leads();
 
         // --- Step 1: read preference role check ---
         match preference {
@@ -458,13 +475,6 @@ impl ReadFence {
     }
 
     // --- Internal helpers ---
-
-    async fn check_is_leader(&self) -> bool {
-        self.raft
-            .ensure_linearizable(openraft::raft::ReadPolicy::LeaseRead)
-            .await
-            .is_ok()
-    }
 
     fn check_staleness(&self) -> Result<(), ReadFenceError> {
         let threshold = self

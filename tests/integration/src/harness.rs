@@ -867,7 +867,6 @@ fn spawn_cluster_binary(
 ) -> Child {
     let bin = binary_path();
     let mut cmd = Command::new(&bin);
-    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     cmd.arg("serve")
         .arg("--node-id")
         .arg(node_id.to_string())
@@ -887,6 +886,7 @@ fn spawn_cluster_binary(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "error".into()),
         );
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     own_process_group(&mut cmd);
 
     cmd.spawn()

@@ -93,9 +93,11 @@ async fn write_seq(port: u16, seq: i64) -> bool {
 }
 
 /// The `:Move` sequence numbers the member at `port` holds, read locally
-/// from itself; `None` when it does not answer.
-async fn local_seqs(port: u16) -> Option<BTreeSet<i64>> {
-    let mut client = cypher_client(port).await?;
+/// from itself; why not when it does not answer.
+async fn local_seqs(port: u16) -> Result<BTreeSet<i64>, String> {
+    let mut client = cypher_client(port)
+        .await
+        .ok_or_else(|| "no connection".to_string())?;
     let rows = client
         .execute_cypher(ExecuteCypherRequest {
             query: "MATCH (n:Move) RETURN n.seq AS seq".to_string(),
@@ -111,17 +113,16 @@ async fn local_seqs(port: u16) -> Option<BTreeSet<i64>> {
             ..Default::default()
         })
         .await
-        .ok()?
+        .map_err(|status| format!("{:?}: {}", status.code(), status.message()))?
         .into_inner()
         .rows;
-    Some(
-        rows.iter()
-            .map(|row| match row.values[0].value {
-                Some(Pv::IntValue(seq)) => seq,
-                ref other => panic!("unexpected seq {other:?}"),
-            })
-            .collect(),
-    )
+    Ok(rows
+        .iter()
+        .map(|row| match row.values[0].value {
+            Some(Pv::IntValue(seq)) => seq,
+            ref other => panic!("unexpected seq {other:?}"),
+        })
+        .collect())
 }
 
 async fn wait_for_voters(client: &mut ClusterServiceClient<tonic::transport::Channel>, n: usize) {
@@ -179,7 +180,7 @@ fn peers_of(ports: [u16; 3], i: usize) -> Vec<u16> {
 #[derive(Default)]
 struct Observed {
     acked: Vec<(i64, Instant)>,
-    refused_reads: Vec<(u16, Instant)>,
+    refused_reads: Vec<(u16, Instant, Instant, String)>,
     /// Write attempts that took long: the member, when, how long, and
     /// whether it was acknowledged. They tell a member that answered slowly
     /// from a group that did not write.
@@ -254,12 +255,14 @@ async fn move_under_workload(kill_completing: bool) {
         tokio::spawn(async move {
             while !stop.load(Ordering::Acquire) {
                 for port in ports {
-                    if local_seqs(port).await.is_none() {
-                        observed
-                            .lock()
-                            .unwrap()
-                            .refused_reads
-                            .push((port, Instant::now()));
+                    let began = Instant::now();
+                    if let Err(why) = local_seqs(port).await {
+                        observed.lock().unwrap().refused_reads.push((
+                            port,
+                            began,
+                            Instant::now(),
+                            why,
+                        ));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -336,11 +339,16 @@ async fn move_under_workload(kill_completing: bool) {
 
     // Reads are served throughout: a member refuses one only while down.
     let slack = Duration::from_secs(3);
-    for (port, when) in &observed.refused_reads {
+    for (port, began, when, why) in &observed.refused_reads {
         assert!(
             down.iter()
                 .any(|(p, from, to)| p == port && *when >= *from && *when <= *to + slack),
-            "member on {port} refused a local read while it was up"
+            "member on {port} refused a local read while it was up: {why}; request {:?}..{:?}, downtime {:?}",
+            began.duration_since(started),
+            when.duration_since(started),
+            down.iter()
+                .map(|(p, from, to)| (*p, from.duration_since(started), to.duration_since(started)))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -468,7 +476,7 @@ async fn wait_holds(port: u16, seqs: &BTreeSet<i64>) {
     loop {
         if local_seqs(port)
             .await
-            .is_some_and(|held| seqs.is_subset(&held))
+            .is_ok_and(|held| seqs.is_subset(&held))
         {
             return;
         }

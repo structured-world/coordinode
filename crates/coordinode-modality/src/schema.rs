@@ -278,6 +278,38 @@ impl<'a> LocalSchemaStore<'a> {
         Self { engine }
     }
 
+    /// Resolve a declaration in an already pinned read view. Does not choose
+    /// a fresh snapshot or wait for unrelated commits. The caller retains
+    /// the view and records schema dependencies if it later writes.
+    pub fn load_label_at(
+        &self,
+        snapshot: coordinode_storage::engine::StorageSnapshot,
+        name: &str,
+    ) -> StoreResult<Option<LabelSchema>> {
+        let pointer_key = encode_label_current_revision_key(name);
+        let Some(revision) =
+            self.load_revision_pointer(&snapshot, &pointer_key, "label revision pointer")?
+        else {
+            return Ok(None);
+        };
+        let schema_key = encode_label_schema_key(name, revision);
+        let Some(schema_bytes) =
+            self.engine
+                .snapshot_get(&snapshot, Partition::Schema, &schema_key)?
+        else {
+            return Err(StoreError::Decode {
+                kind: "label schema",
+                message: format!("pointer for '{name}' references missing revision {revision}"),
+            });
+        };
+        LabelSchema::from_msgpack(&schema_bytes)
+            .map(Some)
+            .map_err(|e| StoreError::Decode {
+                kind: "label schema",
+                message: format!("decode failed for '{name}' rev {revision}: {e}"),
+            })
+    }
+
     /// The revision the pointer at `key` names, as of `snapshot`.
     fn load_revision_pointer(
         &self,
@@ -405,29 +437,7 @@ impl SchemaStore for LocalSchemaStore<'_> {
         // The pointer and the body it names are read from one complete
         // snapshot: a revision committing between two latest-state reads
         // could show its pointer and not yet its body.
-        let snapshot = self.engine.snapshot();
-        let pointer_key = encode_label_current_revision_key(name);
-        let Some(revision) =
-            self.load_revision_pointer(&snapshot, &pointer_key, "label revision pointer")?
-        else {
-            return Ok(None);
-        };
-        let schema_key = encode_label_schema_key(name, revision);
-        let Some(schema_bytes) =
-            self.engine
-                .snapshot_get(&snapshot, Partition::Schema, &schema_key)?
-        else {
-            return Err(StoreError::Decode {
-                kind: "label schema",
-                message: format!("pointer for '{name}' references missing revision {revision}"),
-            });
-        };
-        LabelSchema::from_msgpack(&schema_bytes)
-            .map(Some)
-            .map_err(|e| StoreError::Decode {
-                kind: "label schema",
-                message: format!("decode failed for '{name}' rev {revision}: {e}"),
-            })
+        self.load_label_at(self.engine.snapshot(), name)
     }
 
     fn save_label(&self, schema: &LabelSchema) -> StoreResult<()> {

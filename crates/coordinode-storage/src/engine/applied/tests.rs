@@ -29,6 +29,58 @@ fn put(partition: PartitionId, key: &[u8]) -> Mutation {
 
 const NO_WAIT: Option<Duration> = Some(Duration::from_millis(0));
 
+/// Closing history wakes idle consumers of every partition after the bound
+/// is visible, without inventing changed keys or repeatedly queueing the
+/// same bound. Otherwise a folded index stays stale until another data write.
+#[test]
+fn a_closed_bound_notifies_partitions_without_changed_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let engine = engine(&dir);
+    let node = engine.subscribe_applied_retained(Partition::Node, 4);
+    let edge = engine.subscribe_applied_retained(Partition::EdgeProp, 4);
+    engine
+        .apply_raft_proposal(
+            &[Mutation::Put {
+                partition: PartitionId::Schema,
+                key: crate::engine::core::CLOSURE_KEY.to_vec(),
+                value: crate::engine::core::encode_closure(200),
+            }],
+            199,
+            2,
+            0,
+            |_| false,
+        )
+        .expect("persist the bound");
+    assert!(node.try_next().is_none());
+    assert!(edge.try_next().is_none());
+    engine.raise_closure_frontier(200, 2);
+    for sub in [&node, &edge] {
+        let Some(AppliedEvent::Keys {
+            seq,
+            index,
+            commit_ts,
+            keys,
+        }) = sub.try_next()
+        else {
+            panic!("the closure did not wake a partition's consumer");
+        };
+        assert_eq!(
+            engine.closure_frontier(),
+            200,
+            "notification preceded publication"
+        );
+        assert_eq!((seq, index, commit_ts), (1, 2, 199));
+        assert!(keys.is_empty(), "a closure is not a data mutation");
+        assert_eq!(sub.position().delivered(), seq);
+        sub.position().release(seq);
+    }
+    engine.raise_closure_frontier(200, 2);
+    engine.raise_closure_frontier(150, 1);
+    assert_eq!(engine.closure_frontier(), 200);
+    assert!(node.try_next().is_none());
+    assert!(edge.try_next().is_none());
+}
+
 /// A subscriber waiting with no deadline sleeps until an entry applies, and
 /// takes that entry.
 #[test]

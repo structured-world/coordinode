@@ -318,7 +318,7 @@ impl StatementExecutor {
                 .map_err(fence_error_to_status)?;
         }
         let applied_index = fence.applied_index();
-        let served_by_leader = raft.is_leader().await;
+        let served_by_leader = fence.locally_leads();
         Ok(Admission::Run(Admitted {
             read_concern: checked.read_concern,
             write_concern: checked.write_concern,

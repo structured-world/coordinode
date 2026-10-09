@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use coordinode_core::graph::types::Value;
 use coordinode_core::txn::timestamp::TimestampOracle;
 use coordinode_embed::Database;
 use coordinode_raft::cluster::RaftNode;
@@ -108,6 +109,42 @@ fn uniform_vec(i: usize, dim: usize) -> Vec<f64> {
             // and its query are the same point.
             ((z >> 11) as f64 / (1u64 << 53) as f64 * 1e6).round() / 1e6
         })
+        .collect()
+}
+
+/// `v` as a query value, the list a literal of its numbers would be.
+fn vector_value(v: &[f64]) -> Value {
+    Value::Array(v.iter().map(|x| Value::Float(*x)).collect())
+}
+
+/// Items whose source row or actual index membership has not arrived yet.
+/// ANN recall is independent of this complete-delivery invariant.
+fn unindexed_items(db: &Database, end: usize) -> Vec<usize> {
+    let rows = db
+        .execute_cypher_shared(
+            "MATCH (n:Item) RETURN id(n) AS node_id, n.ext_id AS ext_id",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .rows;
+    let handle = db.vector_index_registry().get("Item", "embedding").unwrap();
+    let graph = handle.read().unwrap();
+    let mut indexed = vec![false; end];
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let id = row.get("node_id").and_then(Value::as_int).unwrap() as u64;
+        let ext = row.get("ext_id").and_then(Value::as_int).unwrap() as usize;
+        assert!(ext < end, "unexpected source item {ext}");
+        assert!(seen.insert(ext), "duplicate source item {ext}");
+        indexed[ext] = graph.contains(id);
+    }
+    indexed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ext, present)| if present { None } else { Some(ext) })
         .collect()
 }
 
@@ -323,43 +360,55 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
     let p1 = alloc_port();
     let p2 = alloc_port();
     let mut n1 = open_node(1, p1, true).await;
-    let mut n2 = open_node(2, p2, false).await;
+    let n2 = open_node(2, p2, false).await;
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // A membership change needs a leader; it returns once committed.
+    for _ in 0..150 {
+        if n1._node.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     n1._node
         .add_node(2, format!("http://127.0.0.1:{p2}"))
         .await
         .unwrap();
     n1._node.change_membership(vec![1, 2]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
 
+    // Rows go in as one parameter: the statement text stays the same, so it
+    // is parsed once and planned from the cache after.
     let create_rows = |db: &mut Database, range: std::ops::Range<usize>| {
-        let rows = range
-            .map(|i| {
-                let emb = uniform_vec(i, DIM)
-                    .iter()
-                    .map(|x| format!("{x:.6}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ext_id: {i}, embedding: [{emb}]}}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        db.execute_cypher(&format!(
-            "UNWIND [{rows}] AS row \
-             CREATE (n:Item {{ext_id: row.ext_id, embedding: row.embedding}})"
-        ))
+        let rows = Value::Array(
+            range
+                .map(|i| {
+                    Value::Map(std::collections::BTreeMap::from([
+                        ("ext_id".to_string(), Value::Int(i as i64)),
+                        ("embedding".to_string(), vector_value(&uniform_vec(i, DIM))),
+                    ]))
+                })
+                .collect(),
+        );
+        db.execute_cypher_with_params(
+            "UNWIND $rows AS row \
+             CREATE (n:Item {ext_id: row.ext_id, embedding: row.embedding})",
+            std::collections::HashMap::from([("rows".to_string(), rows)]),
+        )
         .unwrap();
     };
+    let t = std::time::Instant::now();
     for start in (0..N).step_by(500) {
         create_rows(&mut n1.db, start..start + 500);
     }
+    eprintln!("PHASE load {:?}", t.elapsed());
+    let t = std::time::Instant::now();
     n1.db
         .execute_cypher(
             "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
              OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 8}",
         )
         .unwrap();
+    eprintln!("PHASE leader index {:?}", t.elapsed());
+    let t = std::time::Instant::now();
 
     // Bring the index up on the follower once the definition has reached it,
     // as the server does on every applied entry.
@@ -372,6 +421,8 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(started, "the index definition never reached the follower");
+    eprintln!("PHASE follower start {:?}", t.elapsed());
+    let t = std::time::Instant::now();
 
     // Keep writing through the leader for as long as the follower builds.
     let mut late = N;
@@ -386,40 +437,97 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         "the follower's build finished before any write landed beside it"
     );
 
+    eprintln!("PHASE follower build {:?} ({during} writes)", t.elapsed());
+    let t = std::time::Instant::now();
     // Then keep writing with no build running, which the follower's index
     // takes from its maintenance of applied entries.
     let steady = late..late + 1000;
     for start in steady.clone().step_by(20) {
         create_rows(&mut n1.db, start..start + 20);
     }
+    eprintln!("PHASE steady {:?}", t.elapsed());
+    let t = std::time::Instant::now();
 
-    // Every vector is its own nearest neighbour on both members, found by
-    // the index. The follower applies behind the leader, so it gets a while.
+    // Every committed item must be physically indexed on both members.
+    // ANN candidates do not prove complete membership (or lost writes): a
+    // bounded HNSW beam may miss even its query's own point. Poll membership,
+    // then inspect every live result and payload through the exact index path.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut missing_follower: Vec<usize> = (N..steady.end).collect();
-    while !missing_follower.is_empty() && std::time::Instant::now() < deadline {
-        missing_follower
-            .retain(|&i| top_ids(&mut n2.db, &uniform_vec(i, DIM)).first() != Some(&(i as i64)));
-        if !missing_follower.is_empty() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+    let mut missing_follower = unindexed_items(&n2.db, steady.end);
+    let mut missing_leader = unindexed_items(&n1.db, steady.end);
+    while (!missing_follower.is_empty() || !missing_leader.is_empty())
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        missing_follower = unindexed_items(&n2.db, steady.end);
+        missing_leader = unindexed_items(&n1.db, steady.end);
     }
-    let missing_leader: Vec<(usize, Option<usize>)> = (N..steady.end)
-        .filter_map(|i| {
-            let ids = top_ids(&mut n1.db, &uniform_vec(i, DIM));
-            (ids.first() != Some(&(i as i64)))
-                .then(|| (i, ids.iter().position(|&id| id == i as i64)))
-        })
-        .collect();
     assert!(
         missing_leader.is_empty() && missing_follower.is_empty(),
-        "of {} vectors ({} written during the follower's build) the index misses \
-         {} on the leader {missing_leader:?} and {} on the follower {missing_follower:?}",
-        steady.end - N,
+        "of {} vectors ({} written during the build), missing from leader {missing_leader:?}, follower {missing_follower:?}",
+        steady.end,
         late - N,
-        missing_leader.len(),
-        missing_follower.len(),
     );
+    eprintln!("PHASE complete membership {:?}", t.elapsed());
+
+    for (member, db) in [("leader", &n1.db), ("follower", &n2.db)] {
+        let rows = db
+            .execute_cypher_shared(
+                "MATCH (n:Item) RETURN id(n) AS node_id, n.ext_id AS ext_id",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), steady.end, "{member} source membership");
+        let expected: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|row| {
+                let id = row.get("node_id").and_then(Value::as_int).unwrap() as u64;
+                let ext = row.get("ext_id").and_then(Value::as_int).unwrap() as usize;
+                let vector: Vec<f32> = uniform_vec(ext, DIM)
+                    .into_iter()
+                    .map(|value| value as f32)
+                    .collect();
+                (id, vector)
+            })
+            .collect();
+        assert_eq!(expected.len(), steady.end, "{member} unique source IDs");
+        let handle = db.vector_index_registry().get("Item", "embedding").unwrap();
+        let graph = handle.read().unwrap();
+        assert_eq!(graph.len(), steady.end, "{member} live index count");
+        // Zero and every coordinate basis query check every stored vector's
+        // exact scores and complete live ID set. This detects wrong payloads
+        // and non-live entries as well as a missing mapping, without assuming
+        // perfect ANN recall or weakening the all-writes requirement.
+        for axis in 0..=DIM {
+            let mut query = vec![0.0; DIM];
+            if axis < DIM {
+                query[axis] = 1.0;
+            }
+            let hits =
+                graph.search_with_mode(&query, steady.end, coordinode_vector::SearchMode::Exact);
+            assert_eq!(hits.len(), expected.len(), "{member} exact live ID count");
+            let mut seen = std::collections::HashSet::new();
+            for hit in hits {
+                assert!(
+                    seen.insert(hit.id),
+                    "{member} duplicate indexed ID {}",
+                    hit.id
+                );
+                let vector = expected.get(&hit.id).expect("unexpected indexed ID");
+                assert_eq!(
+                    hit.score,
+                    coordinode_vector::metrics::euclidean_distance_squared(&query, vector),
+                    "{member} wrong indexed payload for {}, axis {axis}",
+                    hit.id,
+                );
+            }
+        }
+    }
+    eprintln!("PHASE exact payload qualification {:?}", t.elapsed());
     let plan = n2
         .db
         .explain_cypher(
@@ -440,8 +548,6 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
 /// only the leader runs the body and every node sees its effect.
 #[tokio::test(flavor = "multi_thread")]
 async fn after_commit_trigger_fires_on_leader_and_replicates_to_follower() {
-    use coordinode_core::graph::types::Value;
-
     let p1 = alloc_port();
     let p2 = alloc_port();
 
@@ -598,7 +704,14 @@ async fn follower_text_search_follows_leader_commits() {
 /// RPC reports to a client (body and `coordinode-indexed-hlc` header).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
-    use coordinode_server::proto::query::vector_service_server::VectorService as _;
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::txn::proposal::{
+        Mutation, PartitionId, ProposalIdGenerator, ProposalPipeline, RaftProposal,
+        fresh_proposal_id_base,
+    };
+    use coordinode_core::txn::timestamp::Timestamp;
+    use coordinode_server::proto::query::vector_service_client::VectorServiceClient;
+    use coordinode_server::proto::query::vector_service_server::VectorServiceServer;
     use coordinode_server::proto::query::{VectorSearchRequest, VectorSearchResponse};
     use coordinode_server::services::vector::VectorServiceImpl;
     use coordinode_storage::engine::partition::Partition;
@@ -614,7 +727,32 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         ..
     } = open_node(2, p2, false).await;
     let n2_db = Arc::new(parking_lot::RwLock::new(n2_db));
-    let n2_rpc = VectorServiceImpl::new(Arc::clone(&n2_db));
+    // Exercise the follower's real gRPC response, including wire metadata,
+    // rather than invoking the service implementation directly.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop_rpc, stopped_rpc) = tokio::sync::oneshot::channel();
+    let service = VectorServiceImpl::new(Arc::clone(&n2_db));
+    let rpc = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(VectorServiceServer::new(service))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped_rpc.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    let mut n2_rpc = VectorServiceClient::new(channel);
     // The watermark a client is served: the response body and its header
     // must agree.
     let served = |resp: tonic::Response<VectorSearchResponse>| {
@@ -691,7 +829,7 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         .pending_commits()
         .admit_allocated(
             || n1.oracle.next().as_raw(),
-            vec![(Partition::Node, held_key)],
+            vec![(Partition::Node, held_key.clone())],
             vec![],
         )
         .expect("admit the held commit");
@@ -723,11 +861,30 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         "the follower's RPC reports {reported}, at or past the held commit {held_ts}"
     );
 
-    // Once the held commit is gone the follower's watermark moves past it.
-    drop(held);
-    n1.db
-        .execute_cypher("CREATE (:Item {ext_id: 2, embedding: [2.0, 2.0]})")
+    // The earlier commit lands after the later one. No subsequent user write
+    // may be needed to close its timestamp and publish index coverage.
+    let fields = n1.db.interner().unwrap();
+    let mut record = NodeRecord::new("Item");
+    record.set(fields.lookup("ext_id").unwrap(), Value::Int(2));
+    record.set(
+        fields.lookup("embedding").unwrap(),
+        vector_value(&[2.0, 2.0]),
+    );
+    n1._node
+        .pipeline()
+        .propose_and_wait(&RaftProposal {
+            id: ProposalIdGenerator::with_base(fresh_proposal_id_base()).next(),
+            mutations: vec![Mutation::Put {
+                partition: PartitionId::Node,
+                key: held_key.clone(),
+                value: record.to_msgpack().unwrap(),
+            }],
+            commit_ts: Timestamp::from_raw(held_ts),
+            start_ts: Timestamp::from_raw(held_ts),
+            bypass_rate_limiter: false,
+        })
         .unwrap();
+    drop(held);
     let mut passed = false;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -745,4 +902,27 @@ async fn a_follower_watermark_stays_below_a_commit_the_leader_still_holds() {
         reported >= held_ts,
         "the follower's RPC still reports {reported}, below the released commit {held_ts}"
     );
+    assert!(
+        n2_engine.get(Partition::Node, &held_key).unwrap().is_some(),
+        "coverage passed a commit absent from the follower"
+    );
+    let mut request = search().into_inner();
+    request.query_vector.as_mut().unwrap().values = vec![2.0, 2.0];
+    let response = n2_rpc
+        .vector_search(tonic::Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response
+            .results
+            .first()
+            .and_then(|r| r.node.as_ref())
+            .map(|n| n.node_id),
+        Some(u64::MAX - 1),
+        "the late commit is missing from the served index"
+    );
+    drop(n2_rpc);
+    stop_rpc.send(()).unwrap();
+    rpc.await.unwrap();
 }
