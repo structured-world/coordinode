@@ -688,6 +688,33 @@ impl NodeRecord {
             rmp_serde::from_slice(data)
         }
     }
+
+    /// The labels of a stored record, read without decoding its properties:
+    /// the record is encoded as the array `[labels, props, extra?]`, so the
+    /// labels are its first element and nothing after them is touched. What a
+    /// scan filtering by label reads before deciding to decode a record whose
+    /// properties may be large.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are a document delta, or not a record.
+    pub fn labels_from_msgpack(data: &[u8]) -> Result<Vec<String>, rmp_serde::decode::Error> {
+        use serde::Deserialize as _;
+        let body = match data.first() {
+            Some(&crate::graph::doc_delta::PREFIX_NODE_RECORD) => &data[1..],
+            Some(&crate::graph::doc_delta::PREFIX_DOC_DELTA) => {
+                return Err(rmp_serde::decode::Error::Syntax(
+                    "cannot read labels from a DocDelta merge operand".to_string(),
+                ));
+            }
+            _ => data,
+        };
+        let mut rest = body;
+        rmp::decode::read_array_len(&mut rest)
+            .map_err(|e| rmp_serde::decode::Error::Syntax(format!("record header: {e}")))?;
+        let mut labels = rmp_serde::Deserializer::from_read_ref(rest);
+        Vec::<String>::deserialize(&mut labels)
+    }
 }
 
 #[cfg(test)]

@@ -764,3 +764,33 @@ fn record_properties_encode_in_ascending_key_order() {
         ["alpha", "mid", "zeta"].map(rmpv::Value::from).to_vec()
     );
 }
+
+/// The labels of a stored record read without its properties, in every
+/// stored form: bare, behind the full-record prefix, with or without the
+/// overflow map. A document delta is no record and is refused.
+#[test]
+fn labels_read_without_the_properties() {
+    let mut record = NodeRecord::with_labels(vec!["State".into(), "Cached".into()]);
+    record.set(1, crate::graph::types::Value::Blob(vec![7; 100_000]));
+    let bare = record.to_msgpack().expect("encode");
+    assert_eq!(
+        NodeRecord::labels_from_msgpack(&bare).expect("labels"),
+        ["State", "Cached"]
+    );
+    let mut prefixed = vec![crate::graph::doc_delta::PREFIX_NODE_RECORD];
+    prefixed.extend_from_slice(&bare);
+    assert_eq!(
+        NodeRecord::labels_from_msgpack(&prefixed).expect("labels"),
+        ["State", "Cached"]
+    );
+    record.set_extra("note", crate::graph::types::Value::Int(1));
+    let with_extra = record.to_msgpack().expect("encode");
+    assert_eq!(
+        NodeRecord::labels_from_msgpack(&with_extra).expect("labels"),
+        ["State", "Cached"]
+    );
+    assert!(
+        NodeRecord::labels_from_msgpack(&[crate::graph::doc_delta::PREFIX_DOC_DELTA, 0x90])
+            .is_err()
+    );
+}

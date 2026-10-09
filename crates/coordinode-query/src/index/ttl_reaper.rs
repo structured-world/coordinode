@@ -30,6 +30,7 @@ use coordinode_modality::{
 };
 use coordinode_storage::engine::core::StorageEngine;
 use coordinode_storage::engine::transaction::{CommitContext, CommitError, Transaction};
+use rustc_hash::FxHashMap;
 
 /// Configuration for the COMPUTED TTL background reaper.
 #[derive(Debug, Clone)]
@@ -59,6 +60,10 @@ pub struct ComputedTtlReapResult {
     pub labels_scanned: usize,
     /// Total nodes checked.
     pub nodes_checked: usize,
+    /// Node records read from the shard, by their labels alone.
+    pub records_scanned: usize,
+    /// Node records decoded in full: those of a label with a TTL.
+    pub records_decoded: usize,
     /// Nodes deleted (scope: Node).
     pub nodes_deleted: usize,
     /// Fields removed (scope: Field).
@@ -324,23 +329,17 @@ fn reap_computed_ttl_inner<'a>(
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
 
-    let mut total_deletions = 0usize;
-
-    for target in &targets {
-        result.labels_scanned += 1;
-        if total_deletions >= batch_size {
-            break;
-        }
-        let remaining = batch_size - total_deletions;
-        let pass_result = reap_label(engine, shard_id, target, now_us, remaining, oracle, commit);
-        result.nodes_checked += pass_result.nodes_checked;
-        result.nodes_deleted += pass_result.nodes_deleted;
-        result.fields_removed += pass_result.fields_removed;
-        result.subtrees_removed += pass_result.subtrees_removed;
-        total_deletions += pass_result.total_deletions();
-        result.errors.extend(pass_result.errors);
-    }
-
+    result.labels_scanned = targets.len();
+    reap_shard(
+        engine,
+        shard_id,
+        &targets,
+        now_us,
+        batch_size,
+        oracle,
+        commit,
+        &mut result,
+    );
     result
 }
 
@@ -356,9 +355,23 @@ fn discover_ttl_targets(
     engine: &StorageEngine,
     interner: Option<&coordinode_core::graph::intern::FieldInterner>,
 ) -> Result<Vec<TtlTarget>, String> {
-    let schemas = LocalSchemaStore::new(engine)
+    let schemas: Vec<_> = LocalSchemaStore::new(engine)
         .list_labels()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|schema| {
+            schema.properties.values().any(|def| {
+                matches!(
+                    def.property_type,
+                    PropertyType::Computed(ComputedSpec::Ttl { .. })
+                )
+            })
+        })
+        .collect();
+    // The index catalog is read only when there is TTL work to do.
+    if schemas.is_empty() {
+        return Ok(Vec::new());
+    }
     let indexes = Arc::new(BtreeIndexes::load(engine, interner)?);
 
     let mut targets = Vec::new();
@@ -418,38 +431,49 @@ fn list_edge_types(engine: &StorageEngine) -> Result<Vec<String>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Run reaper for one label+TTL target. Collects mutations and submits
-/// via pipeline (if provided) or applies directly to engine.
+/// Reap every target in one read of the shard. Collects mutations and
+/// submits them via pipeline (if provided) or applies them directly.
+///
+/// A record is first read by its labels alone; only one of a label with a
+/// target is decoded in full, so the cost of the records of other labels
+/// does not grow with their size or with the number of targets.
 #[allow(clippy::too_many_arguments)]
-fn reap_label<'a>(
+fn reap_shard<'a>(
     engine: &'a StorageEngine,
     shard_id: u16,
-    target: &TtlTarget,
+    targets: &[TtlTarget],
     now_us: i64,
     max_deletions: usize,
     oracle: Option<&'a TimestampOracle>,
     commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
-) -> ComputedTtlReapResult {
-    let mut result = ComputedTtlReapResult::default();
-
-    // Guard: if Subtree scope specifies a target_field that was not in the
-    // interner snapshot at startup, skip the entire label scan and record a
-    // single diagnostic.  Continuing into the node loop would emit one
-    // identical error per expired node and scan the entire shard uselessly —
-    // target_field_id is fixed per TtlTarget and cannot become Some mid-pass.
-    if let (TtlScope::Subtree, Some(tf), None) = (
-        target.scope,
-        target.target_field.as_deref(),
-        target.target_field_id,
-    ) {
-        result.errors.push(format!(
-            "label {}: target_field '{tf}' not in interner — Subtree deletion skipped",
-            target.label,
-        ));
-        return result;
+    result: &mut ComputedTtlReapResult,
+) {
+    // The targets of each label, with the instant before which an anchor has
+    // expired. A Subtree target whose target field the dictionary does not
+    // know is left out with one diagnostic: it cannot become known during the
+    // pass, and every expired node would otherwise repeat the same error.
+    let mut by_label: FxHashMap<&str, Vec<(&TtlTarget, i64)>> = FxHashMap::default();
+    for target in targets {
+        if let (TtlScope::Subtree, Some(tf), None) = (
+            target.scope,
+            target.target_field.as_deref(),
+            target.target_field_id,
+        ) {
+            result.errors.push(format!(
+                "label {}: target_field '{tf}' not in interner — Subtree deletion skipped",
+                target.label,
+            ));
+            continue;
+        }
+        let cutoff_us = now_us - (target.duration_secs as i64 * 1_000_000);
+        by_label
+            .entry(target.label.as_str())
+            .or_default()
+            .push((target, cutoff_us));
     }
-
-    let cutoff_us = now_us - (target.duration_secs as i64 * 1_000_000);
+    if by_label.is_empty() {
+        return;
+    }
 
     // The shard is read a page at a time, each page in a transaction of its
     // own. A page that meets a concurrent change (a renewal of a record it
@@ -500,33 +524,54 @@ fn reap_label<'a>(
             let Some((_, node_id)) = decode_node_key(key) else {
                 continue;
             };
+            page_result.records_scanned += 1;
+            let Ok(labels) = NodeRecord::labels_from_msgpack(bytes) else {
+                continue;
+            };
+            if !labels.iter().any(|l| by_label.contains_key(l.as_str())) {
+                continue;
+            }
             let Ok(record) = NodeRecord::from_msgpack(bytes) else {
                 continue;
             };
-            match stage_expired(
-                engine,
-                &mut txn,
-                shard_id,
-                target,
-                node_id,
-                key,
-                &record,
-                cutoff_us,
-                &edge_types,
-                &mut page_result,
-            ) {
-                Ok(true) => changed.push(key.clone()),
-                Ok(false) => {}
-                Err(e) => {
-                    // The staged work of the page is no longer one decision;
-                    // nothing of it is committed.
-                    result.errors.push(format!(
-                        "label {}: node {}: {e}",
-                        target.label,
-                        node_id.as_raw()
-                    ));
-                    break 'pages;
+            page_result.records_decoded += 1;
+            let mut staged = false;
+            'targets: for label in &labels {
+                for (target, cutoff_us) in by_label.get(label.as_str()).into_iter().flatten() {
+                    let deleted_before = page_result.nodes_deleted;
+                    match stage_expired(
+                        engine,
+                        &mut txn,
+                        shard_id,
+                        target,
+                        node_id,
+                        key,
+                        &record,
+                        *cutoff_us,
+                        &edge_types,
+                        &mut page_result,
+                    ) {
+                        Ok(true) => staged = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            // The staged work of the page is no longer one
+                            // decision; nothing of it is committed.
+                            result.errors.push(format!(
+                                "label {}: node {}: {e}",
+                                target.label,
+                                node_id.as_raw()
+                            ));
+                            break 'pages;
+                        }
+                    }
+                    // A deleted node has nothing left for another target.
+                    if page_result.nodes_deleted > deleted_before {
+                        break 'targets;
+                    }
                 }
+            }
+            if staged {
+                changed.push(key.clone());
             }
         }
 
@@ -558,12 +603,13 @@ fn reap_label<'a>(
                 if retries <= MAX_PAGE_RETRIES {
                     continue;
                 }
-                result.errors.push(format!(
-                    "label {}: a page kept changing under the reaper; left for the next pass",
-                    target.label
-                ));
+                result.errors.push(
+                    "a page kept changing under the reaper; left for the next pass".to_string(),
+                );
                 page_result = ComputedTtlReapResult {
                     nodes_checked: page_result.nodes_checked,
+                    records_scanned: page_result.records_scanned,
+                    records_decoded: page_result.records_decoded,
                     errors: page_result.errors,
                     ..ComputedTtlReapResult::default()
                 };
@@ -571,6 +617,8 @@ fn reap_label<'a>(
         }
         retries = 0;
         result.nodes_checked += page_result.nodes_checked;
+        result.records_scanned += page_result.records_scanned;
+        result.records_decoded += page_result.records_decoded;
         result.nodes_deleted += page_result.nodes_deleted;
         result.fields_removed += page_result.fields_removed;
         result.subtrees_removed += page_result.subtrees_removed;
@@ -580,8 +628,6 @@ fn reap_label<'a>(
         }
         start_after = page.last_key;
     }
-
-    result
 }
 
 /// Records read per page of a reap pass, and so the most one page's

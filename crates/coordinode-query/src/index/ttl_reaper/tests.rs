@@ -168,6 +168,59 @@ fn a_committed_pass_deletes_what_expired() {
     assert!(node_exists(&engine, 1, 2), "the fresh node stays");
 }
 
+/// A pass reads the shard once for all its targets, and decodes in full
+/// only the records of a label with a TTL: nodes of other labels, large ones
+/// included, cost a read of their labels and no more, however many there
+/// are and however many targets the pass serves.
+#[test]
+fn a_pass_reads_the_shard_once_and_decodes_only_ttl_labels() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    persist_schema(&engine, &make_ttl_schema("Token", 3600, TtlScope::Node));
+    let now = now_us();
+    let old = now - 2 * 3600 * 1_000_000;
+    put_with(&engine, &oracle, 1, &session(&mut interner, old));
+    put_with(&engine, &oracle, 2, &session(&mut interner, now));
+    let mut token = NodeRecord::new("Token");
+    token.set(interner.intern("created_at"), Value::Timestamp(old));
+    put_with(&engine, &oracle, 3, &token);
+    let blob = interner.intern("state");
+    for node in 10..60 {
+        let mut other = NodeRecord::new("State");
+        other.set(blob, Value::Blob(vec![7; 64 * 1024]));
+        put_with(&engine, &oracle, node, &other);
+    }
+
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit_now);
+
+    assert_eq!(result.nodes_deleted, 2, "{:?}", result.errors);
+    assert_eq!(
+        result.records_scanned, 53,
+        "one read of the shard for both targets"
+    );
+    assert_eq!(result.records_decoded, 3, "only the TTL labels are decoded");
+    assert!(!node_exists(&engine, 1, 1) && !node_exists(&engine, 1, 3));
+    assert!(node_exists(&engine, 1, 2) && node_exists(&engine, 1, 10));
+}
+
+/// No label declares a TTL: the pass reads nothing of the shard.
+#[test]
+fn a_pass_without_targets_reads_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let oracle = TimestampOracle::resume_from(Timestamp::from_raw(1));
+    let mut interner = FieldInterner::new();
+    put_with(&engine, &oracle, 1, &session(&mut interner, 0));
+
+    let result = reap_computed_ttl_committed(&engine, 1, 1000, &interner, &oracle, &mut commit_now);
+
+    assert_eq!(result.records_scanned, 0);
+    assert!(node_exists(&engine, 1, 1));
+}
+
 /// A renewal committed after the pass read the record and before its page
 /// commits is a later version than the one the expiry was decided on: the
 /// page is refused, read again, and the renewed record is no longer expired.
