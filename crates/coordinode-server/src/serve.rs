@@ -1135,44 +1135,29 @@ pub(crate) async fn serve(
     // Disable for embedded/mobile builds: --no-default-features --features vector,full-text
     #[cfg(feature = "rest-proxy")]
     {
-        use structured_proxy::config::{
-            DescriptorSource, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
-            ServiceConfig, UpstreamConfig,
-        };
+        use structured_proxy::config::{DescriptorSource, ProxyConfig, UpstreamConfig};
         static DESCRIPTOR_BYTES: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/coordinode.descriptor.bin"));
+        // The config types are #[non_exhaustive]: start from the proxy's
+        // defaults and set what CoordiNode wires. Everything not named here
+        // keeps the default, including the forwarded headers (authorization,
+        // dpop, request id, forwarding and client headers, idempotency key).
+        let mut config = ProxyConfig::default();
+        config.upstream = Some(UpstreamConfig::new(grpc_upstream));
+        config.descriptors = vec![DescriptorSource::Embedded {
+            bytes: DESCRIPTOR_BYTES,
+        }];
+        config.listen.http = rest_addr.clone();
+        config.service.name = "coordinode".into();
         // The proxy would otherwise mount its own /health and /metrics on the
         // REST port, reporting proxy state. CoordiNode publishes those for the
-        // database itself on the ops port, which is where the documented
-        // endpoints live, so keep the proxy off both paths. Both structs are
-        // #[non_exhaustive], so start from the default and clear the flag.
-        let mut proxy_health = HealthConfig::default();
-        proxy_health.enabled = false;
-        let mut proxy_metrics = MetricsConfig::default();
-        proxy_metrics.enabled = false;
-        // The wiring structs are hand-buildable for embedders; everything not
-        // named here keeps the proxy's own default, including the forwarded
-        // headers (authorization, dpop, request id, forwarding and client
-        // headers, idempotency key). The proxy exposes an axum Router that is
-        // bound and served here.
-        let config = ProxyConfig {
-            upstream: Some(UpstreamConfig {
-                default: grpc_upstream,
-            }),
-            descriptors: vec![DescriptorSource::Embedded {
-                bytes: DESCRIPTOR_BYTES,
-            }],
-            listen: ListenConfig {
-                http: rest_addr.clone(),
-                ..ListenConfig::default()
-            },
-            service: ServiceConfig {
-                name: "coordinode".into(),
-            },
-            health: proxy_health,
-            metrics: proxy_metrics,
-            ..ProxyConfig::default()
-        };
+        // database itself on the ops port, where the documented endpoints live.
+        config.health.enabled = false;
+        config.metrics.enabled = false;
+        config
+            .validate()
+            .map_err(|e| format!("REST proxy config: {e}"))?;
+        // The proxy exposes an axum Router that is bound and served here.
         let proxy = structured_proxy::ProxyServer::from_config(config);
         tokio::spawn(async move {
             match proxy.router() {

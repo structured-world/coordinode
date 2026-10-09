@@ -8,7 +8,7 @@
 # before building if proto/ is empty.
 
 # ─── Stage 1: Builder ────────────────────────────────────────────────
-FROM rust:1.98-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 # Must track rust-toolchain.toml. The file is authoritative for the build, so
 # a base image on a different version either pulls a second toolchain at build
