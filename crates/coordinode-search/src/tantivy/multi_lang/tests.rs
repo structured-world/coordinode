@@ -511,6 +511,19 @@ fn fresh(dir: &std::path::Path, docs: &[(u64, &str)]) -> MultiLanguageTextIndex 
     idx
 }
 
+/// The current projection keeps no birth times, so a birth-filtered read
+/// through its inner index is refused rather than answered as if every
+/// document were born at zero.
+#[test]
+fn a_birth_filtered_read_of_the_current_projection_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = fresh(dir.path(), &[(1, "graph database")]);
+    assert!(matches!(
+        idx.inner().search_at("graph", 10, u64::MAX),
+        Err(TextSearchError::BirthTimesUnknown)
+    ));
+}
+
 fn assert_same_scores(a: &[(u64, f32)], b: &[(u64, f32)]) {
     assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
     for ((ia, sa), (ib, sb)) in a.iter().zip(b) {

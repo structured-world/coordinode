@@ -930,6 +930,45 @@ fn chinese_jieba_external_dict_text_index() {
     assert_eq!(results[0].node_id, 1);
 }
 
+// -- birth-time filtered reads --
+
+/// A read filtered by birth time is refused once any document carries no
+/// birth time: which of them the snapshot sees cannot be told, and a
+/// missing value must never count as timestamp zero.
+#[test]
+fn a_birth_filtered_read_is_refused_without_birth_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = temp_index(dir.path());
+    idx.add_document_at(1, "graph database", 5).unwrap();
+    idx.add_document(2, "graph engine").unwrap();
+    assert!(matches!(
+        idx.search_at("graph", 10, 100),
+        Err(TextSearchError::BirthTimesUnknown)
+    ));
+}
+
+/// A real birth time of zero is a time, not an absence: the read is
+/// answered, and the document is visible at zero and after it.
+#[test]
+fn a_birth_time_of_zero_is_not_an_absent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut idx = temp_index(dir.path());
+    idx.add_document_at(1, "graph database", 0).unwrap();
+    idx.add_document_at(2, "graph engine", 7).unwrap();
+    let at = |ts| {
+        let mut ids: Vec<u64> = idx
+            .search_at("graph", 10, ts)
+            .expect("every document has a birth time")
+            .into_iter()
+            .map(|r| r.node_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(at(0), [1]);
+    assert_eq!(at(7), [1, 2]);
+}
+
 // -- search_with_highlights_fuzzy --
 
 #[test]
