@@ -2718,6 +2718,21 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
+    /// The node as this transaction leaves it, through a tracked read that
+    /// keeps its pending document deltas pending: the read a writer makes
+    /// between the deltas it stages, which [`Self::mvcc_get_node`] would
+    /// turn into a whole write of the record.
+    pub fn mvcc_node_post_state(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> Result<Option<NodeRecord>, ExecutionError> {
+        use coordinode_modality::LocalNodeStore;
+        self.sync_txn_state();
+        let key = coordinode_core::graph::node::encode_node_key(shard_id, node_id);
+        Ok(LocalNodeStore::post_state_tracked(&mut self.txn, &key)?)
+    }
+
     /// MVCC-aware typed node delete. Buffers a tombstone for the
     /// non-temporal node key (16-byte `encode_node_key` form). Does
     /// NOT iterate temporal version rows (25-byte `temporal_node_key`
@@ -11920,8 +11935,9 @@ fn execute_update(
                         continue;
                     }
 
-                    // Read current node record
-                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                    // Read the node as this statement leaves it so far, with
+                    // the property deltas of earlier items still pending.
+                    if let Some(record) = ctx.mvcc_node_post_state(ctx.shard_id, node_id)? {
                         // Enforce schema mode before writing the property.
                         // Load the label schema for the node's primary label and
                         // check STRICT/VALIDATED constraints on the property name.
@@ -11952,10 +11968,18 @@ fn execute_update(
                         // value another node holds refuses the write.
                         ctx.index_property_changed(node_id, &record, property, Some(&val))?;
 
+                        // The property alone is written, as a delta: the rest
+                        // of the record (a large document or blob next to a
+                        // timestamp) is not rewritten for one field.
                         let by_name = stored_by_name(label_schema.as_ref(), property);
-                        store_node_property(&mut record, property, val.clone(), by_name, ctx)?;
-
-                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
+                        for delta in
+                            property_set_deltas(&record, property, val.clone(), by_name, ctx)?
+                        {
+                            let operand = delta.encode().map_err(|e| {
+                                ExecutionError::Serialization(format!("property delta: {e}"))
+                            })?;
+                            ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
+                        }
                         ctx.write_stats.properties_set += 1;
 
                         // Reflect the new value in the output row only when the
@@ -15267,6 +15291,49 @@ fn store_node_property(
         record.set(field_id, value);
     }
     Ok(())
+}
+
+/// The deltas that do what [`store_node_property`] does to `record`: set
+/// property `name` where its schema keeps it, and remove a copy `record`
+/// holds in the other place, so no read can see an older value.
+fn property_set_deltas(
+    record: &NodeRecord,
+    name: &str,
+    value: Value,
+    by_name: bool,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<coordinode_core::graph::doc_delta::DocDelta>, ExecutionError> {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    let mut deltas = Vec::with_capacity(2);
+    if by_name {
+        if let Some(field_id) = ctx.interner.lookup(name) {
+            if record.props.contains_key(&field_id) {
+                deltas.push(DocDelta::RemoveProperty {
+                    target: PathTarget::PropField(field_id),
+                    key: None,
+                });
+            }
+        }
+        deltas.push(DocDelta::SetProperty {
+            target: PathTarget::Extra,
+            key: Some(name.to_string()),
+            value,
+        });
+    } else {
+        let field_id = ctx.field_id(name)?;
+        if record.get_extra(name).is_some() {
+            deltas.push(DocDelta::RemoveProperty {
+                target: PathTarget::Extra,
+                key: Some(name.to_string()),
+            });
+        }
+        deltas.push(DocDelta::SetProperty {
+            target: PathTarget::PropField(field_id),
+            key: None,
+            value,
+        });
+    }
+    Ok(deltas)
 }
 
 /// Register in one batch the names of `map` stored under an id, so storing

@@ -422,6 +422,34 @@ impl LocalNodeStore {
     ///
     /// A storage failure, or a record or delta that does not decode.
     pub fn post_state(txn: &Transaction, node_key: &[u8]) -> StoreResult<Option<NodeRecord>> {
+        let base = txn.read_untracked(Partition::Node, node_key)?;
+        Self::fold_pending(txn, node_key, base)
+    }
+
+    /// [`Self::post_state`] through the transaction's tracked read: the read
+    /// joins the transaction's read set as any user read does, and the
+    /// pending deltas stay pending, so a writer that changes the record
+    /// with deltas can read it between them without folding them into a
+    /// whole write.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or a record or delta that does not decode.
+    pub fn post_state_tracked(
+        txn: &mut Transaction,
+        node_key: &[u8],
+    ) -> StoreResult<Option<NodeRecord>> {
+        let base = txn.get(Partition::Node, node_key)?;
+        Self::fold_pending(txn, node_key, base)
+    }
+
+    /// `base` (the record as stored or buffered) with the transaction's
+    /// pending document deltas for `node_key` applied.
+    fn fold_pending(
+        txn: &Transaction,
+        node_key: &[u8],
+        base: Option<Vec<u8>>,
+    ) -> StoreResult<Option<NodeRecord>> {
         use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
 
         let mut deltas = Vec::new();
@@ -442,7 +470,7 @@ impl LocalNodeStore {
             };
             deltas.push(decoded);
         }
-        let mut record = match txn.read_untracked(Partition::Node, node_key)? {
+        let mut record = match base {
             Some(bytes) => NodeRecord::from_msgpack(&bytes).map_err(|e| StoreError::Decode {
                 kind: "node record",
                 message: e.to_string(),

@@ -101,6 +101,24 @@ pub enum DocDelta {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
     },
+
+    /// Set an entire top-level property of the NodeRecord to a typed value,
+    /// replacing what it held.
+    ///
+    /// - `PropField(field_id)`: sets `props[field_id]`.
+    /// - `Extra`: sets the key named in `key` in the `extra` overflow map.
+    ///
+    /// The value keeps its type (timestamp, vector, blob, ...), which a
+    /// document path delta would not. A `SET n.p = v` writes this instead of
+    /// the whole record.
+    SetProperty {
+        target: PathTarget,
+        /// Key name for Extra target. Unused for PropField (field_id is in target).
+        /// Always encoded: the operand is a positional array, so a skipped
+        /// field would shift `value` into its place.
+        key: Option<String>,
+        value: crate::graph::types::Value,
+    },
 }
 
 impl DocDelta {
@@ -128,7 +146,8 @@ impl DocDelta {
             | Self::ArrayPull { target, .. }
             | Self::ArrayAddToSet { target, .. }
             | Self::Increment { target, .. }
-            | Self::RemoveProperty { target, .. } => target,
+            | Self::RemoveProperty { target, .. }
+            | Self::SetProperty { target, .. } => target,
         }
     }
 
@@ -146,9 +165,9 @@ impl DocDelta {
                 array_add_to_set(doc, path, value.clone())
             }
             DocDelta::Increment { path, amount, .. } => increment(doc, path, *amount),
-            // RemoveProperty is handled at the merge function level (NodeRecord),
-            // not on the rmpv::Value document. No-op here.
-            DocDelta::RemoveProperty { .. } => false,
+            // Whole-property deltas are handled at the merge function level
+            // (NodeRecord), not on the rmpv::Value document. No-op here.
+            DocDelta::RemoveProperty { .. } | DocDelta::SetProperty { .. } => false,
         }
     }
 }

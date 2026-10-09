@@ -1783,12 +1783,21 @@ impl<'a> Transaction<'a> {
         // they are exempt from validation below: their concurrency story is
         // the merge operator, and excluding them here would serialise the
         // super-node writes that path exists to keep parallel.
-        let scope: Vec<(Partition, Vec<u8>)> = self
+        //
+        // A node document delta writes its record as surely as a whole write
+        // does, so its key is in the scope too: two attempts that change one
+        // node, in either form, are competing for it.
+        let mut scope: Vec<(Partition, Vec<u8>)> = self
             .write_buffer
             .keys()
             .filter(|(part, _)| !part.is_commutative())
             .map(|(part, key)| (*part, key.clone()))
             .collect();
+        for (key, _) in &self.merge_node_deltas {
+            if !scope.iter().any(|(p, k)| *p == Partition::Node && k == key) {
+                scope.push((Partition::Node, key.clone()));
+            }
+        }
         // The records this commit is conditioned on but does not write. The
         // condition is checked against committed state below; registered
         // here, a commit in flight that writes one of them is refused, or
@@ -1801,10 +1810,13 @@ impl<'a> Transaction<'a> {
             .collect();
         let pending = self.engine.pending_commits();
         let admitted = match self.overlap_wait {
-            Some(wait) => {
-                pending.admit_allocated_waiting(|| oracle.next().as_raw(), scope, guards, wait)
-            }
-            None => pending.admit_allocated(|| oracle.next().as_raw(), scope, guards),
+            Some(wait) => pending.admit_allocated_waiting(
+                || oracle.next().as_raw(),
+                scope.clone(),
+                guards,
+                wait,
+            ),
+            None => pending.admit_allocated(|| oracle.next().as_raw(), scope.clone(), guards),
         };
         let (commit_ts_raw, admission) = admitted.map_err(|refusal| match refusal {
             crate::engine::pending::Refusal::Overlap {
@@ -1893,10 +1905,7 @@ impl<'a> Transaction<'a> {
         // starts below its snapshot when commits were still in flight under
         // it: those land beneath the snapshot after the reads were made.
         let occ_read_ts = self.validate_from.unwrap_or_else(|| self.read_ts.as_raw());
-        for (part, key) in self.write_buffer.keys() {
-            if part.is_commutative() {
-                continue;
-            }
+        for (part, key) in &scope {
             // Inclusive: a snapshot sees sequence numbers strictly below
             // itself, so a write landing at exactly that number is one this
             // transaction could not have seen. The strict comparison missed

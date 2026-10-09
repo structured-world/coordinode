@@ -332,6 +332,25 @@ fn apply_delta_to_record_batched(
         return;
     }
 
+    // SetProperty replaces a whole property with a typed value. An overflow
+    // key is set on the record itself, so a pending overflow document is
+    // folded first: the set lands after it and keeps its type, which the
+    // document form of the overflow map would not.
+    if let DocDelta::SetProperty { target, key, value } = delta {
+        match target {
+            PathTarget::PropField(field_id) => rec.set(*field_id, value.clone()),
+            PathTarget::Extra => {
+                if let Some(doc) = extra_doc.take() {
+                    rmpv_to_extra(rec, &doc);
+                }
+                if let Some(k) = key {
+                    rec.set_extra(k.as_str(), value.clone());
+                }
+            }
+        }
+        return;
+    }
+
     match delta.target() {
         PathTarget::Extra => {
             // Lazily initialize the rmpv doc from rec.extra on first Extra delta.

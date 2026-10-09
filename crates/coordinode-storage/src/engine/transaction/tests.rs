@@ -383,6 +383,73 @@ fn commits_that_only_merge_do_not_exclude_each_other() {
     assert_eq!(engine.pending_commits().in_flight(), 0);
 }
 
+/// A node document delta is a write of its record, so first-committer-wins
+/// holds over it as over a whole write: two attempts from one view that both
+/// change one node do not both commit, whichever form each write takes.
+/// Otherwise `SET n.x = n.x + 1` from two clients, each written as a delta,
+/// would both land on the value both read and lose an update.
+#[test]
+fn node_deltas_on_one_record_conflict_like_whole_writes() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::graph::types::Value;
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    let key = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x01";
+    let set = |v: i64| {
+        DocDelta::SetProperty {
+            target: PathTarget::PropField(1),
+            key: None,
+            value: Value::Int(v),
+        }
+        .encode()
+        .expect("encode")
+    };
+    let mut base = NodeRecord::new("Counter");
+    base.set(1, Value::Int(0));
+    let mut create = mvcc_txn(&engine, &oracle);
+    create
+        .put(Partition::Node, key, &base.to_msgpack().expect("encode"))
+        .expect("stage");
+    create.commit(&ctx()).expect("create");
+
+    for second_whole in [false, true] {
+        let mut first = mvcc_txn(&engine, &oracle);
+        let mut second = mvcc_txn(&engine, &oracle);
+        first.push_node_delta(key.to_vec(), set(1));
+        if second_whole {
+            second
+                .put(Partition::Node, key, &base.to_msgpack().expect("encode"))
+                .expect("stage");
+        } else {
+            second.push_node_delta(key.to_vec(), set(2));
+        }
+        first.commit(&ctx()).expect("the first committer wins");
+        match second.commit(&ctx()) {
+            Err(CommitError::Conflict(_)) => {}
+            other => panic!(
+                "a second write of the record from the same view must conflict \
+                 (whole write: {second_whole}), got {other:?}"
+            ),
+        }
+        let stored = engine
+            .get(Partition::Node, key)
+            .expect("get")
+            .expect("node");
+        let record = NodeRecord::from_msgpack(&stored).expect("decode");
+        assert_eq!(record.props.get(&1), Some(&Value::Int(1)));
+    }
+    assert_eq!(engine.pending_commits().in_flight(), 0);
+}
+
 /// A read between two commits waits for the one below it and not for the one
 /// above.
 ///

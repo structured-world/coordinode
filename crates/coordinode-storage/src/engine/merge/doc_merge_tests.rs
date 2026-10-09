@@ -823,6 +823,88 @@ fn doc_merge_setpath_then_remove_property_extra() {
     );
 }
 
+/// A whole-property set keeps the value's type (a timestamp, a vector, a
+/// blob stay what they are, unlike a document path set), replaces what the
+/// property held, and leaves every other property as it was.
+#[test]
+fn doc_merge_set_property_keeps_the_value_type() {
+    let op = DocumentMerge;
+    let mut base = NodeRecord::new("Agent");
+    base.set(1, Value::Timestamp(100));
+    base.set(2, Value::Blob(vec![7; 64]));
+    base.set_extra("note", Value::Timestamp(5));
+    let base_bytes = encode_rec(&base);
+
+    let set_ts = DocDelta::SetProperty {
+        target: PathTarget::PropField(1),
+        key: None,
+        value: Value::Timestamp(200),
+    };
+    let set_vec = DocDelta::SetProperty {
+        target: PathTarget::PropField(3),
+        key: None,
+        value: Value::Vector(vec![0.5, 1.5]),
+    };
+    let set_extra = DocDelta::SetProperty {
+        target: PathTarget::Extra,
+        key: Some("seen".into()),
+        value: Value::Timestamp(300),
+    };
+    let ops: Vec<Vec<u8>> = [set_ts, set_vec, set_extra]
+        .iter()
+        .map(|d| d.encode().expect("encode"))
+        .collect();
+    let refs: Vec<&[u8]> = ops.iter().map(Vec::as_slice).collect();
+
+    let result = op
+        .merge(b"node:0:1", Some(&base_bytes), &refs)
+        .expect("merge");
+    let merged = decode_node_record(&result).expect("decode");
+
+    assert_eq!(merged.props.get(&1), Some(&Value::Timestamp(200)));
+    assert_eq!(merged.props.get(&2), Some(&Value::Blob(vec![7; 64])));
+    assert_eq!(merged.props.get(&3), Some(&Value::Vector(vec![0.5, 1.5])));
+    assert_eq!(merged.get_extra("seen"), Some(&Value::Timestamp(300)));
+    assert_eq!(merged.get_extra("note"), Some(&Value::Timestamp(5)));
+}
+
+/// A whole-property set ordered after a path set on the overflow map is
+/// applied after it: the pending overflow document is folded first, so
+/// neither change is lost and the set's value keeps its type.
+#[test]
+fn doc_merge_set_property_after_an_extra_path_set() {
+    let op = DocumentMerge;
+    let rec = make_record_with_doc("meta", make_rmpv_map(vec![]));
+    let base = encode_rec(&rec);
+
+    let path = DocDelta::SetPath {
+        target: PathTarget::Extra,
+        path: vec!["meta".into(), "a".into()],
+        value: rmpv::Value::Integer(1.into()),
+    };
+    let set = DocDelta::SetProperty {
+        target: PathTarget::Extra,
+        key: Some("seen".into()),
+        value: Value::Timestamp(9),
+    };
+    let op1 = path.encode().expect("encode");
+    let op2 = set.encode().expect("encode");
+
+    let result = op
+        .merge(b"node:0:1", Some(&base), &[&op1, &op2])
+        .expect("merge");
+    let merged = decode_node_record(&result).expect("decode");
+
+    assert_eq!(merged.get_extra("seen"), Some(&Value::Timestamp(9)));
+    let Some(Value::Document(meta)) = merged.get_extra("meta") else {
+        panic!("meta must stay a document");
+    };
+    assert_eq!(
+        coordinode_core::graph::document::extract_at_path(meta, &["a"]),
+        rmpv::Value::Integer(1.into())
+    );
+}
+
 #[test]
 fn doc_merge_base_reset_flushes_extra_doc() {
     // When a PREFIX_NODE_RECORD operand appears mid-stream (base reset),
