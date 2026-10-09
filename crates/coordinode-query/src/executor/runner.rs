@@ -4860,11 +4860,24 @@ fn execute_node_scan(
     let fields = ctx.timeline_fields();
     let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
     let mut versions_of: Option<NodeId> = None;
+    let decode = |value_bytes: &[u8]| {
+        NodeRecord::from_msgpack(value_bytes)
+            .map_err(|e| ExecutionError::Serialization(format!("node deserialization error: {e}")))
+    };
     for (key_bytes, value_bytes) in &scan_results {
-        let record = NodeRecord::from_msgpack(value_bytes).map_err(|e| {
-            ExecutionError::Serialization(format!("node deserialization error: {e}"))
-        })?;
-        if let Some((_, node_id, valid_from)) = decode_temporal_node_key(key_bytes) {
+        let temporal = decode_temporal_node_key(key_bytes);
+        // A record of another label is passed over by its labels alone,
+        // read before the properties: most of a shard scan for one label is
+        // other labels' records, whose properties need not be decoded.
+        if temporal.is_none()
+            && !labels.is_empty()
+            && NodeRecord::labels_from_msgpack(value_bytes)
+                .is_ok_and(|stored| !labels.iter().all(|l| stored.contains(l)))
+        {
+            continue;
+        }
+        let record = decode(value_bytes)?;
+        if let Some((_, node_id, valid_from)) = temporal {
             if versions_of != Some(node_id) {
                 if let Some(previous) = versions_of.replace(node_id) {
                     push_temporal_state(
