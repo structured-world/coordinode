@@ -382,6 +382,54 @@ fn a_retained_subscription_reports_unreleased_keys() {
     assert_eq!(pending_keys(&position), Some(Vec::new()));
 }
 
+/// An entry's keys are pending for a reader from before the entry is in the
+/// store: a reader that already sees the write must also be told the index
+/// may not hold it, or an index search drops the node from its answer.
+/// Meanwhile the consumer is not handed the entry, which would let it fold
+/// the store before the write is there.
+#[test]
+fn an_entry_is_pending_before_a_reader_can_see_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    let dir = TempDir::new().expect("tempdir");
+    let engine = Arc::new(engine(&dir));
+    let sub = engine.subscribe_applied_retained(Partition::Node, 16);
+    let position = sub.position();
+    // 1: the write was visible; 2: and its key was pending; 4: and the
+    // consumer could take nothing yet.
+    let seen = Arc::new(AtomicU8::new(0));
+    {
+        let weak = Arc::downgrade(&engine);
+        let seen = Arc::clone(&seen);
+        let position = position.clone();
+        engine.pause_applies_after_write(Arc::new(move || {
+            let Some(engine) = weak.upgrade() else { return };
+            if engine.get(Partition::Node, b"k").ok().flatten().is_some() {
+                seen.fetch_or(1, Ordering::SeqCst);
+            }
+            if pending_keys(&position).is_some_and(|keys| keys.contains(&b"k".to_vec())) {
+                seen.fetch_or(2, Ordering::SeqCst);
+            }
+            if position.delivered() == 0 {
+                seen.fetch_or(4, Ordering::SeqCst);
+            }
+        }));
+    }
+    engine
+        .apply_raft_proposal(&[put(PartitionId::Node, b"k")], 11, 1, 0, |_| false)
+        .expect("apply");
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1 | 2 | 4,
+        "visible, pending, not delivered"
+    );
+    assert!(matches!(
+        sub.try_next(),
+        Some(AppliedEvent::Keys { seq: 1, .. })
+    ));
+}
+
 /// Unreleased events count toward the capacity, and an event dropped for
 /// lack of room makes the pending keys unknown until the consumer releases
 /// past it, as it does once a rebuild from the store covers it.

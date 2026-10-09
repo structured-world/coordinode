@@ -60,12 +60,25 @@ pub enum AppliedEvent {
 }
 
 /// The subscribers of one engine.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct AppliedFeed {
     /// How many subscriptions are open. Read on every apply, so an apply
     /// with none open pays one load.
     open: AtomicUsize,
     subscribers: RwLock<Vec<Arc<Subscriber>>>,
+    /// Run between an entry's store write and its publication, so a test can
+    /// look at what a reader sees in that window.
+    #[cfg(test)]
+    pub(crate) between_write_and_publish: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for AppliedFeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppliedFeed")
+            .field("open", &self.open)
+            .field("subscribers", &self.subscribers)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -75,8 +88,8 @@ struct Subscriber {
     retained: bool,
     /// Most events the queue holds, handed out and retained ones included.
     capacity: usize,
-    /// The number of the last event offered (queued or dropped). Written
-    /// under `queue`, so numbers enter the queue in order.
+    /// The number of the last event published: every event numbered up to
+    /// it is in the store. Written under `queue`.
     delivered: AtomicU64,
     /// Numbering an event and queueing it happen under this lock: local
     /// commits apply concurrently, and a later number queued ahead of an
@@ -97,14 +110,29 @@ struct Queue {
     events: VecDeque<(u64, AppliedEvent)>,
     /// How many events at the front were handed out.
     taken: usize,
-    /// An event could not be queued: handed out as
-    /// [`AppliedEvent::Replaced`] before the events queued after it.
-    lost: bool,
+    /// The number of the first event that could not be queued and has not
+    /// been reported: handed out as [`AppliedEvent::Replaced`] once it is
+    /// published, before the events queued after it.
+    lost: Option<u64>,
     /// The last event whose keys are not known: one dropped, or a
     /// replacement.
     unknown_through: u64,
     /// The last event the consumer released.
     released: u64,
+    /// The number of the last event staged (queued or dropped).
+    staged: u64,
+    /// Events staged whose writes are not in the store yet. Readers already
+    /// count their keys as pending; the consumer is handed none of them, nor
+    /// any event after the first of them.
+    applying: std::collections::BTreeSet<u64>,
+}
+
+impl Queue {
+    /// The last event whose writes, and every earlier event's, are in the
+    /// store: what the consumer may be handed.
+    fn published(&self) -> u64 {
+        self.applying.first().map_or(self.staged, |first| first - 1)
+    }
 }
 
 /// An open subscription. Closes when dropped.
@@ -235,15 +263,23 @@ impl AppliedSubscription {
     /// An event already queued, without waiting.
     pub fn try_next(&self) -> Option<AppliedEvent> {
         let mut queue = self.subscriber.queue.lock();
-        if queue.lost {
-            queue.lost = false;
+        let published = queue.published();
+        if queue.lost.is_some_and(|lost| lost <= published) {
+            queue.lost = None;
             return Some(AppliedEvent::Replaced);
         }
         if !self.subscriber.retained {
+            if queue.events.front()?.0 > published {
+                return None;
+            }
             return queue.events.pop_front().map(|(_, event)| event);
         }
         let index = queue.taken;
-        let event = queue.events.get(index).map(|(_, event)| event.clone())?;
+        let (seq, event) = queue.events.get(index)?;
+        if *seq > published {
+            return None;
+        }
+        let event = event.clone();
         queue.taken += 1;
         Some(event)
     }
@@ -300,14 +336,26 @@ impl AppliedFeed {
         }
     }
 
-    /// Report that entry `index` applied `mutations` at `commit_ts`. Call
-    /// after they are in the store.
-    #[inline]
-    pub(crate) fn applied(&self, index: u64, commit_ts: u64, mutations: &[Mutation]) {
-        if self.open.load(Ordering::Acquire) == 0 {
-            return;
+    /// Run the test pause between an entry's store write and its publication.
+    #[cfg(test)]
+    pub(crate) fn pause_after_write(&self) {
+        let hook = self.between_write_and_publish.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
-        self.deliver(index, commit_ts, mutations);
+    }
+
+    /// Announce that entry `index` is about to write `mutations` at
+    /// `commit_ts`. Call before they reach the store and publish the result
+    /// once they have: from this call on a reader counts the keys as pending,
+    /// so no reader can see a write that a consumer's state lacks without
+    /// being told; the consumer is handed the entry only once published.
+    #[inline]
+    pub(crate) fn stage(&self, index: u64, commit_ts: u64, mutations: &[Mutation]) -> StagedApply {
+        if self.open.load(Ordering::Acquire) == 0 {
+            return StagedApply::default();
+        }
+        self.stage_entry(index, commit_ts, mutations)
     }
 
     /// A persisted control entry closed history without changing this
@@ -319,12 +367,13 @@ impl AppliedFeed {
         }
         let keys: Arc<[Vec<u8>]> = Arc::from([]);
         for subscriber in self.subscribers.read().iter() {
-            send(subscriber, |seq| AppliedEvent::Keys {
+            let seq = stage(subscriber, |seq| AppliedEvent::Keys {
                 seq,
                 index,
                 commit_ts: at,
                 keys: Arc::clone(&keys),
             });
+            publish(subscriber, seq);
         }
     }
 
@@ -337,13 +386,15 @@ impl AppliedFeed {
         }
         for subscriber in self.subscribers.read().iter() {
             if partition.is_none_or(|p| p == subscriber.partition) {
-                send(subscriber, |_| AppliedEvent::Replaced);
+                let seq = stage(subscriber, |_| AppliedEvent::Replaced);
+                publish(subscriber, seq);
             }
         }
     }
 
     #[cold]
-    fn deliver(&self, index: u64, commit_ts: u64, mutations: &[Mutation]) {
+    fn stage_entry(&self, index: u64, commit_ts: u64, mutations: &[Mutation]) -> StagedApply {
+        let mut staged = StagedApply::default();
         for subscriber in self.subscribers.read().iter() {
             let mut keys = Vec::new();
             let mut replaced = false;
@@ -377,28 +428,60 @@ impl AppliedFeed {
                     }
                 }
             }
-            if replaced {
-                send(subscriber, |_| AppliedEvent::Replaced);
+            let seq = if replaced {
+                stage(subscriber, |_| AppliedEvent::Replaced)
             } else if !keys.is_empty() {
                 let keys: Arc<[Vec<u8>]> = keys.into();
-                send(subscriber, |seq| AppliedEvent::Keys {
+                stage(subscriber, |seq| AppliedEvent::Keys {
                     seq,
                     index,
                     commit_ts,
                     keys,
-                });
-            }
+                })
+            } else {
+                continue;
+            };
+            staged.events.push((Arc::clone(subscriber), seq));
+        }
+        staged
+    }
+}
+
+/// An entry announced to the subscribers and not yet published. Publishing
+/// it, explicitly or by dropping it, hands it to the consumers; an entry
+/// whose apply failed is published too, since the consumers read the store
+/// and must not wait on it forever.
+#[derive(Default)]
+#[must_use = "publish the entry once it is in the store"]
+pub(crate) struct StagedApply {
+    events: Vec<(Arc<Subscriber>, u64)>,
+}
+
+impl StagedApply {
+    /// The entry is in the store: hand it to the consumers.
+    pub(crate) fn publish(self) {
+        drop(self);
+    }
+}
+
+impl Drop for StagedApply {
+    fn drop(&mut self) {
+        for (subscriber, seq) in self.events.drain(..) {
+            publish(subscriber.as_ref(), seq);
         }
     }
 }
 
-/// Number the event `make` builds and queue it without waiting; a full
-/// queue marks the subscription lost.
-fn send(subscriber: &Subscriber, make: impl FnOnce(u64) -> AppliedEvent) {
+/// Number the event `make` builds and queue it without waiting, as applying:
+/// readers count its keys as pending at once, the consumer gets it only once
+/// [`publish`]ed. A full queue marks the subscription lost from this event.
+fn stage(subscriber: &Subscriber, make: impl FnOnce(u64) -> AppliedEvent) -> u64 {
     let mut queue = subscriber.queue.lock();
     // Under `queue`: one writer at a time, so a plain add cannot overflow
     // before 2^64 events.
-    let seq = subscriber.delivered.load(Ordering::Relaxed) + 1;
+    let seq = queue.staged + 1;
+    queue.staged = seq;
+    queue.applying.insert(seq);
     let event = make(seq);
     if matches!(event, AppliedEvent::Replaced) {
         queue.unknown_through = seq;
@@ -406,12 +489,21 @@ fn send(subscriber: &Subscriber, make: impl FnOnce(u64) -> AppliedEvent) {
     if queue.events.len() < subscriber.capacity {
         queue.events.push_back((seq, event));
     } else {
-        queue.lost = true;
+        queue.lost = Some(queue.lost.unwrap_or(seq));
         queue.unknown_through = seq;
     }
-    // Published with the event queued or the subscription marked lost, so a
-    // reader that sees `seq` finds one or the other.
-    subscriber.delivered.store(seq, Ordering::Release);
+    seq
+}
+
+/// Event `seq` is in the store: the consumer may take it, and every event
+/// before it that is in the store too.
+fn publish(subscriber: &Subscriber, seq: u64) {
+    let mut queue = subscriber.queue.lock();
+    queue.applying.remove(&seq);
+    let published = queue.published();
+    // Under `queue`, with the events it covers queued or the subscription
+    // marked lost, so a reader that sees the number finds one or the other.
+    subscriber.delivered.store(published, Ordering::Release);
     drop(queue);
     subscriber.wake.notify();
 }

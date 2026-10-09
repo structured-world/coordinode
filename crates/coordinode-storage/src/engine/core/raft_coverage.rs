@@ -290,12 +290,18 @@ impl StorageEngine {
                 .filter(|m| !skip(partition_of(m)))
                 .cloned()
                 .collect();
+            let staged = self.applied_feed.stage(index, commit_ts, &kept);
             self.apply_proposal_covered(&kept, commit_ts, Some(mark))?;
-            self.applied_feed.applied(index, commit_ts, &kept);
+            staged.publish();
             Ok(kept.len())
         } else {
+            // Staged before the write lands: a reader that sees it is told
+            // the derived indexes may not hold it yet.
+            let staged = self.applied_feed.stage(index, commit_ts, mutations);
             self.apply_proposal_covered(mutations, commit_ts, Some(mark))?;
-            self.applied_feed.applied(index, commit_ts, mutations);
+            #[cfg(test)]
+            self.applied_feed.pause_after_write();
+            staged.publish();
             Ok(mutations.len())
         }
     }

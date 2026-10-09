@@ -2487,10 +2487,12 @@ impl StorageEngine {
     /// canonicalises each key to one final operation, so this marks an
     /// upstream bug rather than silently ordering the pair.
     pub fn apply_proposal_at(&self, mutations: &[Mutation], commit_ts: u64) -> StorageResult<()> {
-        self.apply_proposal_covered(mutations, commit_ts, None)?;
         // A local commit has no log position; its subscribers follow it by
-        // commit timestamp.
-        self.applied_feed.applied(0, commit_ts, mutations);
+        // commit timestamp. Staged before the write lands, so a reader that
+        // sees it is told the derived indexes may not hold it yet.
+        let staged = self.applied_feed.stage(0, commit_ts, mutations);
+        self.apply_proposal_covered(mutations, commit_ts, None)?;
+        staged.publish();
         Ok(())
     }
 
@@ -2552,11 +2554,13 @@ impl StorageEngine {
         // receive the entries derived from them, under the same marker.
         let resolved =
             coordinode_core::index::derive::resolve_unit(mutations, MAX_DERIVED_EFFECTS)?;
+        // Subscribers of an embedded engine follow its commits the way a
+        // cluster member's follow its applied log entries, staged before the
+        // write lands.
+        let staged = self.applied_feed.stage(index, commit_ts, mutations);
         self.apply_effects_covered(&resolved, commit_ts, Some(mark))?;
         self.note_applied(coverage, index);
-        // Subscribers of an embedded engine follow its commits the way a
-        // cluster member's follow its applied log entries.
-        self.applied_feed.applied(index, commit_ts, mutations);
+        staged.publish();
         Ok(())
     }
 
@@ -3379,6 +3383,13 @@ impl StorageEngine {
         capacity: usize,
     ) -> crate::engine::applied::AppliedSubscription {
         self.applied_feed.subscribe(partition, capacity, true)
+    }
+
+    /// Run `hook` between each entry's store write and its publication to
+    /// the subscribers, so a test can look at what a reader sees then.
+    #[cfg(test)]
+    pub(crate) fn pause_applies_after_write(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.applied_feed.between_write_and_publish.lock() = Some(hook);
     }
 
     /// Start `tap` over after it reported
