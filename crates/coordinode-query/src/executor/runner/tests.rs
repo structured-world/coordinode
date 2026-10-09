@@ -1456,6 +1456,28 @@ fn set_of_a_small_record_writes_it_whole() {
     assert_eq!(record.get(visits), Some(&Value::Int(7)));
 }
 
+/// A change that carries most of a large record is written as the record:
+/// a delta that size saves nothing, and every read of the key would unpack
+/// and fold it until a compaction reaches its base.
+#[test]
+fn set_of_most_of_a_large_record_writes_it_whole() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    make_alice_large(&engine, &mut interner);
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    let rows = alice(&mut ctx);
+    let items = vec![crate::plan::SetItem::Property {
+        variable: "n".into(),
+        property: "bio".into(),
+        expr: nx(Expr::Literal(Value::String("y".repeat(4096)))),
+    }];
+    execute_update(&rows, &items, &crate::plan::ViolationMode::Fail, &mut ctx).expect("set");
+    assert!(
+        ctx.txn.node_deltas().is_empty(),
+        "the new value is most of the record"
+    );
+}
+
 /// Deltas to one key end in a whole write once their run is long: every
 /// read of the key folds the run until a compaction reaches its base, so
 /// the run is bounded. The whole write starts a new run, and the record

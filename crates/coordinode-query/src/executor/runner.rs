@@ -2745,20 +2745,33 @@ impl<'a> ExecutionContext<'a> {
         Ok(LocalNodeStore::post_state_tracked(&mut self.txn, &key)?)
     }
 
-    /// Whether a property change of the node whose stored record is
-    /// `stored_bytes` long is written as a delta rather than as the record.
+    /// Whether a property change of `delta_bytes` to the node whose stored
+    /// record is `stored_bytes` long is written as a delta rather than as the
+    /// record.
     ///
     /// A delta saves rewriting a large record, but every read of the key
-    /// folds every delta written since its last whole write, until a
-    /// compaction reaches its base. A small record is cheaper to rewrite than
-    /// to leave a chain behind, and a long chain is ended by a whole write
-    /// (the reason RocksDB has `max_successive_merges`).
-    fn writes_property_delta(&self, shard_id: u16, node_id: NodeId, stored_bytes: usize) -> bool {
+    /// unpacks and folds every delta written since its last whole write,
+    /// until a compaction reaches its base. A small record is cheaper to
+    /// rewrite than to leave a chain behind, a change carrying a large share
+    /// of the record saves little and costs every read its size, and a long
+    /// chain is ended by a whole write (the reason RocksDB has
+    /// `max_successive_merges`).
+    fn writes_property_delta(
+        &self,
+        shard_id: u16,
+        node_id: NodeId,
+        stored_bytes: usize,
+        delta_bytes: usize,
+    ) -> bool {
         /// Records smaller than this are rewritten whole.
         const MIN_DELTA_RECORD_BYTES: usize = 1024;
+        /// A change larger than this share of the record is written whole.
+        const MAX_DELTA_SHARE_DIVISOR: usize = 4;
         /// Deltas in a row on one key before the next write is whole.
         const MAX_SUCCESSIVE_DELTAS: u32 = 32;
-        if stored_bytes < MIN_DELTA_RECORD_BYTES {
+        if stored_bytes < MIN_DELTA_RECORD_BYTES
+            || delta_bytes > stored_bytes / MAX_DELTA_SHARE_DIVISOR
+        {
             return false;
         }
         let key = coordinode_modality::LocalNodeStore::record_key(shard_id, node_id);
@@ -15359,14 +15372,21 @@ fn write_property_changes(
     changes: &[(&str, Value, bool)],
 ) -> Result<(), ExecutionError> {
     let shard_id = ctx.shard_id;
-    if ctx.writes_property_delta(shard_id, node_id, stored_bytes) {
-        for (name, value, by_name) in changes {
-            for delta in property_set_deltas(record, name, value.clone(), *by_name, ctx)? {
-                let operand = delta
+    // Encoded first: their size decides whether they are written at all.
+    let mut operands = Vec::with_capacity(changes.len());
+    for (name, value, by_name) in changes {
+        for delta in property_set_deltas(record, name, value.clone(), *by_name, ctx)? {
+            operands.push(
+                delta
                     .encode()
-                    .map_err(|e| ExecutionError::Serialization(format!("property delta: {e}")))?;
-                ctx.mvcc_merge_node_delta(shard_id, node_id, operand)?;
-            }
+                    .map_err(|e| ExecutionError::Serialization(format!("property delta: {e}")))?,
+            );
+        }
+    }
+    let delta_bytes = operands.iter().map(Vec::len).sum();
+    if ctx.writes_property_delta(shard_id, node_id, stored_bytes, delta_bytes) {
+        for operand in operands {
+            ctx.mvcc_merge_node_delta(shard_id, node_id, operand)?;
         }
         ctx.note_property_write(shard_id, node_id, true);
         return Ok(());
