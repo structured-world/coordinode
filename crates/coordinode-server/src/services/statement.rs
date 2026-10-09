@@ -124,6 +124,8 @@ pub struct StatementExecutor {
     /// passing a statement on to the leader. Lazy channels reconnect on their
     /// own, so a peer that restarts does not poison its entry.
     peer_channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
+    /// Statements running at least this long are logged; `None` logs none.
+    slow_query: Option<Duration>,
 }
 
 impl StatementExecutor {
@@ -137,7 +139,14 @@ impl StatementExecutor {
             query_registry: Arc::new(QueryRegistry::new()),
             nplus1_detector: Arc::new(NPlus1Detector::new()),
             peer_channels: Arc::new(Mutex::new(HashMap::new())),
+            slow_query: Some(DEFAULT_SLOW_QUERY),
         }
+    }
+
+    /// Log statements that run at least `threshold`; `None` logs none.
+    pub fn with_slow_query_threshold(mut self, threshold: Option<Duration>) -> Self {
+        self.slow_query = threshold;
+        self
     }
 
     /// Fence reads and route statements through this consensus node.
@@ -364,6 +373,13 @@ impl StatementExecutor {
             Err(_) => QueryKind::Failed,
         };
         observe_query(kind, started);
+        log_if_slow(
+            self.slow_query,
+            query,
+            kind,
+            started.elapsed(),
+            result.as_ref().ok().map(|r| r.rows.len()),
+        );
         result
     }
 
@@ -499,6 +515,44 @@ impl QueryKind {
             Self::Failed => "failed",
         }
     }
+}
+
+/// How long a statement runs before it is logged as slow, unless the
+/// configuration names another bound.
+pub const DEFAULT_SLOW_QUERY: Duration = Duration::from_millis(100);
+
+/// The most of a statement's text a slow-statement line carries.
+const SLOW_QUERY_TEXT_LIMIT: usize = 2048;
+
+/// Log `query` when it ran for `elapsed` and that is at least `threshold`:
+/// its kind, duration, rows returned and text (cut at a character boundary
+/// past [`SLOW_QUERY_TEXT_LIMIT`] bytes). Parameter values are not logged.
+pub(crate) fn log_if_slow(
+    threshold: Option<Duration>,
+    query: &str,
+    kind: QueryKind,
+    elapsed: Duration,
+    rows: Option<usize>,
+) {
+    let Some(threshold) = threshold else {
+        return;
+    };
+    if elapsed < threshold {
+        return;
+    }
+    let mut end = query.len().min(SLOW_QUERY_TEXT_LIMIT);
+    while !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::info!(
+        target: "coordinode::slow_query",
+        kind = kind.label(),
+        duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        rows,
+        truncated = end < query.len(),
+        query = &query[..end],
+        "slow statement"
+    );
 }
 
 /// Count a statement that started at `started` in the query metrics.

@@ -198,6 +198,7 @@ pub(crate) async fn serve(
         raft_snapshot_log_bytes,
         raft_snapshot_min_interval_secs,
         planner_stats_ttl_secs,
+        slow_query_ms,
         vector_build_wait_ms,
         vector_retired_bytes_budget,
         index_build_max_running,
@@ -1047,7 +1048,11 @@ pub(crate) async fn serve(
     let statement_executor = {
         let executor = services::statement::StatementExecutor::new(Arc::clone(&database))
             .with_advisor(Arc::clone(&query_registry), Arc::clone(&nplus1_detector))
-            .with_statement_defaults(statement_defaults);
+            .with_statement_defaults(statement_defaults)
+            .with_slow_query_threshold(Some(slow_query_ms.map_or(
+                services::statement::DEFAULT_SLOW_QUERY,
+                std::time::Duration::from_millis,
+            )));
         match raft_node_shared {
             Some(ref rn) => executor.with_raft_node(Arc::clone(rn)),
             None => executor,

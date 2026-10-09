@@ -177,6 +177,89 @@ fn statements_are_counted_by_what_they_did() {
     assert!(text.contains("coordinode_query_active 0"), "{text}");
 }
 
+/// The lines logged under the slow-statement target while `f` runs.
+fn slow_lines(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let sink = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("coordinode::slow_query=info")
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.0.lock().clone();
+    String::from_utf8(bytes).expect("utf-8 log")
+}
+
+/// A statement at or past the bound is logged with its kind, rows and
+/// text; one under it is not, nor is any with logging off. Text past the
+/// limit is cut at a character boundary and marked truncated.
+#[test]
+fn a_slow_statement_is_logged_and_a_fast_one_is_not() {
+    let bound = Some(Duration::from_millis(100));
+    let lines = slow_lines(|| {
+        log_if_slow(
+            bound,
+            "MATCH (n:Fast) RETURN n",
+            QueryKind::Read,
+            Duration::from_millis(99),
+            Some(1),
+        );
+        log_if_slow(
+            None,
+            "MATCH (n:Off) RETURN n",
+            QueryKind::Read,
+            Duration::from_secs(9),
+            Some(1),
+        );
+        log_if_slow(
+            bound,
+            "MATCH (n:Slow) RETURN n",
+            QueryKind::Read,
+            Duration::from_millis(100),
+            Some(7),
+        );
+    });
+    assert!(!lines.contains("Fast") && !lines.contains("Off"), "{lines}");
+    assert!(lines.contains("MATCH (n:Slow) RETURN n"), "{lines}");
+    assert!(
+        lines.contains("rows=7") && lines.contains("duration_ms=100"),
+        "{lines}"
+    );
+    assert!(
+        lines.contains("kind=\"read\"") && lines.contains("truncated=false"),
+        "{lines}"
+    );
+
+    // 'é' is two bytes, so the limit falls inside a character.
+    let long = format!("RETURN '{}'", "é".repeat(2048));
+    let lines = slow_lines(|| {
+        log_if_slow(
+            bound,
+            &long,
+            QueryKind::Failed,
+            Duration::from_secs(1),
+            None,
+        );
+    });
+    assert!(lines.contains("truncated=true"), "{lines}");
+    assert!(
+        !lines.contains("rows="),
+        "a failure returns no rows: {lines}"
+    );
+}
+
 /// What a statement leaves out comes from the defaults, what it names wins,
 /// and the write concern it leaves out stays unset for the database to fill.
 #[test]

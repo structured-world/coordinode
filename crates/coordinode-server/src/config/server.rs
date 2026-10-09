@@ -281,6 +281,9 @@ pub struct ServerConfig {
     /// read again, in seconds (`None` = 60). A read that fails is remembered
     /// for the same time.
     pub planner_stats_ttl_secs: Option<u64>,
+    /// Statements running at least this long, in milliseconds, are logged
+    /// with their text (`None` = 100; 0 logs every statement).
+    pub slow_query_ms: Option<u64>,
     /// How long a query waits for a vector index still being built, under
     /// the `block` policy, when it names no bound of its own, in milliseconds
     /// (`None` = 30000). A query's `vector_build_wait` hint overrides it.
@@ -459,6 +462,7 @@ impl Default for ServerConfig {
             raft_snapshot_log_bytes: None,
             raft_snapshot_min_interval_secs: None,
             planner_stats_ttl_secs: None,
+            slow_query_ms: None,
             vector_build_wait_ms: None,
             vector_retired_bytes_budget: None,
             index_build_max_running: None,

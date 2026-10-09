@@ -174,6 +174,18 @@ fn planner_stats_ttl_parses_from_the_config_file() {
     assert_eq!(c.planner_stats_ttl_secs, Some(5));
 }
 
+/// The slow-statement bound is a config-file setting: unset it leaves the
+/// built-in 100 ms, set it carries the milliseconds given, 0 included.
+#[test]
+fn slow_query_bound_parses_from_the_config_file() {
+    assert!(ServerConfig::default().slow_query_ms.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "slow_query_ms: 0\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.slow_query_ms, Some(0));
+}
+
 /// The default bound on waiting for a building vector index is a config-file
 /// setting: unset it leaves the database default, set it carries the
 /// milliseconds given.
