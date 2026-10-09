@@ -2314,7 +2314,7 @@ impl Database {
     /// window releases history and the storage that held it, widening it
     /// cannot bring back history an earlier compaction already released.
     /// Configured at open via `StorageConfig::retention_window_secs`
-    /// (default seven days).
+    /// (default five minutes).
     pub fn set_retention_window(&self, window: Duration) {
         self.engine.set_retention_window(window);
     }

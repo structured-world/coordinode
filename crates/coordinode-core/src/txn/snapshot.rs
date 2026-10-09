@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::txn::timestamp::Timestamp;
 
-/// Default retention window for MVCC versions (7 days).
-pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Default retention window for MVCC versions (5 minutes).
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(300);
 
 /// A consistent read snapshot at a specific timestamp.
 ///

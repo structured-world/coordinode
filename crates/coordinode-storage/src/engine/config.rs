@@ -674,7 +674,9 @@ pub struct StorageConfig {
     /// lagging registered consumer can hold it back further, never less.
     /// Runtime-tunable via `StorageEngine::set_retention_window`. Inert on a
     /// counter-seqno engine (no oracle): its seqnos are not a clock.
-    /// Default: 7 days.
+    /// Default: 5 minutes. Every version of a key written inside the window
+    /// is kept, so a long window makes frequently updated keys cost every
+    /// read and compaction their whole history.
     pub retention_window_secs: u64,
 
     /// Ceiling on the invariant claims held by all in-flight attempts on this
@@ -933,7 +935,7 @@ impl StorageConfig {
             oplog_segment_max_entries: 50_000,
             oplog_retention_secs: 7 * 24 * 3600,
             oplog_sync_method: SyncMethod::default(),
-            retention_window_secs: 7 * 24 * 3600,
+            retention_window_secs: 300,
             max_invariant_claims: 100_000,
             max_commits_in_flight: 10_000,
             snapshot_wait_ms: 5,

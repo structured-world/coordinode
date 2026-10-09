@@ -391,7 +391,7 @@ AS OF TIMESTAMP '2026-03-15T10:00:00Z'
 
 The `AS OF TIMESTAMP` clause applies to the entire query. All MATCH patterns read from the MVCC snapshot at the given timestamp. A string that is not an RFC 3339 timestamp (a bare date, a missing zone offset) is refused rather than read as the current state.
 
-**Retention:** 7 days by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
+**Retention:** 5 minutes by default (`retention_window_secs`, server and embedded alike). A query older than the retention horizon is refused with `OUT_OF_RANGE` (reason `OUTSIDE_RETENTION`, metadata `oldest_readable_ts`) rather than answered from partially collected history.
 
 **Vector and full-text search at a timestamp.** A vector or full-text index holds the current state, and a time-travel query is still answered through it: every node written after the timestamp (found from the stored version history) is left out of the index's answer and read from the snapshot instead, its text matched or its vector ranked as it was then, and full-text scores use the corpus as it stood at the timestamp. The answer is the snapshot's, at any timestamp in the retention window; the cost grows with the number of nodes written since the timestamp. The same applies to `ReadConcern.at_timestamp`.
 

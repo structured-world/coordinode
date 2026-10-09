@@ -71,7 +71,7 @@ Over gRPC the same receipt is `CommitTransactionResponse { applied_index, commit
 
 ## Time-Travel Queries
 
-MVCC retains older versions of data for the configured retention window (`retention_window_secs`, default seven days, in every deployment mode including embedded). You can query historical snapshots in two ways.
+MVCC retains older versions of data for the configured retention window (`retention_window_secs`, default five minutes, in every deployment mode including embedded). You can query historical snapshots in two ways.
 
 **Cypher in-line syntax** for ad-hoc queries:
 
@@ -98,7 +98,7 @@ Constraints:
 
 - `at_timestamp` is only valid with `level = SNAPSHOT`. Combining it with `MAJORITY` / `LOCAL` / `LINEARIZABLE` returns `FAILED_PRECONDITION`.
 - `at_timestamp` and `after_index` are mutually exclusive — pinning to a specific HLC and waiting for a Raft index are contradictory. The server returns `InvalidArgument` if both are non-zero.
-- Reads older than the MVCC retention horizon return `OUT_OF_RANGE` with `ErrorInfo.reason = OUTSIDE_RETENTION` and `oldest_readable_ts` in the metadata: the earliest timestamp the same read succeeds at. The horizon is `now - retention_window_secs` (default seven days), held further back only while a live snapshot pin still needs older history. The refusal is deliberate: history below the horizon may already be collected, and a read there could otherwise answer with a newer version or nothing. The same applies to `AS OF TIMESTAMP` in Cypher.
+- Reads older than the MVCC retention horizon return `OUT_OF_RANGE` with `ErrorInfo.reason = OUTSIDE_RETENTION` and `oldest_readable_ts` in the metadata: the earliest timestamp the same read succeeds at. The horizon is `now - retention_window_secs` (default five minutes), held further back only while a live snapshot pin still needs older history. The refusal is deliberate: history below the horizon may already be collected, and a read there could otherwise answer with a newer version or nothing. The same applies to `AS OF TIMESTAMP` in Cypher.
 
 Typical use: auditing, debugging, time-aligned analytics across multiple queries that must observe the same database state.
 

@@ -8,9 +8,9 @@ fn snapshot_read_ts() {
 }
 
 #[test]
-fn retention_default_is_7_days() {
+fn retention_default_is_5_minutes() {
     let policy = RetentionPolicy::default();
-    assert_eq!(policy.window(), Duration::from_secs(7 * 24 * 3600));
+    assert_eq!(policy.window(), Duration::from_secs(300));
 }
 
 #[test]

@@ -706,7 +706,7 @@ read the label is unaffected.
 
 #### AS OF TIMESTAMP 🔷
 
-Read data as it was at a specific timestamp (microsecond precision). Retention window: 7 days.
+Read data as it was at a specific timestamp (microsecond precision). Retention window: 5 minutes by default (`retention_window_secs`).
 
 ```cypher
 MATCH (u:User {id: 42})

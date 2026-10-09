@@ -320,7 +320,7 @@ pub struct ServerConfig {
     pub cache_size_mb: Option<u64>,
     /// Memtable size in MiB (`None` = engine default).
     pub write_buffer_mb: Option<u64>,
-    /// MVCC time-travel / `AS OF TIMESTAMP` horizon in seconds (`None` = 7 days).
+    /// MVCC time-travel / `AS OF TIMESTAMP` horizon in seconds (`None` = 300).
     pub retention_window_secs: Option<u64>,
     /// Ceiling on the invariant claims held by all in-flight write attempts on
     /// this node, together (`None` = 100000).

@@ -2411,7 +2411,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
         .await
         .expect("create");
 
-    // Read pinned to ts=1 (epoch + 1µs, far below `now - 7d`).
+    // Read pinned to ts=1 (epoch + 1µs, far below the horizon).
     let status = svc
         .execute_cypher(Request::new(query::ExecuteCypherRequest {
             query: "MATCH (n:Past) RETURN n.id".to_string(),
@@ -2440,7 +2440,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
         .expect("numeric");
     assert!(oldest > 1, "the horizon is a real timestamp, got {oldest}");
 
-    // The same read just above the horizon succeeds (empty: seven days ago
+    // The same read just above the horizon succeeds (empty: the horizon
     // predates the write), and at the top of time sees the write. A second
     // past the horizon keeps clear of the wall clock moving it forward
     // between the two calls.
@@ -2465,10 +2465,7 @@ async fn grpc_at_timestamp_below_retention_horizon_is_out_of_range() {
         .await
         .expect("a read above the horizon is served")
         .into_inner();
-    assert!(
-        at_horizon.rows.is_empty(),
-        "seven days ago predates the write"
-    );
+    assert!(at_horizon.rows.is_empty(), "the horizon predates the write");
     let latest = svc
         .execute_cypher(at(u64::MAX))
         .await

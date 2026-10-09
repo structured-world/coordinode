@@ -1378,9 +1378,9 @@ fn retention_window_comes_from_storage_config() {
     assert_eq!(engine.gc_watermark(), engine.snapshot() - 2_000_000);
 }
 
-/// The default window is seven days, matching the documented default.
+/// The default window is five minutes, matching the documented default.
 #[test]
-fn default_retention_window_is_seven_days() {
+fn default_retention_window_is_five_minutes() {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
         "/nonexistent",
@@ -1388,7 +1388,7 @@ fn default_retention_window_is_seven_days() {
         Durability::Durable,
         Tier::Warm,
     )]);
-    assert_eq!(config.retention_window_secs, 7 * 24 * 3600);
+    assert_eq!(config.retention_window_secs, 300);
 }
 
 /// The engine's own guard is a policy boundary; the tree keeps a physical one

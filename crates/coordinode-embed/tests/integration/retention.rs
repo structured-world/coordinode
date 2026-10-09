@@ -74,7 +74,7 @@ fn compact(db: &Database) {
 fn as_of_inside_the_window_is_exact_across_compaction() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = open_db(dir.path());
-    assert_eq!(db.retention_window(), Duration::from_secs(7 * 24 * 3600));
+    assert_eq!(db.retention_window(), Duration::from_secs(300));
 
     let first = commit_anchor(&mut db, 1);
     advance_clock(&db, Duration::from_secs(60));
