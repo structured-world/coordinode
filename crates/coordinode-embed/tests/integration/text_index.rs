@@ -458,6 +458,25 @@ fn fuzzy_and_snippet_searches_answer_unfolded_writes_from_the_store() {
     );
 }
 
+/// The fuzzy form the query syntax documents, `word~N`, matches words within
+/// N edits of `word`.
+#[test]
+fn a_documented_fuzzy_term_matches_within_its_distance() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'raft consensus algorithm'})")
+        .expect("create a");
+    db.execute_cypher("CREATE (:Article {title: 'b', body: 'cooking recipes'})")
+        .expect("create b");
+    assert_eq!(titles(&mut db, "konsensus~2"), ["a"], "two edits away");
+    assert_eq!(titles(&mut db, "consensos~1"), ["a"], "one edit away");
+    assert!(
+        titles(&mut db, "kansensos~1").is_empty(),
+        "three edits away"
+    );
+}
+
 /// When the writes the index lacks are not known (an event was dropped), a
 /// search reads every node of the label from the store instead of trusting
 /// the index for any of them.

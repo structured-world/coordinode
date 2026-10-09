@@ -12,6 +12,7 @@
 mod corpus;
 pub mod multi_lang;
 pub mod pending;
+mod query_syntax;
 pub mod scratch_dir;
 pub mod segment_registry;
 pub mod tokenize;
@@ -115,6 +116,10 @@ pub enum TextSearchError {
 
     #[error("query parse error: {0}")]
     QueryParse(#[from] tantivy::query::QueryParserError),
+
+    /// The text search query is malformed.
+    #[error(transparent)]
+    QuerySyntax(#[from] query_syntax::QuerySyntaxError),
 
     #[error("index not found or corrupted: {0}")]
     IndexCorrupted(String),
@@ -904,23 +909,20 @@ impl TextIndex {
     /// searching a multi-language index with a language different from
     /// the index default.
     ///
-    /// Supports `word*` prefix syntax: prefix terms are extracted before
-    /// tokenization and converted to PhrasePrefixQuery.
-    ///
-    /// Terms are combined with OR (any term match). For AND semantics,
-    /// use the standard `search()` method with boolean query syntax.
+    /// The query is in the text query language: words (any of them
+    /// matching), phrases, `AND` / `OR` / `NOT`, `word*`, `word~N`, `^B`.
     pub fn search_with_language(
         &self,
         query_str: &str,
         limit: usize,
         language: &str,
     ) -> Result<Vec<TextSearchResult>, TextSearchError> {
-        let Some(query) = self.language_query(query_str, language) else {
+        let Some(query) = self.language_query(query_str, language)? else {
             return Ok(Vec::new());
         };
         Ok(self
             .collect(
-                &query,
+                &*query,
                 Matches::Top(limit),
                 &PendingDocuments::none(),
                 pending::Highlight::Off,
@@ -933,30 +935,27 @@ impl TextIndex {
             .collect())
     }
 
-    /// The query of a language search: `query_str` tokenized by `language`'s
-    /// pipeline, its terms OR-ed together, `word*` terms as phrase prefixes;
-    /// `None` when it leaves nothing to search for.
-    fn language_query(&self, query_str: &str, language: &str) -> Option<BooleanQuery> {
-        let (prefix_terms, remainder) = extract_prefix_terms(query_str);
-        let tokens = tokenize::tokenize_text(remainder.trim(), language);
-        if tokens.is_empty() && prefix_terms.is_empty() {
-            return None;
-        }
-        let mut subqueries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
-            .into_iter()
-            .map(|tok| {
-                let term = tantivy::Term::from_field_text(self.body_field, &tok.text);
-                let tq = TermQuery::new(term, IndexRecordOption::WithFreqs);
-                (
-                    Occur::Should,
-                    Box::new(tq) as Box<dyn tantivy::query::Query>,
-                )
-            })
-            .collect();
-        for prefix in &prefix_terms {
-            subqueries.push((Occur::Should, Box::new(self.prefix_query(prefix))));
-        }
-        Some(BooleanQuery::new(subqueries))
+    /// The query of a language search: `query_str` in the text query
+    /// language (see the `query_syntax` module), each word and phrase
+    /// analyzed by `language`'s pipeline; `None` when it leaves nothing to
+    /// search for.
+    ///
+    /// # Errors
+    ///
+    /// [`TextSearchError::QuerySyntax`] for a malformed query.
+    fn language_query(
+        &self,
+        query_str: &str,
+        language: &str,
+    ) -> Result<Option<Box<dyn tantivy::query::Query>>, TextSearchError> {
+        let prefix =
+            |stem: &str| -> Box<dyn tantivy::query::Query> { Box::new(self.prefix_query(stem)) };
+        Ok(query_syntax::build(
+            query_str,
+            self.body_field,
+            language,
+            &prefix,
+        )?)
     }
 
     /// Search with highlighted snippets using language-aware tokenization.
@@ -973,11 +972,11 @@ impl TextIndex {
         limit: usize,
         language: &str,
     ) -> Result<Vec<HighlightedResult>, TextSearchError> {
-        let Some(query) = self.language_query(query_str, language) else {
+        let Some(query) = self.language_query(query_str, language)? else {
             return Ok(Vec::new());
         };
         self.collect(
-            &query,
+            &*query,
             Matches::Top(limit),
             &PendingDocuments::none(),
             pending::Highlight::Query,

@@ -641,6 +641,79 @@ fn merged_and_reopened_segments_keep_the_final_statistics() {
     }
 }
 
+/// Every form of the documented query language matches what it says, and the
+/// same on the index and on pending documents: fuzzy words within their
+/// distance, exact phrases and slop, AND / OR / NOT with parentheses,
+/// prefixes and boosts, each word analyzed as the documents were.
+#[test]
+fn the_query_language_matches_on_the_index_and_on_pending_documents() {
+    let docs: [(u64, &str); 4] = [
+        (1, "raft consensus algorithm for distributed systems"),
+        (2, "paxos consensus in distributed databases"),
+        (3, "zookeeper raft coordination"),
+        (4, "consensus raft cooking"),
+    ];
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let indexed = fresh(dirs.0.path(), &docs);
+    let empty = fresh(dirs.1.path(), &[]);
+    let pending = empty
+        .pending(
+            Some(&[]),
+            &docs
+                .iter()
+                .map(|(id, body)| (*id, props(&[("body", body)])))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let check = |query: &str, expected: &[u64]| {
+        let mut on_index = found(&indexed, query, &PendingDocuments::none());
+        on_index.sort_unstable();
+        let mut on_pending = found(&empty, query, &pending);
+        on_pending.sort_unstable();
+        assert_eq!(on_index, expected, "{query} over the index");
+        assert_eq!(on_pending, expected, "{query} over pending documents");
+    };
+    check("konsensus~2", &[1, 2, 4]);
+    check("consensos~1", &[1, 2, 4]);
+    check("kansensos~1", &[]);
+    check("\"raft consensus\"", &[1]);
+    check("\"consensus raft\"", &[4]);
+    check("\"raft algorithm\"~1", &[1]);
+    check("\"raft algorithm\"", &[]);
+    check("raft AND (consensus OR paxos) NOT zookeeper", &[1, 4]);
+    check("paxos OR zookeeper", &[2, 3]);
+    check("distribut*", &[1, 2]);
+    check("NOT raft", &[2]);
+    // Stemmed as the documents were: "systems" was stored as "system".
+    check("system", &[1]);
+    // A boost reorders, it does not filter.
+    check("paxos^3 OR raft", &[1, 2, 3, 4]);
+    let score_of = |query: &str, node: u64| {
+        scores(&indexed, query, &PendingDocuments::none())
+            .into_iter()
+            .find(|(id, _)| *id == node)
+            .map(|(_, score)| score)
+            .unwrap()
+    };
+    let plain = score_of("paxos OR raft", 2);
+    let boosted = score_of("paxos^10 OR raft", 2);
+    assert!(
+        (boosted - 10.0 * plain).abs() < 1e-3 * boosted,
+        "{plain} x10 vs {boosted}"
+    );
+}
+
+/// A malformed query is refused, not searched as words.
+#[test]
+fn a_malformed_query_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = fresh(dir.path(), &[(1, "raft consensus")]);
+    assert!(matches!(
+        idx.find(terms("(raft"), Matches::All, &PendingDocuments::none()),
+        Err(TextSearchError::QuerySyntax(_))
+    ));
+}
+
 /// A search with pending documents ranks as the index holding the final
 /// documents would: the superseded ones leave the statistics and the pending
 /// ones join them.

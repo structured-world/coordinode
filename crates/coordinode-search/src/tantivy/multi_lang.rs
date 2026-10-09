@@ -500,8 +500,8 @@ impl MultiLanguageTextIndex {
                 } else {
                     Highlight::Off
                 };
-                match self.inner.language_query(query, language) {
-                    Some(query) => self.inner.collect(&query, matches, pending, highlight),
+                match self.inner.language_query(query, language)? {
+                    Some(query) => self.inner.collect(&*query, matches, pending, highlight),
                     None => Ok(Vec::new()),
                 }
             }

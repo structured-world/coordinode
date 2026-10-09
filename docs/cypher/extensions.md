@@ -295,11 +295,12 @@ WHERE text_match(doc.body, "distributed consensus algorithm")
 RETURN doc.title, text_score(doc.body, "distributed consensus algorithm") AS relevance
 ORDER BY relevance DESC LIMIT 10
 
--- Fuzzy: Levenshtein distance ≤ 2
+-- Fuzzy: words within N edits (N from 0 to 2; `konsensus~` means 2)
 WHERE text_match(doc.body, "konsensus~2")
 
--- Phrase: exact word sequence
+-- Phrase: exact word sequence; "…"~N allows N positions of slop
 WHERE text_match(doc.body, '"raft consensus"')
+WHERE text_match(doc.body, '"raft algorithm"~1')
 
 -- Boolean operators
 WHERE text_match(doc.body, "raft AND (consensus OR paxos) NOT zookeeper")
@@ -310,6 +311,8 @@ WHERE text_match(doc.body, "distribut*")
 -- Per-term boosting
 WHERE text_match(doc.body, "name^3 OR description^1")
 ```
+
+Words side by side are alternatives (`raft paxos` is `raft OR paxos`); `AND` binds tighter than `OR`, `NOT` excludes the word or group after it, and the operators are upper case (`and` is searched as a word). Words and phrases go through the index's language pipeline, so `systems` finds documents stored with `system`. A fuzzy or prefix word is lower-cased but not stemmed, as in Lucene: the distance counts edits between the typed word and the stored one. An edit is an insertion, a deletion, a substitution or a swap of neighbouring letters. A malformed query (an unclosed parenthesis or quote, an operator with nothing after it, a distance above 2) is refused with an error rather than searched as plain words.
 
 ### Supported Languages {#supported-languages}
 
