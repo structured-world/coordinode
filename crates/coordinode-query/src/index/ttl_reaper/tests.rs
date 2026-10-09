@@ -948,6 +948,112 @@ fn content_holder(
         .expect("holder")
 }
 
+/// Seed `record` for `node` with its entry in the `created_at` `index`.
+fn seed_with_anchor_entry(
+    engine: &StorageEngine,
+    index: &super::super::IndexDefinition,
+    node: u64,
+    record: &NodeRecord,
+    created_at_us: i64,
+) {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_storage::engine::transaction::Transaction;
+    seed_node_record(engine, 1, NodeId::from_raw(node), record);
+    let mut txn = Transaction::new(engine, None, Timestamp::ZERO, None);
+    let no_fields = |_: &str| None;
+    LocalIndexStore::new(engine)
+        .stage_membership(
+            &mut txn,
+            index,
+            &no_fields,
+            coordinode_core::index::derive::EntryOwner::node(node),
+            None,
+            Some(&[Value::Timestamp(created_at_us)]),
+        )
+        .expect("seed entry");
+}
+
+/// With a ready index on the anchor, a pass finds its candidates in the
+/// index, below the expiry bound, and reads the shard not at all: the fresh
+/// nodes of the label and the nodes of other labels are never read, and only
+/// the expired candidates are decoded.
+#[test]
+fn a_ready_anchor_index_supplies_the_candidates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let index = publish_index(
+        &engine,
+        super::super::IndexDescriptor::btree("s_created", "Session", "created_at"),
+    );
+    let now = now_us();
+    let old = now - 2 * 3600 * 1_000_000;
+    for node in 1..=3u64 {
+        seed_with_anchor_entry(&engine, &index, node, &session(&mut interner, old), old);
+    }
+    for node in 4..=40u64 {
+        seed_with_anchor_entry(&engine, &index, node, &session(&mut interner, now), now);
+    }
+    let blob = interner.intern("state");
+    for node in 100..120u64 {
+        let mut other = NodeRecord::new("State");
+        other.set(blob, Value::Blob(vec![7; 16 * 1024]));
+        seed_node_record(&engine, 1, NodeId::from_raw(node), &other);
+    }
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+
+    assert_eq!(result.nodes_deleted, 3, "{:?}", result.errors);
+    assert_eq!(result.records_scanned, 0, "the shard is not read");
+    assert_eq!(result.records_decoded, 3, "only the candidates are read");
+    for node in 1..=3 {
+        assert!(!node_exists(&engine, 1, node));
+    }
+    assert!(node_exists(&engine, 1, 4) && node_exists(&engine, 1, 100));
+}
+
+/// An index still being built is not evidence that a node absent from it
+/// has not expired: the pass reads the shard for that target.
+#[test]
+fn an_anchor_index_being_built_is_not_trusted() {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_storage::engine::transaction::Transaction;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let mut interner = FieldInterner::new();
+    persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Node));
+    let mut index = publish_index(
+        &engine,
+        super::super::IndexDescriptor::btree("s_created", "Session", "created_at"),
+    );
+    index.state = super::super::IndexState::Building {
+        written: 0,
+        estimated_total: 2,
+    };
+    LocalIndexStore::new(&engine)
+        .put_definition_txn(
+            &mut Transaction::new(&engine, None, Timestamp::ZERO, None),
+            &index,
+        )
+        .expect("mark building");
+    let old = now_us() - 2 * 3600 * 1_000_000;
+    // Expired, and not yet in the index.
+    seed_node_record(
+        &engine,
+        1,
+        NodeId::from_raw(1),
+        &session(&mut interner, old),
+    );
+
+    let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
+
+    assert_eq!(result.nodes_deleted, 1, "{:?}", result.errors);
+    assert_eq!(result.records_scanned, 1, "the shard is read");
+    assert!(!node_exists(&engine, 1, 1));
+}
+
 /// A reaped node's B-tree entries go with it: its unique value is free for
 /// a new node, the live node keeps its own.
 #[test]
@@ -996,18 +1102,13 @@ fn an_indexed_property_is_not_expired_by_field() {
     let engine = test_engine(dir.path());
     let mut interner = FieldInterner::new();
     persist_schema(&engine, &make_ttl_schema("Session", 3600, TtlScope::Field));
-    publish_index(
+    let index = publish_index(
         &engine,
         super::super::IndexDescriptor::btree("s_created", "Session", "created_at"),
     );
-    insert_node(
-        &engine,
-        1,
-        1,
-        "Session",
-        now_us() - 2 * 3600 * 1_000_000,
-        &mut interner,
-    );
+    // A ready index holds an entry for every node of its label.
+    let old = now_us() - 2 * 3600 * 1_000_000;
+    seed_with_anchor_entry(&engine, &index, 1, &session(&mut interner, old), old);
 
     let result = reap_computed_ttl_with_interner(&engine, 1, 1000, &interner);
     assert_eq!(result.fields_removed, 0);

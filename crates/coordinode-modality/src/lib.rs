@@ -87,7 +87,7 @@ pub use encrypted_index::{
     EncryptedIndexDefinition, EncryptedIndexStore, LocalEncryptedIndexStore,
 };
 pub use error::{StoreError, StoreResult};
-pub use index::{IndexStore, LocalIndexStore};
+pub use index::{EntryPage, IndexStore, LocalIndexStore};
 pub use index_def::{
     BuildFailure, BuildState, DuplicateRepair, DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId,
     IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,

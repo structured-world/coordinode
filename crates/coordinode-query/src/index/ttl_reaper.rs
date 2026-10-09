@@ -140,6 +140,25 @@ impl BtreeIndexes {
         })
     }
 
+    /// A ready B-tree index holding exactly the `anchor` property of every
+    /// node of `label`, which can supply the TTL candidates of the label in
+    /// anchor order. An index still building is not evidence that a node it
+    /// lacks has not expired, and a partial index leaves out nodes its filter
+    /// rejects, so neither qualifies; a sparse one only leaves out nodes
+    /// without the anchor, which never expire.
+    fn anchor_index(&self, label: &str, anchor: &str) -> Option<super::IndexDefinition> {
+        self.registry
+            .indexes_for_property(label, anchor)
+            .into_iter()
+            .find(|def| {
+                def.index_type == super::IndexType::BTree
+                    && def.properties.len() == 1
+                    && def.filter.is_none()
+                    && !def.multikey
+                    && def.state == super::IndexState::Ready
+            })
+    }
+
     /// Whether a reaped node's entries can be named: a label with B-tree
     /// indexes needs the values they index, which a pass without the field
     /// dictionary cannot read.
@@ -466,6 +485,25 @@ fn reap_shard<'a>(
             continue;
         }
         let cutoff_us = now_us - (target.duration_secs as i64 * 1_000_000);
+        // A target with a ready index on its anchor reads its candidates
+        // there and leaves the shard alone.
+        if let Some(index) = target
+            .indexes
+            .anchor_index(&target.label, &target.anchor_field)
+        {
+            reap_through_index(
+                engine,
+                shard_id,
+                target,
+                &index,
+                cutoff_us,
+                max_deletions,
+                oracle,
+                commit,
+                result,
+            );
+            continue;
+        }
         by_label
             .entry(target.label.as_str())
             .or_default()
@@ -575,59 +613,218 @@ fn reap_shard<'a>(
             }
         }
 
-        if !changed.is_empty() {
-            // Every record the page changes is conditioned on the version the
-            // page read: the expiry was decided against that version, and a
-            // renewal is a later one.
-            let committed = match nodes.condition_unchanged(&mut txn, &changed) {
-                Ok(true) => match commit(&mut txn) {
-                    Ok(()) => true,
-                    Err(
-                        CommitError::Conflict(_)
-                        | CommitError::RevisionMismatch { .. }
-                        | CommitError::InvariantRefused { .. },
-                    ) => false,
-                    Err(e) => {
-                        result.errors.push(format!("commit: {e}"));
-                        break;
-                    }
-                },
-                Ok(false) => false,
-                Err(e) => {
-                    result.errors.push(format!("condition: {e}"));
-                    break;
-                }
-            };
-            if !committed {
+        match commit_page(&mut txn, &changed, commit, &mut result.errors) {
+            PageCommit::Done => {}
+            PageCommit::Retry => {
                 retries += 1;
                 if retries <= MAX_PAGE_RETRIES {
                     continue;
                 }
-                result.errors.push(
-                    "a page kept changing under the reaper; left for the next pass".to_string(),
-                );
-                page_result = ComputedTtlReapResult {
-                    nodes_checked: page_result.nodes_checked,
-                    records_scanned: page_result.records_scanned,
-                    records_decoded: page_result.records_decoded,
-                    errors: page_result.errors,
-                    ..ComputedTtlReapResult::default()
-                };
+                page_result = left_for_next_pass(page_result);
             }
+            PageCommit::Abort => break,
         }
         retries = 0;
-        result.nodes_checked += page_result.nodes_checked;
-        result.records_scanned += page_result.records_scanned;
-        result.records_decoded += page_result.records_decoded;
-        result.nodes_deleted += page_result.nodes_deleted;
-        result.fields_removed += page_result.fields_removed;
-        result.subtrees_removed += page_result.subtrees_removed;
-        result.errors.extend(page_result.errors);
+        absorb(result, page_result);
         if page.exhausted {
             break;
         }
         start_after = page.last_key;
     }
+}
+
+/// Reap `target` from the candidates its ready anchor `index` holds below
+/// `cutoff_us`, in anchor order, a page at a time. The index only proposes:
+/// each candidate is read and decided on its record as the page's view holds
+/// it, and the page commits conditioned on those versions, as a shard page
+/// does. Anchors are kept as timestamps or as integers, so both ranges are
+/// read.
+#[allow(clippy::too_many_arguments)]
+fn reap_through_index<'a>(
+    engine: &'a StorageEngine,
+    shard_id: u16,
+    target: &TtlTarget,
+    index: &super::IndexDefinition,
+    cutoff_us: i64,
+    max_deletions: usize,
+    oracle: Option<&'a TimestampOracle>,
+    commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
+    result: &mut ComputedTtlReapResult,
+) {
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+
+    let store = LocalIndexStore::new(engine);
+    let nodes = LocalNodeStore;
+    let ranges = [
+        (Value::Int(i64::MIN), Value::Int(cutoff_us)),
+        (Value::Timestamp(i64::MIN), Value::Timestamp(cutoff_us)),
+    ];
+    for (from, to) in &ranges {
+        let mut after: Option<Vec<u8>> = None;
+        let mut retries = 0u32;
+        while result.total_deletions() < max_deletions {
+            let mut txn = match oracle {
+                Some(oracle) => Transaction::begin(engine, Some(oracle), oracle.next()),
+                None => Transaction::new(engine, None, Timestamp::ZERO, None),
+            };
+            let page =
+                match store.scan_entries_in(&mut txn, index, from, to, after.as_deref(), PAGE) {
+                    Ok(Some(page)) => page,
+                    Ok(None) => break,
+                    Err(e) => {
+                        result
+                            .errors
+                            .push(format!("label {}: index scan: {e}", target.label));
+                        return;
+                    }
+                };
+            // The reaper reaps nodes, not single versions of temporal ones.
+            let ids: Vec<NodeId> = page
+                .entries
+                .iter()
+                .filter(|(_, valid_from)| valid_from.is_none())
+                .map(|(id, _)| *id)
+                .collect();
+            let edge_types = match list_edge_types(engine) {
+                Ok(types) => types,
+                Err(e) => {
+                    result.errors.push(format!("edge type scan error: {e}"));
+                    return;
+                }
+            };
+            let records = match nodes.get_many(&txn, shard_id, &ids) {
+                Ok(records) => records,
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("label {}: candidate read: {e}", target.label));
+                    return;
+                }
+            };
+            let budget = max_deletions - result.total_deletions();
+            let mut page_result = ComputedTtlReapResult::default();
+            let mut changed: Vec<Vec<u8>> = Vec::new();
+            for (node_id, record) in ids.iter().zip(records) {
+                if page_result.total_deletions() >= budget {
+                    break;
+                }
+                // Gone since the entry was read: nothing to reap.
+                let Some(record) = record else {
+                    continue;
+                };
+                page_result.records_decoded += 1;
+                let key = coordinode_core::graph::node::encode_node_key(shard_id, *node_id);
+                match stage_expired(
+                    engine,
+                    &mut txn,
+                    shard_id,
+                    target,
+                    *node_id,
+                    &key,
+                    &record,
+                    cutoff_us,
+                    &edge_types,
+                    &mut page_result,
+                ) {
+                    Ok(true) => changed.push(key),
+                    Ok(false) => {}
+                    Err(e) => {
+                        result.errors.push(format!(
+                            "label {}: node {}: {e}",
+                            target.label,
+                            node_id.as_raw()
+                        ));
+                        return;
+                    }
+                }
+            }
+            match commit_page(&mut txn, &changed, commit, &mut result.errors) {
+                PageCommit::Done => {}
+                PageCommit::Retry => {
+                    retries += 1;
+                    if retries <= MAX_PAGE_RETRIES {
+                        continue;
+                    }
+                    page_result = left_for_next_pass(page_result);
+                }
+                PageCommit::Abort => return,
+            }
+            retries = 0;
+            absorb(result, page_result);
+            if page.exhausted {
+                break;
+            }
+            after = page.resume;
+        }
+    }
+}
+
+/// What became of a page's staged work at its commit.
+enum PageCommit {
+    /// Committed, or nothing to commit.
+    Done,
+    /// Refused for a concurrent change: read the page again.
+    Retry,
+    /// Failed for another reason, recorded; the pass stops.
+    Abort,
+}
+
+/// Commit a page's staged work, conditioned on the version of every record
+/// it changes: the expiry was decided against that version, and a renewal
+/// is a later one.
+fn commit_page<'a>(
+    txn: &mut Transaction<'a>,
+    changed: &[Vec<u8>],
+    commit: &mut dyn FnMut(&mut Transaction<'a>) -> Result<(), CommitError>,
+    errors: &mut Vec<String>,
+) -> PageCommit {
+    if changed.is_empty() {
+        return PageCommit::Done;
+    }
+    match LocalNodeStore.condition_unchanged(txn, changed) {
+        Ok(true) => match commit(txn) {
+            Ok(()) => PageCommit::Done,
+            Err(
+                CommitError::Conflict(_)
+                | CommitError::RevisionMismatch { .. }
+                | CommitError::InvariantRefused { .. },
+            ) => PageCommit::Retry,
+            Err(e) => {
+                errors.push(format!("commit: {e}"));
+                PageCommit::Abort
+            }
+        },
+        Ok(false) => PageCommit::Retry,
+        Err(e) => {
+            errors.push(format!("condition: {e}"));
+            PageCommit::Abort
+        }
+    }
+}
+
+/// A page refused more times than it is retried: what it read is counted,
+/// what it would have changed is not, and the next pass reads it again.
+fn left_for_next_pass(page: ComputedTtlReapResult) -> ComputedTtlReapResult {
+    let mut errors = page.errors;
+    errors.push("a page kept changing under the reaper; left for the next pass".to_string());
+    ComputedTtlReapResult {
+        nodes_checked: page.nodes_checked,
+        records_scanned: page.records_scanned,
+        records_decoded: page.records_decoded,
+        errors,
+        ..ComputedTtlReapResult::default()
+    }
+}
+
+/// Add a page's outcome to the pass's.
+fn absorb(result: &mut ComputedTtlReapResult, page: ComputedTtlReapResult) {
+    result.nodes_checked += page.nodes_checked;
+    result.records_scanned += page.records_scanned;
+    result.records_decoded += page.records_decoded;
+    result.nodes_deleted += page.nodes_deleted;
+    result.fields_removed += page.fields_removed;
+    result.subtrees_removed += page.subtrees_removed;
+    result.errors.extend(page.errors);
 }
 
 /// Records read per page of a reap pass, and so the most one page's

@@ -2352,6 +2352,51 @@ impl<'a> Transaction<'a> {
             exhausted,
         })
     }
+
+    /// At most `limit` rows of `part` with keys in `[start, end)`, in key
+    /// order, strictly after `start_after` when given, with the same paging,
+    /// snapshot and tracking contract as [`Self::prefix_scan_paged`]: an
+    /// ordered index read for the entries below a bound, which a prefix
+    /// cannot express.
+    pub fn range_scan_paged(
+        &mut self,
+        part: Partition,
+        start: &[u8],
+        end: &[u8],
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<PagedScan> {
+        let from = match start_after {
+            Some(after) if after >= start => {
+                let mut s = after.to_vec();
+                s.push(0);
+                s
+            }
+            _ => start.to_vec(),
+        };
+        let mut rows: Vec<KvPair> = Vec::with_capacity(limit);
+        let mut exhausted = true;
+        if from.as_slice() < end {
+            // The engine's range bound is inclusive; `end` is not.
+            for guard in self.base_range_seekable(part, &from, end)? {
+                let (key, value) = guard.into_inner()?;
+                if key.as_ref() >= end {
+                    break;
+                }
+                if rows.len() == limit {
+                    exhausted = false;
+                    break;
+                }
+                rows.push((key.to_vec(), value.to_vec()));
+            }
+        }
+        let last_key = rows.last().map(|(k, _)| k.clone());
+        Ok(PagedScan {
+            rows,
+            last_key,
+            exhausted,
+        })
+    }
 }
 
 /// One page of a keyset-resumed prefix scan (see [`Transaction::prefix_scan_paged`]).

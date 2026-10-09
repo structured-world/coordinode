@@ -34,8 +34,8 @@ use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::derive::{EntryOwner, membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_entry, encode_tuple, encode_unique_entry_key, entries_prefix, entry_value_prefix,
-    generation_ranges, unique_entries_prefix,
+    decode_entry, encode_element, encode_tuple, encode_unique_entry_key, entries_prefix,
+    entry_value_prefix, generation_ranges, unique_entries_prefix,
 };
 use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::txn::proposal::Mutation;
@@ -50,6 +50,20 @@ use crate::index_def::{
     DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
     IndexId, IndexProfile, NamespaceIndexPolicy,
 };
+
+/// One page of an ordered read of index entries
+/// ([`IndexStore::scan_entries_in`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryPage {
+    /// The entries' owners in value order: the node, and the version's
+    /// `valid_from` for an entry of one version of a temporal node.
+    pub entries: Vec<(NodeId, Option<i64>)>,
+    /// The key of the last entry read, where the next page resumes; `None`
+    /// for an empty page.
+    pub resume: Option<Vec<u8>>,
+    /// No entry in the range follows this page.
+    pub exhausted: bool,
+}
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
 #[diagnostic::on_unimplemented(
@@ -123,6 +137,24 @@ pub trait IndexStore {
         index: &IndexDefinition,
         values: &[Value],
     ) -> StoreResult<Option<Vec<NodeId>>>;
+
+    /// One page of the entries of the single-property `index` whose value is
+    /// in `[from, to)`, in value order, after the entry key `after` when
+    /// given: the ordered read that finds the values below a bound without
+    /// reading the rest. `None` when `from` or `to` has no key.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable entry.
+    fn scan_entries_in(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        from: &Value,
+        to: &Value,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<Option<EntryPage>>;
 
     /// The node of every entry in `index`, in key order: a temporal node once
     /// per version with an entry.
@@ -601,6 +633,44 @@ impl IndexStore for LocalIndexStore<'_> {
         // versions are adjacent.
         out.dedup();
         Ok(Some(out))
+    }
+
+    fn scan_entries_in(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        from: &Value,
+        to: &Value,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<Option<EntryPage>> {
+        let prefix = if index.unique {
+            unique_entries_prefix(index.generation)
+        } else {
+            entries_prefix(index.generation)
+        };
+        // An element is self-delimiting and sorts in value order, so every
+        // entry holding a value in [from, to) lies between the generation
+        // prefix followed by each bound.
+        let mut start = prefix.to_vec();
+        let mut end = prefix.to_vec();
+        if encode_element(from, &mut start).is_err() || encode_element(to, &mut end).is_err() {
+            return Ok(None);
+        }
+        let page = txn.range_scan_paged(Partition::Idx, &start, &end, after, limit)?;
+        let mut entries = Vec::with_capacity(page.rows.len());
+        for (key, value) in &page.rows {
+            if index.unique {
+                entries.push((decode_holder(value)?, None));
+            } else if let Some((id, valid_from)) = decode_entry(index.generation, key) {
+                entries.push((NodeId::from_raw(id), valid_from));
+            }
+        }
+        Ok(Some(EntryPage {
+            entries,
+            resume: page.last_key,
+            exhausted: page.exhausted,
+        }))
     }
 
     fn scan_entry_ids(
