@@ -713,7 +713,7 @@ fn reap_through_index<'a>(
                     continue;
                 };
                 page_result.records_decoded += 1;
-                let key = coordinode_core::graph::node::encode_node_key(shard_id, *node_id);
+                let key = LocalNodeStore::record_key(shard_id, *node_id);
                 match stage_expired(
                     engine,
                     &mut txn,

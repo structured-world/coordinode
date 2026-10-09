@@ -15,6 +15,7 @@
 pub mod check;
 pub mod journal_stats;
 pub mod migrations;
+pub mod node_sizes;
 pub mod oplog;
 
 use std::path::{Path, PathBuf};

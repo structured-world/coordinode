@@ -1271,18 +1271,8 @@ fn set_property_updates_storage() {
     assert_eq!(record.get(name_id), Some(&Value::String("Alicia".into())));
 }
 
-/// `SET n.p = v` on a top-level property stages a property delta, not the
-/// whole record: a 20-byte heartbeat on a node that carries a large property
-/// must not rewrite that property on every update. Several items on one
-/// node stay deltas (a second item must not fold the first back into a
-/// whole write), every value keeps its type, and the stored record after
-/// the commit holds the new values next to the untouched ones.
-#[test]
-fn set_of_top_level_properties_stages_deltas_not_the_record() {
-    let (_dir, engine, mut interner) = setup_test_graph();
-    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
-    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
-
+/// The rows of the node named Alice.
+fn alice(ctx: &mut ExecutionContext<'_>) -> Vec<Row> {
     let rows = execute_node_scan(
         "n",
         &["User".to_string()],
@@ -1290,10 +1280,47 @@ fn set_of_top_level_properties_stages_deltas_not_the_record() {
             "name".to_string(),
             nx(Expr::Literal(Value::String("Alice".into()))),
         )],
-        &mut ctx,
+        ctx,
     )
     .expect("scan");
     assert_eq!(rows.len(), 1);
+    rows
+}
+
+/// SET `property` of Alice to `value` in a statement of its own, committed.
+fn set_alice(engine: &StorageEngine, interner: &mut FieldInterner, property: &str, value: Value) {
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let mut ctx = make_ctx(engine, interner, &allocator);
+    let rows = alice(&mut ctx);
+    let items = vec![crate::plan::SetItem::Property {
+        variable: "n".into(),
+        property: property.into(),
+        expr: nx(Expr::Literal(value)),
+    }];
+    execute_update(&rows, &items, &crate::plan::ViolationMode::Fail, &mut ctx).expect("set");
+    ctx.mvcc_flush().expect("commit");
+}
+
+/// Give Alice a property large enough that a change of another one is
+/// written as a delta.
+fn make_alice_large(engine: &StorageEngine, interner: &mut FieldInterner) {
+    set_alice(engine, interner, "bio", Value::String("x".repeat(4096)));
+}
+
+/// `SET n.p = v` on a top-level property of a large record stages a property
+/// delta, not the whole record: a 20-byte heartbeat on a node that carries a
+/// large property must not rewrite that property on every update. Several
+/// items on one node stay deltas (a second item must not fold the first back
+/// into a whole write), every value keeps its type, and the stored record
+/// after the commit holds the new values next to the untouched ones.
+#[test]
+fn set_of_top_level_properties_stages_deltas_not_the_record() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    make_alice_large(&engine, &mut interner);
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+    let rows = alice(&mut ctx);
     let items = vec![
         crate::plan::SetItem::Property {
             variable: "n".into(),
@@ -1347,25 +1374,17 @@ fn set_of_top_level_properties_stages_deltas_not_the_record() {
     );
 }
 
-/// `SET n += {map}` writes each key of the map as its own property delta:
-/// the properties the map does not name are not rewritten, and the values
-/// keep their types.
+/// `SET n += {map}` on a large record writes each key of the map as its own
+/// property delta: the properties the map does not name are not rewritten,
+/// and the values keep their types.
 #[test]
 fn set_of_a_property_map_stages_deltas_not_the_record() {
     let (_dir, engine, mut interner) = setup_test_graph();
+    make_alice_large(&engine, &mut interner);
     let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
     let mut ctx = make_ctx(&engine, &mut interner, &allocator);
 
-    let rows = execute_node_scan(
-        "n",
-        &["User".to_string()],
-        &[(
-            "name".to_string(),
-            nx(Expr::Literal(Value::String("Alice".into()))),
-        )],
-        &mut ctx,
-    )
-    .expect("scan");
+    let rows = alice(&mut ctx);
     let map = std::collections::BTreeMap::from([
         ("seen".to_string(), Value::Timestamp(1_700_000_000_000_000)),
         ("visits".to_string(), Value::Int(7)),
@@ -1409,6 +1428,62 @@ fn set_of_a_property_map_stages_deltas_not_the_record() {
         record.get(field("name")),
         Some(&Value::String("Alice".into()))
     );
+}
+
+/// A small record is rewritten whole: a delta would save nothing worth the
+/// chain every read of the key then folds.
+#[test]
+fn set_of_a_small_record_writes_it_whole() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+    let rows = alice(&mut ctx);
+    let items = vec![crate::plan::SetItem::Property {
+        variable: "n".into(),
+        property: "visits".into(),
+        expr: nx(Expr::Literal(Value::Int(7))),
+    }];
+    execute_update(&rows, &items, &crate::plan::ViolationMode::Fail, &mut ctx).expect("set");
+    assert!(
+        ctx.txn.node_deltas().is_empty(),
+        "no delta for a small record"
+    );
+    ctx.mvcc_flush().expect("commit");
+    drop(ctx);
+    let node_id = rows[0].get("n").and_then(|v| v.as_int()).expect("id") as u64;
+    let record = read_node(&engine, 1, NodeId::from_raw(node_id)).expect("exists");
+    let visits = interner.lookup("visits").expect("field id");
+    assert_eq!(record.get(visits), Some(&Value::Int(7)));
+}
+
+/// Deltas to one key end in a whole write once their run is long: every
+/// read of the key folds the run until a compaction reaches its base, so
+/// the run is bounded. The whole write starts a new run, and the record
+/// holds every value written.
+#[test]
+fn a_long_run_of_deltas_ends_in_a_whole_write() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    make_alice_large(&engine, &mut interner);
+    let node_key = |interner: &mut FieldInterner| {
+        let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+        let mut ctx = make_ctx(&engine, interner, &allocator);
+        let rows = alice(&mut ctx);
+        let id = rows[0].get("n").and_then(|v| v.as_int()).expect("id") as u64;
+        coordinode_core::graph::node::encode_node_key(ctx.shard_id, NodeId::from_raw(id))
+    };
+    let key = node_key(&mut interner);
+    for visit in 1..=32 {
+        set_alice(&engine, &mut interner, "visits", Value::Int(visit));
+        assert_eq!(engine.node_delta_run(&key), visit as u32, "a delta each");
+    }
+    set_alice(&engine, &mut interner, "visits", Value::Int(33));
+    assert_eq!(engine.node_delta_run(&key), 0, "the 33rd is written whole");
+    set_alice(&engine, &mut interner, "visits", Value::Int(34));
+    assert_eq!(engine.node_delta_run(&key), 1, "a new run starts");
+
+    let record = read_node(&engine, 1, NodeId::from_raw(1)).expect("exists");
+    let visits = interner.lookup("visits").expect("field id");
+    assert_eq!(record.get(visits), Some(&Value::Int(34)));
 }
 
 #[test]

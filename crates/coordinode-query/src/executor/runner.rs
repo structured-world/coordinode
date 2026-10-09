@@ -2727,10 +2727,53 @@ impl<'a> ExecutionContext<'a> {
         shard_id: u16,
         node_id: NodeId,
     ) -> Result<Option<NodeRecord>, ExecutionError> {
+        Ok(self
+            .mvcc_node_post_state_sized(shard_id, node_id)?
+            .map(|(record, _)| record))
+    }
+
+    /// [`Self::mvcc_node_post_state`] with the size of the stored record the
+    /// pending deltas apply to.
+    pub fn mvcc_node_post_state_sized(
+        &mut self,
+        shard_id: u16,
+        node_id: NodeId,
+    ) -> Result<Option<(NodeRecord, usize)>, ExecutionError> {
         use coordinode_modality::LocalNodeStore;
         self.sync_txn_state();
-        let key = coordinode_core::graph::node::encode_node_key(shard_id, node_id);
+        let key = LocalNodeStore::record_key(shard_id, node_id);
         Ok(LocalNodeStore::post_state_tracked(&mut self.txn, &key)?)
+    }
+
+    /// Whether a property change of the node whose stored record is
+    /// `stored_bytes` long is written as a delta rather than as the record.
+    ///
+    /// A delta saves rewriting a large record, but every read of the key
+    /// folds every delta written since its last whole write, until a
+    /// compaction reaches its base. A small record is cheaper to rewrite than
+    /// to leave a chain behind, and a long chain is ended by a whole write
+    /// (the reason RocksDB has `max_successive_merges`).
+    fn writes_property_delta(&self, shard_id: u16, node_id: NodeId, stored_bytes: usize) -> bool {
+        /// Records smaller than this are rewritten whole.
+        const MIN_DELTA_RECORD_BYTES: usize = 1024;
+        /// Deltas in a row on one key before the next write is whole.
+        const MAX_SUCCESSIVE_DELTAS: u32 = 32;
+        if stored_bytes < MIN_DELTA_RECORD_BYTES {
+            return false;
+        }
+        let key = coordinode_modality::LocalNodeStore::record_key(shard_id, node_id);
+        self.engine.node_delta_run(&key) < MAX_SUCCESSIVE_DELTAS
+    }
+
+    /// Note how the property change of `node_id` was written, for the next
+    /// writer's choice.
+    fn note_property_write(&self, shard_id: u16, node_id: NodeId, as_delta: bool) {
+        let key = coordinode_modality::LocalNodeStore::record_key(shard_id, node_id);
+        if as_delta {
+            self.engine.note_node_delta(&key);
+        } else {
+            self.engine.note_node_whole_write(&key);
+        }
     }
 
     /// MVCC-aware typed node delete. Buffers a tombstone for the
@@ -11937,7 +11980,9 @@ fn execute_update(
 
                     // Read the node as this statement leaves it so far, with
                     // the property deltas of earlier items still pending.
-                    if let Some(record) = ctx.mvcc_node_post_state(ctx.shard_id, node_id)? {
+                    if let Some((record, stored_bytes)) =
+                        ctx.mvcc_node_post_state_sized(ctx.shard_id, node_id)?
+                    {
                         // Enforce schema mode before writing the property.
                         // Load the label schema for the node's primary label and
                         // check STRICT/VALIDATED constraints on the property name.
@@ -11968,18 +12013,14 @@ fn execute_update(
                         // value another node holds refuses the write.
                         ctx.index_property_changed(node_id, &record, property, Some(&val))?;
 
-                        // The property alone is written, as a delta: the rest
-                        // of the record (a large document or blob next to a
-                        // timestamp) is not rewritten for one field.
                         let by_name = stored_by_name(label_schema.as_ref(), property);
-                        for delta in
-                            property_set_deltas(&record, property, val.clone(), by_name, ctx)?
-                        {
-                            let operand = delta.encode().map_err(|e| {
-                                ExecutionError::Serialization(format!("property delta: {e}"))
-                            })?;
-                            ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
-                        }
+                        write_property_changes(
+                            ctx,
+                            node_id,
+                            &record,
+                            stored_bytes,
+                            &[(property.as_str(), val.clone(), by_name)],
+                        )?;
                         ctx.write_stats.properties_set += 1;
 
                         // Reflect the new value in the output row only when the
@@ -12238,7 +12279,9 @@ fn execute_update(
 
                     // The node as the statement leaves it so far, with earlier
                     // property deltas still pending.
-                    if let Some(record) = ctx.mvcc_node_post_state(ctx.shard_id, node_id)? {
+                    if let Some((record, stored_bytes)) =
+                        ctx.mvcc_node_post_state_sized(ctx.shard_id, node_id)?
+                    {
                         // Schema validation: SET n += {map} merges new properties.
                         // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
                         let label = record.primary_label().to_string();
@@ -12255,9 +12298,8 @@ fn execute_update(
                             }
                         }
 
-                        // Each key of the map is written alone, as a property
-                        // delta: the properties it does not name are not
-                        // rewritten.
+                        // The keys of the map are written; the properties it
+                        // does not name are left as they are.
                         if let Value::Map(ref map) = map_val {
                             register_stored_ids(label_schema.as_ref(), map, ctx)?;
                             if ctx.indexes_label(record.primary_label()) {
@@ -12269,19 +12311,17 @@ fn execute_update(
                                 let changed: Vec<&str> = map.keys().map(String::as_str).collect();
                                 ctx.index_record_changed(node_id, &record, &after, &changed)?;
                             }
-                            for (name, v) in map {
-                                let by_name = stored_by_name(label_schema.as_ref(), name);
-                                for delta in
-                                    property_set_deltas(&record, name, v.clone(), by_name, ctx)?
-                                {
-                                    let operand = delta.encode().map_err(|e| {
-                                        ExecutionError::Serialization(format!(
-                                            "property delta: {e}"
-                                        ))
-                                    })?;
-                                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
-                                }
-                            }
+                            let changes: Vec<(&str, Value, bool)> = map
+                                .iter()
+                                .map(|(name, v)| {
+                                    (
+                                        name.as_str(),
+                                        v.clone(),
+                                        stored_by_name(label_schema.as_ref(), name),
+                                    )
+                                })
+                                .collect();
+                            write_property_changes(ctx, node_id, &record, stored_bytes, &changes)?;
                         }
 
                         // Update out_row so RETURN clauses see the merged values.
@@ -15304,6 +15344,44 @@ fn store_node_property(
         record.remove_extra(name);
         record.set(field_id, value);
     }
+    Ok(())
+}
+
+/// Write `changes` (name, value, stored by name) to the properties of
+/// `node_id`, whose record as the statement leaves it is `record`, stored in
+/// `stored_bytes`: as property deltas when that leaves the record unwritten
+/// at a cost reads can bear, else as the whole record.
+fn write_property_changes(
+    ctx: &mut ExecutionContext<'_>,
+    node_id: NodeId,
+    record: &NodeRecord,
+    stored_bytes: usize,
+    changes: &[(&str, Value, bool)],
+) -> Result<(), ExecutionError> {
+    let shard_id = ctx.shard_id;
+    if ctx.writes_property_delta(shard_id, node_id, stored_bytes) {
+        for (name, value, by_name) in changes {
+            for delta in property_set_deltas(record, name, value.clone(), *by_name, ctx)? {
+                let operand = delta
+                    .encode()
+                    .map_err(|e| ExecutionError::Serialization(format!("property delta: {e}")))?;
+                ctx.mvcc_merge_node_delta(shard_id, node_id, operand)?;
+            }
+        }
+        ctx.note_property_write(shard_id, node_id, true);
+        return Ok(());
+    }
+    // The tracked read folds the statement's pending deltas of the node into
+    // its buffered record, so the whole write below is the only change left
+    // for it and no delta is applied twice.
+    let Some(mut whole) = ctx.mvcc_get_node(shard_id, node_id)? else {
+        return Ok(());
+    };
+    for (name, value, by_name) in changes {
+        store_node_property(&mut whole, name, value.clone(), *by_name, ctx)?;
+    }
+    ctx.mvcc_put_node(shard_id, node_id, &whole)?;
+    ctx.note_property_write(shard_id, node_id, false);
     Ok(())
 }
 

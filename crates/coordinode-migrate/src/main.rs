@@ -19,6 +19,7 @@ enum Mode {
     Apply,
     Check,
     JournalStats,
+    NodeSizes,
 }
 
 fn main() -> ExitCode {
@@ -32,6 +33,7 @@ fn main() -> ExitCode {
             "--apply" => mode = Mode::Apply,
             "--check" => mode = Mode::Check,
             "--journal-stats" => mode = Mode::JournalStats,
+            "--node-sizes" => mode = Mode::NodeSizes,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
         Mode::Apply => migrate(&data, true),
         Mode::Check => check(&data),
         Mode::JournalStats => journal_stats(&data),
+        Mode::NodeSizes => node_sizes(&data),
     };
     match outcome {
         Ok(true) => ExitCode::SUCCESS,
@@ -134,6 +137,26 @@ fn journal_stats(data: &Path) -> anyhow::Result<bool> {
             println!("    {field}: {size} bytes, changed in {changes} rewrites");
         }
     }
+    Ok(true)
+}
+
+fn node_sizes(data: &Path) -> anyhow::Result<bool> {
+    let kib = |b: u64| b as f64 / 1024.0;
+    let mut total = 0;
+    println!("label: records, KiB, largest KiB; properties: records, KiB");
+    for (label, sizes) in coordinode_migrate::node_sizes::node_sizes(data)? {
+        total += sizes.bytes;
+        println!(
+            "  {label}: {}, {:.1}, {:.1}",
+            sizes.records,
+            kib(sizes.bytes),
+            kib(sizes.max_bytes)
+        );
+        for (name, records, bytes) in sizes.properties.iter().take(4) {
+            println!("    {name}: {records}, {:.1}", kib(*bytes));
+        }
+    }
+    println!("current node records: {:.1} KiB", kib(total));
     Ok(true)
 }
 

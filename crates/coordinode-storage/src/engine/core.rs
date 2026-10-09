@@ -111,6 +111,13 @@ pub struct StorageEngine {
     /// running at the same time, and no attempt outlives the process. Giving
     /// it durable identity would buy nothing and cost a write on every DDL.
     schema_generation: AtomicU64,
+    /// Per node key, the property deltas written since its last whole write:
+    /// a read of a key with pending deltas folds every one of them, so a
+    /// writer bounds the run by writing the record whole once it is long
+    /// enough (the reason RocksDB has `max_successive_merges`). A hint for
+    /// the choice of write form only, so process-local and bounded: a lost
+    /// or reset count costs one early whole write.
+    node_delta_runs: parking_lot::Mutex<rustc_hash::FxHashMap<Vec<u8>, u32>>,
     /// Held while a metadata command is decided and applied, so each decision
     /// reads every earlier one; on the journalled path it also spans the
     /// journal append, which makes the decisions' order the journal's order.
@@ -1005,6 +1012,7 @@ impl StorageEngine {
             coordinator,
             claim_registry: crate::engine::claims::ClaimRegistry::new(config.max_invariant_claims),
             schema_generation: AtomicU64::new(0),
+            node_delta_runs: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             metadata_decisions: parking_lot::Mutex::new(()),
             field_dictionary_generation: AtomicU64::new(0),
             field_dictionary_epoch: AtomicU64::new(0),
@@ -2745,6 +2753,37 @@ impl StorageEngine {
     pub fn schema_generation(&self) -> u64 {
         self.schema_generation
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Count one more property delta written to `node_key` and return the
+    /// run it makes since the key's last whole write.
+    pub fn note_node_delta(&self, node_key: &[u8]) -> u32 {
+        /// Keys tracked at once; past it the table starts over, which only
+        /// makes some runs look shorter than they are.
+        const MAX_TRACKED: usize = 1 << 16;
+        let mut runs = self.node_delta_runs.lock();
+        if runs.len() >= MAX_TRACKED && !runs.contains_key(node_key) {
+            runs.clear();
+        }
+        let run = runs.entry(node_key.to_vec()).or_insert(0);
+        // Bounded far below u32::MAX: a writer ends the run with a whole
+        // write once it reaches its limit.
+        *run += 1;
+        *run
+    }
+
+    /// The property deltas written to `node_key` since its last whole write.
+    pub fn node_delta_run(&self, node_key: &[u8]) -> u32 {
+        self.node_delta_runs
+            .lock()
+            .get(node_key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `node_key` was written whole: its run of deltas is over.
+    pub fn note_node_whole_write(&self, node_key: &[u8]) {
+        self.node_delta_runs.lock().remove(node_key);
     }
 
     /// Record that a schema definition changed, so that predicates evaluated

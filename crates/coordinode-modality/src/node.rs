@@ -387,6 +387,13 @@ impl LocalNodeStore {
         })
     }
 
+    /// The storage key of `node_id`'s record on `shard_id`: what a writer
+    /// that stages changes by key (a conditioned page, a document delta)
+    /// names the record by.
+    pub fn record_key(shard_id: u16, node_id: NodeId) -> Vec<u8> {
+        encode_node_key(shard_id, node_id)
+    }
+
     /// Read-your-own-writes for buffered document deltas (`SET n.path = x`):
     /// apply every pending [`DocDelta`](coordinode_core::graph::doc_delta::DocDelta)
     /// for `node_key` against the current record and buffer the materialised
@@ -435,12 +442,17 @@ impl LocalNodeStore {
     /// # Errors
     ///
     /// A storage failure, or a record or delta that does not decode.
+    ///
+    /// Also returns the size of the stored or buffered record the deltas
+    /// apply to, which tells a writer whether rewriting the record whole is
+    /// cheap.
     pub fn post_state_tracked(
         txn: &mut Transaction,
         node_key: &[u8],
-    ) -> StoreResult<Option<NodeRecord>> {
+    ) -> StoreResult<Option<(NodeRecord, usize)>> {
         let base = txn.get(Partition::Node, node_key)?;
-        Self::fold_pending(txn, node_key, base)
+        let size = base.as_ref().map_or(0, Vec::len);
+        Ok(Self::fold_pending(txn, node_key, base)?.map(|record| (record, size)))
     }
 
     /// `base` (the record as stored or buffered) with the transaction's
