@@ -566,6 +566,81 @@ fn replaced_documents_leave_the_statistics() {
     }
 }
 
+/// Merging the segments that held replaced and removed documents changes no
+/// score, and neither does reopening the merged index: the statistics are
+/// the final documents' through merge and restart alike.
+#[test]
+fn merged_and_reopened_segments_keep_the_final_statistics() {
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut rewritten = fresh(
+        dirs.0.path(),
+        &[(1, "rust graph rust"), (2, "rust engine"), (3, "rust")],
+    );
+    for round in 0..6 {
+        let body = if round % 2 == 0 {
+            "python scripts"
+        } else {
+            "rust graph"
+        };
+        rewritten
+            .apply_changes(&[(1, props(&[("body", body)]))], &[])
+            .unwrap();
+    }
+    rewritten.apply_changes(&[], &[3]).unwrap();
+    rewritten
+        .apply_changes(&[(4, props(&[("body", "graph rust database")]))], &[])
+        .unwrap();
+    let built = fresh(
+        dirs.1.path(),
+        &[
+            (1, "rust graph"),
+            (2, "rust engine"),
+            (4, "graph rust database"),
+        ],
+    );
+    let queries = ["rust", "graph", "python", "database"];
+    let expected: Vec<_> = queries
+        .iter()
+        .map(|q| scores(&built, q, &PendingDocuments::none()))
+        .collect();
+
+    let segments = rewritten.inner().index.searchable_segment_ids().unwrap();
+    assert!(segments.len() > 1, "the rewrites left several segments");
+    rewritten
+        .inner_mut()
+        .writer
+        .merge(&segments)
+        .wait()
+        .unwrap();
+    rewritten.inner_mut().reader.reload().unwrap();
+    assert_eq!(
+        rewritten
+            .inner()
+            .index
+            .searchable_segment_ids()
+            .unwrap()
+            .len(),
+        1
+    );
+    for (query, expected) in queries.iter().zip(&expected) {
+        assert_same_scores(
+            &scores(&rewritten, query, &PendingDocuments::none()),
+            expected,
+        );
+    }
+
+    drop(rewritten);
+    let config = MultiLangConfig::with_default_language("english");
+    let reopened =
+        MultiLanguageTextIndex::open_or_create(dirs.0.path(), 15_000_000, config).unwrap();
+    for (query, expected) in queries.iter().zip(&expected) {
+        assert_same_scores(
+            &scores(&reopened, query, &PendingDocuments::none()),
+            expected,
+        );
+    }
+}
+
 /// A search with pending documents ranks as the index holding the final
 /// documents would: the superseded ones leave the statistics and the pending
 /// ones join them.
