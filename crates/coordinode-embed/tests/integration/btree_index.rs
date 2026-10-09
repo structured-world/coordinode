@@ -702,6 +702,54 @@ fn an_index_lookup_finds_only_the_value_asked_for() {
     );
 }
 
+/// Nodes of several labels created in one statement, each under its own
+/// unique index, are each indexed under their own node: a lookup through
+/// every index finds the node that holds the value. One node's entry once
+/// pointed at another node created later in the same statement, so the
+/// lookup came back empty while the value stayed taken.
+#[test]
+fn nodes_created_together_are_indexed_under_their_own_ids() {
+    let (mut db, _dir) = open_db();
+    for (name, label) in [("agg_key", "Agg"), ("rev_key", "Rev"), ("rcpt_key", "Rcpt")] {
+        db.execute_cypher(&format!("CREATE UNIQUE INDEX {name} ON :{label}(key)"))
+            .expect("index");
+    }
+    let params = [
+        ("k0", Value::String("fleet/enrollment/a".into())),
+        ("v0", Value::String("v1:60:fleet/enrollment/a:1".into())),
+        ("s0", Value::String("state".into())),
+        ("operation", Value::String("op-1".into())),
+        ("intent", Value::String("intent".into())),
+        ("result", Value::String("result".into())),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), v.clone()))
+    .collect();
+    db.execute_cypher_with_params(
+        "CREATE (a0:Agg {key:$k0,revision:1}) \
+         CREATE (v0:Rev {key:$v0,aggregate:$k0,revision:a0.revision,state:$s0}) \
+         CREATE (r:Rcpt {key:$operation,intent:$intent,result:$result}) \
+         RETURN r.key AS operation",
+        params,
+    )
+    .expect("create");
+    for (label, key) in [
+        ("Agg", "fleet/enrollment/a"),
+        ("Rev", "v1:60:fleet/enrollment/a:1"),
+        ("Rcpt", "op-1"),
+    ] {
+        assert_eq!(
+            count(
+                &mut db,
+                &format!("MATCH (n:{label} {{key: $k}}) RETURN count(n)"),
+                &[("k", Value::String(key.into()))],
+            ),
+            1,
+            "{label} is found through its index"
+        );
+    }
+}
+
 /// A value with no key is not indexed, so it neither collides with another
 /// under a unique index nor hides from an equality.
 #[test]
