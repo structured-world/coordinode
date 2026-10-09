@@ -1743,6 +1743,7 @@ impl<'a> Transaction<'a> {
                 self.claims.insert(read.clone());
             }
         }
+        self.fold_node_deltas_into_writes()?;
         // The pairs whose kept counts this commit changes, claimed with the
         // rest so no other count of them is decided beside it.
         let counts =
@@ -2117,6 +2118,56 @@ impl<'a> Transaction<'a> {
     /// merge operands in their staged order, dense delete runs coalesced into
     /// range deletes, and last the sealed DERIVED work, whose record sources
     /// name positions of this final list.
+    /// Fold the document deltas of a node this attempt also writes whole
+    /// into that write: a delta staged after the node's record was put (a
+    /// node created, then SET, in one statement) is applied to the record,
+    /// and one staged before the node is deleted goes with it. One batch then
+    /// never carries a put or a delete and a merge for one key, which the
+    /// engine refuses, and the record lands as the statement left it.
+    fn fold_node_deltas_into_writes(&mut self) -> Result<(), CommitError> {
+        use coordinode_core::graph::doc_delta::{DocDelta, PREFIX_DOC_DELTA};
+        use coordinode_core::graph::node::NodeRecord;
+
+        if self.merge_node_deltas.is_empty() {
+            return Ok(());
+        }
+        let deltas = std::mem::take(&mut self.merge_node_deltas);
+        let mut folded: HashMap<Vec<u8>, Vec<DocDelta>> = HashMap::new();
+        for (key, operand) in deltas {
+            match self.write_buffer.get(&(Partition::Node, key.clone())) {
+                None => self.merge_node_deltas.push((key, operand)),
+                // Deleted in this attempt: nothing is left for it to change.
+                Some(None) => {}
+                Some(Some(_)) => {
+                    let delta = match operand.split_first() {
+                        Some((&PREFIX_DOC_DELTA, body)) => DocDelta::decode(body).map_err(|e| {
+                            CommitError::Serialization(format!("node document delta: {e}"))
+                        })?,
+                        _ => {
+                            return Err(CommitError::Serialization(
+                                "node operand without the document-delta prefix".to_string(),
+                            ));
+                        }
+                    };
+                    folded.entry(key).or_default().push(delta);
+                }
+            }
+        }
+        for (key, deltas) in folded {
+            let slot = self.write_buffer.get_mut(&(Partition::Node, key));
+            let Some(Some(bytes)) = slot else {
+                continue;
+            };
+            let mut record = crate::engine::merge::decode_node_record(bytes).map_err(|e| {
+                CommitError::Serialization(format!("node record under a delta: {e}"))
+            })?;
+            crate::engine::merge::apply_doc_deltas_to_record(&mut record, &deltas);
+            *bytes = NodeRecord::to_msgpack(&record)
+                .map_err(|e| CommitError::Serialization(format!("node record: {e}")))?;
+        }
+        Ok(())
+    }
+
     fn seal_unit(&mut self, wb: HashMap<(Partition, Vec<u8>), Option<Vec<u8>>>) -> Vec<Mutation> {
         let derived = std::mem::take(&mut self.derived);
         debug_assert!(

@@ -1347,6 +1347,70 @@ fn set_of_top_level_properties_stages_deltas_not_the_record() {
     );
 }
 
+/// `SET n += {map}` writes each key of the map as its own property delta:
+/// the properties the map does not name are not rewritten, and the values
+/// keep their types.
+#[test]
+fn set_of_a_property_map_stages_deltas_not_the_record() {
+    let (_dir, engine, mut interner) = setup_test_graph();
+    let allocator = NodeIdAllocator::resume_from(NodeId::from_raw(100));
+    let mut ctx = make_ctx(&engine, &mut interner, &allocator);
+
+    let rows = execute_node_scan(
+        "n",
+        &["User".to_string()],
+        &[(
+            "name".to_string(),
+            nx(Expr::Literal(Value::String("Alice".into()))),
+        )],
+        &mut ctx,
+    )
+    .expect("scan");
+    let map = std::collections::BTreeMap::from([
+        ("seen".to_string(), Value::Timestamp(1_700_000_000_000_000)),
+        ("visits".to_string(), Value::Int(7)),
+    ]);
+    let items = vec![crate::plan::SetItem::MergeProperties {
+        variable: "n".into(),
+        expr: nx(Expr::Literal(Value::Map(map))),
+    }];
+    execute_update(&rows, &items, &crate::plan::ViolationMode::Fail, &mut ctx).expect("set");
+
+    let node_id = rows[0].get("n").and_then(|v| v.as_int()).expect("id") as u64;
+    let key =
+        coordinode_core::graph::node::encode_node_key(ctx.shard_id, NodeId::from_raw(node_id));
+    // This engine has no clock, so a whole write would already be in the
+    // store; the deltas reach it only at the commit.
+    let before = read_node(&engine, 1, NodeId::from_raw(node_id)).expect("exists");
+    for name in ["seen", "visits"] {
+        let field = ctx.interner.lookup(name).expect("registered by the set");
+        assert_eq!(before.get(field), None, "the record is not rewritten");
+    }
+    assert_eq!(
+        ctx.txn
+            .node_deltas()
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .count(),
+        2,
+        "one delta per key of the map"
+    );
+
+    ctx.mvcc_flush().expect("commit");
+    drop(ctx);
+    let record = read_node(&engine, 1, NodeId::from_raw(node_id)).expect("exists");
+    let field = |name: &str| interner.lookup(name).expect("field id");
+    assert_eq!(
+        record.get(field("seen")),
+        Some(&Value::Timestamp(1_700_000_000_000_000))
+    );
+    assert_eq!(record.get(field("visits")), Some(&Value::Int(7)));
+    assert_eq!(
+        record.get(field("name")),
+        Some(&Value::String("Alice".into()))
+    );
+}
+
 #[test]
 fn delete_removes_from_storage() {
     let (_dir, engine, mut interner) = setup_test_graph();

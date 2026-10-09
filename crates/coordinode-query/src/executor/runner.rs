@@ -12236,7 +12236,9 @@ fn execute_update(
                         _ => continue,
                     };
 
-                    if let Some(mut record) = ctx.mvcc_get_node(ctx.shard_id, node_id)? {
+                    // The node as the statement leaves it so far, with earlier
+                    // property deltas still pending.
+                    if let Some(record) = ctx.mvcc_node_post_state(ctx.shard_id, node_id)? {
                         // Schema validation: SET n += {map} merges new properties.
                         // STRICT: every key in map must be declared; VALIDATED: checks declared keys.
                         let label = record.primary_label().to_string();
@@ -12253,22 +12255,34 @@ fn execute_update(
                             }
                         }
 
+                        // Each key of the map is written alone, as a property
+                        // delta: the properties it does not name are not
+                        // rewritten.
                         if let Value::Map(ref map) = map_val {
-                            let before = ctx
-                                .indexes_label(record.primary_label())
-                                .then(|| record.clone());
                             register_stored_ids(label_schema.as_ref(), map, ctx)?;
+                            if ctx.indexes_label(record.primary_label()) {
+                                let mut after = record.clone();
+                                for (name, v) in map {
+                                    let by_name = stored_by_name(label_schema.as_ref(), name);
+                                    store_node_property(&mut after, name, v.clone(), by_name, ctx)?;
+                                }
+                                let changed: Vec<&str> = map.keys().map(String::as_str).collect();
+                                ctx.index_record_changed(node_id, &record, &after, &changed)?;
+                            }
                             for (name, v) in map {
                                 let by_name = stored_by_name(label_schema.as_ref(), name);
-                                store_node_property(&mut record, name, v.clone(), by_name, ctx)?;
-                            }
-                            if let Some(before) = before {
-                                let changed: Vec<&str> = map.keys().map(String::as_str).collect();
-                                ctx.index_record_changed(node_id, &before, &record, &changed)?;
+                                for delta in
+                                    property_set_deltas(&record, name, v.clone(), by_name, ctx)?
+                                {
+                                    let operand = delta.encode().map_err(|e| {
+                                        ExecutionError::Serialization(format!(
+                                            "property delta: {e}"
+                                        ))
+                                    })?;
+                                    ctx.mvcc_merge_node_delta(ctx.shard_id, node_id, operand)?;
+                                }
                             }
                         }
-
-                        ctx.mvcc_put_node(ctx.shard_id, node_id, &record)?;
 
                         // Update out_row so RETURN clauses see the merged values.
                         // MergeProperties adds/overwrites; existing untouched props stay.

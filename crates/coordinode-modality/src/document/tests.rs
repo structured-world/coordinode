@@ -575,34 +575,54 @@ fn set_path_on_propfield_target_uses_interned_id() {
     }
 }
 
+/// Four threads each set a distinct key under extra in their own
+/// transactions on one clock; the merge operator collapses all four deltas
+/// into a single node body on read. A delta is a write of the node, so two
+/// of them from one view conflict at commit; a client retries a conflict,
+/// and no key is lost either way.
 #[test]
 fn concurrent_set_path_distinct_keys_converges() {
-    // Four threads each set a distinct key under extra in its own
-    // transaction; the merge operator collapses all four deltas
-    // into a single node body on read.
+    use coordinode_storage::engine::transaction::CommitError;
     use std::sync::Arc;
     use std::thread;
 
     let fx = open_engine();
     let engine = Arc::clone(&fx.engine);
+    let oracle = Arc::new(TimestampOracle::resume_from(Timestamp::from_raw(1)));
     let id = NodeId::from_raw(100);
     put_node(&engine, id, &NodeRecord::new("Multi"));
 
     let handles: Vec<_> = (0..4u64)
         .map(|t| {
             let engine = Arc::clone(&engine);
+            let oracle = Arc::clone(&oracle);
             thread::spawn(move || {
-                commit_docs(&engine, |docs, txn| {
-                    docs.set_path(
-                        txn,
-                        0,
-                        id,
-                        PathTarget::Extra,
-                        vec![format!("k{t}")],
-                        rmpv::Value::Integer((t as i64).into()),
-                    )
-                    .expect("set_path");
-                });
+                let wc = WriteConcern::majority();
+                let ctx = CommitContext {
+                    write_concern: &wc,
+                    pipeline: None,
+                    id_gen: None,
+                    drain_buffer: None,
+                    nvme_write_buffer: None,
+                };
+                loop {
+                    let mut txn = Transaction::begin(&engine, Some(&oracle), oracle.next());
+                    LocalDocumentStore
+                        .set_path(
+                            &mut txn,
+                            0,
+                            id,
+                            PathTarget::Extra,
+                            vec![format!("k{t}")],
+                            rmpv::Value::Integer((t as i64).into()),
+                        )
+                        .expect("set_path");
+                    match txn.commit(&ctx) {
+                        Ok(_) => break,
+                        Err(CommitError::Conflict(_)) => continue,
+                        Err(e) => panic!("commit: {e:?}"),
+                    }
+                }
             })
         })
         .collect();

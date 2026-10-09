@@ -450,6 +450,63 @@ fn node_deltas_on_one_record_conflict_like_whole_writes() {
     assert_eq!(engine.pending_commits().in_flight(), 0);
 }
 
+/// A node written whole and then changed by a delta in one attempt (created,
+/// then SET, in one statement) commits as one record with the change in it:
+/// the engine refuses a batch carrying a put and a merge for one key, and an
+/// apply that fails stops the node's consensus. A delta of a node the attempt
+/// then deletes goes with the node.
+#[test]
+fn deltas_of_a_node_written_whole_in_the_same_attempt_fold_into_it() {
+    use coordinode_core::graph::doc_delta::{DocDelta, PathTarget};
+    use coordinode_core::graph::node::NodeRecord;
+    use coordinode_core::graph::types::Value;
+
+    let (engine, oracle, _d) = test_engine();
+    let wc = WriteConcern::default();
+    let ctx = || CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    let created = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x07";
+    let deleted = b"node:\x00\x00:\x00\x00\x00\x00\x00\x00\x00\x08";
+    let set = |v: i64| {
+        DocDelta::SetProperty {
+            target: PathTarget::PropField(2),
+            key: None,
+            value: Value::Int(v),
+        }
+        .encode()
+        .expect("encode")
+    };
+    let mut record = NodeRecord::new("Thing");
+    record.set(1, Value::String("a".into()));
+    let bytes = record.to_msgpack().expect("encode");
+
+    let mut seed = mvcc_txn(&engine, &oracle);
+    seed.put(Partition::Node, deleted, &bytes).expect("stage");
+    seed.commit(&ctx()).expect("seed");
+
+    let mut txn = mvcc_txn(&engine, &oracle);
+    txn.put(Partition::Node, created, &bytes).expect("stage");
+    txn.push_node_delta(created.to_vec(), set(5));
+    txn.push_node_delta(deleted.to_vec(), set(6));
+    txn.delete(Partition::Node, deleted).expect("stage");
+    txn.commit(&ctx())
+        .expect("one record per key reaches the engine");
+
+    let stored = engine
+        .get(Partition::Node, created)
+        .expect("get")
+        .expect("created");
+    let stored = NodeRecord::from_msgpack(&stored).expect("decode");
+    assert_eq!(stored.props.get(&1), Some(&Value::String("a".into())));
+    assert_eq!(stored.props.get(&2), Some(&Value::Int(5)));
+    assert_eq!(engine.get(Partition::Node, deleted).expect("get"), None);
+}
+
 /// A read between two commits waits for the one below it and not for the one
 /// above.
 ///
