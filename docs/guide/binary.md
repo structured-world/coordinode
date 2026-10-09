@@ -30,15 +30,48 @@ coordinode --version
 
 ## Build from Source
 
-Requirements: [Rust](https://rustup.rs/) 1.80+, protoc 3.21+
+Requirements: [rustup](https://rustup.rs/) with the toolchain pinned in
+`rust-toolchain.toml` (currently Rust 1.98.1), and protoc 3.21+.
 
 ```bash
-git clone https://github.com/structured-world/coordinode.git
+git clone --recurse-submodules https://github.com/structured-world/coordinode.git
 cd coordinode
 cargo build --release -p coordinode-server
 ```
 
 The binary is at `target/release/coordinode`.
+
+### Production optimization profile
+
+Build from the workspace root with `--release`. The checked-in
+`[profile.release]` applies to the server and its Rust dependencies:
+
+| Setting | Value | Purpose |
+| --- | --- | --- |
+| `opt-level` | `3` | Optimize execution speed (O3). |
+| `lto` | `"fat"` | Optimize across crate boundaries. |
+| `codegen-units` | `1` | Compile each crate as one code-generation unit. |
+| `panic` | `"abort"` | Abort on panic instead of unwinding. |
+| `strip` | `true` | Strip symbols from the shipped binary. |
+
+The command above includes the server's default features. For an embedded
+application, set its own workspace release profile: Cargo does not inherit
+the dependency repository's profile. `cargo build` without `--release`
+selects the development profile and is not a production performance build.
+
+O2 is an alternative to measure, not the current production default:
+
+```bash
+CARGO_PROFILE_RELEASE_OPT_LEVEL=2 cargo build --release -p coordinode-server
+```
+
+Compare the same workload, features, hardware, throughput and tail latency
+before selecting an override. O3 does not guarantee a faster result than O2;
+see the [Cargo profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html).
+Environment variables, Cargo configuration and `RUSTFLAGS` can override
+build settings, so record them with benchmark results. Do not ship a binary
+built with `target-cpu=native` to machines whose instruction sets differ;
+portable builds preserve runtime CPU detection.
 
 ## Start the Server
 

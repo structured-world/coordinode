@@ -246,21 +246,16 @@ pub trait NodeStore {
         snapshot: lsm_tree::SeqNo,
     ) -> StoreResult<bool>;
 
-    /// Stateless parallel-read: encode the node key and read its raw bytes
-    /// directly from the engine at `snapshot` (or latest when `None`), with
-    /// no [`Transaction`]. Returns the encoded key alongside the bytes so a
-    /// parallel worker can record it in its own OCC accumulator and merge into
-    /// the statement's read-set after the parallel section. The shared unit is
-    /// the snapshot seqno (a `Copy` value), so rayon workers read concurrently
-    /// without a `&mut Transaction` — the read path the sharded scatter-gather
-    /// model also uses (snapshot-parameterised, not transaction-bound).
-    fn read_at_snapshot(
+    /// Stateless typed parallel read. Decode while borrowing the selected
+    /// storage value, without copying its serialized payload. Return the key
+    /// so the caller can retain its OCC dependency independently of the value.
+    fn read_record_at_snapshot(
         &self,
         engine: &StorageEngine,
         snapshot: Option<lsm_tree::SeqNo>,
         shard_id: u16,
         node_id: NodeId,
-    ) -> StoreResult<(Vec<u8>, Option<Vec<u8>>)>;
+    ) -> StoreResult<(Vec<u8>, Option<NodeRecord>)>;
 
     /// Stateless raw read of a node record by its already-encoded key, at
     /// `snapshot` (latest when `None`), with no [`Transaction`]. Returns the
@@ -714,21 +709,24 @@ impl NodeStore for LocalNodeStore {
             .is_some())
     }
 
-    fn read_at_snapshot(
+    fn read_record_at_snapshot(
         &self,
         engine: &StorageEngine,
         snapshot: Option<lsm_tree::SeqNo>,
         shard_id: u16,
         node_id: NodeId,
-    ) -> StoreResult<(Vec<u8>, Option<Vec<u8>>)> {
+    ) -> StoreResult<(Vec<u8>, Option<NodeRecord>)> {
         let key = encode_node_key(shard_id, node_id);
-        let bytes = match snapshot {
-            Some(snap) => engine
-                .snapshot_get(&snap, Partition::Node, &key)?
-                .map(|b| b.to_vec()),
-            None => engine.get(Partition::Node, &key)?.map(|b| b.to_vec()),
+        let record = match snapshot {
+            Some(snap) => engine.with_snapshot_value(&snap, Partition::Node, &key, |bytes| {
+                bytes.map(Self::decode_record).transpose()
+            })??,
+            None => {
+                let bytes = engine.get(Partition::Node, &key)?;
+                bytes.as_deref().map(Self::decode_record).transpose()?
+            }
         };
-        Ok((key, bytes))
+        Ok((key, record))
     }
 
     fn read_raw_at_snapshot(

@@ -6184,10 +6184,15 @@ fn process_targets_parallel(
                     // rayon workers, so no &mut Transaction crosses threads. The
                     // store owns key encoding and hands the key back for OCC.
                     use coordinode_modality::{LocalNodeStore, NodeStore as _};
-                    let (target_key, bytes) = LocalNodeStore
-                        .read_at_snapshot(pctx.engine, pctx.mvcc_snapshot, pctx.shard_id, target_id)
+                    let (target_key, target_record) = LocalNodeStore
+                        .read_record_at_snapshot(
+                            pctx.engine,
+                            pctx.mvcc_snapshot,
+                            pctx.shard_id,
+                            target_id,
+                        )
                         .ok()?;
-                    let Some(bytes) = bytes else {
+                    let Some(mut target_record) = target_record else {
                         if let Ok(mut guard) = unresolved.lock() {
                             guard.push((*src_uid, *tgt_uid, *et_idx));
                         }
@@ -6203,8 +6208,6 @@ fn process_targets_parallel(
                         }
                     }
 
-                    let target_record = NodeRecord::from_msgpack(&bytes).ok()?;
-
                     if !has_all_labels(&target_record, target_labels) {
                         return None;
                     }
@@ -6216,16 +6219,18 @@ fn process_targets_parallel(
                     out_row.insert(target_variable.to_string(), Value::Int(*tgt_uid as i64));
 
                     // Resolve property names from interner (read-only, thread-safe)
-                    for (field_id, value) in &target_record.props {
-                        if let Some(field_name) = pctx.interner.resolve(*field_id) {
+                    // Move the decoded payloads; draining retains the record's
+                    // labels so metadata keeps its original precedence below.
+                    for (field_id, value) in target_record.props.drain() {
+                        if let Some(field_name) = pctx.interner.resolve(field_id) {
                             let col_name = format!("{target_variable}.{field_name}");
-                            out_row.insert(col_name, value.clone());
+                            out_row.insert(col_name, value);
                         }
                     }
-                    if let Some(extra) = &target_record.extra {
+                    if let Some(extra) = target_record.extra.take() {
                         for (name, value) in extra {
                             let col_name = format!("{target_variable}.{name}");
-                            out_row.insert(col_name, value.clone());
+                            out_row.insert(col_name, value);
                         }
                     }
 

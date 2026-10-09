@@ -2,6 +2,37 @@ use super::*;
 use crate::engine::config::{Durability, EndpointConfig, Media, Tier};
 use tempfile::TempDir;
 
+/// The inspector borrows the exact LSM buffer, not a Bytes/Vec copy. It
+/// must select the same old value after a later write and handle absence.
+#[test]
+fn snapshot_inspector_borrows_the_lsm_value_without_copying() {
+    let (engine, _dir) = test_engine();
+    let key = b"borrowed-value";
+    let value = vec![7; 4096];
+    engine.put(Partition::Node, key, &value).expect("put");
+    let (snapshot, _pin) = engine.pin_snapshot();
+    let source = engine
+        .tree(Partition::Node)
+        .expect("tree")
+        .get(key, snapshot)
+        .expect("get")
+        .expect("value");
+    engine.put(Partition::Node, key, b"new").expect("overwrite");
+    engine
+        .with_snapshot_value(&snapshot, Partition::Node, key, |bytes| {
+            let bytes = bytes.expect("old value");
+            assert_eq!(bytes, value);
+            assert_eq!(bytes.as_ptr(), source.as_ptr(), "payload was copied");
+        })
+        .expect("inspect");
+    assert!(
+        engine
+            .with_snapshot_value(&snapshot, Partition::Node, b"missing", |bytes| bytes
+                .is_none())
+            .expect("absence")
+    );
+}
+
 /// With `--features io-uring` on Linux, a disk engine opened with no
 /// explicit filesystem override runs on the shared `IoUringFs` ring.
 /// Confirm the host kernel supports io_uring, then prove a write/read

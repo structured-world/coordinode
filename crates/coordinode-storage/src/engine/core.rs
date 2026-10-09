@@ -3445,6 +3445,22 @@ impl StorageEngine {
         Some(seqno)
     }
 
+    /// Inspect a value borrowed from its LSM owner at the selected snapshot.
+    /// The owner remains alive until `inspect` returns; its borrow cannot
+    /// escape in `R`. No payload is copied into an intermediate byte buffer.
+    /// Retention and visibility checks are the same as [`Self::snapshot_get`].
+    pub fn with_snapshot_value<R>(
+        &self,
+        snapshot: &lsm_tree::SeqNo,
+        part: Partition,
+        key: &[u8],
+        inspect: impl FnOnce(Option<&[u8]>) -> R,
+    ) -> StorageResult<R> {
+        self.check_snapshot_retained(*snapshot)?;
+        let value = self.tree(part)?.get(key, *snapshot)?;
+        Ok(inspect(value.as_deref()))
+    }
+
     /// Read a value through a previously taken snapshot.
     ///
     /// Returns the value as it was at the snapshot seqno — writes after

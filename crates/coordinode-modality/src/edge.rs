@@ -309,7 +309,7 @@ pub trait EdgeStore {
     /// read raw bytes from the engine at `snapshot` (or latest when `None`),
     /// no [`Transaction`]. Returns the key alongside the bytes so a parallel
     /// worker records it in its own OCC accumulator (mirror of
-    /// [`crate::NodeStore::read_at_snapshot`] — Variant A snapshot read).
+    /// [`crate::NodeStore::read_record_at_snapshot`] — snapshot-bound read).
     fn edgeprop_at_snapshot(
         &self,
         engine: &StorageEngine,
@@ -429,7 +429,7 @@ pub trait EdgeStore {
     /// which collapses empty to `None`) so a background scanner can tell
     /// "no key" from "key present but drained" and clean up the latter. For
     /// background walks (TTL reaper) with no MVCC transaction; mirrors the
-    /// [`crate::NodeStore::read_at_snapshot`] Variant A read model.
+    /// [`crate::NodeStore::read_record_at_snapshot`] snapshot-bound read model.
     fn posting_at_snapshot(
         &self,
         engine: &StorageEngine,

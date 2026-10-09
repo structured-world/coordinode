@@ -65,5 +65,9 @@ harness = false
 name = "snapshot_scan"
 harness = false
 
+[[bench]]
+name = "borrowed_point"
+harness = false
+
 [lints]
 workspace = true

@@ -59,6 +59,42 @@ fn rec(label: &str) -> NodeRecord {
     NodeRecord::new(label)
 }
 
+/// Typed stateless reads preserve snapshot selection, absence and decode
+/// failure while avoiding an intermediate serialized payload buffer.
+#[test]
+fn read_record_at_snapshot_keeps_visibility_and_decode_errors() {
+    let db = open();
+    let id = NodeId::from_raw(53);
+    db.write(|store, txn| store.put(txn, 0, id, &rec("Before")).expect("put"));
+    let (snapshot, _pin) = db.engine.pin_snapshot();
+    db.write(|store, txn| store.put(txn, 0, id, &rec("After")).expect("put"));
+    let store = LocalNodeStore;
+    let (key, old) = store
+        .read_record_at_snapshot(&db.engine, Some(snapshot), 0, id)
+        .expect("old");
+    assert_eq!(key, encode_node_key(0, id));
+    assert_eq!(old.expect("record").primary_label(), "Before");
+    let (_, current) = store
+        .read_record_at_snapshot(&db.engine, None, 0, id)
+        .expect("latest");
+    assert_eq!(current.expect("record").primary_label(), "After");
+    assert!(
+        store
+            .read_record_at_snapshot(&db.engine, Some(snapshot), 0, NodeId::from_raw(54))
+            .expect("absence")
+            .1
+            .is_none()
+    );
+    db.engine
+        .put(Partition::Node, &key, &[0xc1])
+        .expect("corrupt fixture");
+    assert!(
+        store
+            .read_record_at_snapshot(&db.engine, None, 0, id)
+            .is_err()
+    );
+}
+
 /// The post-state of a node is its stored record with the transaction's
 /// pending deltas applied: a nested set turns its root into a document, a
 /// property removal removes it, an overflow-targeted delta reaches the

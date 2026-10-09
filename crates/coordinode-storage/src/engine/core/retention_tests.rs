@@ -412,6 +412,18 @@ fn history_below_the_watermark(s: Subject) {
         .expect("prefix_scan_at below the watermark is refused");
     assert!(matches!(err, StorageError::SnapshotOutsideRetention { .. }));
 
+    // Borrowed inspection has the same admission boundary: the caller must
+    // never observe bytes after its requested history has been collected.
+    let mut inspected = false;
+    let result = engine.with_snapshot_value(&(base + 2_500), s.part, s.key, |_| {
+        inspected = true;
+    });
+    assert!(matches!(
+        result,
+        Err(StorageError::SnapshotOutsideRetention { .. })
+    ));
+    assert!(!inspected, "an expired snapshot reached the inspector");
+
     // At the watermark and above: served, and exact. Both keys have every
     // version below the watermark, and each keeps its own newest one.
     assert_eq!(

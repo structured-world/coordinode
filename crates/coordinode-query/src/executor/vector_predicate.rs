@@ -34,11 +34,9 @@ pub fn evaluate_predicate(
     predicate: &VectorPredicate,
     field_lookup: &dyn Fn(&str) -> Option<u32>,
 ) -> bool {
-    let Ok((_key, Some(bytes))) = LocalNodeStore.read_at_snapshot(engine, None, shard_id, node_id)
+    let Ok((_key, Some(record))) =
+        LocalNodeStore.read_record_at_snapshot(engine, None, shard_id, node_id)
     else {
-        return false;
-    };
-    let Ok(record) = NodeRecord::from_msgpack(&bytes) else {
         return false;
     };
     evaluate_against(&record, predicate, field_lookup)
