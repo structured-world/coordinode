@@ -682,6 +682,70 @@ async fn follower_text_search_follows_leader_commits() {
     );
 }
 
+/// A follower whose text worker can neither fold a replicated write nor
+/// rebuild (its index directory is gone) keeps the write pending: its
+/// searches answer the node from its store, never from the stale index.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_follower_that_cannot_fold_answers_from_its_store() {
+    let p1 = alloc_port();
+    let p2 = alloc_port();
+    let mut n1 = open_node(1, p1, true).await;
+    let mut n2 = open_node(2, p2, false).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    n1._node
+        .add_node(2, format!("http://127.0.0.1:{p2}"))
+        .await
+        .unwrap();
+    n1._node.change_membership(vec![1, 2]).await.unwrap();
+
+    n1.db
+        .execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .unwrap();
+    n1.db
+        .execute_cypher("CREATE (:Article {title: 'a', body: 'replicated words'})")
+        .unwrap();
+    let mut folded = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        n2.db.refresh_text_indexes().unwrap();
+        let registry = n2.db.text_index_registry();
+        if registry.has_index("Article", "body")
+            && registry.coverage().is_some_and(|c| c.delta(1).is_empty())
+            && text_hits(&mut n2.db, "replicated") == ["a"]
+        {
+            folded = true;
+            break;
+        }
+    }
+    assert!(folded, "the follower never folded the first write");
+
+    std::fs::remove_dir_all(n2.db.text_index_registry().base_dir()).unwrap();
+    n1.db
+        .execute_cypher("MATCH (n:Article {title: 'a'}) SET n.body = 'revised words'")
+        .unwrap();
+    let mut last = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        last = text_hits(&mut n2.db, "revised");
+        if last == ["a"] {
+            break;
+        }
+    }
+    assert_eq!(last, ["a"], "the follower lost the write it could not fold");
+    assert!(
+        text_hits(&mut n2.db, "replicated").is_empty(),
+        "the follower answered from its stale index"
+    );
+    assert!(
+        !n2.db
+            .text_index_registry()
+            .coverage()
+            .is_some_and(|c| c.delta(1).is_empty()),
+        "the unfolded write was released"
+    );
+}
+
 /// A follower's vector freshness watermark is a fence: a write at or below
 /// it is in the index. The leader can hold a commit whose timestamp is
 /// allocated and not yet in the log while a later-stamped commit replicates

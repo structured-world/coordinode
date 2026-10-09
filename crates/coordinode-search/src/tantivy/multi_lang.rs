@@ -289,13 +289,18 @@ impl MultiLanguageTextIndex {
             Err(e) => Err(e),
         };
         if outcome.is_err() {
-            if let Err(e) = self.inner.writer.rollback() {
+            let rollback = self.inner.writer.rollback();
+            // The staging counted documents no reader will see. Count the
+            // committed ones again, whatever happened to the writer; if even
+            // that read fails, drop the exact statistics so searches use
+            // Tantivy's own counts of the committed index instead.
+            if self.inner.corpus.is_some() {
+                self.inner.corpus = self.inner.recount().ok();
+            }
+            if let Err(e) = rollback {
                 let reason = format!("the index writer is gone after a failed rollback: {e}");
                 self.writer_lost = Some(reason.clone());
                 return Err(TextSearchError::IndexCorrupted(reason));
-            }
-            if self.inner.corpus.is_some() {
-                self.inner.corpus = Some(self.inner.recount()?);
             }
         }
         outcome

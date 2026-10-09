@@ -899,6 +899,37 @@ fn pending_documents_carry_snippets() {
     );
 }
 
+/// A write that fails leaves the statistics describing only what readers
+/// see: searched with the failed document as a pending one, the index ranks
+/// as one built from the committed and the pending documents, rather than
+/// counting the failed document twice.
+#[test]
+fn a_failed_write_leaves_no_trace_in_the_statistics() {
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let path = dirs.0.path().join("idx");
+    let mut idx = MultiLanguageTextIndex::create_scratch(
+        &path,
+        15_000_000,
+        MultiLangConfig::with_default_language("english"),
+    )
+    .unwrap();
+    idx.add_node(1, &props(&[("body", "graph engine")]))
+        .unwrap();
+    std::fs::remove_dir_all(&path).unwrap();
+    assert!(idx.add_node(2, &props(&[("body", "graph lost")])).is_err());
+
+    let pending = idx
+        .pending(Some(&[2]), &[(2, props(&[("body", "graph lost")]))])
+        .unwrap();
+    let built = fresh(dirs.1.path(), &[(1, "graph engine"), (2, "graph lost")]);
+    for query in ["graph", "lost", "engine"] {
+        assert_same_scores(
+            &scores(&idx, query, &pending),
+            &scores(&built, query, &PendingDocuments::none()),
+        );
+    }
+}
+
 /// A write that fails on storage the index can no longer reach returns an
 /// error every time it is retried, rather than panicking once the writer
 /// was lost to the failed rollback of an earlier attempt.
