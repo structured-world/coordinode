@@ -395,20 +395,15 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         )
         .unwrap();
     };
-    let t = std::time::Instant::now();
     for start in (0..N).step_by(500) {
         create_rows(&mut n1.db, start..start + 500);
     }
-    eprintln!("PHASE load {:?}", t.elapsed());
-    let t = std::time::Instant::now();
     n1.db
         .execute_cypher(
             "CREATE VECTOR INDEX item_emb ON :Item(embedding) \
              OPTIONS {m: 16, ef_construction: 100, metric: \"euclidean\", dimensions: 8}",
         )
         .unwrap();
-    eprintln!("PHASE leader index {:?}", t.elapsed());
-    let t = std::time::Instant::now();
 
     // Bring the index up on the follower once the definition has reached it,
     // as the server does on every applied entry.
@@ -421,8 +416,6 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(started, "the index definition never reached the follower");
-    eprintln!("PHASE follower start {:?}", t.elapsed());
-    let t = std::time::Instant::now();
 
     // Keep writing through the leader for as long as the follower builds.
     let mut late = N;
@@ -437,16 +430,12 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         "the follower's build finished before any write landed beside it"
     );
 
-    eprintln!("PHASE follower build {:?} ({during} writes)", t.elapsed());
-    let t = std::time::Instant::now();
     // Then keep writing with no build running, which the follower's index
     // takes from its maintenance of applied entries.
     let steady = late..late + 1000;
     for start in steady.clone().step_by(20) {
         create_rows(&mut n1.db, start..start + 20);
     }
-    eprintln!("PHASE steady {:?}", t.elapsed());
-    let t = std::time::Instant::now();
 
     // Every committed item must be physically indexed on both members.
     // ANN candidates do not prove complete membership (or lost writes): a
@@ -468,7 +457,6 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
         steady.end,
         late - N,
     );
-    eprintln!("PHASE complete membership {:?}", t.elapsed());
 
     for (member, db) in [("leader", &n1.db), ("follower", &n2.db)] {
         let rows = db
@@ -527,7 +515,6 @@ async fn writes_replicated_during_a_follower_build_reach_its_index() {
             }
         }
     }
-    eprintln!("PHASE exact payload qualification {:?}", t.elapsed());
     let plan = n2
         .db
         .explain_cypher(
