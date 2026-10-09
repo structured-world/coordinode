@@ -2,6 +2,12 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Performance
+
+- *(cdc)* answer a consumer's progress age without rereading the log
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

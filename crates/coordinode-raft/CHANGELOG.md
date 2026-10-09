@@ -2,6 +2,19 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- drop the upgrade path from 0.6 stores
+- refuse to open over unreadable index and consensus state
+
+### Performance
+
+- *(storage)* admit bounds by the way writes move the count
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

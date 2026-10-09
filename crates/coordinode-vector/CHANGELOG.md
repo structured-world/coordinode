@@ -2,6 +2,13 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Fixed
+
+- *(embed)* fence the vector freshness watermark at a cut
+- *(query)* mark a built vector index ready after its tail fold
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

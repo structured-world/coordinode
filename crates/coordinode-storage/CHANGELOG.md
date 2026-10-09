@@ -2,6 +2,42 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(query)* count a label's nodes from its counter
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(storage)* release commit claims where the writes land
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(storage)* hide rows a transaction deleted from its scans
+- *(storage)* let a catalog change wait for admitted writers
+- *(server)* list labels from the counters, under a read lock
+- *(storage)* flush memtables sealed while the queue was full
+- *(storage)* wait for every older transaction in an index build
+- drop the upgrade path from 0.6 stores
+- *(storage)* keep the timeline docs free of private links
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(storage)* borrow node bytes during decode
+- *(storage)* admit bounds by the way writes move the count
+- *(cdc)* answer a consumer's progress age without rereading the log
+
+### Testing
+
+- *(storage)* replay kept cardinality counts once after a power cut
+- *(storage)* race edge commits through the whole pipeline
+- *(storage)* first edges into different pairs share an upper bound
+- *(storage)* cover kept counts on every commit path
+
 ## v0.7.0 - 2026-10-06
 
 ### Added
