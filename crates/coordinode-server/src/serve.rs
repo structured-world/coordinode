@@ -1092,14 +1092,24 @@ pub(crate) async fn serve(
 
     // Spawn operational HTTP server (default :7084, configurable via --ops-addr).
     let readiness = ops::Readiness::default();
-    // Consensus that stopped on a fatal error commits nothing more: the node
-    // stops reporting ready, so a balancer and an operator see it.
+    // Consensus that stopped on a fatal error commits nothing more, and the
+    // process does not try to carry on: after a failed log sync the kernel
+    // may already have dropped the unsynced pages, so nothing written since
+    // the last good sync can be trusted. The node stops reporting ready and
+    // shuts down with an error; its supervisor restarts it and recovery
+    // replays the durable state, where every acknowledged write is.
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel(None::<String>);
     if let Some(node) = raft_node_shared.clone() {
         let consensus_readiness = readiness.clone();
         tokio::spawn(async move {
             if let Some(fatal) = node.consensus_stopped().await {
-                tracing::error!(%fatal, "consensus stopped; the node no longer reports ready");
+                tracing::error!(
+                    %fatal,
+                    "consensus stopped on a fatal error; the process exits so it restarts \
+                     from its durable state"
+                );
                 consensus_readiness.consensus_failed();
+                fatal_tx.send_replace(Some(fatal));
             }
         });
     }
@@ -1210,7 +1220,7 @@ pub(crate) async fn serve(
         .map_err(|e| format!("failed to install SIGTERM handler: {e}"))?;
 
     let shutdown_readiness = readiness.clone();
-    let shutdown = async move {
+    let signals = async move {
         #[cfg(unix)]
         tokio::select! {
             _ = sigterm.recv() => {
@@ -1266,6 +1276,15 @@ pub(crate) async fn serve(
                 tracing::warn!(%e, "Ctrl+C handler failed");
             }
             info!("Ctrl+C received, initiating graceful shutdown");
+        }
+    };
+    let mut fatal_watch = fatal_rx.clone();
+    let shutdown = async move {
+        tokio::select! {
+            () = signals => {}
+            () = fatal_reported(&mut fatal_watch) => {
+                info!("shutting down after a fatal consensus error");
+            }
         }
         // First, so /ready turns a balancer away while in-flight RPCs drain.
         shutdown_readiness.set(false);
@@ -1485,7 +1504,18 @@ pub(crate) async fn serve(
         .await?;
     drop(index_definitions);
 
+    if let Some(fatal) = fatal_rx.borrow().clone() {
+        return Err(format!("consensus stopped on a fatal error: {fatal}").into());
+    }
     Ok(())
+}
+
+/// Resolves once the consensus watcher reports a fatal error; never when the
+/// watcher ends without one, which is a normal stop.
+async fn fatal_reported(fatal: &mut tokio::sync::watch::Receiver<Option<String>>) {
+    if fatal.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Brings this member's B-tree, vector and text indexes in line with the
