@@ -30,6 +30,7 @@ anstyle = { version = "1" }
 anstyle-parse = { version = "1" }
 anstyle-query = { version = "1", default-features = false }
 anyerror = { version = "0.1" }
+anyhow = { version = "1" }
 arc-swap = { version = "1", default-features = false }
 atomic-waker = { version = "1", default-features = false }
 axum = { version = "0.8", default-features = false }

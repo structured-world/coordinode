@@ -992,6 +992,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "coordinode-migrate"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "coordinode-core",
+ "coordinode-raft",
+ "coordinode-storage",
+ "coordinode-workspace-hack",
+ "openraft",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "coordinode-modality"
 version = "0.7.0"
 dependencies = [

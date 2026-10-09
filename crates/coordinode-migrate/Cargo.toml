@@ -1,0 +1,31 @@
+[package]
+name = "coordinode-migrate"
+description = "Offline migration of a data directory written by an earlier build to the current engine format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "coordinode-migrate"
+path = "src/main.rs"
+
+[dependencies]
+coordinode-storage = { workspace = true }
+coordinode-raft = { workspace = true }
+anyhow = "1"
+rmp-serde = { workspace = true }
+# Old encodings are rewritten as msgpack values, so no copy of a retired
+# type has to be kept to read them.
+rmpv = { workspace = true }
+coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
+
+[dev-dependencies]
+coordinode-core = { workspace = true }
+openraft = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

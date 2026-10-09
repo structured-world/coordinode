@@ -21,6 +21,7 @@ members = [
     "crates/coordinode-bench",
     "crates/coordinode-wire",
     "crates/coordinode-session",
+    "crates/coordinode-migrate",
     "crates/coordinode-workspace-hack",
     "tests/integration",
 ]
