@@ -190,6 +190,9 @@ fn measure(db: &Database, query: &str) -> (Vec<Duration>, usize) {
 fn main() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
+    // T0 has to stay readable for the whole run, longer than the default
+    // window keeps history.
+    db.set_retention_window(Duration::from_secs(3600));
     db.execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
         .expect("create text index");
     let written_from = written_bytes();
