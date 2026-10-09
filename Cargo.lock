@@ -997,6 +997,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "coordinode-core",
+ "coordinode-modality",
  "coordinode-raft",
  "coordinode-storage",
  "coordinode-workspace-hack",

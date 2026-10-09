@@ -14,6 +14,9 @@ path = "src/main.rs"
 [dependencies]
 coordinode-storage = { workspace = true }
 coordinode-raft = { workspace = true }
+coordinode-modality = { workspace = true }
+coordinode-core = { workspace = true }
+serde = { workspace = true }
 anyhow = "1"
 rmp-serde = { workspace = true }
 # Old encodings are rewritten as msgpack values, so no copy of a retired
@@ -22,9 +25,7 @@ rmpv = { workspace = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
-coordinode-core = { workspace = true }
 openraft = { workspace = true }
-serde = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

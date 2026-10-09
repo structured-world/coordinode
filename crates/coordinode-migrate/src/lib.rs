@@ -12,6 +12,8 @@
 //! data directory, so a run costs no space for the copy and can be undone by
 //! moving the files back.
 
+pub mod check;
+pub mod journal_stats;
 pub mod migrations;
 pub mod oplog;
 
@@ -82,6 +84,51 @@ impl Backup {
         }
         Ok(kept)
     }
+}
+
+/// The store at `data` and each checkpoint inside it: the directories that
+/// carry an engine format marker. A directory without one is never opened,
+/// since opening it would create a store there.
+///
+/// # Errors
+///
+/// The checkpoint directory cannot be listed.
+pub fn stores(data: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use anyhow::Context as _;
+    let marked = |dir: &Path| dir.join(coordinode_storage::format::MARKER_FILE).is_file();
+    let mut stores = Vec::new();
+    if marked(data) {
+        stores.push(data.to_path_buf());
+    }
+    let checkpoints = data.join("checkpoints");
+    if checkpoints.is_dir() {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&checkpoints)
+            .with_context(|| format!("list {}", checkpoints.display()))?
+        {
+            let path = entry
+                .with_context(|| format!("list {}", checkpoints.display()))?
+                .path();
+            if marked(&path) {
+                found.push(path);
+            }
+        }
+        found.sort();
+        stores.extend(found);
+    }
+    Ok(stores)
+}
+
+/// Open the store at `dir` as a plain engine: no journal is replayed and
+/// nothing of the server runs.
+///
+/// # Errors
+///
+/// The engine refuses the directory.
+pub fn open_store(dir: &Path) -> anyhow::Result<coordinode_storage::engine::core::StorageEngine> {
+    use anyhow::Context as _;
+    coordinode_storage::engine::core::StorageEngine::open_checkpoint(dir)
+        .with_context(|| format!("open the store {}", dir.display()))
 }
 
 /// Everything every migration finds in `data`, in migration order.
