@@ -200,6 +200,32 @@ fn has_valid_footer(data: &[u8]) -> bool {
     start >= HEADER_SIZE as usize && read_footer(&mut Cursor::new(&data[start..])).is_ok()
 }
 
+/// `true` when the segment at `path` is sealed: its last `FOOTER_SIZE` bytes
+/// are a footer whose checksum holds and whose entry bytes span exactly the
+/// file between header and footer. Reads only the footer. A sealed segment is
+/// never written again, so the answer holds for as long as the file exists.
+///
+/// # Errors
+///
+/// The file cannot be opened or read.
+pub(crate) fn is_sealed(path: &Path) -> StorageResult<bool> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| StorageError::Io(format!("open segment {path:?}: {e}")))?;
+    let len = file
+        .metadata()
+        .map_err(|e| StorageError::Io(format!("stat segment {path:?}: {e}")))?
+        .len();
+    let Some(entries) = len.checked_sub(HEADER_SIZE + FOOTER_SIZE) else {
+        return Ok(false);
+    };
+    file.seek(SeekFrom::Start(len - FOOTER_SIZE))
+        .map_err(|e| StorageError::Io(format!("seek segment {path:?}: {e}")))?;
+    let mut tail = [0u8; FOOTER_SIZE as usize];
+    file.read_exact(&mut tail)
+        .map_err(|e| StorageError::Io(format!("read footer {path:?}: {e}")))?;
+    Ok(read_footer(&mut Cursor::new(&tail[..])).is_ok_and(|f| f.total_bytes == entries))
+}
+
 /// The complete entries at the start of an entries section, and where they end.
 ///
 /// Parsing stops at the first frame that is incomplete, fails its checksum or

@@ -1389,7 +1389,7 @@ impl StorageEngine {
         if let Ok(endpoint) = self.select_oplog_endpoint(0) {
             let src_oplog = endpoint.path.join("oplog");
             if src_oplog.exists() {
-                summary.oplog_bytes = copy_dir_recursive(&src_oplog, &target.join("oplog"))?;
+                summary.oplog_bytes = capture_journal(&src_oplog, &target.join("oplog"))?;
             }
         }
 
@@ -4046,18 +4046,22 @@ pub struct CheckpointSummary {
     /// zero for an all-hard-link checkpoint, large when cross-fs copy
     /// fall-back fired.
     pub total_bytes: u64,
-    /// Bytes copied for the oplog directory.
+    /// Bytes copied for the oplog directory: the active segments. Sealed
+    /// segments are hard-linked and count only when linking fell back to a
+    /// copy across volumes.
     pub oplog_bytes: u64,
     /// Highest captured lsm seqno across partitions — the checkpoint's
     /// logical position, used by PITR to bound oplog replay.
     pub max_seqno: lsm_tree::SeqNo,
 }
 
-/// Recursively copy `src` into `dst`, returning total bytes copied.
-/// Plain file copy (no symlink following needed for oplog segments). A file
-/// that disappears between the listing and its copy is skipped: the journal
-/// purge removed it, and it held only entries already in the trees.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
+/// Capture the journal directory `src` into `dst`, returning the bytes
+/// copied. A sealed segment is never written again, so it is hard-linked
+/// (copied only where the link fails, across volumes); anything else, the
+/// active segment above all, is copied. A file that disappears between the
+/// listing and its capture is skipped: the journal purge removed it, and it
+/// held only entries already in the trees.
+fn capture_journal(src: &Path, dst: &Path) -> StorageResult<u64> {
     std::fs::create_dir_all(dst)
         .map_err(|e| StorageError::Io(format!("create dir {dst:?}: {e}")))?;
     let mut bytes = 0u64;
@@ -4070,13 +4074,24 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> StorageResult<u64> {
             .map_err(|e| StorageError::Io(format!("file type {:?}: {e}", entry.path())))?;
         let to = dst.join(entry.file_name());
         if file_type.is_dir() {
-            bytes += copy_dir_recursive(&entry.path(), &to)?;
+            bytes += capture_journal(&entry.path(), &to)?;
         } else {
-            match std::fs::copy(entry.path(), &to) {
+            let from = entry.path();
+            match crate::oplog::segment::is_sealed(&from) {
+                Ok(true) => {
+                    if std::fs::hard_link(&from, &to).is_ok() {
+                        continue;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) if !from.exists() => continue,
+                Err(e) => return Err(e),
+            }
+            match std::fs::copy(&from, &to) {
                 Ok(copied) => bytes += copied,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(StorageError::Io(format!("copy {:?}: {e}", entry.path())));
+                    return Err(StorageError::Io(format!("copy {from:?}: {e}")));
                 }
             }
         }

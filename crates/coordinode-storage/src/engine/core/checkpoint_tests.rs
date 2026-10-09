@@ -201,6 +201,85 @@ fn checkpoint_round_trips_all_partitions() {
     );
 }
 
+/// A sealed journal segment never changes again, so a checkpoint shares it
+/// with the store instead of copying it: every checkpoint used to carry a
+/// full copy of the journal. The active segment is still being written and
+/// is copied. Both read back whole from the checkpoint.
+#[test]
+fn checkpoint_links_sealed_journal_segments_and_copies_the_active_one() {
+    use crate::engine::config::SyncMethod;
+    use crate::oplog::entry::{OplogEntry, OplogOp};
+    use crate::oplog::segment::{SegmentReader, SegmentWriter};
+
+    let entry = |index: u64| OplogEntry {
+        ts: 1000 + index,
+        term: 1,
+        index,
+        shard: 0,
+        ops: vec![OplogOp::Insert {
+            partition: 1,
+            key: format!("node:k{index}").into_bytes(),
+            value: vec![7u8; 512],
+        }],
+        is_migration: false,
+        pre_images: None,
+    };
+
+    let src_dir = TempDir::new().expect("src tempdir");
+    let engine = disk_engine(src_dir.path());
+    let journal = src_dir.path().join("oplog").join("0");
+    std::fs::create_dir_all(&journal).expect("journal dir");
+    let sealed_name = "oplog-00000000000000000001.bin";
+    let active_name = "oplog-00000000000000000009.bin";
+    let mut sealed =
+        SegmentWriter::create(&journal.join(sealed_name), 0, 1, SyncMethod::Full).expect("sealed");
+    for i in 1..9 {
+        sealed.append(&entry(i)).expect("append");
+    }
+    sealed.seal().expect("seal");
+    let mut active =
+        SegmentWriter::create(&journal.join(active_name), 0, 9, SyncMethod::Full).expect("active");
+    active.append(&entry(9)).expect("append");
+    active.flush_and_sync().expect("sync");
+
+    let ckpt_parent = TempDir::new().expect("ckpt parent");
+    let target = ckpt_parent.path().join("snap");
+    let summary = engine.create_checkpoint(&target).expect("checkpoint");
+    let captured = target.join("oplog").join("0");
+
+    let active_len = std::fs::metadata(journal.join(active_name))
+        .expect("active len")
+        .len();
+    assert_eq!(
+        summary.oplog_bytes, active_len,
+        "only the active segment is copied"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let ino = |p: &std::path::Path| std::fs::metadata(p).expect("metadata").ino();
+        assert_eq!(
+            ino(&captured.join(sealed_name)),
+            ino(&journal.join(sealed_name)),
+            "the sealed segment is the same file"
+        );
+        assert_ne!(
+            ino(&captured.join(active_name)),
+            ino(&journal.join(active_name)),
+            "the active segment is a copy"
+        );
+    }
+
+    // Appending to the store's active segment does not reach the copy.
+    active.append(&entry(10)).expect("append");
+    active.flush_and_sync().expect("sync");
+    drop(active);
+    let read = SegmentReader::open(&captured.join(sealed_name)).expect("read sealed");
+    assert_eq!(read.entries().len(), 8);
+    let tail = SegmentReader::open_active(&captured.join(active_name)).expect("read active");
+    assert_eq!(tail.entries().len(), 1);
+}
+
 #[test]
 fn checkpoint_refuses_existing_target() {
     let src_dir = TempDir::new().expect("src tempdir");
