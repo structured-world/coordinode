@@ -99,6 +99,30 @@ The integer form, only when driving from a Neo4j v4 driver:
 MATCH (n) WHERE id(n) = $legacy_id RETURN n
 ```
 
+## Application numbers and auto_increment-style fields
+
+Native node identity and an application number serve different purposes. Keep
+using `elementId` for node references. An invoice number, for example, can be a
+separate stored property with its own uniqueness constraint.
+
+Sequence-backed application numbering is planned; `CREATE SEQUENCE`, `nextval`
+and sequence-backed identity/default syntax are not available in the current
+API. The intended recipe is to create a sequence and bind an insert-time field
+default to its next value. Identity syntax is shorthand for that generator.
+Ordinary generation needs no user-authored trigger; a custom BEFORE trigger
+is appropriate when additional application logic is required.
+
+Sequence allocation permits gaps after rollback, failed insertion or abandoned
+cached ranges. Concurrent consumers of cached ranges can issue values out of
+numerical order. It does not provide gap-free accounting, commit ordering or
+field uniqueness by itself. A counter that must commit or roll back together
+with a document has a different transactional contract. Selecting linearizable
+reads supplies neither allocation mechanism.
+
+There is no separate `AUTO_INCREMENT` feature or recommendation to replace
+native node identity with such a field. Executable examples will be published
+with the supported sequence/generation API.
+
 ## See also
 
 - [Functions reference](./functions) — full function list
