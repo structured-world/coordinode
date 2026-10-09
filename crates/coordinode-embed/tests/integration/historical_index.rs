@@ -369,7 +369,7 @@ fn as_of_text_ranking_matches_an_index_built_from_the_snapshot() {
         (state % bound as u64) as usize
     };
 
-    let (mut db, _dir) = open_db();
+    let (mut db, dir) = open_db();
     db.execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
         .expect("create text index");
     let mut live: BTreeMap<String, String> = BTreeMap::new();
@@ -415,36 +415,45 @@ fn as_of_text_ranking_matches_an_index_built_from_the_snapshot() {
         }
     }
 
-    for (ts, docs) in &snapshots {
-        let (mut model, model_dir) = open_db();
-        model
-            .execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
-            .expect("create text index");
-        for (name, body) in docs {
-            commit(
-                &mut model,
-                &format!("CREATE (:Doc {{name: '{name}', body: '{body}'}})"),
-            );
-        }
-        for word in WORDS {
-            let past = text_scores(&mut db, word, Some(*ts));
-            let expected = text_scores(&mut model, word, None);
-            assert_eq!(
-                past.keys().collect::<Vec<_>>(),
-                expected.keys().collect::<Vec<_>>(),
-                "matches of '{word}' at {ts}"
-            );
-            for (name, score) in &past {
-                let want = expected[name];
-                assert!(
-                    (score - want).abs() <= 1e-4 * want.abs().max(1.0),
-                    "score of {name} for '{word}' at {ts}: {score} against {want}"
+    let compare = |db: &mut Database| {
+        for (ts, docs) in &snapshots {
+            let (mut model, model_dir) = open_db();
+            model
+                .execute_cypher("CREATE TEXT INDEX doc_body ON :Doc(body)")
+                .expect("create text index");
+            for (name, body) in docs {
+                commit(
+                    &mut model,
+                    &format!("CREATE (:Doc {{name: '{name}', body: '{body}'}})"),
                 );
             }
+            for word in WORDS {
+                let past = text_scores(db, word, Some(*ts));
+                let expected = text_scores(&mut model, word, None);
+                assert_eq!(
+                    past.keys().collect::<Vec<_>>(),
+                    expected.keys().collect::<Vec<_>>(),
+                    "matches of '{word}' at {ts}"
+                );
+                for (name, score) in &past {
+                    let want = expected[name];
+                    assert!(
+                        (score - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "score of {name} for '{word}' at {ts}: {score} against {want}"
+                    );
+                }
+            }
+            // The database first, so its index worker stops before its
+            // directory goes away.
+            drop(model);
+            drop(model_dir);
         }
-        // The database first, so its index worker stops before its directory
-        // goes away.
-        drop(model);
-        drop(model_dir);
-    }
+    };
+    compare(&mut db);
+
+    // Reopened, the index is rebuilt from the store: the history still
+    // answers each past snapshot exactly.
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    compare(&mut db);
 }

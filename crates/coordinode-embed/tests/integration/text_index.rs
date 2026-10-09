@@ -477,6 +477,39 @@ fn a_documented_fuzzy_term_matches_within_its_distance() {
     );
 }
 
+/// A worker that cannot fold a write, nor rebuild after it (its index
+/// directory is gone), releases nothing: the write stays in the delta, a
+/// search finds the node from the store, and nothing panics.
+#[test]
+fn a_write_the_worker_cannot_fold_is_answered_from_the_store() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE TEXT INDEX article_body ON :Article(body)")
+        .expect("create text index");
+    db.execute_cypher("CREATE (:Article {title: 'a', body: 'stale rust words'})")
+        .expect("create a");
+    let registry = db.text_index_registry();
+    let coverage = registry.coverage().expect("the worker's coverage");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !coverage.delta(1).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "never folded");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    std::fs::remove_dir_all(registry.base_dir()).expect("remove the index directory");
+    db.execute_cypher("CREATE (:Article {title: 'b', body: 'fresh golang words'})")
+        .expect("create b");
+    let b = node_id(&mut db, "b");
+    // Long enough for the worker to try the fold and the rebuild.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        coverage
+            .delta(1)
+            .contains(coordinode_core::graph::node::NodeId::from_raw(b)),
+        "the unfolded write was released"
+    );
+    assert_eq!(titles(&mut db, "golang"), ["b"]);
+}
+
 /// When the writes the index lacks are not known (an event was dropped), a
 /// search reads every node of the label from the store instead of trusting
 /// the index for any of them.
