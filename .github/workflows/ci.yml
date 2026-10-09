@@ -216,6 +216,7 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
       - name: Install protoc and cargo-nextest
         # The runner's service account carries a Rust toolchain and nothing
         # else, so the job brings its own tools, pinned, into a directory of
@@ -253,7 +254,9 @@ jobs:
         run: cargo test --doc --all-features
       - name: Clean the build output
         # The machine is shared with other runners and people; nothing stays.
-        if: always()
+        # cargo is on this account's path only once the toolchain step ran, and
+        # before it nothing was built.
+        if: always() && steps.toolchain.outcome == 'success'
         run: cargo clean
 
   test-macos:
