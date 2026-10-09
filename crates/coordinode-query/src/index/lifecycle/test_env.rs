@@ -40,6 +40,8 @@ pub(crate) enum Fault {
     FieldsUnavailable,
     /// Committing a backfill page panics.
     PanicOnPage,
+    /// The member cannot commit catalog moves: it does not lead.
+    NotLeader,
 }
 
 impl TestEnv {
@@ -219,6 +221,9 @@ impl BuildEnvironment for TestEnv {
     }
 
     fn commit_catalog(&self, txn: &mut Transaction<'_>) -> Result<(), CommitError> {
+        if matches!(*self.fault.lock(), Some(Fault::NotLeader)) {
+            return Err(CommitError::NotLeader { leader_id: None });
+        }
         commit(txn)
     }
 

@@ -315,6 +315,38 @@ fn an_unfinished_build_is_resumed() {
     assert!(builds.resume().expect("resume again").is_empty());
 }
 
+/// A member that cannot lead when it takes a build changes nothing: the
+/// build is neither taken nor failed, its executor ends without an outcome,
+/// and the record still waits for one. A later take, once the member leads,
+/// finishes it.
+#[test]
+fn a_build_a_member_cannot_take_is_left_for_the_next_take() {
+    let env = env();
+    env.put_user(1, "a@x");
+    let def = env.admit(
+        IndexDescriptor::btree("user_email", "User", "email"),
+        BuildFailure::Withdraw,
+    );
+    let builds = service(&env);
+    env.inject(Some(Fault::NotLeader));
+
+    builds.submit(def.generation).expect("submit");
+    let outcome = builds.wait_here(def.generation);
+    assert!(outcome.is_none(), "not taken, so no outcome: {outcome:?}");
+    assert_eq!(
+        env.record(&def).expect("record").state,
+        BuildState::Accepted
+    );
+
+    env.inject(None);
+    assert_eq!(builds.resume().expect("resume"), [def.generation]);
+    let outcome = builds.wait_here(def.generation);
+    assert!(
+        matches!(outcome, Some(IndexBuildOutcome::Published { .. })),
+        "{outcome:?}"
+    );
+}
+
 /// A shutdown stops a build waiting for older transactions without waiting
 /// them out and returns once its executor has ended: the build keeps its
 /// running record, nothing new starts on the stopped service, and a service

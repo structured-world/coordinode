@@ -562,6 +562,22 @@ impl IndexBuildService {
         }
     }
 
+    /// The outcome an executor of this process reached for the build of
+    /// `generation`, once it ends; `None` when none had the build, or the one
+    /// that had it ended without an outcome: it could not take the build, or
+    /// another executor took it over. Unlike [`Self::wait`], it does not
+    /// follow the record.
+    pub fn wait_here(&self, generation: GenerationId) -> Option<IndexBuildOutcome> {
+        let mut slots = self.shared.slots.lock();
+        loop {
+            match slots.get(&generation) {
+                Some(Slot::Done(outcome)) => return Some(outcome.clone()),
+                Some(Slot::Running) => self.shared.finished.wait(&mut slots),
+                Some(Slot::Lost) | None => return None,
+            }
+        }
+    }
+
     /// Wait on the record of `generation` until it carries an outcome, up to
     /// `deadline`.
     fn follow_record(
@@ -927,6 +943,9 @@ impl Shared {
                 }
                 (Ok(()), None) => return Ok(Err(Executed::Outcome(IndexBuildOutcome::Cancelled))),
                 (Err(e), _) if is_contention(&e) => continue,
+                // Nothing moved: the build is the leader's to take, and the
+                // record tells this member's waiters how it ends.
+                (Err(e), _) if cannot_move_here(&e) => return Ok(Err(Executed::Lost)),
                 (Err(e), _) => return Err(e.to_string()),
             }
         }
@@ -1058,6 +1077,9 @@ impl Shared {
             match committed {
                 Ok(()) => return Ok(Concluded::Landed),
                 Err(e) if is_contention(&e) => continue,
+                // The record still names this executor; the next leader
+                // takes the build over and concludes it.
+                Err(e) if cannot_move_here(&e) => return Ok(Concluded::Lost),
                 Err(e) => return Err(e.to_string()),
             }
         }
@@ -1156,6 +1178,16 @@ fn is_contention(e: &CommitError) -> bool {
     matches!(
         e,
         CommitError::Conflict(_) | CommitError::RevisionMismatch { .. }
+    )
+}
+
+/// Whether a failed commit was refused because this member takes no writes
+/// now (it does not lead, or runs another version than its group): nothing
+/// moved, and the member that does takes the build.
+fn cannot_move_here(e: &CommitError) -> bool {
+    matches!(
+        e,
+        CommitError::NotLeader { .. } | CommitError::Mismatched(_)
     )
 }
 

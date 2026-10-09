@@ -41,10 +41,28 @@ pub(crate) fn spawn(
                 .await
             {
                 Ok(Ok(resumed)) => {
-                    if resumed > 0 {
-                        tracing::info!(resumed, "interrupted index builds finished");
+                    if resumed.published > 0 {
+                        tracing::info!(
+                            resumed = resumed.published,
+                            "interrupted index builds finished"
+                        );
                     }
-                    done_this_lead = true;
+                    if resumed.untaken == 0 {
+                        done_this_lead = true;
+                        continue;
+                    }
+                    // Leading, yet the writes were refused: the lead is not
+                    // usable for proposals yet. Look again at the next applied
+                    // entry, or after a pause when none comes.
+                    tracing::debug!(
+                        untaken = resumed.untaken,
+                        "unfinished index builds not taken yet"
+                    );
+                    tokio::select! {
+                        changed = applied.changed() => if changed.is_err() { break },
+                        () = tokio::time::sleep(RETRY) => {}
+                    }
+                    look_now = true;
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(%e, "taking up unfinished index builds failed; retrying");

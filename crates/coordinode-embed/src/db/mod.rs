@@ -163,6 +163,17 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000)
 /// `block` policy, when neither the query nor the session names a bound.
 pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What [`Database::resume_interrupted_index_builds`] did with the builds
+/// left without an outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumedIndexBuilds {
+    /// Builds finished with their index published.
+    pub published: usize,
+    /// Builds this member could not take, because it takes no writes now;
+    /// they stay as recorded for the member that does.
+    pub untaken: usize,
+}
+
 /// Applied Raft entries queued for the vector index worker before it is
 /// behind: past this the applies do not wait, the queue drops, and the
 /// worker rebuilds its indexes from the store.
@@ -3415,24 +3426,35 @@ impl Database {
     /// owning constraint active with it, or, refused by the stored data,
     /// withdrawn with that constraint, which the interrupted statement never
     /// acknowledged; a rebuild refused by the data keeps its index failed.
-    /// Returns how many were published.
+    /// A build this member could not take, because it takes no writes now,
+    /// is left as recorded and counted as untaken.
     ///
     /// # Errors
     ///
     /// The build records could not be read, or an executor could not start.
-    pub fn resume_interrupted_index_builds(&self) -> Result<usize, DatabaseError> {
+    pub fn resume_interrupted_index_builds(&self) -> Result<ResumedIndexBuilds, DatabaseError> {
         use coordinode_query::index::IndexBuildOutcome;
         let resumed = self.index_builds.resume().map_err(DatabaseError::Other)?;
-        let mut published = 0;
+        let mut out = ResumedIndexBuilds::default();
         for generation in resumed {
-            match self.index_builds.wait(generation, None)? {
+            match self.index_builds.wait_here(generation) {
                 Some(IndexBuildOutcome::Published { .. }) => {
-                    published += 1;
+                    out.published += 1;
                     tracing::info!(
                         generation = generation.as_raw(),
                         "finished an interrupted index build"
                     );
                 }
+                // Another executor ended it, or none took it: the record says
+                // which, without waiting.
+                None if self
+                    .index_builds
+                    .wait(generation, Some(Duration::ZERO))?
+                    .is_none() =>
+                {
+                    out.untaken += 1;
+                }
+                None => {}
                 outcome => tracing::error!(
                     generation = generation.as_raw(),
                     ?outcome,
@@ -3441,7 +3463,7 @@ impl Database {
             }
         }
         self.refresh_btree_indexes()?;
-        Ok(published)
+        Ok(out)
     }
 
     /// Reload the index definitions from the schema partition, so a member
