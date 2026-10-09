@@ -86,8 +86,8 @@ the key is unset.
 | `max_request_size_mb` | `16` | restart | Maximum decoded request message size, in MiB. Guards against unbounded-allocation requests. |
 | `request_timeout_secs` | (none) | restart | Per-request server-side timeout, in seconds. |
 | `http2_keepalive_secs` | (none) | restart | HTTP/2 keepalive ping interval, in seconds. Detects half-open connections behind a load balancer. |
-| `cache_size_mb` | engine default | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. |
-| `write_buffer_mb` | engine default | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
+| `cache_size_mb` | `64` | restart | Block cache size, in MiB. The read path serves hot blocks from this cache before touching disk. Size it to the blocks reads touch often: a working set larger than the cache is read and decompressed again on every access. |
+| `write_buffer_mb` | `64` | restart | Write buffer (memtable) size, in MiB. Larger buffers flush less often at the cost of memory. |
 | `retention_window_secs` | `604800` (7 days) | restart | MVCC time-travel / `AS OF TIMESTAMP` horizon, in seconds, enforced by the storage engine itself (embedded databases honour it too via `StorageConfig`). The GC watermark is held back to at least `now - this`, so history within the window stays queryable; a live snapshot pin can hold it back further, never less. A read older than the horizon is refused with `OUT_OF_RANGE` / `OUTSIDE_RETENTION`. Storage held by the window scales with the updates inside it: every version of a key written within the window is kept, plus the newest one below it. |
 | `max_invariant_claims` | `100000` | restart | Ceiling on the invariant claims held by all in-flight write attempts on this node, together. A claim is what a mutation states its result depends on (an endpoint it needs to keep existing, a bound it decided, a pair it observed); a commit writing an edge type that declares a relationship cardinality constraint also holds one claim per pair of that type it changes, so a single transaction changing more pairs than this ceiling is refused. The guard holds one set per attempt until the attempt ends, and refuses a claim beyond this ceiling rather than letting the table grow with load. A refused attempt is answered with `ABORTED` / `INVARIANT_REFUSED` and retries cheaply. Raise it only for workloads that legitimately hold many conditions at once (large scans inside write transactions); reaching it otherwise points at attempts that never end. |
 | `max_commits_in_flight` | `10000` | restart | Ceiling on the commits admitted and not yet applied on this node. A commit registers the keys it will write before it validates them and holds that registration until its writes are local state, so the table holds one entry per commit in flight: bounded by write concurrency, not by data size. At the ceiling a commit is refused as retryable backpressure (`RESOURCE_EXHAUSTED` / `WRITE_BACKPRESSURE`) rather than the table growing without limit. Reaching it means commits are not finishing (a stalled replication wait, a member that stopped acknowledging), not that the node is merely busy. |
@@ -292,8 +292,8 @@ peers: []
 # nofile: 262144
 # max_connections: 1024
 max_request_size_mb: 16
-# cache_size_mb: 4096
-# write_buffer_mb: 256
+# cache_size_mb: 64
+# write_buffer_mb: 64
 
 # Interactive-transaction limits.
 interactive_txn_idle_timeout_secs: 30
