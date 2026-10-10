@@ -3687,16 +3687,23 @@ impl StorageEngine {
         part: Partition,
         key: &[u8],
     ) -> StorageResult<Option<(bytes::Bytes, lsm_tree::SeqNo)>> {
-        let Some(version) = self.record_version(part, key)? else {
-            return Ok(None);
-        };
-        // The value of exactly that write: a snapshot just past it sees it
-        // and nothing newer. A committed version is a commit timestamp,
-        // never the read-latest sentinel, so the step does not overflow.
+        // The latest value, read between two reads of the version: equal
+        // versions mean no write landed between, so the value is that
+        // write's. The value is read at the present, never at the version
+        // itself: a record last written before the retention horizon is still
+        // the latest state, and compaction may have settled its version to
+        // zero, so a read at the version would be a refused read in the past.
         let tree = self.tree(part)?;
-        Ok(tree
-            .get(key, version + 1)?
-            .map(|value| (bytes::Bytes::copy_from_slice(&value), version)))
+        loop {
+            let Some(version) = self.record_version(part, key)? else {
+                return Ok(None);
+            };
+            let value = tree.get(key, lsm_tree::SeqNo::MAX)?;
+            if self.record_version(part, key)? != Some(version) {
+                continue;
+            }
+            return Ok(value.map(|value| (bytes::Bytes::copy_from_slice(&value), version)));
+        }
     }
 
     /// Whether `key` was written by anything this snapshot does not already

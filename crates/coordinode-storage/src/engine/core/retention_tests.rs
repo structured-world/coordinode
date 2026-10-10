@@ -609,6 +609,45 @@ fn delete_does_not_resurrect(s: Subject) {
     );
 }
 
+/// A record last written before the retention horizon is still the latest
+/// state, and reading it together with its version is a read of the present:
+/// it answers, rather than being refused as a read in the past. The version
+/// reads as written, or as zero once compaction has settled the row.
+#[test]
+fn a_versioned_read_of_a_record_older_than_the_horizon_answers() {
+    let base = future_base();
+    let (engine, oracle, _dir) = oracle_engine(base);
+    engine.set_retention_window(Duration::from_secs(1));
+    let key = b"node:00:00000001";
+    let other = b"node:00:00000002";
+    put_at(&engine, key, b"old", base + 1_000);
+    flush(&engine);
+    // Much later: the horizon passes the record, and a compaction records a
+    // retention floor above it.
+    put_at(&engine, other, b"new", base + 60_000_000);
+    flush(&engine);
+    oracle.advance_to(Timestamp::from_raw(base + 120_000_000));
+    engine.advance_gc_watermark();
+    engine.force_compaction(Partition::Node).expect("compact");
+    assert!(
+        engine.oldest_readable_seqno() > base + 1_000,
+        "the horizon is past the record"
+    );
+
+    let (value, version) = engine
+        .get_versioned(Partition::Node, key)
+        .expect("a read of the present is not a read in the past")
+        .expect("the record is live");
+    assert_eq!(value.as_ref(), b"old");
+    assert_eq!(
+        engine
+            .record_version(Partition::Node, key)
+            .expect("version"),
+        Some(version),
+        "the value and the version are one write's"
+    );
+}
+
 /// The window's disk cost is observable per partition, and it is paid in key
 /// versions, not in tables: inside the window the compaction output carries
 /// both versions of the key (so it is larger than one version) and nothing

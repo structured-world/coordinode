@@ -840,6 +840,56 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     );
 }
 
+/// Records and catalog rows last written before the retention horizon are
+/// the present state: a check of the index and a rebuild read them, and
+/// succeed, after compaction has settled them below the horizon. A store
+/// opened long after its last write is in this state at once.
+#[test]
+fn a_check_and_a_rebuild_read_records_older_than_the_horizon() {
+    use coordinode_storage::engine::partition::Partition;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let owner = id_of(&mut db, "a@x");
+    let wrong = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", wrong);
+
+    // The horizon passes every record: a short window, time beyond it, one
+    // later write to move the clock, and a compaction of every partition
+    // that records its retention floor.
+    db.set_retention_window(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.execute_cypher("CREATE (:Other {n: 1})")
+        .expect("later write");
+    db.engine().advance_gc_watermark();
+    for part in Partition::all() {
+        db.engine().force_compaction(*part).expect("compact");
+    }
+
+    let operation = db
+        .check_index(&IndexSelector::Name("u_email".into()))
+        .expect("check admitted");
+    let (_, outcome) = db
+        .index_check(operation, std::time::Duration::from_secs(30))
+        .expect("check readable")
+        .expect("check known");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { repaired: 1.., .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(found(&mut db, "a@x"), vec![owner]);
+
+    db.reindex(
+        &IndexSelector::Name("u_email".into()),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("rebuilt");
+    assert_eq!(found(&mut db, "a@x"), vec![owner]);
+    assert_eq!(found(&mut db, "z@x"), vec![wrong]);
+}
+
 /// A limit smaller than one record of the label stops the lookup with the
 /// memory refusal, rather than answering with what it read before it or
 /// with nothing.
