@@ -891,6 +891,206 @@ impl schema::schema_service_server::SchemaService for SchemaServiceImpl {
                 .collect(),
         }))
     }
+
+    async fn check_index(
+        &self,
+        request: Request<schema::CheckIndexRequest>,
+    ) -> Result<Response<schema::IndexCheck>, Status> {
+        let selector = check_selector(request.into_inner().index)?;
+        let check = super::blocking(|| -> Result<schema::IndexCheck, Status> {
+            let db = self.database.read();
+            let operation = db.check_index(&selector).map_err(db_error_to_status)?;
+            check_of(&db, operation, Duration::ZERO)
+        })?;
+        Ok(Response::new(check))
+    }
+
+    async fn list_index_checks(
+        &self,
+        _request: Request<schema::ListIndexChecksRequest>,
+    ) -> Result<Response<schema::ListIndexChecksResponse>, Status> {
+        let checks = super::blocking(|| -> Result<Vec<schema::IndexCheck>, Status> {
+            Ok(self
+                .database
+                .read()
+                .index_checks()
+                .map_err(db_error_to_status)?
+                .iter()
+                .map(|status| check_to_proto(status, None))
+                .collect())
+        })?;
+        Ok(Response::new(schema::ListIndexChecksResponse { checks }))
+    }
+
+    async fn get_index_check(
+        &self,
+        request: Request<schema::GetIndexCheckRequest>,
+    ) -> Result<Response<schema::IndexCheck>, Status> {
+        let req = request.into_inner();
+        let operation = operation_from_proto(req.operation)?;
+        let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
+        let check = super::blocking(|| check_of(&self.database.read(), operation, wait))?;
+        Ok(Response::new(check))
+    }
+
+    async fn cancel_index_check(
+        &self,
+        request: Request<schema::CancelIndexCheckRequest>,
+    ) -> Result<Response<schema::IndexCheck>, Status> {
+        let operation = operation_from_proto(request.into_inner().operation)?;
+        let check = super::blocking(|| -> Result<schema::IndexCheck, Status> {
+            let db = self.database.read();
+            db.cancel_index_check(operation)
+                .map_err(db_error_to_status)?;
+            check_of(&db, operation, Duration::ZERO)
+        })?;
+        Ok(Response::new(check))
+    }
+
+    async fn reindex(
+        &self,
+        request: Request<schema::ReindexRequest>,
+    ) -> Result<Response<schema::IndexBuild>, Status> {
+        let req = request.into_inner();
+        let selector = reindex_selector(req.index)?;
+        let wait = wait_from_proto("wait", req.wait)?.unwrap_or(Duration::ZERO);
+        let build = super::blocking(|| -> Result<schema::IndexBuild, Status> {
+            let db = self.database.read();
+            let operation = db.reindex(&selector, wait).map_err(db_error_to_status)?;
+            db.index_build(operation, Duration::ZERO)
+                .map_err(db_error_to_status)?
+                .map(|status| build_to_proto(&status))
+                .ok_or_else(|| unknown_build(operation))
+        })?;
+        Ok(Response::new(build))
+    }
+}
+
+/// The index a check request selects, by identity or by name; one is
+/// required.
+fn check_selector(
+    index: Option<schema::check_index_request::Index>,
+) -> Result<coordinode_query::index::IndexSelector, Status> {
+    use schema::check_index_request::Index;
+    selector(match index {
+        Some(Index::IndexId(id)) => Some(Ok(id)),
+        Some(Index::IndexName(name)) => Some(Err(name)),
+        None => None,
+    })
+}
+
+/// The index a rebuild request selects, by identity or by name; one is
+/// required.
+fn reindex_selector(
+    index: Option<schema::reindex_request::Index>,
+) -> Result<coordinode_query::index::IndexSelector, Status> {
+    use schema::reindex_request::Index;
+    selector(match index {
+        Some(Index::IndexId(id)) => Some(Ok(id)),
+        Some(Index::IndexName(name)) => Some(Err(name)),
+        None => None,
+    })
+}
+
+/// An identity (`Ok`) or a name (`Err`) as a selector.
+fn selector(
+    index: Option<Result<u64, String>>,
+) -> Result<coordinode_query::index::IndexSelector, Status> {
+    use coordinode_query::index::{IndexId, IndexSelector};
+    match index {
+        Some(Ok(id)) => Ok(IndexSelector::Id(IndexId::from_raw(id))),
+        Some(Err(name)) => Ok(IndexSelector::Name(name)),
+        None => Err(invalid_field("index", "an index id or name is required")),
+    }
+}
+
+/// The check `operation` as the wire shows it, after waiting up to `wait`
+/// for its outcome.
+fn check_of(
+    db: &coordinode_embed::Database,
+    operation: GenerationId,
+    wait: Duration,
+) -> Result<schema::IndexCheck, Status> {
+    let (status, outcome) = db
+        .index_check(operation, wait)
+        .map_err(db_error_to_status)?
+        .ok_or_else(|| unknown_check(operation))?;
+    Ok(check_to_proto(&status, outcome.as_ref()))
+}
+
+/// No check has `operation`.
+fn unknown_check(operation: GenerationId) -> Status {
+    let operation = operation.as_raw().to_string();
+    catalog_object_status(
+        tonic::Code::NotFound,
+        format!("no index check has operation {operation}"),
+        Reason::CatalogObjectNotFound,
+        "index_check",
+        &operation,
+    )
+}
+
+/// One generation's integrity and latest check as the wire shows it.
+fn check_to_proto(
+    status: &coordinode_query::index::CheckStatus,
+    outcome: Option<&coordinode_query::index::CheckOutcome>,
+) -> schema::IndexCheck {
+    use coordinode_query::index::{CheckOutcome, CheckPhase, CheckState, Integrity, Mismatch};
+    let record = &status.record;
+    let check = record.check.as_ref();
+    schema::IndexCheck {
+        operation: status.generation.as_raw(),
+        index_id: record.index.as_raw(),
+        index: status
+            .index
+            .as_ref()
+            .and_then(|i| i.name.clone())
+            .unwrap_or_default(),
+        label: status
+            .index
+            .as_ref()
+            .map(|i| i.label.clone())
+            .unwrap_or_default(),
+        integrity: match record.integrity {
+            Integrity::Unchecked => schema::IndexIntegrity::Unchecked,
+            Integrity::Suspect => schema::IndexIntegrity::Suspect,
+            Integrity::Verified => schema::IndexIntegrity::Verified,
+        } as i32,
+        state: check.map_or(schema::IndexCheckState::Unspecified, |c| match c.state {
+            CheckState::Accepted => schema::IndexCheckState::Accepted,
+            CheckState::Running { .. } => schema::IndexCheckState::Running,
+            CheckState::Done => schema::IndexCheckState::Done,
+            CheckState::Failed { .. } => schema::IndexCheckState::Failed,
+            CheckState::Cancelled => schema::IndexCheckState::Cancelled,
+        }) as i32,
+        phase: check.map_or(schema::IndexCheckPhase::Unspecified, |c| match c.phase {
+            CheckPhase::Records => schema::IndexCheckPhase::Records,
+            CheckPhase::Entries => schema::IndexCheckPhase::Entries,
+        }) as i32,
+        passes: check.map_or(0, |c| c.passes),
+        checked: check.map_or(0, |c| c.checked),
+        mismatches: check.map_or(0, |c| c.mismatches),
+        repaired: check.map_or(0, |c| c.repaired),
+        conflicts: record
+            .evidence
+            .iter()
+            .filter_map(|m| match m {
+                Mismatch::SourceDuplicate { nodes, .. } => Some(schema::IndexSourceConflict {
+                    element_ids: nodes
+                        .iter()
+                        .map(|n| coordinode_core::graph::node::NodeId::from_raw(*n).to_element_id())
+                        .collect(),
+                }),
+                _ => None,
+            })
+            .collect(),
+        rebuilt_into: check.and_then(|c| c.rebuilt_into).map(|g| g.as_raw()),
+        failure: match (check.map(|c| &c.state), outcome) {
+            (Some(CheckState::Failed { reason }), _) => reason.clone(),
+            (_, Some(CheckOutcome::Failed(reason))) => reason.clone(),
+            _ => String::new(),
+        },
+    }
 }
 
 #[cfg(test)]

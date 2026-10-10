@@ -8,8 +8,10 @@
 
 use core::time::Duration;
 
+use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
 use coordinode_query::index::{
-    CheckOutcome, CheckRequestError, CheckStatus, GenerationId, IndexSelector, IndexType,
+    CheckOutcome, CheckRequestError, CheckStatus, GenerationId, IndexSelector, IndexSelectorError,
+    IndexType,
 };
 
 use super::{Database, DatabaseError};
@@ -29,7 +31,7 @@ impl Database {
     pub fn check_index(&self, index: &IndexSelector) -> Result<GenerationId, DatabaseError> {
         let def = index
             .resolve(&self.engine)
-            .map_err(|e| DatabaseError::Other(e.to_string()))?;
+            .map_err(|e| selector_error(index, e))?;
         self.index_builds
             .request_check(def.id)
             .map_err(check_request_error)
@@ -98,10 +100,12 @@ impl Database {
     ) -> Result<GenerationId, DatabaseError> {
         let def = index
             .resolve(&self.engine)
-            .map_err(|e| DatabaseError::Other(e.to_string()))?;
+            .map_err(|e| selector_error(index, e))?;
         if def.index_type != IndexType::BTree {
-            return Err(DatabaseError::Other(format!(
-                "index '{def}' is not a B-tree index; only B-tree indexes are rebuilt this way"
+            return Err(DatabaseError::Execution(ExecutionError::CatalogRefused(
+                format!(
+                    "index '{def}' is not a B-tree index; only B-tree indexes are rebuilt this way"
+                ),
             )));
         }
         let def = self
@@ -113,6 +117,34 @@ impl Database {
     }
 }
 
+/// A refused check as the error a caller can tell apart: a missing index,
+/// an index or a member that cannot run one, or a storage failure.
 fn check_request_error(e: CheckRequestError) -> DatabaseError {
-    DatabaseError::Other(e.to_string())
+    DatabaseError::Execution(match e {
+        CheckRequestError::NoSuchIndex => ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Index,
+            name: String::new(),
+        },
+        CheckRequestError::NotChecked(_) | CheckRequestError::NotReady(_) => {
+            ExecutionError::CatalogRefused(e.to_string())
+        }
+        CheckRequestError::NotHere => ExecutionError::NotLeader { leader_id: None },
+        CheckRequestError::Other(reason) => ExecutionError::Unsupported(reason),
+    })
+}
+
+/// An index a selector names that does not resolve.
+fn selector_error(index: &IndexSelector, e: IndexSelectorError) -> DatabaseError {
+    match e {
+        IndexSelectorError::NotFound(_) => {
+            DatabaseError::Execution(ExecutionError::CatalogObjectMissing {
+                object: CatalogObject::Index,
+                name: match index {
+                    IndexSelector::Name(name) => name.clone(),
+                    IndexSelector::Id(id) => id.as_raw().to_string(),
+                },
+            })
+        }
+        IndexSelectorError::Storage(reason) => DatabaseError::Other(reason),
+    }
 }

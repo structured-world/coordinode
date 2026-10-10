@@ -532,6 +532,12 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   `state`, `phase` (`RECORDS`, `ENTRIES`), `passes`, `checked`,
   `mismatches`, `repaired`, `conflicts`, `rebuiltInto` and `failure`. A
   string argument names an index, an integer is its id.
+- Over gRPC the same operations are `SchemaService.CheckIndex`,
+  `ListIndexChecks`, `GetIndexCheck`, `CancelIndexCheck` and `Reindex`,
+  selecting an index by `index_id` or `index_name`. A missing index or
+  check answers `NOT_FOUND`; an index that is not a ready B-tree index
+  answers `FAILED_PRECONDITION`; a member that takes no writes refuses
+  `CheckIndex` as not the leader.
 
 #### CREATE CONSTRAINT / DROP CONSTRAINT ✅
 

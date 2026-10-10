@@ -541,6 +541,104 @@ async fn a_constraint_build_outlives_its_call_and_is_inspected_by_operation() {
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
 }
 
+/// The index check RPCs: a check started by name reaches VERIFIED and is
+/// listed and inspected; cancelling a finished check changes nothing; a
+/// rebuild by identity is a build GetIndexBuild knows; and the refusals
+/// carry their codes.
+#[tokio::test]
+async fn index_checks_over_grpc() {
+    let (svc, _dir) = test_service();
+    {
+        let mut db = svc.database.write();
+        db.execute_cypher("CREATE INDEX c_city ON :Customer(city)")
+            .expect("index");
+        db.execute_cypher("CREATE (:Customer {city: 'oslo'})")
+            .expect("node");
+    }
+    let started = svc
+        .check_index(Request::new(schema::CheckIndexRequest {
+            index: Some(schema::check_index_request::Index::IndexName(
+                "c_city".into(),
+            )),
+        }))
+        .await
+        .expect("start a check")
+        .into_inner();
+    assert_eq!(started.index, "c_city");
+    assert_eq!(started.label, "Customer");
+    let operation = started.operation;
+
+    let done = svc
+        .get_index_check(Request::new(schema::GetIndexCheckRequest {
+            operation: Some(operation),
+            wait: Some(prost_types::Duration {
+                seconds: 20,
+                nanos: 0,
+            }),
+        }))
+        .await
+        .expect("inspect")
+        .into_inner();
+    assert_eq!(done.integrity, schema::IndexIntegrity::Verified as i32);
+    assert_eq!(done.state, schema::IndexCheckState::Done as i32);
+    assert!(done.checked >= 2, "a record and an entry: {}", done.checked);
+    let listed = svc
+        .list_index_checks(Request::new(schema::ListIndexChecksRequest {}))
+        .await
+        .expect("list")
+        .into_inner()
+        .checks;
+    assert!(listed.iter().any(|c| c.operation == operation));
+    let kept = svc
+        .cancel_index_check(Request::new(schema::CancelIndexCheckRequest {
+            operation: Some(operation),
+        }))
+        .await
+        .expect("cancel")
+        .into_inner();
+    assert_eq!(kept.state, schema::IndexCheckState::Done as i32);
+
+    let built = svc
+        .reindex(Request::new(schema::ReindexRequest {
+            index: Some(schema::reindex_request::Index::IndexId(started.index_id)),
+            wait: Some(prost_types::Duration {
+                seconds: 20,
+                nanos: 0,
+            }),
+        }))
+        .await
+        .expect("reindex")
+        .into_inner();
+    assert_eq!(built.state, schema::IndexBuildState::Published as i32);
+    assert_ne!(built.operation, operation, "a fresh generation");
+
+    let missing = svc
+        .check_index(Request::new(schema::CheckIndexRequest {
+            index: Some(schema::check_index_request::Index::IndexName(
+                "no_such".into(),
+            )),
+        }))
+        .await
+        .expect_err("no such index");
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    let unknown = svc
+        .get_index_check(Request::new(schema::GetIndexCheckRequest {
+            operation: Some(operation + 1000),
+            wait: None,
+        }))
+        .await
+        .expect_err("no such check");
+    assert_eq!(unknown.code(), tonic::Code::NotFound);
+    let unselected = svc
+        .reindex(Request::new(schema::ReindexRequest {
+            index: None,
+            wait: None,
+        }))
+        .await
+        .expect_err("no index named");
+    assert_eq!(unselected.code(), tonic::Code::InvalidArgument);
+}
+
 /// A CreateConstraint with on_duplicate_rename repairs the stored
 /// duplicate: the constraint is ACTIVE, its build reports the property and
 /// one repair, and ListIndexBuildRepairs names the node and both values.

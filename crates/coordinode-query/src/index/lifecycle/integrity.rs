@@ -105,6 +105,9 @@ pub struct CheckStatus {
     pub record: IndexIntegrityRecord,
     /// Whether an executor of this process runs it now.
     pub running_here: bool,
+    /// The index the record names, while its definition exists. `None`
+    /// once the index is dropped.
+    pub index: Option<super::BuildIndex>,
 }
 
 /// What an executor took: the definition it checks, the version of its
@@ -535,16 +538,27 @@ impl IndexBuildService {
     /// The records could not be read.
     pub fn checks(&self) -> Result<Vec<CheckStatus>, StoreError> {
         let store = LocalIndexStore::new(self.shared.env.engine());
-        let running = self.shared.checks.lock();
-        Ok(store
-            .list_integrity()?
-            .into_iter()
-            .map(|record| CheckStatus {
+        let records = store.list_integrity()?;
+        let mut out = Vec::with_capacity(records.len());
+        for record in records {
+            let index = store
+                .load_definition(record.index)?
+                .map(|d| super::BuildIndex {
+                    name: d.name.clone(),
+                    label: d.label.clone(),
+                });
+            let running_here = matches!(
+                self.shared.checks.lock().get(&record.generation),
+                Some(CheckSlot::Running)
+            );
+            out.push(CheckStatus {
                 generation: record.generation,
-                running_here: matches!(running.get(&record.generation), Some(CheckSlot::Running)),
+                running_here,
+                index,
                 record,
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 
     /// Take up every check the catalog records without an outcome, as after
