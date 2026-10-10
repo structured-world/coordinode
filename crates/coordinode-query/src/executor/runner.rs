@@ -3804,6 +3804,7 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
             property_filters, ..
         } => filters(property_filters),
         LogicalOp::IndexScan { value_expr, .. } => expr_unaccounted(value_expr),
+        LogicalOp::NodeCountFromCounter { fallback, .. } => first_unaccounted_operator(fallback),
         LogicalOp::Empty => None,
         LogicalOp::Filter { input, predicate } => {
             expr_unaccounted(predicate).or_else(|| first_unaccounted_operator(input))
@@ -3819,6 +3820,9 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
             first_unaccounted_operator(input)
         }
+        // The search holds its queue and predecessors per pair and expands
+        // through the charged hop.
+        LogicalOp::ShortestPath { input, .. } => first_unaccounted_operator(input),
         LogicalOp::Unwind { input, expr, .. } => {
             expr_unaccounted(expr).or_else(|| first_unaccounted_operator(input))
         }
@@ -3926,9 +3930,11 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             fallback,
         } => match counted_nodes(label, ctx)? {
             Some(n) => {
+                // One counter read, one row.
+                ctx.budget.work(1)?;
                 let mut row = Row::new();
                 row.insert(column.clone(), Value::Int(n));
-                Ok(vec![row])
+                charge_returned(ctx, 0, vec![row])
             }
             None => execute_op(fallback, ctx),
         },
@@ -4711,7 +4717,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 max_depth: *max_depth,
                 path_variable,
             };
-            execute_shortest_path(&rows, &sp, ctx)
+            let found = execute_shortest_path(&rows, &sp, ctx)?;
+            charge_returned(ctx, rows.len(), found)
         }
 
         LogicalOp::EdgeVectorSearch {

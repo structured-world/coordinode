@@ -862,6 +862,8 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     let exists = "MATCH (u:U {email: 'a@x'}) WHERE EXISTS { MATCH (u)-[:R]->(:T) } \
                   RETURN count { MATCH (u)-[:R]->(:T) } AS n";
     let count = "MATCH (u:U {email: 'a@x'}) RETURN count(u) AS n";
+    let shortest =
+        "MATCH p = shortestPath((u:U {email: 'a@x'})-[:R*..3]->(t:T)) RETURN length(p) AS n";
 
     let wrong = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", wrong);
@@ -878,7 +880,7 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
         ),
         "{refused:?}"
     );
-    for query in [optional, traverse, exists, count] {
+    for query in [optional, traverse, exists, count, shortest] {
         wrong_again(&db, wrong);
         let rows = db.execute_cypher(query).expect("accounted");
         assert_eq!(rows.len(), 1, "{query}");
