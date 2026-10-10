@@ -3828,6 +3828,32 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::HnswScan { query_vector, .. } => expr_unaccounted(query_vector),
         // The text index search reports every document it scores and reads.
         LogicalOp::TextIndexScan { .. } => None,
+        // Fusion scores every row per method, a text method through the
+        // charged text search; a document score walks its chunks through
+        // the charged hop.
+        LogicalOp::RankFuse {
+            input,
+            methods,
+            query_vector,
+            query_text,
+            ..
+        } => methods
+            .iter()
+            .chain(query_vector)
+            .chain(query_text)
+            .find_map(expr_unaccounted)
+            .or_else(|| first_unaccounted_operator(input)),
+        LogicalOp::DocScore {
+            input,
+            query_vector,
+            alpha,
+            beta,
+            gamma,
+            ..
+        } => [query_vector, alpha, beta, gamma]
+            .into_iter()
+            .find_map(expr_unaccounted)
+            .or_else(|| first_unaccounted_operator(input)),
         // The encrypted index's entries stream past within the budget.
         LogicalOp::EncryptedFilter {
             input,
@@ -5300,6 +5326,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             fusion,
         } => {
             let rows = execute_op(input, ctx)?;
+            // Each method scores and ranks every row; its ranks are held
+            // while the scores are fused, and every row gains its score
+            // columns.
+            let cells = methods.len() * rows.len();
+            ctx.budget.work(2 * cells as u64)?;
+            let budget = Arc::clone(&ctx.budget);
+            let _ranks = budget
+                .reserve((cells * core::mem::size_of::<(Option<usize>, f64, u64)>()) as u64)?;
+            ctx.hold((rows.len() * 2 * SCORE_COLUMN_BYTES) as u64)?;
             execute_rank_fuse(
                 rows,
                 methods,
@@ -5320,10 +5355,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             gamma,
         } => {
             let rows = execute_op(input, ctx)?;
+            // Every row gains its score column; the chunks are counted and
+            // held as each document is scored.
+            ctx.hold((rows.len() * SCORE_COLUMN_BYTES) as u64)?;
             execute_doc_score(rows, doc_variable, query_vector, alpha, beta, gamma, ctx)
         }
     }
 }
+
+/// What a score column (its name and a float value) adds to a row.
+const SCORE_COLUMN_BYTES: usize =
+    core::mem::size_of::<String>() + core::mem::size_of::<Value>() + 32;
 
 /// Scan nodes from storage, optionally filtering by label.
 /// Whether the node counter of `label` equals what a scan of the label
@@ -9168,6 +9210,8 @@ fn execute_doc_score(
         let mut matching: usize = 0;
 
         for (chunk_uid, _et_idx) in &neighbours {
+            // A chunk read and scored.
+            ctx.budget.work(1)?;
             let chunk = match ctx.mvcc_get_node(ctx.shard_id, NodeId::from_raw(*chunk_uid))? {
                 Some(rec) => rec,
                 None => continue,
