@@ -20,12 +20,20 @@ Add-Type -Namespace Win32 -Name Power -MemberDefinition @'
 [Win32.Power]::SetThreadExecutionState([uint32]2147483649) | Out-Null
 
 # The idle timer keeps running under the hold, so by the end of a run it has
-# usually run out, and the machine would sleep the moment the hold goes,
-# before check.sh fetches the logs. A one-shot ES_SYSTEM_REQUIRED on the way
-# out restarts the countdown instead.
-function Release-Awake {
-    [Win32.Power]::SetThreadExecutionState([uint32]2147483648) | Out-Null
-    [Win32.Power]::SetThreadExecutionState([uint32]1) | Out-Null
+# run out, and the machine sleeps the moment the hold goes, before check.sh
+# fetches the logs; resetting the timer does not stop it after an unattended
+# wake. So the run says it is done and keeps the hold until check.sh creates
+# the file `fetched` beside the logs, or for ten minutes at most. (A script
+# run with -File over ssh does not see the session's standard input.)
+function Wait-Fetched {
+    $marker = Join-Path $Root 'fetched'
+    $watcher = New-Object IO.FileSystemWatcher $Root, 'fetched'
+    [Console]::Out.WriteLine('CHECK-DONE')
+    [Console]::Out.Flush()
+    if (-not (Test-Path $marker)) {
+        $watcher.WaitForChanged([IO.WatcherChangeTypes]::Created, 600000) | Out-Null
+    }
+    $watcher.Dispose()
 }
 
 # Windows PowerShell writes UTF-16 by default; check.sh reads status.txt as
@@ -57,7 +65,7 @@ if ($LASTEXITCODE -ne 0) {
     Set-Location $Root
     Remove-Item -Recurse -Force $src, $Bundle, (Join-Path $Root 'sub-*.bundle') -ErrorAction SilentlyContinue
     'done' | Out-File -Append $status
-    Release-Awake
+    Wait-Fetched
     exit 1
 }
 
@@ -79,7 +87,7 @@ if ($Nextest) {
     Set-Location $Root
     Remove-Item -Recurse -Force $src, $target, $Bundle -ErrorAction SilentlyContinue
     'done' | Out-File -Append $status
-    Release-Awake
+    Wait-Fetched
     exit 0
 }
 
@@ -96,4 +104,4 @@ cargo test --doc --all-features *> (Join-Path $Root 'doctest.log')
 Set-Location $Root
 Remove-Item -Recurse -Force $src, $target, $Bundle -ErrorAction SilentlyContinue
 'done' | Out-File -Append $status
-Release-Awake
+Wait-Fetched

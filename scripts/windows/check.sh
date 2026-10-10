@@ -92,15 +92,41 @@ nextest_arg=''
 if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
   nextest_arg=" -Nextest '$COORDINODE_CHECK_NEXTEST'"
 fi
-ssh "$host" "powershell -NoProfile -ExecutionPolicy Bypass -File '$remote_root\\check.ps1' -Root '$remote_root' -Bundle '$remote_root\\tree.bundle' -Ref '$ref'$nextest_arg" || true
 
 # A log this run did not write must not be read as its result.
 for f in status.txt clippy.log build.log test.log doctest.log; do
   rm -f "$out/$f"
 done
-for f in status.txt clippy.log build.log test.log doctest.log; do
+
+# check.ps1 keeps the machine awake while it runs, and the machine sleeps
+# the moment that hold goes. So the run prints CHECK-DONE and holds on until
+# the file `fetched` appears beside its logs: the logs are fetched in
+# between, over connections of their own, while the machine is still held
+# awake.
+pipes="$(mktemp -d)"
+mkfifo "$pipes/out"
+ssh "$host" "powershell -NoProfile -ExecutionPolicy Bypass -File '$remote_root\\check.ps1' -Root '$remote_root' -Bundle '$remote_root\\tree.bundle' -Ref '$ref'$nextest_arg" \
+  </dev/null >"$pipes/out" &
+remote=$!
+exec 4<"$pipes/out"
+while IFS= read -r line <&4; do
+  case "$line" in
+    CHECK-DONE*) break ;;
+    *) printf '%s\n' "$line" >&2 ;;
+  esac
+done
+# A nextest-only run writes no other logs.
+logs='status.txt clippy.log build.log test.log doctest.log'
+if [ -n "${COORDINODE_CHECK_NEXTEST:-}" ]; then
+  logs='status.txt test.log'
+fi
+for f in $logs; do
   scp -q "$host:$remote_scp/$f" "$out/$f" || true
 done
+ssh "$host" "New-Item -ItemType File -Force -Path '$remote_root\\fetched' | Out-Null" || true
+wait "$remote" || true
+exec 4<&-
+rm -rf "$pipes"
 ssh "$host" "Remove-Item -Recurse -Force '$remote_root' -ErrorAction SilentlyContinue"
 
 check_verdict "$out/status.txt"
