@@ -238,8 +238,11 @@ fn end_entries(db: &Database, end: i64) -> Vec<NodeId> {
         coordinode_core::txn::timestamp::Timestamp::ZERO,
         None,
     );
+    let budget = coordinode_core::budget::QueryBudget::new(
+        coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+    );
     LocalIndexStore::new(db.engine())
-        .scan_exact(&mut txn, &index, &[Value::Int(end)])
+        .scan_exact(&mut txn, &index, &[Value::Int(end)], &budget)
         .expect("scan")
         .expect("indexable")
 }

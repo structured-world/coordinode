@@ -409,8 +409,12 @@ fn bench_index_put_scan(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &probe, |b, p| {
             let mut txn = Transaction::new(&engine, None, Timestamp::ZERO, None);
             b.iter(|| {
+                // One lookup is one query, with the budget a query gets.
+                let budget = coordinode_core::budget::QueryBudget::new(
+                    coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+                );
                 store
-                    .scan_exact(&mut txn, &index, &[Value::Int(*p)])
+                    .scan_exact(&mut txn, &index, &[Value::Int(*p)], &budget)
                     .unwrap()
             })
         });

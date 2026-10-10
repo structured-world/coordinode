@@ -74,8 +74,11 @@ fn backfill(fx: &Fixture) -> Backfill<'_> {
 
 fn lookup(fx: &Fixture, index: &IndexDefinition, value: &str) -> Vec<u64> {
     let mut txn = Transaction::begin(&fx.engine, Some(&fx.oracle), fx.oracle.next());
+    let budget = coordinode_core::budget::QueryBudget::new(
+        coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+    );
     let mut ids: Vec<u64> = LocalIndexStore::new(&fx.engine)
-        .scan_exact(&mut txn, index, &[Value::String(value.into())])
+        .scan_exact(&mut txn, index, &[Value::String(value.into())], &budget)
         .expect("scan")
         .expect("indexable")
         .into_iter()

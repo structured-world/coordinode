@@ -74,9 +74,10 @@ pub enum ExecutionError {
     /// Modality-store error from `coordinode-modality`. Wraps the typed
     /// store error, which itself preserves the underlying `StorageError`
     /// chain — capacity-exhausted, checksum-mismatch, and other engine
-    /// errors propagate end-to-end.
+    /// errors propagate end-to-end. A spent budget arrives as
+    /// [`Self::Budget`] instead.
     #[error("modality store error: {0}")]
-    Modality(#[from] coordinode_modality::StoreError),
+    Modality(coordinode_modality::StoreError),
 
     /// The statement found an index entry disagreeing with its record and
     /// could not store that finding durably on this member.
@@ -343,6 +344,17 @@ impl KeyClaims {
 impl From<crate::index::UniqueViolation> for ExecutionError {
     fn from(v: crate::index::UniqueViolation) -> Self {
         unique_violation(v)
+    }
+}
+
+impl From<coordinode_modality::StoreError> for ExecutionError {
+    fn from(e: coordinode_modality::StoreError) -> Self {
+        match e {
+            // The query's own budget, whichever layer spent it: answered as
+            // a resource refusal, not as a store failure.
+            coordinode_modality::StoreError::Budget(stop) => Self::Budget(stop),
+            other => Self::Modality(other),
+        }
     }
 }
 
@@ -1809,6 +1821,7 @@ impl<'a> ExecutionContext<'a> {
             &mut self.txn,
             &index,
             std::slice::from_ref(value),
+            &self.budget,
         )?)
     }
 
@@ -1853,11 +1866,21 @@ impl<'a> ExecutionContext<'a> {
         }
         self.sync_txn_state();
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
-        if LocalNodeStore
-            .versions(&self.txn, self.shard_id, node)?
-            .iter()
-            .any(|(_, version)| holds(version))
-        {
+        // A version that held the value accounts for the entry. The
+        // versions stream past one at a time against the statement's budget.
+        let mut held_before = false;
+        LocalNodeStore.prefix_for_each(
+            &self.txn,
+            &LocalNodeStore.version_prefix(self.shard_id, node),
+            &self.budget,
+            |key, value| {
+                if !held_before && decode_temporal_node_key(key).is_some() {
+                    held_before = holds(&decode_version(value)?);
+                }
+                Ok::<(), ExecutionError>(())
+            },
+        )?;
+        if held_before {
             return Ok(false);
         }
         for tuple in wanted {
@@ -2387,12 +2410,22 @@ impl<'a> ExecutionContext<'a> {
         use coordinode_modality::{LocalNodeStore, NodeStore as _};
         let prefix = LocalNodeStore.version_prefix(self.shard_id, node_id);
         self.sync_txn_state();
-        let scanned = LocalNodeStore.prefix_scan_tracked(&mut self.txn, &prefix)?;
-        let versions = decode_versions(&scanned)?;
+        let fields = self.timeline_fields();
+        // The node's history is held, and charged, only while its state at
+        // `at` is chosen from it.
+        let mut held = self.budget.empty_charge();
+        let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
+        LocalNodeStore.prefix_for_each(&self.txn, &prefix, &self.budget, |key, value| {
+            let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
+                return Ok(());
+            };
+            let record = decode_version(value)?;
+            held.grow(record.held_bytes())?;
+            versions.push((valid_from, record));
+            Ok::<(), ExecutionError>(())
+        })?;
         Ok(crate::executor::temporal_read::state_at(
-            versions,
-            at,
-            self.timeline_fields(),
+            versions, at, fields,
         ))
     }
 
@@ -5206,21 +5239,11 @@ fn named_instants(predicate: &crate::plan::expr::Expr, out: &mut Vec<(String, i6
     }
 }
 
-/// The `(valid_from, record)` versions among scanned node rows, in key order.
-fn decode_versions(
-    scanned: &[(Vec<u8>, Vec<u8>)],
-) -> Result<Vec<(i64, NodeRecord)>, ExecutionError> {
-    let mut out = Vec::with_capacity(scanned.len());
-    for (key, bytes) in scanned {
-        let Some((_, _, valid_from)) = decode_temporal_node_key(key) else {
-            continue;
-        };
-        let record = NodeRecord::from_msgpack(bytes).map_err(|e| {
-            ExecutionError::Serialization(format!("temporal node deserialization error: {e}"))
-        })?;
-        out.push((valid_from, record));
-    }
-    Ok(out)
+/// The record one stored version of a temporal node holds.
+fn decode_version(bytes: &[u8]) -> Result<NodeRecord, ExecutionError> {
+    NodeRecord::from_msgpack(bytes).map_err(|e| {
+        ExecutionError::Serialization(format!("temporal node deserialization error: {e}"))
+    })
 }
 
 /// Bind `var`'s label columns for `record` and return its primary label:
@@ -5751,57 +5774,74 @@ fn execute_btree_index_scan(
         return scan_records(ctx, lookup_val);
     };
 
-    // A temporal node's entries are the union of the values its versions
-    // ever held, so a candidate resolves to its state valid at the instant
-    // this variable reads at; one with no live state there is no match.
-    let records: Vec<Option<NodeRecord>> = if temporal {
-        let at = ctx.instant_for(variable);
-        let mut states = Vec::with_capacity(ids.len());
-        for id in &ids {
-            states.push(
-                ctx.temporal_node_state(*id, at)?
-                    .positive()
-                    .map(|(_, record)| record),
-            );
-        }
-        states
-    } else {
-        use coordinode_modality::NodeStore as _;
-        // One batched multi_get (single version snapshot + batched bloom/SST
-        // traversal) rather than a per-id lookup loop.
-        coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?
-    };
-
-    let mut results = Vec::with_capacity(ids.len());
+    // Candidates are read a batch at a time: the records of one batch are
+    // held, and charged, while its rows are built. Rows kept stay charged
+    // for the rest of the statement.
+    let budget = Arc::clone(&ctx.budget);
+    let mut kept = budget.empty_charge();
+    let mut results = Vec::new();
     let labels = [label.to_string()];
-    for (id, record_opt) in ids.into_iter().zip(records) {
-        // The index finds a list by each of its elements, and a temporal
-        // node by any value it ever held; the equality the query asked holds
-        // only for the value the record carries itself. A candidate the
-        // index had no reason to hold (no node, or a node whose own entries
-        // do not include the value) shows the index wrong: its other
-        // entries prove nothing either, and the records answer instead.
-        let held = record_opt.as_ref().and_then(|record| {
-            crate::index::registry::record_lookup(record, ctx.interner)(property)
-        });
-        if held.as_ref() != Some(&lookup_val) {
-            if ctx.index_entry_disagrees(index, &lookup_val, id, record_opt.as_ref())? {
-                return scan_records(ctx, lookup_val);
+    let at = ctx.instant_for(variable);
+    for batch in ids.chunks(CANDIDATE_BATCH) {
+        // A temporal node's entries are the union of the values its versions
+        // ever held, so a candidate resolves to its state valid at the
+        // instant this variable reads at; one with no live state there is no
+        // match.
+        let records: Vec<Option<NodeRecord>> = if temporal {
+            let mut states = Vec::with_capacity(batch.len());
+            for id in batch {
+                states.push(
+                    ctx.temporal_node_state(*id, at)?
+                        .positive()
+                        .map(|(_, record)| record),
+                );
             }
-            continue;
-        }
-        let Some(record) = record_opt else {
-            continue;
+            states
+        } else {
+            use coordinode_modality::NodeStore as _;
+            // One batched multi_get (single version snapshot + batched
+            // bloom/SST traversal) rather than a per-id lookup loop.
+            coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, batch)?
         };
-        // The label check guards against entries of relabeled nodes.
-        if let Some(row) = node_row_if_matching(variable, &labels, id.as_raw(), &record, &[], ctx)?
-        {
-            results.push(row);
+        let _batch = budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
+        for (&id, record_opt) in batch.iter().zip(records) {
+            budget.work(1)?;
+            // The index finds a list by each of its elements, and a temporal
+            // node by any value it ever held; the equality the query asked
+            // holds only for the value the record carries itself. A
+            // candidate the index had no reason to hold (no node, or a node
+            // whose own entries do not include the value) shows the index
+            // wrong: its other entries prove nothing either, and the records
+            // answer instead, within the same budget.
+            let held = record_opt.as_ref().and_then(|record| {
+                crate::index::registry::record_lookup(record, ctx.interner)(property)
+            });
+            if held.as_ref() != Some(&lookup_val) {
+                if ctx.index_entry_disagrees(index, &lookup_val, id, record_opt.as_ref())? {
+                    drop(results);
+                    drop(kept);
+                    return scan_records(ctx, lookup_val);
+                }
+                continue;
+            }
+            let Some(record) = record_opt else {
+                continue;
+            };
+            // The label check guards against entries of relabeled nodes.
+            if let Some(row) =
+                node_row_if_matching(variable, &labels, id.as_raw(), &record, &[], ctx)?
+            {
+                kept.grow(crate::executor::row::row_held_bytes(&row))?;
+                results.push(row);
+            }
         }
     }
-
+    kept.keep_until_query_ends();
     Ok(results)
 }
+
+/// Index candidates whose records are read, and held, at once.
+const CANDIDATE_BATCH: usize = 256;
 
 /// The nodes a read through an index of the current state answers itself,
 /// beyond `pending` (what the index's worker has not folded): on a read at a

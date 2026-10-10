@@ -107,8 +107,11 @@ fn change(
 }
 
 fn lookup(engine: &StorageEngine, index: &IndexDefinition, values: &[Value]) -> Vec<u64> {
+    let budget = coordinode_core::budget::QueryBudget::new(
+        coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+    );
     let mut ids: Vec<u64> = LocalIndexStore::new(engine)
-        .scan_exact(&mut txn(engine), index, values)
+        .scan_exact(&mut txn(engine), index, values, &budget)
         .expect("scan")
         .expect("indexable")
         .into_iter()

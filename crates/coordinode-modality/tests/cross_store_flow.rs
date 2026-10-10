@@ -204,12 +204,20 @@ fn node_edge_index_document_flow() {
     // IndexStore lookups for both names return the expected node.
     let read_ts = oracle.next();
     let mut rtxn = Transaction::begin(engine, Some(&oracle), read_ts);
+    let budget = coordinode_core::budget::QueryBudget::new(
+        coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+    );
     let alice_via_idx = indexes
-        .scan_exact(&mut rtxn, &by_name, &[Value::String("alice".into())])
+        .scan_exact(
+            &mut rtxn,
+            &by_name,
+            &[Value::String("alice".into())],
+            &budget,
+        )
         .expect("scan");
     assert_eq!(alice_via_idx, Some(vec![alice]));
     let bob_via_idx = indexes
-        .scan_exact(&mut rtxn, &by_name, &[Value::String("bob".into())])
+        .scan_exact(&mut rtxn, &by_name, &[Value::String("bob".into())], &budget)
         .expect("scan");
     assert_eq!(bob_via_idx, Some(vec![bob]));
 

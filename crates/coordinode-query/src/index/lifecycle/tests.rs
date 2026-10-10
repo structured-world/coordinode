@@ -78,8 +78,11 @@ impl Users for TestEnv {
 
     fn holders(&self, def: &IndexDefinition, email: &str) -> Vec<u64> {
         let mut txn = self.begin();
+        let budget = coordinode_core::budget::QueryBudget::new(
+            coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+        );
         let mut ids: Vec<u64> = LocalIndexStore::new(&self.engine)
-            .scan_exact(&mut txn, def, &[Value::String(email.into())])
+            .scan_exact(&mut txn, def, &[Value::String(email.into())], &budget)
             .expect("scan")
             .expect("indexable")
             .into_iter()

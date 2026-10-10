@@ -56,6 +56,11 @@ pub enum StoreError {
     /// The index catalog has no identity left to allocate.
     #[error(transparent)]
     IdentityExhausted(#[from] coordinode_core::index::identity::IdentityExhausted),
+
+    /// The query reading the store spent its budget: memory, deadline or
+    /// cancellation.
+    #[error(transparent)]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
 }
 
 // Convenience: `iter_guard.into_inner()?` inside store scan loops

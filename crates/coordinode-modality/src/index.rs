@@ -177,14 +177,19 @@ pub trait IndexStore {
     /// holds them). `None` when the values have no key, so the index cannot
     /// answer.
     ///
+    /// Each entry read counts one unit of `budget`'s work, and the nodes
+    /// returned are charged to it, reserved before the list grows, for the
+    /// rest of the query that reads them.
+    ///
     /// # Errors
     ///
-    /// A storage failure or an undecodable entry.
+    /// A storage failure, an undecodable entry, or the budget's refusal.
     fn scan_exact(
         &self,
         txn: &mut Transaction,
         index: &IndexDefinition,
         values: &[Value],
+        budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Option<Vec<NodeId>>>;
 
     /// One page of the entries of the single-property `index` whose value is
@@ -803,28 +808,48 @@ impl IndexStore for LocalIndexStore<'_> {
         txn: &mut Transaction,
         index: &IndexDefinition,
         values: &[Value],
+        budget: &coordinode_core::budget::QueryBudget,
     ) -> StoreResult<Option<Vec<NodeId>>> {
         let Ok(tuple) = encode_tuple(values) else {
             return Ok(None);
         };
+        let id_bytes = core::mem::size_of::<NodeId>() as u64;
+        let mut kept = budget.empty_charge();
         if index.unique {
+            budget.work(1)?;
+            kept.grow(id_bytes)?;
             let key = encode_unique_entry_key(index.generation, &tuple);
-            return match txn.get(Partition::Idx, &key)? {
-                Some(bytes) => Ok(Some(vec![decode_holder(&bytes)?])),
-                None => Ok(Some(Vec::new())),
+            let holder = match txn.get(Partition::Idx, &key)? {
+                Some(bytes) => vec![decode_holder(&bytes)?],
+                None => Vec::new(),
             };
+            kept.keep_until_query_ends();
+            return Ok(Some(holder));
         }
         let prefix = entry_value_prefix(index.generation, &tuple);
-        let mut out = Vec::new();
-        for (key, _) in txn.prefix_scan(Partition::Idx, &prefix)? {
-            if let Some((id, _)) = decode_entry(index.generation, &key) {
-                out.push(NodeId::from_raw(id));
+        let mut out: Vec<NodeId> = Vec::new();
+        txn.prefix_for_each(Partition::Idx, &prefix, budget, |key, _| {
+            let Some((id, _)) = decode_entry(index.generation, key) else {
+                return Ok(());
+            };
+            let id = NodeId::from_raw(id);
+            // A temporal node's versions holding the value are one node.
+            // Entries of one value come in key order, which orders them by
+            // node, so its versions are adjacent.
+            if out.last() == Some(&id) {
+                return Ok(());
             }
-        }
-        // A temporal node's versions holding the value are one node. Entries
-        // of one value come in key order, which orders them by node, so its
-        // versions are adjacent.
-        out.dedup();
+            if out.len() == out.capacity() {
+                let more = out.capacity().max(4);
+                // `more` slots of memory that is about to exist: the product
+                // fits in u64.
+                kept.grow(more as u64 * id_bytes)?;
+                out.reserve_exact(more);
+            }
+            out.push(id);
+            Ok::<(), StoreError>(())
+        })?;
+        kept.keep_until_query_ends();
         Ok(Some(out))
     }
 

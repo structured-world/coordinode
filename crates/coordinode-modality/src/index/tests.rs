@@ -31,6 +31,11 @@ fn id(raw: u64) -> NodeId {
     NodeId::from_raw(raw)
 }
 
+/// A query budget no lookup here comes near.
+fn budget() -> coordinode_core::budget::QueryBudget {
+    coordinode_core::budget::QueryBudget::new(coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
 /// No property is bound to a field id: every value is looked up by name.
 fn no_fields(_: &str) -> Option<u32> {
     None
@@ -98,13 +103,15 @@ fn non_unique_entries_are_found_by_value() {
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     let mut hits = store
-        .scan_exact(&mut t, &index, &s("alice"))
+        .scan_exact(&mut t, &index, &s("alice"), &budget())
         .unwrap()
         .unwrap();
     hits.sort_unstable_by_key(|n| n.as_raw());
     assert_eq!(hits, vec![id(1), id(2)]);
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("carol")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("carol"), &budget())
+            .unwrap(),
         Some(Vec::new())
     );
 }
@@ -121,7 +128,9 @@ fn an_uncommitted_entry_is_invisible_outside_its_transaction() {
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("alice"), &budget())
+            .unwrap(),
         Some(vec![id(1)]),
         "the transaction sees its own entry"
     );
@@ -129,7 +138,9 @@ fn an_uncommitted_entry_is_invisible_outside_its_transaction() {
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("alice"), &budget())
+            .unwrap(),
         Some(Vec::new())
     );
 }
@@ -150,7 +161,9 @@ fn a_staged_removal_hides_the_entry_from_its_transaction() {
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     leave(&store, &mut t, &index, &s("alice"), id(1));
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("alice"), &budget())
+            .unwrap(),
         Some(Vec::new())
     );
 }
@@ -189,7 +202,9 @@ fn a_unique_value_has_one_holder() {
         Some(id(1))
     );
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("a@x")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("a@x"), &budget())
+            .unwrap(),
         Some(vec![id(1)])
     );
 }
@@ -302,7 +317,10 @@ fn lists_index_their_elements_and_unkeyed_values_nothing() {
 
     let map = vec![Value::Map(Default::default())];
     assert_eq!(enter(&store, &mut t, &index, &map, id(3)), 0);
-    assert_eq!(store.scan_exact(&mut t, &index, &map).unwrap(), None);
+    assert_eq!(
+        store.scan_exact(&mut t, &index, &map, &budget()).unwrap(),
+        None
+    );
 }
 
 /// Compound entries are told apart by every column.
@@ -322,11 +340,11 @@ fn compound_entries_are_told_apart_by_every_column() {
     enter(&store, &mut t, &index, &a, id(1));
     enter(&store, &mut t, &index, &b, id(2));
     assert_eq!(
-        store.scan_exact(&mut t, &index, &a).unwrap(),
+        store.scan_exact(&mut t, &index, &a, &budget()).unwrap(),
         Some(vec![id(1)])
     );
     assert_eq!(
-        store.scan_exact(&mut t, &index, &b).unwrap(),
+        store.scan_exact(&mut t, &index, &b, &budget()).unwrap(),
         Some(vec![id(2)])
     );
 }
@@ -392,7 +410,9 @@ fn version_entries_answer_once_and_move_alone() {
                 .unwrap();
         }
         assert_eq!(
-            store.scan_exact(&mut t, &index, &s("ada")).unwrap(),
+            store
+                .scan_exact(&mut t, &index, &s("ada"), &budget())
+                .unwrap(),
             Some(vec![id(1)]),
             "one candidate for the node's two versions"
         );
@@ -406,7 +426,9 @@ fn version_entries_answer_once_and_move_alone() {
 
         let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
         assert_eq!(
-            store.scan_exact(&mut t, &index, &s("ada")).unwrap(),
+            store
+                .scan_exact(&mut t, &index, &s("ada"), &budget())
+                .unwrap(),
             Some(vec![id(1)]),
             "the second version still holds the value"
         );
@@ -430,7 +452,9 @@ fn a_derived_index_gives_the_resolved_view() {
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     enter(&store, &mut t, &index, &s("alice"), id(1));
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("alice"), &budget())
+            .unwrap(),
         Some(vec![id(1)]),
         "the transaction sees its own entry"
     );
@@ -451,11 +475,15 @@ fn a_derived_index_gives_the_resolved_view() {
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("alice")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("alice"), &budget())
+            .unwrap(),
         Some(Vec::new())
     );
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("bob")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("bob"), &budget())
+            .unwrap(),
         Some(vec![id(1)])
     );
     enter(&store, &mut t, &index, &s("carol"), id(2));
@@ -463,7 +491,9 @@ fn a_derived_index_gives_the_resolved_view() {
 
     let mut t = Transaction::begin(&fx.engine, Some(&oracle), oracle.next());
     assert_eq!(
-        store.scan_exact(&mut t, &index, &s("carol")).unwrap(),
+        store
+            .scan_exact(&mut t, &index, &s("carol"), &budget())
+            .unwrap(),
         Some(Vec::new()),
         "a rolled-back statement leaves no entry"
     );
