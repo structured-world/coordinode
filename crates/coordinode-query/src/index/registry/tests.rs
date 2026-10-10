@@ -35,6 +35,23 @@ fn no_fields(_: &str) -> Option<u32> {
     None
 }
 
+/// The shard the tests' nodes live in.
+const SHARD: u16 = 1;
+
+/// Store the `User` node `id` with `pairs` as its properties, kept by name,
+/// as a write stores the record its entries are derived from: a unique
+/// entry's holder is checked against it.
+fn put_record(t: &mut Transaction, id: u64, pairs: &[(&str, Value)]) {
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let mut record = coordinode_core::graph::node::NodeRecord::new("User");
+    for (name, value) in pairs {
+        record.set_extra(*name, value.clone());
+    }
+    LocalNodeStore
+        .put(t, SHARD, NodeId::from_raw(id), &record)
+        .expect("put node record");
+}
+
 fn create(
     reg: &IndexRegistry,
     engine: &StorageEngine,
@@ -44,9 +61,11 @@ fn create(
     let props = props(pairs);
     let lookup = props_lookup(&props);
     let mut t = txn(engine);
+    put_record(&mut t, id, pairs);
     reg.on_node_created(
         engine,
         &mut t,
+        SHARD,
         &NodeState {
             node_id: NodeId::from_raw(id),
             valid_from: None,
@@ -66,12 +85,14 @@ fn change(
     before: &[(&str, Value)],
     after: &[(&str, Value)],
 ) -> Result<(), IndexWriteError> {
+    let mut t = txn(engine);
+    put_record(&mut t, id, after);
     let (before, after) = (props(before), props(after));
     let (before, after) = (props_lookup(&before), props_lookup(&after));
-    let mut t = txn(engine);
     reg.on_property_changed(
         engine,
         &mut t,
+        SHARD,
         &PropertyChange {
             node_id: NodeId::from_raw(id),
             valid_from: None,

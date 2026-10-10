@@ -16,7 +16,7 @@ use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
 use rustc_hash::FxHashMap;
 
-use super::definition::{IndexDefinition, IndexId, IndexType};
+use super::definition::{GenerationId, IndexDefinition, IndexId, IndexType};
 
 /// Registry of active indexes.
 ///
@@ -24,6 +24,11 @@ use super::definition::{IndexDefinition, IndexId, IndexType};
 /// registry through the shared reference the execution context holds.
 pub struct IndexRegistry {
     indexes: parking_lot::RwLock<Catalog>,
+    /// Generations an entry was found disagreeing with the record it names
+    /// in this process: none of them proves a value free or a result
+    /// complete, so lookups answer from the records and every unique value
+    /// taken in them is proved free against the whole label.
+    suspect: parking_lot::RwLock<rustc_hash::FxHashSet<GenerationId>>,
 }
 
 /// The indexes in force, by identity, and the names that bind them.
@@ -80,6 +85,9 @@ pub struct UniqueClaim {
     pub values: Vec<Value>,
     /// The node that claimed them.
     pub node_id: NodeId,
+    /// The index's entries cannot prove the values free: the commit reads
+    /// the label's stored nodes for another holder instead.
+    pub needs_source_proof: bool,
 }
 
 /// Properties of one node changing value: what the index maintenance of a
@@ -215,7 +223,27 @@ impl IndexRegistry {
     pub fn new() -> Self {
         Self {
             indexes: parking_lot::RwLock::new(Catalog::default()),
+            suspect: parking_lot::RwLock::new(rustc_hash::FxHashSet::default()),
         }
+    }
+
+    /// Record that an entry of `generation` was found disagreeing with the
+    /// record it names: from now on the generation proves no lookup
+    /// complete and no unique value free in this process.
+    pub fn mark_suspect(&self, generation: GenerationId) {
+        if self.suspect.write().insert(generation) {
+            tracing::warn!(
+                generation = generation.as_raw(),
+                "an index entry disagrees with the record it names; lookups in this \
+                 index generation answer from the stored records"
+            );
+        }
+    }
+
+    /// Whether an entry of `generation` was found disagreeing with its
+    /// record.
+    pub fn is_suspect(&self, generation: GenerationId) -> bool {
+        self.suspect.read().contains(&generation)
     }
 
     /// Make `index` active in this process without a stored record to bind
@@ -375,13 +403,14 @@ impl IndexRegistry {
         self.indexes.read().by_id.is_empty()
     }
 
-    /// Stage the entries of a node being created. A unique value another
-    /// node holds refuses the write; each unique value claimed is appended to
-    /// `claims`.
+    /// Stage the entries of a node of shard `shard_id` being created. A
+    /// unique value another node holds refuses the write; each unique value
+    /// claimed is appended to `claims`.
     pub fn on_node_created(
         &self,
         engine: &StorageEngine,
         txn: &mut Transaction,
+        shard_id: u16,
         node: &NodeState<'_>,
         field_of: FieldOf<'_>,
         claims: &mut Vec<UniqueClaim>,
@@ -391,16 +420,23 @@ impl IndexRegistry {
             version,
         } in self.btree_for_label(node.label)
         {
-            if entry_values(&index, node.value_of).is_some() {
-                bind(txn, &index, version)?;
-            }
-            stage_node_entry(
+            let Some(values) = entry_values(&index, node.value_of) else {
+                continue;
+            };
+            bind(txn, &index, version)?;
+            let staging = Staging {
                 engine,
+                shard_id,
+                field_of,
+                registry: Some(self),
+            };
+            stage(
+                &staging,
                 txn,
                 &index,
                 node.owner(),
-                node.value_of,
-                field_of,
+                None,
+                Some(values),
                 claims,
             )?;
         }
@@ -413,6 +449,7 @@ impl IndexRegistry {
         &self,
         engine: &StorageEngine,
         txn: &mut Transaction,
+        shard_id: u16,
         change: &PropertyChange<'_>,
         field_of: FieldOf<'_>,
         claims: &mut Vec<UniqueClaim>,
@@ -438,7 +475,13 @@ impl IndexRegistry {
                 node_id: change.node_id.as_raw(),
                 valid_from: change.valid_from,
             };
-            stage(engine, txn, &index, field_of, owner, old, new, claims)?;
+            let staging = Staging {
+                engine,
+                shard_id,
+                field_of,
+                registry: Some(self),
+            };
+            stage(&staging, txn, &index, owner, old, new, claims)?;
         }
         Ok(())
     }
@@ -482,12 +525,14 @@ fn bind(
 }
 
 /// Stage the entry `index` holds for `owner` (a node, or one version of a
-/// temporal node) whose properties `value_of` answers, if it has one there,
-/// and say whether it did. A unique value another node holds refuses the
-/// write; a unique value claimed is appended to `claims`.
+/// temporal node, of shard `shard_id`) whose properties `value_of` answers,
+/// if it has one there, and say whether it did. A unique value another node
+/// holds refuses the write; a unique value claimed is appended to `claims`.
+#[allow(clippy::too_many_arguments)]
 pub fn stage_node_entry(
     engine: &StorageEngine,
     txn: &mut Transaction,
+    shard_id: u16,
     index: &IndexDefinition,
     owner: EntryOwner,
     value_of: &dyn Fn(&str) -> Option<Value>,
@@ -496,10 +541,14 @@ pub fn stage_node_entry(
 ) -> Result<bool, IndexWriteError> {
     match entry_values(index, value_of) {
         Some(values) => stage(
-            engine,
+            &Staging {
+                engine,
+                shard_id,
+                field_of,
+                registry: None,
+            },
             txn,
             index,
-            field_of,
             owner,
             None,
             Some(values),
@@ -523,41 +572,121 @@ pub fn record_lookup<'r>(
     }
 }
 
+/// What staging an entry reads besides the entry: the store, the shard its
+/// nodes live in, the field dictionary, and the registry that keeps which
+/// generations are suspect (`None` for a build filling a generation no
+/// reader uses yet).
+struct Staging<'a> {
+    engine: &'a StorageEngine,
+    shard_id: u16,
+    field_of: FieldOf<'a>,
+    registry: Option<&'a IndexRegistry>,
+}
+
 /// Stage `owner`'s membership in `index` moving from `old` to `new`,
 /// refusing a unique value another node holds, and say whether an entry was
 /// put.
-#[allow(clippy::too_many_arguments)]
+///
+/// A unique entry names the value's holder, and the holder is checked
+/// against its own record before the value is refused: an entry naming a
+/// node that does not hold the value is wrong. That marks the generation
+/// suspect and leaves the value to be proved free from the stored nodes
+/// when the statement commits; a wrong entry is never taken as proof that
+/// the value is free, nor as a duplicate of the node it names.
 fn stage(
-    engine: &StorageEngine,
+    staging: &Staging<'_>,
     txn: &mut Transaction,
     index: &IndexDefinition,
-    field_of: FieldOf<'_>,
     owner: EntryOwner,
     old: Option<Vec<Value>>,
     new: Option<Vec<Value>>,
     claims: &mut Vec<UniqueClaim>,
 ) -> Result<bool, IndexWriteError> {
     let node_id = NodeId::from_raw(owner.node_id);
-    let store = LocalIndexStore::new(engine);
+    let store = LocalIndexStore::new(staging.engine);
+    let mut needs_source_proof = false;
     if index.unique {
         if let Some(values) = &new {
+            needs_source_proof = staging
+                .registry
+                .is_some_and(|r| r.is_suspect(index.generation));
             if let Some(holder) = store.unique_conflict(txn, index, values, node_id)? {
-                return Err(UniqueViolation::new(index, values, holder).into());
+                if holds_values(
+                    txn,
+                    staging.shard_id,
+                    index,
+                    staging.field_of,
+                    holder,
+                    values,
+                )? {
+                    return Err(UniqueViolation::new(index, values, holder).into());
+                }
+                if let Some(registry) = staging.registry {
+                    registry.mark_suspect(index.generation);
+                }
+                needs_source_proof = true;
             }
         }
     }
-    let written =
-        store.stage_membership(txn, index, field_of, owner, old.as_deref(), new.as_deref())? > 0;
+    let written = store.stage_membership(
+        txn,
+        index,
+        staging.field_of,
+        owner,
+        old.as_deref(),
+        new.as_deref(),
+    )? > 0;
     if index.unique && written {
         if let Some(values) = new {
             claims.push(UniqueClaim {
                 index: index.clone(),
                 values,
                 node_id,
+                needs_source_proof,
             });
         }
     }
     Ok(written)
+}
+
+/// Whether the node `holder` of shard `shard_id` holds one of the entries
+/// `values` take in `index`, as `txn` sees its record: the node's own
+/// record, or any version of a temporal node, since a temporal node keeps
+/// the values of its history. Checked against the index's own
+/// interpretation (its label, sparse and partial rules, each list element),
+/// not against any query.
+///
+/// # Errors
+///
+/// A storage failure or an undecodable record.
+pub fn holds_values(
+    txn: &Transaction,
+    shard_id: u16,
+    index: &IndexDefinition,
+    field_of: FieldOf<'_>,
+    holder: NodeId,
+    values: &[Value],
+) -> Result<bool, StoreError> {
+    use coordinode_core::index::derive::tuples;
+    use coordinode_modality::{LocalNodeStore, NodeStore as _};
+    let wanted = tuples(values);
+    let interpretation = index.interpretation(field_of);
+    let holds = |record: &coordinode_core::graph::node::NodeRecord| {
+        record.primary_label() == index.label
+            && interpretation
+                .record_membership(record)
+                .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
+    };
+    if LocalNodeStore
+        .get(txn, shard_id, holder)?
+        .is_some_and(|record| holds(&record))
+    {
+        return Ok(true);
+    }
+    Ok(LocalNodeStore
+        .versions(txn, shard_id, holder)?
+        .iter()
+        .any(|(_, record)| holds(record)))
 }
 
 impl Default for IndexRegistry {

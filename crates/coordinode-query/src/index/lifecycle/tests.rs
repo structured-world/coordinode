@@ -831,6 +831,7 @@ fn take_while_building(
         .on_node_created(
             &env.engine,
             &mut txn,
+            1,
             &crate::index::registry::NodeState {
                 node_id: NodeId::from_raw(id),
                 valid_from: None,

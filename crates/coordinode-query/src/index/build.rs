@@ -247,6 +247,7 @@ impl<'a> Backfill<'a> {
                 match stage_node_entry(
                     self.engine,
                     &mut txn,
+                    self.shard_id,
                     index,
                     owner,
                     &lookup,

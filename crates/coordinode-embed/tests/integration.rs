@@ -31,6 +31,7 @@ mod integration {
     mod hnsw;
     mod index_builds;
     mod index_profiles;
+    mod index_repair;
     mod interactive_txn;
     mod label_count;
     mod merge_stress;

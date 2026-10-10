@@ -1449,11 +1449,13 @@ impl<'a> ExecutionContext<'a> {
         Ok(())
     }
 
-    /// State the unique values claimed since the `from`th claim in indexes
-    /// still being built as conditions of the commit: the backfill has not
-    /// reached every stored node, so a missing entry does not prove a value
-    /// free, and the commit reads the stored nodes past the key the backfill
-    /// covered through, as they stand when it is decided.
+    /// State the unique values claimed since the `from`th claim whose index
+    /// entries cannot prove them free as conditions of the commit, decided
+    /// by reading the stored nodes as they stand when it is decided. An
+    /// index still being built has not reached every stored node, so the
+    /// commit reads the nodes past the key the backfill covered through; an
+    /// index whose entries were found disagreeing with their records proves
+    /// nothing, so the commit reads every node of the label.
     fn claim_building_uniques(&mut self, from: usize) {
         use coordinode_core::index::derive::tuples;
         use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope, UncoveredSource};
@@ -1466,17 +1468,22 @@ impl<'a> ExecutionContext<'a> {
         let field_of = |name: &str| interner.lookup(name);
         let mut stated = Vec::new();
         for claim in &self.key_claims.indexes[from..] {
-            if !matches!(claim.index.state, IndexState::Building { .. }) {
+            let building = matches!(claim.index.state, IndexState::Building { .. });
+            if !building && !claim.needs_source_proof {
                 continue;
             }
             let generation = claim.index.generation;
+            let covered_through = if claim.needs_source_proof {
+                None
+            } else {
+                self.index_builds
+                    .and_then(|builds| builds.covered_through(generation))
+            };
             let source = UncoveredSource {
                 shard_id: self.shard_id,
                 label: claim.index.label.clone(),
                 interpretation: claim.index.interpretation(&field_of),
-                covered_through: self
-                    .index_builds
-                    .and_then(|builds| builds.covered_through(generation)),
+                covered_through,
                 read_limit: limit,
             };
             for tuple in tuples(&claim.values) {
@@ -1521,6 +1528,7 @@ impl<'a> ExecutionContext<'a> {
                 .on_node_created(
                     self.engine,
                     &mut self.txn,
+                    self.shard_id,
                     &crate::index::registry::NodeState {
                         node_id,
                         valid_from,
@@ -1575,6 +1583,7 @@ impl<'a> ExecutionContext<'a> {
                 .on_property_changed(
                     self.engine,
                     &mut self.txn,
+                    self.shard_id,
                     &crate::index::PropertyChange {
                         node_id,
                         valid_from: Some(valid_from),
@@ -1626,6 +1635,7 @@ impl<'a> ExecutionContext<'a> {
                 .on_property_changed(
                     self.engine,
                     &mut self.txn,
+                    self.shard_id,
                     &crate::index::PropertyChange {
                         node_id,
                         valid_from: None,
@@ -1679,6 +1689,7 @@ impl<'a> ExecutionContext<'a> {
                 .on_property_changed(
                     self.engine,
                     &mut self.txn,
+                    self.shard_id,
                     &crate::index::PropertyChange {
                         node_id,
                         valid_from: None,
@@ -1731,6 +1742,7 @@ impl<'a> ExecutionContext<'a> {
             .on_property_changed(
                 self.engine,
                 &mut self.txn,
+                self.shard_id,
                 &crate::index::PropertyChange {
                     node_id,
                     valid_from: None,
@@ -1750,19 +1762,24 @@ impl<'a> ExecutionContext<'a> {
     /// The nodes whose entry in the B-tree index `id` holds exactly `value`,
     /// as this statement sees the index. `None` when the index cannot
     /// answer: it is not active here (dropped since the plan was built), not
-    /// fully built, or `value` has no key.
+    /// fully built, its entries were found disagreeing with their records,
+    /// or `value` has no key.
     pub fn index_lookup(
         &mut self,
         id: crate::index::IndexId,
         value: &Value,
     ) -> Result<Option<Vec<NodeId>>, ExecutionError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        let Some(index) = self.btree_index_registry.and_then(|r| r.get_by_id(id)) else {
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(None);
+        };
+        let Some(index) = registry.get_by_id(id) else {
             return Ok(None);
         };
         if index.index_type != crate::index::IndexType::BTree
             || index.state != IndexState::Ready
             || index.layout != ENTRY_LAYOUT
+            || registry.is_suspect(index.generation)
         {
             return Ok(None);
         }
@@ -1772,6 +1789,58 @@ impl<'a> ExecutionContext<'a> {
             &index,
             std::slice::from_ref(value),
         )?)
+    }
+
+    /// Whether the entry of the B-tree index `id` under `value` that named
+    /// `node` is one the index had no reason to hold: `record` is the node
+    /// as this statement sees it (`None`: no such node), and the index's own
+    /// interpretation of it (label, sparse and partial rules, each list
+    /// element, each version of a temporal node) yields no such entry. A
+    /// legitimate candidate the query's own comparison rejects (a list
+    /// holding the value, a value a temporal node held before) is not one.
+    /// A disagreement marks the generation suspect.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading a temporal node's versions.
+    pub fn index_entry_disagrees(
+        &mut self,
+        id: crate::index::IndexId,
+        value: &Value,
+        node: NodeId,
+        record: Option<&NodeRecord>,
+    ) -> Result<bool, ExecutionError> {
+        use coordinode_core::index::derive::tuples;
+        let Some(registry) = self.btree_index_registry else {
+            return Ok(false);
+        };
+        let Some(index) = registry.get_by_id(id) else {
+            return Ok(false);
+        };
+        let wanted = tuples(std::slice::from_ref(value));
+        let interner: &FieldInterner = self.interner;
+        let field_of = |name: &str| interner.lookup(name);
+        let interpretation = index.interpretation(&field_of);
+        let holds = |record: &NodeRecord| {
+            record.primary_label() == index.label
+                && interpretation
+                    .record_membership(record)
+                    .is_some_and(|held| tuples(&held).iter().any(|t| wanted.contains(t)))
+        };
+        if record.is_some_and(holds) {
+            return Ok(false);
+        }
+        self.sync_txn_state();
+        use coordinode_modality::{LocalNodeStore, NodeStore as _};
+        if LocalNodeStore
+            .versions(&self.txn, self.shard_id, node)?
+            .iter()
+            .any(|(_, version)| holds(version))
+        {
+            return Ok(false);
+        }
+        registry.mark_suspect(index.generation);
+        Ok(true)
     }
 
     /// Stage the removal of the B-tree index entries of `record`, a node
@@ -1986,9 +2055,31 @@ impl<'a> ExecutionContext<'a> {
             }
         }
         let indexes = LocalIndexStore::new(self.engine);
+        // The latest committed records, read directly: the holder an entry
+        // names is a duplicate only while its own record holds the value.
+        let latest = coordinode_storage::engine::transaction::Transaction::new(
+            self.engine,
+            None,
+            Timestamp::ZERO,
+            None,
+        );
+        let interner: &FieldInterner = self.interner;
+        let field_of = |name: &str| interner.lookup(name);
         for claim in &self.key_claims.indexes {
-            if let Ok(Some(holder)) =
+            let Ok(Some(holder)) =
                 indexes.committed_conflict(&claim.index, &claim.values, claim.node_id)
+            else {
+                continue;
+            };
+            if crate::index::registry::holds_values(
+                &latest,
+                self.shard_id,
+                &claim.index,
+                &field_of,
+                holder,
+                &claim.values,
+            )
+            .unwrap_or(false)
             {
                 return unique_violation(crate::index::UniqueViolation::new(
                     &claim.index,
@@ -5447,11 +5538,12 @@ fn execute_btree_index_scan(
         return Ok(Vec::new());
     }
 
-    // The entries as this statement sees them: its snapshot, its own writes.
-    // An index that cannot answer (not built, or a value with no key) leaves
-    // the equality to a scan, which applies the query's own comparison.
-    let Some(ids) = ctx.index_lookup(index, &lookup_val)? else {
-        return execute_node_scan(
+    // An index that cannot answer (not built, its entries found wrong, or a
+    // value with no key) leaves the equality to a scan of the label's
+    // records, which applies the query's own comparison at this statement's
+    // snapshot with its own writes.
+    let scan_records = |ctx: &mut ExecutionContext<'_>, lookup_val: Value| {
+        execute_node_scan(
             variable,
             &[label.to_string()],
             &[(
@@ -5459,7 +5551,12 @@ fn execute_btree_index_scan(
                 crate::plan::expr::Expr::Literal(lookup_val),
             )],
             ctx,
-        );
+        )
+    };
+
+    // The entries as this statement sees them: its snapshot, its own writes.
+    let Some(ids) = ctx.index_lookup(index, &lookup_val)? else {
+        return scan_records(ctx, lookup_val);
     };
 
     // A temporal node's entries are the union of the values its versions
@@ -5486,17 +5583,24 @@ fn execute_btree_index_scan(
     let mut results = Vec::with_capacity(ids.len());
     let labels = [label.to_string()];
     for (id, record_opt) in ids.into_iter().zip(records) {
-        // A deleted node leaves stale entries behind.
+        // The index finds a list by each of its elements, and a temporal
+        // node by any value it ever held; the equality the query asked holds
+        // only for the value the record carries itself. A candidate the
+        // index had no reason to hold (no node, or a node whose own entries
+        // do not include the value) shows the index wrong: its other
+        // entries prove nothing either, and the records answer instead.
+        let held = record_opt.as_ref().and_then(|record| {
+            crate::index::registry::record_lookup(record, ctx.interner)(property)
+        });
+        if held.as_ref() != Some(&lookup_val) {
+            if ctx.index_entry_disagrees(index, &lookup_val, id, record_opt.as_ref())? {
+                return scan_records(ctx, lookup_val);
+            }
+            continue;
+        }
         let Some(record) = record_opt else {
             continue;
         };
-        // The index finds a list by each of its elements, and a temporal
-        // node by any value it ever held; the equality the query asked holds
-        // only for the value the record carries itself.
-        let held = crate::index::registry::record_lookup(&record, ctx.interner)(property);
-        if held.as_ref() != Some(&lookup_val) {
-            continue;
-        }
         // The label check guards against entries of relabeled nodes.
         if let Some(row) = node_row_if_matching(variable, &labels, id.as_raw(), &record, &[], ctx)?
         {
