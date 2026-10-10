@@ -387,6 +387,12 @@ pub struct ServerConfig {
     pub interactive_txn_idle_timeout_secs: u64,
     /// Max buffered (uncommitted) bytes per interactive transaction.
     pub interactive_txn_max_bytes: u64,
+    /// Runs of an auto-commit statement refused at commit for contention
+    /// before the refusal is returned to the client.
+    pub autocommit_retry_attempts: NonZeroU32,
+    /// Wait in ms before the second run of a refused auto-commit statement,
+    /// doubled for each later one.
+    pub autocommit_retry_backoff_ms: u64,
     /// Inter-node gRPC transport zstd compression level (C-zstd numbering:
     /// positive 1..=22 trade speed for ratio). Applied to inter-node wire
     /// traffic. Default 3 — zstd's standard speed/ratio default and the lowest
@@ -517,6 +523,8 @@ impl Default for ServerConfig {
             default_write_concern: None,
             interactive_txn_idle_timeout_secs: 30,
             interactive_txn_max_bytes: 256 * 1024 * 1024,
+            autocommit_retry_attempts: coordinode_embed::Database::DEFAULT_AUTOCOMMIT_ATTEMPTS,
+            autocommit_retry_backoff_ms: 2,
             wire_compression_level: 3,
             tls_cert: None,
             tls_key: None,

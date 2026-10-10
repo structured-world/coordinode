@@ -158,18 +158,6 @@ const STATS_CACHE_TTL_SECS: u64 = 60;
 /// refused with what it was waiting for rather than answered from a state
 /// missing a write its own timestamp covers.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
-
-/// Runs of an auto-commit statement refused at commit for contention before
-/// the refusal is returned. A refused attempt applied nothing, so running it
-/// again from a fresh snapshot is safe; the bound keeps a statement that keeps
-/// losing from waiting without end.
-const AUTOCOMMIT_ATTEMPTS: u32 = 6;
-
-/// Wait before the second run, doubled for each later one: the commits that
-/// refused it hold their keys from validation to apply, and the runs together
-/// wait about 60 ms, past a slow disk's flush.
-const AUTOCOMMIT_REEXECUTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
-
 /// How long a query waits for a vector index still being built, under the
 /// `block` policy, when neither the query nor the session names a bound.
 pub const DEFAULT_VECTOR_BUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -457,6 +445,11 @@ pub struct Database {
     /// `--interactive-txn-idle-timeout-secs` flag (passed via
     /// `COORDINODE_EXTRA_ARGS` in `/etc/coordinode/coordinode.conf`).
     interactive_idle_timeout: Duration,
+    /// Runs of an auto-commit statement refused at commit for contention
+    /// before the refusal is returned ([`Self::set_autocommit_retry`]).
+    autocommit_attempts: core::num::NonZeroU32,
+    /// Wait before the second run, doubled for each later one.
+    autocommit_backoff: Duration,
     /// Max buffered (uncommitted) bytes per interactive transaction before it
     /// is aborted — caps leader memory a client can hold without committing.
     /// Set by the server from the `--interactive-txn-max-bytes` flag (passed
@@ -1290,6 +1283,8 @@ impl Database {
             interactive_txns: Mutex::new(std::collections::HashMap::new()),
             next_txn_id: AtomicU64::new(0),
             interactive_idle_timeout: Self::DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT,
+            autocommit_attempts: Self::DEFAULT_AUTOCOMMIT_ATTEMPTS,
+            autocommit_backoff: Self::DEFAULT_AUTOCOMMIT_BACKOFF,
             max_interactive_txn_bytes: Self::DEFAULT_MAX_INTERACTIVE_TXN_BYTES,
             interactive_begun: None,
         };
@@ -2281,6 +2276,15 @@ impl Database {
     /// Default idle timeout for an open interactive transaction.
     pub const DEFAULT_INTERACTIVE_TXN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// Default runs of an auto-commit statement refused at commit for
+    /// contention: with [`Self::DEFAULT_AUTOCOMMIT_BACKOFF`] they wait about
+    /// 60 ms together, past a slow disk's flush.
+    pub const DEFAULT_AUTOCOMMIT_ATTEMPTS: core::num::NonZeroU32 =
+        core::num::NonZeroU32::new(6).expect("six is not zero");
+
+    /// Default wait before the second run of a refused auto-commit statement.
+    pub const DEFAULT_AUTOCOMMIT_BACKOFF: Duration = Duration::from_millis(2);
+
     /// Default max buffered bytes per interactive transaction (256 MiB).
     pub const DEFAULT_MAX_INTERACTIVE_TXN_BYTES: usize = 256 * 1024 * 1024;
 
@@ -2397,6 +2401,17 @@ impl Database {
     /// Set the interactive-transaction idle timeout (server config wiring).
     pub fn set_interactive_idle_timeout(&mut self, timeout: Duration) {
         self.interactive_idle_timeout = timeout;
+    }
+
+    /// How an auto-commit statement refused at commit for contention is run
+    /// again: at most `attempts` runs in all, the second after `backoff` and
+    /// each later one after twice the wait before it. A refused run applied
+    /// nothing, so running it again is safe. One attempt returns the first
+    /// refusal. Statements of an explicit transaction, ones pinned to a named
+    /// timestamp and cursor pages always run once.
+    pub fn set_autocommit_retry(&mut self, attempts: core::num::NonZeroU32, backoff: Duration) {
+        self.autocommit_attempts = attempts;
+        self.autocommit_backoff = backoff;
     }
 
     /// Set the per-interactive-transaction buffered-bytes ceiling (server
@@ -3117,13 +3132,13 @@ impl Database {
         };
 
         let mut attempt = 1;
-        let mut backoff = AUTOCOMMIT_REEXECUTION_BACKOFF;
+        let mut backoff = self.autocommit_backoff;
         let (results, write_stats, out_state, duration_us) = loop {
             let mode = txn_mode.take().unwrap_or(TxnMode::AutoCommit);
             match attempt_once(mode) {
                 Err(DatabaseError::Execution(
                     coordinode_query::executor::runner::ExecutionError::Conflict(reason),
-                )) if reexecutable && attempt < AUTOCOMMIT_ATTEMPTS => {
+                )) if reexecutable && attempt < self.autocommit_attempts.get() => {
                     tracing::debug!(attempt, %reason, "auto-commit statement refused at commit; running it again");
                     std::thread::sleep(backoff);
                     backoff *= 2;

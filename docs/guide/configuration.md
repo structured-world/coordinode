@@ -124,6 +124,8 @@ the key is unset.
 | `default_write_concern` | `{ w: majority, journal: journal, timeout_ms: 0 }` | restart | When a write that names no concern, and whose session set none, is acknowledged. `w` is `majority` or a member count, the leader included (`0` answers at once); `journal` is the state each of those members holds the write in: `journal` (fsynced), `cache` (RAM plus the NVMe write cache) or `memory` (RAM). `cache` and `memory` are honoured for `w: 1` only; any other combination with them fails the start. `timeout_ms` bounds the wait for `w` (`0` = none); a write that times out is not rolled back and may still commit. A causal session refuses writes under anything weaker than `w: majority, journal: journal`, including this default. |
 | `interactive_txn_idle_timeout_secs` | `30` | restart | Idle timeout for an interactive transaction (a `BeginTransaction` left open without commit/rollback), in seconds. An open transaction pins an MVCC snapshot and buffers writes; one idle this long is auto-rolled-back. |
 | `interactive_txn_max_bytes` | `268435456` (256 MiB) | restart | Max buffered (uncommitted) bytes per interactive transaction. A transaction whose accumulated writes exceed this is aborted, capping leader memory a client can hold without committing. |
+| `autocommit_retry_attempts` | `6` | restart | Runs, in all, of a statement executed without `BEGIN` whose commit is refused for contention, before the conflict is returned. A refused run applied nothing, so the server runs it again from a fresh snapshot. At least `1`; `1` returns the first refusal. Statements of an explicit transaction, ones pinned to a named timestamp and cursor pages always run once. |
+| `autocommit_retry_backoff_ms` | `2` | restart | Wait before the second run of a refused auto-commit statement, in ms; each later run waits twice as long as the one before. With the defaults the runs wait about 60 ms in all. |
 | `wire_compression_level` | `3` | restart | Inter-node gRPC transport zstd compression level (C-zstd `1`..=`22`). Default `3` is zstd's standard default (~9x reduction on Raft batches); raise on a bandwidth-constrained link. Independent of the on-disk codec. |
 | `scrub_enabled` | `false` | restart | Whether the background integrity scrub runs (each node verifies its own on-disk block checksums). A pass reads every block, so it is off unless enabled. |
 | `scrub_interval_secs` | `604800` (7 days) | restart | Seconds between background scrub cycles. |
@@ -316,6 +318,10 @@ max_request_size_mb: 16
 # Interactive-transaction limits.
 interactive_txn_idle_timeout_secs: 30
 interactive_txn_max_bytes: 268435456
+
+# Re-execution of an auto-commit statement refused at commit.
+autocommit_retry_attempts: 6
+autocommit_retry_backoff_ms: 2
 
 # Inter-node gRPC transport zstd level for wire traffic.
 wire_compression_level: 3

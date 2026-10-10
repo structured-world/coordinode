@@ -6,11 +6,44 @@ use super::*;
 /// the caller sees it succeed, not a conflict it never caused.
 #[test]
 fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
-    use coordinode_core::graph::node::{NodeId, encode_node_key};
     use coordinode_core::graph::types::Value;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
+    set_while_a_commit_holds_the_node(&mut db).expect("the statement lands once the holder has");
+    let rows = db
+        .execute_cypher("MATCH (u:U) RETURN u.n AS n")
+        .expect("read");
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
+}
+
+/// With a single attempt configured, the same statement returns the first
+/// refusal instead of running again.
+#[test]
+fn a_single_auto_commit_attempt_returns_the_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.set_autocommit_retry(core::num::NonZeroU32::MIN, Duration::from_millis(2));
+    let err = set_while_a_commit_holds_the_node(&mut db).expect_err("refused once, not retried");
+    assert!(
+        matches!(
+            err,
+            DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::Conflict(_)
+            )
+        ),
+        "got {err:?}"
+    );
+}
+
+/// Create a node, then run `SET` on it while another commit is held in
+/// flight on its record for 20 ms; the statement's outcome.
+fn set_while_a_commit_holds_the_node(
+    db: &mut Database,
+) -> Result<Vec<coordinode_query::executor::row::Row>, DatabaseError> {
+    use coordinode_core::graph::node::{NodeId, encode_node_key};
+    use coordinode_core::graph::types::Value;
+
     db.execute_cypher("CREATE (:U {name: 'a', n: 1})")
         .expect("create");
     let id = match db
@@ -35,14 +68,10 @@ fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
             drop(admission);
         });
         release.recv().expect("held");
-        db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = 2")
-            .expect("the statement lands once the holder has");
+        let outcome = db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = 2");
         holder.join().expect("holder");
-    });
-    let rows = db
-        .execute_cypher("MATCH (u:U) RETURN u.n AS n")
-        .expect("read");
-    assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
+        outcome
+    })
 }
 
 /// The per-label counts agree with counting the nodes, follow creates,

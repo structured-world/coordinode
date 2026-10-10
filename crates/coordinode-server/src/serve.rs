@@ -191,6 +191,8 @@ pub(crate) async fn serve(
         default_write_concern: _,
         interactive_txn_idle_timeout_secs,
         interactive_txn_max_bytes,
+        autocommit_retry_attempts,
+        autocommit_retry_backoff_ms,
         peers: peers_vec,
         membership_change_timeout_secs,
         join_readiness_lag_entries,
@@ -791,6 +793,10 @@ pub(crate) async fn serve(
         let begun = Arc::clone(&interactive_begun);
         db.set_interactive_begun_hook(Arc::new(move || begun.notify_one()));
         db.set_max_interactive_txn_bytes(interactive_txn_max_bytes as usize);
+        db.set_autocommit_retry(
+            autocommit_retry_attempts,
+            std::time::Duration::from_millis(autocommit_retry_backoff_ms),
+        );
         // AFTER COMMIT trigger dispatch knobs from the config file.
         // The same setter is the runtime `setParameters` seam.
         db.set_trigger_dispatch_config(trigger_dispatch_cfg);

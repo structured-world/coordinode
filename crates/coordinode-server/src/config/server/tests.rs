@@ -395,6 +395,29 @@ fn index_check_settings_parse_from_the_config_file() {
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
 }
 
+/// The auto-commit re-execution budget is a config-file setting with the
+/// engine's defaults; zero attempts is refused at parse, since a statement
+/// must run at least once.
+#[test]
+fn autocommit_retry_parses_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert_eq!(d.autocommit_retry_attempts.get(), 6);
+    assert_eq!(d.autocommit_retry_backoff_ms, 2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "autocommit_retry_attempts: 1\nautocommit_retry_backoff_ms: 10\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.autocommit_retry_attempts.get(), 1);
+    assert_eq!(c.autocommit_retry_backoff_ms, 10);
+
+    std::fs::write(&path, "autocommit_retry_attempts: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// The change-stream pacing is a config-file setting; zero is refused at
 /// parse, since a zero batch never reads and a zero heartbeat interval spins.
 #[test]
