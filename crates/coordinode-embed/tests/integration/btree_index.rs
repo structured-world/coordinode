@@ -306,6 +306,90 @@ fn a_write_finds_its_node_through_the_index() {
     }
 }
 
+/// A write to an indexed label commits after compaction has settled the
+/// index's definition below the retention horizon: the definition is the
+/// one the index was registered from, and only a change to it refuses the
+/// writes bound to it.
+#[test]
+fn writes_bind_an_index_whose_definition_has_settled() {
+    use coordinode_storage::engine::partition::Partition;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX agent_session ON :Agent(session_id)")
+        .expect("CREATE INDEX");
+    db.execute_cypher("CREATE (:Agent {session_id: 's1'})")
+        .expect("a write before settling");
+    db.set_retention_window(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.execute_cypher("CREATE (:Other {n: 1})")
+        .expect("a later write");
+    db.engine().advance_gc_watermark();
+    for part in Partition::all() {
+        db.engine().force_compaction(*part).expect("compact");
+    }
+
+    for sid in ["s2", "s3"] {
+        db.execute_cypher(&format!("CREATE (:Agent {{session_id: '{sid}'}})"))
+            .unwrap_or_else(|e| panic!("a write after settling: {e:?}"));
+    }
+    db.execute_cypher("MATCH (a:Agent {session_id: 's1'}) SET a.seen = 1")
+        .expect("an update after settling");
+    assert_eq!(count(&mut db, "MATCH (a:Agent) RETURN count(a)", &[],), 3);
+    assert!(
+        db.execute_cypher("CREATE (:Agent {session_id: 's2'})")
+            .is_err(),
+        "the unique index still holds"
+    );
+}
+
+/// A definition that changed and then settled is not the one registered:
+/// version zero on both does not make them one, and a write bound to the
+/// registered definition is refused.
+#[test]
+fn a_settled_change_of_the_definition_refuses_the_writes_bound_before_it() {
+    use coordinode_storage::engine::partition::Partition;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX agent_session ON :Agent(session_id)")
+        .expect("CREATE INDEX");
+    let registered = super::helpers::index_named(db.engine(), "agent_session").expect("index");
+    // The record changes behind the registry: another generation.
+    let mut changed = registered.clone();
+    changed.generation =
+        coordinode_query::index::GenerationId::from_raw(registered.generation.as_raw() + 1_000);
+    db.engine()
+        .put(
+            Partition::Schema,
+            &registered.schema_key(),
+            &rmp_serde::to_vec(&changed).expect("encode"),
+        )
+        .expect("rewrite the definition");
+    db.set_retention_window(std::time::Duration::from_millis(200));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.execute_cypher("CREATE (:Other {n: 1})")
+        .expect("a later write");
+    db.engine().advance_gc_watermark();
+    for part in Partition::all() {
+        db.engine().force_compaction(*part).expect("compact");
+    }
+    assert_eq!(
+        db.engine()
+            .record_version(Partition::Schema, &registered.schema_key())
+            .expect("version"),
+        Some(0),
+        "the change settled"
+    );
+
+    let refused = db.execute_cypher("CREATE (:Agent {session_id: 's1'})");
+    assert!(
+        matches!(
+            refused,
+            Err(coordinode_embed::db::DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::RevisionMismatch { .. }
+            ))
+        ),
+        "{refused:?}"
+    );
+}
+
 /// A MERGE or UPSERT found through the index creates the node it does not
 /// find with its whole pattern, indexed, and finds that node the next time
 /// instead of creating another.

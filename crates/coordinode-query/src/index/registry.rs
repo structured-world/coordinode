@@ -870,7 +870,7 @@ impl IndexRegistry {
             let Some(values) = entry_values(&index, node.value_of) else {
                 continue;
             };
-            bind(txn, &index, version)?;
+            self.bind(engine, txn, &index, version)?;
             let staging = Staging {
                 engine,
                 shard_id,
@@ -917,7 +917,7 @@ impl IndexRegistry {
             if old == new {
                 continue;
             }
-            bind(txn, &index, version)?;
+            self.bind(engine, txn, &index, version)?;
             let owner = EntryOwner {
                 node_id: change.node_id.as_raw(),
                 valid_from: change.valid_from,
@@ -948,7 +948,7 @@ impl IndexRegistry {
         } in self.btree_for_label(node.label)
         {
             if let Some(values) = entry_values(&index, node.value_of) {
-                bind(txn, &index, version)?;
+                self.bind(engine, txn, &index, version)?;
                 store.stage_membership(txn, &index, field_of, node.owner(), Some(&values), None)?;
             }
         }
@@ -956,19 +956,72 @@ impl IndexRegistry {
     }
 }
 
-/// Bind the writing transaction's effects in `index` to the definition
-/// record this member read, when it read one: a transition, drop or rebuild
-/// of the index before the commit refuses the write, to be retried under
-/// the binding in force.
-fn bind(
-    txn: &mut Transaction,
-    index: &IndexDefinition,
-    version: Option<u64>,
-) -> Result<(), StoreError> {
-    if version.is_some() {
-        txn.bind_index_definition(&index.schema_key(), version)?;
+impl IndexRegistry {
+    /// Bind the writing transaction's effects in `index` to the definition
+    /// record this member read, when it read one: a transition, drop or
+    /// rebuild of the index before the commit refuses the write, to be
+    /// retried under the binding in force.
+    ///
+    /// The version is the record's sequence number, which compaction
+    /// settles to zero once the record is below the retention horizon,
+    /// without any write. A version the horizon has passed is checked
+    /// against the record: still the definition registered, now at version
+    /// zero, it is the same write settled, and the binding moves to zero.
+    /// Any change to the definition is a later write, with its own nonzero
+    /// version until it settles too, and its content differs.
+    fn bind(
+        &self,
+        engine: &StorageEngine,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        version: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let Some(read) = version else {
+            return Ok(());
+        };
+        let version = if read != 0 && read < engine.gc_watermark() {
+            self.settled_version(engine, index, read)?
+        } else {
+            read
+        };
+        txn.bind_index_definition(&index.schema_key(), Some(version))?;
+        Ok(())
     }
-    Ok(())
+
+    /// The version to bind `index` to when it was registered at `read`, a
+    /// version below the retention horizon: zero when compaction settled
+    /// the very record registered, `read` otherwise, which the commit then
+    /// refuses as a change.
+    fn settled_version(
+        &self,
+        engine: &StorageEngine,
+        index: &IndexDefinition,
+        read: u64,
+    ) -> Result<u64, StoreError> {
+        let key = index.schema_key();
+        let version_now = || {
+            engine.record_version(
+                coordinode_storage::engine::partition::Partition::Schema,
+                &key,
+            )
+        };
+        if version_now()? != Some(0) {
+            return Ok(read);
+        }
+        let stored = LocalIndexStore::new(engine).load_definition(index.id)?;
+        // A write between the two reads of the version would have given it
+        // a nonzero one: the content read is the settled record's.
+        if stored.as_ref() != Some(index) || version_now()? != Some(0) {
+            return Ok(read);
+        }
+        let mut indexes = self.indexes.write();
+        if let Some(registered) = indexes.by_id.get_mut(&index.id) {
+            if registered.version == Some(read) {
+                registered.version = Some(0);
+            }
+        }
+        Ok(0)
+    }
 }
 
 /// Stage the entry `index` holds for `owner` (a node, or one version of a
