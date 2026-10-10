@@ -9,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use coordinode_core::graph::node::{NodeId, NodeRecord, encode_node_key};
+use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
 use coordinode_core::index::encoding::{encode_entry_key, encode_tuple, encode_unique_entry_key};
 use coordinode_embed::Database;
@@ -333,27 +333,32 @@ fn records_breaking_a_unique_index_are_reported_and_left_alone() {
         a = id_of(&mut db, "a@x");
         b = id_of(&mut db, "b@x");
         c = id_of(&mut db, "c@x");
-        // b's record changed to a@x behind the index's back.
-        let key = encode_node_key(1, NodeId::from_raw(u64::try_from(b).expect("id")));
-        let bytes = db
-            .engine()
-            .get(Partition::Node, &key)
-            .expect("read b")
-            .expect("b exists");
-        let mut record = NodeRecord::from_msgpack(&bytes).expect("decode b");
-        let email = db
-            .interner()
-            .expect("field dictionary")
-            .lookup("email")
-            .expect("email field");
-        record.set(email, Value::String("a@x".into()));
-        db.engine()
-            .put(
-                Partition::Node,
-                &key,
-                &record.to_msgpack().expect("encode b"),
-            )
-            .expect("write b");
+        // b's record changed to a@x behind the index's back: written by the
+        // node store alone, in a direct-mode transaction whose writes land
+        // as they are staged, so no index maintenance runs.
+        {
+            use coordinode_modality::{LocalNodeStore, NodeStore as _};
+            let node = NodeId::from_raw(u64::try_from(b).expect("id"));
+            let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+                db.engine(),
+                None,
+                coordinode_core::txn::timestamp::Timestamp::ZERO,
+                None,
+            );
+            let mut record = LocalNodeStore
+                .get(&txn, 1, node)
+                .expect("read b")
+                .expect("b exists");
+            let email = db
+                .interner()
+                .expect("field dictionary")
+                .lookup("email")
+                .expect("email field");
+            record.set(email, Value::String("a@x".into()));
+            LocalNodeStore
+                .put(&mut txn, 1, node, &record)
+                .expect("write b");
+        }
 
         let (status, outcome) = check(&db, "u_email");
         assert!(
