@@ -1088,6 +1088,210 @@ fn a_lookup_answered_by_the_records_passes_over_other_labels_within_the_limit() 
     assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)));
 }
 
+/// Damage found after the statement has spent most of its budget gives no
+/// fresh allowance: the answer from the records spends from what is left.
+/// The same statement holding a large value fits its limit while the index
+/// is sound, and is refused for memory once the lookup has to read records
+/// it cannot hold beside that value.
+#[test]
+fn damage_found_after_spent_work_answers_from_what_is_left() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_embed::db::{DatabaseError, StatementOptions};
+    use coordinode_query::executor::runner::ExecutionError;
+    let (mut db, _dir) = open_db();
+    // The held value is kept twice (its row and the row joined to the node),
+    // which fits; one copy beside one record of about 64 KiB does not.
+    let limit: u64 = 100 << 10;
+    let options = StatementOptions {
+        query_memory_limit: Some(limit),
+        ..Default::default()
+    };
+    let held = Value::String("x".repeat(45 << 10));
+    let run = |db: &Database| {
+        db.execute_cypher_shared_with(
+            "WITH $held AS held MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id, size(held) AS n",
+            Some([("held".to_string(), held.clone())].into_iter().collect()),
+            None,
+            &options,
+        )
+        .map(|result| result.rows)
+    };
+
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher(
+        "UNWIND range(1, 4) AS i \
+         CREATE (:U {email: 'n' + toString(i) + '@x', pad: reduce(s = '', k IN range(1, 2048) \
+         | s + 'abcdefghijklmnopqrstuvwxyz012345')})",
+    )
+    .expect("large records");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    let owner = id_of(&mut db, "a@x");
+    let sound = run(&db).expect("the sound index fits beside the held value");
+    assert_eq!(sound[0].get("id"), Some(&Value::Int(owner)));
+
+    let wrong = id_of(&mut db, "n1@x");
+    misattribute(&db, "u_email", "a@x", wrong);
+    let refused = run(&db);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { limit: l, .. }
+            ))) if l == limit
+        ),
+        "{refused:?}"
+    );
+}
+
+/// A sparse index holds no entry for a node without the property; a lookup
+/// through a wrong entry of it answers from the records within a small
+/// limit, the nodes without the property passed over as they are by the
+/// sound index.
+#[test]
+fn a_sparse_lookup_through_a_wrong_entry_answers_from_the_records() {
+    use coordinode_embed::db::StatementOptions;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE SPARSE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo'})")
+        .expect("a");
+    db.execute_cypher("CREATE (:U {name: 'c', city: 'rome'})")
+        .expect("c");
+    db.execute_cypher(
+        "UNWIND range(1, 500) AS i CREATE (:U {name: 'n' + toString(i), \
+         pad: reduce(s = '', k IN range(1, 64) | s + 'abcdefghijklmnopqrstuvwxyz012345')})",
+    )
+    .expect("nodes without the property");
+    let a = scan_id(&mut db, "name", "a");
+    let c = scan_id(&mut db, "name", "c");
+    db.engine()
+        .put(Partition::Idx, &entry_key(&db, "u_city", "oslo", c), &[])
+        .expect("an entry naming a node that does not hold the value");
+
+    let options = StatementOptions {
+        query_memory_limit: Some(256 << 10),
+        ..Default::default()
+    };
+    let rows = db
+        .execute_cypher_shared_with(
+            "MATCH (u:U {city: 'oslo'}) RETURN id(u) AS id",
+            None,
+            None,
+            &options,
+        )
+        .expect("within the limit")
+        .rows;
+    let ids: Vec<&Value> = rows.iter().filter_map(|row| row.get("id")).collect();
+    assert_eq!(ids, vec![&Value::Int(a)]);
+}
+
+/// A node with a deep history (hundreds of versions, far more than the
+/// statement's limit in all) is answered from the records within that
+/// limit, at the present and as of a timestamp inside the history: only the
+/// version the read sees is held.
+#[test]
+fn a_deep_history_is_answered_from_the_records_within_the_limit() {
+    let (mut db, _dir) = open_db();
+    let owner = label_answered_by_its_records(&mut db, 8);
+    let mut middle = 0;
+    for i in 0..300 {
+        let tx = db.begin_transaction();
+        db.execute_in_transaction(
+            tx,
+            &format!(
+                "MATCH (u:U) WHERE id(u) = {owner} SET u.v = {i}, u.pad = reduce(s = '', k IN \
+                 range(1, 64) | s + 'abcdefghijklmnopqrstuvwxyz01234{}')",
+                i % 10
+            ),
+            None,
+        )
+        .expect("a version");
+        let at = db
+            .commit_transaction(tx)
+            .expect("commit")
+            .commit_ts
+            .as_raw();
+        if i == 150 {
+            middle = at;
+        }
+    }
+    // The entry still names another node: the lookup answers from the
+    // records, about 600 KiB of the holder's history against 256 KiB.
+    let options = coordinode_embed::db::StatementOptions {
+        query_memory_limit: Some(256 << 10),
+        ..Default::default()
+    };
+    for (query, v) in [
+        (
+            "MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id, u.v AS v".to_string(),
+            299,
+        ),
+        (
+            format!(
+                "MATCH (u:U {{email: 'a@x'}}) RETURN id(u) AS id, u.v AS v AS OF TIMESTAMP {middle}"
+            ),
+            150,
+        ),
+    ] {
+        let rows = db
+            .execute_cypher_shared_with(&query, None, None, &options)
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"))
+            .rows;
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)), "{query}");
+        assert_eq!(rows[0].get("v"), Some(&Value::Int(v)), "{query}");
+    }
+}
+
+/// A deadline reached while the lookup reads the label's records stops it
+/// with the deadline refusal, never with the holders read so far; without
+/// the deadline the same lookup answers the holder.
+#[test]
+fn a_deadline_reached_while_reading_the_records_stops_the_lookup() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_embed::db::{DatabaseError, StatementOptions};
+    use coordinode_query::executor::runner::ExecutionError;
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("UNWIND range(1, 20000) AS i CREATE (:U {email: 'n' + toString(i) + '@x'})")
+        .expect("the label");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    let owner = id_of(&mut db, "a@x");
+    let wrong = id_of(&mut db, "n1@x");
+    let query = "MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id";
+
+    misattribute(&db, "u_email", "a@x", wrong);
+    let stopped = db.execute_cypher_shared_with(
+        query,
+        None,
+        None,
+        &StatementOptions {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(5)),
+            ..Default::default()
+        },
+    );
+    assert!(
+        matches!(
+            stopped,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Deadline
+            )))
+        ),
+        "{:?}",
+        stopped.map(|r| r.rows)
+    );
+
+    wrong_again(&db, wrong);
+    let rows = db
+        .execute_cypher_shared_with(query, None, None, &StatementOptions::default())
+        .expect("no deadline")
+        .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)));
+}
+
 /// A limit smaller than one record of the label stops the lookup with the
 /// memory refusal, rather than answering with what it read before it or
 /// with nothing.

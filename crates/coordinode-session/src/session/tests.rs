@@ -171,6 +171,71 @@ impl CursorEngine for RecordingEngine {
     }
 }
 
+/// A statement that fails after some of its rows were sent ends with the
+/// error, never with `CursorEnd`: the rows already sent are not a complete
+/// answer, and a client reading the stream can tell.
+#[tokio::test]
+async fn a_statement_failing_after_its_first_rows_ends_with_the_error() {
+    /// Gives one row, then fails as a statement past its limit does.
+    struct FailsOnSecondPage {
+        pages: u8,
+    }
+    impl QueryCursor for FailsOnSecondPage {
+        fn columns(&self) -> Vec<String> {
+            vec!["n".to_string()]
+        }
+        fn next_batch(&mut self, _max: usize) -> Result<Vec<Vec<Value>>, EngineError> {
+            self.pages += 1;
+            if self.pages == 1 {
+                return Ok(vec![vec![Value::Int(1)]]);
+            }
+            Err(EngineError(Failure::new(
+                ErrorCode::DeadlineExceeded,
+                "the statement passed its deadline",
+            )))
+        }
+        fn stats(&self) -> SessionStats {
+            SessionStats::default()
+        }
+    }
+    struct Engine;
+    impl CursorEngine for Engine {
+        fn open_cursor(
+            &self,
+            _query: &str,
+            _params: HashMap<String, Value>,
+            _txid: u64,
+            _settings: &ConnectionSettings,
+            _source: Option<&StatementSource>,
+            _cancel: &coordinode_core::budget::CancelFlag,
+        ) -> Result<Box<dyn QueryCursor>, EngineError> {
+            Ok(Box::new(FailsOnSecondPage { pages: 0 }))
+        }
+        fn begin_transaction(&self) -> Result<u64, EngineError> {
+            Ok(1)
+        }
+        fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+            Ok(MOCK_RECEIPT)
+        }
+        fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    let by_id = run_session(Arc::new(Engine), vec![exec()]).await;
+    match by_id[&1].as_slice() {
+        [
+            SessionEvent::CursorOpen { .. },
+            SessionEvent::Rows { rows },
+            SessionEvent::Error(failure),
+        ] => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(failure.code, ErrorCode::DeadlineExceeded);
+        }
+        other => panic!("expected rows then the error, got {other:?}"),
+    }
+}
+
 /// A session SET changes that session's settings: it answers with an empty
 /// result without reaching the engine, and the statements after it run under
 /// the new setting. A second session is untouched, which is the point: before,

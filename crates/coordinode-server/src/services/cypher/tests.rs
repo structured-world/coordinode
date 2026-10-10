@@ -3193,3 +3193,73 @@ fn a_write_to_a_follower_is_a_redirect_with_the_leader_named() {
     );
     assert!(details.retry_info().is_some());
 }
+
+/// On a replicated member, a public request whose lookup goes through a
+/// wrong unique entry answers the real holder from the records within the
+/// memory limit the request names, far below the label's size.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replicated_lookup_through_a_wrong_entry_answers_within_the_request_limit() {
+    use coordinode_core::index::encoding::{encode_tuple, encode_unique_entry_key};
+    use coordinode_modality::{IndexStore as _, LocalIndexStore};
+    use coordinode_storage::engine::partition::Partition;
+
+    let (executor, node, _dir) = crate::services::statement::tests::raft().await;
+    let service = CypherServiceImpl::from_executor(executor.clone());
+    let run = |query: &str, limit_mb: Option<u32>| {
+        let request = Request::new(query::ExecuteCypherRequest {
+            query: query.to_string(),
+            query_memory_limit_mb: limit_mb,
+            ..Default::default()
+        });
+        service.execute_cypher(request)
+    };
+    let id_of = |response: &query::ExecuteCypherResponse| match response.rows[0].values[0].value {
+        Some(common::property_value::Value::IntValue(id)) => id,
+        ref other => panic!("expected an id, got {other:?}"),
+    };
+
+    run("CREATE UNIQUE INDEX u_email ON :U(email)", None)
+        .await
+        .expect("index");
+    run(
+        "UNWIND range(1, 600) AS i CREATE (:U {email: 'n' + toString(i) + '@x', \
+         pad: reduce(s = '', k IN range(1, 64) | s + 'abcdefghijklmnopqrstuvwxyz012345')})",
+        None,
+    )
+    .await
+    .expect("about 1.2 MiB of records");
+    run("CREATE (:U {email: 'a@x'})", None).await.expect("a");
+    let scan =
+        |email: &str| format!("MATCH (u:U) WHERE u.email + '' = '{email}' RETURN id(u) AS id");
+    let owner = id_of(&run(&scan("a@x"), None).await.expect("scan").into_inner());
+    let wrong = id_of(&run(&scan("n1@x"), None).await.expect("scan").into_inner());
+
+    {
+        let database = executor.database().read();
+        let engine = database.engine();
+        let store = LocalIndexStore::new(engine);
+        let index = store
+            .resolve_name("u_email")
+            .expect("resolve")
+            .and_then(|id| store.load_definition(id).expect("load"))
+            .expect("index");
+        let tuple = encode_tuple(&[Value::String("a@x".into())]).expect("tuple");
+        engine
+            .put(
+                Partition::Idx,
+                &encode_unique_entry_key(index.generation, &tuple),
+                &u64::try_from(wrong).expect("id").to_be_bytes(),
+            )
+            .expect("an entry naming the wrong node");
+    }
+
+    let lookup = "MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id";
+    let found = run(lookup, Some(1))
+        .await
+        .expect("within 1 MiB")
+        .into_inner();
+    assert_eq!(found.rows.len(), 1);
+    assert_eq!(id_of(&found), owner);
+
+    node.shutdown().await.expect("shutdown");
+}
