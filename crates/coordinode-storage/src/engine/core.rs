@@ -1511,8 +1511,11 @@ impl StorageEngine {
     }
 
     /// Record that `generation`'s replacement holds its complete imported
-    /// history, after making the imported versions durable. `covers_through`
-    /// and `history_from` are the imported history's bounds
+    /// history. The record is written to the tree after the imported
+    /// versions, and a flush persists the tree's writes as a prefix, so it
+    /// reaches disk no earlier than they do; one lost to a crash leaves the
+    /// replacement to be dropped at the next open. `covers_through` and
+    /// `history_from` are the imported history's bounds
     /// ([`GenerationHistory`](crate::engine::installation::GenerationHistory)):
     /// a history taken after [`Self::stage_generation`] returned qualifies,
     /// one taken before does not, and once published the copy refuses reads
@@ -1522,24 +1525,20 @@ impl StorageEngine {
     ///
     /// The errors of [`Self::import_generation_history`];
     /// [`StorageError::PositionBehind`] for a history that ends before the
-    /// replacement's registration; a flush failure.
+    /// replacement's registration.
     pub fn finish_generation_import(
         &self,
         generation: coordinode_core::index::identity::GenerationId,
         covers_through: u64,
         history_from: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
-        let tree = self.tree(Partition::Idx)?;
-        tree.flush_active_memtable(0)?;
         self.installations.mark_imported(
-            tree,
+            self.tree(Partition::Idx)?,
             generation.as_raw(),
             covers_through,
             history_from,
             self.next_seqno(),
-        )?;
-        tree.flush_active_memtable(0)?;
-        Ok(())
+        )
     }
 
     /// Swap `generation`'s completed replacement in for its copy: from this

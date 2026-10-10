@@ -13,16 +13,19 @@
 //!    the replacement already holds from the writes above is written again
 //!    identically: the generation's entries are puts, deletes and range
 //!    deletes, which a repeat at the same seqno does not change.
-//! 3. [`Installations::mark_imported`] records, after the imported versions
-//!    are on disk, that the replacement's contents are complete.
+//! 3. [`Installations::mark_imported`] records that the replacement's
+//!    contents are complete, once its history reaches the registration.
+//!    Written to the tree after the imported versions, the record persists
+//!    no earlier than they do: a flush persists the tree's writes as a prefix.
 //! 4. [`Installations::publish`] makes the replacement the published
 //!    installation and retires the old one in one catalog write, again while
 //!    no batch applies, then deletes the old entries with MVCC range
 //!    tombstones: a reader already holding the old binding at an earlier
 //!    snapshot still sees them.
 //!
-//! A crash before step 3 leaves a replacement whose contents may be partial;
-//! the next open clears it and the generation keeps its installation
+//! A crash before step 3's record reaches disk leaves a replacement whose
+//! contents may be partial; the next open clears it and the generation keeps
+//! its installation
 //! ([`Installations::settle`]). A crash after step 4's catalog write and
 //! before its tombstones leaves a retired installation with entries; the next
 //! open deletes them.
@@ -291,8 +294,8 @@ impl Installations {
 
     /// Record that `generation`'s replacement holds its complete imported
     /// contents, from a history complete below `covers_through` and answering
-    /// snapshots from `history_from` on. The caller makes the imported
-    /// versions durable first.
+    /// snapshots from `history_from` on. Written after the imported versions,
+    /// it persists no earlier than they do.
     ///
     /// # Errors
     ///
@@ -365,7 +368,7 @@ impl Installations {
         seqno: SeqNo,
         clear_at: SeqNo,
     ) -> StorageResult<u64> {
-        let _quiet = self.fence.write();
+        let quiet = self.fence.write();
         let mut alloc = self.alloc.lock();
         let mut current = self.current.write();
         let (Some(old), Some(new)) = (
@@ -399,7 +402,9 @@ impl Installations {
         bindings.staging.remove(&generation);
         *current = Arc::new(bindings);
         self.imported.lock().remove(&generation);
-        drop(current);
+        // Applies resume once the binding is swapped: nothing writes to the
+        // retired copy any more, so clearing it needs no pause.
+        drop((current, alloc, quiet));
         clear_installation(tree, old, clear_at.max(above(at)?));
         Ok(old)
     }
@@ -418,7 +423,7 @@ impl Installations {
         seqno: SeqNo,
         clear_at: SeqNo,
     ) -> StorageResult<()> {
-        let _quiet = self.fence.write();
+        let quiet = self.fence.write();
         let mut alloc = self.alloc.lock();
         let mut current = self.current.write();
         let staging = current.staging(generation).ok_or_else(|| {
@@ -433,7 +438,7 @@ impl Installations {
         bindings.staging.remove(&generation);
         *current = Arc::new(bindings);
         self.imported.lock().remove(&generation);
-        drop(current);
+        drop((current, alloc, quiet));
         clear_installation(tree, staging, clear_at.max(above(at)?));
         Ok(())
     }

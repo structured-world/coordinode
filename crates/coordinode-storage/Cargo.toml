@@ -119,6 +119,10 @@ name = "commit_fence"
 harness = false
 
 [[bench]]
+name = "generation_replace"
+harness = false
+
+[[bench]]
 name = "coordinator_dispatch"
 harness = false
 
