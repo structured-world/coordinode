@@ -807,10 +807,11 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
 }
 
 /// A lookup the index cannot answer is refused before reading the records
-/// when the rest of the statement runs an operator outside its budget (a
-/// traversal here): it names the index and the operator, and never answers
-/// with partial or empty rows. The same statement over a sound index
-/// answers; an aggregate, which is accounted, answers from the records.
+/// when the rest of the statement runs an operator outside its budget (an
+/// optional match here): it names the index and the operator, and never
+/// answers with partial or empty rows. The same statement over a sound index
+/// answers; a traversal and an aggregate, which are accounted, answer from
+/// the records exactly as the sound index did.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -821,25 +822,31 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     db.execute_cypher("CREATE (:U {email: 'a@x'})-[:R]->(:T {n: 1})")
         .expect("a");
     db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let optional = "MATCH (u:U {email: 'a@x'}) OPTIONAL MATCH (u)-[:R]->(t:T) RETURN t.n AS n";
     let traverse = "MATCH (u:U {email: 'a@x'})-[:R]->(t:T) RETURN t.n AS n";
     let count = "MATCH (u:U {email: 'a@x'}) RETURN count(u) AS n";
-    let sound = db.execute_cypher(traverse).expect("a sound index answers");
+    let sound = db.execute_cypher(optional).expect("a sound index answers");
     assert_eq!(sound[0].get("n"), Some(&Value::Int(1)));
 
     let wrong = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", wrong);
-    let refused = db.execute_cypher(traverse);
+    let refused = db.execute_cypher(optional);
     assert!(
         matches!(
             &refused,
             Err(DatabaseError::Execution(ExecutionError::IndexUnresolved {
                 label,
                 property,
-                operator: "Traverse",
+                operator: "LeftOuterJoin",
             })) if label == "U" && property == "email"
         ),
         "{refused:?}"
     );
+    let traversed = db
+        .execute_cypher(traverse)
+        .expect("a traversal is accounted");
+    assert_eq!(traversed.len(), 1);
+    assert_eq!(traversed[0].get("n"), Some(&Value::Int(1)));
     let counted = db.execute_cypher(count).expect("an aggregate is accounted");
     assert_eq!(counted[0].get("n"), Some(&Value::Int(1)));
 }

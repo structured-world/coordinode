@@ -267,10 +267,15 @@ pub struct MemoryCharge<'b> {
     bytes: u64,
 }
 
-impl MemoryCharge<'_> {
+impl<'b> MemoryCharge<'b> {
     /// Bytes this charge holds.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// An empty charge on the same budget, for memory owned apart from this.
+    pub fn empty_like(&self) -> MemoryCharge<'b> {
+        self.budget.empty_charge()
     }
 
     /// Reserve `bytes` more under this charge, before the growth they pay

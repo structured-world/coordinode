@@ -3751,6 +3751,18 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::Unwind { input, expr, .. } if !neutral_contains_subplan(expr) => {
             first_unaccounted_operator(input)
         }
+        LogicalOp::Traverse {
+            input,
+            target_filters,
+            edge_filters,
+            ..
+        } if !target_filters
+            .iter()
+            .chain(edge_filters)
+            .any(|(_, e)| neutral_contains_subplan(e)) =>
+        {
+            first_unaccounted_operator(input)
+        }
         LogicalOp::Aggregate {
             input,
             group_by,
@@ -6400,12 +6412,19 @@ fn execute_traverse(
 /// Returns ALL `(target_uid, edge_type_index)` pairs — no truncation.
 /// The caller decides whether to process them sequentially or in parallel
 /// based on `AdaptiveConfig::parallel_threshold`.
+///
+/// Each neighbour counts one unit of the statement's work, and `held` grows
+/// by the list's memory (and the posting list it is read from) before the
+/// list grows: the caller holds the charge as long as it holds the list.
 fn expand_one_hop(
     src_id: NodeId,
     edge_types: &[String],
     direction: Direction,
     ctx: &mut ExecutionContext<'_>,
+    held: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Vec<(u64, usize)>, ExecutionError> {
+    // A neighbour's slot in the list and its id in the decoded posting list.
+    let per_neighbor = (core::mem::size_of::<(u64, usize)>() + core::mem::size_of::<u64>()) as u64;
     let mut neighbors = Vec::new();
     // Single buffer reused for all key constructions in this call.
     // Avoids N_edge_types × N_directions heap allocations per traversal step.
@@ -6424,6 +6443,8 @@ fn expand_one_hop(
 
         if let Some(posting_list) = LocalEdgeStore.posting_for_key(&ctx.txn, &adj_key)? {
             let fan_out = posting_list.len();
+            ctx.budget.work(fan_out as u64)?;
+            held.grow(fan_out as u64 * per_neighbor)?;
             // Reserve the whole fan-out up front so a high-degree node does not
             // repeatedly reallocate `neighbors` mid-expansion (super-node path).
             neighbors.reserve(fan_out);
@@ -6451,6 +6472,8 @@ fn expand_one_hop(
         if direction == Direction::Both {
             LocalEdgeStore.write_rev_key(&mut adj_key, edge_type, src_id);
             if let Some(posting_list) = LocalEdgeStore.posting_for_key(&ctx.txn, &adj_key)? {
+                ctx.budget.work(posting_list.len() as u64)?;
+                held.grow(posting_list.len() as u64 * per_neighbor)?;
                 neighbors.reserve(posting_list.len());
                 for tgt_uid in posting_list.iter() {
                     neighbors.push((tgt_uid, et_idx));
@@ -6608,6 +6631,16 @@ fn build_target_rows(
                     ep_src,
                     ep_tgt,
                     upper_ms,
+                )?;
+                // The pair's edge versions, held while its rows are built.
+                ctx.budget.work(versions.len() as u64)?;
+                let _versions = ctx.budget.reserve(
+                    versions
+                        .iter()
+                        .map(|(_, bytes)| {
+                            (core::mem::size_of::<(i64, Vec<u8>)>() + bytes.len()) as u64
+                        })
+                        .sum(),
                 )?;
                 let mut acc: Vec<Row> =
                     Vec::with_capacity(materialised_rows.len() * versions.len());
@@ -6975,6 +7008,10 @@ fn execute_single_hop_traverse(
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
     let use_parallel = ctx.adaptive.enabled && ctx.adaptive.parallel_threshold > 0;
+    // Its own handle: charges taken here outlive the borrows of `ctx` below.
+    let budget = Arc::clone(&ctx.budget);
+    // Rows kept stay charged for the rest of the statement.
+    let mut kept = budget.empty_charge();
 
     for row in input_rows {
         let source_id = match row.get(params.source) {
@@ -6982,7 +7019,15 @@ fn execute_single_hop_traverse(
             _ => continue,
         };
 
-        let neighbors = expand_one_hop(source_id, params.edge_types, params.direction, ctx)?;
+        // The neighbours of this source, held while its rows are built.
+        let mut held = budget.empty_charge();
+        let neighbors = expand_one_hop(
+            source_id,
+            params.edge_types,
+            params.direction,
+            ctx,
+            &mut held,
+        )?;
 
         // Parallel path doesn't yet support temporal version fan-out (it bypasses
         // ExecutionContext and prefix scans), so any temporal edge type in the
@@ -7056,7 +7101,7 @@ fn execute_single_hop_traverse(
                     }
                 }
             }
-            results.extend(parallel_rows);
+            keep_rows(&mut kept, parallel_rows, &mut results)?;
             // Targets with no plain record (temporal nodes the pattern does
             // not label, or dangling edges) take the sequential path, which
             // reads their versions.
@@ -7067,7 +7112,8 @@ fn execute_single_hop_traverse(
                     edge_type: params.edge_types.get(et_idx).map(|s| s.as_str()),
                     edge_is_temporal: params.edge_temporal.get(et_idx).copied().unwrap_or(false),
                 };
-                results.extend(build_target_rows(&trp, params, ctx)?);
+                let target_rows = build_target_rows(&trp, params, ctx)?;
+                keep_rows(&mut kept, target_rows, &mut results)?;
             }
         } else {
             // Sequential path for normal fan-out
@@ -7095,12 +7141,29 @@ fn execute_single_hop_traverse(
                         r.insert(pv.to_string(), path.clone());
                     }
                 }
-                results.extend(target_rows);
+                keep_rows(&mut kept, target_rows, &mut results)?;
             }
         }
+        drop(held);
     }
 
+    kept.keep_until_query_ends();
     Ok(results)
+}
+
+/// Move `rows` into `results`, charging `kept` for them first.
+fn keep_rows(
+    kept: &mut coordinode_core::budget::MemoryCharge<'_>,
+    rows: Vec<Row>,
+    results: &mut Vec<Row>,
+) -> Result<(), ExecutionError> {
+    kept.grow(
+        rows.iter()
+            .map(crate::executor::row::row_held_bytes)
+            .sum::<u64>(),
+    )?;
+    results.extend(rows);
+    Ok(())
 }
 
 /// Reconstruct the route from `source` to `target` as a path value, using the
@@ -7158,11 +7221,16 @@ fn expand_frontier(
     to_expand: &[u64],
     params: &TraverseParams<'_>,
     ctx: &mut ExecutionContext<'_>,
+    held: &mut coordinode_core::budget::MemoryCharge<'_>,
 ) -> Result<Vec<(u64, u64, usize)>, ExecutionError> {
     let mut out = Vec::new();
     for &src_uid in to_expand {
         let src_nid = NodeId::from_raw(src_uid);
-        let neighbors = expand_one_hop(src_nid, params.edge_types, params.direction, ctx)?;
+        // One source's neighbours, held only while they are copied out.
+        let mut one = held.empty_like();
+        let neighbors =
+            expand_one_hop(src_nid, params.edge_types, params.direction, ctx, &mut one)?;
+        held.grow((neighbors.len() * core::mem::size_of::<(u64, u64, usize)>()) as u64)?;
         out.reserve(neighbors.len());
         for (tgt_uid, et_idx) in neighbors {
             out.push((src_uid, tgt_uid, et_idx));
@@ -7212,12 +7280,25 @@ fn execute_varlen_traverse(
         dedup_targets && params.target_labels.is_empty() && params.target_filters.is_empty();
 
     let mut results = Vec::new();
+    // Its own handle: charges taken here outlive the borrows of `ctx` below.
+    let budget = Arc::clone(&ctx.budget);
+    // Rows kept stay charged for the rest of the statement.
+    let mut kept = budget.empty_charge();
+    // An entry of a visited set or of the predecessor map: its key and value
+    // with the hash table's slot and control byte.
+    let set_entry = (core::mem::size_of::<(u64, u64, usize)>() + 1) as u64;
+    let pred_entry = (core::mem::size_of::<(u64, Option<(u64, usize)>)>() + 1) as u64;
 
     for row in input_rows {
         let source_id = match row.get(params.source) {
             Some(Value::Int(id)) => NodeId::from_raw(*id as u64),
             _ => continue,
         };
+        // The traversal's visited sets, predecessor map and current frontier,
+        // held for this source's whole traversal.
+        let mut traversal = budget.empty_charge();
+        let mut frontier_bytes = 0u64;
+        let mut sets_bytes = 0u64;
 
         // Edge-level cycle detection: (source_uid, target_uid, edge_type_idx).
         // Prevents traversing the same relationship twice per BFS invocation.
@@ -7264,6 +7345,8 @@ fn execute_varlen_traverse(
             }
 
             let mut next_frontier: Vec<u64> = Vec::new();
+            // This depth's expansions, next frontier and emitted neighbours.
+            let mut level = traversal.empty_like();
             let depth_start_edges = edges_processed;
 
             // Collect all unique neighbors across the frontier for this depth
@@ -7275,13 +7358,29 @@ fn execute_varlen_traverse(
             // expansion seam. The single-shard engine expands locally; the
             // distributed engine routes each source to its owning shard, which
             // runs this same expansion and returns its slice (scatter-gather).
+            // The set of expanded nodes and the list to expand grow by at
+            // most the frontier: charged before they do.
+            level.grow(frontier.len() as u64 * (set_entry + core::mem::size_of::<u64>() as u64))?;
             let to_expand: Vec<u64> = frontier
                 .iter()
                 .copied()
                 .filter(|&src_uid| expanded.insert(src_uid))
                 .collect();
-            let expansions = expand_frontier(&to_expand, params, ctx)?;
+            let expansions = expand_frontier(&to_expand, params, ctx, &mut level)?;
 
+            // Each expansion may enter the visited set, the next frontier,
+            // the predecessor map, the emitted set and this depth's
+            // neighbours: charged for all of them before any grows.
+            let per_expansion = set_entry
+                + core::mem::size_of::<u64>() as u64
+                + if params.path_variable.is_some() {
+                    pred_entry
+                } else {
+                    0
+                }
+                + if dedup_targets { set_entry } else { 0 }
+                + core::mem::size_of::<(u64, u64, usize)>() as u64;
+            level.grow(expansions.len() as u64 * per_expansion)?;
             for (src_uid, tgt_uid, et_idx) in expansions {
                 if !visited_edges.insert((src_uid, tgt_uid, et_idx)) {
                     continue;
@@ -7294,6 +7393,18 @@ fn execute_varlen_traverse(
                 if depth >= min_hops && (!dedup_targets || emitted_targets.insert(tgt_uid)) {
                     depth_neighbors.push((src_uid, tgt_uid, et_idx));
                 }
+            }
+            // The sets and the map outlive this depth: their part of the
+            // charge moves to the traversal's.
+            let lasting = visited_edges.len() as u64 * set_entry
+                + pred.len() as u64 * pred_entry
+                + emitted_targets.len() as u64 * set_entry
+                + expanded.len() as u64 * set_entry;
+            if lasting > sets_bytes {
+                let more = lasting - sets_bytes;
+                traversal.grow(more)?;
+                level.shrink(more);
+                sets_bytes = lasting;
             }
 
             // Adaptive check: detect divergence at this depth
@@ -7356,7 +7467,7 @@ fn execute_varlen_traverse(
                         params.target_variable.to_string(),
                         Value::Int(tgt_uid as i64),
                     );
-                    results.push(out);
+                    keep_rows(&mut kept, vec![out], &mut results)?;
                 }
             } else if use_parallel {
                 // depth_neighbors already has (src, tgt, et_idx) — pass directly
@@ -7392,7 +7503,7 @@ fn execute_varlen_traverse(
                         }
                     }
                 }
-                results.extend(parallel_rows);
+                keep_rows(&mut kept, parallel_rows, &mut results)?;
                 // As at the single-hop site: targets with no plain record are
                 // read sequentially, versions included. The parallel path runs
                 // only without a path variable, so no route is bound here.
@@ -7409,7 +7520,8 @@ fn execute_varlen_traverse(
                             .copied()
                             .unwrap_or(false),
                     };
-                    results.extend(build_target_rows(&trp, params, ctx)?);
+                    let target_rows = build_target_rows(&trp, params, ctx)?;
+                    keep_rows(&mut kept, target_rows, &mut results)?;
                 }
             } else {
                 for &(src_uid, tgt_uid, et_idx) in &depth_neighbors {
@@ -7449,14 +7561,22 @@ fn execute_varlen_traverse(
                             r.insert(pv.to_string(), path.clone());
                         }
                     }
-                    results.extend(target_rows);
+                    keep_rows(&mut kept, target_rows, &mut results)?;
                 }
             }
 
             frontier = next_frontier;
+            // The next frontier lives on as the frontier, in place of the
+            // last; the rest of this depth's memory is gone with its charge.
+            traversal.shrink(frontier_bytes);
+            frontier_bytes = (frontier.len() * core::mem::size_of::<u64>()) as u64;
+            traversal.grow(frontier_bytes)?;
+            drop(level);
         }
+        drop(traversal);
     }
 
+    kept.keep_until_query_ends();
     Ok(results)
 }
 
@@ -8725,11 +8845,15 @@ fn execute_doc_score(
         };
 
         // Traverse outward HAS_CHUNK edges; each neighbour is a chunk node id.
+        // The list is held, and charged, while this document is scored.
+        let budget = Arc::clone(&ctx.budget);
+        let mut held = budget.empty_charge();
         let neighbours = expand_one_hop(
             doc_id,
             std::slice::from_ref(&has_chunk),
             Direction::Outgoing,
             ctx,
+            &mut held,
         )?;
 
         if neighbours.is_empty() {
@@ -9728,6 +9852,9 @@ fn execute_shortest_path(
         let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
         let mut pred: rustc_hash::FxHashMap<u64, Option<(u64, usize)>> =
             rustc_hash::FxHashMap::default();
+        // The search's queue and predecessor map, held for this pair.
+        let budget = Arc::clone(&ctx.budget);
+        let mut searched = budget.empty_charge();
 
         queue.push_back((src_uid, 0));
         pred.insert(src_uid, None);
@@ -9743,10 +9870,17 @@ fn execute_shortest_path(
             }
 
             let nid = NodeId::from_raw(uid);
-            let neighbors = expand_one_hop(nid, edge_types, sp.direction, ctx)?;
+            let mut one = searched.empty_like();
+            let neighbors = expand_one_hop(nid, edge_types, sp.direction, ctx, &mut one)?;
 
             for (neighbor_uid, et_idx) in neighbors {
                 if let std::collections::hash_map::Entry::Vacant(e) = pred.entry(neighbor_uid) {
+                    // The map and the queue both grow by the new node.
+                    searched.grow(
+                        (core::mem::size_of::<(u64, Option<(u64, usize)>)>()
+                            + 1
+                            + core::mem::size_of::<(u64, usize)>()) as u64,
+                    )?;
                     e.insert(Some((uid, et_idx)));
                     queue.push_back((neighbor_uid, depth + 1));
                 }
@@ -10493,7 +10627,16 @@ fn execute_merge_relationship_check(
         }
     }
     for et in effective_types {
-        let neighbors = expand_one_hop(source_id, std::slice::from_ref(et), *direction, ctx)?;
+        // The source's neighbours, held while the target is looked for.
+        let budget = Arc::clone(&ctx.budget);
+        let mut held = budget.empty_charge();
+        let neighbors = expand_one_hop(
+            source_id,
+            std::slice::from_ref(et),
+            *direction,
+            ctx,
+            &mut held,
+        )?;
         if !neighbors.iter().any(|(tgt, _)| *tgt == target_raw) {
             continue;
         }
