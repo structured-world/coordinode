@@ -316,6 +316,42 @@ fn a_mark_whose_flush_failed_fails_the_finding_and_is_not_retried() {
     assert!(reg.is_suspect(index.generation));
 }
 
+/// A removal whose flush failed may or may not have reached the disk: the
+/// mark is no longer taken as stored, so a later finding fails rather than
+/// report a mark that a restart may not find, and nothing writes it again.
+#[test]
+fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let index = btree("user_email", "email", 1);
+    let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+    let reg = IndexRegistry::new();
+    report(&reg, &engine, &index, 7);
+    let started = reg.local_revision(index.generation);
+    rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
+    assert!(
+        reg.verified_here(&engine, index.generation, started)
+            .is_err(),
+        "the removal's flush failed"
+    );
+    assert!(reg.is_suspect(index.generation), "unfit here regardless");
+    // The disk now refuses everything: a finding that touched it would fail
+    // with a fresh engine error, not the refusal of a mark already failed.
+    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+    let after = reg.report_mismatch(&engine, &index, stray(8));
+    assert!(
+        matches!(
+            &after,
+            Err(MarkNotDurable {
+                source: StoreError::Storage(StorageError::Io(why)),
+                ..
+            }) if why.contains("earlier write")
+        ),
+        "a finding after the failed removal is refused: {after:?}"
+    );
+    reg.store_pending_marks(&engine)
+        .expect("a failed mark is not pending");
+}
+
 /// A disk below its free-space reserve is not written to: the finding goes
 /// on with its mark pending, and the mark is written once there is room.
 #[test]

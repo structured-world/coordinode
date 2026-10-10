@@ -599,13 +599,25 @@ impl IndexRegistry {
                 return Ok(false);
             }
         }
-        // Removed from storage first: a failure leaves the copy unfit.
-        LocalIndexStore::new(engine)
-            .clear_unfit_here(&[generation])
-            .map_err(|source| MarkNotDurable {
+        // Removed from storage first. A failure leaves the copy unfit, and
+        // the stored mark of unknown state: the removal may have reached the
+        // disk, so the mark no longer counts as stored and is never written
+        // again.
+        if let Err(source) = LocalIndexStore::new(engine).clear_unfit_here(&[generation]) {
+            if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
+                mark.state = MarkState::Failed;
+            }
+            tracing::error!(
+                generation = generation.as_raw(),
+                error = %source,
+                "could not remove the mark of a verified index copy; its stored state is \
+                 unknown and the copy stays unfit here"
+            );
+            return Err(MarkNotDurable {
                 generation: generation.as_raw(),
                 source,
-            })?;
+            });
+        }
         #[cfg(test)]
         if let Some(hook) = self.after_mark_removed.lock().as_ref() {
             hook();
