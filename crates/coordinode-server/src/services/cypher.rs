@@ -861,11 +861,24 @@ pub(crate) fn memory_limit_from_proto(mib: Option<u32>) -> Result<Option<u64>, S
         })
 }
 
+/// Throws the statement's cancel switch when dropped: when the call's future
+/// is dropped because the client cancelled or went away, the statement still
+/// running on the blocking pool stops at its next check. Dropped after the
+/// statement finished, it changes nothing.
+struct CancelOnDrop(coordinode_core::budget::CancelFlag);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// The settings a unary request names, as the executor takes them. A level,
 /// preference or concern left unspecified is `None`: the server's default.
 fn requested_from_proto(
     req: &query::ExecuteCypherRequest,
     deadline: Option<std::time::Instant>,
+    cancel: &coordinode_core::budget::CancelFlag,
 ) -> Result<Requested, Status> {
     let rc = req.read_concern.as_ref();
     Ok(Requested {
@@ -885,6 +898,7 @@ fn requested_from_proto(
         vector_build_wait: build_wait(req.vector_build_wait_ms),
         query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
         deadline,
+        cancel: Some(cancel.clone()),
     })
 }
 
@@ -901,6 +915,8 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // and forth while the client waits.
         let already_forwarded = request.metadata().contains_key(FORWARDED_HEADER);
         let deadline = grpc_deadline(request.metadata());
+        let cancel = coordinode_core::budget::CancelFlag::new();
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
         let req = request.into_inner();
 
         let start = std::time::Instant::now();
@@ -919,6 +935,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             let options = coordinode_embed::db::StatementOptions {
                 query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
                 deadline,
+                cancel: Some(cancel.clone()),
                 ..Default::default()
             };
             let rows = super::blocking(|| {
@@ -973,7 +990,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader is passed there.
-        let requested = requested_from_proto(&req, deadline)?;
+        let requested = requested_from_proto(&req, deadline, &cancel)?;
         let admitted = match self
             .executor
             .admit(&req.query, &requested, already_forwarded)

@@ -1,4 +1,5 @@
 use super::*;
+use coordinode_core::budget::CancelFlag;
 use coordinode_session::{SessionEvent, SessionManager, SessionOp};
 
 /// Build a tempdir-backed database seeded with `n` `:Page {k}` nodes, returned
@@ -55,6 +56,7 @@ fn keyset_cursor_drains_every_row_across_small_batches() {
             0,
             &unset(),
             None,
+            &CancelFlag::new(),
         )
         .expect("open");
 
@@ -85,6 +87,7 @@ fn keyset_cursor_with_filter_still_drains_all_matches() {
             0,
             &unset(),
             None,
+            &CancelFlag::new(),
         )
         .expect("open");
 
@@ -117,6 +120,7 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
             0,
             &unset(),
             None,
+            &CancelFlag::new(),
         )
         .expect("open");
 
@@ -131,6 +135,41 @@ fn blocking_plan_routes_to_materialize_and_still_returns_all_rows() {
     assert_eq!(ordered, (0..10).collect::<Vec<_>>(), "sorted, complete");
 }
 
+/// A statement whose cancel switch is thrown does not run: the session's
+/// Cancel answers it with CANCELLED, in an interactive transaction too.
+#[test]
+fn a_cancelled_statement_answers_with_a_cancellation() {
+    let engine = DatabaseCursorEngine::new(seeded_db(3));
+    let cancelled = CancelFlag::new();
+    cancelled.cancel();
+    let refused = engine
+        .open_cursor(
+            "MATCH (n:Page) RETURN n.k ORDER BY n.k",
+            HashMap::new(),
+            0,
+            &unset(),
+            None,
+            &cancelled,
+        )
+        .err()
+        .expect("cancelled");
+    assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
+
+    let txid = engine.begin_transaction().expect("begin");
+    let refused = engine
+        .open_cursor(
+            "CREATE (:Page {k: 99})",
+            HashMap::new(),
+            txid,
+            &unset(),
+            None,
+            &cancelled,
+        )
+        .err()
+        .expect("cancelled in a transaction");
+    assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
+}
+
 #[test]
 fn keyset_cursor_empty_label_yields_no_rows() {
     let engine = DatabaseCursorEngine::new(seeded_db(0));
@@ -141,6 +180,7 @@ fn keyset_cursor_empty_label_yields_no_rows() {
             0,
             &unset(),
             None,
+            &CancelFlag::new(),
         )
         .expect("open");
     assert!(cursor.next_batch(8).expect("batch").is_empty());
@@ -313,7 +353,14 @@ fn a_session_statement_is_counted_where_it_was_issued() {
     };
     for query in ["MATCH (n:Page) RETURN n.k", "RETURN 1 AS one"] {
         let mut cursor = engine
-            .open_cursor(query, HashMap::new(), 0, &unset(), Some(&source))
+            .open_cursor(
+                query,
+                HashMap::new(),
+                0,
+                &unset(),
+                Some(&source),
+                &CancelFlag::new(),
+            )
             .expect("open");
         drain(cursor.as_mut(), 8);
     }

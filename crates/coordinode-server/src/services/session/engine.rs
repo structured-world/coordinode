@@ -139,6 +139,7 @@ impl CursorEngine for DatabaseCursorEngine {
         txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let params = if params.is_empty() {
             None
@@ -155,6 +156,7 @@ impl CursorEngine for DatabaseCursorEngine {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
                 query_memory_limit: settings.query_memory_limit,
+                cancel: Some(cancel.clone()),
                 ..StatementOptions::default()
             };
             let rows = self
@@ -172,7 +174,7 @@ impl CursorEngine for DatabaseCursorEngine {
         }
 
         let start = Instant::now();
-        let admitted = match self.admit(query, &requested(settings))? {
+        let admitted = match self.admit(query, &requested(settings, cancel))? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
                 return self.forwarded(leader_id, query, params, settings, source.as_ref());
@@ -301,8 +303,12 @@ fn source_context(source: &StatementSource) -> Option<SourceContext> {
 /// The settings a session statement runs under, as the executor takes them.
 /// A level or preference of zero is the wire's "unspecified": the server's
 /// default, like a setting left out. The binding admits only values the
-/// server knows into a session's settings, so none is refused here.
-fn requested(settings: &ConnectionSettings) -> Requested {
+/// server knows into a session's settings, so none is refused here. `cancel`
+/// is the switch the session's Cancel throws.
+fn requested(
+    settings: &ConnectionSettings,
+    cancel: &coordinode_core::budget::CancelFlag,
+) -> Requested {
     Requested {
         read_concern: settings
             .read_concern
@@ -319,6 +325,7 @@ fn requested(settings: &ConnectionSettings) -> Requested {
         // A session statement has no call deadline of its own; the session's
         // stream lives on, and Cancel stops a statement.
         deadline: None,
+        cancel: Some(cancel.clone()),
     }
 }
 

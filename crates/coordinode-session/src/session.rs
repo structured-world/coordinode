@@ -18,6 +18,8 @@ use coordinode_core::graph::types::Value;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 
+use coordinode_core::budget::CancelFlag;
+
 use crate::engine::{CursorEngine, EngineError};
 use crate::registry::SessionRegistry;
 use crate::types::{
@@ -95,6 +97,7 @@ impl SessionManager {
             registry: Arc::clone(&self.registry),
             connection: self.connection.clone(),
             settings: Mutex::new(ConnectionSettings::default()),
+            cancels: Cancels::default(),
         }
     }
 }
@@ -116,6 +119,8 @@ pub struct Session {
     /// a lock because a Configure lands on the session task while statements
     /// dispatched from it read the settings.
     settings: Mutex<ConnectionSettings>,
+    /// The statements in flight, for a Cancel to reach.
+    cancels: Cancels,
 }
 
 impl Session {
@@ -229,6 +234,7 @@ impl Session {
                         params,
                         settings: self.settings.lock().under(&settings),
                         source: source.map(Box::new),
+                        cancel: self.cancels.register(request_id),
                     },
                 };
                 // A send error means the task just resolved (rx dropped) before
@@ -243,6 +249,7 @@ impl Session {
                                 params: HashMap::new(),
                                 settings: ConnectionSettings::default(),
                                 source: None,
+                                cancel: self.cancels.register(request_id),
                             },
                             txid,
                             out,
@@ -266,6 +273,7 @@ impl Session {
                     params,
                     settings: self.settings.lock().under(&settings),
                     source: source.map(Box::new),
+                    cancel: self.cancels.register(request_id),
                 };
                 self.spawn_autonomous(statement, txid, out);
             }
@@ -302,9 +310,9 @@ impl Session {
                 }
             }
 
-            // Cancellation lifecycle lands with the cursor registry; accepted
-            // silently for now.
-            SessionOp::Cancel { .. } => {}
+            // Stops the statement at its next check, which answers it with
+            // a cancellation; one already finished is unaffected.
+            SessionOp::Cancel { target_request_id } => self.cancels.cancel(target_request_id),
 
             // Settings are connection-wide, so this is handled on the session's
             // own task rather than spawned: a change must be in effect before
@@ -402,6 +410,45 @@ impl Session {
     }
 }
 
+/// The in-flight statements of one session, by request id, with the switch
+/// that cancels each: what a Cancel naming the request throws.
+#[derive(Clone, Default)]
+struct Cancels(Arc<Mutex<HashMap<u64, CancelFlag>>>);
+
+impl Cancels {
+    /// Register `request_id` as in flight; its entry goes when the guard
+    /// drops, with the statement.
+    fn register(&self, request_id: u64) -> CancelGuard {
+        let flag = CancelFlag::new();
+        self.0.lock().insert(request_id, flag.clone());
+        CancelGuard {
+            cancels: self.clone(),
+            request_id,
+            flag,
+        }
+    }
+
+    /// Cancel the statement `request_id`, if it is in flight.
+    fn cancel(&self, request_id: u64) {
+        if let Some(flag) = self.0.lock().get(&request_id) {
+            flag.cancel();
+        }
+    }
+}
+
+/// A statement's registration among its session's cancellable requests.
+struct CancelGuard {
+    cancels: Cancels,
+    request_id: u64,
+    flag: CancelFlag,
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.cancels.0.lock().remove(&self.request_id);
+    }
+}
+
 /// One statement on its way to the engine.
 struct Statement {
     request_id: u64,
@@ -414,6 +461,8 @@ struct Statement {
     /// debug mode sends one, and inline it would triple the size of every
     /// statement queued to a transaction.
     source: Option<Box<StatementSource>>,
+    /// Its registration as cancellable, from the moment it is received.
+    cancel: CancelGuard,
 }
 
 /// A message in a transaction's serial mailbox.
@@ -749,11 +798,14 @@ async fn execute(
         params,
         settings,
         source,
+        cancel,
     } = statement;
     // Open on the blocking pool: a write statement commits through Raft here.
     let engine = Arc::clone(engine);
+    let flag = cancel.flag.clone();
     let opened = tokio::task::spawn_blocking(move || {
-        let cursor = engine.open_cursor(&query, params, txid, &settings, source.as_deref())?;
+        let cursor =
+            engine.open_cursor(&query, params, txid, &settings, source.as_deref(), &flag)?;
         let columns = cursor.columns();
         Ok::<_, EngineError>((cursor, columns))
     })
@@ -779,6 +831,17 @@ async fn execute(
     }
 
     loop {
+        // A cancelled statement stops paging: the rows already sent are not
+        // a complete answer, and the error says so.
+        if cancel.flag.is_cancelled() {
+            send_error(
+                out,
+                request_id,
+                Failure::new(ErrorCode::Cancelled, "the statement was cancelled"),
+            )
+            .await;
+            return false;
+        }
         // Page on the blocking pool; hand the cursor in and take it back so the
         // next iteration (and `stats()` below) still own it.
         let pulled = tokio::task::spawn_blocking(move || {

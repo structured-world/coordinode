@@ -60,6 +60,7 @@ impl CursorEngine for MockEngine {
         _txid: u64,
         _settings: &ConnectionSettings,
         _source: Option<&StatementSource>,
+        _cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         if let Some(message) = &self.fail {
             return Err(EngineError(Failure {
@@ -145,6 +146,7 @@ impl CursorEngine for RecordingEngine {
         _txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        _cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         self.seen
             .lock()
@@ -384,6 +386,79 @@ async fn run_session(
     }
     handle.await.unwrap();
     by_id
+}
+
+/// An engine whose statement works until it is cancelled, checking the
+/// switch as a statement's budget does, then answers with a cancellation.
+struct UntilCancelled;
+
+impl CursorEngine for UntilCancelled {
+    fn open_cursor(
+        &self,
+        _query: &str,
+        _params: HashMap<String, Value>,
+        _txid: u64,
+        _settings: &ConnectionSettings,
+        _source: Option<&StatementSource>,
+        cancel: &coordinode_core::budget::CancelFlag,
+    ) -> Result<Box<dyn QueryCursor>, EngineError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Cancel never reached the statement"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(EngineError(Failure::new(
+            ErrorCode::Cancelled,
+            "the query was cancelled",
+        )))
+    }
+
+    fn begin_transaction(&self) -> Result<u64, EngineError> {
+        Ok(1)
+    }
+
+    fn commit_transaction(&self, _txid: u64) -> Result<CommitReceipt, EngineError> {
+        Ok(MOCK_RECEIPT)
+    }
+
+    fn rollback_transaction(&self, _txid: u64) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+/// A Cancel naming a running statement reaches the engine, which stops the
+/// statement; the client gets the cancellation, not a result. A Cancel
+/// naming no statement in flight does nothing.
+#[tokio::test]
+async fn a_cancel_stops_the_statement_it_names() {
+    let by_id = run_session(
+        Arc::new(UntilCancelled),
+        vec![
+            exec(),
+            SessionOp::Cancel {
+                target_request_id: 99,
+            },
+            SessionOp::Cancel {
+                target_request_id: 1,
+            },
+        ],
+    )
+    .await;
+    assert!(
+        matches!(
+            by_id[&1].as_slice(),
+            [SessionEvent::Error(Failure {
+                code: ErrorCode::Cancelled,
+                ..
+            })]
+        ),
+        "{:?}",
+        by_id[&1]
+    );
+    assert!(!by_id.contains_key(&2) && !by_id.contains_key(&3));
 }
 
 /// Drive a single op and return its events.

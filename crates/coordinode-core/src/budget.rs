@@ -14,7 +14,31 @@
 //! it runs: an alternative path after damage is found, a retry or a parallel
 //! operator spends from the same one.
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// The switch that cancels a query, held by whoever may cancel it (a
+/// session's Cancel, a client that went away) and by the query's budget,
+/// which refuses every later check once it is set.
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    /// A switch not yet thrown.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancel the query.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the query was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// Default `query_memory_limit`: 256 MiB.
 pub const DEFAULT_QUERY_MEMORY_LIMIT: u64 = 256 << 20;
@@ -78,7 +102,7 @@ pub struct QueryBudget {
     work: AtomicU64,
     /// Work at the last deadline and cancellation check.
     checked_at: AtomicU64,
-    cancelled: AtomicBool,
+    cancelled: CancelFlag,
     /// The deadline on `clock`, or `None` without one.
     deadline: Option<(u64, MonotonicNanos)>,
 }
@@ -92,7 +116,7 @@ impl QueryBudget {
             peak: AtomicU64::new(0),
             work: AtomicU64::new(0),
             checked_at: AtomicU64::new(0),
-            cancelled: AtomicBool::new(false),
+            cancelled: CancelFlag::new(),
             deadline: None,
         }
     }
@@ -101,6 +125,13 @@ impl QueryBudget {
     #[must_use]
     pub fn with_deadline(mut self, deadline_nanos: u64, clock: MonotonicNanos) -> Self {
         self.deadline = Some((deadline_nanos, clock));
+        self
+    }
+
+    /// The same budget cancelled by `flag`, which its holder throws.
+    #[must_use]
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancelled = flag;
         self
     }
 
@@ -127,7 +158,7 @@ impl QueryBudget {
     /// Stop the query: every later check refuses with
     /// [`BudgetStop::Cancelled`].
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.cancel();
     }
 
     /// Reserve `bytes` before allocating them. The returned charge returns
@@ -178,7 +209,7 @@ impl QueryBudget {
     ///
     /// [`BudgetStop::Deadline`] or [`BudgetStop::Cancelled`].
     pub fn check(&self) -> Result<(), BudgetStop> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.is_cancelled() {
             return Err(BudgetStop::Cancelled);
         }
         if let Some((deadline, clock)) = self.deadline {

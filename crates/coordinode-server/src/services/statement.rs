@@ -60,6 +60,8 @@ pub(crate) struct Requested {
     pub query_memory_limit: Option<u64>,
     /// When the caller stops waiting for the statement: its gRPC deadline.
     pub deadline: Option<std::time::Instant>,
+    /// Thrown when the caller cancels the statement or goes away.
+    pub cancel: Option<coordinode_core::budget::CancelFlag>,
 }
 
 /// A statement whose settings are resolved and consistent, not yet fenced.
@@ -72,6 +74,7 @@ pub(crate) struct Checked {
     vector_build_wait: Option<Duration>,
     query_memory_limit: Option<u64>,
     deadline: Option<std::time::Instant>,
+    cancel: Option<coordinode_core::budget::CancelFlag>,
 }
 
 /// A statement this node may run, with what the fence learned about it.
@@ -90,6 +93,8 @@ pub(crate) struct Admitted {
     pub query_memory_limit: Option<u64>,
     /// When the caller stops waiting for the statement.
     pub deadline: Option<std::time::Instant>,
+    /// Thrown when the caller cancels the statement or goes away.
+    pub cancel: Option<coordinode_core::budget::CancelFlag>,
     /// The applied log index the read was served at; zero outside a cluster.
     pub applied_index: u64,
     /// Whether this node led when it served the statement.
@@ -108,6 +113,7 @@ impl Admitted {
             vector_build_wait: self.vector_build_wait,
             query_memory_limit: self.query_memory_limit,
             deadline: self.deadline,
+            cancel: self.cancel.clone(),
         }
     }
 }
@@ -282,6 +288,7 @@ impl StatementExecutor {
             vector_build_wait: requested.vector_build_wait,
             query_memory_limit: requested.query_memory_limit,
             deadline: requested.deadline,
+            cancel: requested.cancel.clone(),
         })
     }
 
@@ -295,6 +302,7 @@ impl StatementExecutor {
             vector_build_wait: checked.vector_build_wait,
             query_memory_limit: checked.query_memory_limit,
             deadline: checked.deadline,
+            cancel: checked.cancel,
             applied_index: 0,
             served_by_leader: false,
             read_as_of_ts: 0,
@@ -352,6 +360,7 @@ impl StatementExecutor {
             vector_build_wait: checked.vector_build_wait,
             query_memory_limit: checked.query_memory_limit,
             deadline: checked.deadline,
+            cancel: checked.cancel,
             applied_index,
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),

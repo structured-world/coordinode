@@ -3699,6 +3699,9 @@ pub fn execute_no_commit(
     // var-length traverse). Collapses O(edges) emitted rows to O(reached nodes).
     ctx.dedup_varlen_targets = plan_allows_varlen_target_dedup(&plan.root);
     ctx.unaccounted_operator = first_unaccounted_operator(&plan.root);
+    // A statement cancelled or out of time before it starts does not start:
+    // the periodic checks come only once it has worked a while.
+    ctx.budget.check()?;
     // What this statement stages is charged to its budget as it is staged.
     ctx.txn
         .charge_writes_to(Some(std::sync::Arc::clone(&ctx.budget)));

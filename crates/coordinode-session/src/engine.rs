@@ -41,6 +41,8 @@ impl std::error::Error for EngineError {}
 /// for an autonomous (auto-commit) statement. `settings` are the statement's
 /// own settings over its session's: a field still unset is the engine's
 /// default. `source` is where in the client's code the statement was issued.
+/// `cancel` is thrown when the client cancels the statement: the engine stops
+/// its work at the next check and answers with a cancellation.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot serve a session's statements",
     label = "needs `CursorEngine`",
@@ -54,6 +56,7 @@ pub trait CursorEngine: Send + Sync {
         txid: u64,
         settings: &ConnectionSettings,
         source: Option<&StatementSource>,
+        cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
     /// The change to its session's settings `query` makes, when it is a

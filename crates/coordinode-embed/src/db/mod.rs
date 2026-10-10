@@ -607,6 +607,9 @@ pub struct StatementOptions {
     /// When this statement must have finished: a client's deadline. Work past
     /// it stops with a deadline error.
     pub deadline: Option<Instant>,
+    /// The switch that cancels this statement, held by whoever may cancel
+    /// it: work after it is thrown stops with a cancellation error.
+    pub cancel: Option<coordinode_core::budget::CancelFlag>,
 }
 
 #[derive(Debug, Clone)]
@@ -641,12 +644,17 @@ fn monotonic_nanos() -> u64 {
 }
 
 /// The budget of one statement: `limit` bytes of query memory, ending at
-/// `deadline` when there is one.
+/// `deadline` when there is one, cancelled by `cancel` when it is thrown.
 fn statement_budget(
     limit: u64,
     deadline: Option<Instant>,
+    cancel: Option<coordinode_core::budget::CancelFlag>,
 ) -> Arc<coordinode_core::budget::QueryBudget> {
     let budget = coordinode_core::budget::QueryBudget::new(limit);
+    let budget = match cancel {
+        Some(flag) => budget.with_cancel(flag),
+        None => budget,
+    };
     Arc::new(match deadline {
         Some(deadline) => {
             // The deadline on the same clock `monotonic_nanos` reads; one
@@ -1639,7 +1647,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
-            budget: statement_budget(self.query_memory_limit, None),
+            budget: statement_budget(self.query_memory_limit, None, None),
         }
     }
 
@@ -2621,7 +2629,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
-            budget: statement_budget(self.query_memory_limit, None),
+            budget: statement_budget(self.query_memory_limit, None, None),
         };
         let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
@@ -3921,7 +3929,11 @@ impl Database {
             Some(bytes) => checked_query_memory_limit(bytes)?,
             None => self.query_memory_limit,
         };
-        Ok(statement_budget(limit, options.deadline))
+        Ok(statement_budget(
+            limit,
+            options.deadline,
+            options.cancel.clone(),
+        ))
     }
 }
 

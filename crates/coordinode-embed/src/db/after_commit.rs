@@ -387,7 +387,7 @@ impl Database {
             // A trigger body is a statement of its own, under the database's
             // limit; it outlives the statement that queued it, so it has no
             // client deadline to inherit.
-            budget: super::statement_budget(self.query_memory_limit, None),
+            budget: super::statement_budget(self.query_memory_limit, None, None),
         };
         let params = if params.is_empty() {
             None
