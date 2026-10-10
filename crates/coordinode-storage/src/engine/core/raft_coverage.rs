@@ -358,7 +358,9 @@ impl StorageEngine {
             .map_err(|e| {
                 StorageError::Io(format!("capture partition {}: {e}", partition.name()))
             })?;
-        Ok(())
+        // The capture is opened as an engine directory, which names its
+        // format like any other.
+        crate::format::write_marker(target, coordinode_core::version::engine_format_version())
     }
 
     /// The replicated rows of `partition` in this engine: every key but the

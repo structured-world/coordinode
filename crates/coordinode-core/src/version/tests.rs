@@ -97,12 +97,18 @@ fn an_oversized_leader_address_is_left_out() {
 #[test]
 fn pairs_match_only_when_both_parts_are_equal() {
     let p = VersionPair {
-        engine: 1,
+        engine: ENGINE_FORMAT_VERSION,
         host_epoch: 0,
     };
     assert_eq!(p, VersionPair::current(0));
     assert_ne!(p, VersionPair { host_epoch: 1, ..p });
-    assert_ne!(p, VersionPair { engine: 2, ..p });
+    assert_ne!(
+        p,
+        VersionPair {
+            engine: ENGINE_FORMAT_VERSION + 1,
+            ..p
+        }
+    );
 }
 
 #[test]
