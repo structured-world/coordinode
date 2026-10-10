@@ -3005,6 +3005,8 @@ impl Database {
                 dismissed: Arc::clone(&self.dismissed),
             }),
             budget: Arc::clone(&session.budget),
+            // Set from the plan when it starts.
+            unaccounted_operator: None,
             txn,
             vector_consistency: plan.vector_consistency,
             vector_overfetch_factor: 1.2,

@@ -65,6 +65,7 @@ fn make_test_ctx<'a>(
         budget: std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(
             coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
         )),
+        unaccounted_operator: None,
         vector_consistency: coordinode_core::graph::types::VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,

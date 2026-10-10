@@ -177,6 +177,12 @@ pub enum Reason {
     /// The statement was cancelled and stopped. Nothing it produced is
     /// returned.
     QueryCancelled,
+    /// An index the statement reads is not proved complete, and answering
+    /// from the records instead would run part of the statement outside its
+    /// resource budget. Refused before reading anything. Metadata carries
+    /// `label`, `property` and `operator`. Retry once the index is verified
+    /// or rebuilt.
+    IndexUnresolved,
 }
 
 impl Reason {
@@ -216,6 +222,7 @@ impl Reason {
             Reason::ExceedsMemoryBudget => "EXCEEDS_MEMORY_BUDGET",
             Reason::QueryDeadlineExceeded => "QUERY_DEADLINE_EXCEEDED",
             Reason::QueryCancelled => "QUERY_CANCELLED",
+            Reason::IndexUnresolved => "INDEX_UNRESOLVED",
         }
     }
 
@@ -259,6 +266,9 @@ impl Reason {
             // The proof shrinks as the build covers more of the stored
             // nodes; an immediate retry reads almost as much again.
             Reason::UniquenessUnresolved => Some(std::time::Duration::from_secs(1)),
+            // The index answers again once its check proves it, which takes
+            // a verification pass, not a moment.
+            Reason::IndexUnresolved => Some(std::time::Duration::from_secs(5)),
             _ => None,
         }
     }

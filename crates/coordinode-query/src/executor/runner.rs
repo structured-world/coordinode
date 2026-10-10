@@ -89,6 +89,22 @@ pub enum ExecutionError {
     #[error("{0}")]
     Budget(#[from] coordinode_core::budget::BudgetStop),
 
+    /// An index cannot answer (its entries are not proved complete), and the
+    /// read of the label's records that would answer instead leads on into
+    /// `operator`, which works outside the statement's budget. Refused
+    /// before any of that work: nothing was read or written. The same
+    /// statement succeeds once the index is verified or rebuilt.
+    #[error(
+        "the index on :{label}({property}) cannot answer, and reading the records instead \
+         would run {operator} outside the statement's resource budget; retry once the index \
+         is verified or rebuilt"
+    )]
+    IndexUnresolved {
+        label: String,
+        property: String,
+        operator: &'static str,
+    },
+
     /// Arithmetic with no answer: division or modulo by an integer zero, or an
     /// integer operation whose exact result leaves the `i64` range. Carries the
     /// message verbatim, so a driver sees the same text it would elsewhere.
@@ -345,6 +361,19 @@ impl From<crate::index::UniqueViolation> for ExecutionError {
     fn from(v: crate::index::UniqueViolation) -> Self {
         unique_violation(v)
     }
+}
+
+/// Why an index lookup did not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexUnanswered {
+    /// The index does not serve this lookup: dropped since the plan was
+    /// built, not fully built, of another layout, or the value has no key.
+    /// The statement reads as if there were no index.
+    NotServing,
+    /// The index serves, but its entries are not proved complete: they were
+    /// found disagreeing with their records. Reading the records instead is
+    /// the integrity fallback, held to the statement's budget.
+    Unproved,
 }
 
 impl From<coordinode_modality::StoreError> for ExecutionError {
@@ -882,6 +911,11 @@ pub struct ExecutionContext<'a> {
     /// access path, alternative plan and operator of the statement spends
     /// from it. Shared so whoever admitted the request can cancel it.
     pub budget: std::sync::Arc<coordinode_core::budget::QueryBudget>,
+    /// The first operator of the running plan that works outside `budget`,
+    /// or `None` when the whole plan is accounted. Set when the plan starts.
+    /// An index that cannot answer is not replaced by a read of the records
+    /// while it is set: that read would go on into unaccounted work.
+    pub unaccounted_operator: Option<&'static str>,
 
     /// Vector MVCC consistency mode. Controls how vector search interacts
     /// with snapshot isolation. Default: `Current` (no visibility filter).
@@ -1354,6 +1388,17 @@ impl<'a> ExecutionContext<'a> {
         Ok(self.txn.put(part, key, value)?)
     }
 
+    /// Reserve `bytes` of memory an operator is about to allocate and hand
+    /// on to the plan's later stages, for the rest of the statement.
+    ///
+    /// # Errors
+    ///
+    /// The budget's refusal; nothing is reserved.
+    pub fn hold(&self, bytes: u64) -> Result<(), ExecutionError> {
+        self.budget.reserve(bytes)?.keep_until_query_ends();
+        Ok(())
+    }
+
     /// Read the current label schema by name. Returns `None` if the label
     /// has no schema declared.
     ///
@@ -1787,21 +1832,18 @@ impl<'a> ExecutionContext<'a> {
     }
 
     /// The nodes whose entry in the B-tree index `id` holds exactly `value`,
-    /// as this statement sees the index. `None` when the index cannot
-    /// answer: it is not active here (dropped since the plan was built), not
-    /// fully built, its entries were found disagreeing with their records,
-    /// or `value` has no key.
+    /// as this statement sees the index, or why the index cannot answer.
     pub fn index_lookup(
         &mut self,
         id: crate::index::IndexId,
         value: &Value,
-    ) -> Result<Option<Vec<NodeId>>, ExecutionError> {
+    ) -> Result<Result<Vec<NodeId>, IndexUnanswered>, ExecutionError> {
         use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
         let Some(registry) = self.btree_index_registry else {
-            return Ok(None);
+            return Ok(Err(IndexUnanswered::NotServing));
         };
         let Some(index) = registry.get_by_id(id) else {
-            return Ok(None);
+            return Ok(Err(IndexUnanswered::NotServing));
         };
         // The snapshot this statement reads: a named timestamp, or its own.
         // A timestamp before the epoch reads nothing an index could miss.
@@ -1812,17 +1854,22 @@ impl<'a> ExecutionContext<'a> {
         if index.index_type != crate::index::IndexType::BTree
             || index.state != IndexState::Ready
             || index.layout != ENTRY_LAYOUT
-            || !registry.answers_at(index.generation, read_ts)
         {
-            return Ok(None);
+            return Ok(Err(IndexUnanswered::NotServing));
+        }
+        if !registry.answers_at(index.generation, read_ts) {
+            return Ok(Err(IndexUnanswered::Unproved));
         }
         self.sync_txn_state();
-        Ok(LocalIndexStore::new(self.engine).scan_exact(
+        match LocalIndexStore::new(self.engine).scan_exact(
             &mut self.txn,
             &index,
             std::slice::from_ref(value),
             &self.budget,
-        )?)
+        )? {
+            Some(ids) => Ok(Ok(ids)),
+            None => Ok(Err(IndexUnanswered::NotServing)),
+        }
     }
 
     /// Whether the entry of the B-tree index `id` under `value` that named
@@ -3637,9 +3684,47 @@ pub fn execute_no_commit(
     // provably cannot observe target multiplicity (count(DISTINCT v) over a lone
     // var-length traverse). Collapses O(edges) emitted rows to O(reached nodes).
     ctx.dedup_varlen_targets = plan_allows_varlen_target_dedup(&plan.root);
+    ctx.unaccounted_operator = first_unaccounted_operator(&plan.root);
 
     let result = execute_op(&plan.root, ctx)?;
     Ok(result)
+}
+
+/// The first operator of `op`'s tree whose work is not charged to the
+/// statement's budget, or `None` when every operator's is. An operator is
+/// accounted when it counts its work and reserves what it keeps, and every
+/// expression it evaluates stays out of storage (a subquery or pattern
+/// expression reads unaccounted).
+fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
+    match op {
+        LogicalOp::NodeScan {
+            property_filters, ..
+        } if !property_filters
+            .iter()
+            .any(|(_, e)| neutral_contains_subplan(e)) =>
+        {
+            None
+        }
+        LogicalOp::IndexScan { value_expr, .. } if !neutral_contains_subplan(value_expr) => None,
+        LogicalOp::Empty => None,
+        LogicalOp::Filter { input, predicate } if !neutral_contains_subplan(predicate) => {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::Project { input, items, .. }
+            if !items.iter().any(|i| neutral_contains_subplan(&i.expr)) =>
+        {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::Sort { input, items }
+            if !items.iter().any(|i| neutral_contains_subplan(&i.expr)) =>
+        {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
+            first_unaccounted_operator(input)
+        }
+        other => Some(other.operator_name()),
+    }
 }
 
 /// Execute a single logical operator recursively.
@@ -3815,10 +3900,13 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             ctx.temporal_instants.truncate(scope);
             let rows = rows?;
             let corr = ctx.correlated_row.clone();
+            // The kept rows move over; only the list holding them is new.
+            ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
             if neutral_contains_subplan(predicate) {
                 // Storage-aware path: correlated subplans need edge lookups.
                 let mut result = Vec::new();
                 for row in rows {
+                    ctx.budget.work(1)?;
                     let effective_row = if let Some(ref outer) = corr {
                         let mut merged = outer.clone();
                         merged.extend(row.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -3837,6 +3925,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 // can fail and a filter closure has nowhere to put the failure.
                 let mut kept = Vec::with_capacity(rows.len());
                 for row in rows {
+                    ctx.budget.work(1)?;
                     let keep = if let Some(ref outer) = corr {
                         // Correlated OPTIONAL MATCH: merge outer-scope variables
                         // so predicates like `c.age > a.age` can resolve `a`.
@@ -3919,8 +4008,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // For-loop (not `.map`) so projection items containing pattern
             // comprehensions / EXISTS can evaluate through the storage-aware,
             // `&mut ctx`-borrowing path and propagate errors with `?`.
+            ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
             let mut result: Vec<Row> = Vec::with_capacity(rows.len());
             for row in rows {
+                ctx.budget.work(1)?;
                 let mut out = Row::new();
                 for item in items {
                     if item.expr == crate::plan::expr::Expr::Star {
@@ -3972,21 +4063,36 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                         }
                     }
                 }
+                // A projected row is new memory, held for the later stages.
+                ctx.hold(crate::executor::row::row_held_bytes(&out))?;
                 result.push(out);
             }
 
             if *distinct {
                 // Full dedup — not just consecutive. O(n²) but correct for
-                // all Value types including Float (which lacks Hash).
+                // all Value types including Float (which lacks Hash). The
+                // copies kept to compare against are charged before they are
+                // made.
                 let mut seen: Vec<Row> = Vec::new();
+                let mut refused = None;
                 result.retain(|row| {
-                    if seen.iter().any(|s| s == row) {
-                        false
-                    } else {
-                        seen.push(row.clone());
-                        true
+                    if refused.is_some() || seen.iter().any(|s| s == row) {
+                        return false;
                     }
+                    if let Err(stop) = ctx.budget.work(seen.len() as u64).and_then(|()| {
+                        ctx.budget
+                            .reserve(crate::executor::row::row_held_bytes(row))
+                            .map(coordinode_core::budget::MemoryCharge::keep_until_query_ends)
+                    }) {
+                        refused = Some(stop);
+                        return false;
+                    }
+                    seen.push(row.clone());
+                    true
                 });
+                if let Some(stop) = refused {
+                    return Err(stop.into());
+                }
             }
 
             Ok(result)
@@ -4066,12 +4172,24 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             // of with their keys, so the whole sort allocates a fixed three
             // times regardless of how many rows arrive.
             let width = items.len();
+            // The key buffer and the indexed list are the sort's own memory;
+            // each key's allocations are charged as it is evaluated.
+            let mut scratch = ctx.budget.reserve(
+                (rows.len() * width * core::mem::size_of::<Value>()
+                    + rows.len() * core::mem::size_of::<(usize, Row)>()) as u64,
+            )?;
             let mut keys: Vec<Value> = Vec::with_capacity(rows.len() * width);
             for row in &rows {
+                ctx.budget.work(1)?;
                 for item in items {
-                    keys.push(eval_neutral(&item.expr, row)?);
+                    let key = eval_neutral(&item.expr, row)?;
+                    scratch.grow(key.held_bytes() - core::mem::size_of::<Value>() as u64)?;
+                    keys.push(key);
                 }
             }
+            // Comparisons: about n log n of them.
+            let n = rows.len() as u64;
+            ctx.budget.work(n * u64::from(n.max(1).ilog2() + 1))?;
             let mut indexed: Vec<(usize, Row)> = rows.into_iter().enumerate().collect();
             indexed.sort_by(|(a, _), (b, _)| {
                 for (idx, item) in items.iter().enumerate() {
@@ -4083,14 +4201,21 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 }
                 std::cmp::Ordering::Equal
             });
+            // The sorted list reuses the indexed one's rows; it is held on.
+            ctx.hold((indexed.len() * core::mem::size_of::<Row>()) as u64)?;
+            drop(scratch);
             Ok(indexed.into_iter().map(|(_, row)| row).collect())
         }
 
         LogicalOp::Limit { input, count } => {
             let rows = execute_op(input, ctx)?;
+            ctx.budget.work(1)?;
             let n = eval_neutral(count, &Row::new())?;
             if let Value::Int(limit) = n {
-                Ok(rows.into_iter().take(limit.max(0) as usize).collect())
+                // Truncated in place: the rows kept were charged upstream.
+                let mut rows = rows;
+                rows.truncate(limit.max(0) as usize);
+                Ok(rows)
             } else {
                 Ok(rows)
             }
@@ -4098,9 +4223,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
 
         LogicalOp::Skip { input, count } => {
             let rows = execute_op(input, ctx)?;
+            ctx.budget.work(1)?;
             let n = eval_neutral(count, &Row::new())?;
             if let Value::Int(skip) = n {
-                Ok(rows.into_iter().skip(skip.max(0) as usize).collect())
+                let mut rows = rows;
+                rows.drain(..(skip.max(0) as usize).min(rows.len()));
+                Ok(rows)
             } else {
                 Ok(rows)
             }
@@ -5753,11 +5881,23 @@ fn execute_btree_index_scan(
         return Ok(Vec::new());
     }
 
-    // An index that cannot answer (not built, its entries found wrong, or a
-    // value with no key) leaves the equality to a scan of the label's
-    // records, which applies the query's own comparison at this statement's
-    // snapshot with its own writes.
-    let scan_records = |ctx: &mut ExecutionContext<'_>, lookup_val: Value| {
+    // An index that cannot answer leaves the equality to a scan of the
+    // label's records, which applies the query's own comparison at this
+    // statement's snapshot with its own writes. One that does not serve (not
+    // built, or a value with no key) reads as if there were no index. One
+    // whose entries are not proved complete replaces its answer with the
+    // records only when everything this statement does with them is charged
+    // to its budget; otherwise it is refused before reading.
+    let scan_records = |ctx: &mut ExecutionContext<'_>, why: IndexUnanswered, lookup_val: Value| {
+        if why == IndexUnanswered::Unproved {
+            if let Some(operator) = ctx.unaccounted_operator {
+                return Err(ExecutionError::IndexUnresolved {
+                    label: label.to_string(),
+                    property: property.to_string(),
+                    operator,
+                });
+            }
+        }
         execute_node_scan(
             variable,
             &[label.to_string()],
@@ -5770,8 +5910,9 @@ fn execute_btree_index_scan(
     };
 
     // The entries as this statement sees them: its snapshot, its own writes.
-    let Some(ids) = ctx.index_lookup(index, &lookup_val)? else {
-        return scan_records(ctx, lookup_val);
+    let ids = match ctx.index_lookup(index, &lookup_val)? {
+        Ok(ids) => ids,
+        Err(why) => return scan_records(ctx, why, lookup_val),
     };
 
     // Candidates are read a batch at a time: the records of one batch are
@@ -5820,7 +5961,7 @@ fn execute_btree_index_scan(
                 if ctx.index_entry_disagrees(index, &lookup_val, id, record_opt.as_ref())? {
                     drop(results);
                     drop(kept);
-                    return scan_records(ctx, lookup_val);
+                    return scan_records(ctx, IndexUnanswered::Unproved, lookup_val);
                 }
                 continue;
             }

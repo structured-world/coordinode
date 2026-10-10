@@ -391,6 +391,7 @@ fn make_ctx<'a>(
         budget: std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(
             coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
         )),
+        unaccounted_operator: None,
         txn: Transaction::new(
             engine,
             None,

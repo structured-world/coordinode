@@ -356,6 +356,22 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
                 }
             };
         }
+        DatabaseError::Execution(ExecutionError::IndexUnresolved {
+            label,
+            property,
+            operator,
+        }) => {
+            return status_with_reason(
+                Code::Unavailable,
+                rendered,
+                Reason::IndexUnresolved,
+                [
+                    ("label", label.clone()),
+                    ("property", property.clone()),
+                    ("operator", operator.to_string()),
+                ],
+            );
+        }
         DatabaseError::SessionSetting(refused) => {
             return super::error_details::invalid_field(refused.setting, refused.reason.clone());
         }

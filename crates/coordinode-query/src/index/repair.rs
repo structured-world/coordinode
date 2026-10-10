@@ -205,6 +205,8 @@ fn attempt(
         budget: Arc::new(coordinode_core::budget::QueryBudget::new(
             coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
         )),
+        // Set from the plan when it starts.
+        unaccounted_operator: None,
         txn,
         vector_consistency: plan.vector_consistency,
         vector_overfetch_factor: 1.2,

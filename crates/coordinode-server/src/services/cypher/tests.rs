@@ -2601,6 +2601,30 @@ fn a_spent_budget_maps_to_its_own_class() {
     }
 }
 
+/// An index that cannot answer, where reading the records would run unaccounted
+/// work, is UNAVAILABLE / INDEX_UNRESOLVED naming the index and the operator,
+/// with retry advice: the same statement succeeds once the index is proved.
+#[test]
+fn an_unresolved_index_maps_to_unavailable_with_retry_advice() {
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::IndexUnresolved {
+        label: "U".into(),
+        property: "email".into(),
+        operator: "Aggregate",
+    }));
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "INDEX_UNRESOLVED");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("label"), Some("U"));
+    assert_eq!(meta("property"), Some("email"));
+    assert_eq!(meta("operator"), Some("Aggregate"));
+    assert!(details.retry_info().is_some(), "retryable once proved");
+}
+
 /// A memory limit past the ceiling, or zero, is the caller's error naming the
 /// field; one within it is taken as bytes.
 #[test]
