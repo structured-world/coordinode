@@ -3795,6 +3795,10 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
             first_unaccounted_operator(input)
         }
         LogicalOp::RemoveOp { input, .. } => first_unaccounted_operator(input),
+        LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
+            first_unaccounted_operator(left).or_else(|| first_unaccounted_operator(right))
+        }
+        LogicalOp::Union { inputs, .. } => inputs.iter().find_map(first_unaccounted_operator),
         // A detaching delete reads every edge of the node it removes.
         LogicalOp::Delete {
             input,
@@ -4368,11 +4372,20 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 let mut result = Vec::new();
                 for lr in &left_rows {
                     ctx.correlated_row = Some(lr.clone());
-                    let rr = execute_op(right, ctx)?;
+                    let rr = match execute_op(right, ctx) {
+                        Ok(rr) => rr,
+                        Err(e) => {
+                            ctx.correlated_row = prev_corr;
+                            return Err(e);
+                        }
+                    };
                     for r in rr {
                         let mut merged = lr.clone();
                         merged.extend(r);
-                        result.push(merged);
+                        if let Err(e) = keep_joined(ctx, merged, &mut result) {
+                            ctx.correlated_row = prev_corr;
+                            return Err(e);
+                        }
                     }
                 }
                 ctx.correlated_row = prev_corr;
@@ -4380,12 +4393,22 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             }
 
             let right_rows = execute_op(right, ctx)?;
+            // The product's slots, reserved before the list is made; a count
+            // past the address space asks for more than any limit.
+            ctx.hold(
+                left_rows
+                    .len()
+                    .checked_mul(right_rows.len())
+                    .and_then(|n| n.checked_mul(core::mem::size_of::<Row>()))
+                    .map_or(u64::MAX, |bytes| bytes as u64),
+            )?;
             let mut result = Vec::with_capacity(left_rows.len() * right_rows.len());
+            let slot = core::mem::size_of::<Row>() as u64;
             for lr in &left_rows {
                 for rr in &right_rows {
                     let mut merged = lr.clone();
                     merged.extend(rr.clone());
-                    result.push(merged);
+                    keep_joined_in(ctx, merged, &mut result, slot)?;
                 }
             }
             Ok(result)
@@ -4395,13 +4418,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         // order. Plain UNION (`all == false`) de-duplicates the combined set,
         // preserving first-seen order; UNION ALL keeps every row.
         LogicalOp::Union { inputs, all } => {
+            // The branches' rows were charged as they were made; they move
+            // here, and the de-duplication counts its comparisons.
             let mut result: Vec<Row> = Vec::new();
             for branch in inputs {
                 let rows = execute_op(branch, ctx)?;
+                ctx.hold((rows.len() * core::mem::size_of::<Row>()) as u64)?;
                 if *all {
                     result.extend(rows);
                 } else {
                     for row in rows {
+                        ctx.budget.work(1 + result.len() as u64)?;
                         if !result.contains(&row) {
                             result.push(row);
                         }
@@ -9595,6 +9622,30 @@ fn execute_left_outer_join(
     }
 }
 
+/// Keep one joined row: a unit of work, and its memory reserved for the
+/// plan's later stages before it joins the result.
+fn keep_joined(
+    ctx: &ExecutionContext<'_>,
+    row: Row,
+    results: &mut Vec<Row>,
+) -> Result<(), ExecutionError> {
+    keep_joined_in(ctx, row, results, 0)
+}
+
+/// [`keep_joined`] into a list whose slot for the row, `slot` bytes, was
+/// reserved with the list.
+fn keep_joined_in(
+    ctx: &ExecutionContext<'_>,
+    row: Row,
+    results: &mut Vec<Row>,
+    slot: u64,
+) -> Result<(), ExecutionError> {
+    ctx.budget.work(1)?;
+    ctx.hold(crate::executor::row::row_held_bytes(&row) - slot)?;
+    results.push(row);
+    Ok(())
+}
+
 /// Non-correlated path: execute right side once, join by shared variables.
 fn execute_left_outer_join_global(
     left_rows: &[Row],
@@ -9607,6 +9658,8 @@ fn execute_left_outer_join_global(
 
     for left_row in left_rows {
         let mut matched = false;
+        // Every right row is compared with this left row.
+        ctx.budget.work(right_rows.len() as u64)?;
         for rr in &right_rows {
             let shared_match = rr.iter().all(|(key, rval)| match left_row.get(key) {
                 Some(lval) => lval == rval,
@@ -9616,7 +9669,7 @@ fn execute_left_outer_join_global(
             if shared_match {
                 let mut merged = left_row.clone();
                 merged.extend(rr.clone());
-                results.push(merged);
+                keep_joined(ctx, merged, &mut results)?;
                 matched = true;
             }
         }
@@ -9626,7 +9679,7 @@ fn execute_left_outer_join_global(
             for var in right_vars {
                 out.entry(var.clone()).or_insert(Value::Null);
             }
-            results.push(out);
+            keep_joined(ctx, out, &mut results)?;
         }
     }
 
@@ -9641,6 +9694,20 @@ fn execute_left_outer_join_correlated(
     ctx: &mut ExecutionContext<'_>,
 ) -> Result<Vec<Row>, ExecutionError> {
     let prev_correlated = ctx.correlated_row.take();
+    let joined = join_correlated(left_rows, right_op, right_vars, ctx);
+    // The outer scope comes back whether the join finished or was refused.
+    ctx.correlated_row = prev_correlated;
+    joined
+}
+
+/// The rows of [`execute_left_outer_join_correlated`], each left row's right
+/// side run with it as the correlated row.
+fn join_correlated(
+    left_rows: &[Row],
+    right_op: &LogicalOp,
+    right_vars: &[String],
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
 
     for left_row in left_rows {
@@ -9649,6 +9716,7 @@ fn execute_left_outer_join_correlated(
         let right_rows = execute_op(right_op, ctx)?;
 
         let mut matched = false;
+        ctx.budget.work(right_rows.len() as u64)?;
         for rr in &right_rows {
             let shared_match = rr.iter().all(|(key, rval)| match left_row.get(key) {
                 Some(lval) => lval == rval,
@@ -9658,7 +9726,7 @@ fn execute_left_outer_join_correlated(
             if shared_match {
                 let mut merged = left_row.clone();
                 merged.extend(rr.clone());
-                results.push(merged);
+                keep_joined(ctx, merged, &mut results)?;
                 matched = true;
             }
         }
@@ -9668,11 +9736,10 @@ fn execute_left_outer_join_correlated(
             for var in right_vars {
                 out.entry(var.clone()).or_insert(Value::Null);
             }
-            results.push(out);
+            keep_joined(ctx, out, &mut results)?;
         }
     }
 
-    ctx.correlated_row = prev_correlated;
     Ok(results)
 }
 

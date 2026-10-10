@@ -807,11 +807,11 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
 }
 
 /// A lookup the index cannot answer is refused before reading the records
-/// when the rest of the statement runs an operator outside its budget (an
-/// optional match here): it names the index and the operator, and never
-/// answers with partial or empty rows. The same statement over a sound index
-/// answers; a traversal and an aggregate, which are accounted, answer from
-/// the records exactly as the sound index did.
+/// when the rest of the statement runs an operator outside its budget (a
+/// detaching delete, which reads every edge of the node): it names the
+/// index and the operator, and changes nothing. Accounted operators over
+/// the same lookup (a traversal, an optional match, an aggregate) answer
+/// from the records exactly as the sound index did.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -825,30 +825,32 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     let optional = "MATCH (u:U {email: 'a@x'}) OPTIONAL MATCH (u)-[:R]->(t:T) RETURN t.n AS n";
     let traverse = "MATCH (u:U {email: 'a@x'})-[:R]->(t:T) RETURN t.n AS n";
     let count = "MATCH (u:U {email: 'a@x'}) RETURN count(u) AS n";
-    let sound = db.execute_cypher(optional).expect("a sound index answers");
-    assert_eq!(sound[0].get("n"), Some(&Value::Int(1)));
 
     let wrong = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", wrong);
-    let refused = db.execute_cypher(optional);
+    let refused = db.execute_cypher("MATCH (u:U {email: 'a@x'}) DETACH DELETE u");
     assert!(
         matches!(
             &refused,
             Err(DatabaseError::Execution(ExecutionError::IndexUnresolved {
                 label,
                 property,
-                operator: "LeftOuterJoin",
+                operator: "Delete",
             })) if label == "U" && property == "email"
         ),
         "{refused:?}"
     );
-    let traversed = db
-        .execute_cypher(traverse)
-        .expect("a traversal is accounted");
-    assert_eq!(traversed.len(), 1);
-    assert_eq!(traversed[0].get("n"), Some(&Value::Int(1)));
+    for query in [optional, traverse] {
+        let rows = db.execute_cypher(query).expect("accounted");
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows[0].get("n"), Some(&Value::Int(1)), "{query}");
+    }
     let counted = db.execute_cypher(count).expect("an aggregate is accounted");
-    assert_eq!(counted[0].get("n"), Some(&Value::Int(1)));
+    assert_eq!(
+        counted[0].get("n"),
+        Some(&Value::Int(1)),
+        "nothing was deleted"
+    );
 }
 
 /// Records and catalog rows last written before the retention horizon are
