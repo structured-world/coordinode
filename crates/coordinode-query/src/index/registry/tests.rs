@@ -350,6 +350,57 @@ fn a_removal_whose_flush_failed_leaves_the_mark_of_unknown_durability() {
     );
     reg.store_pending_marks(&engine)
         .expect("a failed mark is not pending");
+    // A later check verifying the copy does not touch the disk either: the
+    // mark's stored state stays unknown, so the copy stays unfit here.
+    let now = reg.local_revision(index.generation);
+    assert!(
+        !reg.verified_here(&engine, index.generation, now)
+            .expect("refused without touching the disk"),
+        "a failed mark is not lifted"
+    );
+    assert!(reg.is_suspect(index.generation));
+}
+
+/// The same holds when the flush itself is refused at its sync, not at
+/// opening its file: a finding whose mark's sync failed fails, and a removal
+/// whose sync failed leaves the mark failed, with no further I/O for it.
+/// A memtable flush syncs its table with `sync_all`, so that is the sync
+/// failed here.
+#[test]
+fn a_failed_sync_leaves_the_mark_of_unknown_durability() {
+    use coordinode_test_fixtures::FaultOp;
+    for op in [FaultOp::SyncAll] {
+        let rig = coordinode_test_fixtures::PowerRig::new();
+        let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+        let reg = IndexRegistry::new();
+        let written = btree("user_email", "email", 1);
+        let removed = btree("user_name", "name", 2);
+        report(&reg, &engine, &removed, 7);
+        let started = reg.local_revision(removed.generation);
+
+        rig.fail_from(op, 0);
+        let found = reg.report_mismatch(&engine, &written, stray(8));
+        assert!(found.is_err(), "{op:?}: the mark's sync failed: {found:?}");
+        assert!(
+            reg.verified_here(&engine, removed.generation, started)
+                .is_err(),
+            "{op:?}: the removal's sync failed"
+        );
+        for (index, node) in [(&written, 9), (&removed, 10)] {
+            let again = reg.report_mismatch(&engine, index, stray(node));
+            assert!(
+                matches!(
+                    &again,
+                    Err(MarkNotDurable {
+                        source: StoreError::Storage(StorageError::Io(why)),
+                        ..
+                    }) if why.contains("earlier write")
+                ),
+                "{op:?}: refused without touching the disk: {again:?}"
+            );
+            assert!(reg.is_suspect(index.generation));
+        }
+    }
 }
 
 /// A disk below its free-space reserve is not written to: the finding goes

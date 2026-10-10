@@ -591,10 +591,12 @@ impl IndexRegistry {
         let _order = self.marks.lock();
         {
             let view = self.integrity.lock();
+            // A failed mark's stored state is unknown: nothing about this copy
+            // is proved by touching the disk again, so it stays unfit here.
             if view
                 .local
                 .get(&generation)
-                .is_some_and(|m| m.revision != revision)
+                .is_some_and(|m| m.revision != revision || m.state == MarkState::Failed)
             {
                 return Ok(false);
             }
