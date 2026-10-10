@@ -374,6 +374,20 @@ DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
   be refused as unresolved for that while.
   A transaction that wrote to the label before a partial unique index existed
   is refused at its commit and retried under the new index.
+- **An entry found wrong.** A lookup checks every node its index names
+  against that node's record. An entry naming a node that does not hold the
+  value shows the index wrong: the lookup answers from the records of the
+  label instead, exactly as the index should have, and a check of the index
+  starts in the background and repairs it. The answer from the records runs
+  within the statement's memory limit, deadline and cancellation like every
+  other read, so it is the exact answer or one of those stops, never a
+  partial result. Every operator a statement can place over a lookup counts
+  its work and memory; one that cannot (an extension operator) is refused
+  before the records are read, with gRPC `UNAVAILABLE`, reason
+  `INDEX_UNRESOLVED` (metadata `label`, `property`, `operator`) and retry
+  advice: the same statement succeeds once the check has repaired the index.
+  A write to the node the repair is fixing, committing while the repair does,
+  is refused as a write conflict and succeeds when retried.
 - **Build failure and cancellation.** `CREATE UNIQUE INDEX` over data that
   already has a duplicate fails and leaves no index. A build of a new index
   that fails or is cancelled withdraws the index (and the constraint owning
@@ -1068,7 +1082,13 @@ at once; it starts at the server's `query_memory_limit_mb` (256). A value of
 `0`, past the 4096 MiB ceiling, or not a whole number is refused with
 `INVALID_ARGUMENT` naming the setting, and the limit stays as it was. A
 statement that needs more fails with `RESOURCE_EXHAUSTED`, reason
-`EXCEEDS_MEMORY_BUDGET`, and returns no rows.
+`EXCEEDS_MEMORY_BUDGET`, and returns no rows. The limit covers everything the
+statement holds: its operators' rows, the subqueries it runs per row (each
+holding its rows only while it runs), index searches (vector, full-text,
+encrypted) and the writes it stages. A statement also stops at the deadline
+of its call, with `DEADLINE_EXCEEDED`, reason `QUERY_DEADLINE_EXCEEDED`, and
+when cancelled, with `CANCELLED`, reason `QUERY_CANCELLED`; the deadline and
+cancellation are checked as its work proceeds, inside index searches too.
 
 ### `read_consistency`
 
