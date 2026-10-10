@@ -1,5 +1,50 @@
 use super::*;
 
+/// An auto-commit statement refused at commit because another commit in
+/// flight holds its node (here one conditioned on the node, as a background
+/// index repair is) applied nothing, and runs again once that commit lands:
+/// the caller sees it succeed, not a conflict it never caused.
+#[test]
+fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
+    use coordinode_core::graph::node::{NodeId, encode_node_key};
+    use coordinode_core::graph::types::Value;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    db.execute_cypher("CREATE (:U {name: 'a', n: 1})")
+        .expect("create");
+    let id = match db
+        .execute_cypher("MATCH (u:U) RETURN id(u) AS id")
+        .expect("id")[0]
+        .get("id")
+    {
+        Some(Value::Int(id)) => u64::try_from(*id).expect("id"),
+        other => panic!("expected an id, got {other:?}"),
+    };
+    let node = encode_node_key(db.shard_id, NodeId::from_raw(id));
+
+    let (held, release) = std::sync::mpsc::channel::<()>();
+    let pending = Arc::clone(db.engine().pending_commits());
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(move || {
+            let (_ts, admission) = pending
+                .admit_allocated(|| u64::MAX - 1, Vec::new(), vec![(Partition::Node, node)])
+                .expect("admit the holder");
+            held.send(()).expect("signal");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(admission);
+        });
+        release.recv().expect("held");
+        db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = 2")
+            .expect("the statement lands once the holder has");
+        holder.join().expect("holder");
+    });
+    let rows = db
+        .execute_cypher("MATCH (u:U) RETURN u.n AS n")
+        .expect("read");
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(2)));
+}
+
 /// The per-label counts agree with counting the nodes, follow creates,
 /// deletes and label changes, and leave out a label with no nodes left.
 #[test]
