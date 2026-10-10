@@ -237,18 +237,21 @@ impl Installations {
     }
 
     /// Write `entries`, versions of `generation`'s history, into its
-    /// replacement at their own seqnos. Returns how many were written.
+    /// replacement at their own seqnos, asking `admit` before the first entry
+    /// and every `stride` entries after. Returns how many were written.
     ///
     /// # Errors
     ///
     /// [`StorageError::InstallationCatalog`] when the generation has no
     /// replacement in preparation, or an entry's key lies outside the
-    /// generation.
+    /// generation; what `admit` refuses with, the entries before it written.
     pub(crate) fn import(
         &self,
         tree: &AnyTree,
         generation: u64,
         entries: &[HistoryEntry],
+        stride: usize,
+        admit: impl Fn() -> StorageResult<()>,
     ) -> StorageResult<usize> {
         let installation = self.current().staging(generation).ok_or_else(|| {
             StorageError::InstallationCatalog(format!(
@@ -263,7 +266,10 @@ impl Installations {
             ))
         };
         let mut buf = Vec::new();
-        for entry in entries {
+        for (i, entry) in entries.iter().enumerate() {
+            if i % stride.max(1) == 0 {
+                admit()?;
+            }
             match entry {
                 HistoryEntry::Put { key, value, seqno } => {
                     if !within(key) {

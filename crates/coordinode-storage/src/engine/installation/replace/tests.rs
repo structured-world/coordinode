@@ -519,6 +519,44 @@ fn a_snapshot_installed_during_preparation_drops_the_replacement() {
     assert_eq!(get(&engine, &entry(b"s")), Some(b"s1".to_vec()));
 }
 
+/// Preparing a replacement writes a second copy of the generation, so it is
+/// admitted like any write: below the free-space reserve neither the
+/// registration nor an import goes ahead, the published copy keeps serving,
+/// and both go through once there is room again.
+#[test]
+fn a_replacement_is_not_prepared_below_the_free_space_reserve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    engine
+        .put(Partition::Idx, &entry(b"a"), b"a1")
+        .expect("put");
+    let space = engine.space();
+    let (min, resume) = (space.min_free_bytes(), space.resume_free_bytes());
+
+    space.set_reserve(u64::MAX, u64::MAX);
+    assert!(matches!(
+        engine.stage_generation(GENERATION),
+        Err(StorageError::OutOfSpace { .. })
+    ));
+    space.set_reserve(min, resume);
+    engine.stage_generation(GENERATION).expect("stage");
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+
+    space.set_reserve(u64::MAX, u64::MAX);
+    assert!(matches!(
+        engine.import_generation_history(GENERATION, &history.entries),
+        Err(StorageError::OutOfSpace { .. })
+    ));
+    assert_eq!(get(&engine, &entry(b"a")), Some(b"a1".to_vec()));
+
+    space.set_reserve(min, resume);
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+}
+
 /// Fill a registered replacement of `GENERATION` from its own history and
 /// publish it.
 fn replace_after_stage(engine: &StorageEngine) {

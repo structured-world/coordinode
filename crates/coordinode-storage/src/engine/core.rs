@@ -250,6 +250,12 @@ pub struct StorageEngine {
     space: Arc<crate::engine::space::SpaceGuard>,
 }
 
+/// History entries a replacement import writes between two admissions
+/// ([`StorageEngine::import_generation_history`]): admission is an atomic load
+/// almost always, so this bounds how far an import runs past a refusal, not
+/// what it costs.
+pub const IMPORT_ADMISSION_STRIDE: usize = 1024;
+
 /// An inclusive `[min, max]` user-key range, as reported by a lossy open
 /// repair ([`OpenRepair::scoped_ranges`]) and consumed by the range-scoped
 /// rebuild ([`StorageEngine::repair_partition_ranges_from_checkpoint`]).
@@ -1455,6 +1461,7 @@ impl StorageEngine {
         &self,
         generation: coordinode_core::index::identity::GenerationId,
     ) -> StorageResult<()> {
+        self.admit_replacement_write()?;
         self.installations.stage(
             self.tree(Partition::Idx)?,
             self.coverage_domain(),
@@ -1494,20 +1501,40 @@ impl StorageEngine {
     /// already holds is written again unchanged. Returns how many were
     /// written.
     ///
+    /// The writes are admitted like any other, every [`IMPORT_ADMISSION_STRIDE`]
+    /// entries: refused below the free-space reserve or at the endpoint's
+    /// hard limit, which the reserve exists to keep for reclaiming space,
+    /// not for building copies. A refused import has written a prefix of
+    /// `entries`; running it again, or the whole history, is safe, since a
+    /// version written twice is unchanged.
+    ///
     /// # Errors
     ///
     /// [`StorageError::InstallationCatalog`] when the generation has no
-    /// replacement in preparation or an entry lies outside it.
+    /// replacement in preparation or an entry lies outside it;
+    /// [`StorageError::OutOfSpace`] or [`StorageError::CapacityExhausted`]
+    /// when the write is not admitted.
     pub fn import_generation_history(
         &self,
         generation: coordinode_core::index::identity::GenerationId,
         entries: &[crate::engine::installation::HistoryEntry],
     ) -> StorageResult<usize> {
-        let written =
-            self.installations
-                .import(self.tree(Partition::Idx)?, generation.as_raw(), entries)?;
+        let written = self.installations.import(
+            self.tree(Partition::Idx)?,
+            generation.as_raw(),
+            entries,
+            IMPORT_ADMISSION_STRIDE,
+            || self.admit_replacement_write(),
+        );
         self.coordinator.flush_trigger().wrote_unmeasured();
-        Ok(written)
+        written
+    }
+
+    /// Admit a write that prepares a replacement copy of an index generation,
+    /// as a client write to the index partition is admitted.
+    fn admit_replacement_write(&self) -> StorageResult<()> {
+        self.space.admit()?;
+        self.check_partition_capacity(Partition::Idx)
     }
 
     /// Record that `generation`'s replacement holds its complete imported
