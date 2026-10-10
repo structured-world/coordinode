@@ -1,4 +1,5 @@
 use super::*;
+use coordinode_core::budget::Unmetered;
 
 fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
@@ -491,7 +492,7 @@ fn scores(
     pending: &PendingDocuments,
 ) -> Vec<(u64, f32)> {
     let mut hits: Vec<(u64, f32)> = idx
-        .find(terms(query), Matches::All, pending)
+        .find(terms(query), Matches::All, pending, &mut Unmetered)
         .unwrap()
         .into_iter()
         .map(|hit| (hit.node_id, hit.score))
@@ -709,7 +710,12 @@ fn a_malformed_query_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let idx = fresh(dir.path(), &[(1, "raft consensus")]);
     assert!(matches!(
-        idx.find(terms("(raft"), Matches::All, &PendingDocuments::none()),
+        idx.find(
+            terms("(raft"),
+            Matches::All,
+            &PendingDocuments::none(),
+            &mut Unmetered
+        ),
         Err(TextSearchError::QuerySyntax(_))
     ));
 }
@@ -760,7 +766,7 @@ fn terms(query: &str) -> TextRequest<'_> {
 
 fn found(idx: &MultiLanguageTextIndex, query: &str, pending: &PendingDocuments) -> Vec<u64> {
     let mut ids: Vec<u64> = idx
-        .find(terms(query), Matches::All, pending)
+        .find(terms(query), Matches::All, pending, &mut Unmetered)
         .unwrap()
         .into_iter()
         .map(|hit| hit.node_id)
@@ -839,13 +845,51 @@ fn pending_documents_score_on_the_index_scale() {
     let pending = idx
         .pending(Some(&[9]), &[(9, props(&[("body", "rust graph engine")]))])
         .unwrap();
-    let hits = idx.find(terms("rust"), Matches::All, &pending).unwrap();
+    let hits = idx
+        .find(terms("rust"), Matches::All, &pending, &mut Unmetered)
+        .unwrap();
 
     assert_eq!(hits.len(), 2);
     assert!(
         (hits[0].score - hits[1].score).abs() < 1e-6,
         "identical text scores alike in the index and the pending segment: {hits:?}"
     );
+}
+
+/// A search for every match reports each document it scores, so a
+/// cancelled query stops inside the segment rather than after scoring it
+/// whole, and a search under no stop answers every match.
+#[test]
+fn a_search_for_every_match_stops_with_its_budget() {
+    use coordinode_core::budget::{BatchedWork, BudgetStop, QueryBudget};
+    let dir = tempfile::tempdir().unwrap();
+    let config = MultiLangConfig::with_default_language("english");
+    let mut idx = MultiLanguageTextIndex::open_or_create(dir.path(), 15_000_000, config).unwrap();
+    let docs: Vec<_> = (1..=2_000u64)
+        .map(|i| (i, props(&[("body", "graph engine")])))
+        .collect();
+    idx.add_nodes_batch(&docs).unwrap();
+
+    let budget = QueryBudget::new(64 << 20);
+    budget.cancel();
+    let mut batch = BatchedWork::new(&budget);
+    let stopped = idx.find(
+        terms("graph"),
+        Matches::All,
+        &PendingDocuments::none(),
+        &mut batch,
+    );
+    assert!(
+        matches!(stopped, Err(TextSearchError::Budget(BudgetStop::Cancelled))),
+        "{stopped:?}"
+    );
+    assert!(
+        budget.work_done() < 2_000,
+        "stopped inside the segment: {} documents",
+        budget.work_done()
+    );
+
+    assert_eq!(found(&idx, "graph", &PendingDocuments::none()).len(), 2_000);
 }
 
 /// `Matches::Top` keeps the best `n` of the merged list; `Matches::All`
@@ -864,7 +908,9 @@ fn matches_bound_the_merged_list() {
         .pending(Some(&[3]), &[(3, props(&[("body", "graph graph")]))])
         .unwrap();
 
-    let top = idx.find(terms("graph"), Matches::Top(2), &pending).unwrap();
+    let top = idx
+        .find(terms("graph"), Matches::Top(2), &pending, &mut Unmetered)
+        .unwrap();
     assert_eq!(top.len(), 2);
     assert!(top[0].score >= top[1].score, "best first: {top:?}");
     assert_eq!(found(&idx, "graph", &pending), [1, 2, 3]);
@@ -889,6 +935,7 @@ fn pending_documents_carry_snippets() {
             },
             Matches::Top(10),
             &pending,
+            &mut Unmetered,
         )
         .unwrap();
     assert_eq!(hits.len(), 1);

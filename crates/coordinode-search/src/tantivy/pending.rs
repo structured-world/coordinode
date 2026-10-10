@@ -6,14 +6,17 @@
 //! segment of their current documents, scored with the index's corpus
 //! statistics so the two result sets rank on one scale.
 
-use tantivy::collector::{Collector, SegmentCollector, TopDocs};
-use tantivy::query::{Bm25StatisticsProvider, BooleanQuery, Occur, Query, TermSetQuery};
+use coordinode_core::budget::Meter;
+use tantivy::collector::TopDocs;
+use tantivy::query::{
+    Bm25StatisticsProvider, BooleanQuery, EnableScoring, Occur, Query, TermSetQuery,
+};
 use tantivy::schema::Field;
 use tantivy::schema::document::Value as _;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{
-    DocAddress, DocId, Index, ReloadPolicy, Score, Searcher, SegmentOrdinal, SegmentReader,
-    SingleSegmentIndexWriter, TantivyDocument, Term,
+    DocAddress, DocId, DocSet as _, Index, ReloadPolicy, Score, Searcher, SegmentOrdinal,
+    SingleSegmentIndexWriter, TERMINATED, TantivyDocument, Term,
 };
 
 use super::corpus::{Corpus, CorpusChange};
@@ -131,14 +134,19 @@ impl TextIndex {
     }
 
     /// Run `query` over the index and `pending`, best score first (ties by
-    /// node id), with snippets highlighting what `highlight` says.
-    pub(crate) fn collect(
+    /// node id), with snippets highlighting what `highlight` says, reporting
+    /// the documents it reads and scores to `meter`, which can stop it.
+    pub(crate) fn collect<M: Meter>(
         &self,
         query: &dyn Query,
         matches: Matches,
         pending: &PendingDocuments,
         highlight: Highlight<'_>,
-    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        meter: &mut M,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError>
+    where
+        TextSearchError: From<M::Stop>,
+    {
         let searcher = self.reader.searcher();
         // One corpus for both sides, so their scores rank on one scale and a
         // term only the pending documents hold still scores there: the
@@ -147,6 +155,7 @@ impl TextIndex {
         let mut removed = Corpus::default();
         if let (Some(_), Superseded::Nodes(nodes)) = (&self.corpus, &pending.superseded) {
             for node_id in nodes {
+                meter.work(1)?;
                 if let Some(Some(tokens)) = self.live_tokens(&searcher, *node_id)? {
                     removed.add(&tokens);
                 }
@@ -165,7 +174,9 @@ impl TextIndex {
             removed: &removed,
         };
         let mut hits = match &pending.superseded {
-            Superseded::None => self.hits(&searcher, query, matches, &statistics, highlight)?,
+            Superseded::None => {
+                self.hits(&searcher, query, matches, &statistics, highlight, meter)?
+            }
             Superseded::Nodes(nodes) => {
                 let terms = nodes
                     .iter()
@@ -174,12 +185,12 @@ impl TextIndex {
                     (Occur::Must, query.box_clone()),
                     (Occur::MustNot, Box::new(TermSetQuery::new(terms))),
                 ]);
-                self.hits(&searcher, &current, matches, &statistics, highlight)?
+                self.hits(&searcher, &current, matches, &statistics, highlight, meter)?
             }
             Superseded::All => Vec::new(),
         };
         if let Some(segment) = &pending.segment {
-            hits.extend(self.hits(segment, query, matches, &statistics, highlight)?);
+            hits.extend(self.hits(segment, query, matches, &statistics, highlight, meter)?);
             hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node_id.cmp(&b.node_id)));
             if let Matches::Top(n) = matches {
                 hits.truncate(n);
@@ -188,47 +199,70 @@ impl TextIndex {
         Ok(hits)
     }
 
-    /// The matches of `query` in `searcher`, scored with `statistics`.
-    fn hits(
+    /// The matches of `query` in `searcher`, scored with `statistics`, each
+    /// document read and scored reported to `meter`.
+    fn hits<M: Meter>(
         &self,
         searcher: &Searcher,
         query: &dyn Query,
         matches: Matches,
         statistics: &CorpusStatistics<'_>,
         highlight: Highlight<'_>,
-    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        meter: &mut M,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError>
+    where
+        TextSearchError: From<M::Stop>,
+    {
         let found = match matches {
             Matches::Top(0) => return Ok(Vec::new()),
+            // Bounded by `n`, and block-max pruned inside the library.
             Matches::Top(n) => searcher.search_with_statistics_provider(
                 query,
                 &TopDocs::with_limit(n).order_by_score(),
                 statistics,
             )?,
-            Matches::All => {
-                searcher.search_with_statistics_provider(query, &AllMatches, statistics)?
-            }
+            Matches::All => all_matches(searcher, query, statistics, meter)?,
         };
+        // A document is read for its node id; it is kept only for the
+        // snippet, whose generation reads it again.
+        let keep_documents = highlight != Highlight::Off;
+        meter.scratch(
+            (found.len() * core::mem::size_of::<(Score, u64, Option<TantivyDocument>)>()) as u64,
+        )?;
         let mut docs = Vec::with_capacity(found.len());
         for (score, address) in found {
+            meter.work(1)?;
             let doc: TantivyDocument = searcher.doc(address)?;
             if let Some(node_id) = doc.get_first(self.node_id_field).and_then(|v| v.as_u64()) {
-                docs.push((score, node_id, doc));
+                if keep_documents {
+                    meter.scratch(document_bytes(&doc))?;
+                    docs.push((score, node_id, Some(doc)));
+                } else {
+                    docs.push((score, node_id, None));
+                }
             }
         }
         let snippet_gen = match highlight {
             Highlight::Off => None,
             Highlight::Query => Some(SnippetGenerator::create(searcher, query, self.body_field)?),
             Highlight::NearWords(text) => {
-                let near = self.near_words(searcher, text, docs.iter().map(|(_, _, doc)| doc));
+                let near = self.near_words(
+                    searcher,
+                    text,
+                    docs.iter().filter_map(|(_, _, doc)| doc.as_ref()),
+                );
                 Some(SnippetGenerator::create(searcher, &near, self.body_field)?)
             }
         };
         let mut hits = Vec::with_capacity(docs.len());
         for (score, node_id, doc) in docs {
-            let snippet_html = snippet_gen
-                .as_ref()
-                .map(|g| g.snippet_from_doc(&doc).to_html())
-                .unwrap_or_default();
+            let snippet_html = match (&snippet_gen, &doc) {
+                (Some(generator), Some(doc)) => {
+                    meter.work(1)?;
+                    generator.snippet_from_doc(doc).to_html()
+                }
+                _ => String::new(),
+            };
             hits.push(HighlightedResult {
                 node_id,
                 score,
@@ -389,51 +423,67 @@ impl Bm25StatisticsProvider for CorpusStatistics<'_> {
     }
 }
 
-/// Every match with its score, best first.
-struct AllMatches;
+/// Every match of `query` in `searcher` with its score, best first (ties in
+/// segment and document order), scored with `statistics`.
+///
+/// The segments' scorers are walked here rather than through a collector,
+/// whose callback cannot stop the walk: every document the scorer visits is
+/// reported to `meter`, so a query's deadline or cancellation stops it
+/// inside a segment, and the list of matches is charged as it grows.
+fn all_matches<M: Meter>(
+    searcher: &Searcher,
+    query: &dyn Query,
+    statistics: &dyn Bm25StatisticsProvider,
+    meter: &mut M,
+) -> Result<Vec<(Score, DocAddress)>, TextSearchError>
+where
+    TextSearchError: From<M::Stop>,
+{
+    let weight = query.weight(EnableScoring::enabled_from_statistics_provider(
+        statistics, searcher,
+    ))?;
+    let mut found: Vec<(Score, DocAddress)> = Vec::new();
+    for (ordinal, reader) in searcher.segment_readers().iter().enumerate() {
+        // A scorer over a term range or an automaton (prefix, fuzzy) holds a
+        // bitset of the whole segment while it runs.
+        meter.scratch(u64::from(reader.max_doc()).div_ceil(8))?;
+        let segment = SegmentOrdinal::try_from(ordinal).map_err(|_| {
+            TextSearchError::IndexCorrupted(format!("segment ordinal {ordinal} out of range"))
+        })?;
+        let alive = reader.alive_bitset();
+        let mut scorer = weight.scorer(reader, 1.0)?;
+        let mut doc: DocId = scorer.doc();
+        while doc != TERMINATED {
+            meter.work(1)?;
+            if alive.is_none_or(|alive| alive.is_alive(doc)) {
+                if found.len() == found.capacity() {
+                    // The list doubles; the growth is charged before it is
+                    // made.
+                    let more = found.capacity().max(64);
+                    meter.scratch((more * core::mem::size_of::<(Score, DocAddress)>()) as u64)?;
+                    found.reserve_exact(more);
+                }
+                found.push((scorer.score(), DocAddress::new(segment, doc)));
+            }
+            doc = scorer.advance();
+        }
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(found)
+}
 
-impl Collector for AllMatches {
-    type Fruit = Vec<(Score, DocAddress)>;
-    type Child = AllMatchesInSegment;
-
-    fn for_segment(
-        &self,
-        segment: SegmentOrdinal,
-        _reader: &SegmentReader,
-    ) -> tantivy::Result<Self::Child> {
-        Ok(AllMatchesInSegment {
-            segment,
-            found: Vec::new(),
+/// What a stored document holds, for the scratch a search keeps it in.
+fn document_bytes(doc: &TantivyDocument) -> u64 {
+    use tantivy::schema::OwnedValue;
+    doc.field_values()
+        .map(|(_, value)| {
+            let owned: OwnedValue = value.into();
+            let payload = match &owned {
+                OwnedValue::Str(text) => text.len(),
+                OwnedValue::Bytes(bytes) => bytes.len(),
+                _ => 0,
+            };
+            (core::mem::size_of::<OwnedValue>() + payload) as u64
         })
-    }
-
-    fn requires_scoring(&self) -> bool {
-        true
-    }
-
-    fn merge_fruits(
-        &self,
-        segments: Vec<Vec<(Score, DocAddress)>>,
-    ) -> tantivy::Result<Self::Fruit> {
-        let mut all: Vec<(Score, DocAddress)> = segments.into_iter().flatten().collect();
-        all.sort_by(|a, b| b.0.total_cmp(&a.0));
-        Ok(all)
-    }
-}
-
-struct AllMatchesInSegment {
-    segment: SegmentOrdinal,
-    found: Vec<(Score, DocAddress)>,
-}
-
-impl SegmentCollector for AllMatchesInSegment {
-    type Fruit = Vec<(Score, DocAddress)>;
-
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.found.push((score, DocAddress::new(self.segment, doc)));
-    }
-
-    fn harvest(self) -> Self::Fruit {
-        self.found
-    }
+        .sum()
 }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use coordinode_core::budget::{BudgetStop, Meter};
 use coordinode_core::graph::intern::FieldInterner;
 use coordinode_core::graph::node::{NodeId, NodeRecord, decode_node_key, decode_temporal_node_key};
 use coordinode_modality::{LocalNodeStore, NodeStore as _};
@@ -18,7 +19,7 @@ use coordinode_search::tantivy::multi_lang::{
 };
 use coordinode_search::tantivy::pending::Matches;
 use coordinode_search::tantivy::validity::Validity;
-use coordinode_search::tantivy::{HighlightedResult, TextSearchResult};
+use coordinode_search::tantivy::{HighlightedResult, TextSearchError, TextSearchResult};
 use coordinode_storage::engine::transaction::Transaction;
 
 use super::coverage::{IndexCoverage, IndexDelta};
@@ -27,6 +28,26 @@ use crate::executor::temporal_read::{TimelineFields, state_span};
 
 /// Key for text index lookup: (label, property).
 type TextIndexKey = (String, String);
+
+/// Why a search of a text index ([`TextIndexRegistry::find`]) did not answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindError {
+    /// The query's budget stopped it.
+    Budget(BudgetStop),
+    /// The nodes could not be read or the query not run, as described.
+    Failed(String),
+}
+
+impl core::fmt::Display for FindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Budget(stop) => stop.fmt(f),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for FindError {}
 
 /// Thread-safe handle to a multi-language text index.
 pub type TextHandle = Arc<RwLock<MultiLanguageTextIndex>>;
@@ -295,13 +316,15 @@ impl TextIndexRegistry {
     ///
     /// The index stays read-locked from choosing those nodes to the end of
     /// the search, so the documents and statistics it answers with are the
-    /// ones the choice was made against.
+    /// ones the choice was made against. The nodes read and the documents
+    /// scored are reported to `meter`, which can stop the search.
     ///
     /// # Errors
     ///
-    /// The nodes could not be read, or the query not run.
+    /// [`FindError::Budget`] when `meter` stopped it, [`FindError::Failed`]
+    /// when the nodes could not be read or the query not run.
     #[allow(clippy::too_many_arguments)]
-    pub fn find(
+    pub fn find<M: Meter>(
         &self,
         label: &str,
         property: &str,
@@ -312,11 +335,21 @@ impl TextIndexRegistry {
         at: i64,
         request: TextRequest<'_>,
         matches: Matches,
-    ) -> Result<Option<Vec<HighlightedResult>>, String> {
+        meter: &mut M,
+    ) -> Result<Option<Vec<HighlightedResult>>, FindError>
+    where
+        TextSearchError: From<M::Stop>,
+    {
         let Some(handle) = self.get(label, property) else {
             return Ok(None);
         };
-        let failed = |e: &dyn std::fmt::Display| format!("text index :{label}({property}): {e}");
+        let failed = |e: &dyn std::fmt::Display| {
+            FindError::Failed(format!("text index :{label}({property}): {e}"))
+        };
+        let searched = |e: TextSearchError| match e {
+            TextSearchError::Budget(stop) => FindError::Budget(stop),
+            other => failed(&other),
+        };
         let index = handle.read().map_err(|_| failed(&"lock poisoned"))?;
         let delta = match self.coverage() {
             Some(coverage) => coverage.delta(shard_id),
@@ -331,31 +364,49 @@ impl TextIndexRegistry {
             IndexDelta::Nodes(nodes) => {
                 let mut ids: Vec<NodeId> = nodes.iter().copied().collect();
                 ids.sort_unstable();
-                for (id, rows) in read_nodes(read, shard_id, &ids)? {
+                meter
+                    .work(ids.len() as u64)
+                    .map_err(|stop| searched(stop.into()))?;
+                for (id, rows) in read_nodes(read, shard_id, &ids).map_err(|e| failed(&e))? {
                     if let Some(text) = source.at(id, &rows, at).text {
+                        meter
+                            .scratch(text.len() as u64)
+                            .map_err(|stop| searched(stop.into()))?;
                         texts.push((id, text));
                     }
                 }
                 Some(ids.iter().map(|id| id.as_raw()).collect::<Vec<u64>>())
             }
             IndexDelta::Unknown => {
+                // Every node of the shard is read; a stop ends the walk and
+                // is reported below.
+                let mut stopped = None;
                 for_each_node_read(read, shard_id, &mut |id, rows| {
+                    if let Err(stop) = meter.work(1) {
+                        stopped = Some(searched(stop.into()));
+                        return Err("stopped by the query budget".to_string());
+                    }
                     if let Some(text) = source.at(id, &rows, at).text {
+                        if let Err(stop) = meter.scratch(text.len() as u64) {
+                            stopped = Some(searched(stop.into()));
+                            return Err("stopped by the query budget".to_string());
+                        }
                         texts.push((id, text));
                     }
                     Ok(())
-                })?;
+                })
+                .map_err(|e| stopped.take().unwrap_or_else(|| failed(&e)))?;
                 None
             }
         };
         let documents = single_property_documents(property, &texts);
         let pending = index
             .pending(superseded.as_deref(), &documents)
-            .map_err(|e| failed(&e))?;
+            .map_err(searched)?;
         index
-            .find(request, matches, &pending)
+            .find(request, matches, &pending, meter)
             .map(Some)
-            .map_err(|e| failed(&e))
+            .map_err(searched)
     }
 
     /// The earliest instant at which some held state of a temporal node

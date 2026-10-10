@@ -3826,6 +3826,11 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         // The index search reports its comparisons and scratch to the
         // budget; scoring a row's vector is a unit of work.
         LogicalOp::HnswScan { query_vector, .. } => expr_unaccounted(query_vector),
+        // The text index search reports every document it scores and reads.
+        LogicalOp::TextIndexScan { .. } => None,
+        LogicalOp::TextFilter {
+            input, text_expr, ..
+        } => expr_unaccounted(text_expr).or_else(|| first_unaccounted_operator(input)),
         LogicalOp::VectorTopK {
             input,
             vector_expr,
@@ -4013,14 +4018,17 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             binding,
             query_string,
             language,
-        } => execute_text_index_scan(
-            label,
-            property,
-            binding,
-            query_string,
-            language.as_deref(),
-            ctx,
-        ),
+        } => {
+            let rows = execute_text_index_scan(
+                label,
+                property,
+                binding,
+                query_string,
+                language.as_deref(),
+                ctx,
+            )?;
+            charge_returned(ctx, 0, rows)
+        }
 
         LogicalOp::Traverse {
             input,
@@ -4721,7 +4729,12 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
         } => {
             let rows = execute_op(input, ctx)?;
             materialize_own_node_writes(ctx)?;
-            execute_text_filter(&rows, text_expr, query_string, language.as_deref(), ctx)
+            // Every row is looked up in the matches; the ones kept are
+            // charged as they are returned.
+            ctx.budget.work(rows.len() as u64)?;
+            let kept =
+                execute_text_filter(&rows, text_expr, query_string, language.as_deref(), ctx)?;
+            charge_returned(ctx, 0, kept)
         }
 
         LogicalOp::EncryptedFilter {
@@ -6503,13 +6516,17 @@ fn execute_text_index_scan(
     };
     materialize_own_node_writes(ctx)?;
     let matches = text_index_matches(registry, (binding, label, property), query, language, ctx)
-        .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+        .map_err(|e| text_search_error("text search error", e))?
         // Dropped between planning and execution: refused as TextFilter does.
         .ok_or_else(|| text_match_missing_index_error(Some(label), Some(property)))?;
 
     let mut ids: Vec<NodeId> = matches.keys().map(|id| NodeId::from_raw(*id)).collect();
     ids.sort_unstable();
+    ctx.budget.work(ids.len() as u64)?;
     let records = coordinode_modality::LocalNodeStore.get_many(&ctx.txn, ctx.shard_id, &ids)?;
+    // The matched records, held while their rows are built.
+    let budget = Arc::clone(&ctx.budget);
+    let _records = budget.reserve(records.iter().flatten().map(NodeRecord::held_bytes).sum())?;
     let at = ctx.instant_for(binding);
     let mut rows = Vec::with_capacity(ids.len());
     for (id, record) in ids.into_iter().zip(records) {
@@ -8783,7 +8800,7 @@ fn score_text_method(
         )
     })?;
     let scores = text_index_matches(registry, (variable, label, property), query_text, None, ctx)
-        .map_err(|e| ExecutionError::Unsupported(format!("rrf_score(): text search error: {e}")))?
+        .map_err(|e| text_search_error("rrf_score(): text search error", e))?
         .ok_or_else(|| {
             ExecutionError::Unsupported(format!(
                 "rrf_score(): text method {variable}.{property} on :{label} requires a \
@@ -8911,7 +8928,7 @@ fn raw_scores_text_method(
         )
     })?;
     let scores = text_index_matches(registry, (variable, label, property), query_text, None, ctx)
-        .map_err(|e| ExecutionError::Unsupported(format!("hybrid fusion: text search: {e}")))?
+        .map_err(|e| text_search_error("hybrid fusion: text search", e))?
         .ok_or_else(|| {
             ExecutionError::Unsupported(format!(
                 "hybrid fusion: no text index on :{label}({property})"
@@ -9407,18 +9424,22 @@ fn own_written_nodes(ctx: &ExecutionContext<'_>) -> Vec<NodeId> {
 /// folded, the transaction's own (fold them first with
 /// [`materialize_own_node_writes`]) and at a named timestamp the nodes
 /// written since are evaluated from it. `Ok(None)` when there is no such
-/// index.
+/// index. The search runs against the statement's budget, and the match map
+/// it answers with is held for the rest of the statement.
 fn text_index_matches(
     registry: &crate::index::TextIndexRegistry,
     (variable, label, property): (&str, &str, &str),
     query: &str,
     language: Option<&str>,
     ctx: &ExecutionContext<'_>,
-) -> Result<Option<HashMap<u64, f32>>, String> {
+) -> Result<Option<HashMap<u64, f32>>, crate::index::text_registry::FindError> {
+    use crate::index::text_registry::FindError;
     use coordinode_search::tantivy::multi_lang::TextRequest;
     use coordinode_search::tantivy::pending::Matches;
 
-    let also = read_delta(IndexDelta::Nodes(Default::default()), ctx).map_err(|e| e.to_string())?;
+    let also = read_delta(IndexDelta::Nodes(Default::default()), ctx)
+        .map_err(|e| FindError::Failed(e.to_string()))?;
+    let mut search = coordinode_core::budget::BatchedWork::new(&ctx.budget);
     let Some(hits) = registry.find(
         label,
         property,
@@ -9435,15 +9456,34 @@ fn text_index_matches(
             snippets: false,
         },
         Matches::All,
+        &mut search,
     )?
     else {
         return Ok(None);
     };
+    search.finish().map_err(FindError::Budget)?;
+    ctx.budget
+        .reserve((hits.len() * core::mem::size_of::<(u64, f32)>() * 2) as u64)
+        .map_err(FindError::Budget)?
+        .keep_until_query_ends();
     Ok(Some(
         hits.into_iter()
             .map(|hit| (hit.node_id, hit.score))
             .collect(),
     ))
+}
+
+/// A text index search's failure as the statement fails with it: the budget
+/// stop as itself, anything else described after `context`.
+fn text_search_error(
+    context: &str,
+    error: crate::index::text_registry::FindError,
+) -> ExecutionError {
+    use crate::index::text_registry::FindError;
+    match error {
+        FindError::Budget(stop) => ExecutionError::Budget(stop),
+        FindError::Failed(reason) => ExecutionError::Unsupported(format!("{context}: {reason}")),
+    }
 }
 
 /// TextFilter: search TextIndex for matching documents, filter rows.
@@ -9506,7 +9546,7 @@ fn execute_text_filter(
         if let (Some(l), Some(p)) = (label, property) {
             // Every match, not a top-K: the predicate is membership.
             match text_index_matches(registry, (variable, l, p), query_string, language, ctx)
-                .map_err(|e| ExecutionError::Unsupported(format!("text search error: {e}")))?
+                .map_err(|e| text_search_error("text search error", e))?
             {
                 Some(matches) => matches
                     .into_iter()

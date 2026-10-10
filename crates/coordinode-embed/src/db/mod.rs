@@ -3638,19 +3638,30 @@ impl Database {
             Timestamp::ZERO,
             None,
         );
-        self.text_index_registry
-            .find(
-                label,
-                property,
-                &read,
-                self.shard_id,
-                &interner,
-                coordinode_query::index::IndexDelta::Nodes(Default::default()),
-                coordinode_query::executor::runner::wall_clock_us(),
-                request,
-                matches,
-            )
-            .map_err(DatabaseError::Other)
+        // A search request is a query: it runs under this database's
+        // statement memory limit like any other.
+        use coordinode_query::index::text_registry::FindError;
+        let budget = statement_budget(self.query_memory_limit, None, None);
+        let mut search = coordinode_core::budget::BatchedWork::new(&budget);
+        let found = self.text_index_registry.find(
+            label,
+            property,
+            &read,
+            self.shard_id,
+            &interner,
+            coordinode_query::index::IndexDelta::Nodes(Default::default()),
+            coordinode_query::executor::runner::wall_clock_us(),
+            request,
+            matches,
+            &mut search,
+        );
+        let stopped = |stop| DatabaseError::Execution(ExecutionError::Budget(stop));
+        let found = found.map_err(|e| match e {
+            FindError::Budget(stop) => stopped(stop),
+            FindError::Failed(reason) => DatabaseError::Other(reason),
+        })?;
+        search.finish().map_err(stopped)?;
+        Ok(found)
     }
 
     /// The verified field dictionary as it stands: every binding applied so

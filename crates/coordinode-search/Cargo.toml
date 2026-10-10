@@ -16,6 +16,8 @@ cjk-ko = ["dep:lindera", "lindera/embed-ko-dic"]     # Korean (lindera KO-dic, +
 cjk = ["cjk-zh", "cjk-ja", "cjk-ko"]
 
 [dependencies]
+# The query budget a search reports its work and scratch to.
+coordinode-core = { workspace = true }
 coordinode-storage = { workspace = true }
 tantivy = { workspace = true }
 rust-stemmers = { workspace = true }
@@ -36,7 +38,6 @@ jieba-rs = { workspace = true, optional = true }
 coordinode-workspace-hack = { version = "0.1", path = "../coordinode-workspace-hack" }
 
 [dev-dependencies]
-coordinode-core = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

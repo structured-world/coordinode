@@ -130,6 +130,18 @@ pub enum TextSearchError {
         "the index holds documents without a birth time; it cannot answer a read at a timestamp"
     )]
     BirthTimesUnknown,
+
+    /// The query's budget stopped the search: its memory limit, deadline
+    /// or cancellation.
+    #[error(transparent)]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
+}
+
+// A search no budget can stop has no stop to carry.
+impl From<core::convert::Infallible> for TextSearchError {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
+    }
 }
 
 /// A scored search result from the text index.
@@ -694,6 +706,7 @@ impl TextIndex {
             Matches::Top(limit),
             &PendingDocuments::none(),
             pending::Highlight::NearWords(query_str),
+            &mut coordinode_core::budget::Unmetered,
         )
     }
 
@@ -926,6 +939,7 @@ impl TextIndex {
                 Matches::Top(limit),
                 &PendingDocuments::none(),
                 pending::Highlight::Off,
+                &mut coordinode_core::budget::Unmetered,
             )?
             .into_iter()
             .map(|hit| TextSearchResult {
@@ -980,6 +994,7 @@ impl TextIndex {
             Matches::Top(limit),
             &PendingDocuments::none(),
             pending::Highlight::Query,
+            &mut coordinode_core::budget::Unmetered,
         )
     }
 

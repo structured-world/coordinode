@@ -16,6 +16,8 @@ use std::path::Path;
 
 use std::collections::HashSet;
 
+use coordinode_core::budget::Meter;
+
 use super::corpus::Corpus;
 use super::pending::{Highlight, Matches, PendingDocuments};
 use super::tokenize;
@@ -486,13 +488,23 @@ impl MultiLanguageTextIndex {
         self.inner.pending(superseded, documents)
     }
 
-    /// Run `request` over the index and `pending`, best score first.
-    pub fn find(
+    /// Run `request` over the index and `pending`, best score first,
+    /// reporting the documents it reads and scores to `meter`, which can
+    /// stop it.
+    ///
+    /// # Errors
+    ///
+    /// A malformed query, a failed read, or the stop `meter` returned.
+    pub fn find<M: Meter>(
         &self,
         request: TextRequest<'_>,
         matches: Matches,
         pending: &PendingDocuments,
-    ) -> Result<Vec<HighlightedResult>, TextSearchError> {
+        meter: &mut M,
+    ) -> Result<Vec<HighlightedResult>, TextSearchError>
+    where
+        TextSearchError: From<M::Stop>,
+    {
         match request {
             TextRequest::Terms {
                 query,
@@ -506,7 +518,9 @@ impl MultiLanguageTextIndex {
                     Highlight::Off
                 };
                 match self.inner.language_query(query, language)? {
-                    Some(query) => self.inner.collect(&*query, matches, pending, highlight),
+                    Some(query) => self
+                        .inner
+                        .collect(&*query, matches, pending, highlight, meter),
                     None => Ok(Vec::new()),
                 }
             }
@@ -519,7 +533,8 @@ impl MultiLanguageTextIndex {
                     Highlight::Off
                 };
                 let query = self.inner.build_query_fuzzy(query, None)?;
-                self.inner.collect(&*query, matches, pending, highlight)
+                self.inner
+                    .collect(&*query, matches, pending, highlight, meter)
             }
         }
     }

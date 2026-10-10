@@ -803,6 +803,46 @@ fn a_vector_search_through_the_index_is_held_to_the_memory_limit() {
     assert_eq!(rows[0].get("i"), Some(&Value::Int(7)));
 }
 
+/// A text search through the index runs against the statement's budget:
+/// the matches it collects and the records it reads are held to the limit,
+/// so a limit smaller than them refuses it with the memory stop, and the
+/// default answers.
+#[test]
+fn a_text_search_through_the_index_is_held_to_the_memory_limit() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let run = |query: &str, options: &StatementOptions| {
+        db.execute_cypher_shared_with(query, None, None, options)
+    };
+    let default = StatementOptions::default();
+    run("CREATE TEXT INDEX doc_body ON :Doc(body)", &default).expect("index");
+    run(
+        "UNWIND range(1, 300) AS i CREATE (:Doc {i: i, body: 'graph engine number ' + toString(i)})",
+        &default,
+    )
+    .expect("docs");
+    let query = "MATCH (n:Doc) WHERE text_match(n.body, 'graph') RETURN count(n) AS n";
+
+    let tiny = StatementOptions {
+        query_memory_limit: Some(1 << 10),
+        ..StatementOptions::default()
+    };
+    let refused = run(query, &tiny);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+    let rows = run(query, &default).expect("within the default").rows;
+    assert_eq!(rows[0].get("n"), Some(&Value::Int(300)));
+}
+
 /// In an interactive transaction, a statement whose writes did not fit its
 /// limit fails, and the transaction cannot then commit what was staged
 /// before the refusal: committing would apply part of that statement.
