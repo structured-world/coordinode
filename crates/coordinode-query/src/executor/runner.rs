@@ -3745,6 +3745,18 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::Limit { input, .. } | LogicalOp::Skip { input, .. } => {
             first_unaccounted_operator(input)
         }
+        LogicalOp::Unwind { input, expr, .. } if !neutral_contains_subplan(expr) => {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } if !group_by.iter().any(neutral_contains_subplan)
+            && !aggregates.iter().any(|a| neutral_contains_subplan(&a.arg)) =>
+        {
+            first_unaccounted_operator(input)
+        }
         other => Some(other.operator_name()),
     }
 }
@@ -4126,7 +4138,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             aggregates,
         } => {
             let rows = execute_op(input, ctx)?;
-            execute_aggregate(&rows, group_by, aggregates, &ctx.params)
+            execute_aggregate(&rows, group_by, aggregates, &ctx.params, &ctx.budget)
         }
 
         LogicalOp::Sort { input, items } => {
@@ -4509,7 +4521,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             variable,
         } => {
             let rows = execute_op(input, ctx)?;
-            execute_unwind(&rows, expr, variable)
+            execute_unwind(&rows, expr, variable, &ctx.budget)
         }
 
         LogicalOp::LeftOuterJoin { left, right } => {
@@ -9318,17 +9330,29 @@ fn execute_unwind(
     rows: &[Row],
     expr: &crate::plan::expr::Expr,
     variable: &str,
+    budget: &coordinode_core::budget::QueryBudget,
 ) -> Result<Vec<Row>, ExecutionError> {
     let mut results = Vec::new();
+    // Every row made is held for the plan's later stages: charged before it
+    // joins the result.
+    let keep = |out: Row, results: &mut Vec<Row>| -> Result<(), ExecutionError> {
+        budget.work(1)?;
+        budget
+            .reserve(crate::executor::row::row_held_bytes(&out))?
+            .keep_until_query_ends();
+        results.push(out);
+        Ok(())
+    };
 
     for row in rows {
+        budget.work(1)?;
         let val = eval_neutral(expr, row)?;
         match val {
             Value::Array(items) => {
                 for item in items {
                     let mut out = row.clone();
                     out.insert(variable.to_string(), item);
-                    results.push(out);
+                    keep(out, &mut results)?;
                 }
             }
             Value::Null => {
@@ -9338,7 +9362,7 @@ fn execute_unwind(
                 // Non-list scalar: treat as single-element list
                 let mut out = row.clone();
                 out.insert(variable.to_string(), other);
-                results.push(out);
+                keep(out, &mut results)?;
             }
         }
     }
@@ -9794,14 +9818,20 @@ fn execute_aggregate(
     group_by: &[crate::plan::expr::Expr],
     aggregates: &[AggregateItem],
     params: &HashMap<String, coordinode_core::graph::types::Value>,
+    budget: &coordinode_core::budget::QueryBudget,
 ) -> Result<Vec<Row>, ExecutionError> {
-    // Group rows by group-by key
     // Group rows by group-by key.
     // Value doesn't implement Ord/Hash, so we use linear search for grouping.
     let mut groups: Vec<(Vec<Value>, Vec<&Row>)> = Vec::new();
+    // The groups are the operator's own memory: each key and each member
+    // reference is charged before it is kept.
+    let mut held = budget.empty_charge();
+    let reference = core::mem::size_of::<&Row>() as u64;
 
     if group_by.is_empty() {
         // No group-by: all rows form a single group
+        budget.work(rows.len() as u64)?;
+        held.grow(rows.len() as u64 * reference)?;
         let all: Vec<&Row> = rows.iter().collect();
         groups.push((Vec::new(), all));
     } else {
@@ -9810,10 +9840,18 @@ fn execute_aggregate(
                 .iter()
                 .map(|e| eval_neutral(e, row))
                 .collect::<Result<_, _>>()?;
+            // The search compares the key with every group so far.
+            budget.work(1 + groups.len() as u64)?;
             let found = groups.iter_mut().find(|(k, _)| k == &key);
             if let Some((_, group_rows)) = found {
+                held.grow(reference)?;
                 group_rows.push(row);
             } else {
+                held.grow(
+                    core::mem::size_of::<(Vec<Value>, Vec<&Row>)>() as u64
+                        + reference
+                        + key.iter().map(Value::held_bytes).sum::<u64>(),
+                )?;
                 groups.push((key, vec![row]));
             }
         }
@@ -9831,13 +9869,20 @@ fn execute_aggregate(
             out.insert(col, val);
         }
 
-        // Compute aggregates
+        // Compute aggregates. Each collects its group's argument values
+        // before folding them: reserved for the group, returned after.
         for agg in aggregates {
+            budget.work(group_rows.len() as u64)?;
+            let _scratch =
+                budget.reserve((group_rows.len() * core::mem::size_of::<Value>()) as u64)?;
             let val = compute_aggregate(agg, group_rows, params)?;
             let col = agg.alias.clone().unwrap_or_else(|| agg.function.clone());
             out.insert(col, val);
         }
 
+        budget
+            .reserve(crate::executor::row::row_held_bytes(&out))?
+            .keep_until_query_ends();
         results.push(out);
     }
 
