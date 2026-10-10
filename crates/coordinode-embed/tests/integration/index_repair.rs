@@ -454,6 +454,94 @@ fn reindex_by_name_and_by_identity() {
     assert!(err.to_string().contains("no_such"), "{err}");
 }
 
+/// `REINDEX` rebuilds into a fresh generation, reports the build like
+/// `CREATE INDEX`, refuses a label the index is not on and an index that
+/// does not exist.
+#[test]
+fn reindex_statement() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo'})")
+        .expect("a");
+    let a = scan_id(&mut db, "name", "a");
+    let before = index_named(db.engine(), "u_city")
+        .expect("index")
+        .generation;
+
+    let rows = db.execute_cypher("REINDEX u_city ON :U").expect("reindex");
+    assert_eq!(rows[0].get("state"), Some(&Value::String("READY".into())));
+    let after = index_named(db.engine(), "u_city")
+        .expect("index")
+        .generation;
+    assert_ne!(after, before);
+    assert_eq!(
+        rows[0].get("operation"),
+        Some(&Value::Int(
+            i64::try_from(after.as_raw()).expect("operation")
+        ))
+    );
+    assert_eq!(found_by(&mut db, "city", "oslo"), vec![a]);
+
+    let wrong_label = db
+        .execute_cypher("REINDEX u_city ON :V")
+        .expect_err("not on :V");
+    assert!(wrong_label.to_string().contains(":U"), "{wrong_label}");
+    assert!(db.execute_cypher("REINDEX no_such").is_err());
+}
+
+/// The maintenance procedures: a check started by name reaches its
+/// outcome, inspection shows it verified, and REINDEX by identity reports
+/// its build.
+#[test]
+fn maintenance_procedures() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE INDEX u_city ON :U(city)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo'})")
+        .expect("a");
+    let a = scan_id(&mut db, "name", "a");
+    db.engine()
+        .delete(Partition::Idx, &entry_key(&db, "u_city", "oslo", a))
+        .expect("lose a's entry");
+
+    let started = db
+        .execute_cypher("CALL db.checkIndex('u_city')")
+        .expect("start a check");
+    let Some(Value::Int(operation)) = started[0].get("operation").cloned() else {
+        panic!("an operation: {started:?}");
+    };
+    let inspected = db
+        .execute_cypher(&format!(
+            "CALL db.indexCheck({operation}, 60000) YIELD integrity, repaired \
+             RETURN integrity, repaired"
+        ))
+        .expect("inspect the check");
+    assert_eq!(
+        inspected[0].get("integrity"),
+        Some(&Value::String("VERIFIED".into()))
+    );
+    assert_eq!(inspected[0].get("repaired"), Some(&Value::Int(1)));
+    let listed = db
+        .execute_cypher("CALL db.indexChecks()")
+        .expect("list checks");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(found_by(&mut db, "city", "oslo"), vec![a]);
+
+    let id = index_named(db.engine(), "u_city").expect("index").id;
+    let rebuilt = db
+        .execute_cypher(&format!("CALL db.reindex({}, 60000)", id.as_raw()))
+        .expect("reindex by identity");
+    assert_eq!(
+        rebuilt[0].get("state"),
+        Some(&Value::String("PUBLISHED".into()))
+    );
+    let err = db
+        .execute_cypher("CALL db.checkIndex('no_such')")
+        .expect_err("no such index");
+    assert!(err.to_string().contains("no_such"), "{err}");
+}
+
 /// Dropping an index removes its integrity records with it.
 #[test]
 fn dropping_an_index_removes_its_integrity_records() {

@@ -376,6 +376,10 @@ fn write_clause(buf: &mut String, clause: &Clause) {
             buf.push_str(&c.name);
             buf.push_str(" SET MAINTENANCE");
         }
+        Clause::Reindex(c) => {
+            buf.push_str("REINDEX ");
+            buf.push_str(&c.name);
+        }
         Clause::AlterNamespaceIndexDefault(_) => {
             buf.push_str("ALTER NAMESPACE SET INDEX MAINTENANCE");
         }

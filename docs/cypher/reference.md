@@ -482,6 +482,57 @@ ALTER NAMESPACE SET INDEX MAINTENANCE DERIVED     -- default for new indexes
 - An unknown option, or a profile other than `resolved` / `derived`, is
   refused.
 
+#### REINDEX and index checks ✅
+
+A B-tree index is derived from the records it covers. The engine checks it
+against them and repairs it; `REINDEX` rebuilds it outright.
+
+```cypher
+REINDEX user_email                         -- rebuild into a fresh generation
+REINDEX user_email ON :User                -- the same, refused if not on :User
+
+CALL db.checkIndex('user_email')           -- check against the records, by name
+CALL db.checkIndex(12)                     --   ... or by index id
+CALL db.indexChecks()                      -- every generation's integrity
+CALL db.indexCheck(operation, waitMs)      -- one check, after waiting up to waitMs
+CALL db.cancelIndexCheck(operation)        -- stop a check; its repairs stay
+CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or id
+```
+
+- **What a check does.** It reads every record of the label for the entries
+  its values give it (each list element, each version of a temporal node,
+  the sparse and partial rules), then every entry for a record holding its
+  value. Each disagreement is repaired while the record and the entry are
+  still as the check read them and the index still serves from the checked
+  generation, so a write, a drop or a rebuild arriving meanwhile wins. A pass
+  that finds nothing marks the generation `VERIFIED`. More disagreements
+  than `index_check_max_repairs`, or a third pass still finding some,
+  rebuild the index instead (`rebuiltInto` names the new generation).
+- **What starts one.** A read or a write that meets an entry its record does
+  not back marks the generation `SUSPECT` and starts a check at once; every
+  B-tree index is also checked every `index_check_interval_secs`. A missing
+  entry gives no sign on any read, so only a check finds it. The member that
+  takes writes runs checks.
+- **While an index is suspect** its lookups answer from the records, so a
+  query never returns a wrong or short result for a damaged entry, and a
+  value taken in a unique index is proved free from the records when the
+  write commits: the real holder is reported as the duplicate, and a proof
+  that would read more than `index_build_unique_read_limit` records is
+  refused as unresolved, to be retried. An entry naming a node that does not
+  hold its value never makes the value free nor counts as a duplicate.
+- **Records breaking a unique index.** Two records holding one value cannot
+  be represented by any entry: a check reports them (`conflicts`), changes
+  neither, and the generation stays `SUSPECT` until the records are fixed.
+- `REINDEX` returns like `CREATE INDEX`: `state` (`READY`, or `BUILDING` when
+  the statement's wait ran out), `operation` (the build, which
+  `db.indexBuild` inspects) and `nodes_indexed`. Writers maintain the new
+  generation at once; a constraint the index enforces stays enforced.
+- `db.indexChecks()` and `db.indexCheck` return `operation` (the generation
+  checked), `indexId`, `integrity` (`UNCHECKED`, `SUSPECT`, `VERIFIED`),
+  `state`, `phase` (`RECORDS`, `ENTRIES`), `passes`, `checked`,
+  `mismatches`, `repaired`, `conflicts`, `rebuiltInto` and `failure`. A
+  string argument names an index, an integer is its id.
+
 #### CREATE CONSTRAINT / DROP CONSTRAINT ✅
 
 Named constraints on the nodes of a label.
@@ -821,6 +872,11 @@ Built-in procedures:
 | `db.advisor.slowQueries(limit = 20, minTime = 100)` | READ | `query`, `p99Time`, `count`, `plan`, `sources` |
 | `db.advisor.dismiss(id)` | DBMS | `id`, `dismissed` |
 | `db.advisor.reset()` | DBMS | `status` |
+| `db.checkIndex(index)` | SCHEMA | the check columns of [REINDEX and index checks](#reindex-and-index-checks-) |
+| `db.indexChecks()` | READ | the check columns |
+| `db.indexCheck(operation, waitMs = 0)` | READ | the check columns |
+| `db.cancelIndexCheck(operation)` | SCHEMA | the check columns |
+| `db.reindex(index, waitMs = 0)` | SCHEMA | `operation`, `state` |
 
 `dbms.procedures()` lists every procedure the server answers, with its full
 signature, for example

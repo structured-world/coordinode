@@ -418,6 +418,7 @@ fn children(op: &LogicalOp) -> Vec<&LogicalOp> {
         | LogicalOp::CreateConstraint { .. }
         | LogicalOp::DropConstraint { .. }
         | LogicalOp::AlterIndexMaintenance { .. }
+        | LogicalOp::Reindex { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::IndexScan { .. } => vec![],
         // A counter read: its fallback scan runs only when the counter

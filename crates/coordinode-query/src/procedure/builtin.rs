@@ -15,6 +15,7 @@ pub(super) fn procedures() -> Vec<Arc<dyn Procedure>> {
     ];
     all.extend(crate::advisor::procedures::procedures());
     all.extend(super::index_builds::procedures());
+    all.extend(super::index_checks::procedures());
     all
 }
 

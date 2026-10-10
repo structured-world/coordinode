@@ -29,6 +29,7 @@ clause = {
   | call_clause
   | alter_label_clause
   | alter_index_clause
+  | reindex_clause
   | alter_namespace_clause
   | create_encrypted_index_clause
   | create_text_index_clause
@@ -295,6 +296,10 @@ if_exists              = { kw_if ~ kw_exists }
 // ALTER INDEX idx_name SET MAINTENANCE RESOLVED | DERIVED | INHERIT
 alter_index_clause = { kw_alter ~ kw_index ~ identifier ~ kw_set ~ kw_maintenance ~ index_maintenance }
 index_maintenance  = @{ (^"resolved" | ^"derived" | ^"inherit") ~ !(ASCII_ALPHANUMERIC | "_") }
+
+// REINDEX idx_name [ON :Label]: rebuild a B-tree index into a fresh
+// generation.
+reindex_clause = { kw_reindex ~ identifier ~ (kw_on ~ ":" ~ identifier)? }
 
 // ALTER NAMESPACE SET INDEX MAINTENANCE RESOLVED | DERIVED: the default of
 // the namespace the statement runs in.
@@ -1035,6 +1040,7 @@ kw_show        = @{ ^"show" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_enable      = @{ ^"enable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_disable     = @{ ^"disable" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_maintenance = @{ ^"maintenance" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_reindex     = @{ ^"reindex" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_namespace   = @{ ^"namespace" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_constraint  = @{ ^"constraint" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_require     = @{ ^"require" ~ !(ASCII_ALPHANUMERIC | "_") }

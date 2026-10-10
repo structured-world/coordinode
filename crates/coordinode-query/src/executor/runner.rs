@@ -4451,6 +4451,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             execute_alter_index_maintenance(name, *profile, ctx)
         }
 
+        LogicalOp::Reindex { name, label } => execute_reindex(name, label.as_deref(), ctx),
+
         LogicalOp::SetNamespaceIndexDefault { profile } => {
             execute_set_namespace_index_default(*profile, ctx)
         }
@@ -18234,6 +18236,48 @@ fn execute_set_namespace_index_default(
         "revision".to_string(),
         Value::Int(i64::try_from(revision).unwrap_or(i64::MAX)),
     );
+    Ok(vec![row])
+}
+
+/// Execute `REINDEX idx [ON :Label]`: rebuild the B-tree index from its
+/// records into a fresh generation, and wait for the build as `CREATE INDEX`
+/// does. Writers maintain the new generation at once; lookups answer from
+/// the records until it is built, and its unique values are proved free
+/// from them. A constraint the index enforces stays enforced throughout.
+fn execute_reindex(
+    name: &str,
+    label: Option<&str>,
+    ctx: &mut ExecutionContext<'_>,
+) -> Result<Vec<Row>, ExecutionError> {
+    let builds = ctx.index_builds.ok_or_else(|| {
+        ExecutionError::Unsupported("REINDEX requires the engine's index builds".into())
+    })?;
+    let (def, _) = stored_definition(name, ctx.engine)?.ok_or_else(|| {
+        ExecutionError::CatalogObjectMissing {
+            object: CatalogObject::Index,
+            name: name.to_string(),
+        }
+    })?;
+    if let Some(label) = label {
+        if def.label != label {
+            return Err(ExecutionError::CatalogRefused(format!(
+                "index '{name}' is on :{}, not :{label}",
+                def.label
+            )));
+        }
+    }
+    if def.index_type != crate::index::IndexType::BTree {
+        return Err(ExecutionError::CatalogRefused(format!(
+            "index '{name}' is not a B-tree index; REINDEX rebuilds B-tree indexes"
+        )));
+    }
+    let def = builds.rebuild(def).map_err(ExecutionError::Unsupported)?;
+    let wait = await_index_build(&def, None, ctx)?;
+    let mut row = Row::new();
+    row.insert("index".to_string(), Value::String(name.to_string()));
+    row.insert("label".to_string(), Value::String(def.label.clone()));
+    row.insert("state".to_string(), index_state(wait));
+    insert_build(&mut row, &def, wait);
     Ok(vec![row])
 }
 

@@ -297,6 +297,17 @@ fn build_clause(pair: Pair<'_, Rule>, clauses: &mut Vec<Clause>) -> Result<(), P
             })?;
             clauses.push(Clause::AlterIndex(AlterIndexClause { name, maintenance }));
         }
+        Rule::reindex_clause => {
+            let mut identifiers = pair
+                .into_inner()
+                .filter(|inner| inner.as_rule() == Rule::identifier)
+                .map(|inner| inner.as_str().to_string());
+            let name = identifiers
+                .next()
+                .ok_or_else(|| ParseError::Invalid("REINDEX requires an index name".into()))?;
+            let label = identifiers.next();
+            clauses.push(Clause::Reindex(ReindexClause { name, label }));
+        }
         Rule::alter_namespace_clause => {
             let profile = pair
                 .into_inner()

@@ -2310,6 +2310,30 @@ fn alter_index_and_namespace_maintenance() {
     }
 }
 
+/// `REINDEX name` and `REINDEX name ON :Label` name the index and, in the
+/// second form, the label the statement expects it on.
+#[test]
+fn reindex_with_and_without_a_label() {
+    let q = parse("REINDEX user_email").unwrap();
+    assert_eq!(
+        q.clauses[0],
+        Clause::Reindex(ReindexClause {
+            name: "user_email".into(),
+            label: None,
+        })
+    );
+    let q = parse("REINDEX user_email ON :User").unwrap();
+    assert_eq!(
+        q.clauses[0],
+        Clause::Reindex(ReindexClause {
+            name: "user_email".into(),
+            label: Some("User".into()),
+        })
+    );
+    assert!(q.is_write(&|_| false), "a rebuild writes the catalog");
+    assert!(parse("REINDEX").is_err(), "an index name is required");
+}
+
 #[test]
 fn drop_index_simple() {
     let q = parse_ok("DROP INDEX email_idx");

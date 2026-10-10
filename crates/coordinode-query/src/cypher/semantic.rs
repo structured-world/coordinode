@@ -375,6 +375,7 @@ impl<'a> Analyzer<'a> {
             | Clause::CreateConstraint(_)
             | Clause::DropConstraint(_)
             | Clause::AlterIndex(_)
+            | Clause::Reindex(_)
             | Clause::AlterNamespaceIndexDefault(_)
             | Clause::CreateVectorIndex(_)
             | Clause::DropVectorIndex(_)

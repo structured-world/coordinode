@@ -13,6 +13,7 @@
 
 mod builtin;
 mod index_builds;
+mod index_checks;
 
 use core::fmt;
 use std::collections::BTreeMap;

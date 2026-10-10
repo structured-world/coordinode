@@ -523,6 +523,10 @@ pub enum LogicalOp {
         profile: Option<crate::index::IndexProfile>,
     },
 
+    /// Rebuild the B-tree index `name` into a fresh generation; `label`,
+    /// when the statement names one, must be the index's.
+    Reindex { name: String, label: Option<String> },
+
     /// Set the namespace default profile for key-shaped indexes.
     SetNamespaceIndexDefault { profile: crate::index::IndexProfile },
 
@@ -1062,6 +1066,7 @@ impl LogicalOp {
             | LogicalOp::CreateConstraint { .. }
             | LogicalOp::DropConstraint { .. }
             | LogicalOp::AlterIndexMaintenance { .. }
+            | LogicalOp::Reindex { .. }
             | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
@@ -1389,6 +1394,7 @@ impl LogicalOp {
             | LogicalOp::CreateConstraint { .. }
             | LogicalOp::DropConstraint { .. }
             | LogicalOp::AlterIndexMaintenance { .. }
+            | LogicalOp::Reindex { .. }
             | LogicalOp::SetNamespaceIndexDefault { .. }
             | LogicalOp::CreateVectorIndex { .. }
             | LogicalOp::DropVectorIndex { .. }
@@ -2046,6 +2052,7 @@ fn estimate_op_cost(
         | LogicalOp::CreateConstraint { .. }
         | LogicalOp::DropConstraint { .. }
         | LogicalOp::AlterIndexMaintenance { .. }
+        | LogicalOp::Reindex { .. }
         | LogicalOp::SetNamespaceIndexDefault { .. }
         | LogicalOp::CreateVectorIndex { .. }
         | LogicalOp::DropVectorIndex { .. }
@@ -2795,6 +2802,9 @@ fn explain_op(op: &LogicalOp, indent: usize, output: &mut String) {
         LogicalOp::AlterIndexMaintenance { name, profile } => {
             let to = profile.map_or_else(|| "Inherit".to_string(), |p| format!("{p:?}"));
             output.push_str(&format!("{prefix}AlterIndexMaintenance({name} -> {to})\n"));
+        }
+        LogicalOp::Reindex { name, .. } => {
+            output.push_str(&format!("{prefix}Reindex({name})\n"));
         }
         LogicalOp::SetNamespaceIndexDefault { profile } => {
             output.push_str(&format!("{prefix}SetNamespaceIndexDefault({profile:?})\n"));

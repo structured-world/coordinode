@@ -68,6 +68,7 @@ impl Query {
                 | Clause::CreateConstraint(_)
                 | Clause::DropConstraint(_)
                 | Clause::AlterIndex(_)
+                | Clause::Reindex(_)
                 | Clause::AlterNamespaceIndexDefault(_)
                 | Clause::CreateVectorIndex(_)
                 | Clause::DropVectorIndex(_)
@@ -145,6 +146,8 @@ pub enum Clause {
     DropConstraint(DropConstraintClause),
     /// `ALTER INDEX <name> SET MAINTENANCE ...`: explicit profile transition.
     AlterIndex(AlterIndexClause),
+    /// `REINDEX <name> [ON :Label]`: rebuild into a fresh generation.
+    Reindex(ReindexClause),
     /// `ALTER NAMESPACE SET INDEX MAINTENANCE ...`: the namespace default.
     AlterNamespaceIndexDefault(ProfileChoice),
     CreateVectorIndex(CreateVectorIndexClause),
@@ -385,6 +388,17 @@ pub enum IndexMaintenanceChoice {
     Profile(ProfileChoice),
     /// The namespace default.
     Inherit,
+}
+
+/// `REINDEX idx [ON :Label]`: rebuild a B-tree index from its records into a
+/// fresh generation of the same index. The label, when given, must be the
+/// index's own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReindexClause {
+    /// The index's name.
+    pub name: String,
+    /// The label the statement says the index covers.
+    pub label: Option<String>,
 }
 
 /// `ALTER INDEX idx SET MAINTENANCE RESOLVED | DERIVED | INHERIT`: an

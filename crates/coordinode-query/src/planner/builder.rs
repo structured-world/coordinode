@@ -811,6 +811,10 @@ fn apply_clause(current: Option<LogicalOp>, clause: &Clause) -> Result<LogicalOp
                 crate::cypher::ast::IndexMaintenanceChoice::Inherit => None,
             },
         }),
+        Clause::Reindex(c) => Ok(LogicalOp::Reindex {
+            name: c.name.clone(),
+            label: c.label.clone(),
+        }),
         Clause::AlterNamespaceIndexDefault(choice) => Ok(LogicalOp::SetNamespaceIndexDefault {
             profile: index_profile(*choice),
         }),
