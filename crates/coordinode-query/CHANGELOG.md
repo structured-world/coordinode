@@ -2,6 +2,41 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(query)* count a label's nodes from its counter
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(embed)* fence the vector freshness watermark at a cut
+- *(query)* end a vector build at its ready mark
+- *(query)* mark a built vector index ready after its tail fold
+- *(storage)* let a catalog change wait for admitted writers
+- *(query)* keep the edge discriminator in the query fingerprint
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- *(index)* refuse to open over an index catalog record it cannot read
+- *(vector)* mark an index ready only at a build's handover
+
+### Performance
+
+- *(storage)* borrow node bytes during decode
+
+### Testing
+
+- *(query)* bound the repairs a backfill page may make
+- *(schema)* cover type definitions and repair outcomes
+- *(query)* cover a suffix collision and suffix exhaustion in duplicate repair
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,16 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Fixed
+
+- *(search)* run a text prefix as a term range
+- *(search)* refuse writes after a lost text-index writer
+- *(search)* match every word a text prefix starts
+- *(search)* carry no fictitious birth time in text documents
+- *(query)* search temporal labels at their valid state
+
 ## v0.7.0 - 2026-10-06
 
 ### Documentation

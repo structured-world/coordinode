@@ -2,6 +2,28 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(storage)* keep exact edge cardinality counts at commit
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(query)* search temporal labels at their valid state
+- *(storage)* hide rows a transaction deleted from its scans
+- *(modality)* refuse an unresolved temporal edge type on every write
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(storage)* borrow node bytes during decode
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

@@ -2,6 +2,35 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* admit index builds as inspectable operations
+
+### Fixed
+
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(core)* key an edge discriminator by its complete value
+
+### Performance
+
+- *(storage)* admit bounds by the way writes move the count
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- *(schema)* cover the refusals of edge identity
+- *(core)* equal starts do not merge independent edge instances
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

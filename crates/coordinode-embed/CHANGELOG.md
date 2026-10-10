@@ -2,6 +2,52 @@
 
 All notable changes to this crate are documented in this file.
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(query)* count a label's nodes from its counter
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(search)* match every word a text prefix starts
+- *(query)* search temporal labels at their valid state
+- *(embed)* fence the vector freshness watermark at a cut
+- *(embed)* keep a failed index fold out of later releases
+- *(storage)* let a catalog change wait for admitted writers
+- *(server)* list labels from the counters, under a read lock
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- drop the upgrade path from 0.6 stores
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+
+### Performance
+
+- *(storage)* borrow node bytes during decode
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- *(embed)* rank unfolded and own text writes against a fresh index
+- *(schema)* cover the refusals of edge identity
+- *(schema)* cover type definitions and repair outcomes
+- a scoped uniqueness survives a restore and a repair replicates
+- unreadable state refuses the loaders and a replicated member
+
+### Bench
+
+- *(embed)* report text-index resources and recovery
+
 ## v0.7.0 - 2026-10-06
 
 ### Added

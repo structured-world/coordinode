@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.7.1 - 2026-10-09
+
+### Added
+
+- *(schema)* resolve edge identity apart from temporality
+- *(schema)* declare a partial unique index as a scoped constraint
+- *(schema)* repair stored duplicates during a unique build
+- *(schema)* admit index builds as inspectable operations
+- *(storage)* keep exact edge cardinality counts at commit
+- *(core)* count edge cardinality over logical identities
+- *(query)* count a label's nodes from its counter
+
+### Fixed
+
+- *(reads)* reuse the statement schema view
+- *(raft)* fence follower cuts with a closed bound
+- *(query)* search temporal labels at their valid state
+- *(server)* list labels from the counters, under a read lock
+- drop the upgrade path from 0.6 stores
+- *(vector)* mark an index ready only at a build's handover
+- *(core)* key an edge discriminator by its complete value
+- *(search)* match every word a text prefix starts
+- *(embed)* fence the vector freshness watermark at a cut
+- *(embed)* keep a failed index fold out of later releases
+- *(storage)* let a catalog change wait for admitted writers
+- *(query)* stop and join index build executors when a database closes
+- *(storage)* wait for every older transaction in an index build
+- refuse to open over unreadable index and consensus state
+- *(index)* refuse to open over an index catalog record it cannot read
+- *(storage)* hide rows a transaction deleted from its scans
+- *(modality)* refuse an unresolved temporal edge type on every write
+- *(query)* end a vector build at its ready mark
+- *(query)* mark a built vector index ready after its tail fold
+- *(query)* keep the edge discriminator in the query fingerprint
+- *(search)* run a text prefix as a term range
+- *(search)* refuse writes after a lost text-index writer
+- *(search)* carry no fictitious birth time in text documents
+- *(storage)* release commit claims where the writes land
+- *(storage)* flush memtables sealed while the queue was full
+- *(storage)* keep the timeline docs free of private links
+
+### Performance
+
+- *(cdc)* answer a consumer's progress age without rereading the log
+- *(storage)* admit bounds by the way writes move the count
+- *(storage)* borrow node bytes during decode
+
+### Refactored
+
+- *(schema)* drop the property uniqueness flag and index adoption
+
+### Testing
+
+- *(server)* take cdc raft-tail timestamps from the clock
+- a scoped uniqueness survives a restore and a repair replicates
+- unreadable state refuses the loaders and a replicated member
+- *(integration)* measure the group, not a held write, in version moves
+- *(integration)* ask every member for the voters after restarts
+- *(schema)* cover the refusals of edge identity
+- *(core)* equal starts do not merge independent edge instances
+- *(embed)* rank unfolded and own text writes against a fresh index
+- *(schema)* cover type definitions and repair outcomes
+- *(query)* bound the repairs a backfill page may make
+- *(query)* cover a suffix collision and suffix exhaustion in duplicate repair
+- *(storage)* replay kept cardinality counts once after a power cut
+- *(storage)* race edge commits through the whole pipeline
+- *(storage)* first edges into different pairs share an upper bound
+- *(storage)* cover kept counts on every commit path
+
+### Bench
+
+- *(embed)* report text-index resources and recovery
+
 ## v0.7.0 - 2026-10-06
 
 ### Added
