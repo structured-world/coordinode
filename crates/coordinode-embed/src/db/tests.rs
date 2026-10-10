@@ -606,6 +606,78 @@ fn set_vector_build_wait_is_refused_on_the_shared_path() {
     assert_eq!(db.vector_build_wait(), DEFAULT_VECTOR_BUILD_WAIT);
 }
 
+/// `SET query_memory_limit_mb` sets the memory limit of later statements; it
+/// starts at the default, and the API setter is the same knob.
+#[test]
+fn set_query_memory_limit_session() {
+    use coordinode_core::budget::{DEFAULT_QUERY_MEMORY_LIMIT, QUERY_MEMORY_CEILING};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    assert_eq!(db.query_memory_limit(), DEFAULT_QUERY_MEMORY_LIMIT);
+
+    let rows = db
+        .execute_cypher("SET query_memory_limit_mb = 512")
+        .expect("set 512");
+    assert!(rows.is_empty());
+    assert_eq!(db.query_memory_limit(), 512 << 20);
+
+    db.execute_cypher("set QUERY_MEMORY_LIMIT_MB = '4096'")
+        .expect("case, quotes and the ceiling itself");
+    assert_eq!(db.query_memory_limit(), QUERY_MEMORY_CEILING);
+
+    db.set_query_memory_limit(1 << 20).expect("one MiB");
+    assert_eq!(db.query_memory_limit(), 1 << 20);
+}
+
+/// A limit of zero, past the ceiling, or not a whole number of MiB is refused
+/// with an error naming the setting, and leaves the limit as it was.
+#[test]
+fn set_query_memory_limit_invalid_value_is_refused() {
+    use coordinode_core::budget::{DEFAULT_QUERY_MEMORY_LIMIT, QUERY_MEMORY_CEILING};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+    for bad in ["0", "4097", "'lots'", "1.5", "-1", "99999999999999999999"] {
+        let refused = db.execute_cypher(&format!("SET query_memory_limit_mb = {bad}"));
+        assert!(
+            matches!(
+                &refused,
+                Err(DatabaseError::SessionSetting(SessionSettingRefused {
+                    setting,
+                    ..
+                })) if setting.starts_with("query_memory_limit")
+            ),
+            "{bad}: {refused:?}"
+        );
+    }
+    assert_eq!(db.query_memory_limit(), DEFAULT_QUERY_MEMORY_LIMIT);
+    assert!(db.set_query_memory_limit(0).is_err());
+    assert!(db.set_query_memory_limit(QUERY_MEMORY_CEILING + 1).is_err());
+    assert_eq!(db.query_memory_limit(), DEFAULT_QUERY_MEMORY_LIMIT);
+}
+
+/// A statement naming a memory limit past the ceiling is refused before it
+/// runs; one within it runs.
+#[test]
+fn a_statement_memory_limit_past_the_ceiling_is_refused() {
+    use coordinode_core::budget::QUERY_MEMORY_CEILING;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let over = StatementOptions {
+        query_memory_limit: Some(QUERY_MEMORY_CEILING + 1),
+        ..StatementOptions::default()
+    };
+    assert!(matches!(
+        db.execute_cypher_shared_with("RETURN 1 AS x", None, None, &over),
+        Err(DatabaseError::SessionSetting(_))
+    ));
+    let within = StatementOptions {
+        query_memory_limit: Some(1 << 20),
+        ..StatementOptions::default()
+    };
+    db.execute_cypher_shared_with("RETURN 1 AS x", None, None, &within)
+        .expect("within the ceiling");
+}
+
 #[test]
 fn extension_op_dispatches_through_database() {
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -330,6 +330,11 @@ pub struct Database {
     /// `SET vector_build_wait` or [`Database::set_vector_build_wait`]; the
     /// server sets it from its configuration.
     vector_build_wait: Duration,
+    /// Memory limit of each statement in bytes, unless the statement names
+    /// its own. Set by `SET query_memory_limit_mb` or
+    /// [`Database::set_query_memory_limit`]; the server sets it from its
+    /// configuration.
+    query_memory_limit: u64,
     /// Session-level read concern. Default: Local.
     read_concern: coordinode_core::txn::read_concern::ReadConcernLevel,
     /// One-shot snapshot timestamp for the next query (consumed on use).
@@ -566,6 +571,19 @@ pub enum SessionSetting {
     VectorConsistency(VectorConsistencyMode),
     /// `SET vector_build_wait = '5s'`.
     VectorBuildWait(Duration),
+    /// `SET query_memory_limit_mb = 512`: the memory limit of each later
+    /// statement, in bytes, at most the administrative ceiling.
+    QueryMemoryLimit(u64),
+}
+
+/// A session SET naming a known setting with a value it cannot take.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{setting}: {reason}")]
+pub struct SessionSettingRefused {
+    /// The setting named.
+    pub setting: &'static str,
+    /// Why the value was refused.
+    pub reason: String,
 }
 
 /// What one statement runs under where its caller decides it, in place of
@@ -583,6 +601,12 @@ pub struct StatementOptions {
     /// Bound on waiting for a vector index still being built, below a hint
     /// the query names.
     pub vector_build_wait: Option<Duration>,
+    /// Memory limit of this statement in bytes, at most
+    /// [`coordinode_core::budget::QUERY_MEMORY_CEILING`].
+    pub query_memory_limit: Option<u64>,
+    /// When this statement must have finished: a client's deadline. Work past
+    /// it stops with a deadline error.
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +626,40 @@ struct QuerySession {
     /// statements; set to the queued event's generation when the dispatcher
     /// runs a trigger body so enqueued child events are stamped `generation + 1`.
     after_commit_generation: u32,
+    /// The statement's execution budget, bound here, before it is planned.
+    budget: Arc<coordinode_core::budget::QueryBudget>,
+}
+
+/// Nanoseconds on the process's monotonic clock: the clock statement
+/// deadlines are read on.
+fn monotonic_nanos() -> u64 {
+    // no-std: the embedding host's monotonic clock.
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    // u64 nanoseconds from the first statement span over 580 years.
+    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The budget of one statement: `limit` bytes of query memory, ending at
+/// `deadline` when there is one.
+fn statement_budget(
+    limit: u64,
+    deadline: Option<Instant>,
+) -> Arc<coordinode_core::budget::QueryBudget> {
+    let budget = coordinode_core::budget::QueryBudget::new(limit);
+    Arc::new(match deadline {
+        Some(deadline) => {
+            // The deadline on the same clock `monotonic_nanos` reads; one
+            // already past is the clock's present, so the first check stops.
+            let now = monotonic_nanos();
+            let left = deadline.saturating_duration_since(Instant::now());
+            // A deadline beyond the clock's range is no deadline in practice:
+            // the top of the range is never reached.
+            let at = now.saturating_add(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX));
+            budget.with_deadline(at, monotonic_nanos)
+        }
+        None => budget,
+    })
 }
 
 /// Error from embedded database operations.
@@ -618,6 +676,10 @@ pub enum DatabaseError {
 
     #[error("execution error: {0}")]
     Execution(#[from] ExecutionError),
+
+    /// A session SET named a known setting with a value it cannot take.
+    #[error(transparent)]
+    SessionSetting(#[from] SessionSettingRefused),
 
     #[error("semantic error: {0}")]
     Semantic(String),
@@ -1176,6 +1238,7 @@ impl Database {
             pipeline,
             vector_consistency: None,
             vector_build_wait: DEFAULT_VECTOR_BUILD_WAIT,
+            query_memory_limit: coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
             read_concern: coordinode_core::txn::read_concern::ReadConcernLevel::default(),
             snapshot_read_ts: None,
             cached_stats: Mutex::new(None),
@@ -1576,6 +1639,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
+            budget: statement_budget(self.query_memory_limit, None),
         }
     }
 
@@ -1587,17 +1651,21 @@ impl Database {
     /// Lifts SET handling out of `execute_cypher_impl` so the impl
     /// can stay on `&self`; this method needs `&mut self` because it
     /// mutates the session default field.
-    fn try_apply_session_set(&mut self, query: &str) -> bool {
-        match Self::parse_session_set(query) {
+    fn try_apply_session_set(&mut self, query: &str) -> Result<bool, DatabaseError> {
+        match Self::parse_session_set(query).transpose()? {
             Some(SessionSetting::VectorConsistency(mode)) => {
                 self.vector_consistency = Some(mode);
-                true
+                Ok(true)
             }
             Some(SessionSetting::VectorBuildWait(wait)) => {
                 self.vector_build_wait = wait;
-                true
+                Ok(true)
             }
-            None => false,
+            Some(SessionSetting::QueryMemoryLimit(bytes)) => {
+                self.query_memory_limit = bytes;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -1610,7 +1678,7 @@ impl Database {
         query: &str,
         source: &SourceContext,
     ) -> Result<Vec<Row>, DatabaseError> {
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
@@ -1640,7 +1708,7 @@ impl Database {
         } else {
             Some(params)
         };
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
@@ -1692,7 +1760,7 @@ impl Database {
     /// Automatically tracks query fingerprint and execution time in the
     /// query advisor registry for performance analysis.
     pub fn execute_cypher(&mut self, query: &str) -> Result<Vec<Row>, DatabaseError> {
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
@@ -1740,7 +1808,7 @@ impl Database {
         } else {
             Some(params)
         };
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(Vec::new());
         }
         let session = self.capture_session();
@@ -1774,7 +1842,7 @@ impl Database {
         read_concern: Option<coordinode_core::txn::read_concern::ReadConcern>,
         write_concern: Option<coordinode_core::txn::write_concern::WriteConcern>,
     ) -> Result<CypherResult, DatabaseError> {
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(CypherResult {
                 rows: Vec::new(),
                 write_stats: WriteStats::default(),
@@ -1902,6 +1970,7 @@ impl Database {
             vector_consistency: options.vector_consistency.or(self.vector_consistency),
             vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
+            budget: self.options_budget(options)?,
         };
         let params = params.filter(|p| !p.is_empty());
         // On error the state is intentionally NOT re-parked → transaction aborts.
@@ -2487,6 +2556,7 @@ impl Database {
             vector_consistency: options.vector_consistency.or(self.vector_consistency),
             vector_build_wait: options.vector_build_wait.unwrap_or(self.vector_build_wait),
             after_commit_generation: 0,
+            budget: self.options_budget(options)?,
         };
         if let Some(rc) = &options.read_concern {
             rc.validate()
@@ -2546,6 +2616,7 @@ impl Database {
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: 0,
+            budget: statement_budget(self.query_memory_limit, None),
         };
         let params = params.filter(|p| !p.is_empty());
         let mut paging = Some(ScanPaging {
@@ -2639,7 +2710,7 @@ impl Database {
             .validate()
             .map_err(|e| DatabaseError::Semantic(e.to_string()))?;
 
-        if self.try_apply_session_set(query) {
+        if self.try_apply_session_set(query)? {
             return Ok(Vec::new());
         }
 
@@ -2933,6 +3004,7 @@ impl Database {
                 nplus1: Arc::clone(&self.nplus1_detector),
                 dismissed: Arc::clone(&self.dismissed),
             }),
+            budget: Arc::clone(&session.budget),
             txn,
             vector_consistency: plan.vector_consistency,
             vector_overfetch_factor: 1.2,
@@ -3769,12 +3841,14 @@ impl Database {
 
     /// The session setting `query` changes, when it is a session SET command.
     ///
-    /// Supports `SET vector_consistency = 'mode'` and
-    /// `SET vector_build_wait = '5s'`. `None` for anything else, including a
-    /// value the setting cannot take: the text then goes to the Cypher parser,
-    /// which refuses it. Run on every statement, so a statement that is not a
-    /// SET costs a prefix comparison and no allocation.
-    pub fn parse_session_set(query: &str) -> Option<SessionSetting> {
+    /// Supports `SET vector_consistency = 'mode'`,
+    /// `SET vector_build_wait = '5s'` and `SET query_memory_limit_mb = 512`.
+    /// `None` for anything else, including a vector setting's value it cannot
+    /// take: the text then goes to the Cypher parser, which refuses it. A
+    /// memory limit past the administrative ceiling is refused here, naming
+    /// the ceiling. Run on every statement, so a statement that is not a SET
+    /// costs a prefix comparison and no allocation.
+    pub fn parse_session_set(query: &str) -> Option<Result<SessionSetting, SessionSettingRefused>> {
         let trimmed = query.trim();
         if !trimmed
             .get(..4)
@@ -3799,13 +3873,89 @@ impl Database {
 
         let name = name.trim();
         if name.eq_ignore_ascii_case("vector_consistency") {
-            VectorConsistencyMode::from_str_opt(unquoted).map(SessionSetting::VectorConsistency)
+            VectorConsistencyMode::from_str_opt(unquoted)
+                .map(|mode| Ok(SessionSetting::VectorConsistency(mode)))
         } else if name.eq_ignore_ascii_case("vector_build_wait") {
-            coordinode_query::cypher::parse_wait(unquoted).map(SessionSetting::VectorBuildWait)
+            coordinode_query::cypher::parse_wait(unquoted)
+                .map(|wait| Ok(SessionSetting::VectorBuildWait(wait)))
+        } else if name.eq_ignore_ascii_case("query_memory_limit_mb") {
+            Some(query_memory_limit_from_mib(unquoted).map(SessionSetting::QueryMemoryLimit))
         } else {
             None
         }
     }
+
+    /// Set the memory limit of each later statement, in bytes, as
+    /// `SET query_memory_limit_mb` does. A statement that names its own
+    /// limit keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionSettingRefused`] for zero or a limit past
+    /// [`coordinode_core::budget::QUERY_MEMORY_CEILING`]; the limit is left
+    /// as it was.
+    pub fn set_query_memory_limit(&mut self, bytes: u64) -> Result<(), SessionSettingRefused> {
+        self.query_memory_limit = checked_query_memory_limit(bytes)?;
+        Ok(())
+    }
+
+    /// The memory limit of each statement that names none, in bytes.
+    pub fn query_memory_limit(&self) -> u64 {
+        self.query_memory_limit
+    }
+
+    /// The budget of a statement run under `options`: its own memory limit
+    /// or the database's, and its deadline.
+    fn options_budget(
+        &self,
+        options: &StatementOptions,
+    ) -> Result<Arc<coordinode_core::budget::QueryBudget>, DatabaseError> {
+        let limit = match options.query_memory_limit {
+            Some(bytes) => checked_query_memory_limit(bytes)?,
+            None => self.query_memory_limit,
+        };
+        Ok(statement_budget(limit, options.deadline))
+    }
+}
+
+/// `bytes` as a statement memory limit: positive and at most the
+/// administrative ceiling.
+///
+/// # Errors
+///
+/// [`SessionSettingRefused`] naming the bound it breaks.
+pub fn checked_query_memory_limit(bytes: u64) -> Result<u64, SessionSettingRefused> {
+    use coordinode_core::budget::QUERY_MEMORY_CEILING;
+    if bytes == 0 {
+        return Err(SessionSettingRefused {
+            setting: "query_memory_limit",
+            reason: "a statement needs a positive memory limit".into(),
+        });
+    }
+    if bytes > QUERY_MEMORY_CEILING {
+        return Err(SessionSettingRefused {
+            setting: "query_memory_limit",
+            reason: format!(
+                "{bytes} bytes is past the administrative ceiling of {QUERY_MEMORY_CEILING} bytes"
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+/// A `query_memory_limit_mb` value, in MiB, as a memory limit in bytes.
+fn query_memory_limit_from_mib(text: &str) -> Result<u64, SessionSettingRefused> {
+    let mib: u64 = text.trim().parse().map_err(|_| SessionSettingRefused {
+        setting: "query_memory_limit_mb",
+        reason: format!("'{text}' is not a whole number of MiB"),
+    })?;
+    let bytes = mib
+        .checked_mul(1 << 20)
+        .ok_or_else(|| SessionSettingRefused {
+            setting: "query_memory_limit_mb",
+            reason: format!("{mib} MiB does not fit in bytes"),
+        })?;
+    checked_query_memory_limit(bytes)
 }
 
 mod after_commit;

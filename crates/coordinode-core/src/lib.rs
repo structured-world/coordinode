@@ -9,6 +9,7 @@ extern crate alloc;
 /// within a domain.
 pub const ERROR_DOMAIN: &str = "coordinode.sw.foundation";
 
+pub mod budget;
 pub mod graph;
 pub mod group;
 pub mod index;

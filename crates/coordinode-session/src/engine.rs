@@ -57,11 +57,12 @@ pub trait CursorEngine: Send + Sync {
     ) -> Result<Box<dyn QueryCursor>, EngineError>;
 
     /// The change to its session's settings `query` makes, when it is a
-    /// dialect's session SET command; `None` for any other statement. Called
-    /// for every statement on the session's own task, so it must be cheap and
-    /// must not block: a SET takes effect before the next statement is
-    /// dispatched, as a Configure does.
-    fn session_setting(&self, _query: &str) -> Option<ConnectionSettings> {
+    /// dialect's session SET command; `None` for any other statement, and an
+    /// error for a SET whose value the setting cannot take, which then
+    /// changes nothing. Called for every statement on the session's own
+    /// task, so it must be cheap and must not block: a SET takes effect
+    /// before the next statement is dispatched, as a Configure does.
+    fn session_setting(&self, _query: &str) -> Option<Result<ConnectionSettings, EngineError>> {
         None
     }
 

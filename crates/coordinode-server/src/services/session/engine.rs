@@ -94,7 +94,8 @@ impl DatabaseCursorEngine {
             EngineError::internal(format!("no runtime to reach the leader on: {e}"))
         })?;
         let response = runtime
-            .block_on(self.executor.forward(leader_id, request, source))
+            // A session statement carries no call deadline; its stream lives on.
+            .block_on(self.executor.forward(leader_id, request, source, None))
             .map_err(|s| EngineError(failure(&s)))?
             .into_inner();
         Ok(Box::new(MaterializedCursor {
@@ -111,16 +112,23 @@ impl DatabaseCursorEngine {
 }
 
 impl CursorEngine for DatabaseCursorEngine {
-    fn session_setting(&self, query: &str) -> Option<ConnectionSettings> {
+    fn session_setting(&self, query: &str) -> Option<Result<ConnectionSettings, EngineError>> {
         Database::parse_session_set(query).map(|setting| match setting {
-            SessionSetting::VectorConsistency(mode) => ConnectionSettings {
+            Ok(SessionSetting::VectorConsistency(mode)) => Ok(ConnectionSettings {
                 vector_consistency: Some(mode),
                 ..ConnectionSettings::default()
-            },
-            SessionSetting::VectorBuildWait(wait) => ConnectionSettings {
+            }),
+            Ok(SessionSetting::VectorBuildWait(wait)) => Ok(ConnectionSettings {
                 vector_build_wait: Some(wait),
                 ..ConnectionSettings::default()
-            },
+            }),
+            Ok(SessionSetting::QueryMemoryLimit(bytes)) => Ok(ConnectionSettings {
+                query_memory_limit: Some(bytes),
+                ..ConnectionSettings::default()
+            }),
+            Err(refused) => Err(EngineError(failure(
+                &crate::services::cypher::db_error_to_status(refused.into()),
+            ))),
         })
     }
 
@@ -146,6 +154,7 @@ impl CursorEngine for DatabaseCursorEngine {
             let options = StatementOptions {
                 vector_consistency: settings.vector_consistency,
                 vector_build_wait: settings.vector_build_wait,
+                query_memory_limit: settings.query_memory_limit,
                 ..StatementOptions::default()
             };
             let rows = self
@@ -306,6 +315,10 @@ fn requested(settings: &ConnectionSettings) -> Requested {
         write_concern: settings.write_concern,
         vector_consistency: settings.vector_consistency,
         vector_build_wait: settings.vector_build_wait,
+        query_memory_limit: settings.query_memory_limit,
+        // A session statement has no call deadline of its own; the session's
+        // stream lives on, and Cancel stops a statement.
+        deadline: None,
     }
 }
 
@@ -339,6 +352,9 @@ fn forwarded_request(
             .vector_consistency
             .map_or(0, vector_consistency_to_proto),
         vector_build_wait_ms: settings.vector_build_wait.map(build_wait_ms),
+        query_memory_limit_mb: settings
+            .query_memory_limit
+            .and_then(|bytes| u32::try_from(bytes >> 20).ok()),
     }
 }
 

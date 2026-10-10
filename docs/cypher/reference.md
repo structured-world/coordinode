@@ -1053,14 +1053,22 @@ being built under the `block` online-during-build policy; see
 
 ### Session settings: `SET`
 
-`SET vector_consistency = '...'` and `SET vector_build_wait = '...'` change a
-setting of the session that sends them, below the query's own hint. An
-embedded database is one session. On a server the setting belongs to the
-client's Session stream and reaches only its statements; the Session's
-`Configure` frame changes the same two settings and reports them. A unary
-`ExecuteCypher` call has no session, so it refuses a `SET` with
-`FAILED_PRECONDITION`; it names the settings for that one statement in its
-`vector_consistency` and `vector_build_wait_ms` fields instead.
+`SET vector_consistency = '...'`, `SET vector_build_wait = '...'` and
+`SET query_memory_limit_mb = 512` change a setting of the session that sends
+them, below the query's own hint. An embedded database is one session. On a
+server the setting belongs to the client's Session stream and reaches only its
+statements; the Session's `Configure` frame changes the same settings and
+reports them. A unary `ExecuteCypher` call has no session, so it refuses a
+`SET` with `FAILED_PRECONDITION`; it names the settings for that one statement
+in its `vector_consistency`, `vector_build_wait_ms` and
+`query_memory_limit_mb` fields instead.
+
+`query_memory_limit_mb` is the memory, in MiB, each later statement may hold
+at once; it starts at the server's `query_memory_limit_mb` (256). A value of
+`0`, past the 4096 MiB ceiling, or not a whole number is refused with
+`INVALID_ARGUMENT` naming the setting, and the limit stays as it was. A
+statement that needs more fails with `RESOURCE_EXHAUSTED`, reason
+`EXCEEDS_MEMORY_BUDGET`, and returns no rows.
 
 ### `read_consistency`
 

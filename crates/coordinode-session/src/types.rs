@@ -94,6 +94,9 @@ pub struct ConnectionSettings {
     /// How long a statement waits for a vector index still being built, when
     /// its query names no bound in a hint.
     pub vector_build_wait: Option<Duration>,
+    /// Memory limit of each statement, in bytes, at most the server's
+    /// administrative ceiling.
+    pub query_memory_limit: Option<u64>,
 }
 
 impl ConnectionSettings {
@@ -126,6 +129,9 @@ impl ConnectionSettings {
         }
         if change.vector_build_wait.is_some() {
             self.vector_build_wait = change.vector_build_wait;
+        }
+        if change.query_memory_limit.is_some() {
+            self.query_memory_limit = change.query_memory_limit;
         }
     }
 

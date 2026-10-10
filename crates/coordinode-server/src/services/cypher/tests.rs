@@ -2548,6 +2548,113 @@ fn a_duplicate_key_maps_to_already_exists_with_the_holder() {
     assert!(details.retry_info().is_none(), "terminal: no retry advice");
 }
 
+/// A spent statement budget answers with the class a caller acts on: memory
+/// is RESOURCE_EXHAUSTED / EXCEEDS_MEMORY_BUDGET with the three numbers and no
+/// retry advice, a deadline DEADLINE_EXCEEDED, a cancellation CANCELLED. None
+/// is INTERNAL, which would page someone over a query that asked too much.
+#[test]
+fn a_spent_budget_maps_to_its_own_class() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_query::executor::runner::ExecutionError;
+    use tonic_types::StatusExt;
+
+    let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Budget(
+        BudgetStop::Memory {
+            requested: 4096,
+            used: 1_000_000,
+            limit: 1 << 20,
+        },
+    )));
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    let details = status.get_error_details();
+    let info = details.error_info().expect("ErrorInfo expected");
+    assert_eq!(info.reason, "EXCEEDS_MEMORY_BUDGET");
+    let meta = |k: &str| info.metadata.get(k).map(String::as_str);
+    assert_eq!(meta("requested_bytes"), Some("4096"));
+    assert_eq!(meta("used_bytes"), Some("1000000"));
+    assert_eq!(meta("limit_bytes"), Some("1048576"));
+    assert!(
+        details.retry_info().is_none(),
+        "the same statement at the same limit is refused again"
+    );
+
+    for (stop, code, reason) in [
+        (
+            BudgetStop::Deadline,
+            tonic::Code::DeadlineExceeded,
+            "QUERY_DEADLINE_EXCEEDED",
+        ),
+        (
+            BudgetStop::Cancelled,
+            tonic::Code::Cancelled,
+            "QUERY_CANCELLED",
+        ),
+    ] {
+        let status = db_error_to_status(DatabaseError::Execution(ExecutionError::Budget(stop)));
+        assert_eq!(status.code(), code, "{status:?}");
+        let info = status
+            .get_error_details()
+            .error_info()
+            .cloned()
+            .expect("ErrorInfo expected");
+        assert_eq!(info.reason, reason);
+    }
+}
+
+/// A memory limit past the ceiling, or zero, is the caller's error naming the
+/// field; one within it is taken as bytes.
+#[test]
+fn a_request_memory_limit_is_checked_against_the_ceiling() {
+    use tonic_types::StatusExt;
+
+    assert_eq!(memory_limit_from_proto(None).expect("absent"), None);
+    assert_eq!(
+        memory_limit_from_proto(Some(512)).expect("within"),
+        Some(512 << 20)
+    );
+    assert_eq!(
+        memory_limit_from_proto(Some(4096)).expect("the ceiling itself"),
+        Some(4096 << 20)
+    );
+    for bad in [0, 4097, u32::MAX] {
+        let status = memory_limit_from_proto(Some(bad)).expect_err("refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{bad}");
+        let info = status
+            .get_error_details()
+            .error_info()
+            .cloned()
+            .expect("ErrorInfo expected");
+        assert_eq!(info.reason, "INVALID_FIELD");
+        assert_eq!(
+            info.metadata.get("field").map(String::as_str),
+            Some("query_memory_limit_mb")
+        );
+    }
+}
+
+/// `grpc-timeout` sets the statement's deadline; a header that does not
+/// follow the gRPC format sets none.
+#[test]
+fn the_grpc_timeout_is_the_statement_deadline() {
+    use tonic::metadata::{MetadataMap, MetadataValue};
+    let with = |value: &'static str| {
+        let mut metadata = MetadataMap::new();
+        metadata.insert("grpc-timeout", MetadataValue::from_static(value));
+        metadata
+    };
+    let before = std::time::Instant::now();
+    let deadline = grpc_deadline(&with("1500m")).expect("milliseconds");
+    let after = std::time::Instant::now();
+    assert!(deadline >= before + Duration::from_millis(1500));
+    assert!(deadline <= after + Duration::from_millis(1500));
+    assert!(grpc_deadline(&with("2S")).is_some());
+    assert!(grpc_deadline(&with("10n")).is_some());
+    assert!(grpc_deadline(&MetadataMap::new()).is_none());
+    for bad in ["", "S", "15", "1x", "123456789S", "-1S", "1.5S"] {
+        assert!(grpc_deadline(&with(bad)).is_none(), "{bad:?}");
+    }
+}
+
 /// A unique value not proved free while its index is being built is
 /// UNAVAILABLE / UNIQUENESS_UNRESOLVED with the index and the limit, and a
 /// retry delay: it is not a duplicate, and the same write succeeds once the

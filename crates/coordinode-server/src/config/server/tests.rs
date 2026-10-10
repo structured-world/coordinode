@@ -227,6 +227,18 @@ fn vector_build_wait_parses_from_the_config_file() {
     assert_eq!(c.vector_build_wait_ms, Some(1500));
 }
 
+/// The statement memory limit is unset by default (the engine's 256 MiB) and
+/// read from the config file in MiB.
+#[test]
+fn query_memory_limit_parses_from_the_config_file() {
+    assert!(ServerConfig::default().query_memory_limit_mb.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(&path, "query_memory_limit_mb: 1024\n").unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.query_memory_limit_mb, Some(1024));
+}
+
 /// The statement defaults: a file that names none keeps the built-in local
 /// read from the leader and the majority journaled write.
 #[test]

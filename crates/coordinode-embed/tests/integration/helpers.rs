@@ -137,6 +137,14 @@ pub fn admit_index(
     def
 }
 
+/// The budget a hand-built test context runs under: the default memory
+/// limit, no deadline.
+fn test_budget() -> std::sync::Arc<coordinode_core::budget::QueryBudget> {
+    std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(
+        coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+    ))
+}
+
 /// Build an ExecutionContext in legacy mode (no MVCC, no oracle).
 ///
 /// Used by tests that write directly to engine without MVCC versioning.
@@ -179,6 +187,7 @@ pub fn make_ctx_legacy<'a>(
         ),
         procedures: None,
         advisor: None,
+        budget: test_budget(),
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -252,6 +261,7 @@ pub fn make_ctx_mvcc<'a>(
         ),
         procedures: None,
         advisor: None,
+        budget: test_budget(),
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,
@@ -326,6 +336,7 @@ pub fn make_ctx_with_pipeline<'a>(
         ),
         procedures: None,
         advisor: None,
+        budget: test_budget(),
         vector_consistency: VectorConsistencyMode::default(),
         vector_overfetch_factor: 1.2,
         vector_mvcc_stats: None,

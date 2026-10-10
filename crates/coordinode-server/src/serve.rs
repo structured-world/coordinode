@@ -201,6 +201,7 @@ pub(crate) async fn serve(
         planner_stats_ttl_secs,
         slow_query_ms,
         vector_build_wait_ms,
+        query_memory_limit_mb,
         vector_retired_bytes_budget,
         index_build_max_running,
         index_build_older_transactions_wait_secs,
@@ -722,6 +723,16 @@ pub(crate) async fn serve(
     }
     if let Some(ms) = vector_build_wait_ms {
         database.set_vector_build_wait(std::time::Duration::from_millis(ms));
+    }
+    if let Some(mib) = query_memory_limit_mb {
+        // Refused at start rather than clamped: an operator who wrote a
+        // limit past the ceiling meant something the server cannot honour.
+        let bytes = mib
+            .checked_mul(1 << 20)
+            .ok_or_else(|| format!("query_memory_limit_mb = {mib} does not fit in bytes"))?;
+        database
+            .set_query_memory_limit(bytes)
+            .map_err(|e| format!("query_memory_limit_mb = {mib}: {e}"))?;
     }
     if let Some(bytes) = vector_retired_bytes_budget {
         // A budget past the address space is no bound at all, which is what

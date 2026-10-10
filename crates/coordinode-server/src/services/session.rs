@@ -421,6 +421,7 @@ fn settings_from_proto(c: &Configure) -> Result<ConnectionSettings, Status> {
             .transpose()?
             .flatten(),
         vector_build_wait: build_wait(c.vector_build_wait_ms),
+        query_memory_limit: super::cypher::memory_limit_from_proto(c.query_memory_limit_mb)?,
     })
 }
 
@@ -447,9 +448,11 @@ fn statement_settings(e: &Execute) -> Result<ConnectionSettings, Status> {
             .transpose()?
             .filter(|&preference| preference != 0),
         drain_timeout_ms: None,
-        // A statement names its vector settings in a hint in its query.
+        // A statement names its vector settings in a hint in its query, and
+        // runs under its session's memory limit.
         vector_consistency: None,
         vector_build_wait: None,
+        query_memory_limit: None,
     })
 }
 
@@ -509,6 +512,10 @@ fn settings_to_proto(s: &ConnectionSettings) -> Configure {
         drain_timeout_ms: s.drain_timeout_ms,
         vector_consistency: s.vector_consistency.map(vector_consistency_to_proto),
         vector_build_wait_ms: s.vector_build_wait.map(build_wait_ms),
+        // Set in whole MiB within the 4096 MiB ceiling, so it fits.
+        query_memory_limit_mb: s
+            .query_memory_limit
+            .and_then(|bytes| u32::try_from(bytes >> 20).ok()),
     }
 }
 

@@ -125,11 +125,17 @@ struct RecordingEngine {
 }
 
 impl CursorEngine for RecordingEngine {
-    fn session_setting(&self, query: &str) -> Option<ConnectionSettings> {
-        (query == "SET exact").then(|| ConnectionSettings {
-            vector_consistency: Some(coordinode_core::graph::types::VectorConsistencyMode::Exact),
-            ..ConnectionSettings::default()
-        })
+    fn session_setting(&self, query: &str) -> Option<Result<ConnectionSettings, EngineError>> {
+        match query {
+            "SET exact" => Some(Ok(ConnectionSettings {
+                vector_consistency: Some(
+                    coordinode_core::graph::types::VectorConsistencyMode::Exact,
+                ),
+                ..ConnectionSettings::default()
+            })),
+            "SET refused" => Some(Err(EngineError::internal("no such value"))),
+            _ => None,
+        }
     }
 
     fn open_cursor(
@@ -208,6 +214,52 @@ async fn a_session_set_changes_only_its_session() {
         Some(VectorConsistencyMode::Exact)
     );
     assert_eq!(seen["other session"].vector_consistency, None);
+}
+
+/// A SET the engine refuses answers with that error, never with an empty
+/// result, and leaves the session's settings as they were: the statement
+/// after it runs under the earlier SET.
+#[tokio::test]
+async fn a_refused_set_is_an_error_and_changes_nothing() {
+    let recording = Arc::new(RecordingEngine::default());
+    let statement = |query: &str| SessionOp::Execute {
+        query: query.to_string(),
+        params: HashMap::new(),
+        txid: 0,
+        nonce: 0,
+        settings: ConnectionSettings::default(),
+        source: None,
+    };
+
+    let by_id = run_session(
+        Arc::clone(&recording) as Arc<dyn CursorEngine>,
+        vec![
+            statement("SET exact"),
+            statement("SET refused"),
+            statement("after"),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(by_id[&2].as_slice(), [SessionEvent::Error(failure)] if failure.message.contains("no such value")),
+        "{:?}",
+        by_id[&2]
+    );
+
+    let seen: HashMap<String, ConnectionSettings> = recording
+        .seen
+        .lock()
+        .iter()
+        .map(|(query, (settings, _))| (query.clone(), settings.clone()))
+        .collect();
+    assert!(
+        !seen.contains_key("SET refused"),
+        "a SET never runs as a query"
+    );
+    assert_eq!(
+        seen["after"].vector_consistency,
+        Some(coordinode_core::graph::types::VectorConsistencyMode::Exact)
+    );
 }
 
 /// A statement reaches the engine with its session's settings, its own in

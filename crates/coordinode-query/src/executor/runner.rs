@@ -83,6 +83,11 @@ pub enum ExecutionError {
     #[error(transparent)]
     IndexMarkNotDurable(#[from] crate::index::MarkNotDurable),
 
+    /// The query spent its execution budget: its memory limit, its deadline,
+    /// or it was cancelled. Nothing it produced so far is a complete answer.
+    #[error("{0}")]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
+
     /// Arithmetic with no answer: division or modulo by an integer zero, or an
     /// integer operation whose exact result leaves the `i64` range. Carries the
     /// message verbatim, so a driver sees the same text it would elsewhere.
@@ -861,6 +866,10 @@ pub struct ExecutionContext<'a> {
     /// Advisor state the `db.advisor.*` procedures read and reset; `None`
     /// makes them unavailable.
     pub advisor: Option<crate::advisor::AdvisorContext>,
+    /// The request's execution budget, bound when it was admitted: every
+    /// access path, alternative plan and operator of the statement spends
+    /// from it. Shared so whoever admitted the request can cancel it.
+    pub budget: std::sync::Arc<coordinode_core::budget::QueryBudget>,
 
     /// Vector MVCC consistency mode. Controls how vector search interacts
     /// with snapshot isolation. Default: `Current` (no visibility filter).

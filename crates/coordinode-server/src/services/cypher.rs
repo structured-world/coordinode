@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 // no-std: spin::RwLock (drop-in).
 use parking_lot::RwLock;
@@ -325,6 +326,39 @@ pub(crate) fn db_error_to_status(err: DatabaseError) -> Status {
         }
         // Not a duplicate: the value may be free. UNAVAILABLE, since the
         // same write succeeds once the build covers the stored nodes.
+        // A spent budget is not a server fault: the statement asked for more
+        // than its limit, or for longer than its caller waits.
+        DatabaseError::Execution(ExecutionError::Budget(stop)) => {
+            use coordinode_core::budget::BudgetStop;
+            return match stop {
+                BudgetStop::Memory {
+                    requested,
+                    used,
+                    limit,
+                } => status_with_reason(
+                    Code::ResourceExhausted,
+                    rendered,
+                    Reason::ExceedsMemoryBudget,
+                    [
+                        ("requested_bytes", requested.to_string()),
+                        ("used_bytes", used.to_string()),
+                        ("limit_bytes", limit.to_string()),
+                    ],
+                ),
+                BudgetStop::Deadline => status_with_reason(
+                    Code::DeadlineExceeded,
+                    rendered,
+                    Reason::QueryDeadlineExceeded,
+                    [],
+                ),
+                BudgetStop::Cancelled => {
+                    status_with_reason(Code::Cancelled, rendered, Reason::QueryCancelled, [])
+                }
+            };
+        }
+        DatabaseError::SessionSetting(refused) => {
+            return super::error_details::invalid_field(refused.setting, refused.reason.clone());
+        }
         DatabaseError::Execution(ExecutionError::UniquenessUnresolved { index, limit }) => {
             return status_with_reason(
                 Code::Unavailable,
@@ -776,9 +810,47 @@ impl CypherServiceImpl {
     }
 }
 
+/// When a call carrying `metadata` must have finished: its `grpc-timeout`
+/// from now, or `None` without one. The header is the gRPC over HTTP/2
+/// format, at most eight ASCII digits and a unit (`H`, `M`, `S`, `m`, `u`,
+/// `n`); a malformed one sets no deadline, as tonic itself treats it.
+pub(crate) fn grpc_deadline(metadata: &tonic::metadata::MetadataMap) -> Option<std::time::Instant> {
+    let text = metadata.get("grpc-timeout")?.to_str().ok()?;
+    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    let timeout = match unit {
+        "H" => Duration::from_secs(value.checked_mul(3600)?),
+        "M" => Duration::from_secs(value.checked_mul(60)?),
+        "S" => Duration::from_secs(value),
+        "m" => Duration::from_millis(value),
+        "u" => Duration::from_micros(value),
+        "n" => Duration::from_nanos(value),
+        _ => return None,
+    };
+    std::time::Instant::now().checked_add(timeout)
+}
+
+/// The memory limit a request names in MiB, as bytes within the ceiling.
+pub(crate) fn memory_limit_from_proto(mib: Option<u32>) -> Result<Option<u64>, Status> {
+    let Some(mib) = mib else {
+        return Ok(None);
+    };
+    coordinode_embed::db::checked_query_memory_limit(u64::from(mib) << 20)
+        .map(Some)
+        .map_err(|refused| {
+            super::error_details::invalid_field("query_memory_limit_mb", refused.to_string())
+        })
+}
+
 /// The settings a unary request names, as the executor takes them. A level,
 /// preference or concern left unspecified is `None`: the server's default.
-fn requested_from_proto(req: &query::ExecuteCypherRequest) -> Result<Requested, Status> {
+fn requested_from_proto(
+    req: &query::ExecuteCypherRequest,
+    deadline: Option<std::time::Instant>,
+) -> Result<Requested, Status> {
     let rc = req.read_concern.as_ref();
     Ok(Requested {
         read_concern: match rc {
@@ -795,6 +867,8 @@ fn requested_from_proto(req: &query::ExecuteCypherRequest) -> Result<Requested, 
             .transpose()?,
         vector_consistency: vector_consistency("vector_consistency", req.vector_consistency)?,
         vector_build_wait: build_wait(req.vector_build_wait_ms),
+        query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
+        deadline,
     })
 }
 
@@ -810,6 +884,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
         // on again. Two nodes with stale hints would otherwise trade it back
         // and forth while the client waits.
         let already_forwarded = request.metadata().contains_key(FORWARDED_HEADER);
+        let deadline = grpc_deadline(request.metadata());
         let req = request.into_inner();
 
         let start = std::time::Instant::now();
@@ -825,11 +900,17 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             } else {
                 Some(convert_params(&req.parameters))
             };
+            let options = coordinode_embed::db::StatementOptions {
+                query_memory_limit: memory_limit_from_proto(req.query_memory_limit_mb)?,
+                deadline,
+                ..Default::default()
+            };
             let rows = super::blocking(|| {
-                self.database().read().execute_in_transaction(
+                self.database().read().execute_in_transaction_with(
                     req.transaction_id,
                     &req.query,
                     params,
+                    &options,
                 )
             })
             .map_err(db_error_to_status)?;
@@ -876,7 +957,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
 
         // Resolve and check the settings, fence the read and wait for the
         // causal position. A statement that needs the leader is passed there.
-        let requested = requested_from_proto(&req)?;
+        let requested = requested_from_proto(&req, deadline)?;
         let admitted = match self
             .executor
             .admit(&req.query, &requested, already_forwarded)
@@ -886,7 +967,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
             Admission::Forward(leader_id) => {
                 return self
                     .executor
-                    .forward(leader_id, req, source_ctx.as_ref())
+                    .forward(leader_id, req, source_ctx.as_ref(), deadline)
                     .await;
             }
         };
@@ -913,7 +994,7 @@ impl query::cypher_service_server::CypherService for CypherServiceImpl {
                         Some(leader_id) if !already_forwarded => {
                             return self
                                 .executor
-                                .forward(leader_id, req, source_ctx.as_ref())
+                                .forward(leader_id, req, source_ctx.as_ref(), deadline)
                                 .await;
                         }
                         _ => return Err(db_error_to_status(e)),

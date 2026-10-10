@@ -166,6 +166,17 @@ pub enum Reason {
     /// validated, a dependency that forbids it. Nothing changed. Terminal
     /// until that state changes.
     CatalogChangeRefused,
+    /// The statement needed more memory than its limit allows. Nothing it
+    /// produced is returned and nothing was written. Metadata carries
+    /// `requested_bytes`, `used_bytes` and `limit_bytes`. Terminal at that
+    /// limit: raise `query_memory_limit_mb`, or narrow the query.
+    ExceedsMemoryBudget,
+    /// The statement ran past its deadline and was stopped. Nothing it
+    /// produced is returned.
+    QueryDeadlineExceeded,
+    /// The statement was cancelled and stopped. Nothing it produced is
+    /// returned.
+    QueryCancelled,
 }
 
 impl Reason {
@@ -202,6 +213,9 @@ impl Reason {
             Reason::CatalogObjectExists => "CATALOG_OBJECT_EXISTS",
             Reason::CatalogObjectNotFound => "CATALOG_OBJECT_NOT_FOUND",
             Reason::CatalogChangeRefused => "CATALOG_CHANGE_REFUSED",
+            Reason::ExceedsMemoryBudget => "EXCEEDS_MEMORY_BUDGET",
+            Reason::QueryDeadlineExceeded => "QUERY_DEADLINE_EXCEEDED",
+            Reason::QueryCancelled => "QUERY_CANCELLED",
         }
     }
 

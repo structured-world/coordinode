@@ -55,6 +55,11 @@ pub(crate) struct Requested {
     /// Bound on waiting for a vector index still being built, below a hint in
     /// the query; `None` takes the server's.
     pub vector_build_wait: Option<Duration>,
+    /// Memory limit of the statement in bytes, already within the ceiling;
+    /// `None` takes the server's.
+    pub query_memory_limit: Option<u64>,
+    /// When the caller stops waiting for the statement: its gRPC deadline.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// A statement whose settings are resolved and consistent, not yet fenced.
@@ -65,6 +70,8 @@ pub(crate) struct Checked {
     write_concern: Option<WriteConcern>,
     vector_consistency: Option<VectorConsistencyMode>,
     vector_build_wait: Option<Duration>,
+    query_memory_limit: Option<u64>,
+    deadline: Option<std::time::Instant>,
 }
 
 /// A statement this node may run, with what the fence learned about it.
@@ -79,6 +86,10 @@ pub(crate) struct Admitted {
     /// Vector build-wait bound below a hint in the query; `None` = the
     /// database's.
     pub vector_build_wait: Option<Duration>,
+    /// Memory limit of the statement in bytes; `None` = the database's.
+    pub query_memory_limit: Option<u64>,
+    /// When the caller stops waiting for the statement.
+    pub deadline: Option<std::time::Instant>,
     /// The applied log index the read was served at; zero outside a cluster.
     pub applied_index: u64,
     /// Whether this node led when it served the statement.
@@ -95,6 +106,8 @@ impl Admitted {
             write_concern: self.write_concern,
             vector_consistency: self.vector_consistency,
             vector_build_wait: self.vector_build_wait,
+            query_memory_limit: self.query_memory_limit,
+            deadline: self.deadline,
         }
     }
 }
@@ -267,6 +280,8 @@ impl StatementExecutor {
             write_concern: requested.write_concern,
             vector_consistency: requested.vector_consistency,
             vector_build_wait: requested.vector_build_wait,
+            query_memory_limit: requested.query_memory_limit,
+            deadline: requested.deadline,
         })
     }
 
@@ -278,6 +293,8 @@ impl StatementExecutor {
             write_concern: checked.write_concern,
             vector_consistency: checked.vector_consistency,
             vector_build_wait: checked.vector_build_wait,
+            query_memory_limit: checked.query_memory_limit,
+            deadline: checked.deadline,
             applied_index: 0,
             served_by_leader: false,
             read_as_of_ts: 0,
@@ -333,6 +350,8 @@ impl StatementExecutor {
             write_concern: checked.write_concern,
             vector_consistency: checked.vector_consistency,
             vector_build_wait: checked.vector_build_wait,
+            query_memory_limit: checked.query_memory_limit,
+            deadline: checked.deadline,
             applied_index,
             served_by_leader,
             read_as_of_ts: fence.as_of().unwrap_or(0),
@@ -416,12 +435,14 @@ impl StatementExecutor {
     /// noticing one: the node that knows who leads passes the request along.
     /// The response carries the hop count, so a client that does care can see
     /// it and start addressing the leader directly. `source` travels along,
-    /// so the leader's advisor counts the statement where it was issued.
+    /// so the leader's advisor counts the statement where it was issued, and
+    /// so does what is left of the caller's `deadline`.
     pub(crate) async fn forward(
         &self,
         leader_id: u64,
         req: query::ExecuteCypherRequest,
         source: Option<&SourceContext>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Response<query::ExecuteCypherResponse>, Status> {
         let addr = self
             .raft_node
@@ -440,6 +461,10 @@ impl StatementExecutor {
             FORWARDED_HEADER,
             tonic::metadata::MetadataValue::from_static("1"),
         );
+        if let Some(deadline) = deadline {
+            // Already past: the leader stops it at its first check.
+            forwarded.set_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
         if let Some(source) = source {
             let line = source.line.to_string();
             for (key, value) in [

@@ -588,6 +588,9 @@ impl CoordinodeClient {
             // server's defaults.
             vector_consistency: 0,
             vector_build_wait_ms: None,
+            // The server's memory limit; a session's `SET query_memory_limit_mb`
+            // names another.
+            query_memory_limit_mb: None,
         });
 
         if let Some(loc) = location {

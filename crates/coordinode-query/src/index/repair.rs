@@ -200,6 +200,11 @@ fn attempt(
         mvcc_read_ts: read_ts,
         procedures: None,
         advisor: None,
+        // One statement over one duplicate value: the default limit of any
+        // statement, with no deadline of a client to inherit.
+        budget: Arc::new(coordinode_core::budget::QueryBudget::new(
+            coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+        )),
         txn,
         vector_consistency: plan.vector_consistency,
         vector_overfetch_factor: 1.2,

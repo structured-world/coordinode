@@ -384,6 +384,10 @@ impl Database {
             vector_consistency: None,
             vector_build_wait: self.vector_build_wait,
             after_commit_generation: generation,
+            // A trigger body is a statement of its own, under the database's
+            // limit; it outlives the statement that queued it, so it has no
+            // client deadline to inherit.
+            budget: super::statement_budget(self.query_memory_limit, None),
         };
         let params = if params.is_empty() {
             None

@@ -189,6 +189,13 @@ impl Session {
         // settings: those are every other session's too.
         if let SessionOp::Execute { query, .. } = &op {
             if let Some(change) = self.engine.session_setting(query) {
+                let change = match change {
+                    Ok(change) => change,
+                    Err(refused) => {
+                        send_error(out, request_id, refused.0).await;
+                        return;
+                    }
+                };
                 self.settings.lock().apply(&change);
                 let opened = SessionEvent::CursorOpen {
                     columns: Vec::new(),

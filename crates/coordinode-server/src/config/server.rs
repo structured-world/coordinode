@@ -288,6 +288,12 @@ pub struct ServerConfig {
     /// the `block` policy, when it names no bound of its own, in milliseconds
     /// (`None` = 30000). A query's `vector_build_wait` hint overrides it.
     pub vector_build_wait_ms: Option<u64>,
+    /// Memory limit of each statement, in MiB (`None` = 256): what its
+    /// operators, access paths and buffered results may hold at once. At most
+    /// the 4096 MiB administrative ceiling; a session's
+    /// `SET query_memory_limit_mb` or a request's `query_memory_limit_mb`
+    /// names another, never past the ceiling.
+    pub query_memory_limit_mb: Option<u64>,
     /// Bytes of replaced neighbour lists each vector index lets wait for
     /// reclamation before its writers hold off until running searches finish
     /// (`None` = 256 MiB).
@@ -477,6 +483,7 @@ impl Default for ServerConfig {
             planner_stats_ttl_secs: None,
             slow_query_ms: None,
             vector_build_wait_ms: None,
+            query_memory_limit_mb: None,
             vector_retired_bytes_budget: None,
             index_build_max_running: None,
             index_build_older_transactions_wait_secs: None,

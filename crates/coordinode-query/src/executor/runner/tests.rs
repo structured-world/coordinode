@@ -388,6 +388,9 @@ fn make_ctx<'a>(
         mvcc_read_ts: coordinode_core::txn::timestamp::Timestamp::ZERO,
         procedures: None,
         advisor: None,
+        budget: std::sync::Arc::new(coordinode_core::budget::QueryBudget::new(
+            coordinode_core::budget::DEFAULT_QUERY_MEMORY_LIMIT,
+        )),
         txn: Transaction::new(
             engine,
             None,
