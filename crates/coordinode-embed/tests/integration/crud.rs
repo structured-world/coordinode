@@ -2951,6 +2951,28 @@ fn redirect_edges_temporal_moves_all_versions() {
 
 // ── TRIGGER DDL ──────────────────────────────────────
 
+/// A second trigger of a name in use is refused as a name that already
+/// exists, not as a write conflict: retrying it cannot succeed, so it must not
+/// read as a contention the caller should retry.
+#[test]
+fn a_trigger_of_a_name_in_use_is_refused_as_existing() {
+    use coordinode_query::executor::runner::{CatalogObject, ExecutionError};
+    let mut db = open_db();
+    let ddl = "CREATE TRIGGER audit ON :User CREATE AFTER COMMIT EXECUTE CREATE (e:AuditEntry)";
+    db.execute_cypher(ddl).expect("create");
+    let err = db.execute_cypher(ddl).expect_err("the name is taken");
+    assert!(
+        matches!(
+            err,
+            coordinode_embed::DatabaseError::Execution(ExecutionError::CatalogObjectExists {
+                object: CatalogObject::Trigger,
+                ref name,
+            }) if name == "audit"
+        ),
+        "got {err:?}"
+    );
+}
+
 /// Full DDL lifecycle: CREATE → SHOW finds it → ALTER updates it → DROP
 /// removes it → SHOW returns empty.
 #[test]

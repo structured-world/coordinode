@@ -52,6 +52,7 @@ pub enum CatalogObject {
     EdgeType,
     Constraint,
     Index,
+    Trigger,
 }
 
 impl std::fmt::Display for CatalogObject {
@@ -61,6 +62,7 @@ impl std::fmt::Display for CatalogObject {
             Self::EdgeType => "edge type",
             Self::Constraint => "constraint",
             Self::Index => "index",
+            Self::Trigger => "trigger",
         })
     }
 }
@@ -18009,10 +18011,10 @@ fn execute_create_trigger(
         .get_definition(&mut ctx.txn, &c.name)?
         .is_some()
     {
-        return Err(ExecutionError::Conflict(format!(
-            "trigger `{}` already exists; use DROP TRIGGER first or ALTER it",
-            c.name
-        )));
+        return Err(ExecutionError::CatalogObjectExists {
+            object: CatalogObject::Trigger,
+            name: c.name.clone(),
+        });
     }
 
     validate_trigger_body_source(&c.name, &c.body_source)?;
