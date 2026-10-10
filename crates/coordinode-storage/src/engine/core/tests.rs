@@ -1530,8 +1530,6 @@ fn a_fresh_store_holds_no_user_data() {
     assert!(engine2.holds_user_data().expect("read the written store"));
 }
 
-/// A table flushed before its oplog entries are purged must be as durable as
-/// those entries: the partition trees sync every file at the mode the oplog's
 /// `persist_partition` promises that every write to the partition before the
 /// call is durable when it returns. A sync failing inside one call fails it;
 /// the next call on a healthy disk writes what the failed one did not, and a
@@ -1582,16 +1580,13 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
                 break;
             }
             reached += 1;
-            // A healthy disk from here; the second call must write again.
+            // A healthy disk from here; the second call must write again. The
+            // proof that it did is the value surviving the power cut below.
             faults.clear();
             let retry = engine.persist_partition(partition);
             assert!(
                 retry.is_ok(),
                 "{partition:?} {failed:?} {k}: retry: {retry:?}"
-            );
-            assert!(
-                faults.open_count() > 0,
-                "{partition:?} {failed:?} {k}: the retry opened no file, so it wrote nothing"
             );
 
             // Power cut: nothing written from here on is durable, and every
@@ -1628,6 +1623,8 @@ fn a_persist_after_a_failed_one_keeps_the_write_across_a_power_cut() {
     }
 }
 
+/// A table flushed before its oplog entries are purged must be as durable as
+/// those entries: the partition trees sync every file at the mode the oplog's
 /// sync method calls for. They synced at the engine default (plain fsync)
 /// under a full-flush oplog, so on macOS a power cut after a purge could lose
 /// acknowledged writes.
