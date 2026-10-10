@@ -6541,3 +6541,55 @@ fn cascade_reset_clears_fanout_counts() {
         .expect("fanout counter cleared");
     ctx.cascade_exit();
 }
+
+/// A lookup answered from the records is refused only under work outside
+/// the statement's budget: an operator the executor does not count, named
+/// by the first one found, whether it runs beside the lookup or inside a
+/// subquery an accounted operator evaluates. A plan of accounted operators
+/// has none.
+#[test]
+fn the_first_unaccounted_operator_is_found_beside_and_inside() {
+    use crate::plan::expr::{BinOp, Expr};
+    use crate::planner::logical::LogicalPlan;
+    let scan = || LogicalOp::NodeScan {
+        variable: "u".into(),
+        labels: vec!["U".into()],
+        property_filters: vec![("email".into(), Expr::Literal(Value::String("a".into())))],
+    };
+    let extension = || LogicalOp::Extension {
+        name: "ext".into(),
+        payload: Vec::new(),
+    };
+    let subplan = |root| {
+        Box::new(LogicalPlan {
+            root,
+            snapshot_ts: None,
+            vector_consistency: Default::default(),
+            read_consistency: Default::default(),
+        })
+    };
+    let filtered = |predicate| LogicalOp::Filter {
+        input: Box::new(scan()),
+        predicate,
+    };
+
+    assert_eq!(
+        first_unaccounted_operator(&filtered(Expr::ExistsSubplan(subplan(scan())))),
+        None
+    );
+    assert_eq!(
+        first_unaccounted_operator(&LogicalOp::Union {
+            inputs: vec![scan(), extension()],
+            all: true,
+        }),
+        Some("Extension")
+    );
+    assert_eq!(
+        first_unaccounted_operator(&filtered(Expr::Binary {
+            left: Box::new(Expr::Literal(Value::Bool(true))),
+            op: BinOp::And,
+            right: Box::new(Expr::ExistsSubplan(subplan(extension()))),
+        })),
+        Some("Extension")
+    );
+}

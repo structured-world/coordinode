@@ -301,6 +301,12 @@ pub trait Procedure: Send + Sync {
     /// Run the procedure. `args` match the signature's inputs one for one,
     /// defaults filled in and values coerced to the declared types. Each
     /// returned row holds one value per output, in output order.
+    ///
+    /// The procedure runs within the statement's budget, `ctx.budget`: it
+    /// counts the work that grows with its data and reserves what it holds
+    /// before allocating it, so a deadline, a cancellation or the memory
+    /// limit stops it. The call and the rows it returns are charged by the
+    /// caller.
     fn call(
         &self,
         ctx: &mut ExecutionContext<'_>,

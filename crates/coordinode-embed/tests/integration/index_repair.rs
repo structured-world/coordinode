@@ -838,19 +838,15 @@ fn write_through_wrong_entry(
     }
 }
 
-/// A lookup the index cannot answer is refused before reading the records
-/// when the rest of the statement runs work outside its budget (a procedure
-/// call): it names the index and the operator. Accounted operators over the
-/// same lookup (a traversal, an optional match, a pattern subquery, an
-/// aggregate, an UPSERT, a relationship MERGE, a detaching delete) answer
-/// from the records exactly as the sound index would; each runs right after
-/// the entry is made wrong again, so each answers from the records. The
-/// writes change the node that holds the value, not the one the wrong entry
-/// named.
+/// A lookup the index cannot answer is answered from the records under every
+/// operator a statement can run over it (a traversal, an optional match, a
+/// pattern subquery, an aggregate, a shortest path, a procedure call, an
+/// UPSERT, a relationship MERGE, a detaching delete), exactly as the sound
+/// index would; each runs right after the entry is made wrong again, so each
+/// answers from the records. The writes change the node that holds the
+/// value, not the one the wrong entry named.
 #[test]
-fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
-    use coordinode_embed::db::DatabaseError;
-    use coordinode_query::executor::runner::ExecutionError;
+fn a_lookup_answered_by_the_records_runs_under_every_accounted_operator() {
     let (mut db, _dir) = open_db();
     db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
         .expect("index");
@@ -865,22 +861,11 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     let shortest =
         "MATCH p = shortestPath((u:U {email: 'a@x'})-[:R*..3]->(t:T)) RETURN length(p) AS n";
 
+    let procedure = "MATCH (u:U {email: 'a@x'}) CALL dbms.procedures() YIELD name \
+                     RETURN count(DISTINCT u) AS n";
+
     let wrong = id_of(&mut db, "z@x");
-    misattribute(&db, "u_email", "a@x", wrong);
-    let refused = db
-        .execute_cypher("MATCH (u:U {email: 'a@x'}) CALL dbms.procedures() YIELD name RETURN name");
-    assert!(
-        matches!(
-            &refused,
-            Err(DatabaseError::Execution(ExecutionError::IndexUnresolved {
-                label,
-                property,
-                operator: "ProcedureCall",
-            })) if label == "U" && property == "email"
-        ),
-        "{refused:?}"
-    );
-    for query in [optional, traverse, exists, count, shortest] {
+    for query in [optional, traverse, exists, count, shortest, procedure] {
         wrong_again(&db, wrong);
         let rows = db.execute_cypher(query).expect("accounted");
         assert_eq!(rows.len(), 1, "{query}");

@@ -3828,6 +3828,35 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::HnswScan { query_vector, .. } => expr_unaccounted(query_vector),
         // The text index search reports every document it scores and reads.
         LogicalOp::TextIndexScan { .. } => None,
+        // Document and node rewrites read their nodes by id, walk adjacency
+        // through charged lists and stage their writes on the transaction.
+        LogicalOp::AttachDocument { input, .. }
+        | LogicalOp::DetachDocument { input, .. }
+        | LogicalOp::RedirectEdges { input, .. } => first_unaccounted_operator(input),
+        LogicalOp::CloneNode {
+            input, set_items, ..
+        } => set_items_unaccounted(set_items).or_else(|| first_unaccounted_operator(input)),
+        LogicalOp::MergeNodes {
+            input, conflict, ..
+        } => match conflict {
+            crate::plan::MergeNodesConflictStrategy::SetExpressions(items) => {
+                set_items_unaccounted(items)
+            }
+            _ => None,
+        }
+        .or_else(|| first_unaccounted_operator(input)),
+        // A procedure runs within the statement's budget by its contract;
+        // its call and its rows are charged as they return.
+        LogicalOp::ProcedureCall {
+            input,
+            args,
+            filter,
+            ..
+        } => args
+            .iter()
+            .chain(filter)
+            .find_map(expr_unaccounted)
+            .or_else(|| first_unaccounted_operator(input)),
         // Fusion scores every row per method, a text method through the
         // charged text search; a document score walks its chunks through
         // the charged hop.
@@ -5214,7 +5243,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             transfer,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_detach_document(
+            let rows = execute_detach_document(
                 &input_rows,
                 source_variable,
                 property_path,
@@ -5224,7 +5253,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *edge_direction,
                 transfer.as_ref(),
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::AttachDocument {
@@ -5239,7 +5269,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             on_remaining_fail,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_attach_document(
+            let rows = execute_attach_document(
                 &input_rows,
                 source_variable,
                 target_variable,
@@ -5250,7 +5280,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 *on_conflict_replace,
                 *on_remaining_fail,
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::MergeNodes {
@@ -5264,7 +5295,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             transfer_edge_properties,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_merge_nodes(
+            let rows = execute_merge_nodes(
                 &input_rows,
                 source_a,
                 source_b,
@@ -5274,7 +5305,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 duplicate,
                 *transfer_edge_properties,
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::CloneNode {
@@ -5287,7 +5319,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             as_of,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_clone_node(
+            let rows = execute_clone_node(
                 &input_rows,
                 source,
                 target,
@@ -5296,7 +5328,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 set_items,
                 as_of.as_ref(),
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::RedirectEdges {
@@ -5307,14 +5340,15 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             direction,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_redirect_edges(
+            let rows = execute_redirect_edges(
                 &input_rows,
                 source,
                 target,
                 edge_types.as_deref(),
                 *direction,
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::RankFuse {
@@ -5361,6 +5395,16 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             execute_doc_score(rows, doc_variable, query_vector, alpha, beta, gamma, ctx)
         }
     }
+}
+
+/// Count the `edges` of an adjacency list a statement walks, a unit each,
+/// and reserve the list it holds while it walks them.
+fn walked_adjacency(
+    budget: &coordinode_core::budget::QueryBudget,
+    edges: usize,
+) -> Result<coordinode_core::budget::MemoryCharge<'_>, ExecutionError> {
+    budget.work(edges as u64)?;
+    Ok(budget.reserve((edges * core::mem::size_of::<u64>()) as u64)?)
 }
 
 /// What a score column (its name and a float value) adds to a row.
@@ -14897,6 +14941,8 @@ fn clone_incident_edges(
         // Outgoing edges a→x  ⇒  b→x  (self-loop a→a ⇒ b→b).
         if let Some(fwd) = ctx.adj_get_fwd(et, a_id)? {
             let targets: Vec<u64> = fwd.iter().collect();
+            let budget = Arc::clone(&ctx.budget);
+            let _walked = walked_adjacency(&budget, targets.len())?;
             for x_uid in targets {
                 let x = NodeId::from_raw(x_uid);
                 let tgt = if x == a_id { b_id } else { x };
@@ -14912,6 +14958,8 @@ fn clone_incident_edges(
         // forward scan, so skip x == a here.
         if let Some(rev) = ctx.adj_get_rev(et, a_id)? {
             let sources: Vec<u64> = rev.iter().collect();
+            let budget = Arc::clone(&ctx.budget);
+            let _walked = walked_adjacency(&budget, sources.len())?;
             for x_uid in sources {
                 let x = NodeId::from_raw(x_uid);
                 if x == a_id {
@@ -15017,23 +15065,29 @@ fn execute_redirect_edges(
         }
 
         // Snapshot every selected type's neighbours BEFORE mutating, so a later
-        // remove never perturbs a list still being read.
+        // remove never perturbs a list still being read. The snapshots are
+        // counted and held while the edges move.
+        let budget = Arc::clone(&ctx.budget);
+        let mut snapped = budget.empty_charge();
         let mut snaps: Vec<RedirectSnap> = Vec::with_capacity(types.len());
         for et in &types {
-            let out_neighbours = if do_out {
+            let out_neighbours: Vec<u64> = if do_out {
                 ctx.adj_get_fwd(et, a_id)?
                     .map(|p| p.iter().collect())
                     .unwrap_or_default()
             } else {
                 Vec::new()
             };
-            let in_neighbours = if do_in {
+            let in_neighbours: Vec<u64> = if do_in {
                 ctx.adj_get_rev(et, a_id)?
                     .map(|p| p.iter().collect())
                     .unwrap_or_default()
             } else {
                 Vec::new()
             };
+            let edges = out_neighbours.len() + in_neighbours.len();
+            budget.work(edges as u64)?;
+            snapped.grow((edges * core::mem::size_of::<u64>()) as u64)?;
             if !out_neighbours.is_empty() || !in_neighbours.is_empty() {
                 snaps.push(RedirectSnap {
                     edge_type: et.clone(),
@@ -15271,6 +15325,8 @@ fn transfer_node_edges(
             // merge_remove on it during the loop would be safe (deferred) but
             // collecting up-front keeps the loop body simpler.
             let peers: Vec<u64> = plist.iter().collect();
+            let budget = Arc::clone(&ctx.budget);
+            let _walked = walked_adjacency(&budget, peers.len())?;
             let target_plist = match direction {
                 AdjDirection::Out => ctx.adj_get_fwd(edge_type, target_id),
                 AdjDirection::In => ctx.adj_get_rev(edge_type, target_id),
@@ -16202,6 +16258,8 @@ fn transfer_edges_on_node(
         // Forward: source is the edge source.
         if let Some(plist) = ctx.adj_get_fwd(edge_type, source_id)? {
             let peers: Vec<u64> = plist.iter().collect();
+            let budget = Arc::clone(&ctx.budget);
+            let _walked = walked_adjacency(&budget, peers.len())?;
             for peer_uid in peers {
                 let peer_id = NodeId::from_raw(peer_uid);
                 // Remove source → peer
@@ -16219,6 +16277,8 @@ fn transfer_edges_on_node(
         // Reverse: source is the edge target.
         if let Some(plist) = ctx.adj_get_rev(edge_type, source_id)? {
             let peers: Vec<u64> = plist.iter().collect();
+            let budget = Arc::clone(&ctx.budget);
+            let _walked = walked_adjacency(&budget, peers.len())?;
             for peer_uid in peers {
                 let peer_id = NodeId::from_raw(peer_uid);
                 ctx.adj_merge_remove_rev(edge_type, source_id, peer_uid);
@@ -19924,11 +19984,17 @@ fn execute_procedure_call(
         for arg in args {
             arg_values.push(eval_neutral_with_storage(arg, &row, ctx)?);
         }
+        // The procedure counts its own work through the context's budget;
+        // the call and the rows it returns are counted and held here.
+        ctx.budget.work(1)?;
         let results = callee.call(ctx, bind_arguments(signature, arg_values)?)?;
         if signature.outputs.is_empty() {
             out.push(row);
             continue;
         }
+        let budget = Arc::clone(&ctx.budget);
+        let _results =
+            budget.reserve(results.iter().flatten().map(Value::held_bytes).sum::<u64>())?;
         for result in results {
             if result.len() != signature.outputs.len() {
                 return Err(ProcedureError::OutputShape {
