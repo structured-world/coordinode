@@ -4911,11 +4911,10 @@ fn execute_node_scan(
     {
         return Ok(rows);
     }
-    let mut results = Vec::new();
 
     // A COLUMNAR table's rows live in its own columnar tree, not the node path;
     // scan there at the read snapshot. The (key, value) shape matches the node
-    // prefix scan, so the decode loop below is shared verbatim.
+    // prefix scan, so the rows fold the same way.
     let columnar_label = labels.first().and_then(|l| {
         ctx.load_current_label_schema(l)
             .ok()
@@ -4925,155 +4924,260 @@ fn execute_node_scan(
     });
 
     // Scan all nodes in the shard using prefix scan. The Layer-4 store owns
-    // the node-key shape; the query layer just runs the tracked prefix scan.
+    // the node-key shape; the query layer just runs the prefix scan.
     use coordinode_modality::{LocalNodeStore, NodeStore as _};
     let prefix_bytes = LocalNodeStore.shard_scan_prefix(ctx.shard_id);
     ctx.sync_txn_state();
-    // Keyset-paged source (server-side cursor) when `scan_paging` is set;
-    // otherwise the whole-prefix scan. The decode loop below is identical.
-    let scan_results = if let Some(label) = columnar_label {
-        ctx.engine
-            .columnar_scan(&label, ctx.mvcc_read_ts.as_raw())?
-    } else {
-        match ctx
-            .scan_paging
-            .as_ref()
-            .map(|p| (p.resume.clone(), p.limit))
-        {
-            Some((resume, limit)) => {
-                let mut page = LocalNodeStore.prefix_scan_paged_tracked(
-                    &mut ctx.txn,
-                    &prefix_bytes,
-                    resume.as_deref(),
-                    limit,
+    // The schemas the pattern's rows are built from are read before the
+    // scan holds the transaction.
+    for label in labels {
+        cache_label_schema(label, ctx)?;
+    }
+    // Its own handle: rows kept stay charged after this scan lets go of the
+    // statement.
+    let budget = Arc::clone(&ctx.budget);
+    let mut fold = NodeScanFold::new(
+        (variable, labels, property_filters),
+        (ctx.instant_for(variable), ctx.timeline_fields()),
+        &budget,
+    );
+    let paging = ctx
+        .scan_paging
+        .as_ref()
+        .map(|p| (p.resume.clone(), p.limit));
+    if let Some(label) = columnar_label {
+        let env = NodeRowEnv::of(ctx);
+        ctx.engine.columnar_for_each(
+            &label,
+            ctx.mvcc_read_ts.as_raw(),
+            &budget,
+            |key, value| fold.row(key, value, &env),
+        )?;
+    } else if let Some((resume, limit)) = paging {
+        // Keyset-paged source (server-side cursor): one page held at a time.
+        let mut page = LocalNodeStore.prefix_scan_paged_tracked(
+            &mut ctx.txn,
+            &prefix_bytes,
+            resume.as_deref(),
+            limit,
+        )?;
+        let mut page_charge =
+            budget.reserve(page.rows.iter().map(|(k, v)| kv_bytes(k, v)).sum())?;
+        // A page that ends inside one temporal node's versions would
+        // project a partial timeline: read that node's versions whole and
+        // resume after the last of them.
+        if !page.exhausted {
+            let cut = page
+                .rows
+                .last()
+                .and_then(|(key, _)| decode_temporal_node_key(key));
+            if let Some((shard, node_id, _)) = cut {
+                let mut all: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                LocalNodeStore.prefix_for_each(
+                    &ctx.txn,
+                    &LocalNodeStore.version_prefix(shard, node_id),
+                    &budget,
+                    |key, value| {
+                        page_charge.grow(kv_bytes(key, value))?;
+                        all.push((key.to_vec(), value.to_vec()));
+                        Ok::<(), ExecutionError>(())
+                    },
                 )?;
-                // A page that ends inside one temporal node's versions would
-                // project a partial timeline: read that node's versions whole
-                // and resume after the last of them.
-                if !page.exhausted {
-                    let cut = page
-                        .rows
-                        .last()
-                        .and_then(|(key, _)| decode_temporal_node_key(key));
-                    if let Some((shard, node_id, _)) = cut {
-                        let all = LocalNodeStore.prefix_scan_tracked(
-                            &mut ctx.txn,
-                            &LocalNodeStore.version_prefix(shard, node_id),
-                        )?;
-                        page.rows.retain(|(key, _)| {
-                            decode_temporal_node_key(key).is_none_or(|(_, id, _)| id != node_id)
-                        });
-                        page.last_key = all.last().map(|(key, _)| key.clone());
-                        page.rows.extend(all);
-                    }
-                }
-                if let Some(paging) = ctx.scan_paging.as_mut() {
-                    paging.last_key = page.last_key;
-                    paging.exhausted = page.exhausted;
-                }
-                page.rows
+                page.rows.retain(|(key, _)| {
+                    decode_temporal_node_key(key).is_none_or(|(_, id, _)| id != node_id)
+                });
+                page.last_key = all.last().map(|(key, _)| key.clone());
+                page.rows.extend(all);
             }
-            None => LocalNodeStore.prefix_scan_tracked(&mut ctx.txn, &prefix_bytes)?,
         }
-    };
+        if let Some(paging) = ctx.scan_paging.as_mut() {
+            paging.last_key = page.last_key;
+            paging.exhausted = page.exhausted;
+        }
+        let env = NodeRowEnv::of(ctx);
+        for (key, value) in &page.rows {
+            budget.work(1)?;
+            fold.row(key, value, &env)?;
+        }
+    } else {
+        let env = NodeRowEnv::of(ctx);
+        LocalNodeStore.prefix_for_each(&ctx.txn, &prefix_bytes, &budget, |key, value| {
+            fold.row(key, value, &env)
+        })?;
+    }
+    fold.finish(ctx)
+}
 
-    // A temporal node's versions sort together under its id; they are
-    // gathered and the node contributes the state valid at the instant this
-    // variable reads at, or nothing.
-    let at = ctx.instant_for(variable);
-    let fields = ctx.timeline_fields();
-    let mut versions: Vec<(i64, NodeRecord)> = Vec::new();
-    let mut versions_of: Option<NodeId> = None;
-    let decode = |value_bytes: &[u8]| {
-        NodeRecord::from_msgpack(value_bytes)
-            .map_err(|e| ExecutionError::Serialization(format!("node deserialization error: {e}")))
-    };
-    for (key_bytes, value_bytes) in &scan_results {
-        let temporal = decode_temporal_node_key(key_bytes);
+/// Bytes a scanned `(key, value)` pair holds.
+fn kv_bytes(key: &[u8], value: &[u8]) -> u64 {
+    // Lengths of memory that exists: their sum fits in u64.
+    (key.len() + value.len()) as u64
+}
+
+/// The rows of a node scan, built while its records stream past and charged
+/// to the query's budget as they are kept: what the scan examines is never
+/// held beyond the record in hand.
+struct NodeScanFold<'s, 'b> {
+    variable: &'s str,
+    labels: &'s [String],
+    property_filters: &'s [(String, crate::plan::expr::Expr)],
+    /// The instant this variable reads a temporal node at.
+    at: i64,
+    fields: crate::executor::temporal_read::TimelineFields,
+    results: Vec<Row>,
+    /// Pays for `results`, the versions being gathered and `deferred`.
+    kept: coordinode_core::budget::MemoryCharge<'b>,
+    /// A temporal node's versions, which sort together under its id; the
+    /// node contributes the state valid at `at`, or nothing.
+    versions: Vec<(i64, NodeRecord)>,
+    versions_bytes: u64,
+    versions_of: Option<NodeId>,
+    /// Records whose primary label's schema was not loaded when they streamed
+    /// past, with the position of their row among `results`: built once the
+    /// scan lets go of the transaction.
+    deferred: Vec<(usize, u64, NodeRecord)>,
+}
+
+impl<'s, 'b> NodeScanFold<'s, 'b> {
+    fn new(
+        (variable, labels, property_filters): (
+            &'s str,
+            &'s [String],
+            &'s [(String, crate::plan::expr::Expr)],
+        ),
+        (at, fields): (i64, crate::executor::temporal_read::TimelineFields),
+        budget: &'b coordinode_core::budget::QueryBudget,
+    ) -> Self {
+        Self {
+            variable,
+            labels,
+            property_filters,
+            at,
+            fields,
+            results: Vec::new(),
+            kept: budget.empty_charge(),
+            versions: Vec::new(),
+            versions_bytes: 0,
+            versions_of: None,
+            deferred: Vec::new(),
+        }
+    }
+
+    /// Fold one scanned row in.
+    fn row(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        env: &NodeRowEnv<'_>,
+    ) -> Result<(), ExecutionError> {
+        let temporal = decode_temporal_node_key(key);
         // A record of another label is passed over by its labels alone,
         // read before the properties: most of a shard scan for one label is
         // other labels' records, whose properties need not be decoded.
         if temporal.is_none()
-            && !labels.is_empty()
-            && NodeRecord::labels_from_msgpack(value_bytes)
-                .is_ok_and(|stored| !labels.iter().all(|l| stored.contains(l)))
+            && !self.labels.is_empty()
+            && NodeRecord::labels_from_msgpack(value)
+                .is_ok_and(|stored| !self.labels.iter().all(|l| stored.contains(l)))
         {
-            continue;
+            return Ok(());
         }
-        let record = decode(value_bytes)?;
+        let record = NodeRecord::from_msgpack(value).map_err(|e| {
+            ExecutionError::Serialization(format!("node deserialization error: {e}"))
+        })?;
         if let Some((_, node_id, valid_from)) = temporal {
-            if versions_of != Some(node_id) {
-                if let Some(previous) = versions_of.replace(node_id) {
-                    push_temporal_state(
-                        &mut results,
-                        previous,
-                        std::mem::take(&mut versions),
-                        (at, fields),
-                        (variable, labels, property_filters),
-                        ctx,
-                    )?;
+            if self.versions_of != Some(node_id) {
+                if let Some(previous) = self.versions_of.replace(node_id) {
+                    self.flush_versions(previous, env)?;
                 }
             }
-            versions.push((valid_from, record));
-            continue;
+            let bytes = record.held_bytes();
+            self.kept.grow(bytes)?;
+            self.versions_bytes += bytes;
+            self.versions.push((valid_from, record));
+            return Ok(());
         }
-        if let Some(previous) = versions_of.take() {
-            push_temporal_state(
-                &mut results,
-                previous,
-                std::mem::take(&mut versions),
-                (at, fields),
-                (variable, labels, property_filters),
-                ctx,
-            )?;
+        if let Some(previous) = self.versions_of.take() {
+            self.flush_versions(previous, env)?;
         }
-        let node_id = decode_node_id_from_key(key_bytes);
+        self.state(decode_node_id_from_key(key), record, env)
+    }
+
+    /// The row of the node `versions_of` named, from its gathered versions.
+    fn flush_versions(
+        &mut self,
+        node_id: NodeId,
+        env: &NodeRowEnv<'_>,
+    ) -> Result<(), ExecutionError> {
+        let versions = std::mem::take(&mut self.versions);
+        let held = std::mem::take(&mut self.versions_bytes);
+        let state =
+            crate::executor::temporal_read::state_at(versions, self.at, self.fields).positive();
+        let result = match state {
+            Some((_, record)) => self.state(node_id.as_raw(), record, env),
+            None => Ok(()),
+        };
+        self.kept.shrink(held);
+        result
+    }
+
+    /// Keep the row of the node `record` is, if it matches the pattern.
+    fn state(
+        &mut self,
+        node_id: u64,
+        record: NodeRecord,
+        env: &NodeRowEnv<'_>,
+    ) -> Result<(), ExecutionError> {
+        if !has_all_labels(&record, self.labels) {
+            return Ok(());
+        }
+        if !env.can_build(&record) {
+            self.kept.grow(record.held_bytes())?;
+            self.deferred.push((self.results.len(), node_id, record));
+            return Ok(());
+        }
         if let Some(row) =
-            node_row_if_matching(variable, labels, node_id, &record, property_filters, ctx)?
+            node_row_from(self.variable, node_id, &record, self.property_filters, env)?
         {
-            results.push(row);
+            self.keep(row)?;
         }
-    }
-    if let Some(previous) = versions_of {
-        push_temporal_state(
-            &mut results,
-            previous,
-            versions,
-            (at, fields),
-            (variable, labels, property_filters),
-            ctx,
-        )?;
+        Ok(())
     }
 
-    Ok(results)
-}
-
-/// Add the row for one temporal node's gathered `versions`: its state valid
-/// at the read instant, when that state is live and matches the pattern.
-fn push_temporal_state(
-    results: &mut Vec<Row>,
-    node_id: NodeId,
-    versions: Vec<(i64, NodeRecord)>,
-    (at, fields): (i64, crate::executor::temporal_read::TimelineFields),
-    (variable, labels, property_filters): (&str, &[String], &[(String, crate::plan::expr::Expr)]),
-    ctx: &mut ExecutionContext<'_>,
-) -> Result<(), ExecutionError> {
-    let Some((_, record)) =
-        crate::executor::temporal_read::state_at(versions, at, fields).positive()
-    else {
-        return Ok(());
-    };
-    if let Some(row) = node_row_if_matching(
-        variable,
-        labels,
-        node_id.as_raw(),
-        &record,
-        property_filters,
-        ctx,
-    )? {
-        results.push(row);
+    fn keep(&mut self, row: Row) -> Result<(), ExecutionError> {
+        self.kept.grow(crate::executor::row::row_held_bytes(&row))?;
+        self.results.push(row);
+        Ok(())
     }
-    Ok(())
+
+    /// The scan's rows, in key order, once it has let go of the
+    /// transaction. They stay charged for the rest of the query, which
+    /// holds them in its later stages.
+    fn finish(mut self, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>, ExecutionError> {
+        if let Some(previous) = self.versions_of.take() {
+            let env = NodeRowEnv::of(ctx);
+            self.flush_versions(previous, &env)?;
+        }
+        // From the last, so the positions of the earlier ones still hold.
+        while let Some((position, node_id, record)) = self.deferred.pop() {
+            let bytes = record.held_bytes();
+            cache_label_schema(record.primary_label(), ctx)?;
+            let row = node_row_from(
+                self.variable,
+                node_id,
+                &record,
+                self.property_filters,
+                &NodeRowEnv::of(ctx),
+            )?;
+            drop(record);
+            self.kept.shrink(bytes);
+            if let Some(row) = row {
+                self.kept.grow(crate::executor::row::row_held_bytes(&row))?;
+                self.results.insert(position, row);
+            }
+        }
+        self.kept.keep_until_query_ends();
+        Ok(self.results)
+    }
 }
 
 /// Append to `out` the instant each `temporal_active_at(n, t)` conjunct of
@@ -5161,11 +5265,64 @@ fn node_row_if_matching(
     if !has_all_labels(record, labels) {
         return Ok(None);
     }
+    cache_label_schema(record.primary_label(), ctx)?;
+    node_row_from(
+        variable,
+        node_id,
+        record,
+        property_filters,
+        &NodeRowEnv::of(ctx),
+    )
+}
 
+/// Load the schema of `label` into the statement's cache, once.
+fn cache_label_schema(label: &str, ctx: &mut ExecutionContext<'_>) -> Result<(), ExecutionError> {
+    if !ctx.label_schema_cache.contains_key(label) {
+        let schema = ctx.load_current_label_schema(label)?;
+        ctx.label_schema_cache.insert(label.to_string(), schema);
+    }
+    Ok(())
+}
+
+/// What building a node's row reads of its statement, none of it mutable:
+/// a scan can build rows while it holds the statement's transaction.
+struct NodeRowEnv<'e> {
+    interner: &'e FieldInterner,
+    schemas: &'e HashMap<String, Option<LabelSchema>>,
+    valid_now: i64,
+    correlated_row: Option<&'e Row>,
+}
+
+impl<'e> NodeRowEnv<'e> {
+    fn of(ctx: &'e ExecutionContext<'_>) -> Self {
+        Self {
+            interner: ctx.interner,
+            schemas: &ctx.label_schema_cache,
+            valid_now: ctx.valid_now,
+            correlated_row: ctx.correlated_row.as_ref(),
+        }
+    }
+
+    /// Whether `record`'s row can be built here: its primary label's schema,
+    /// which its computed properties come from, is loaded.
+    fn can_build(&self, record: &NodeRecord) -> bool {
+        self.schemas.contains_key(record.primary_label())
+    }
+}
+
+/// [`node_row_if_matching`] for a record that carries every label of the
+/// pattern and whose primary label's schema `env` holds.
+fn node_row_from(
+    variable: &str,
+    node_id: u64,
+    record: &NodeRecord,
+    property_filters: &[(String, crate::plan::expr::Expr)],
+    env: &NodeRowEnv<'_>,
+) -> Result<Option<Row>, ExecutionError> {
     let mut row = Row::new();
     row.insert(variable.to_string(), Value::Int(node_id as i64));
     for (field_id, value) in &record.props {
-        if let Some(field_name) = ctx.interner.resolve(*field_id) {
+        if let Some(field_name) = env.interner.resolve(*field_id) {
             row.insert(format!("{variable}.{field_name}"), value.clone());
         }
     }
@@ -5176,7 +5333,9 @@ fn node_row_if_matching(
         }
     }
     let primary_label = insert_label_columns(&mut row, variable, record);
-    inject_computed_properties(&mut row, variable, &primary_label, ctx)?;
+    if let Some(Some(schema)) = env.schemas.get(&primary_label) {
+        inject_computed_from_schema(&mut row, variable, schema, env.valid_now);
+    }
 
     // Inline property filters. Inside a correlated join (e.g. `UNWIND ... AS
     // e MATCH (a {p: e.x})`) a filter value can reference outer bindings, so
@@ -5187,7 +5346,7 @@ fn node_row_if_matching(
             .get(&format!("{variable}.{prop_name}"))
             .cloned()
             .unwrap_or(Value::Null);
-        let expected = match &ctx.correlated_row {
+        let expected = match env.correlated_row {
             Some(corr) => {
                 let mut eval_row = corr.clone();
                 eval_row.extend(row.clone());

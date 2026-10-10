@@ -1,5 +1,26 @@
 use super::*;
 
+/// What a value holds grows with what it allocated, through nesting: a
+/// budget charging a scalar's size for a long string or a deep document
+/// would let a query keep far more than its limit.
+#[test]
+fn held_bytes_counts_what_a_value_allocated() {
+    let inline = core::mem::size_of::<Value>() as u64;
+    assert_eq!(Value::Int(7).held_bytes(), inline);
+    let text = "x".repeat(10_000);
+    assert!(Value::String(text.clone()).held_bytes() >= inline + 10_000);
+    let nested = Value::Array(vec![Value::String(text.clone()); 3]);
+    assert!(nested.held_bytes() >= 3 * (inline + 10_000));
+    let map = Value::Map([("k".to_string(), Value::String(text))].into());
+    assert!(map.held_bytes() >= inline + 10_000);
+    let doc = Value::Document(rmpv::Value::Array(vec![
+        rmpv::Value::Binary(vec![0; 5_000]);
+        2
+    ]));
+    assert!(doc.held_bytes() >= 10_000);
+    assert!(Value::Vector(vec![0.0; 1_000]).held_bytes() >= inline + 4_000);
+}
+
 #[test]
 fn type_names() {
     assert_eq!(Value::Null.type_name(), "NULL");

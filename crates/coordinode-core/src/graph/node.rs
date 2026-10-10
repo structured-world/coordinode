@@ -580,6 +580,30 @@ fn serialize_sorted_opt<K: Ord + Serialize, S: serde::Serializer>(
 pub type PropertyValue = super::types::Value;
 
 impl NodeRecord {
+    /// Memory this decoded record holds: what a query budget charges for
+    /// keeping it. A map's slots count their key and inline value with one
+    /// control byte each; a value's own allocations come from
+    /// [`super::types::Value::held_bytes`].
+    pub fn held_bytes(&self) -> u64 {
+        let value = core::mem::size_of::<PropertyValue>();
+        // Each term is a size or capacity of memory that exists, so the sums
+        // stay far below u64::MAX.
+        let labels = self.labels.capacity() * core::mem::size_of::<String>()
+            + self.labels.iter().map(String::capacity).sum::<usize>();
+        let props = self.props.capacity() * (core::mem::size_of::<u32>() + value + 1);
+        let extra = self.extra.as_ref().map_or(0, |extra| {
+            extra.capacity() * (core::mem::size_of::<String>() + value + 1)
+                + extra.keys().map(String::capacity).sum::<usize>()
+        });
+        let values: u64 = self
+            .props
+            .values()
+            .chain(self.extra.iter().flat_map(|e| e.values()))
+            .map(|v| v.held_bytes() - value as u64)
+            .sum();
+        (core::mem::size_of::<Self>() + labels + props + extra) as u64 + values
+    }
+
     /// Create a new node record with a single label and no properties.
     pub fn new(label: impl Into<String>) -> Self {
         let label = label.into();

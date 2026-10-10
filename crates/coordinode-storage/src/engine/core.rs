@@ -1248,6 +1248,60 @@ impl StorageEngine {
         Ok(out)
     }
 
+    /// The rows [`Self::columnar_scan`] returns, handed to `visit` in key
+    /// order one engine batch at a time and never collected beyond a batch.
+    /// Each batch's rows are charged to `budget` while they are visited, and
+    /// each row counts one unit of its work.
+    ///
+    /// # Errors
+    ///
+    /// A block read or decode failure, the budget's refusal, or the first
+    /// error of `visit`.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_for_each<E>(
+        &self,
+        table_id: &str,
+        snapshot: lsm_tree::SeqNo,
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
+    {
+        use lsm_tree::table::columnar::{COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE};
+
+        let Some(tree) = self.columnar_tables.get(table_id) else {
+            return Ok(());
+        };
+        for batch in tree
+            .columnar_scan(
+                &[COL_USER_KEY, COL_SEQNO, COL_VALUE_TYPE, COL_VALUE],
+                None,
+                snapshot,
+                ..,
+            )
+            .map_err(StorageError::from)?
+        {
+            let batch = batch.map_err(StorageError::from)?;
+            // A batch holds the engine's fixed row count; its decoded rows
+            // are charged before any of them is handed on.
+            let rows = crate::columnar::columnar_batch_rows(&batch)?;
+            let _batch = budget.reserve(
+                rows.iter()
+                    .map(|(key, value)| (key.capacity() + value.capacity()) as u64)
+                    .sum(),
+            )?;
+            for (key, value) in &rows {
+                if coverage::is_reserved(key) {
+                    continue;
+                }
+                budget.work(1)?;
+                visit(key, value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every `STORAGE COLUMNAR` table with its rows visible at `snapshot`, in
     /// table-id order: the columnar half of a whole-store snapshot. Empty in
     /// a build without columnar support.

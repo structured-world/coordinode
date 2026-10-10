@@ -167,6 +167,24 @@ pub trait NodeStore {
         prefix: &[u8],
     ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// The rows [`Self::prefix_scan_tracked`] returns, handed to `visit` one
+    /// at a time in key order and never collected, each charged to `budget`
+    /// while it is seen: the caller keeps, and pays for, what it retains.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or the first error of `visit`.
+    fn prefix_for_each<E>(
+        &self,
+        txn: &Transaction,
+        prefix: &[u8],
+        budget: &coordinode_core::budget::QueryBudget,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>;
+
     /// OCC-tracked, keyset-resumed page of a prefix scan over `Partition::Node`:
     /// the memory-bounded source for a server-side cursor. Reads the committed
     /// snapshot only (no write-buffer overlay), so the cursor path uses it for
@@ -708,6 +726,20 @@ impl NodeStore for LocalNodeStore {
         prefix: &[u8],
     ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(txn.prefix_scan(Partition::Node, prefix)?)
+    }
+
+    fn prefix_for_each<E>(
+        &self,
+        txn: &Transaction,
+        prefix: &[u8],
+        budget: &coordinode_core::budget::QueryBudget,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<coordinode_storage::error::StorageError>
+            + From<coordinode_core::budget::BudgetStop>,
+    {
+        txn.prefix_for_each(Partition::Node, prefix, budget, visit)
     }
 
     fn prefix_scan_paged_tracked(

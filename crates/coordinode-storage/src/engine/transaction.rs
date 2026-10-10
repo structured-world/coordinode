@@ -2295,6 +2295,95 @@ impl<'a> Transaction<'a> {
         Ok(merge_overlay(stored, buffer_matches))
     }
 
+    /// The rows [`Self::prefix_scan`] returns, handed to `visit` one at a time
+    /// in key order instead of collected: the caller keeps, and pays for, only
+    /// what it retains.
+    ///
+    /// Each row counts one unit of `budget`'s work (which checks its deadline
+    /// and cancellation) and holds its bytes against the budget while `visit`
+    /// sees it; the index of this transaction's own writes under the prefix is
+    /// reserved before it is built. A refusal stops the scan before the row
+    /// it was for is read further.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, the budget's refusal, or the first error of `visit`.
+    pub fn prefix_for_each<E>(
+        &self,
+        part: Partition,
+        prefix: &[u8],
+        budget: &coordinode_core::budget::QueryBudget,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<StorageError> + From<coordinode_core::budget::BudgetStop>,
+    {
+        // Own writes under the prefix, by reference and in key order, so the
+        // stored rows they shadow are skipped as they stream past.
+        let own = self
+            .write_buffer
+            .keys()
+            .filter(|(p, k)| *p == part && k.starts_with(prefix))
+            .count();
+        // A size past u64 asks for more than any limit, and is refused as such.
+        let _own_index = budget.reserve(
+            own.checked_mul(core::mem::size_of::<(&[u8], Option<&[u8]>)>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX),
+        )?;
+        let mut overlay: Vec<(&[u8], Option<&[u8]>)> = Vec::with_capacity(own);
+        overlay.extend(
+            self.write_buffer
+                .iter()
+                .filter(|((p, k), _)| *p == part && k.starts_with(prefix))
+                .map(|((_, k), v)| (k.as_slice(), v.as_deref())),
+        );
+        overlay.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut overlay = overlay.into_iter().peekable();
+
+        let mut emit = |key: &[u8], value: &[u8]| -> Result<(), E> {
+            budget.work(1)?;
+            let _row = budget.reserve(row_bytes(key, value))?;
+            visit(key, value)
+        };
+        let mut stored_row = |key: &[u8], value: &[u8]| -> Result<(), E> {
+            // Own writes before this key come first, in order.
+            while let Some((own_key, own_value)) = overlay.next_if(|(k, _)| *k < key) {
+                if let Some(own_value) = own_value {
+                    emit(own_key, own_value)?;
+                }
+            }
+            // An own write of the same key replaces this row, or removes it.
+            if let Some((own_key, own_value)) = overlay.next_if(|(k, _)| *k == key) {
+                return match own_value {
+                    Some(own_value) => emit(own_key, own_value),
+                    None => budget.work(1).map_err(E::from),
+                };
+            }
+            emit(key, value)
+        };
+        match self.snapshot {
+            Some(snap) => {
+                for guard in self.engine.snapshot_prefix_iter(&snap, part, prefix)? {
+                    let (key, value) = guard.into_inner().map_err(StorageError::from)?;
+                    stored_row(&key, &value)?;
+                }
+            }
+            None => {
+                for guard in self.engine.prefix_scan(part, prefix)? {
+                    let (key, value) = guard.into_inner().map_err(StorageError::from)?;
+                    stored_row(&key, &value)?;
+                }
+            }
+        }
+        for (own_key, own_value) in overlay {
+            if let Some(own_value) = own_value {
+                emit(own_key, own_value)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Keyset-resumed page of a prefix scan, reading the transaction's pinned
     /// snapshot. Returns up to `limit` rows whose key carries `prefix`, starting
     /// strictly after `start_after` (or at the prefix start when `None`), plus
@@ -2449,6 +2538,12 @@ fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
 
 /// `stored` rows overlaid with `overlay` rows, both in key order, into one
 /// list in key order: an overlay row replaces the stored row of its key.
+/// Bytes a row holds while a budgeted scan hands it on: its key and value.
+fn row_bytes(key: &[u8], value: &[u8]) -> u64 {
+    // Both are slices of memory that exists, so their sum fits in u64.
+    (key.len() + value.len()) as u64
+}
+
 fn merge_overlay(stored: Vec<KvPair>, overlay: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Vec<KvPair> {
     if overlay.is_empty() {
         return stored;

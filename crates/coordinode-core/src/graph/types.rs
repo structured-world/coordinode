@@ -183,6 +183,32 @@ pub struct PathValue {
     pub rels: Vec<PathRel>,
 }
 
+/// Bytes one entry of a string-keyed map holds beside its value: the key's
+/// inline size and capacity, and a pointer of the tree's bookkeeping.
+pub fn map_entry_bytes(key: &String) -> u64 {
+    (core::mem::size_of::<String>() + core::mem::size_of::<usize>() + key.capacity()) as u64
+}
+
+/// [`Value::held_bytes`] for a nested document value.
+fn document_held_bytes(doc: &rmpv::Value) -> u64 {
+    let inline = core::mem::size_of::<rmpv::Value>() as u64;
+    inline
+        + match doc {
+            rmpv::Value::String(s) => s.as_bytes().len() as u64,
+            rmpv::Value::Binary(b) | rmpv::Value::Ext(_, b) => b.capacity() as u64,
+            rmpv::Value::Array(items) => items.iter().map(document_held_bytes).sum(),
+            rmpv::Value::Map(entries) => entries
+                .iter()
+                .map(|(k, v)| document_held_bytes(k) + document_held_bytes(v))
+                .sum(),
+            rmpv::Value::Nil
+            | rmpv::Value::Boolean(_)
+            | rmpv::Value::Integer(_)
+            | rmpv::Value::F32(_)
+            | rmpv::Value::F64(_) => 0,
+        }
+}
+
 /// Extract an owned f32 vector from a [`Value`], accepting both the native
 /// [`Value::Vector`] and a numeric [`Value::Array`] of `Float`/`Int` elements
 /// (the shape a Cypher array literal like `[1.0, 0.0]` parses to). Returns
@@ -207,6 +233,60 @@ pub fn try_extract_vector(val: &Value) -> Option<Vec<f32>> {
 }
 
 impl Value {
+    /// Memory this value holds: its own size plus the capacity it allocated,
+    /// counted through nested lists, maps and documents. What a query budget
+    /// charges for keeping it. A map's entries count their key and value
+    /// with one pointer each for the tree that holds them.
+    pub fn held_bytes(&self) -> u64 {
+        let inline = core::mem::size_of::<Self>() as u64;
+        // Each term is a size or capacity of memory that exists, so the sums
+        // stay far below u64::MAX.
+        inline
+            + match self {
+                Self::Null
+                | Self::Bool(_)
+                | Self::Int(_)
+                | Self::Float(_)
+                | Self::Timestamp(_)
+                | Self::Geo(_) => 0,
+                Self::String(s) => s.capacity() as u64,
+                Self::Vector(v) => (v.capacity() * core::mem::size_of::<f32>()) as u64,
+                Self::Blob(b) | Self::Binary(b) => b.capacity() as u64,
+                Self::Array(items) => {
+                    // The slots past the length are allocated too.
+                    let spare = (items.capacity() - items.len()) * core::mem::size_of::<Self>();
+                    spare as u64 + items.iter().map(Self::held_bytes).sum::<u64>()
+                }
+                Self::Map(entries) => entries
+                    .iter()
+                    .map(|(k, v)| map_entry_bytes(k) + v.held_bytes())
+                    .sum(),
+                Self::Document(doc) => document_held_bytes(doc),
+                Self::MultiVector(rows) => {
+                    let spare = (rows.capacity() - rows.len()) * core::mem::size_of::<Vec<f32>>();
+                    spare as u64
+                        + rows
+                            .iter()
+                            .map(|r| {
+                                (core::mem::size_of::<Vec<f32>>()
+                                    + r.capacity() * core::mem::size_of::<f32>())
+                                    as u64
+                            })
+                            .sum::<u64>()
+                }
+                Self::Path(path) => {
+                    (path.nodes.capacity() * core::mem::size_of::<u64>()
+                        + path.rels.capacity() * core::mem::size_of::<PathRel>())
+                        as u64
+                        + path
+                            .rels
+                            .iter()
+                            .map(|r| r.edge_type.capacity() as u64)
+                            .sum::<u64>()
+                }
+            }
+    }
+
     /// Returns the type name as a static string.
     pub fn type_name(&self) -> &'static str {
         match self {

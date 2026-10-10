@@ -1302,6 +1302,138 @@ fn prefix_scan_hides_a_row_the_transaction_deleted() {
     );
 }
 
+/// The visiting scan hands on exactly the rows the collecting scan returns,
+/// in the same order: own rows between, on and after stored ones, and own
+/// deletes hiding stored rows. It is the same view, only not held.
+#[test]
+fn prefix_for_each_sees_what_prefix_scan_returns() {
+    use coordinode_core::budget::{DEFAULT_QUERY_MEMORY_LIMIT, QueryBudget};
+    let (engine, oracle, _d) = test_engine();
+    for i in (0..64u32).step_by(2) {
+        engine
+            .put(Partition::Node, format!("p:{i:03}").as_bytes(), b"stored")
+            .unwrap();
+    }
+    engine.put(Partition::Node, b"q:other", b"x").unwrap();
+    let mut txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    for i in (1..64u32).step_by(2).chain([10, 20, 70, 71]) {
+        txn.put(Partition::Node, format!("p:{i:03}").as_bytes(), b"own")
+            .unwrap();
+    }
+    txn.delete(Partition::Node, b"p:004").unwrap();
+    txn.delete(Partition::Node, b"p:099").unwrap();
+
+    let budget = QueryBudget::new(DEFAULT_QUERY_MEMORY_LIMIT);
+    let mut seen = Vec::new();
+    txn.prefix_for_each(Partition::Node, b"p:", &budget, |k, v| {
+        seen.push((k.to_vec(), v.to_vec()));
+        Ok::<(), StorageScanError>(())
+    })
+    .unwrap();
+    assert_eq!(seen, txn.prefix_scan(Partition::Node, b"p:").unwrap());
+    assert_eq!(seen.len(), 65, "66 rows less the one deleted");
+    assert_eq!(budget.memory_used(), 0, "nothing is held after the scan");
+    assert!(budget.memory_peak() > 0, "each row was held while visited");
+    assert!(budget.work_done() >= 65);
+}
+
+/// A row larger than what is left of the budget stops the scan before it is
+/// handed on, with the memory refusal, and leaves nothing held: the scan does
+/// not return the rows it reached as if they were all.
+#[test]
+fn prefix_for_each_stops_at_the_memory_limit() {
+    use coordinode_core::budget::{BudgetStop, QueryBudget};
+    let (engine, oracle, _d) = test_engine();
+    engine.put(Partition::Node, b"p:1", &[0u8; 64]).unwrap();
+    engine.put(Partition::Node, b"p:2", &[0u8; 4096]).unwrap();
+    engine.put(Partition::Node, b"p:3", &[0u8; 64]).unwrap();
+    let txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let budget = QueryBudget::new(1024);
+    let mut seen = Vec::new();
+    let result = txn.prefix_for_each(Partition::Node, b"p:", &budget, |k, _| {
+        seen.push(k.to_vec());
+        Ok::<(), StorageScanError>(())
+    });
+    assert!(
+        matches!(
+            result,
+            Err(StorageScanError::Budget(BudgetStop::Memory {
+                limit: 1024,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(seen, vec![b"p:1".to_vec()], "stopped before the large row");
+    assert_eq!(budget.memory_used(), 0);
+}
+
+/// A cancelled budget stops the scan at its next check, with the
+/// cancellation, rather than reading the prefix to its end.
+#[test]
+fn prefix_for_each_stops_when_cancelled() {
+    use coordinode_core::budget::{
+        BudgetStop, CHECK_EVERY, DEFAULT_QUERY_MEMORY_LIMIT, QueryBudget,
+    };
+    let (engine, oracle, _d) = test_engine();
+    let rows = CHECK_EVERY * 3;
+    for i in 0..rows {
+        engine
+            .put(Partition::Node, format!("p:{i:06}").as_bytes(), b"v")
+            .unwrap();
+    }
+    let txn = Transaction::begin(
+        &engine,
+        Some(&oracle),
+        Timestamp::from_raw(engine.snapshot()),
+    );
+    let budget = QueryBudget::new(DEFAULT_QUERY_MEMORY_LIMIT);
+    let mut seen = 0u64;
+    let result = txn.prefix_for_each(Partition::Node, b"p:", &budget, |_, _| {
+        seen += 1;
+        if seen == 10 {
+            budget.cancel();
+        }
+        Ok::<(), StorageScanError>(())
+    });
+    assert!(
+        matches!(result, Err(StorageScanError::Budget(BudgetStop::Cancelled))),
+        "{result:?}"
+    );
+    assert!(
+        seen <= CHECK_EVERY,
+        "stopped at the next check, after {seen}"
+    );
+}
+
+/// The error a budgeted scan in these tests ends with.
+#[derive(Debug)]
+enum StorageScanError {
+    #[allow(dead_code)]
+    Storage(StorageError),
+    Budget(coordinode_core::budget::BudgetStop),
+}
+
+impl From<StorageError> for StorageScanError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
+    }
+}
+
+impl From<coordinode_core::budget::BudgetStop> for StorageScanError {
+    fn from(e: coordinode_core::budget::BudgetStop) -> Self {
+        Self::Budget(e)
+    }
+}
+
 #[test]
 fn legacy_mode_writes_directly_no_buffer() {
     let (engine, _oracle, _d) = test_engine();

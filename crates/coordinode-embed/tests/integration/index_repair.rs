@@ -753,3 +753,77 @@ fn a_multikey_candidate_is_not_reported() {
         "no disagreement was reported"
     );
 }
+
+/// `count` `:U` nodes whose padding makes each record about 2 KiB, plus the
+/// node holding `a@x`, with a unique index on `email` whose entry for `a@x`
+/// names another node: a lookup of `a@x` answers from the label's records.
+/// Returns the real holder's id.
+fn label_answered_by_its_records(db: &mut Database, count: usize) -> i64 {
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher(&format!(
+        "UNWIND range(1, {count}) AS i \
+         CREATE (:U {{email: 'n' + toString(i) + '@x', pad: reduce(s = '', k IN range(1, 64) \
+         | s + 'abcdefghijklmnopqrstuvwxyz012345')}})"
+    ))
+    .expect("the label");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    let owner = id_of(db, "a@x");
+    let wrong = id_of(db, "n1@x");
+    misattribute(db, "u_email", "a@x", wrong);
+    owner
+}
+
+/// The lookup of `a@x` under a statement memory limit of `limit` bytes.
+fn found_within(
+    db: &Database,
+    limit: u64,
+) -> Result<Vec<coordinode_query::executor::row::Row>, coordinode_embed::db::DatabaseError> {
+    let options = coordinode_embed::db::StatementOptions {
+        query_memory_limit: Some(limit),
+        ..Default::default()
+    };
+    db.execute_cypher_shared_with(
+        "MATCH (u:U {email: 'a@x'}) RETURN id(u) AS id",
+        None,
+        None,
+        &options,
+    )
+    .map(|result| result.rows)
+}
+
+/// A lookup the index cannot answer reads the label's records within the
+/// statement's memory limit: it holds the record in hand and the rows it
+/// keeps, never the whole label. A limit far below the label's size answers
+/// exactly what the healthy index would.
+#[test]
+fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
+    let (mut db, _dir) = open_db();
+    // About 4 MiB of records against a 1 MiB limit.
+    let owner = label_answered_by_its_records(&mut db, 2_000);
+    let rows = found_within(&db, 1 << 20).expect("within the limit");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)));
+}
+
+/// A limit smaller than one record of the label stops the lookup with the
+/// memory refusal, rather than answering with what it read before it or
+/// with nothing.
+#[test]
+fn a_lookup_answered_by_the_records_past_its_memory_limit_is_refused() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::ExecutionError;
+    let (mut db, _dir) = open_db();
+    label_answered_by_its_records(&mut db, 16);
+    let refused = found_within(&db, 1024);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { limit: 1024, .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+}

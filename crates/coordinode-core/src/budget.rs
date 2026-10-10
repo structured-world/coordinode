@@ -145,6 +145,14 @@ impl QueryBudget {
         })
     }
 
+    /// A charge of no bytes, to grow as memory is kept.
+    pub fn empty_charge(&self) -> MemoryCharge<'_> {
+        MemoryCharge {
+            budget: self,
+            bytes: 0,
+        }
+    }
+
     /// Count `units` of work, then check the deadline and cancellation when
     /// [`CHECK_EVERY`] units have accrued since the last check.
     ///
@@ -253,6 +261,14 @@ impl MemoryCharge<'_> {
         let returned = bytes.min(self.bytes);
         self.budget.give(returned);
         self.bytes -= returned;
+    }
+
+    /// Keep this charge's bytes reserved for the rest of the query: for
+    /// memory handed to the query's later stages (rows an operator returns),
+    /// whose release no single owner sees. A query's budget ends with the
+    /// query, so the reservation ends with it.
+    pub fn keep_until_query_ends(mut self) {
+        self.bytes = 0;
     }
 }
 

@@ -15,6 +15,21 @@ fn a_reservation_is_held_until_its_charge_drops() {
     assert_eq!(budget.memory_peak(), 100);
 }
 
+/// Memory handed to the query's later stages stays reserved after its charge
+/// is let go, so what they hold still counts against the limit; an empty
+/// charge grows like any other.
+#[test]
+fn a_charge_kept_for_the_query_stays_reserved() {
+    let budget = QueryBudget::new(100);
+    let mut rows = budget.empty_charge();
+    assert_eq!(budget.memory_used(), 0);
+    rows.grow(60).expect("within the limit");
+    rows.keep_until_query_ends();
+    assert_eq!(budget.memory_used(), 60, "still held by the rows handed on");
+    assert!(budget.reserve(41).is_err(), "the kept rows count");
+    budget.reserve(40).expect("what is left");
+}
+
 /// A reservation past the limit is refused before anything is held, names
 /// what it asked for, and leaves the budget as it was.
 #[test]
