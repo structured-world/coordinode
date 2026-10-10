@@ -330,6 +330,53 @@ async fn merge_on_existing_unique_key_matches() {
     assert_eq!(result.unwrap().len(), 1, "should return 1 matched node");
 }
 
+/// An index copy a server used is closed by a graceful stop: the next start
+/// uses it at once and records no check of it. A crash leaves the copy as it
+/// was in use, so the next start checks it before it serves again.
+#[tokio::test]
+async fn index_copies_in_use_are_checked_after_a_crash_only() {
+    let proc = CoordinodeProcess::start().await;
+    cypher_q(&proc, "CREATE INDEX g_code ON :G(code)")
+        .await
+        .expect("index");
+    cypher_q(&proc, "CREATE (:G {code: 'a'})")
+        .await
+        .expect("node");
+    let lookup = "MATCH (n:G {code: 'a'}) RETURN n.code AS code";
+    assert_eq!(cypher_q(&proc, lookup).await.expect("lookup").len(), 1);
+
+    let proc = proc.restart().await;
+    assert!(
+        cypher_q(&proc, "CALL db.indexChecks()")
+            .await
+            .expect("checks")
+            .is_empty(),
+        "a graceful stop leaves no copy to check"
+    );
+    assert_eq!(cypher_q(&proc, lookup).await.expect("lookup").len(), 1);
+
+    let proc = proc.restart_unclean().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let checks = cypher_q(&proc, "CALL db.indexChecks()")
+            .await
+            .expect("checks");
+        if !checks.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the copy in use at the crash was never checked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        cypher_q(&proc, lookup).await.expect("lookup").len(),
+        1,
+        "answered while and after the copy is checked"
+    );
+}
+
 /// Same as above across a restart, through the schema reload path.
 #[tokio::test]
 async fn merge_on_existing_unique_key_matches_after_restart() {

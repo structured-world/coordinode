@@ -108,7 +108,24 @@ fn main() {
 
     let lookup = "MATCH (u:U {email: 'u7@x'}) RETURN u.n AS n";
     let nothing = || {};
+    // A new run: its first use of the index's copy stores the copy's use
+    // guard, every later lookup stores nothing.
+    drop(db);
+    let mut db = Database::open(dir.path()).expect("reopen");
+    let started = Instant::now();
+    let rows = db
+        .execute_cypher_shared(lookup, None, None, None, None)
+        .expect("first read")
+        .rows;
+    assert_eq!(rows.len(), 1);
+    let first = started.elapsed();
+    let flushes = db.index_recovery_flushes();
     report("index answers", &db, lookup, &nothing);
+    println!(
+        "first lookup of a run         {first:>10.3?} (guard flushes: {flushes}, after {READS}+ more \
+         lookups: {})",
+        db.index_recovery_flushes()
+    );
     report(
         "label scan, no index",
         &db,
