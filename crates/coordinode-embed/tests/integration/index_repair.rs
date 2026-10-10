@@ -807,11 +807,12 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
 }
 
 /// A lookup the index cannot answer is refused before reading the records
-/// when the rest of the statement runs an operator outside its budget (a
-/// detaching delete, which reads every edge of the node): it names the
-/// index and the operator, and changes nothing. Accounted operators over
-/// the same lookup (a traversal, an optional match, an aggregate) answer
-/// from the records exactly as the sound index did.
+/// when the rest of the statement runs work outside its budget (a filter
+/// with a pattern subquery, which reads storage): it names the index and
+/// the operator. Accounted operators over the same lookup (a traversal, an
+/// optional match, an aggregate, a detaching delete) answer from the
+/// records exactly as the sound index would, and the delete removes the
+/// node that holds the value, not the one the wrong entry named.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -828,14 +829,15 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
 
     let wrong = id_of(&mut db, "z@x");
     misattribute(&db, "u_email", "a@x", wrong);
-    let refused = db.execute_cypher("MATCH (u:U {email: 'a@x'}) DETACH DELETE u");
+    let refused = db
+        .execute_cypher("MATCH (u:U {email: 'a@x'}) WHERE EXISTS { MATCH (u)-[:R]->() } RETURN u");
     assert!(
         matches!(
             &refused,
             Err(DatabaseError::Execution(ExecutionError::IndexUnresolved {
                 label,
                 property,
-                operator: "Delete",
+                operator: "Filter",
             })) if label == "U" && property == "email"
         ),
         "{refused:?}"
@@ -846,11 +848,16 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
         assert_eq!(rows[0].get("n"), Some(&Value::Int(1)), "{query}");
     }
     let counted = db.execute_cypher(count).expect("an aggregate is accounted");
+    assert_eq!(counted[0].get("n"), Some(&Value::Int(1)));
+
+    db.execute_cypher("MATCH (u:U {email: 'a@x'}) DETACH DELETE u")
+        .expect("a detaching delete is accounted");
     assert_eq!(
-        counted[0].get("n"),
-        Some(&Value::Int(1)),
-        "nothing was deleted"
+        found(&mut db, "a@x"),
+        Vec::<i64>::new(),
+        "the holder is gone"
     );
+    assert_eq!(id_of(&mut db, "z@x"), wrong, "the wrongly named node stays");
 }
 
 /// Records and catalog rows last written before the retention horizon are

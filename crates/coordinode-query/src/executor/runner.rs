@@ -3794,17 +3794,13 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::Update { input, items, .. } if !set_items_read_storage(items) => {
             first_unaccounted_operator(input)
         }
-        LogicalOp::RemoveOp { input, .. } => first_unaccounted_operator(input),
+        LogicalOp::RemoveOp { input, .. } | LogicalOp::Delete { input, .. } => {
+            first_unaccounted_operator(input)
+        }
         LogicalOp::CartesianProduct { left, right } | LogicalOp::LeftOuterJoin { left, right } => {
             first_unaccounted_operator(left).or_else(|| first_unaccounted_operator(right))
         }
         LogicalOp::Union { inputs, .. } => inputs.iter().find_map(first_unaccounted_operator),
-        // A detaching delete reads every edge of the node it removes.
-        LogicalOp::Delete {
-            input,
-            detach: false,
-            ..
-        } => first_unaccounted_operator(input),
         // A node MERGE matches through its scan; a relationship MERGE walks
         // adjacency outside the budget.
         LogicalOp::Merge {
@@ -13897,6 +13893,12 @@ fn execute_delete(
                         AdjDirection::In => ctx.adj_get_rev(&parts.edge_type, parts.node_id)?,
                     };
                     if let Some(plist) = plist {
+                        // Every peer is unhooked; the decoded list is held
+                        // while they are.
+                        let budget = Arc::clone(&ctx.budget);
+                        budget.work(plist.len() as u64)?;
+                        let _plist =
+                            budget.reserve((plist.len() * core::mem::size_of::<u64>()) as u64)?;
                         for peer_uid in plist.iter() {
                             let peer_id = NodeId::from_raw(peer_uid);
                             // adj:TYPE:out:NODE → counterpart adj:TYPE:in:PEER,
@@ -15199,6 +15201,10 @@ fn detach_delete_node(
                 matches!(direction, AdjDirection::Out),
             );
             let temporal = lookup_edge_type_temporal(edge_type, ctx)?;
+            // Every peer is unhooked; the decoded list is held while they are.
+            let budget = Arc::clone(&ctx.budget);
+            budget.work(plist.len() as u64)?;
+            let _plist = budget.reserve((plist.len() * core::mem::size_of::<u64>()) as u64)?;
             for peer_uid in plist.iter() {
                 let peer_id = NodeId::from_raw(peer_uid);
                 match direction {
@@ -17947,7 +17953,14 @@ fn execute_trigger_body_inline(
         ExecutionError::Unsupported(format!("trigger `{}` body plan failed: {e}", trigger.name))
     })?;
     plan.root.substitute_params(params);
-    let _ = execute_op(&plan.root, ctx)?;
+    // The body is part of the statement that fired it: it spends the same
+    // budget, and an unproved index in it answers from the records only when
+    // both the body and the statement around it are accounted.
+    let outer = ctx.unaccounted_operator;
+    ctx.unaccounted_operator = first_unaccounted_operator(&plan.root).or(outer);
+    let ran = execute_op(&plan.root, ctx);
+    ctx.unaccounted_operator = outer;
+    ran?;
     Ok(())
 }
 
