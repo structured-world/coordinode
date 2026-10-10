@@ -903,6 +903,101 @@ fn a_check_and_a_rebuild_read_records_older_than_the_horizon() {
     assert_eq!(found(&mut db, "z@x"), vec![wrong]);
 }
 
+/// A lookup driven per outer row (UNWIND, then MATCH by the unwound value)
+/// through an index whose entry is wrong answers every row from the
+/// records, within the statement's budget: the right holder for the damaged
+/// value, the indexed holder for the rest.
+#[test]
+fn a_correlated_lookup_answered_by_the_records_finds_every_holder() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    for email in ["a@x", "b@x", "z@x"] {
+        db.execute_cypher(&format!("CREATE (:U {{email: '{email}'}})"))
+            .expect("node");
+    }
+    let a = id_of(&mut db, "a@x");
+    let b = id_of(&mut db, "b@x");
+    let z = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", z);
+
+    let mut rows: Vec<(String, i64)> = db
+        .execute_cypher(
+            "UNWIND ['a@x', 'b@x', 'q@x'] AS e MATCH (u:U {email: e}) RETURN e, id(u) AS id",
+        )
+        .expect("correlated lookup")
+        .iter()
+        .map(|row| match (row.get("e"), row.get("id")) {
+            (Some(Value::String(e)), Some(Value::Int(id))) => (e.clone(), *id),
+            other => panic!("unexpected row {other:?}"),
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![("a@x".into(), a), ("b@x".into(), b)]);
+}
+
+/// Inside an interactive transaction, a lookup answered from the records
+/// sees the transaction's own writes exactly as the sound index would: a
+/// value written by the transaction is found, a value it removed is not,
+/// with the damaged entry in the store.
+#[test]
+fn a_lookup_answered_by_the_records_sees_the_transactions_own_writes() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let z = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", z);
+
+    let txid = db.begin_transaction();
+    for i in 0..200 {
+        db.execute_in_transaction(txid, &format!("CREATE (:U {{email: 'own{i}@x'}})"), None)
+            .expect("own write");
+    }
+    db.execute_in_transaction(
+        txid,
+        "MATCH (u:U {email: 'a@x'}) SET u.email = 'moved@x'",
+        None,
+    )
+    .expect("own change");
+    let found = |query: &str| {
+        db.execute_in_transaction(txid, query, None)
+            .expect("lookup")
+            .len()
+    };
+    assert_eq!(found("MATCH (u:U {email: 'own150@x'}) RETURN u"), 1);
+    assert_eq!(found("MATCH (u:U {email: 'moved@x'}) RETURN u"), 1);
+    assert_eq!(found("MATCH (u:U {email: 'a@x'}) RETURN u"), 0);
+    db.rollback_transaction(txid).expect("rollback");
+}
+
+/// A lookup the index cannot answer reads the label's records through a
+/// shard that is mostly other labels' records, within a limit far below
+/// the shard's size: records of other labels are passed over and never
+/// held.
+#[test]
+fn a_lookup_answered_by_the_records_passes_over_other_labels_within_the_limit() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "UNWIND range(1, 3000) AS i CREATE (:Other {i: i, pad: reduce(s = '', k IN range(1, 32) \
+         | s + 'abcdefghijklmnopqrstuvwxyz012345')})",
+    )
+    .expect("other labels");
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let owner = id_of(&mut db, "a@x");
+    let wrong = id_of(&mut db, "z@x");
+    misattribute(&db, "u_email", "a@x", wrong);
+
+    // About 3 MiB of other labels' records against a 512 KiB limit.
+    let rows = found_within(&db, 512 << 10).expect("within the limit");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)));
+}
+
 /// A limit smaller than one record of the label stops the lookup with the
 /// memory refusal, rather than answering with what it read before it or
 /// with nothing.

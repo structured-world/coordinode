@@ -93,6 +93,40 @@ fn names(db: &mut Database, query: &str) -> Vec<String> {
     out
 }
 
+/// A node with a deep history holds its versions together while the one valid
+/// now is chosen, and that history is charged to the statement: a limit below
+/// it stops the read with the memory refusal, never a row of a version that
+/// is not current; within the limit the state valid now is returned.
+#[test]
+fn a_deep_single_node_history_is_read_within_the_statement_budget() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_embed::db::{DatabaseError, StatementOptions};
+    use coordinode_query::executor::runner::ExecutionError;
+    let mut db = open_db();
+    let now = now_us();
+    let id = create(&mut db, "current", now - YEAR, Some(now + 10 * YEAR));
+    for k in 0..2_000i64 {
+        let from = now - 2 * YEAR - (k + 1) * 1_000_000;
+        seed_version(&db, id, &format!("old {k:04}"), from, Some(from + 500_000));
+    }
+    let query = "MATCH (n:Emp) RETURN n.name AS name";
+    let small = StatementOptions {
+        query_memory_limit: Some(64 << 10),
+        ..StatementOptions::default()
+    };
+    let refused = db.execute_cypher_shared_with(query, None, None, &small);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(names(&mut db, query), ["current"]);
+}
+
 /// The version valid now is returned; an older backfill written after it
 /// and an open-ended future version are not, whatever the write order.
 #[test]
