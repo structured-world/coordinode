@@ -10,7 +10,8 @@ fn an_auto_commit_statement_refused_by_a_commit_in_flight_runs_again() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
-    set_while_a_commit_holds_the_node(&mut db).expect("the statement lands once the holder has");
+    set_while_a_commit_holds_the_node(&mut db, Hold::For20Ms)
+        .expect("the statement lands once the holder has");
     let rows = db
         .execute_cypher("MATCH (u:U) RETURN u.n AS n")
         .expect("read");
@@ -24,7 +25,8 @@ fn a_single_auto_commit_attempt_returns_the_refusal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open(dir.path()).expect("open");
     db.set_autocommit_retry(core::num::NonZeroU32::MIN, Duration::from_millis(2));
-    let err = set_while_a_commit_holds_the_node(&mut db).expect_err("refused once, not retried");
+    let err = set_while_a_commit_holds_the_node(&mut db, Hold::UntilTheStatementReturns)
+        .expect_err("refused once, not retried");
     assert!(
         matches!(
             err,
@@ -36,10 +38,20 @@ fn a_single_auto_commit_attempt_returns_the_refusal() {
     );
 }
 
+/// How long the commit in flight holds the node.
+enum Hold {
+    /// 20 ms, which a statement retrying its commit outlasts.
+    For20Ms,
+    /// Until the statement has returned: its every commit meets the holder,
+    /// however slowly the statement reaches it.
+    UntilTheStatementReturns,
+}
+
 /// Create a node, then run `SET` on it while another commit is held in
-/// flight on its record for 20 ms; the statement's outcome.
+/// flight on its record as `hold` says; the statement's outcome.
 fn set_while_a_commit_holds_the_node(
     db: &mut Database,
+    hold: Hold,
 ) -> Result<Vec<coordinode_query::executor::row::Row>, DatabaseError> {
     use coordinode_core::graph::node::{NodeId, encode_node_key};
     use coordinode_core::graph::types::Value;
@@ -57,18 +69,30 @@ fn set_while_a_commit_holds_the_node(
     let node = encode_node_key(db.shard_id, NodeId::from_raw(id));
 
     let (held, release) = std::sync::mpsc::channel::<()>();
+    let (returned, statement_done) = std::sync::mpsc::channel::<()>();
     let pending = Arc::clone(db.engine().pending_commits());
+    let holder_waits = matches!(hold, Hold::UntilTheStatementReturns);
     std::thread::scope(|scope| {
         let holder = scope.spawn(move || {
             let (_ts, admission) = pending
                 .admit_allocated(|| u64::MAX - 1, Vec::new(), vec![(Partition::Node, node)])
                 .expect("admit the holder");
             held.send(()).expect("signal");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            match hold {
+                Hold::For20Ms => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Hold::UntilTheStatementReturns => {
+                    statement_done.recv().expect("the statement returned");
+                }
+            }
             drop(admission);
         });
         release.recv().expect("held");
         let outcome = db.execute_cypher("MATCH (u:U {name: 'a'}) SET u.n = 2");
+        if holder_waits {
+            returned
+                .send(())
+                .expect("the holder waits for the statement");
+        }
         holder.join().expect("holder");
         outcome
     })
