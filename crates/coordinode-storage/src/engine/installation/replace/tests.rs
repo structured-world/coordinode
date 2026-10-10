@@ -492,6 +492,33 @@ fn a_cleared_partition_drops_the_replacement_in_preparation() {
         .expect("a new replacement can be registered");
 }
 
+/// A Raft snapshot installed while a replacement is prepared replaces the
+/// index partition with the snapshot's rows: the replacement goes with the
+/// old contents, the generation reads the snapshot's entries, and a new
+/// replacement can be registered over them.
+#[test]
+fn a_snapshot_installed_during_preparation_drops_the_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    engine
+        .put(Partition::Idx, &entry(b"a"), b"a1")
+        .expect("put");
+    engine.stage_generation(GENERATION).expect("stage");
+    let rows = vec![(entry(b"s"), b"s1".to_vec())];
+    engine
+        .install_raft_image(&[(Partition::Idx, rows)], 10, b"payload")
+        .expect("install the snapshot");
+    assert!(matches!(
+        engine.import_generation_history(GENERATION, &[]),
+        Err(StorageError::InstallationCatalog(_))
+    ));
+    assert_eq!(get(&engine, &entry(b"a")), None);
+    assert_eq!(get(&engine, &entry(b"s")), Some(b"s1".to_vec()));
+    engine.stage_generation(GENERATION).expect("stage again");
+    replace_after_stage(&engine);
+    assert_eq!(get(&engine, &entry(b"s")), Some(b"s1".to_vec()));
+}
+
 /// Fill a registered replacement of `GENERATION` from its own history and
 /// publish it.
 fn replace_after_stage(engine: &StorageEngine) {
