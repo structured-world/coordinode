@@ -557,6 +557,107 @@ fn a_replacement_is_not_prepared_below_the_free_space_reserve() {
         .expect("import");
 }
 
+/// A transaction's reads and conflict keys are logical, so switching the
+/// copy under it changes neither: it reads its snapshot through the switch,
+/// sees its own private write, and is refused at commit when another writer
+/// committed an entry it also writes, whether that write landed while the
+/// replacement was prepared or after it was published, exactly as without a
+/// switch.
+#[test]
+fn a_transaction_across_the_switch_keeps_its_reads_and_conflicts() {
+    use coordinode_core::txn::timestamp::{Timestamp, TimestampOracle};
+    use coordinode_core::txn::write_concern::WriteConcern;
+
+    use crate::engine::transaction::{CommitContext, CommitError, Transaction};
+
+    let wc = WriteConcern::default();
+    let ctx = CommitContext {
+        write_concern: &wc,
+        pipeline: None,
+        id_gen: None,
+        drain_buffer: None,
+        nvme_write_buffer: None,
+    };
+    for (switch, write_while_prepared) in [(false, true), (true, true), (true, false)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oracle = std::sync::Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_with_oracle(&config(dir.path()), oracle.clone()).expect("open");
+        engine
+            .put(Partition::Idx, &entry(b"k"), b"v1")
+            .expect("put");
+        engine
+            .put(Partition::Idx, &entry(b"r"), b"r1")
+            .expect("put");
+        // Another writer, committing the entry the transaction writes and one
+        // it only reads.
+        let concurrent = || {
+            engine
+                .put(Partition::Idx, &entry(b"k"), b"v2")
+                .expect("concurrent write");
+            engine
+                .put(Partition::Idx, &entry(b"r"), b"r2")
+                .expect("concurrent write");
+        };
+
+        let snap = engine.snapshot();
+        let mut txn = Transaction::new(
+            &engine,
+            Some(&oracle),
+            Timestamp::from_raw(snap),
+            Some(snap),
+        );
+        assert_eq!(
+            txn.get(Partition::Idx, &entry(b"k"))
+                .expect("read")
+                .as_deref(),
+            Some(b"v1".as_slice())
+        );
+        txn.put(Partition::Idx, &entry(b"mine"), b"m")
+            .expect("stage");
+        txn.put(Partition::Idx, &entry(b"k"), b"txn")
+            .expect("stage");
+
+        if switch {
+            engine.stage_generation(GENERATION).expect("stage");
+        }
+        if write_while_prepared {
+            concurrent();
+        }
+        if switch {
+            replace_after_stage(&engine);
+        }
+        if !write_while_prepared {
+            concurrent();
+        }
+
+        assert_eq!(
+            txn.get(Partition::Idx, &entry(b"r"))
+                .expect("read")
+                .as_deref(),
+            Some(b"r1".as_slice()),
+            "the transaction still reads its snapshot"
+        );
+        assert_eq!(
+            txn.get(Partition::Idx, &entry(b"mine"))
+                .expect("read")
+                .as_deref(),
+            Some(b"m".as_slice()),
+            "and its own write"
+        );
+        assert!(
+            matches!(txn.commit(&ctx), Err(CommitError::Conflict(_))),
+            "a write to an entry it writes refuses it (switch: {switch}, written while prepared: \
+             {write_while_prepared})"
+        );
+        assert_eq!(
+            get(&engine, &entry(b"mine")),
+            None,
+            "nothing of it was applied"
+        );
+    }
+}
+
 /// Fill a registered replacement of `GENERATION` from its own history and
 /// publish it.
 fn replace_after_stage(engine: &StorageEngine) {
