@@ -746,6 +746,18 @@ impl IndexBuildService {
         };
         let replaced = store.definition_version(def.id).map_err(text)?;
         let retired = def.generation;
+        // Read after the version the commit is conditioned on: a rebuild
+        // meeting another one replaces only the generation it was asked to.
+        if store
+            .load_definition(def.id)
+            .map_err(text)?
+            .is_none_or(|d| d.generation != retired)
+        {
+            return Err(format!(
+                "index '{def}' no longer serves from generation {}",
+                retired.as_raw()
+            ));
+        }
         let committed = {
             let mut txn = begin(env);
             store
@@ -1102,6 +1114,9 @@ impl Shared {
                 &mut repaired_total,
             )? {
                 Some(pass) => pass,
+                None if !self.still_serves(generation, taken)? => {
+                    return self.conclude_retired(generation, taken);
+                }
                 None => return self.lost_check(generation, taken),
             };
             let Some(record) = self.held_record(generation, taken)? else {
@@ -1157,6 +1172,11 @@ impl Shared {
                 });
             }
             if repaired_total > config.check_max_repairs || passes >= MAX_PASSES {
+                // A check of a generation the index left must not rebuild the
+                // index it now serves from.
+                if !self.still_serves(generation, taken)? {
+                    return self.conclude_retired(generation, taken);
+                }
                 return self.escalate(generation, taken);
             }
         }
@@ -1189,6 +1209,11 @@ impl Shared {
             let Some(check) = record.check.clone() else {
                 return Ok(None);
             };
+            // Repairs to a generation the index left are refused at commit;
+            // the pass stops rather than read on and count them as damage.
+            if !self.still_serves(generation, taken)? {
+                return Ok(None);
+            }
             if first_page {
                 first_page = false;
                 // Taken before the pass reads anything: a report after it
@@ -1527,6 +1552,26 @@ impl Shared {
             Err(e) if is_contention(&e) => Ok(0),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Whether the index `taken` checks still serves from `generation`, built.
+    fn still_serves(&self, generation: GenerationId, taken: &Taken) -> Result<bool, String> {
+        Ok(LocalIndexStore::new(self.env.engine())
+            .load_definition(taken.def.id)
+            .map_err(text)?
+            .is_some_and(|d| d.generation == generation && d.state == IndexState::Ready))
+    }
+
+    /// Record that the held check ended because its index stopped serving
+    /// from the checked generation: dropped, rebuilt or replaced.
+    fn conclude_retired(
+        &self,
+        generation: GenerationId,
+        taken: &Taken,
+    ) -> Result<Executed, String> {
+        self.conclude_check(generation, taken, |_, check| {
+            check.state = CheckState::Cancelled;
+        })
     }
 
     /// The integrity record of `generation` while its check is still the

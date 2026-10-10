@@ -433,6 +433,92 @@ fn a_member_that_takes_no_writes_checks_its_own_copy() {
     );
 }
 
+/// Lose the entry of user `id` under `email` in `def`.
+fn lose_entry(env: &TestEnv, def: &IndexDefinition, email: &str, id: u64) {
+    let tuple = coordinode_core::index::encoding::encode_tuple(&[Value::String(email.into())])
+        .expect("tuple");
+    env.engine
+        .delete(
+            coordinode_storage::engine::partition::Partition::Idx,
+            &coordinode_core::index::encoding::encode_entry_key(def.generation, &tuple, id),
+        )
+        .expect("lose the entry");
+}
+
+/// A repair commits only while the record it read is as it read it: a write
+/// moving the record between the check's read and the repair's commit
+/// refuses the repair, and the next pass repairs the record as it stands.
+/// The stale entry is never written.
+#[test]
+fn a_repair_raced_by_a_write_repairs_the_record_as_it_stands() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    // The repair of b's entry waits to commit; b moves meanwhile, its
+    // record written without its entry, as a second loss would leave it.
+    env.put_user(2, "c@x");
+    env.release_pages();
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        env.holders(&def, "b@x").is_empty(),
+        "no stale entry for b@x"
+    );
+    assert_eq!(env.holders(&def, "c@x"), vec![2], "the record as it stands");
+}
+
+/// A repair commits only while the index still serves from the checked
+/// generation: a rebuild between the check's read and the repair's commit
+/// refuses the repair, and the check ends cancelled, leaving the rebuild's
+/// generation to its own build.
+#[test]
+fn a_repair_raced_by_a_rebuild_is_refused() {
+    let (env, builds, def) = member_with_users();
+    lose_entry(&env, &def, "b@x", 2);
+    env.hold_pages_after(0);
+    let operation = builds.request_check(def.id).expect("check");
+    env.await_held_page();
+    let stored = env.stored(&def).expect("definition");
+    let rebuilt = std::thread::spawn({
+        let builds = builds.clone();
+        move || builds.rebuild(stored)
+    });
+    // The rebuild's catalog commit lands while the repair is held; its
+    // backfill pages wait behind the hold too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while env
+        .stored(&def)
+        .is_none_or(|d| d.generation == def.generation)
+    {
+        assert!(std::time::Instant::now() < deadline, "never rebuilt");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    env.release_pages();
+    let rebuilt = rebuilt.join().expect("rebuild thread").expect("rebuild");
+    let outcome = builds
+        .wait_check(operation, Some(Duration::from_secs(30)))
+        .expect("wait");
+    assert!(
+        matches!(
+            outcome,
+            Some(CheckOutcome::Cancelled | CheckOutcome::Failed(_))
+        ),
+        "the check of a generation no longer served concludes nothing: {outcome:?}"
+    );
+    assert!(matches!(
+        builds.wait_here(rebuilt.generation),
+        Some(IndexBuildOutcome::Published { .. })
+    ));
+    assert_eq!(env.holders(&rebuilt, "b@x"), vec![2], "the rebuild has b");
+}
+
 /// Fills a replacement from a peer's copy of the generation, as segment
 /// transfer does between members: the peer's history imported at its own
 /// seqnos.
