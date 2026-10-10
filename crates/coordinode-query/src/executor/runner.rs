@@ -3828,6 +3828,14 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         LogicalOp::HnswScan { query_vector, .. } => expr_unaccounted(query_vector),
         // The text index search reports every document it scores and reads.
         LogicalOp::TextIndexScan { .. } => None,
+        // The encrypted index's entries stream past within the budget.
+        LogicalOp::EncryptedFilter {
+            input,
+            field_expr,
+            token_expr,
+        } => expr_unaccounted(field_expr)
+            .or_else(|| expr_unaccounted(token_expr))
+            .or_else(|| first_unaccounted_operator(input)),
         LogicalOp::TextFilter {
             input, text_expr, ..
         } => expr_unaccounted(text_expr).or_else(|| first_unaccounted_operator(input)),
@@ -4743,7 +4751,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             token_expr,
         } => {
             let rows = execute_op(input, ctx)?;
-            execute_encrypted_filter(&rows, field_expr, token_expr, ctx)
+            let kept = execute_encrypted_filter(&rows, field_expr, token_expr, ctx)?;
+            charge_returned(ctx, 0, kept)
         }
 
         LogicalOp::Unwind {
@@ -9742,13 +9751,19 @@ fn execute_encrypted_filter(
     // through the active transaction's committed snapshot.
     let index = EncryptedIndex::new(&label, &property);
     let matching_ids = index
-        .search(&ctx.txn, &search_token)
-        .map_err(|e| ExecutionError::Unsupported(format!("encrypted search error: {e}")))?;
+        .search_within(&ctx.txn, &search_token, &ctx.budget)
+        .map_err(|e| match e {
+            coordinode_search::encrypted::SseError::Budget(stop) => ExecutionError::Budget(stop),
+            other => ExecutionError::Unsupported(format!("encrypted search error: {other}")),
+        })?;
 
-    // Build a set for O(1) lookup.
+    // Build a set for O(1) lookup, held while the rows are filtered.
+    let budget = Arc::clone(&ctx.budget);
+    let _set = budget.reserve((matching_ids.len() * 2 * core::mem::size_of::<u64>()) as u64)?;
     let matching_set: std::collections::HashSet<u64> = matching_ids.into_iter().collect();
 
     // Filter rows: keep those whose node ID is in the match set.
+    ctx.budget.work(rows.len() as u64)?;
     let mut results = Vec::new();
     for row in rows {
         let node_id = row.get(&variable).and_then(|v| {

@@ -62,6 +62,38 @@ fn insert_and_search() {
     assert_eq!(results, vec![1]);
 }
 
+/// A search within a query budget counts every entry it passes, so a
+/// cancelled query stops partway through a value's entries; within a live
+/// budget it finds every node.
+#[test]
+fn a_search_within_a_budget_stops_with_it() {
+    use coordinode_core::budget::{BudgetStop, CHECK_EVERY, QueryBudget};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = test_engine(dir.path());
+    let idx = EncryptedIndex::new("User", "role");
+    let token = make_token(b"admin");
+    commit_txn(&engine, |txn| {
+        for id in 1..=2 * CHECK_EVERY {
+            idx.insert(txn, &token, id).unwrap();
+        }
+    });
+
+    let cancelled = QueryBudget::new(u64::MAX);
+    cancelled.cancel();
+    let stopped = read_txn(&engine, |txn| idx.search_within(txn, &token, &cancelled));
+    assert!(
+        matches!(stopped, Err(SseError::Budget(BudgetStop::Cancelled))),
+        "{stopped:?}"
+    );
+    assert!(cancelled.work_done() < 2 * CHECK_EVERY);
+
+    let live = QueryBudget::new(u64::MAX);
+    let found = read_txn(&engine, |txn| {
+        idx.search_within(txn, &token, &live).unwrap()
+    });
+    assert_eq!(found.len() as u64, 2 * CHECK_EVERY);
+}
+
 #[test]
 fn search_not_found() {
     let dir = tempfile::tempdir().unwrap();

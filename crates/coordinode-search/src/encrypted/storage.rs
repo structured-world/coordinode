@@ -111,19 +111,38 @@ impl EncryptedIndex {
         txn: &Transaction,
         query_token: &SearchToken,
     ) -> Result<Vec<u64>, SseError> {
+        self.search_within(
+            txn,
+            query_token,
+            &coordinode_core::budget::QueryBudget::new(u64::MAX),
+        )
+    }
+
+    /// [`Self::search`] within a query's `budget`: the entries stream past,
+    /// each a unit of work, with the transaction's own writes over them,
+    /// and the list of node ids is charged as it grows.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure, or [`SseError::Budget`] when the budget stopped
+    /// it.
+    pub fn search_within(
+        &self,
+        txn: &Transaction,
+        query_token: &SearchToken,
+        budget: &coordinode_core::budget::QueryBudget,
+    ) -> Result<Vec<u64>, SseError> {
         let prefix = self.token_prefix(query_token);
-
-        let pairs = txn
-            .base_prefix_scan(Partition::Idx, &prefix)
-            .map_err(|e| SseError::Storage(e.to_string()))?;
-
         let mut node_ids = Vec::new();
-        for (key, _value) in pairs {
-            if let Some(node_id) = self.extract_node_id(&key) {
+        let mut held = budget.empty_charge();
+        txn.prefix_for_each(Partition::Idx, &prefix, budget, |key, _value| {
+            if let Some(node_id) = self.extract_node_id(key) {
+                held.grow(core::mem::size_of::<u64>() as u64)?;
                 node_ids.push(node_id);
             }
-        }
-
+            Ok::<(), SseError>(())
+        })?;
+        held.keep_until_query_ends();
         Ok(node_ids)
     }
 

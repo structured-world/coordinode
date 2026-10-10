@@ -99,6 +99,16 @@ pub enum SseError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    /// The query's budget stopped the search.
+    #[error(transparent)]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
+}
+
+impl From<coordinode_storage::error::StorageError> for SseError {
+    fn from(e: coordinode_storage::error::StorageError) -> Self {
+        Self::Storage(e.to_string())
+    }
 }
 
 #[cfg(test)]
