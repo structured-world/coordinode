@@ -320,7 +320,7 @@ B-tree index on a single property. Optional: `UNIQUE`, `SPARSE` (skip nulls), `W
 CREATE INDEX user_email ON :User(email)
 CREATE UNIQUE INDEX user_handle ON :User(handle)
 CREATE SPARSE INDEX article_deleted ON :Article(deleted_at)
-CREATE INDEX active_users ON :User(name) WHERE active = true
+CREATE INDEX active_users ON :User(name) WHERE n.active = true
 DROP INDEX user_email
 DROP CONSTRAINT user_handle   -- a unique index goes with its constraint
 ```
