@@ -3715,6 +3715,34 @@ pub fn execute_no_commit(
     result
 }
 
+/// The rows a write operator returns, charged: one unit of work per input
+/// row it processed, and the rows reserved for the plan's later stages.
+/// They are made by then; each holds at most its input row and the bindings
+/// the write added, which the input's charge already bounds in count.
+fn charge_returned(
+    ctx: &ExecutionContext<'_>,
+    inputs: usize,
+    rows: Vec<Row>,
+) -> Result<Vec<Row>, ExecutionError> {
+    ctx.budget.work(inputs as u64)?;
+    ctx.hold(rows.iter().map(crate::executor::row::row_held_bytes).sum())?;
+    Ok(rows)
+}
+
+/// Whether evaluating one of `items` reads storage (a subquery or pattern
+/// expression), which works outside the statement's budget.
+fn set_items_read_storage(items: &[crate::plan::SetItem]) -> bool {
+    use crate::plan::SetItem;
+    items.iter().any(|item| match item {
+        SetItem::Property { expr, .. }
+        | SetItem::PropertyPath { expr, .. }
+        | SetItem::ReplaceProperties { expr, .. }
+        | SetItem::MergeProperties { expr, .. } => neutral_contains_subplan(expr),
+        SetItem::DocFunction { value_expr, .. } => neutral_contains_subplan(value_expr),
+        SetItem::AddLabel { .. } => false,
+    })
+}
+
 /// The first operator of `op`'s tree whose work is not charged to the
 /// statement's budget, or `None` when every operator's is. An operator is
 /// accounted when it counts its work and reserves what it keeps, and every
@@ -3750,6 +3778,43 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
         }
         LogicalOp::Unwind { input, expr, .. } if !neutral_contains_subplan(expr) => {
             first_unaccounted_operator(input)
+        }
+        // Writes stage into the transaction, which charges what it stages;
+        // their own rows are charged as they return them.
+        LogicalOp::CreateNode {
+            input, properties, ..
+        } if !properties.iter().any(|(_, e)| neutral_contains_subplan(e)) => {
+            input.as_deref().and_then(first_unaccounted_operator)
+        }
+        LogicalOp::CreateEdge {
+            input, properties, ..
+        } if !properties.iter().any(|(_, e)| neutral_contains_subplan(e)) => {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::Update { input, items, .. } if !set_items_read_storage(items) => {
+            first_unaccounted_operator(input)
+        }
+        LogicalOp::RemoveOp { input, .. } => first_unaccounted_operator(input),
+        // A detaching delete reads every edge of the node it removes.
+        LogicalOp::Delete {
+            input,
+            detach: false,
+            ..
+        } => first_unaccounted_operator(input),
+        // A node MERGE matches through its scan; a relationship MERGE walks
+        // adjacency outside the budget.
+        LogicalOp::Merge {
+            pattern,
+            on_match,
+            on_create,
+            multi: false,
+        } if matches!(
+            **pattern,
+            LogicalOp::NodeScan { .. } | LogicalOp::IndexScan { .. }
+        ) && !set_items_read_storage(on_match)
+            && !set_items_read_storage(on_create) =>
+        {
+            first_unaccounted_operator(pattern)
         }
         LogicalOp::Traverse {
             input,
@@ -4848,7 +4913,9 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 Some(inp) => execute_op(inp, ctx)?,
                 None => vec![Row::new()],
             };
-            execute_create_node(&input_rows, variable.as_deref(), labels, properties, ctx)
+            let rows =
+                execute_create_node(&input_rows, variable.as_deref(), labels, properties, ctx)?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::CreateEdge {
@@ -4861,7 +4928,7 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             properties,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_create_edge(
+            let rows = execute_create_edge(
                 &input_rows,
                 source,
                 target,
@@ -4869,7 +4936,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
                 variable.as_deref(),
                 properties,
                 ctx,
-            )
+            )?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::Update {
@@ -4878,12 +4946,14 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             violation_mode,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_update(&input_rows, items, violation_mode, ctx)
+            let rows = execute_update(&input_rows, items, violation_mode, ctx)?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::RemoveOp { input, items } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_remove(&input_rows, items, ctx)
+            let rows = execute_remove(&input_rows, items, ctx)?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::Delete {
@@ -4892,7 +4962,8 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             detach,
         } => {
             let input_rows = execute_op(input, ctx)?;
-            execute_delete(&input_rows, variables, *detach, ctx)
+            let rows = execute_delete(&input_rows, variables, *detach, ctx)?;
+            charge_returned(ctx, input_rows.len(), rows)
         }
 
         LogicalOp::Merge {
@@ -4900,7 +4971,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             on_match,
             on_create,
             multi,
-        } => execute_merge(pattern, on_match, on_create, *multi, ctx),
+        } => {
+            let rows = execute_merge(pattern, on_match, on_create, *multi, ctx)?;
+            charge_returned(ctx, 1, rows)
+        }
 
         LogicalOp::Upsert {
             pattern,
