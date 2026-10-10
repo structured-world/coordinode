@@ -218,6 +218,21 @@ impl TreeCoverage {
         self.base.unwrap_or(0).max(above)
     }
 
+    /// One past the end of the covered prefix: every index below it has a
+    /// marker or lies under the base, so a read of the tree holds them all.
+    pub(crate) fn covered_prefix(&self) -> u64 {
+        let mut next = self.base.unwrap_or(0);
+        for &(index, _) in &self.sparse {
+            if index > next {
+                break;
+            }
+            if index == next {
+                next += 1;
+            }
+        }
+        next
+    }
+
     /// Whether apply `sub` of source entry `index` is physically in this tree.
     pub(crate) fn contains(&self, index: u64, sub: u32) -> bool {
         index < self.base.unwrap_or(0) || self.sparse.contains(&(index, sub))

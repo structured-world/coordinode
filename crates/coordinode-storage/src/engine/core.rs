@@ -771,6 +771,13 @@ impl StorageEngine {
             }
         }
 
+        // A replacement cut short before its contents were complete is
+        // dropped, and a retired copy still holding entries is cleared, at
+        // seqnos above everything the store holds.
+        if let Some(idx) = trees.get(&Partition::Idx) {
+            installations.settle(idx, seqno.next())?;
+        }
+
         // A fresh journalled store gets its coverage record before it accepts
         // a write, and the record is made durable at once: a store with
         // journal entries and no record is one whose coverage cannot be
@@ -1428,6 +1435,163 @@ impl StorageEngine {
         (part == Partition::Idx).then_some(&self.installations)
     }
 
+    /// Begin replacing this member's copy of `generation` in the index
+    /// partition: a new installation is registered beside the published one,
+    /// and from this call on every write of the generation reaches both.
+    /// `history_from` is the lowest seqno the history imported into it will
+    /// cover; reads at earlier snapshots are refused once it is published.
+    ///
+    /// The replacement is filled with [`Self::import_generation_history`],
+    /// completed with [`Self::finish_generation_import`] and swapped in with
+    /// [`Self::publish_generation`], or dropped with
+    /// [`Self::abandon_generation`]. A crash before it is completed drops it
+    /// at the next open.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the generation has no copy
+    /// here or already has a replacement in preparation; a write failure.
+    pub fn stage_generation(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+        history_from: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        self.installations.stage(
+            self.tree(Partition::Idx)?,
+            self.coverage_domain(),
+            generation.as_raw(),
+            history_from,
+            self.next_seqno(),
+        )?;
+        Ok(())
+    }
+
+    /// The log whose positions this engine's applies are recorded in: the
+    /// Raft log when a state machine runs over the engine, the embedded
+    /// journal otherwise.
+    fn coverage_domain(&self) -> Domain {
+        if self.raft_fence().is_some() {
+            Domain::Raft
+        } else {
+            Domain::Journal
+        }
+    }
+
+    /// Write `entries`, versions of `generation`'s history in logical keys,
+    /// into its replacement at their own seqnos. A version the replacement
+    /// already holds is written again unchanged. Returns how many were
+    /// written.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the generation has no
+    /// replacement in preparation or an entry lies outside it.
+    pub fn import_generation_history(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+        entries: &[crate::engine::installation::HistoryEntry],
+    ) -> StorageResult<usize> {
+        let written =
+            self.installations
+                .import(self.tree(Partition::Idx)?, generation.as_raw(), entries)?;
+        self.coordinator.flush_trigger().wrote_unmeasured();
+        Ok(written)
+    }
+
+    /// Record that `generation`'s replacement holds its complete imported
+    /// history, after making the imported versions durable. `covers_through`
+    /// is the source position the imported history is complete below
+    /// ([`GenerationHistory::covers_through`](crate::engine::installation::GenerationHistory::covers_through)):
+    /// a history taken after [`Self::stage_generation`] returned qualifies,
+    /// one taken before does not.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::import_generation_history`]; a history that ends
+    /// before the replacement's registration; a flush failure.
+    pub fn finish_generation_import(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+        covers_through: u64,
+    ) -> StorageResult<()> {
+        let tree = self.tree(Partition::Idx)?;
+        tree.flush_active_memtable(0)?;
+        self.installations.mark_imported(
+            tree,
+            generation.as_raw(),
+            covers_through,
+            self.next_seqno(),
+        )?;
+        tree.flush_active_memtable(0)?;
+        Ok(())
+    }
+
+    /// Swap `generation`'s completed replacement in for its copy: from this
+    /// call on every read of the generation reads the replacement, and the
+    /// old copy's entries are deleted. A reader already holding the old copy
+    /// at an earlier snapshot still reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the generation has no
+    /// completed replacement; a write or flush failure.
+    pub fn publish_generation(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> StorageResult<()> {
+        let tree = self.tree(Partition::Idx)?;
+        self.installations.publish(
+            tree,
+            generation.as_raw(),
+            self.next_seqno(),
+            self.next_seqno(),
+        )?;
+        tree.flush_active_memtable(0)?;
+        // Cached values were read from the old copy.
+        self.write_taps.replaced(Partition::Idx);
+        if let Some(cache) = &self.tiered_cache {
+            cache.clear_partition(Partition::Idx);
+        }
+        Ok(())
+    }
+
+    /// Drop `generation`'s replacement; the generation keeps its copy.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the generation has no
+    /// replacement in preparation; a write failure.
+    pub fn abandon_generation(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> StorageResult<()> {
+        self.installations.abandon(
+            self.tree(Partition::Idx)?,
+            generation.as_raw(),
+            self.next_seqno(),
+            self.next_seqno(),
+        )
+    }
+
+    /// The history this member's copy of `generation` holds, in logical
+    /// keys and seqno order: the portable form another member, or a
+    /// replacement here, is filled from.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InstallationCatalog`] when the generation has no copy
+    /// here or holds a version a history entry cannot carry; a read failure.
+    pub fn export_generation_history(
+        &self,
+        generation: coordinode_core::index::identity::GenerationId,
+    ) -> StorageResult<crate::engine::installation::GenerationHistory> {
+        self.installations.export(
+            self.tree(Partition::Idx)?,
+            self.coverage_domain(),
+            generation.as_raw(),
+        )
+    }
+
     /// Where the logical `key` of `part` is stored, for a read: as written,
     /// or under its generation's installation (written into `buf`). `None`
     /// when its generation has no installation here: nothing is stored
@@ -1459,12 +1623,11 @@ impl StorageEngine {
     ) -> StorageResult<StorageIter> {
         let tree = self.tree(part)?;
         Ok(match part {
-            Partition::Idx => crate::engine::installation::scan_prefix(
-                tree,
-                &self.installations.current(),
-                prefix,
-                seqno,
-            ),
+            Partition::Idx => {
+                let bindings = self.installations.current();
+                bindings.check_prefix_history(prefix, seqno)?;
+                crate::engine::installation::scan_prefix(tree, &bindings, prefix, seqno)
+            }
             _ => coverage::user_prefix(tree, prefix, seqno),
         })
     }
@@ -1489,13 +1652,11 @@ impl StorageEngine {
             Bound::Unbounded => Bound::Included(coverage::USER_KEYSPACE_START),
         };
         Ok(match part {
-            Partition::Idx => crate::engine::installation::scan(
-                tree,
-                &self.installations.current(),
-                lo,
-                hi,
-                seqno,
-            ),
+            Partition::Idx => {
+                let bindings = self.installations.current();
+                bindings.check_history(lo, hi, seqno)?;
+                crate::engine::installation::scan(tree, &bindings, lo, hi, seqno)
+            }
             _ => {
                 let owned = |b: Bound<&[u8]>| match b {
                     Bound::Included(k) => Bound::Included(k.to_vec()),
@@ -2461,8 +2622,12 @@ impl StorageEngine {
     pub fn put(&self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
         let mut addressing = self.addressing(part)?;
-        self.coordinator
+        let seqno = self
+            .coordinator
             .put_no_capacity_check(part, addressing.point(key)?, value)?;
+        if let Some(staging) = addressing.staging_point(key) {
+            self.coordinator.put_at(part, staging, value, seqno)?;
+        }
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -2538,7 +2703,11 @@ impl StorageEngine {
         let mut buf = Vec::new();
         // A generation with no installation here holds nothing to delete.
         if let Some(stored) = self.stored_key(part, key, &mut buf) {
-            self.coordinator.delete(part, stored)?;
+            let seqno = self.coordinator.delete(part, stored)?;
+            let mut addressing = self.addressing(part)?;
+            if let Some(staging) = addressing.staging_point(key) {
+                self.tree(part)?.remove(staging, seqno);
+            }
         }
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
@@ -2562,7 +2731,10 @@ impl StorageEngine {
         let addressing = self.addressing(part)?;
         let tree = self.tree(part)?;
         let seqno = self.next_seqno();
-        for (start, end) in addressing.range(coverage::clamp_user_start(start), end) {
+        let start = coverage::clamp_user_start(start);
+        let ranges = addressing.range(start, end);
+        let staging = addressing.staging_range(start, end);
+        for (start, end) in ranges.into_iter().chain(staging) {
             if start < end {
                 tree.remove_range(start, end, seqno);
             }
@@ -2587,8 +2759,12 @@ impl StorageEngine {
     pub fn merge(&self, part: Partition, key: &[u8], operand: &[u8]) -> StorageResult<()> {
         self.check_partition_capacity(part)?;
         let mut addressing = self.addressing(part)?;
-        self.coordinator
-            .merge_no_capacity_check(part, addressing.point(key)?, operand)?;
+        let seqno =
+            self.coordinator
+                .merge_no_capacity_check(part, addressing.point(key)?, operand)?;
+        if let Some(staging) = addressing.staging_point(key) {
+            self.tree(part)?.merge(staging, operand, seqno);
+        }
         self.write_taps.wrote(part, [key]);
         if let Some(cache) = &self.tiered_cache {
             cache.remove(part, key);
@@ -3527,6 +3703,13 @@ impl StorageEngine {
         self.check_snapshot_retained(seqno)?;
         let tree = self.tree(part)?;
         let bindings = (part == Partition::Idx).then(|| self.installations.current());
+        if let Some(bindings) = &bindings {
+            bindings.check_history(
+                Bound::Included(coverage::clamp_user_start(start)),
+                Bound::Included(end),
+                seqno,
+            )?;
+        }
         Ok(Box::new(crate::engine::installation::Seekable::open(
             tree,
             bindings.as_deref(),
@@ -3818,12 +4001,27 @@ impl StorageEngine {
         inspect: impl FnOnce(Option<&[u8]>) -> R,
     ) -> StorageResult<R> {
         self.check_snapshot_retained(*snapshot)?;
+        self.check_history_of(part, key, *snapshot)?;
         let mut buf = Vec::new();
         let Some(stored) = self.stored_key(part, key, &mut buf) else {
             return Ok(inspect(None));
         };
         let value = self.tree(part)?.get(stored, *snapshot)?;
         Ok(inspect(value.as_deref()))
+    }
+
+    /// Refuse a read of the index generation `key` belongs to at a snapshot
+    /// below the history its copy here holds.
+    fn check_history_of(
+        &self,
+        part: Partition,
+        key: &[u8],
+        seqno: lsm_tree::SeqNo,
+    ) -> StorageResult<()> {
+        if part == Partition::Idx {
+            self.installations.current().check_key_history(key, seqno)?;
+        }
+        Ok(())
     }
 
     /// Read a value through a previously taken snapshot.
@@ -3849,6 +4047,7 @@ impl StorageEngine {
         key: &[u8],
     ) -> StorageResult<Option<bytes::Bytes>> {
         let tree = self.tree(part)?;
+        self.check_history_of(part, key, *snapshot)?;
         let mut buf = Vec::new();
         let Some(stored) = self.stored_key(part, key, &mut buf) else {
             return Ok(None);
@@ -3870,6 +4069,9 @@ impl StorageEngine {
         keys: &[&[u8]],
     ) -> StorageResult<Vec<Option<bytes::Bytes>>> {
         self.check_snapshot_retained(*snapshot)?;
+        for key in keys {
+            self.check_history_of(part, key, *snapshot)?;
+        }
         let values = self.stored_multi_get(part, keys, *snapshot)?;
         Ok(values
             .into_iter()

@@ -17,11 +17,15 @@
 //!   Installations are never reused: a whole-partition rebuild keeps the
 //!   catalog.
 //! - `0x00 'i' 'b' <GenerationId u64 BE>` holds the generation's published
-//!   installation (u64 BE).
+//!   installation and the lowest seqno its history covers (u64 BE each).
+//! - `0x00 'i' 's' <GenerationId u64 BE>` holds a replacement being prepared:
+//!   its installation, the history it will cover and whether its imported
+//!   contents are complete (see the `replace` module).
+//! - `0x00 'i' 'r' <InstallationId u64 BE>` names a retired installation and
+//!   its generation: its entries are deleted, and nothing reads it again.
 //!
-//! Only keys whose first byte is a generation tag
-//! ([`GENERATION_TAGS`](coordinode_core::index::encoding::GENERATION_TAGS))
-//! are translated; every other family of the partition is stored as written.
+//! Only keys whose first byte is a generation tag ([`GENERATION_TAGS`]) are
+//! translated; every other family of the partition is stored as written.
 
 use std::ops::Bound;
 use std::sync::Arc;
@@ -41,8 +45,19 @@ const NEXT_KEY: [u8; 3] = [0x00, b'i', b'n'];
 const BINDING_PREFIX: [u8; 3] = [0x00, b'i', b'b'];
 /// Exclusive end of the binding records.
 const BINDING_END: [u8; 3] = [0x00, b'i', b'c'];
+/// Start of the retired-installation records, `0x00 'i' 'r' <installation>`.
+const RETIRED_PREFIX: [u8; 3] = [0x00, b'i', b'r'];
+/// Exclusive end of the retired-installation records.
+const RETIRED_END: [u8; 3] = [0x00, b'i', b's'];
+/// Start of the replacement records, `0x00 'i' 's' <generation>`.
+const STAGING_PREFIX: [u8; 3] = [0x00, b'i', b's'];
+/// Exclusive end of the replacement records.
+const STAGING_END: [u8; 3] = [0x00, b'i', b't'];
 /// The first installation handed out; 0 is never one.
 const FIRST_INSTALLATION: u64 = 1;
+
+mod replace;
+pub use replace::{GenerationHistory, HistoryEntry};
 
 /// Whether `key` is one of the installation catalog's own records. They
 /// belong to this member and never travel with the partition's rows.
@@ -51,11 +66,38 @@ pub fn is_catalog_key(key: &[u8]) -> bool {
     key.starts_with(&CATALOG_PREFIX)
 }
 
-fn binding_key(generation: u64) -> [u8; 11] {
+/// A catalog key: one of the record prefixes and a u64.
+fn record_key(prefix: [u8; 3], id: u64) -> [u8; 11] {
     let mut key = [0u8; 11];
-    key[..3].copy_from_slice(&BINDING_PREFIX);
-    key[3..].copy_from_slice(&generation.to_be_bytes());
+    key[..3].copy_from_slice(&prefix);
+    key[3..].copy_from_slice(&id.to_be_bytes());
     key
+}
+
+fn binding_key(generation: u64) -> [u8; 11] {
+    record_key(BINDING_PREFIX, generation)
+}
+
+/// A binding's value: the installation and the lowest seqno its history
+/// covers.
+fn encode_binding(installation: u64, history_from: SeqNo) -> [u8; 16] {
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&installation.to_be_bytes());
+    value[8..].copy_from_slice(&history_from.to_be_bytes());
+    value
+}
+
+fn decode_pair(what: &str, value: &[u8]) -> StorageResult<(u64, u64)> {
+    let (a, b) = value
+        .split_first_chunk::<8>()
+        .filter(|(_, rest)| rest.len() == 8)
+        .ok_or_else(|| {
+            StorageError::InstallationCatalog(format!(
+                "{what} holds {} bytes, expected 16",
+                value.len()
+            ))
+        })?;
+    Ok((u64::from_be_bytes(*a), decode_u64(what, b)?))
 }
 
 /// The tag of a generation-domain key, `None` for any other key.
@@ -233,14 +275,20 @@ pub(crate) enum Piece {
 
 /// The validated bindings of one moment: immutable, so an access resolves
 /// them once and keeps them for its whole run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Bindings {
     /// Generation to its published installation.
     installed: FxHashMap<u64, u64>,
-    /// Installation to the generation it holds.
+    /// Installation to the generation it holds: published, being prepared
+    /// or retired.
     owner: FxHashMap<u64, u64>,
     /// Bound generations, ascending: the order of their logical keys.
     generations: Vec<u64>,
+    /// Generation to the replacement being prepared for it, which every
+    /// write of the generation also reaches.
+    staging: FxHashMap<u64, u64>,
+    /// Installation to the lowest seqno its history covers; absent means 0.
+    history_from: FxHashMap<u64, SeqNo>,
 }
 
 impl Bindings {
@@ -248,6 +296,125 @@ impl Bindings {
     #[inline]
     pub(crate) fn installation(&self, generation: u64) -> Option<u64> {
         self.installed.get(&generation).copied()
+    }
+
+    /// The replacement being prepared for `generation`.
+    #[inline]
+    pub(crate) fn staging(&self, generation: u64) -> Option<u64> {
+        self.staging.get(&generation).copied()
+    }
+
+    /// Whether any replacement is being prepared: the write path's one test
+    /// before it looks for a second address.
+    #[inline]
+    pub(crate) fn any_staging(&self) -> bool {
+        !self.staging.is_empty()
+    }
+
+    /// The lowest seqno the history of `installation` covers.
+    #[inline]
+    pub(crate) fn history_from(&self, installation: u64) -> SeqNo {
+        self.history_from.get(&installation).copied().unwrap_or(0)
+    }
+
+    /// Refuse a read of the generations in `(lo, hi)` at `seqno` below the
+    /// history their installations hold: an installation built from current
+    /// contents does not answer for the past.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::SnapshotOutsideRetention`] naming the first floor the
+    /// read is below.
+    pub(crate) fn check_history(
+        &self,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        seqno: SeqNo,
+    ) -> StorageResult<()> {
+        if self.history_from.is_empty() {
+            return Ok(());
+        }
+        for split in self.split(lo, hi) {
+            if let Some(installation) = split.installation {
+                let floor = self.history_from(installation);
+                if seqno < floor {
+                    return Err(StorageError::SnapshotOutsideRetention {
+                        snapshot: seqno,
+                        watermark: floor,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_history`] for the keys starting with `prefix`.
+    pub(crate) fn check_prefix_history(&self, prefix: &[u8], seqno: SeqNo) -> StorageResult<()> {
+        if self.history_from.is_empty() {
+            return Ok(());
+        }
+        let end = successor(prefix);
+        self.check_history(
+            Bound::Included(prefix),
+            end.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+            seqno,
+        )
+    }
+
+    /// [`Self::check_history`] for the one key `key`.
+    pub(crate) fn check_key_history(&self, key: &[u8], seqno: SeqNo) -> StorageResult<()> {
+        if self.history_from.is_empty() || domain_tag(key).is_none() {
+            return Ok(());
+        }
+        let Some(installation) = slot(key).and_then(|g| self.installation(g)) else {
+            return Ok(());
+        };
+        let floor = self.history_from(installation);
+        if seqno < floor {
+            return Err(StorageError::SnapshotOutsideRetention {
+                snapshot: seqno,
+                watermark: floor,
+            });
+        }
+        Ok(())
+    }
+
+    /// The replacements being prepared, as if each were its generation's
+    /// published installation: what a write also reaches.
+    fn staging_view(&self) -> Self {
+        let mut generations: Vec<u64> = self.staging.keys().copied().collect();
+        generations.sort_unstable();
+        Self {
+            installed: self.staging.clone(),
+            owner: self
+                .staging
+                .iter()
+                .map(|(&generation, &installation)| (installation, generation))
+                .collect(),
+            generations,
+            staging: FxHashMap::default(),
+            history_from: FxHashMap::default(),
+        }
+    }
+
+    /// The bindings with `generation` published at `installation`.
+    fn with_published(&self, generation: u64, installation: u64, history_from: SeqNo) -> Self {
+        let mut next = self.clone();
+        // A previous installation stays in `owner`: retired, never reused.
+        if next.installed.insert(generation, installation).is_none() {
+            let at = next
+                .generations
+                .binary_search(&generation)
+                .unwrap_or_else(|at| at);
+            next.generations.insert(at, generation);
+        }
+        next.owner.insert(installation, generation);
+        if history_from == 0 {
+            next.history_from.remove(&installation);
+        } else {
+            next.history_from.insert(installation, history_from);
+        }
+        next
     }
 
     /// The generation `installation` holds.
@@ -521,6 +688,16 @@ pub(crate) struct Installations {
     /// Held while a binding is written, so two writers of one new generation
     /// bind it once.
     alloc: parking_lot::Mutex<Allocator>,
+    /// Every batch applied to the index tree holds it shared; registering or
+    /// publishing a replacement holds it exclusively, for the time of one
+    /// catalog write, so a batch reaches either both copies or the old one.
+    fence: parking_lot::RwLock<()>,
+    /// Replacements found unfinished at open, cleared once the store's seqno
+    /// is restored.
+    unfinished: parking_lot::Mutex<Vec<(u64, u64)>>,
+    /// Generations whose replacement is recorded complete: the ones that may
+    /// be published.
+    imported: parking_lot::Mutex<rustc_hash::FxHashSet<u64>>,
 }
 
 #[derive(Debug)]
@@ -548,71 +725,121 @@ impl Installations {
             Some(value) => decode_u64("the installation allocator", &value)?,
             None => FIRST_INSTALLATION,
         };
-        let mut bindings = Bindings::default();
-        for guard in tree.range(
-            BINDING_PREFIX.as_slice()..BINDING_END.as_slice(),
-            SeqNo::MAX,
-            None,
-        ) {
-            let (key, value) = guard.into_inner()?;
-            let generation = decode_u64(
-                "a binding key",
-                key.get(BINDING_PREFIX.len()..).unwrap_or(&[]),
-            )?;
-            let installation = decode_u64("a binding", &value)?;
+        let allocated = |what: &str, installation: u64| {
             if installation < FIRST_INSTALLATION || installation >= next {
                 return Err(StorageError::InstallationCatalog(format!(
-                    "generation {generation} is bound to installation {installation}, \
-                     outside the allocated {FIRST_INSTALLATION}..{next}"
+                    "{what} names installation {installation}, outside the allocated \
+                     {FIRST_INSTALLATION}..{next}"
                 )));
             }
+            Ok(())
+        };
+        let mut bindings = Bindings::default();
+        let own = |bindings: &mut Bindings, installation: u64, generation: u64| {
             if let Some(other) = bindings.owner.insert(installation, generation) {
                 return Err(StorageError::InstallationCatalog(format!(
-                    "installation {installation} is bound to generations {other} and {generation}"
+                    "installation {installation} is claimed by generations {other} and \
+                     {generation}"
                 )));
             }
+            Ok(())
+        };
+        for (generation, value) in read_records(tree, BINDING_PREFIX, BINDING_END)? {
+            let (installation, history_from) = decode_pair("a binding", &value)?;
+            allocated("a binding", installation)?;
+            own(&mut bindings, installation, generation)?;
             bindings.installed.insert(generation, installation);
             bindings.generations.push(generation);
+            if history_from != 0 {
+                bindings.history_from.insert(installation, history_from);
+            }
         }
         // Binding keys sort by generation, so the list is ascending.
+        let mut unfinished = Vec::new();
+        for (generation, value) in read_records(tree, STAGING_PREFIX, STAGING_END)? {
+            let staged = replace::Staged::decode(&value)?;
+            allocated("a replacement", staged.installation)?;
+            own(&mut bindings, staged.installation, generation)?;
+            if staged.imported {
+                bindings.staging.insert(generation, staged.installation);
+                if staged.history_from != 0 {
+                    bindings
+                        .history_from
+                        .insert(staged.installation, staged.history_from);
+                }
+            } else {
+                // Its contents may be partial: it is cleared, and its
+                // generation keeps the installation it had.
+                unfinished.push((generation, staged.installation));
+            }
+        }
+        for (installation, value) in read_records(tree, RETIRED_PREFIX, RETIRED_END)? {
+            allocated("a retired installation", installation)?;
+            own(
+                &mut bindings,
+                installation,
+                decode_u64("a retirement", &value)?,
+            )?;
+        }
         verify_no_orphans(tree, &bindings)?;
         Ok(Self {
-            current: parking_lot::RwLock::new(Arc::new(bindings)),
             alloc: parking_lot::Mutex::new(Allocator {
                 next,
                 written_at: tree.get_highest_seqno().unwrap_or(0),
             }),
+            imported: parking_lot::Mutex::new(bindings.staging.keys().copied().collect()),
+            current: parking_lot::RwLock::new(Arc::new(bindings)),
+            fence: parking_lot::RwLock::new(()),
+            unfinished: parking_lot::Mutex::new(unfinished),
         })
+    }
+
+    /// The seqno the next catalog write goes at: above the catalog's last
+    /// write and at least `seqno`.
+    fn next_write(alloc: &Allocator, seqno: SeqNo) -> StorageResult<SeqNo> {
+        Ok(alloc
+            .written_at
+            .checked_add(1)
+            .ok_or_else(|| {
+                StorageError::InstallationCatalog("the catalog's seqnos are exhausted".into())
+            })?
+            .max(seqno))
     }
 
     /// Write the allocator and every binding back into `tree` after it was
     /// cleared: the installations stay allocated, so none is handed out
     /// again, and entries written after the clear land under the bindings
-    /// already in use.
+    /// already in use. A replacement in preparation lost its contents with
+    /// the clear and is dropped.
     ///
     /// # Errors
     ///
     /// A write failure.
     pub(crate) fn rewrite(&self, tree: &AnyTree, seqno: SeqNo) -> StorageResult<()> {
         let mut alloc = self.alloc.lock();
-        let at = alloc
-            .written_at
-            .checked_add(1)
-            .ok_or_else(|| {
-                StorageError::InstallationCatalog("the catalog's seqnos are exhausted".into())
-            })?
-            .max(seqno);
-        let bindings = self.current();
-        let mut batch = lsm_tree::WriteBatch::with_capacity(bindings.installed.len() + 1);
+        let at = Self::next_write(&alloc, seqno)?;
+        let mut current = self.current.write();
+        let mut bindings = Bindings::clone(&current);
+        bindings.staging.clear();
+        let mut batch = lsm_tree::WriteBatch::with_capacity(bindings.owner.len() + 1);
         batch.insert(NEXT_KEY.as_slice(), alloc.next.to_be_bytes().as_slice());
         for (&generation, &installation) in &bindings.installed {
             batch.insert(
                 binding_key(generation).as_slice(),
-                installation.to_be_bytes().as_slice(),
+                encode_binding(installation, bindings.history_from(installation)).as_slice(),
             );
+        }
+        for (&installation, &generation) in &bindings.owner {
+            if bindings.installed.get(&generation) != Some(&installation) {
+                batch.insert(
+                    record_key(RETIRED_PREFIX, installation).as_slice(),
+                    generation.to_be_bytes().as_slice(),
+                );
+            }
         }
         tree.apply_batch(batch, at)?;
         alloc.written_at = at;
+        *current = Arc::new(bindings);
         Ok(())
     }
 
@@ -639,42 +866,45 @@ impl Installations {
         if let Some(installation) = self.current.read().installation(generation) {
             return Ok(installation);
         }
-        let installation = alloc.next;
-        let after = installation.checked_add(1).ok_or_else(|| {
-            StorageError::InstallationCatalog("every installation id has been allocated".into())
-        })?;
-        let at = alloc
-            .written_at
-            .checked_add(1)
-            .ok_or_else(|| {
-                StorageError::InstallationCatalog("the catalog's seqnos are exhausted".into())
-            })?
-            .max(seqno);
+        let (installation, after) = Self::allocate(&alloc)?;
+        let at = Self::next_write(&alloc, seqno)?;
         let mut batch = lsm_tree::WriteBatch::with_capacity(2);
         batch.insert(NEXT_KEY.as_slice(), after.to_be_bytes().as_slice());
         batch.insert(
             binding_key(generation).as_slice(),
-            installation.to_be_bytes().as_slice(),
+            encode_binding(installation, 0).as_slice(),
         );
         tree.apply_batch(batch, at)?;
         alloc.next = after;
         alloc.written_at = at;
         let mut current = self.current.write();
-        let mut bindings = Bindings {
-            installed: current.installed.clone(),
-            owner: current.owner.clone(),
-            generations: current.generations.clone(),
-        };
-        bindings.installed.insert(generation, installation);
-        bindings.owner.insert(installation, generation);
-        let at = bindings
-            .generations
-            .binary_search(&generation)
-            .unwrap_or_else(|at| at);
-        bindings.generations.insert(at, generation);
-        *current = Arc::new(bindings);
+        *current = Arc::new(current.with_published(generation, installation, 0));
         Ok(installation)
     }
+
+    /// The installation to hand out next, and the allocator's value after.
+    fn allocate(alloc: &Allocator) -> StorageResult<(u64, u64)> {
+        let installation = alloc.next;
+        let after = installation.checked_add(1).ok_or_else(|| {
+            StorageError::InstallationCatalog("every installation id has been allocated".into())
+        })?;
+        Ok((installation, after))
+    }
+}
+
+/// The records under `[prefix, end)`, each with the u64 after the prefix.
+fn read_records(
+    tree: &AnyTree,
+    prefix: [u8; 3],
+    end: [u8; 3],
+) -> StorageResult<Vec<(u64, lsm_tree::UserValue)>> {
+    let mut out = Vec::new();
+    for guard in tree.range(prefix.as_slice()..end.as_slice(), SeqNo::MAX, None) {
+        let (key, value) = guard.into_inner()?;
+        let id = decode_u64("a catalog key", key.get(prefix.len()..).unwrap_or(&[]))?;
+        out.push((id, value));
+    }
+    Ok(out)
 }
 
 /// One piece of a seekable scan: its own tree iterator, and how its keys
@@ -901,13 +1131,17 @@ fn lower_admits(bound: &Bound<Vec<u8>>, key: &[u8]) -> bool {
 /// How one tree batch addresses its keys: through the index tree's
 /// installations, binding a generation on its first write, or as written for
 /// every other tree. The bindings are resolved once for the batch and again
-/// only after a binding is made.
+/// only after a binding is made. For the index tree it holds the catalog's
+/// apply side for the batch's lifetime, so a replacement is registered or
+/// published between batches, never inside one.
 pub(crate) struct Addressing<'a> {
     installations: Option<&'a Installations>,
+    _applying: Option<parking_lot::RwLockReadGuard<'a, ()>>,
     tree: &'a AnyTree,
     seqno: SeqNo,
     bindings: Option<Arc<Bindings>>,
     buf: Vec<u8>,
+    staging_buf: Vec<u8>,
 }
 
 impl<'a> Addressing<'a> {
@@ -918,13 +1152,47 @@ impl<'a> Addressing<'a> {
         tree: &'a AnyTree,
         seqno: SeqNo,
     ) -> Self {
+        // Taken before the bindings are read, so they stay current for the
+        // whole batch. Recursive: a batch may run inside another engine write.
+        let applying = installations.map(|i| i.fence.read_recursive());
         Self {
             bindings: installations.map(Installations::current),
+            _applying: applying,
             installations,
             tree,
             seqno,
             buf: Vec::new(),
+            staging_buf: Vec::new(),
         }
+    }
+
+    /// Where the replacement being prepared for the generation of `key`
+    /// holds the same write, if one is: the write lands there too, in the
+    /// same tree batch, so the tree's coverage of the batch covers both.
+    pub(crate) fn staging_point<'k>(&'k mut self, key: &'k [u8]) -> Option<&'k [u8]> {
+        let bindings = self.bindings.as_ref()?;
+        if !bindings.any_staging() || domain_tag(key).is_none() {
+            return None;
+        }
+        let installation = bindings.staging(slot(key)?)?;
+        with_slot(key, installation, &mut self.staging_buf);
+        Some(&self.staging_buf)
+    }
+
+    /// The stored ranges, `[start, end)`, of the replacements being prepared
+    /// that the range delete of `[start, end)` covers.
+    pub(crate) fn staging_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(bindings) = self.bindings.as_ref().filter(|b| b.any_staging()) else {
+            return Vec::new();
+        };
+        let view = bindings.staging_view();
+        view.pieces(Bound::Included(start), Bound::Excluded(end))
+            .into_iter()
+            .filter_map(|piece| match piece {
+                Piece::Domain { lo, hi, .. } => Some((exclusive_start(lo), exclusive_end(hi)?)),
+                Piece::Raw { .. } => None,
+            })
+            .collect()
     }
 
     /// Where the point write of `key` lands. A generation without an

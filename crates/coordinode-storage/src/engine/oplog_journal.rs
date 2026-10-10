@@ -250,16 +250,31 @@ pub(crate) fn apply_oplog_ops_at(
     let mut batch = lsm_tree::WriteBatch::with_capacity(ops.len() + 1);
     for op in ops {
         match op {
+            // A replacement being prepared receives the same write in the
+            // same batch, as on the live apply path.
             OplogOp::Insert { key, value, .. } => {
                 batch.insert(addressing.point(key)?, value.as_slice());
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.insert(staging, value.as_slice());
+                }
             }
-            OplogOp::Delete { key, .. } => batch.remove(addressing.point(key)?),
+            OplogOp::Delete { key, .. } => {
+                batch.remove(addressing.point(key)?);
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.remove(staging);
+                }
+            }
             OplogOp::Merge { key, operand, .. } => {
                 batch.merge(addressing.point(key)?, operand.as_slice());
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.merge(staging, operand.as_slice());
+                }
             }
             OplogOp::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                for (start, end) in addressing.range(start, end) {
+                let ranges = addressing.range(start, end);
+                let staging = addressing.staging_range(start, end);
+                for (start, end) in ranges.into_iter().chain(staging) {
                     if start < end {
                         tree.remove_range(start, end, seqno);
                     }

@@ -172,7 +172,7 @@ impl ColumnarTableRegistry {
         self.create_or_open_with(table_id, |_| Ok(()))
     }
 
-    /// [`Self::create_or_open`] that runs `on_create` on a tree it had to
+    /// Open or create the table's tree, running `on_create` on a tree it had to
     /// create, before any other caller can reach the table: the registry lock
     /// is held throughout, so whatever `on_create` records about the new table
     /// is in place before its first write.

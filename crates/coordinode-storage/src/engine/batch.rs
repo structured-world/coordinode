@@ -324,18 +324,33 @@ fn apply_group(
     let mut addressing =
         crate::engine::installation::Addressing::new(engine.installations_of(part), tree, seqno);
     let mut batch = lsm_tree::WriteBatch::with_capacity(group.len() + 1);
+    // A replacement being prepared for a generation receives the same write
+    // in the same batch, so the batch's coverage marker covers it too.
     for mutation in group {
         match mutation {
             Mutation::Put { key, value, .. } => {
                 batch.insert(addressing.point(key)?, value.as_slice());
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.insert(staging, value.as_slice());
+                }
             }
-            Mutation::Delete { key, .. } => batch.remove(addressing.point(key)?),
+            Mutation::Delete { key, .. } => {
+                batch.remove(addressing.point(key)?);
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.remove(staging);
+                }
+            }
             Mutation::Merge { key, operand, .. } => {
                 batch.merge(addressing.point(key)?, operand.as_slice());
+                if let Some(staging) = addressing.staging_point(key) {
+                    batch.merge(staging, operand.as_slice());
+                }
             }
             Mutation::RemoveRange { start, end, .. } => {
                 let start = coverage::clamp_user_start(start);
-                for (start, end) in addressing.range(start, end) {
+                let ranges = addressing.range(start, end);
+                let staging = addressing.staging_range(start, end);
+                for (start, end) in ranges.into_iter().chain(staging) {
                     if start < end {
                         tree.remove_range(start, end, seqno);
                         engine.coordinator().flush_trigger().wrote_unmeasured();

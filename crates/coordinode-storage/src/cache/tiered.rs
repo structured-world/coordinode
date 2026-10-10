@@ -293,7 +293,7 @@ impl CacheLayer {
     /// all cached keys of the affected partition: the cache cannot range-query,
     /// and a range tombstone leaves the shadowed keys physically present, so a
     /// stale cache hit would otherwise return a deleted value. Orphaned file
-    /// bytes are reclaimed by the next compaction, mirroring [`remove`].
+    /// bytes are reclaimed by the next compaction, mirroring [`Self::remove`].
     fn clear_partition(&self, part: Partition) {
         let target = part as u8;
         let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
