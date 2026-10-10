@@ -244,6 +244,199 @@ fn a_history_ending_before_the_registration_is_refused() {
     assert_eq!(get(&engine, &b), Some(b"b1".to_vec()));
 }
 
+/// An embedded engine and a closure committing puts and range deletes to the
+/// index partition through its journal at a given commit timestamp.
+fn journaled(
+    dir: &std::path::Path,
+) -> (
+    StorageEngine,
+    std::sync::Arc<coordinode_core::txn::timestamp::TimestampOracle>,
+) {
+    let oracle = std::sync::Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let engine = StorageEngine::open_embedded(&config(dir), oracle.clone()).expect("open");
+    (engine, oracle)
+}
+
+fn put(key: &[u8], value: &[u8]) -> coordinode_core::txn::proposal::Mutation {
+    coordinode_core::txn::proposal::Mutation::Put {
+        partition: coordinode_core::txn::proposal::PartitionId::Idx,
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+fn entry_of(generation: u64, rest: &[u8]) -> Vec<u8> {
+    let mut out = prefix(TAG_ENTRIES, generation);
+    out.extend_from_slice(rest);
+    out
+}
+
+/// Replace `GENERATION` from its own history and publish it.
+fn replace_locally(engine: &StorageEngine) {
+    engine.stage_generation(GENERATION).expect("stage");
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+    engine
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
+        .expect("finish");
+    engine.publish_generation(GENERATION).expect("publish");
+}
+
+/// One proposal writing two generations while one of them is replaced: the
+/// replaced one gets the write in both copies, the other keeps its single
+/// copy, and neither loses the write.
+#[test]
+fn a_proposal_over_two_generations_reaches_only_the_replaced_ones_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = journaled(dir.path());
+    let other = 41;
+    engine
+        .commit_journaled(
+            &[put(&entry(b"a"), b"a1"), put(&entry_of(other, b"a"), b"o1")],
+            oracle.next().as_raw(),
+        )
+        .expect("commit");
+    let before = stored_installations(&engine);
+    assert_eq!(before.len(), 2);
+    engine.stage_generation(GENERATION).expect("stage");
+    engine
+        .commit_journaled(
+            &[put(&entry(b"b"), b"b1"), put(&entry_of(other, b"b"), b"o2")],
+            oracle.next().as_raw(),
+        )
+        .expect("commit");
+    assert_eq!(
+        stored_installations(&engine).len(),
+        3,
+        "only the staged generation gained a copy"
+    );
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+    engine
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
+        .expect("finish");
+    engine.publish_generation(GENERATION).expect("publish");
+
+    assert_eq!(get(&engine, &entry(b"a")), Some(b"a1".to_vec()));
+    assert_eq!(get(&engine, &entry(b"b")), Some(b"b1".to_vec()));
+    assert_eq!(get(&engine, &entry_of(other, b"a")), Some(b"o1".to_vec()));
+    assert_eq!(get(&engine, &entry_of(other, b"b")), Some(b"o2".to_vec()));
+}
+
+/// A commit that applies after the registration at a timestamp below writes
+/// already applied (a late finalize) lands in the replacement at that
+/// timestamp: a snapshot between the two sees it, the latest read sees the
+/// later write.
+#[test]
+fn a_late_low_timestamp_write_lands_in_the_replacement_at_its_timestamp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = journaled(dir.path());
+    let late = oracle.next().as_raw();
+    let between = oracle.next().as_raw();
+    let current = oracle.next().as_raw();
+    engine
+        .commit_journaled(&[put(&entry(b"k"), b"current")], current)
+        .expect("commit");
+    engine.stage_generation(GENERATION).expect("stage");
+    engine
+        .commit_journaled(&[put(&entry(b"k"), b"late")], late)
+        .expect("late commit");
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+    engine
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
+        .expect("finish");
+    engine.publish_generation(GENERATION).expect("publish");
+
+    assert_eq!(get(&engine, &entry(b"k")), Some(b"current".to_vec()));
+    assert_eq!(
+        get_at(&engine, between, &entry(b"k")),
+        Some(b"late".to_vec())
+    );
+}
+
+/// Dropping the generation's entries with a range delete while its
+/// replacement is prepared deletes them from both copies: the published
+/// replacement holds nothing the drop removed.
+#[test]
+fn a_range_delete_during_preparation_reaches_the_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (engine, oracle) = journaled(dir.path());
+    engine
+        .commit_journaled(
+            &[put(&entry(b"a"), b"a1"), put(&entry(b"b"), b"b1")],
+            oracle.next().as_raw(),
+        )
+        .expect("commit");
+    engine.stage_generation(GENERATION).expect("stage");
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    engine
+        .commit_journaled(
+            &[coordinode_core::txn::proposal::Mutation::RemoveRange {
+                partition: coordinode_core::txn::proposal::PartitionId::Idx,
+                start: prefix(TAG_ENTRIES, GENERATION.as_raw()),
+                end: prefix(TAG_ENTRIES, GENERATION.as_raw() + 1),
+            }],
+            oracle.next().as_raw(),
+        )
+        .expect("drop");
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+    engine
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
+        .expect("finish");
+    engine.publish_generation(GENERATION).expect("publish");
+
+    assert_eq!(get(&engine, &entry(b"a")), None);
+    assert_eq!(get(&engine, &entry(b"b")), None);
+}
+
+/// Entries a retired copy still holds after its publication (the range
+/// tombstones lost to a crash) are deleted at the next open: no read reaches
+/// them, and they do not survive as storage.
+#[test]
+fn entries_left_under_a_retired_copy_are_cleared_at_open() {
+    use lsm_tree::AbstractTree as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    engine
+        .put(Partition::Idx, &entry(b"a"), b"a1")
+        .expect("put");
+    let old = stored_installations(&engine);
+    replace_locally(&engine);
+    // Bring an entry back under the retired copy, above its tombstone.
+    let tree = engine.tree(Partition::Idx).expect("idx");
+    let mut stale = prefix(TAG_ENTRIES, old[0]);
+    stale.extend_from_slice(b"stale");
+    tree.insert(stale.as_slice(), b"x".as_slice(), engine.snapshot() + 10);
+    tree.flush_active_memtable(0).expect("flush");
+    assert!(stored_installations(&engine).contains(&old[0]));
+    drop(engine);
+
+    let engine = StorageEngine::open(&config(dir.path())).expect("reopen");
+    assert!(
+        !stored_installations(&engine).contains(&old[0]),
+        "the retired copy holds nothing after open"
+    );
+    assert_eq!(get(&engine, &entry(b"a")), Some(b"a1".to_vec()));
+    assert_eq!(get(&engine, &entry(b"stale")), None);
+}
+
 /// An imported entry outside the generation is refused, so a history meant
 /// for one generation cannot write into another.
 #[test]
