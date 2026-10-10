@@ -126,6 +126,29 @@ pub struct IntegrityReport {
     pub found: Mismatch,
 }
 
+/// This member's copy of one B-tree index generation, as diagnostics show
+/// it: the logical generation, the local installation holding it, and how
+/// this member may use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalCopyStatus {
+    /// The generation the copy holds.
+    pub generation: GenerationId,
+    /// The index serving from the generation now; `None` once it left the
+    /// catalog.
+    pub index: Option<IndexId>,
+    /// This member's installation holding the copy; `None` before anything
+    /// was written to or read from it here.
+    pub installation: Option<u64>,
+    /// Its use guard is stored in this run: it has been used as evidence.
+    pub guarded: bool,
+    /// Found disagreeing with the records here: it answers from the records
+    /// until a check verifies it.
+    pub unfit: bool,
+    /// The finding is stored and survives a restart on its own; `false` for
+    /// a finding whose mark could not be saved, which the open guard covers.
+    pub mark_stored: bool,
+}
+
 /// The most reports waiting to be recorded; past it new ones are dropped,
 /// the generation stays suspect here, and the maintenance admits the checks
 /// they would have started from this member's marks.
@@ -624,6 +647,48 @@ impl IndexRegistry {
         view.trusted_from
             .get(&generation)
             .is_none_or(|from| read_ts >= *from)
+    }
+
+    /// This member's copies of the B-tree generations it serves, uses or
+    /// found unfit, in generation order.
+    pub fn local_copies(&self, engine: &StorageEngine) -> Vec<LocalCopyStatus> {
+        let serving: FxHashMap<GenerationId, IndexId> = self
+            .indexes
+            .read()
+            .by_id
+            .values()
+            .filter(|r| r.def.index_type == IndexType::BTree)
+            .map(|r| (r.def.generation, r.def.id))
+            .collect();
+        let view = self.integrity.lock();
+        let mut generations: Vec<GenerationId> = serving
+            .keys()
+            .copied()
+            .chain(view.local.keys().copied())
+            .chain(view.armed.iter().map(|c| c.generation))
+            .collect();
+        generations.sort_unstable();
+        generations.dedup();
+        generations
+            .into_iter()
+            .map(|generation| {
+                let installation = engine.installation_of(generation);
+                let mark = view.local.get(&generation);
+                LocalCopyStatus {
+                    generation,
+                    index: serving.get(&generation).copied(),
+                    installation,
+                    guarded: installation.is_some_and(|installation| {
+                        view.armed.contains(&LocalCopy {
+                            generation,
+                            installation,
+                        })
+                    }),
+                    unfit: mark.is_some(),
+                    mark_stored: mark.is_some_and(|m| m.state == MarkState::Stored),
+                }
+            })
+            .collect()
     }
 
     /// Flushes of this member's recovery state (use guards and marks) made

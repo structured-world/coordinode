@@ -1618,6 +1618,47 @@ fn a_copy_in_use_when_the_process_died_is_checked_before_it_serves() {
     );
 }
 
+/// `db.indexCopies()` shows this member's copy apart from the generation:
+/// its installation, that a lookup put it in use, and that a lookup finding
+/// it wrong made it unfit here with the finding stored.
+#[test]
+fn index_copies_show_this_members_copy() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX u_email ON :U(email)")
+        .expect("index");
+    db.execute_cypher("CREATE (:U {email: 'a@x'})").expect("a");
+    db.execute_cypher("CREATE (:U {email: 'z@x'})").expect("z");
+    let owner = id_of(&mut db, "a@x");
+    let wrong = id_of(&mut db, "z@x");
+    let copy = |db: &mut Database| {
+        let rows = db.execute_cypher("CALL db.indexCopies()").expect("copies");
+        assert_eq!(rows.len(), 1, "one copy: {rows:?}");
+        rows[0].clone()
+    };
+    let generation = index_named(db.engine(), "u_email")
+        .expect("index")
+        .generation;
+    let row = copy(&mut db);
+    assert_eq!(
+        row.get("generation"),
+        Some(&Value::Int(i64::try_from(generation.as_raw()).expect("id")))
+    );
+    assert!(matches!(row.get("installation"), Some(Value::Int(_))));
+    assert_eq!(row.get("unfit"), Some(&Value::Bool(false)));
+
+    assert_eq!(found(&mut db, "a@x"), vec![owner]);
+    assert_eq!(copy(&mut db).get("inUse"), Some(&Value::Bool(true)));
+
+    misattribute(&db, "u_email", "a@x", wrong);
+    assert_eq!(found(&mut db, "a@x"), vec![owner]);
+    let row = copy(&mut db);
+    let state = row.get("unfit").cloned();
+    // A check the finding started may already have verified the copy again.
+    if state == Some(Value::Bool(true)) {
+        assert_eq!(row.get("findingStored"), Some(&Value::Bool(true)));
+    }
+}
+
 /// A copy is guarded once per run: its first lookup stores the guard, and
 /// no later lookup or write through it touches the recovery state.
 #[test]

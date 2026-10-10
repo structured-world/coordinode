@@ -548,7 +548,8 @@ CALL db.reindex('user_email', waitMs)      -- REINDEX as a procedure, by name or
   again before it serves. A standalone member answers from its records until
   its copy is checked or rebuilt. These records are written even when the
   disk is below its free-space reserve. A member that cannot write one keeps
-  the copy out of use and answers from its records.
+  the copy out of use and answers from its records. `CALL db.indexCopies()`
+  shows the state of each copy on the member that runs it.
 - **Records breaking a unique index.** Two records holding one value cannot
   be represented by any entry: a check reports them (`conflicts`), changes
   neither, and the generation stays `SUSPECT` until the records are fixed.
@@ -912,6 +913,7 @@ Built-in procedures:
 | `db.indexCheck(operation, waitMs = 0)` | READ | the check columns |
 | `db.cancelIndexCheck(operation)` | SCHEMA | the check columns |
 | `db.reindex(index, waitMs = 0)` | SCHEMA | `operation`, `state` |
+| `db.indexCopies()` | READ | `generation`, `indexId`, `installation`, `inUse`, `unfit`, `findingStored`, `checking`: this member's own copy of each B-tree generation |
 
 `dbms.procedures()` lists every procedure the server answers, with its full
 signature, for example
