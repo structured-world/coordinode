@@ -39,6 +39,18 @@ use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Wait until `node` leads: an election on a loaded host can take longer
+/// than any fixed pause, and a proposal made before it is refused.
+async fn await_leadership(node: &RaftNode) {
+    for _ in 0..150 {
+        if node.is_leader().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(node.is_leader().await, "the node never became leader");
+}
+
 fn open_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
     let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
         "default",
@@ -186,9 +198,7 @@ async fn crash_recovery_resumes_from_the_covered_prefix() {
         let node = RaftNode::single_node(Arc::clone(&engine))
             .await
             .expect("bootstrap");
-
-        // Wait for leadership
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        await_leadership(&node).await;
 
         let pipeline = node.pipeline();
         let id_gen = ProposalIdGenerator::new();
@@ -381,8 +391,7 @@ async fn an_applied_proposal_is_recorded_in_its_tree() {
     let node = RaftNode::single_node(Arc::clone(&engine))
         .await
         .expect("bootstrap");
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_leadership(&node).await;
 
     let pipeline = node.pipeline();
     let id_gen = ProposalIdGenerator::new();
