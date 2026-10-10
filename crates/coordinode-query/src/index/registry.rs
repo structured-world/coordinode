@@ -40,6 +40,10 @@ pub struct IndexRegistry {
     /// Orders the stored marks of this member's unfit copies: a mark written
     /// for a new report never lands before the removal of an older one.
     marks: parking_lot::Mutex<()>,
+    /// Runs inside [`Self::verified_here`] right after the stored mark is
+    /// removed, so a test can make a finding at that point.
+    #[cfg(test)]
+    after_mark_removed: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// The suspect generations as this process knows them.
@@ -58,6 +62,9 @@ struct IntegrityView {
     trusted_from: FxHashMap<GenerationId, u64>,
     /// Disagreements found here, waiting to be recorded.
     reports: Vec<IntegrityReport>,
+    /// A report was dropped at the bound: the maintenance finds the
+    /// generations it would have named from the marks instead.
+    overflowed: bool,
 }
 
 /// This member's own finding against one generation's copy.
@@ -67,8 +74,38 @@ struct LocalMark {
     /// generations: a check proves the copy only if none arrived since the
     /// revision its pass started at.
     revision: u64,
-    /// Stored, so a restart still answers from the records.
-    stored: bool,
+    /// Where its stored copy stands.
+    state: MarkState,
+}
+
+/// Whether a mark survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkState {
+    /// Not written: the disk was below its free-space reserve, so nothing
+    /// reached it, and the write is safe to make once there is room.
+    Pending,
+    /// Written and flushed.
+    Stored,
+    /// A write or flush of it failed: whether anything reached the disk is
+    /// unknown, and a retry proves nothing (a failed fsync may have dropped
+    /// the pages it reports clean afterwards). Never retried; the generation
+    /// stays unfit in this process.
+    Failed,
+}
+
+/// A mark could not be made durable: the statement that found the
+/// disagreement fails with it rather than report it kept.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the finding that index generation {generation} disagrees with its records could not be \
+     stored durably on this member: {source}"
+)]
+pub struct MarkNotDurable {
+    /// The generation found disagreeing.
+    pub generation: u64,
+    /// The write or flush that failed.
+    #[source]
+    pub source: StoreError,
 }
 
 /// A disagreement between an entry and a record, found by a read or a write
@@ -84,8 +121,8 @@ pub struct IntegrityReport {
 }
 
 /// The most reports waiting to be recorded; past it new ones are dropped,
-/// the generation stays suspect here, and the check its first report
-/// starts finds the rest.
+/// the generation stays suspect here, and the maintenance admits the checks
+/// they would have started from this member's marks.
 const MAX_PENDING_REPORTS: usize = 1024;
 
 /// The indexes in force, by identity, and the names that bind them.
@@ -220,6 +257,9 @@ pub enum IndexWriteError {
     /// The index store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A disagreement found during the write could not be stored durably.
+    #[error(transparent)]
+    MarkNotDurable(#[from] MarkNotDurable),
 }
 
 impl UniqueViolation {
@@ -284,6 +324,8 @@ impl IndexRegistry {
             any_suspect: core::sync::atomic::AtomicBool::new(false),
             reported: parking_lot::Condvar::new(),
             marks: parking_lot::Mutex::new(()),
+            #[cfg(test)]
+            after_mark_removed: parking_lot::Mutex::new(None),
         }
     }
 
@@ -294,27 +336,35 @@ impl IndexRegistry {
     /// checks the generation. A read or a write that finds one reports it;
     /// neither changes an entry or a record for it.
     ///
-    /// The first finding against a generation is stored in `engine` before
-    /// this returns, so a restart keeps answering from the records. If the
-    /// store refuses it, the mark stays in memory and the maintenance
-    /// stores it on its next round ([`Self::store_pending_marks`]).
+    /// When this returns `Ok`, the finding is stored in `engine`, so a
+    /// restart keeps answering from the records; or the disk is below its
+    /// free-space reserve, nothing was written, and the maintenance stores it
+    /// once there is room ([`Self::store_pending_marks`]). The decision that
+    /// a mark is stored is taken in the same order as a check lifting it, so
+    /// a finding made while a check removes the mark returns only after the
+    /// mark is stored again.
+    ///
+    /// # Errors
+    ///
+    /// [`MarkNotDurable`] when the write or flush of the mark failed: its
+    /// durability is unknown and it is not retried. The generation stays
+    /// unfit in this process; the statement that found it fails.
     pub fn report_mismatch(
         &self,
         engine: &StorageEngine,
         index: &IndexDefinition,
         found: Mismatch,
-    ) {
-        let unstored = {
+    ) -> Result<(), MarkNotDurable> {
+        {
             let mut view = self.integrity.lock();
             view.last_revision += 1;
             let revision = view.last_revision;
             let mark = view.local.entry(index.generation).or_insert(LocalMark {
                 revision,
-                stored: false,
+                state: MarkState::Pending,
             });
             mark.revision = revision;
-            let unstored = !mark.stored;
-            if unstored {
+            if mark.state == MarkState::Pending {
                 tracing::warn!(
                     index = %index,
                     generation = index.generation.as_raw(),
@@ -328,68 +378,121 @@ impl IndexRegistry {
                 generation: index.generation,
                 found,
             };
-            // Past the bound, a generation with no report queued still gets
-            // one: its check finds the rest.
-            let queued = view
-                .reports
-                .iter()
-                .any(|r| r.generation == index.generation);
-            if (view.reports.len() < MAX_PENDING_REPORTS || !queued)
-                && !view.reports.contains(&report)
-            {
+            if view.reports.contains(&report) {
+                // Already queued.
+            } else if view.reports.len() < MAX_PENDING_REPORTS {
                 view.reports.push(report);
+            } else {
+                view.overflowed = true;
             }
             self.any_suspect
                 .store(true, core::sync::atomic::Ordering::Release);
             self.reported.notify_all();
-            unstored
-        };
-        if unstored {
-            self.store_mark(engine, index.generation);
         }
+        self.store_mark(engine, index.generation)
     }
 
-    /// Store the mark of `generation` unless it is stored already or was
-    /// lifted meanwhile. A failure leaves it for the next round.
-    fn store_mark(&self, engine: &StorageEngine, generation: GenerationId) {
+    /// Store the mark of `generation` if it waits to be. Taken in the order
+    /// of [`Self::verified_here`]: what it finds is what a lift left.
+    fn store_mark(
+        &self,
+        engine: &StorageEngine,
+        generation: GenerationId,
+    ) -> Result<(), MarkNotDurable> {
         let _order = self.marks.lock();
-        let wanted = self
+        let state = self
             .integrity
             .lock()
             .local
             .get(&generation)
-            .is_some_and(|m| !m.stored);
-        if !wanted {
-            return;
-        }
-        match LocalIndexStore::new(engine).mark_unfit_here(generation) {
-            Ok(()) => {
-                if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
-                    mark.stored = true;
-                }
-            }
-            Err(e) => tracing::warn!(
-                generation = generation.as_raw(),
-                error = %e,
-                "could not store that this member's index copy disagrees with the records; \
-                 retrying, and a restart before it lands forgets it"
-            ),
+            .map(|m| m.state);
+        match state {
+            Some(MarkState::Pending) => self.write_mark(engine, generation),
+            Some(MarkState::Failed) => Err(MarkNotDurable {
+                generation: generation.as_raw(),
+                source: StoreError::Storage(StorageError::Io(
+                    "an earlier write of this mark failed; its durability is unknown".into(),
+                )),
+            }),
+            Some(MarkState::Stored) | None => Ok(()),
         }
     }
 
-    /// Store every mark a failure left in memory only.
-    pub fn store_pending_marks(&self, engine: &StorageEngine) {
+    /// Write and flush the mark of `generation`, under the order lock. A disk
+    /// below its free-space reserve is not written to at all and the mark
+    /// stays pending; any failure after that leaves it failed.
+    fn write_mark(
+        &self,
+        engine: &StorageEngine,
+        generation: GenerationId,
+    ) -> Result<(), MarkNotDurable> {
+        if engine.space().is_paused() {
+            return Ok(());
+        }
+        let result = LocalIndexStore::new(engine).mark_unfit_here(generation);
+        let state = if result.is_ok() {
+            MarkState::Stored
+        } else {
+            MarkState::Failed
+        };
+        if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
+            mark.state = state;
+        }
+        result.map_err(|source| {
+            tracing::error!(
+                generation = generation.as_raw(),
+                error = %source,
+                "could not store that this member's index copy disagrees with the records; \
+                 its durability is unknown and it is not retried"
+            );
+            MarkNotDurable {
+                generation: generation.as_raw(),
+                source,
+            }
+        })
+    }
+
+    /// Store the marks the free-space reserve kept from being written, now
+    /// that there may be room. A mark whose write failed is not retried.
+    ///
+    /// # Errors
+    ///
+    /// The first mark whose write or flush failed.
+    pub fn store_pending_marks(&self, engine: &StorageEngine) -> Result<(), MarkNotDurable> {
         let pending: Vec<GenerationId> = self
             .integrity
             .lock()
             .local
             .iter()
-            .filter(|(_, m)| !m.stored)
+            .filter(|(_, m)| m.state == MarkState::Pending)
             .map(|(g, _)| *g)
             .collect();
         for generation in pending {
-            self.store_mark(engine, generation);
+            self.store_mark(engine, generation)?;
         }
+        Ok(())
+    }
+
+    /// The generations this member found its copy of unfit, for the
+    /// maintenance to admit their checks from when reports were dropped or
+    /// the marks were read back after a restart.
+    pub fn unfit_here(&self) -> Vec<GenerationId> {
+        self.integrity.lock().local.keys().copied().collect()
+    }
+
+    /// The index that serves from `generation` now, if one does.
+    pub fn index_of_generation(&self, generation: GenerationId) -> Option<IndexId> {
+        self.indexes
+            .read()
+            .by_id
+            .values()
+            .find(|r| r.def.generation == generation)
+            .map(|r| r.def.id)
+    }
+
+    /// Whether a report was dropped at the bound since the last call.
+    pub fn take_overflow(&self) -> bool {
+        core::mem::take(&mut self.integrity.lock().overflowed)
     }
 
     /// Whether an entry of `generation` is known to disagree with its record,
@@ -460,7 +563,7 @@ impl IndexRegistry {
             let revision = view.last_revision;
             view.local.entry(*generation).or_insert(LocalMark {
                 revision,
-                stored: true,
+                state: MarkState::Stored,
             });
         }
         self.refresh_any_suspect(&view);
@@ -471,15 +574,20 @@ impl IndexRegistry {
     /// mark is lifted, in memory and in `engine`, unless a disagreement was
     /// found here since. Returns whether it was lifted.
     ///
+    /// A finding made while the mark is being removed waits for this to
+    /// finish (the same order lock decides whether a mark is stored), and
+    /// this stores its mark again before letting it go on.
+    ///
     /// # Errors
     ///
-    /// The stored mark could not be removed; the copy stays unfit here.
+    /// The stored mark could not be removed (the copy stays unfit here), or a
+    /// finding made during the removal could not be stored again.
     pub fn verified_here(
         &self,
         engine: &StorageEngine,
         generation: GenerationId,
         revision: u64,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, MarkNotDurable> {
         let _order = self.marks.lock();
         {
             let view = self.integrity.lock();
@@ -492,22 +600,25 @@ impl IndexRegistry {
             }
         }
         // Removed from storage first: a failure leaves the copy unfit.
-        LocalIndexStore::new(engine).clear_unfit_here(&[generation])?;
+        LocalIndexStore::new(engine)
+            .clear_unfit_here(&[generation])
+            .map_err(|source| MarkNotDurable {
+                generation: generation.as_raw(),
+                source,
+            })?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_mark_removed.lock().as_ref() {
+            hook();
+        }
         let mut view = self.integrity.lock();
         match view.local.get_mut(&generation) {
             Some(mark) if mark.revision != revision => {
-                // A finding arrived during the removal: its mark is stored
-                // again, by this round or, on failure, the next.
-                mark.stored = false;
+                // A finding arrived during the removal: the stored copy it
+                // relied on is gone, so it is written again while the finding
+                // still waits on the order lock.
+                mark.state = MarkState::Pending;
                 drop(view);
-                if LocalIndexStore::new(engine)
-                    .mark_unfit_here(generation)
-                    .is_ok()
-                {
-                    if let Some(mark) = self.integrity.lock().local.get_mut(&generation) {
-                        mark.stored = true;
-                    }
-                }
+                self.write_mark(engine, generation)?;
                 Ok(false)
             }
             _ => {
@@ -940,7 +1051,7 @@ fn stage(
                                 valid_from: None,
                                 tuple,
                             },
-                        );
+                        )?;
                     }
                 }
                 needs_source_proof = true;

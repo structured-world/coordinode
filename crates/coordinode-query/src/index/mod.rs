@@ -89,7 +89,8 @@ pub enum IndexSelectorError {
     Storage(String),
 }
 pub use registry::{
-    IndexRegistry, IndexWriteError, PropertyChange, UniqueClaim, UniqueViolation, props_lookup,
+    IndexRegistry, IndexWriteError, MarkNotDurable, PropertyChange, UniqueClaim, UniqueViolation,
+    props_lookup,
 };
 pub use text_registry::TextIndexRegistry;
 pub use vector_build::{BuildOutcome, BuildTarget, VectorBuild};

@@ -87,6 +87,7 @@ impl From<IndexWriteError> for BackfillError {
         match e {
             IndexWriteError::Unique(v) => Self::Duplicate(v),
             IndexWriteError::Store(s) => Self::Store(s),
+            IndexWriteError::MarkNotDurable(m) => Self::Store(m.source),
         }
     }
 }

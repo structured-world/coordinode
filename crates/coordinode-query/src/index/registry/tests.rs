@@ -156,6 +156,13 @@ fn stray(node: u64) -> Mismatch {
     }
 }
 
+/// Report that node `node` holds a stray entry of `index`; the mark must
+/// be stored.
+fn report(reg: &IndexRegistry, engine: &StorageEngine, index: &IndexDefinition, node: u64) {
+    reg.report_mismatch(engine, index, stray(node))
+        .expect("the finding is stored");
+}
+
 /// A disagreement found here makes the generation suspect at once and waits
 /// to be recorded; nothing else is suspect.
 #[test]
@@ -166,8 +173,8 @@ fn a_reported_generation_is_suspect_and_its_report_waits() {
     let index = btree("user_email", "email", 1);
     let other = btree("user_name", "name", 2);
     assert!(!reg.is_suspect(index.generation));
-    reg.report_mismatch(&engine, &index, stray(7));
-    reg.report_mismatch(&engine, &index, stray(7));
+    report(&reg, &engine, &index, 7);
+    report(&reg, &engine, &index, 7);
     assert!(reg.is_suspect(index.generation));
     assert!(!reg.is_suspect(other.generation));
     let reports = reg.take_reports(core::time::Duration::ZERO);
@@ -190,7 +197,7 @@ fn a_catalog_verification_does_not_clear_a_suspicion_found_here() {
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    reg.report_mismatch(&engine, &index, stray(7));
+    report(&reg, &engine, &index, 7);
     let revision = reg.local_revision(index.generation);
     reg.apply_integrity(&[integrity(&index, Integrity::Verified)]);
     assert!(
@@ -228,9 +235,9 @@ fn a_finding_after_the_pass_started_survives_its_verification() {
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    reg.report_mismatch(&engine, &index, stray(7));
+    report(&reg, &engine, &index, 7);
     let started = reg.local_revision(index.generation);
-    reg.report_mismatch(&engine, &index, stray(8));
+    report(&reg, &engine, &index, 8);
     assert!(
         !reg.verified_here(&engine, index.generation, started)
             .expect("lift")
@@ -246,7 +253,7 @@ fn a_finding_after_the_pass_started_survives_its_verification() {
     // finding that came after it either.
     let fresh = btree("user_name", "name", 2);
     let before = reg.local_revision(fresh.generation);
-    reg.report_mismatch(&engine, &fresh, stray(9));
+    report(&reg, &engine, &fresh, 9);
     assert!(
         !reg.verified_here(&engine, fresh.generation, before)
             .expect("lift")
@@ -264,7 +271,7 @@ fn a_finding_survives_power_loss_before_any_maintenance() {
     {
         let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
         let reg = IndexRegistry::new();
-        reg.report_mismatch(&engine, &index, stray(7));
+        report(&reg, &engine, &index, 7);
         rig.cut(engine);
     }
     let engine = StorageEngine::open(&rig.config()).expect("reopen");
@@ -273,26 +280,157 @@ fn a_finding_survives_power_loss_before_any_maintenance() {
     assert!(reg.is_suspect(index.generation));
 }
 
-/// A mark whose flush failed is not taken as stored because its key is in
-/// memory: the next round writes and flushes it again, and a power cut
-/// after that finds it.
+/// A mark whose write or flush failed has unknown durability: the finding
+/// fails rather than report it kept, every later finding against the
+/// generation fails the same way, the copy stays unfit here, and nothing
+/// writes the mark again (a retry after a failed flush proves nothing).
 #[test]
-fn a_mark_whose_flush_failed_is_stored_on_the_next_round() {
+fn a_mark_whose_flush_failed_fails_the_finding_and_is_not_retried() {
+    let rig = coordinode_test_fixtures::PowerRig::new();
+    let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
+    let first = reg.report_mismatch(&engine, &index, stray(7));
+    assert!(
+        matches!(&first, Err(e) if e.generation == index.generation.as_raw()),
+        "{first:?}"
+    );
+    assert!(reg.is_suspect(index.generation), "unfit here regardless");
+    // From here every flush would fail: one attempted would show as a fresh
+    // engine error, not the refusal of a mark already failed.
+    rig.fail_from(coordinode_test_fixtures::FaultOp::Open, 0);
+    let again = reg.report_mismatch(&engine, &index, stray(8));
+    assert!(
+        matches!(
+            &again,
+            Err(MarkNotDurable {
+                source: StoreError::Storage(StorageError::Io(why)),
+                ..
+            }) if why.contains("earlier write")
+        ),
+        "a later finding is refused without touching the disk: {again:?}"
+    );
+    reg.store_pending_marks(&engine)
+        .expect("a failed mark is not pending, so nothing is written");
+    assert!(reg.is_suspect(index.generation));
+}
+
+/// A disk below its free-space reserve is not written to: the finding goes
+/// on with its mark pending, and the mark is written once there is room.
+#[test]
+fn a_mark_waits_for_room_when_the_disk_is_below_its_reserve() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    engine.space().set_reserve(u64::MAX, u64::MAX);
+    report(&reg, &engine, &index, 7);
+    let store = LocalIndexStore::new(&engine);
+    assert!(store.list_unfit_here().expect("marks").is_empty());
+    reg.store_pending_marks(&engine).expect("still no room");
+    assert!(store.list_unfit_here().expect("marks").is_empty());
+    engine.space().set_reserve(0, 0);
+    reg.store_pending_marks(&engine).expect("room again");
+    assert_eq!(
+        store.list_unfit_here().expect("marks"),
+        vec![index.generation]
+    );
+}
+
+/// A finding made while a check removes the mark does not return until the
+/// mark is stored again: a power cut the moment the finding returns still
+/// finds the copy unfit.
+#[test]
+fn a_finding_during_the_removal_returns_only_once_stored_again() {
     let rig = coordinode_test_fixtures::PowerRig::new();
     let index = btree("user_email", "email", 1);
     {
         let engine = Arc::new(StorageEngine::open(&rig.config()).expect("open"));
-        let reg = IndexRegistry::new();
-        rig.fail_next(coordinode_test_fixtures::FaultOp::Open, 1);
-        reg.report_mismatch(&engine, &index, stray(7));
-        assert!(reg.is_suspect(index.generation), "unfit here regardless");
-        reg.store_pending_marks(&engine);
+        let reg = Arc::new(IndexRegistry::new());
+        report(&reg, &engine, &index, 7);
+        let started = reg.local_revision(index.generation);
+        let reporter = Arc::new(parking_lot::Mutex::new(None));
+        {
+            let (reg_in, engine_in, index_in, reporter_in) = (
+                Arc::clone(&reg),
+                Arc::clone(&engine),
+                index.clone(),
+                Arc::clone(&reporter),
+            );
+            *reg.after_mark_removed.lock() = Some(Box::new(move || {
+                let (reg_t, engine_t, index_t) = (
+                    Arc::clone(&reg_in),
+                    Arc::clone(&engine_in),
+                    index_in.clone(),
+                );
+                let handle = std::thread::spawn(move || {
+                    reg_t.report_mismatch(&engine_t, &index_t, stray(8))
+                });
+                // The finding has taken its revision; it must now wait for
+                // the removal to finish rather than return.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while reg_in.local_revision(index_in.generation) == started {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the finding never came"
+                    );
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(
+                    !handle.is_finished(),
+                    "the finding returned while its mark was being removed"
+                );
+                *reporter_in.lock() = Some(handle);
+            }));
+        }
+        assert!(
+            !reg.verified_here(&engine, index.generation, started)
+                .expect("lift")
+        );
+        *reg.after_mark_removed.lock() = None;
+        let handle = reporter.lock().take().expect("the finding ran");
+        handle
+            .join()
+            .expect("reporter thread")
+            .expect("the finding is stored");
+        drop(reg);
         rig.cut(engine);
     }
     let engine = StorageEngine::open(&rig.config()).expect("reopen");
     let reg = IndexRegistry::new();
     reg.load_all(&engine).expect("load");
     assert!(reg.is_suspect(index.generation));
+}
+
+/// The report queue stays within its bound: a report past it is dropped and
+/// the drop is flagged, so the maintenance admits the check from the mark,
+/// which every finding still stores.
+#[test]
+fn a_full_report_queue_drops_reports_but_keeps_marks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = test_engine(dir.path());
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    for node in 0..MAX_PENDING_REPORTS as u64 {
+        report(&reg, &engine, &index, node);
+    }
+    assert!(!reg.take_overflow());
+    let other = btree("user_name", "name", 2);
+    report(&reg, &engine, &other, 1);
+    assert!(reg.take_overflow(), "the drop is flagged");
+    assert!(!reg.take_overflow(), "once");
+    assert!(reg.unfit_here().contains(&other.generation));
+    assert_eq!(
+        reg.take_reports(core::time::Duration::ZERO).len(),
+        MAX_PENDING_REPORTS
+    );
+    let mut stored = LocalIndexStore::new(&engine)
+        .list_unfit_here()
+        .expect("marks");
+    stored.sort_unstable();
+    assert_eq!(stored, vec![index.generation, other.generation]);
 }
 
 /// A generation that left the catalog keeps a mark found here: a reader
@@ -304,7 +442,7 @@ fn a_replaced_generation_keeps_its_mark() {
     let engine = test_engine(dir.path());
     let reg = IndexRegistry::new();
     let index = btree("user_email", "email", 1);
-    reg.report_mismatch(&engine, &index, stray(7));
+    report(&reg, &engine, &index, 7);
     reg.load_all(&engine).expect("load without the generation");
     assert!(reg.is_suspect(index.generation));
     assert!(!reg.answers_at(index.generation, u64::MAX));

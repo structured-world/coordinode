@@ -78,6 +78,11 @@ pub enum ExecutionError {
     #[error("modality store error: {0}")]
     Modality(#[from] coordinode_modality::StoreError),
 
+    /// The statement found an index entry disagreeing with its record and
+    /// could not store that finding durably on this member.
+    #[error(transparent)]
+    IndexMarkNotDurable(#[from] crate::index::MarkNotDurable),
+
     /// Arithmetic with no answer: division or modulo by an integer zero, or an
     /// integer operation whose exact result leaves the `i64` range. Carries the
     /// message verbatim, so a driver sees the same text it would elsewhere.
@@ -442,6 +447,7 @@ fn index_write_error(e: crate::index::IndexWriteError) -> ExecutionError {
     match e {
         crate::index::IndexWriteError::Unique(v) => unique_violation(v),
         crate::index::IndexWriteError::Store(e) => e.into(),
+        crate::index::IndexWriteError::MarkNotDurable(e) => e.into(),
     }
 }
 
@@ -1854,7 +1860,7 @@ impl<'a> ExecutionContext<'a> {
                     valid_from: None,
                     tuple,
                 },
-            );
+            )?;
         }
         Ok(true)
     }

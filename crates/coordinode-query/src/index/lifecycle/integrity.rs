@@ -171,10 +171,16 @@ impl IndexBuildService {
                 {
                     let env = service.shared.env.as_ref();
                     let reports = env.registry().take_reports(MAINTENANCE_TICK);
-                    // A mark the finding could not store is retried here.
-                    env.registry().store_pending_marks(env.engine());
+                    // Marks the free-space reserve kept off the disk; a mark
+                    // whose write failed is not among them.
+                    if let Err(e) = env.registry().store_pending_marks(env.engine()) {
+                        tracing::error!(error = %e, "index maintenance could not store a mark");
+                    }
                     if !reports.is_empty() {
                         service.record_reports(reports);
+                    }
+                    if env.registry().take_overflow() {
+                        service.admit_unfit_here();
                     }
                     service.sweep();
                 }
@@ -213,8 +219,34 @@ impl IndexBuildService {
         }
     }
 
+    /// Admit the check of every generation this member found its copy of
+    /// unfit, as its marks name them: for findings whose reports were
+    /// dropped at the queue's bound, and marks read back at open.
+    fn admit_unfit_here(&self) {
+        let registry = self.shared.env.registry();
+        for generation in registry.unfit_here() {
+            let Some(index) = registry.index_of_generation(generation) else {
+                // A generation that left the catalog: nothing serves from it
+                // to check.
+                continue;
+            };
+            match self.record(index, generation, Vec::new()) {
+                Ok(true) => {
+                    if let Err(e) = self.submit_check(generation) {
+                        tracing::warn!(generation = generation.as_raw(), error = %e,
+                            "could not start the check of an index generation found unfit");
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(generation = generation.as_raw(), error = %e,
+                    "could not record an index generation found unfit"),
+            }
+        }
+    }
+
     /// Record `found` against `generation` of `index` and admit a check
-    /// unless one is pending. `false` when nothing was recorded: the index
+    /// unless one is pending. With nothing in `found`, the generation is
+    /// recorded suspect on this member's mark alone. `false` when nothing was recorded: the index
     /// no longer serves from that generation, or this member takes no
     /// writes.
     fn record(
@@ -240,6 +272,13 @@ impl IndexBuildService {
             let mut new = false;
             for mismatch in &found {
                 new |= record.report(mismatch.clone());
+            }
+            if found.is_empty() && record.integrity != Integrity::Suspect {
+                // This member's mark alone: the revision moves, so a check
+                // already running passes again before it verifies.
+                record.integrity = Integrity::Suspect;
+                record.evidence_revision += 1;
+                new = true;
             }
             if !new && record.integrity == Integrity::Suspect && record.check_pending() {
                 return Ok(true);
@@ -589,6 +628,8 @@ impl IndexBuildService {
             }
         }
         self.refresh_integrity()?;
+        // Marks read back at open name generations no report will.
+        self.admit_unfit_here();
         Ok(resumed)
     }
 
@@ -873,7 +914,7 @@ impl Shared {
                         self.env
                             .registry()
                             .verified_here(self.env.engine(), generation, revision)
-                            .map_err(text)?;
+                            .map_err(|e| e.to_string())?;
                     }
                     return Ok(outcome);
                 }

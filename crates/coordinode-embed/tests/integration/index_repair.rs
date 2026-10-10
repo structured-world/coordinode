@@ -385,9 +385,10 @@ fn records_breaking_a_unique_index_are_reported_and_left_alone() {
 }
 
 /// A member that found its own copy of a generation disagreeing keeps
-/// answering from the records after a restart, though the catalog holds no
-/// suspicion: the mark is this member's, and only a check verified here or a
-/// replacement of the generation lifts it.
+/// answering from the records after a restart, though no report reached the
+/// catalog: the mark is this member's. Read back at open, it admits the
+/// check no report did, and that check, run here, repairs the copy and
+/// lifts the mark from memory and storage.
 #[test]
 fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -402,37 +403,36 @@ fn a_copy_found_unfit_here_stays_unfit_across_a_restart() {
         generation = index_named(db.engine(), "u_email")
             .expect("index")
             .generation;
+        // c's entry lost and this member's copy marked, with no report made.
+        let tuple = encode_tuple(&[Value::String("c@x".into())]).expect("tuple");
+        db.engine()
+            .delete(Partition::Idx, &encode_unique_entry_key(generation, &tuple))
+            .expect("lose c's entry");
         LocalIndexStore::new(db.engine())
             .mark_unfit_here(generation)
             .expect("mark this member's copy");
     }
     let mut db = Database::open(dir.path()).expect("reopen db");
-    assert!(
-        db.index_checks()
-            .expect("checks")
-            .iter()
-            .all(|s| s.record.integrity != Integrity::Suspect),
-        "the catalog holds no suspicion"
-    );
-    // c's entry lost: only the records still answer c.
-    let tuple = encode_tuple(&[Value::String("c@x".into())]).expect("tuple");
-    db.engine()
-        .delete(Partition::Idx, &encode_unique_entry_key(generation, &tuple))
-        .expect("lose c's entry");
+    // Before or after the check repairs c's entry, c is found: from the
+    // records while the mark stands, through the index once it is lifted.
+    // Without the mark read back, the index would answer nothing.
     assert_eq!(found(&mut db, "c@x"), vec![c], "answered from the records");
 
-    // A check run here verifies the copy (and repairs c's entry): the mark
-    // is gone, from memory and from storage.
-    let (_, outcome) = check(&db, "u_email");
+    let (status, outcome) = db
+        .index_check(generation, std::time::Duration::from_secs(30))
+        .expect("read the check")
+        .expect("the mark admitted a check");
     assert!(
-        matches!(outcome, CheckOutcome::Verified { .. }),
+        matches!(outcome, Some(CheckOutcome::Verified { .. })),
         "{outcome:?}"
     );
+    assert!(status.record.check.as_ref().is_some_and(|c| c.repaired > 0));
     assert!(
         LocalIndexStore::new(db.engine())
             .list_unfit_here()
             .expect("marks")
-            .is_empty()
+            .is_empty(),
+        "the check run here lifted the stored mark"
     );
     assert_eq!(found(&mut db, "c@x"), vec![c]);
 }
