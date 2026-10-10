@@ -18,6 +18,8 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 streamvbyte64 = "0.2"
 smallvec = "1"
+# Wakes the task waiting on a query's cancel switch; no_std.
+atomic-waker = "1.1"
 # Integrity of the compact application-unit frame.
 crc32c = "0.6"
 # Identical-slice lookup while encoding a frame: internal byte keys, no DoS hasher needed.

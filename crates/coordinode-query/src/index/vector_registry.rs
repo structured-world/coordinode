@@ -55,6 +55,12 @@ pub(crate) fn insert_many(handle: &RwLock<HnswIndex>, items: Vec<(u64, Vec<f32>)
     }
 }
 
+/// What a partition's `results` may add to the merge map of a scattered
+/// search: an id and a score each, before duplicates across partitions fold.
+fn merged_bytes(results: &[SearchResult]) -> u64 {
+    (results.len() * core::mem::size_of::<(u64, f32)>()) as u64
+}
+
 #[cold]
 fn calibrate(handle: &RwLock<HnswIndex>) {
     if let Ok(mut graph) = handle.write() {
@@ -533,6 +539,7 @@ impl VectorIndexRegistry {
                 Some(l) => hnsw.search_with_loader_metered(query, k, l, meter)?,
                 None => hnsw.search_metered(query, k, meter)?,
             };
+            meter.scratch(merged_bytes(&results))?;
             Self::accumulate_best(&mut best, results);
         }
         Ok(Self::finalize_merge(best, k))
@@ -574,6 +581,7 @@ impl VectorIndexRegistry {
                 &is_visible,
                 meter,
             )?;
+            meter.scratch(merged_bytes(&results))?;
             Self::accumulate_best(&mut best, results);
         }
         Ok(Self::finalize_merge(best, k))

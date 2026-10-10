@@ -222,3 +222,21 @@ fn a_part_works_and_stops_with_the_whole() {
     assert_eq!(part.work(1), Err(BudgetStop::Cancelled));
     assert_eq!(whole.work_done(), CHECK_EVERY);
 }
+
+/// A task waiting on a cancel switch is woken when the switch is thrown
+/// from elsewhere, and one thrown before it waits resolves at once.
+#[tokio::test]
+async fn a_task_waiting_on_a_switch_wakes_when_it_is_thrown() {
+    let flag = CancelFlag::new();
+    let thrower = flag.clone();
+    let waiting = tokio::spawn(async move { flag.thrown().await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished(), "nothing thrown yet");
+    thrower.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("woken by the throw")
+        .expect("task");
+
+    thrower.thrown().await;
+}

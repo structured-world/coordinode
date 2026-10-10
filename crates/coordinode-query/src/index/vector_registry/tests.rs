@@ -305,6 +305,46 @@ fn sharded_dedup_replicated_boundary_id() {
     assert_eq!(sevens, 1, "a replicated id must appear once after merge");
 }
 
+/// A scattered search holds the merge of its partitions' answers within the
+/// statement's budget: after each partition answers, its results are charged
+/// as merge scratch (an id and a score each) before they join the merge.
+#[test]
+fn a_scattered_search_charges_the_merge_of_its_partitions() {
+    /// Records the scratch each step asks for.
+    #[derive(Default)]
+    struct Recorded(Vec<u64>);
+    impl coordinode_core::budget::Meter for Recorded {
+        type Stop = core::convert::Infallible;
+        fn work(&mut self, _units: u64) -> Result<(), Self::Stop> {
+            Ok(())
+        }
+        fn scratch(&mut self, bytes: u64) -> Result<(), Self::Stop> {
+            self.0.push(bytes);
+            Ok(())
+        }
+    }
+
+    let reg = VectorIndexRegistry::new();
+    reg.register_sharded(
+        hnsw(1, "emb", "Doc", "embedding"),
+        Arc::new(TwoPartitionRouter),
+    );
+    // id 7 is on the boundary, in both partitions; id 4 only in the second.
+    reg.bulk_insert(
+        "Doc",
+        "embedding",
+        [(4u64, vec![1.0, 0.0, 0.0]), (7, vec![0.0, 1.0, 0.0])].into_iter(),
+    );
+    let mut recorded = Recorded::default();
+    let Ok(found) = reg.search("Doc", "embedding", &[0.0, 1.0, 0.0], 10, &mut recorded);
+    assert_eq!(found.map(|r| r.len()), Some(2));
+    // The boundary query reaches the first partition (one answer) and then
+    // the second (two answers); each is charged before it is merged.
+    let entry = core::mem::size_of::<(u64, f32)>() as u64;
+    assert!(recorded.0.contains(&entry), "{:?}", recorded.0);
+    assert_eq!(recorded.0.last(), Some(&(2 * entry)), "{:?}", recorded.0);
+}
+
 #[test]
 fn sharded_search_with_visibility_filters_hidden_ids() {
     let reg = VectorIndexRegistry::new();

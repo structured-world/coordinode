@@ -25,7 +25,14 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// session's Cancel, a client that went away) and by the query's budget,
 /// which refuses every later check once it is set.
 #[derive(Debug, Clone, Default)]
-pub struct CancelFlag(Arc<AtomicBool>);
+pub struct CancelFlag(Arc<CancelState>);
+
+#[derive(Debug, Default)]
+struct CancelState {
+    thrown: AtomicBool,
+    /// The task waiting in [`CancelFlag::thrown`], woken when it is thrown.
+    waiter: atomic_waker::AtomicWaker,
+}
 
 impl CancelFlag {
     /// A switch not yet thrown.
@@ -35,12 +42,48 @@ impl CancelFlag {
 
     /// Cancel the query.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.thrown.store(true, Ordering::Release);
+        self.0.waiter.wake();
     }
 
     /// Whether the query was cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.thrown.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the switch is thrown: what a task waiting on work done
+    /// elsewhere (a statement passed to another member) races its answer
+    /// against. One task waits on a switch at a time; a second one polling
+    /// it takes the first one's place.
+    pub fn thrown(&self) -> Thrown<'_> {
+        Thrown(self)
+    }
+}
+
+/// The future [`CancelFlag::thrown`] returns.
+#[derive(Debug)]
+#[must_use = "a future does nothing unless polled"]
+pub struct Thrown<'f>(&'f CancelFlag);
+
+impl core::future::Future for Thrown<'_> {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        let flag = self.0;
+        if flag.is_cancelled() {
+            return core::task::Poll::Ready(());
+        }
+        flag.0.waiter.register(cx.waker());
+        // Read again after registering: a throw between the first read and
+        // the registration woke no one.
+        if flag.is_cancelled() {
+            core::task::Poll::Ready(())
+        } else {
+            core::task::Poll::Pending
+        }
     }
 }
 

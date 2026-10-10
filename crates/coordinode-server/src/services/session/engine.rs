@@ -80,7 +80,8 @@ impl DatabaseCursorEngine {
             .map_err(|s| EngineError(failure(&s)))
     }
 
-    /// Run `query` at the leader and page its answer out of memory.
+    /// Run `query` at the leader and page its answer out of memory. A Cancel
+    /// thrown meanwhile drops the call, and with it the leader's statement.
     fn forwarded(
         &self,
         leader_id: u64,
@@ -88,15 +89,28 @@ impl DatabaseCursorEngine {
         params: Option<HashMap<String, Value>>,
         settings: &ConnectionSettings,
         source: Option<&SourceContext>,
+        cancel: &coordinode_core::budget::CancelFlag,
     ) -> Result<Box<dyn QueryCursor>, EngineError> {
         let request = forwarded_request(query, params, settings);
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             EngineError::internal(format!("no runtime to reach the leader on: {e}"))
         })?;
         let response = runtime
-            // A session statement carries no call deadline; its stream lives on.
-            .block_on(self.executor.forward(leader_id, request, source, None))
-            .map_err(|s| EngineError(failure(&s)))?
+            .block_on(async {
+                tokio::select! {
+                    biased;
+                    () = cancel.thrown() => Err(engine_error(DatabaseError::Execution(
+                        coordinode_query::executor::runner::ExecutionError::Budget(
+                            coordinode_core::budget::BudgetStop::Cancelled,
+                        ),
+                    ))),
+                    // A session statement carries no call deadline; its
+                    // stream lives on.
+                    answered = self.executor.forward(leader_id, request, source, None) => {
+                        answered.map_err(|s| EngineError(failure(&s)))
+                    }
+                }
+            })?
             .into_inner();
         Ok(Box::new(MaterializedCursor {
             rows: response
@@ -177,7 +191,7 @@ impl CursorEngine for DatabaseCursorEngine {
         let admitted = match self.admit(query, &requested(settings, cancel))? {
             Admission::Run(admitted) => admitted,
             Admission::Forward(leader_id) => {
-                return self.forwarded(leader_id, query, params, settings, source.as_ref());
+                return self.forwarded(leader_id, query, params, settings, source.as_ref(), cancel);
             }
         };
         let fenced = SessionStats {
@@ -222,7 +236,14 @@ impl CursorEngine for DatabaseCursorEngine {
             Ok(result) => result,
             Err(e) => match (leader_hint(&e), retry) {
                 (Some(leader_id), Some(params)) => {
-                    return self.forwarded(leader_id, query, params, settings, source.as_ref());
+                    return self.forwarded(
+                        leader_id,
+                        query,
+                        params,
+                        settings,
+                        source.as_ref(),
+                        cancel,
+                    );
                 }
                 _ => return Err(engine_error(e)),
             },

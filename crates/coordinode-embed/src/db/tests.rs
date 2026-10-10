@@ -2168,6 +2168,53 @@ fn the_vector_index_loader_refuses_an_unreadable_definition() {
     }
 }
 
+/// A statement's budget is bound at admission, before it is planned: one
+/// cancelled, or past its deadline, before it reaches its data stops with
+/// that reason and writes nothing, however little work it would have done.
+#[test]
+fn a_statement_stopped_before_it_runs_writes_nothing() {
+    use coordinode_core::budget::{BudgetStop, CancelFlag};
+    use coordinode_query::executor::runner::ExecutionError;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut db = Database::open(dir.path()).expect("open");
+
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    let past = Instant::now();
+    for (options, stop) in [
+        (
+            StatementOptions {
+                cancel: Some(cancel),
+                ..StatementOptions::default()
+            },
+            BudgetStop::Cancelled,
+        ),
+        (
+            StatementOptions {
+                deadline: Some(past),
+                ..StatementOptions::default()
+            },
+            BudgetStop::Deadline,
+        ),
+    ] {
+        let stopped = db.execute_cypher_shared_with("CREATE (:Stopped)", None, None, &options);
+        assert!(
+            matches!(
+                &stopped,
+                Err(DatabaseError::Execution(ExecutionError::Budget(s))) if *s == stop
+            ),
+            "{stopped:?}"
+        );
+    }
+    let rows = db
+        .execute_cypher("MATCH (n:Stopped) RETURN count(n) AS n")
+        .expect("count");
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&coordinode_core::graph::types::Value::Int(0))
+    );
+}
+
 /// The text index loader refuses an unreadable definition by itself; it used
 /// to start with no text indexes when the catalog listing failed.
 #[test]

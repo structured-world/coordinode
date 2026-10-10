@@ -492,6 +492,82 @@ async fn a_session_write_is_checked_with_its_settings() {
     assert_eq!(count(&database), Some(Value::Int(1)));
 }
 
+/// A session statement passed to the leader stops waiting when its Cancel is
+/// thrown: the call to the leader is dropped, which cancels the leader's
+/// statement, and the session answers CANCELLED. Before, the session waited
+/// for the leader's whole answer whatever the client asked. The leader here
+/// accepts the connection and never answers, so only the Cancel ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_stops_a_statement_waiting_on_the_leader() {
+    use coordinode_raft::cluster::RaftNode;
+    use coordinode_storage::engine::config::{
+        Durability, EndpointConfig, Media, StorageConfig, Tier,
+    };
+
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let silent_addr = silent.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oracle = Arc::new(coordinode_core::txn::timestamp::TimestampOracle::new());
+    let config = StorageConfig::with_endpoints(vec![EndpointConfig::new(
+        "default",
+        dir.path(),
+        Media::Hdd,
+        Durability::Durable,
+        Tier::Warm,
+    )]);
+    let storage = Arc::new(
+        coordinode_storage::engine::core::StorageEngine::open_with_oracle(
+            &config,
+            Arc::clone(&oracle),
+        )
+        .expect("engine"),
+    );
+    let (node, _handler) =
+        RaftNode::open_cluster_embedded(1, Arc::clone(&storage), format!("http://{silent_addr}"))
+            .await
+            .expect("raft");
+    let node = Arc::new(node);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let pipeline: Arc<dyn coordinode_core::txn::proposal::ProposalPipeline> = Arc::new(
+        coordinode_raft::proposal::RaftProposalPipeline::new(Arc::clone(node.raft())),
+    );
+    let database = Database::from_engine(dir.path(), storage, oracle, pipeline).expect("db");
+    let engine = Arc::new(DatabaseCursorEngine::from_executor(
+        StatementExecutor::new(Arc::new(RwLock::new(database))).with_raft_node(Arc::clone(&node)),
+    ));
+
+    let cancel = CancelFlag::new();
+    let waiting = {
+        let engine = Arc::clone(&engine);
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            engine
+                .forwarded(1, "RETURN 1 AS one", None, &unset(), None, &cancel)
+                .err()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "the leader has not answered");
+    cancel.cancel();
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+        .await
+        .expect("answered once cancelled")
+        .expect("task")
+        .expect("refused");
+    assert_eq!(refused.0.code, coordinode_session::ErrorCode::Cancelled);
+
+    node.shutdown().await.expect("shutdown");
+}
+
 /// In a cluster a session statement goes through the read fence with the
 /// preference it runs under, and its statistics say where it was served: a
 /// SECONDARY read is refused on the leader, a default one is served there,

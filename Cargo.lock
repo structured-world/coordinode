@@ -892,6 +892,7 @@ dependencies = [
 name = "coordinode-core"
 version = "0.7.0"
 dependencies = [
+ "atomic-waker",
  "bytes",
  "crc32c",
  "criterion",
