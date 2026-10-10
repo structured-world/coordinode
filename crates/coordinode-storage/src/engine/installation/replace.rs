@@ -92,6 +92,10 @@ pub struct GenerationHistory {
     /// `entries`. A replacement filled from it is complete only when this
     /// reaches the position the replacement was registered at.
     pub covers_through: u64,
+    /// The oldest snapshot the history answers: versions below it may have
+    /// been folded at the source, so a copy filled from it refuses reads at
+    /// earlier snapshots.
+    pub history_from: SeqNo,
     /// The versions, in seqno order.
     pub entries: Vec<HistoryEntry>,
 }
@@ -185,7 +189,6 @@ impl Installations {
         tree: &AnyTree,
         domain: Domain,
         generation: u64,
-        history_from: SeqNo,
         seqno: SeqNo,
     ) -> StorageResult<u64> {
         let _quiet = self.fence.write();
@@ -207,9 +210,10 @@ impl Installations {
         // here reached the published copy alone, and every later one reaches
         // both. The highest marker bounds them from above, gaps included.
         let cut = TreeCoverage::read(tree, domain)?.next_uncovered();
+        // The history's floor is known once it is imported.
         let staged = Staged {
             installation,
-            history_from,
+            history_from: 0,
             cut,
             imported: false,
         };
@@ -225,9 +229,6 @@ impl Installations {
         let mut bindings = Bindings::clone(&current);
         bindings.owner.insert(installation, generation);
         bindings.staging.insert(generation, installation);
-        if history_from != 0 {
-            bindings.history_from.insert(installation, history_from);
-        }
         *current = Arc::new(bindings);
         Ok(installation)
     }
@@ -289,29 +290,32 @@ impl Installations {
     }
 
     /// Record that `generation`'s replacement holds its complete imported
-    /// contents, from a history complete below `covers_through`. The caller
-    /// makes the imported versions durable first.
+    /// contents, from a history complete below `covers_through` and answering
+    /// snapshots from `history_from` on. The caller makes the imported
+    /// versions durable first.
     ///
     /// # Errors
     ///
     /// [`StorageError::InstallationCatalog`] when the generation has no
-    /// replacement in preparation, or the history ends before the position
-    /// the replacement was registered at: effects applied in between reached
-    /// the published copy only; a read or write failure.
+    /// replacement in preparation; [`StorageError::PositionBehind`] when the
+    /// history ends before the position the replacement was registered at, so
+    /// effects applied in between reached the published copy only; a read or
+    /// write failure.
     pub(crate) fn mark_imported(
         &self,
         tree: &AnyTree,
         generation: u64,
         covers_through: u64,
+        history_from: SeqNo,
         seqno: SeqNo,
     ) -> StorageResult<()> {
         let mut alloc = self.alloc.lock();
-        let current = self.current();
-        if current.staging(generation).is_none() {
+        let mut current = self.current.write();
+        let Some(installation) = current.staging(generation) else {
             return Err(StorageError::InstallationCatalog(format!(
                 "generation {generation} has no replacement in preparation"
             )));
-        }
+        };
         let record = record_key(STAGING_PREFIX, generation);
         let value = tree.get(record, SeqNo::MAX)?.ok_or_else(|| {
             StorageError::InstallationCatalog(format!(
@@ -320,13 +324,14 @@ impl Installations {
         })?;
         let mut staged = Staged::decode(&value)?;
         if covers_through < staged.cut {
-            return Err(StorageError::InstallationCatalog(format!(
-                "the history of generation {generation} is complete below position \
-                 {covers_through}, short of the replacement's {}",
-                staged.cut
-            )));
+            return Err(StorageError::PositionBehind {
+                partition: format!("index generation {generation}"),
+                source_next: covers_through,
+                local_next: staged.cut,
+            });
         }
         staged.imported = true;
+        staged.history_from = history_from;
         let at = Self::next_write(&alloc, seqno)?;
         tree.insert(
             record_key(STAGING_PREFIX, generation).as_slice(),
@@ -334,6 +339,11 @@ impl Installations {
             at,
         );
         alloc.written_at = at;
+        if history_from != 0 {
+            let mut bindings = Bindings::clone(&current);
+            bindings.history_from.insert(installation, history_from);
+            *current = Arc::new(bindings);
+        }
         self.imported.lock().insert(generation);
         Ok(())
     }
@@ -469,13 +479,17 @@ impl Installations {
         tree: &AnyTree,
         domain: Domain,
         generation: u64,
+        oldest_readable: SeqNo,
     ) -> StorageResult<GenerationHistory> {
         use lsm_tree::ScanSinceEvent;
-        let installation = self.current().installation(generation).ok_or_else(|| {
+        let current = self.current();
+        let installation = current.installation(generation).ok_or_else(|| {
             StorageError::InstallationCatalog(format!(
                 "generation {generation} has no installation here"
             ))
         })?;
+        let history_from = oldest_readable.max(current.history_from(installation));
+        drop(current);
         // Read with no batch applying, so every effect below the prefix is in
         // the tree in full when the scan starts.
         let covers_through = {
@@ -557,6 +571,7 @@ impl Installations {
         }
         Ok(GenerationHistory {
             covers_through,
+            history_from,
             entries: out,
         })
     }

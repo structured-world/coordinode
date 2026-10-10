@@ -148,9 +148,13 @@ fn segment_source_builds_and_caches_servable_pieces() {
         start: b"node:".to_vec(),
         end: Vec::new(),
     };
+    let subject = crate::transfer::SegmentSubject::Range {
+        partition: Partition::Node,
+        range: range.clone(),
+    };
 
     let built = installer
-        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, false)
+        .build_segment(&subject, 64, PieceEncoding::None, false)
         .expect("build segment");
 
     // The served pieces assemble back to exactly the exported blob, and each
@@ -169,7 +173,7 @@ fn segment_source_builds_and_caches_servable_pieces() {
 
     // A second build for the same parameters is served from cache (same Arc).
     let again = installer
-        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, false)
+        .build_segment(&subject, 64, PieceEncoding::None, false)
         .expect("build again");
     assert!(
         std::sync::Arc::ptr_eq(&built, &again),
@@ -179,7 +183,7 @@ fn segment_source_builds_and_caches_servable_pieces() {
     // A manifest request builds fresh: a new pull sees the store as it
     // stands, not a build an earlier pull cached.
     let fresh = installer
-        .build_segment(Partition::Node, &range, 64, PieceEncoding::None, true)
+        .build_segment(&subject, 64, PieceEncoding::None, true)
         .expect("build fresh");
     assert!(!std::sync::Arc::ptr_eq(&built, &fresh));
 }
@@ -321,6 +325,7 @@ async fn swarm_pull_reconstructs_segment_over_grpc() {
         piece_size: 256,
         encoding: 0,
         zstd_level: 0,
+        generation: None,
     };
 
     // Connect a gRPC piece source to the peer (fetches manifest + bitfield).
@@ -839,6 +844,174 @@ fn exported_blob_carries_partition_tag() {
     let map = SegmentMap::build(&engine, Partition::Node, PlacementSegmentId(1)).expect("map");
     let blob = export_segment(&engine, &map.segments()[0]).expect("export");
     assert_eq!(blob.first(), Some(&partition_wire_tag(Partition::Node)));
+}
+
+/// The logical key `tag 0x01 / generation / rest` of an index entry.
+fn index_entry(generation: u64, rest: &[u8]) -> Vec<u8> {
+    let mut key = vec![coordinode_core::index::encoding::GENERATION_TAGS[0]];
+    key.extend_from_slice(&generation.to_be_bytes());
+    key.extend_from_slice(rest);
+    key
+}
+
+/// A member whose copy of an index generation was damaged locally (an entry
+/// written outside the log) replaces it with one filled from a peer's history
+/// over the transfer service: the damage is gone, every logged write reads
+/// back, a read at an earlier snapshot answers from the imported history, and
+/// a write made while the replacement was prepared is in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generation_replaced_from_a_peer_drops_local_damage_and_keeps_history() {
+    use coordinode_core::txn::proposal::{Mutation, PartitionId};
+    use coordinode_core::txn::timestamp::TimestampOracle;
+
+    use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    const GEN: u64 = 40;
+    let config = |dir: &std::path::Path| {
+        StorageConfig::with_endpoints(vec![EndpointConfig::new(
+            "default",
+            dir,
+            Media::Hdd,
+            Durability::Durable,
+            Tier::Warm,
+        )])
+    };
+    // Two replicas applying the same log at the same commit timestamps.
+    let oracle = std::sync::Arc::new(TimestampOracle::new());
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let peer = std::sync::Arc::new(
+        StorageEngine::open_embedded(&config(peer_dir.path()), oracle.clone()).expect("open"),
+    );
+    let local = std::sync::Arc::new(
+        StorageEngine::open_embedded(&config(local_dir.path()), oracle.clone()).expect("open"),
+    );
+    let commit = |key: &[u8], value: &[u8]| {
+        let ts = oracle.next().as_raw();
+        for engine in [&peer, &local] {
+            let mutation = Mutation::Put {
+                partition: PartitionId::Idx,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            };
+            engine.commit_journaled(&[mutation], ts).expect("commit");
+        }
+        ts
+    };
+    let a = index_entry(GEN, b"a");
+    let b = index_entry(GEN, b"b");
+    let c = index_entry(GEN, b"c");
+    let wrong = index_entry(GEN, b"wrong");
+    let first = commit(&a, b"a1");
+    commit(&a, b"a2");
+    commit(&b, b"b1");
+    local.put(Partition::Idx, &wrong, b"x").expect("damage");
+
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&peer),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
+    let generation = GenerationId::from_raw(GEN);
+    let bytes = installer
+        .prepare_generation(
+            &[format!("http://{addr}")],
+            generation,
+            128,
+            PieceEncoding::None,
+        )
+        .await
+        .expect("prepare");
+    assert!(bytes > 0, "nothing imported");
+    // Logged after the replacement was registered: it reaches it too.
+    commit(&c, b"c1");
+    local.publish_generation(generation).expect("publish");
+
+    let get = |key: &[u8]| {
+        local
+            .get(Partition::Idx, key)
+            .expect("get")
+            .map(|v| v.to_vec())
+    };
+    assert_eq!(get(&wrong), None, "the local damage is gone");
+    assert_eq!(get(&a), Some(b"a2".to_vec()));
+    assert_eq!(get(&b), Some(b"b1".to_vec()));
+    assert_eq!(get(&c), Some(b"c1".to_vec()));
+    let at_first = first + 1;
+    assert_eq!(
+        local
+            .snapshot_get(&at_first, Partition::Idx, &a)
+            .expect("historical read")
+            .map(|v| v.to_vec()),
+        Some(b"a1".to_vec()),
+        "an earlier snapshot reads the imported history"
+    );
+}
+
+/// A peer that holds no copy of the generation serves nothing, and the
+/// replacement registered for the pull is dropped: the published copy stays
+/// and a later replacement can be registered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_generation_pull_drops_the_replacement() {
+    use crate::transfer::SegmentTransferHandler;
+    use crate::transfer::proto::segment_transfer_service_server::SegmentTransferServiceServer;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    const GEN: u64 = 40;
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer = std::sync::Arc::new(test_engine(peer_dir.path()));
+    let handler = SegmentTransferHandler::new(std::sync::Arc::new(SegmentInstaller::new(
+        std::sync::Arc::clone(&peer),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(SegmentTransferServiceServer::new(handler))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("server");
+    });
+
+    let local_dir = tempfile::tempdir().expect("tempdir");
+    let local = std::sync::Arc::new(test_engine(local_dir.path()));
+    let a = index_entry(GEN, b"a");
+    local.put(Partition::Idx, &a, b"a1").expect("put");
+    let installer = std::sync::Arc::new(SegmentInstaller::new(std::sync::Arc::clone(&local)));
+    let generation = GenerationId::from_raw(GEN);
+    let err = installer
+        .prepare_generation(
+            &[format!("http://{addr}")],
+            generation,
+            128,
+            PieceEncoding::None,
+        )
+        .await
+        .expect_err("the peer holds no copy");
+    assert!(matches!(err, RepairError::NoSource(_)), "got {err}");
+    assert_eq!(
+        local
+            .get(Partition::Idx, &a)
+            .expect("get")
+            .map(|v| v.to_vec()),
+        Some(b"a1".to_vec())
+    );
+    local
+        .stage_generation(generation)
+        .expect("a new replacement can be registered");
 }
 
 #[test]

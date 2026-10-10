@@ -77,7 +77,7 @@ fn a_published_replacement_answers_every_read_the_old_copy_did() {
     let old = stored_installations(&engine);
     assert_eq!(old.len(), 1, "one copy before the replacement");
 
-    engine.stage_generation(GENERATION, 0).expect("stage");
+    engine.stage_generation(GENERATION).expect("stage");
     // Written while the replacement is prepared: reaches both copies.
     engine.put(Partition::Idx, &c, b"c1").expect("put");
     let history = engine
@@ -97,7 +97,7 @@ fn a_published_replacement_answers_every_read_the_old_copy_did() {
         .import_generation_history(GENERATION, &history.entries)
         .expect("import");
     engine
-        .finish_generation_import(GENERATION, history.covers_through)
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
         .expect("finish");
     engine.publish_generation(GENERATION).expect("publish");
 
@@ -129,7 +129,7 @@ fn an_unfinished_replacement_is_dropped_at_open() {
     let a = entry(b"a");
     engine.put(Partition::Idx, &a, b"a1").expect("put");
     let old = stored_installations(&engine);
-    engine.stage_generation(GENERATION, 0).expect("stage");
+    engine.stage_generation(GENERATION).expect("stage");
     engine.put(Partition::Idx, &a, b"a2").expect("put");
     assert!(matches!(
         engine.publish_generation(GENERATION),
@@ -151,7 +151,7 @@ fn an_unfinished_replacement_is_dropped_at_open() {
     assert_eq!(get(&engine, &a), Some(b"a2".to_vec()));
     assert_eq!(stored_installations(&engine), old);
     // A new replacement can be prepared again.
-    engine.stage_generation(GENERATION, 0).expect("stage again");
+    engine.stage_generation(GENERATION).expect("stage again");
 }
 
 /// After a replacement whose history starts at a seqno is published, a read
@@ -166,10 +166,11 @@ fn a_read_below_the_replacement_history_is_refused() {
     let early = engine.snapshot();
     engine.put(Partition::Idx, &a, b"a2").expect("put");
     let from = engine.snapshot();
-    engine.stage_generation(GENERATION, from).expect("stage");
+    engine.stage_generation(GENERATION).expect("stage");
     let history = engine
         .export_generation_history(GENERATION)
         .expect("export");
+    // A source whose compaction folded every version below `from`.
     let recent: Vec<_> = history
         .entries
         .iter()
@@ -180,7 +181,7 @@ fn a_read_below_the_replacement_history_is_refused() {
         .import_generation_history(GENERATION, &recent)
         .expect("import");
     engine
-        .finish_generation_import(GENERATION, history.covers_through)
+        .finish_generation_import(GENERATION, history.covers_through, from)
         .expect("finish");
     engine.publish_generation(GENERATION).expect("publish");
 
@@ -220,13 +221,13 @@ fn a_history_ending_before_the_registration_is_refused() {
         .expect("export");
     // Applied after the history was taken and before the registration.
     commit(&b, b"b1");
-    engine.stage_generation(GENERATION, 0).expect("stage");
+    engine.stage_generation(GENERATION).expect("stage");
     engine
         .import_generation_history(GENERATION, &early.entries)
         .expect("import");
     assert!(matches!(
-        engine.finish_generation_import(GENERATION, early.covers_through),
-        Err(StorageError::InstallationCatalog(_))
+        engine.finish_generation_import(GENERATION, early.covers_through, early.history_from),
+        Err(StorageError::PositionBehind { .. })
     ));
 
     // A history taken after the registration covers it.
@@ -237,7 +238,7 @@ fn a_history_ending_before_the_registration_is_refused() {
         .import_generation_history(GENERATION, &late.entries)
         .expect("import");
     engine
-        .finish_generation_import(GENERATION, late.covers_through)
+        .finish_generation_import(GENERATION, late.covers_through, late.history_from)
         .expect("finish");
     engine.publish_generation(GENERATION).expect("publish");
     assert_eq!(get(&engine, &b), Some(b"b1".to_vec()));
@@ -252,7 +253,7 @@ fn an_entry_of_another_generation_is_refused() {
     engine
         .put(Partition::Idx, &entry(b"a"), b"a1")
         .expect("put");
-    engine.stage_generation(GENERATION, 0).expect("stage");
+    engine.stage_generation(GENERATION).expect("stage");
     let mut other = prefix(TAG_ENTRIES, 41);
     other.extend_from_slice(b"a");
     let entries = [HistoryEntry::Put {

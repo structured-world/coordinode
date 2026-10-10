@@ -1437,9 +1437,9 @@ impl StorageEngine {
 
     /// Begin replacing this member's copy of `generation` in the index
     /// partition: a new installation is registered beside the published one,
-    /// and from this call on every write of the generation reaches both.
-    /// `history_from` is the lowest seqno the history imported into it will
-    /// cover; reads at earlier snapshots are refused once it is published.
+    /// and from this call on every write of the generation reaches both. A
+    /// history taken after this call ([`Self::export_generation_history`],
+    /// here or on a peer) fills it.
     ///
     /// The replacement is filled with [`Self::import_generation_history`],
     /// completed with [`Self::finish_generation_import`] and swapped in with
@@ -1454,13 +1454,11 @@ impl StorageEngine {
     pub fn stage_generation(
         &self,
         generation: coordinode_core::index::identity::GenerationId,
-        history_from: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
         self.installations.stage(
             self.tree(Partition::Idx)?,
             self.coverage_domain(),
             generation.as_raw(),
-            history_from,
             self.next_seqno(),
         )?;
         Ok(())
@@ -1500,19 +1498,22 @@ impl StorageEngine {
 
     /// Record that `generation`'s replacement holds its complete imported
     /// history, after making the imported versions durable. `covers_through`
-    /// is the source position the imported history is complete below
-    /// ([`GenerationHistory::covers_through`](crate::engine::installation::GenerationHistory::covers_through)):
+    /// and `history_from` are the imported history's bounds
+    /// ([`GenerationHistory`](crate::engine::installation::GenerationHistory)):
     /// a history taken after [`Self::stage_generation`] returned qualifies,
-    /// one taken before does not.
+    /// one taken before does not, and once published the copy refuses reads
+    /// at snapshots below `history_from`.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::import_generation_history`]; a history that ends
-    /// before the replacement's registration; a flush failure.
+    /// The errors of [`Self::import_generation_history`];
+    /// [`StorageError::PositionBehind`] for a history that ends before the
+    /// replacement's registration; a flush failure.
     pub fn finish_generation_import(
         &self,
         generation: coordinode_core::index::identity::GenerationId,
         covers_through: u64,
+        history_from: lsm_tree::SeqNo,
     ) -> StorageResult<()> {
         let tree = self.tree(Partition::Idx)?;
         tree.flush_active_memtable(0)?;
@@ -1520,6 +1521,7 @@ impl StorageEngine {
             tree,
             generation.as_raw(),
             covers_through,
+            history_from,
             self.next_seqno(),
         )?;
         tree.flush_active_memtable(0)?;
@@ -1589,6 +1591,7 @@ impl StorageEngine {
             self.tree(Partition::Idx)?,
             self.coverage_domain(),
             generation.as_raw(),
+            self.oldest_readable_seqno(),
         )
     }
 

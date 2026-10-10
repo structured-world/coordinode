@@ -80,12 +80,29 @@ pub trait SegmentSource: Send + Sync {
     /// A storage / split failure, surfaced to the requesting peer.
     fn build_segment(
         &self,
-        partition: Partition,
-        range: &KeyRange,
+        subject: &SegmentSubject,
         piece_size: usize,
         encoding: PieceEncoding,
         fresh: bool,
     ) -> Result<Arc<BuiltSegment>, String>;
+}
+
+/// What a segment holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentSubject {
+    /// The current rows of `partition` in the half-open `range`.
+    Range {
+        /// The partition the rows live in.
+        partition: Partition,
+        /// The rows' key range; unbounded is the whole partition.
+        range: KeyRange,
+    },
+    /// The retained history of one index generation, for a local replacement
+    /// copy of it.
+    History {
+        /// The generation, as its raw `GenerationId`.
+        generation: u64,
+    },
 }
 
 /// Build the wire frames for one segment transfer: a leading header carrying the
@@ -215,32 +232,38 @@ fn manifest_from_header(h: &SegmentTransferHeader) -> Result<SegmentManifest, St
 }
 
 /// Maps a wire [`SegmentDescriptorRef`] to a built segment via a
-/// [`SegmentSource`]: decodes the partition tag, key range, and split parameters,
-/// then builds (fresh when `fresh`, else from the cache) the pieces on a
-/// blocking thread.
+/// [`SegmentSource`]: decodes the subject (a generation, else the partition
+/// tag and key range) and split parameters, then builds (fresh when `fresh`,
+/// else from the cache) the pieces on a blocking thread.
 async fn build_from_ref<Src: SegmentSource + 'static>(
     source: Arc<Src>,
     seg: &SegmentDescriptorRef,
     fresh: bool,
 ) -> Result<Arc<BuiltSegment>, Status> {
-    let tag = u8::try_from(seg.partition).map_err(|_| {
-        Status::invalid_argument(format!("partition tag {} out of range", seg.partition))
-    })?;
-    let partition = partition_from_wire_tag(tag)
-        .ok_or_else(|| Status::invalid_argument(format!("unknown partition tag {tag}")))?;
-    let range = KeyRange {
-        start: seg.range_start.clone(),
-        end: seg.range_end.clone(),
+    let subject = match seg.generation {
+        Some(generation) => SegmentSubject::History { generation },
+        None => {
+            let tag = u8::try_from(seg.partition).map_err(|_| {
+                Status::invalid_argument(format!("partition tag {} out of range", seg.partition))
+            })?;
+            let partition = partition_from_wire_tag(tag)
+                .ok_or_else(|| Status::invalid_argument(format!("unknown partition tag {tag}")))?;
+            SegmentSubject::Range {
+                partition,
+                range: KeyRange {
+                    start: seg.range_start.clone(),
+                    end: seg.range_end.clone(),
+                },
+            }
+        }
     };
     let encoding = PieceEncoding::from_wire(seg.encoding, seg.zstd_level)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     let piece_size = seg.piece_size as usize;
-    tokio::task::spawn_blocking(move || {
-        source.build_segment(partition, &range, piece_size, encoding, fresh)
-    })
-    .await
-    .map_err(|e| Status::internal(format!("build task: {e}")))?
-    .map_err(Status::internal)
+    tokio::task::spawn_blocking(move || source.build_segment(&subject, piece_size, encoding, fresh))
+        .await
+        .map_err(|e| Status::internal(format!("build task: {e}")))?
+        .map_err(Status::internal)
 }
 
 /// The target-side tonic service: assembles inbound transfers into the injected
