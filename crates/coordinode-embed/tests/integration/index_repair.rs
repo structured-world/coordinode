@@ -1316,6 +1316,216 @@ fn a_lookup_answered_by_the_records_past_its_memory_limit_is_refused() {
     );
 }
 
+/// The entries the index `name` holds, as `(encoded value, node)` pairs.
+fn stored_entries(db: &Database, name: &str) -> std::collections::BTreeSet<(Vec<u8>, i64)> {
+    let index = index_named(db.engine(), name).expect("index");
+    let mut txn = coordinode_storage::engine::transaction::Transaction::new(
+        db.engine(),
+        None,
+        coordinode_core::txn::timestamp::Timestamp::ZERO,
+        None,
+    );
+    let page = LocalIndexStore::new(db.engine())
+        .entries_page(&mut txn, &index, None, 1 << 16)
+        .expect("read the entries");
+    assert!(page.exhausted, "a test index fits one page");
+    page.entries
+        .iter()
+        .map(|entry| {
+            let node = entry.owner.expect("an entry names its node").node_id;
+            (entry.tuple.clone(), i64::try_from(node).expect("id"))
+        })
+        .collect()
+}
+
+/// A `:U` node as stored: `(id, city, active, zip)`.
+type StoredUser = (i64, String, bool, Option<String>);
+
+/// The `:U` nodes as stored, read by a label scan.
+fn stored_users(db: &mut Database) -> Vec<StoredUser> {
+    db.execute_cypher(
+        "MATCH (u:U) RETURN id(u) AS id, u.city AS city, u.active AS active, u.zip AS zip",
+    )
+    .expect("scan")
+    .iter()
+    .map(|row| {
+        let text = |key: &str| match row.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        (
+            match row.get("id") {
+                Some(Value::Int(id)) => *id,
+                other => panic!("expected an id, got {other:?}"),
+            },
+            text("city").expect("every user has a city"),
+            matches!(row.get("active"), Some(Value::Bool(true))),
+            text("zip"),
+        )
+    })
+    .collect()
+}
+
+/// A check reads each index by its own rules: a partial index holds no
+/// entry for a node its predicate rejects, a sparse one none for a node
+/// without the property, and a DERIVED index the same entries a RESOLVED one
+/// would. Entries missing and entries those rules forbid are repaired in each,
+/// and afterwards every index holds exactly what the records give it by
+/// those rules, computed here from the records alone.
+#[test]
+fn a_check_repairs_partial_sparse_and_derived_indexes_by_their_rules() {
+    let (mut db, _dir) = open_db();
+    for ddl in [
+        "CREATE INDEX u_active_city ON :U(city) WHERE n.active = true",
+        "CREATE SPARSE INDEX u_zip ON :U(zip)",
+        "CREATE INDEX u_city ON :U(city) OPTIONS { maintenance: 'derived' }",
+    ] {
+        db.execute_cypher(ddl).expect("index");
+    }
+    db.execute_cypher("CREATE (:U {name: 'a', city: 'oslo', active: true, zip: 'z1'})")
+        .expect("a");
+    db.execute_cypher("CREATE (:U {name: 'b', city: 'oslo', active: false})")
+        .expect("b");
+    db.execute_cypher("CREATE (:U {name: 'c', city: 'rome', active: true})")
+        .expect("c");
+    let a = scan_id(&mut db, "name", "a");
+    let b = scan_id(&mut db, "name", "b");
+    let c = scan_id(&mut db, "name", "c");
+    let engine = db.engine();
+    // In each index: one entry lost, one entry its rules forbid.
+    engine
+        .delete(Partition::Idx, &entry_key(&db, "u_active_city", "oslo", a))
+        .expect("lose a's entry");
+    engine
+        .put(
+            Partition::Idx,
+            &entry_key(&db, "u_active_city", "oslo", b),
+            &[],
+        )
+        .expect("an entry b's predicate rejects");
+    engine
+        .delete(Partition::Idx, &entry_key(&db, "u_zip", "z1", a))
+        .expect("lose a's zip");
+    engine
+        .put(Partition::Idx, &entry_key(&db, "u_zip", "z9", b), &[])
+        .expect("an entry b, without a zip, cannot have");
+    engine
+        .delete(Partition::Idx, &entry_key(&db, "u_city", "rome", c))
+        .expect("lose c's entry");
+    engine
+        .put(Partition::Idx, &entry_key(&db, "u_city", "rome", a), &[])
+        .expect("an entry a, in oslo, cannot have");
+
+    for name in ["u_active_city", "u_zip", "u_city"] {
+        let (status, outcome) = check(&db, name);
+        assert!(
+            matches!(outcome, CheckOutcome::Verified { repaired: 2, .. }),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(status.record.integrity, Integrity::Verified, "{name}");
+    }
+
+    let users = stored_users(&mut db);
+    let expected = |keep: &dyn Fn(&StoredUser) -> Option<String>| {
+        users
+            .iter()
+            .filter_map(|user| {
+                keep(user).map(|value| {
+                    let tuple = encode_tuple(&[Value::String(value)]).expect("tuple");
+                    (tuple, user.0)
+                })
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        stored_entries(&db, "u_active_city"),
+        expected(&|(_, city, active, _)| active.then(|| city.clone())),
+        "the partial index holds the active users only"
+    );
+    assert_eq!(
+        stored_entries(&db, "u_zip"),
+        expected(&|(_, _, _, zip)| zip.clone()),
+        "the sparse index holds the users with a zip only"
+    );
+    assert_eq!(
+        stored_entries(&db, "u_city"),
+        expected(&|(_, city, _, _)| Some(city.clone())),
+        "the derived index holds every user"
+    );
+    assert_eq!(found_by(&mut db, "city", "rome"), vec![c]);
+}
+
+/// A temporal node keeps an entry per version: entries a check finds for
+/// an earlier version's value are the index's, not damage, and a check of a
+/// temporal index with nothing wrong repairs nothing. An entry no version
+/// holds is removed.
+#[test]
+fn a_check_of_a_temporal_index_repairs_damage_only() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher(
+        "CREATE NODE TYPE Emp TEMPORAL WITH (code: STRING, name: STRING, valid_from: INT, valid_to: INT)",
+    )
+    .expect("temporal label");
+    db.execute_cypher("CREATE INDEX emp_code ON :Emp(code)")
+        .expect("index");
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_micros() as i64
+        - 1_000_000;
+    for (code, name) in [("a", "x"), ("b", "y")] {
+        db.execute_cypher(&format!(
+            "CREATE (:Emp {{code: '{code}', name: '{name}', valid_from: {since}}})"
+        ))
+        .expect("create");
+    }
+    db.execute_cypher("MATCH (n:Emp {name: 'x'}) SET n.code = 'c'")
+        .expect("x moves to c");
+
+    let (status, outcome) = check(&db, "emp_code");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { repaired: 0, .. }),
+        "the versions' own entries are not damage: {outcome:?}"
+    );
+    assert_eq!(status.record.integrity, Integrity::Verified);
+
+    let y = {
+        let rows = db
+            .execute_cypher("MATCH (n:Emp) WHERE n.name + '' = 'y' RETURN id(n) AS id")
+            .expect("scan");
+        match rows[0].get("id") {
+            Some(Value::Int(id)) => *id,
+            other => panic!("expected an id, got {other:?}"),
+        }
+    };
+    let stray = entry_key(&db, "emp_code", "zz", y);
+    db.engine()
+        .put(Partition::Idx, &stray, &[])
+        .expect("an entry no version of y holds");
+    let (_, outcome) = check(&db, "emp_code");
+    assert!(
+        matches!(outcome, CheckOutcome::Verified { repaired: 1, .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        db.engine()
+            .get(Partition::Idx, &stray)
+            .expect("read")
+            .is_none(),
+        "the stray entry is gone"
+    );
+    let codes = |db: &mut Database, code: &str| {
+        db.execute_cypher(&format!(
+            "MATCH (n:Emp {{code: '{code}'}}) RETURN n.name AS name"
+        ))
+        .expect("lookup")
+        .len()
+    };
+    assert_eq!(codes(&mut db, "c"), 1);
+    assert_eq!(codes(&mut db, "b"), 1);
+    assert_eq!(codes(&mut db, "zz"), 0);
+}
+
 /// The generations of this member's stored marks.
 fn marked(db: &Database) -> Vec<u64> {
     let mut out: Vec<u64> = LocalIndexStore::new(db.engine())
