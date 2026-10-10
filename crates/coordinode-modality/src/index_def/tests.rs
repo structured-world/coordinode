@@ -117,3 +117,90 @@ fn definition_roundtrip_serde() {
     let back: IndexDefinition = rmp_serde::from_slice(&bytes).expect("decode failed");
     assert_eq!(back, idx);
 }
+
+fn extra(node: u64) -> Mismatch {
+    Mismatch::Extra {
+        node,
+        valid_from: None,
+        tuple: vec![1, 2, 3],
+    }
+}
+
+/// A fresh integrity record serves as its build state says: nothing is
+/// suspect until a disagreement is reported.
+#[test]
+fn a_fresh_integrity_record_is_unchecked() {
+    let record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    assert_eq!(record.integrity, Integrity::Unchecked);
+    assert!(!record.check_pending());
+    assert_eq!(record.evidence_revision, 0);
+}
+
+/// A report makes the generation suspect and moves the revision; the same
+/// disagreement reported again is one report, and the revision a running
+/// check started from stays.
+#[test]
+fn a_report_is_kept_once_and_moves_the_revision() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    assert!(record.report(extra(7)));
+    assert_eq!(record.integrity, Integrity::Suspect);
+    assert_eq!(record.evidence_revision, 1);
+    assert!(!record.report(extra(7)), "the same disagreement again");
+    assert_eq!(record.evidence_revision, 1);
+    assert!(record.report(extra(8)));
+    assert_eq!(record.evidence, vec![extra(7), extra(8)]);
+    assert_eq!(record.evidence_revision, 2);
+}
+
+/// Past the evidence a record keeps, reports still move the revision and
+/// keep the generation suspect: a check started before them sees it.
+#[test]
+fn reports_past_the_cap_still_move_the_revision() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    for node in 0..IndexIntegrityRecord::MAX_EVIDENCE as u64 + 5 {
+        assert!(record.report(extra(node)));
+    }
+    assert_eq!(record.evidence.len(), IndexIntegrityRecord::MAX_EVIDENCE);
+    assert_eq!(
+        record.evidence_revision,
+        IndexIntegrityRecord::MAX_EVIDENCE as u64 + 5
+    );
+}
+
+/// A check is pending until it reaches an outcome.
+#[test]
+fn a_check_is_pending_until_its_outcome() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(1), GenerationId::from_raw(2));
+    record.check = Some(IndexCheck::accepted(0));
+    assert!(record.check_pending());
+    for state in [CheckState::Running { executor: 3 }, CheckState::Accepted] {
+        record.check.as_mut().expect("check").state = state;
+        assert!(record.check_pending());
+    }
+    for state in [
+        CheckState::Done,
+        CheckState::Cancelled,
+        CheckState::Failed { reason: "x".into() },
+    ] {
+        record.check.as_mut().expect("check").state = state;
+        assert!(!record.check_pending());
+    }
+}
+
+/// The record round-trips through its stored form, and its key sits outside
+/// the definition prefix, so a definition listing never meets it.
+#[test]
+fn integrity_record_roundtrip_and_key() {
+    let mut record = IndexIntegrityRecord::new(IndexId::from_raw(4), GenerationId::from_raw(9));
+    record.report(Mismatch::SourceDuplicate {
+        nodes: [1, 2],
+        tuple: vec![9],
+    });
+    record.check = Some(IndexCheck::accepted(record.evidence_revision));
+    let bytes = rmp_serde::to_vec(&record).expect("encode");
+    let back: IndexIntegrityRecord = rmp_serde::from_slice(&bytes).expect("decode");
+    assert_eq!(back, record);
+    let key = IndexIntegrityRecord::key_of(GenerationId::from_raw(9));
+    assert!(key.starts_with(IndexIntegrityRecord::PREFIX));
+    assert!(!key.starts_with(IndexDefinition::SCHEMA_PREFIX));
+}

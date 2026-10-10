@@ -29,9 +29,10 @@
 //! [`NodeStore::get_at`] so callers don't reimplement the seek-and-pick.
 
 use coordinode_core::graph::node::{
-    NodeId, NodeRecord, decode_temporal_node_key, encode_node_key, encode_temporal_node_key,
-    temporal_node_id_prefix,
+    NodeId, NodeRecord, decode_node_key, decode_temporal_node_key, encode_node_key,
+    encode_temporal_node_key, temporal_node_id_prefix,
 };
+use coordinode_core::index::derive::EntryOwner;
 use coordinode_core::txn::invariant::{Claim, ClaimPredicate, ClaimScope};
 use coordinode_storage::Guard;
 use coordinode_storage::engine::core::StorageEngine;
@@ -365,6 +366,82 @@ pub trait NodeStore {
         shard_id: u16,
         visit: &mut dyn FnMut(NodeId, NodeRecord) -> StoreResult<()>,
     ) -> StoreResult<()>;
+
+    /// One page of the rows of `shard_id` after the row key `after`, at
+    /// most `limit`, in key order, decoded, as `txn` sees them: each node's
+    /// own row and each version of a temporal node, named by its owner.
+    /// Untracked.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn rows_page(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<RowPage>;
+
+    /// The row of `owner` (a node, or one version of a temporal node), as
+    /// `txn` sees it. Untracked.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn row(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+    ) -> StoreResult<Option<NodeRecord>>;
+
+    /// The latest committed row of `owner`, with the version of its write.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn latest_row(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        owner: EntryOwner,
+    ) -> StoreResult<Option<(NodeRecord, u64)>>;
+
+    /// Write the transaction only while the row of `owner` is at `version`
+    /// when it commits (`None`: while there is none).
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn expect_row_txn(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+}
+
+/// One page of a shard's rows ([`NodeStore::rows_page`]).
+#[derive(Debug, Clone)]
+pub struct RowPage {
+    /// Each row's owner and record, in key order.
+    pub rows: Vec<(EntryOwner, NodeRecord)>,
+    /// The key of the last row read, where the next page resumes; `None`
+    /// for an empty page.
+    pub resume: Option<Vec<u8>>,
+    /// No row of the shard follows this page.
+    pub exhausted: bool,
+}
+
+/// The key of the row of `owner`.
+fn row_key(shard_id: u16, owner: EntryOwner) -> Vec<u8> {
+    let node = NodeId::from_raw(owner.node_id);
+    match owner.valid_from {
+        Some(valid_from) => encode_temporal_node_key(shard_id, node, valid_from),
+        None => encode_node_key(shard_id, node),
+    }
 }
 
 /// CE single-shard implementation of [`NodeStore`]. Stateless — all
@@ -958,6 +1035,73 @@ impl NodeStore for LocalNodeStore {
             out.push((node_id, Self::decode_record(&value)?));
         }
         Ok(out)
+    }
+
+    fn rows_page(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<RowPage> {
+        let start = self.shard_scan_prefix(shard_id);
+        // Exclusive end past every row key of the shard: a row key is at
+        // most 25 bytes, the prefix 8.
+        let mut end = start.clone();
+        end.extend_from_slice(&[0xFF; 32]);
+        let page = txn.range_scan_paged(Partition::Node, &start, &end, after, limit)?;
+        let mut rows = Vec::with_capacity(page.rows.len());
+        for (key, value) in &page.rows {
+            let owner = match decode_node_key(key) {
+                Some((shard, id)) if shard == shard_id => EntryOwner::node(id.as_raw()),
+                Some(_) => continue,
+                None => match decode_temporal_node_key(key) {
+                    Some((shard, id, valid_from)) if shard == shard_id => {
+                        EntryOwner::version(id.as_raw(), valid_from)
+                    }
+                    _ => continue,
+                },
+            };
+            rows.push((owner, Self::decode_record(value)?));
+        }
+        Ok(RowPage {
+            rows,
+            resume: page.last_key,
+            exhausted: page.exhausted,
+        })
+    }
+
+    fn row(
+        &self,
+        txn: &Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+    ) -> StoreResult<Option<NodeRecord>> {
+        txn.read_untracked(Partition::Node, &row_key(shard_id, owner))?
+            .map(|bytes| Self::decode_record(&bytes))
+            .transpose()
+    }
+
+    fn latest_row(
+        &self,
+        engine: &StorageEngine,
+        shard_id: u16,
+        owner: EntryOwner,
+    ) -> StoreResult<Option<(NodeRecord, u64)>> {
+        engine
+            .get_versioned(Partition::Node, &row_key(shard_id, owner))?
+            .map(|(bytes, version)| Ok((Self::decode_record(&bytes)?, version)))
+            .transpose()
+    }
+
+    fn expect_row_txn(
+        &self,
+        txn: &mut Transaction,
+        shard_id: u16,
+        owner: EntryOwner,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        Ok(txn.expect_version(Partition::Node, &row_key(shard_id, owner), version)?)
     }
 }
 

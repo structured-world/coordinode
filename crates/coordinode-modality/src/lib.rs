@@ -87,14 +87,17 @@ pub use encrypted_index::{
     EncryptedIndexDefinition, EncryptedIndexStore, LocalEncryptedIndexStore,
 };
 pub use error::{StoreError, StoreResult};
-pub use index::{EntryPage, IndexStore, LocalIndexStore};
+pub use index::{
+    EntryPage, IndexStore, LatestEntry, LocalIndexStore, StoredEntry, StoredEntryPage,
+};
 pub use index_def::{
-    BuildFailure, BuildState, DuplicateRepair, DuplicateRepairRecord, ENTRY_LAYOUT, GenerationId,
-    IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,
-    IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
+    BuildFailure, BuildState, CheckPhase, CheckState, DuplicateRepair, DuplicateRepairRecord,
+    ENTRY_LAYOUT, GenerationId, IndexBuildRecord, IndexCheck, IndexDefinition, IndexDescriptor,
+    IndexId, IndexIntegrityRecord, IndexMaintenance, IndexProfile, IndexState, IndexType,
+    Integrity, Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
     TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };
-pub use node::{LocalNodeStore, NodeStore};
+pub use node::{LocalNodeStore, NodeStore, RowPage};
 pub use schema::{LocalSchemaStore, SchemaStore};
 pub use spatial::{Bbox, Crs, LocalSpatialStore, Point, SpatialStore, distance};
 pub use stats::{LocalStatsStore, StatsStore};

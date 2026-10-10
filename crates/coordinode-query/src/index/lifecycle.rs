@@ -178,7 +178,16 @@ struct Shared {
     /// The executor threads started here, joined at shutdown so none
     /// outlives the storage it holds.
     executors: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Where an executor of this process stands with each check it holds.
+    checks: parking_lot::Mutex<FxHashMap<GenerationId, integrity::CheckSlot>>,
+    /// Signalled, under `checks`, when a check here reaches its outcome.
+    check_done: parking_lot::Condvar,
+    /// When this process last asked for the periodic check of every index.
+    last_sweep: parking_lot::Mutex<Option<Instant>>,
 }
+
+mod integrity;
+pub use integrity::{CheckOutcome, CheckRequestError, CheckStatus};
 
 /// How the engine runs its index builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +207,16 @@ pub struct IndexBuildConfig {
     /// with the build still running and the operation that identifies it;
     /// the build goes on without the statement.
     pub statement_wait: Duration,
+    /// Records, or entries, a check of an index reads per page: the most
+    /// one page holds in memory and the most one repair commit writes.
+    pub check_page: usize,
+    /// The most disagreements a check repairs entry by entry; past it the
+    /// damage is wide and the index is rebuilt into a fresh generation.
+    pub check_max_repairs: u64,
+    /// How often every B-tree index is checked against its records even
+    /// when nothing reported it wrong; `None` checks only on reports and
+    /// requests.
+    pub check_interval: Option<Duration>,
 }
 
 /// The most stored node rows a write reads by default to prove a value
@@ -207,6 +226,15 @@ pub const DEFAULT_UNIQUE_ADMISSION_READ_LIMIT: u64 = 100_000;
 /// How long a statement creating an index waits for its build by default.
 pub const DEFAULT_STATEMENT_WAIT: Duration = Duration::from_secs(60);
 
+/// Records, or entries, a check reads per page by default.
+pub const DEFAULT_CHECK_PAGE: usize = 512;
+
+/// The most disagreements a check repairs entry by entry by default.
+pub const DEFAULT_CHECK_MAX_REPAIRS: u64 = 10_000;
+
+/// How often every index is checked by default: once a day.
+pub const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 impl Default for IndexBuildConfig {
     fn default() -> Self {
         Self {
@@ -214,15 +242,20 @@ impl Default for IndexBuildConfig {
             older_transactions_wait: super::build::DEFAULT_OLDER_TRANSACTIONS_WAIT,
             unique_admission_read_limit: DEFAULT_UNIQUE_ADMISSION_READ_LIMIT,
             statement_wait: DEFAULT_STATEMENT_WAIT,
+            check_page: DEFAULT_CHECK_PAGE,
+            check_max_repairs: DEFAULT_CHECK_MAX_REPAIRS,
+            check_interval: Some(DEFAULT_CHECK_INTERVAL),
         }
     }
 }
 
 impl IndexBuildConfig {
-    /// At least one build runs, or none would ever start.
+    /// At least one build runs, or none would ever start; a check reads at
+    /// least one record per page, or it would never advance.
     fn normalized(self) -> Self {
         Self {
             max_running: self.max_running.max(1),
+            check_page: self.check_page.max(1),
             ..self
         }
     }
@@ -380,6 +413,9 @@ impl IndexBuildService {
                 covered: parking_lot::Mutex::new(FxHashMap::default()),
                 stopping: core::sync::atomic::AtomicBool::new(false),
                 executors: parking_lot::Mutex::new(Vec::new()),
+                checks: parking_lot::Mutex::new(FxHashMap::default()),
+                check_done: parking_lot::Condvar::new(),
+                last_sweep: parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -393,6 +429,7 @@ impl IndexBuildService {
         self.shared
             .stopping
             .store(true, core::sync::atomic::Ordering::Release);
+        self.shared.env.registry().wake_reporters();
         {
             // Under the lock the seat waiters check the flag with, so none
             // misses this wake.
@@ -1152,6 +1189,20 @@ impl Shared {
         }
         *running += 1;
         self.set_phase(generation, BuildPhase::Indexing { indexed: None });
+        Seat { shared: self }
+    }
+
+    /// A seat among the builds and checks running now, waited for while all
+    /// are taken, without showing a build phase: a check's generation is one
+    /// whose build has long ended. Released when dropped.
+    fn quiet_seat(&self) -> Seat<'_> {
+        let mut running = self.running.lock();
+        while *running >= self.config.read().max_running
+            && !self.stopping.load(core::sync::atomic::Ordering::Acquire)
+        {
+            self.vacancy.wait(&mut running);
+        }
+        *running += 1;
         Seat { shared: self }
     }
 

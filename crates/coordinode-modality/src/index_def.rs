@@ -692,6 +692,216 @@ impl DuplicateRepairRecord {
     }
 }
 
+/// One disagreement between a generation's entries and the records they are
+/// derived from, as a check or a reader found it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mismatch {
+    /// A record whose entry under `tuple` is missing, or names another node.
+    Missing {
+        /// The node whose record holds the value.
+        node: u64,
+        /// The version's `valid_from` for a temporal node.
+        valid_from: Option<i64>,
+        /// The encoded value tuple.
+        tuple: Vec<u8>,
+    },
+    /// An entry under `tuple` naming `node`, whose record does not hold the
+    /// value (or that has no record).
+    Extra {
+        /// The node the entry names.
+        node: u64,
+        /// The version's `valid_from` for an entry of a temporal version.
+        valid_from: Option<i64>,
+        /// The encoded value tuple.
+        tuple: Vec<u8>,
+    },
+    /// Two stored nodes hold one value of a unique index: the records
+    /// themselves break the constraint, and no entry can represent them.
+    /// Reported, never resolved by changing the records.
+    SourceDuplicate {
+        /// The nodes holding the value, in ascending order.
+        nodes: [u64; 2],
+        /// The encoded value tuple.
+        tuple: Vec<u8>,
+    },
+}
+
+/// What is known about whether a generation's entries agree with their
+/// records. Separate from its build state: a ready generation may be
+/// suspect, and a verified one may still be building its successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Integrity {
+    /// Nothing was found wrong and no check has completed: the generation
+    /// serves as its build state says.
+    Unchecked,
+    /// An entry was found disagreeing with its record: the generation
+    /// proves no lookup complete and no unique value free until a check
+    /// verifies it.
+    Suspect,
+    /// A complete check found every entry and every record in agreement,
+    /// after its last repair, and no evidence arrived while it ran.
+    Verified,
+}
+
+/// Where one check of a generation stands. Every move is a catalog commit
+/// conditioned on the record the mover read, as a build's moves are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckState {
+    /// Admitted; no executor has taken it.
+    Accepted,
+    /// Taken by the executor `executor`, which alone may move it on.
+    Running {
+        /// The executor's token, fresh for every take.
+        executor: u64,
+    },
+    /// The check ran to its end; the record's integrity says what it found.
+    Done,
+    /// The check could not finish; `reason` says why.
+    Failed {
+        /// Why it failed.
+        reason: String,
+    },
+    /// Cancelled before it finished.
+    Cancelled,
+}
+
+impl CheckState {
+    /// Whether the check has an outcome and no executor will touch it again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Failed { .. } | Self::Cancelled)
+    }
+}
+
+/// Which half of a check is running: records against entries, then entries
+/// against records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckPhase {
+    /// Every stored record of the label, checked for the entries it should
+    /// have.
+    Records,
+    /// Every entry of the generation, checked for a record holding it.
+    Entries,
+}
+
+/// One check of a generation: its state, how far it got, and what it found
+/// and repaired. Progress is not proof; only [`Integrity::Verified`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexCheck {
+    /// Where the check stands.
+    pub state: CheckState,
+    /// The evidence revision when the check was taken: evidence arriving
+    /// after it keeps the generation suspect whatever the check finds.
+    pub started_revision: u64,
+    /// The half running now.
+    pub phase: CheckPhase,
+    /// The key the running half resumes after; `None` from its start.
+    pub cursor: Option<Vec<u8>>,
+    /// Complete passes over both halves so far.
+    pub passes: u32,
+    /// Records and entries checked so far.
+    pub checked: u64,
+    /// Disagreements found so far.
+    pub mismatches: u64,
+    /// Disagreements repaired so far.
+    pub repaired: u64,
+    /// The fresh generation a rebuild fills, when the damage was too wide
+    /// to repair entry by entry; the checked generation is retired by it.
+    pub rebuilt_into: Option<GenerationId>,
+    /// Wall-clock milliseconds when the check reached its outcome: what a
+    /// periodic check measures its interval from.
+    pub finished_at_ms: Option<u64>,
+}
+
+impl IndexCheck {
+    /// A check admitted at evidence revision `revision`, not taken.
+    pub fn accepted(revision: u64) -> Self {
+        Self {
+            state: CheckState::Accepted,
+            started_revision: revision,
+            phase: CheckPhase::Records,
+            cursor: None,
+            passes: 0,
+            checked: 0,
+            mismatches: 0,
+            repaired: 0,
+            rebuilt_into: None,
+            finished_at_ms: None,
+        }
+    }
+}
+
+/// What the catalog knows about whether one generation's entries agree with
+/// their records, and the check that establishes it. Keyed by generation:
+/// a rebuild's fresh generation starts with no record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexIntegrityRecord {
+    /// The generation.
+    pub generation: GenerationId,
+    /// Its logical index.
+    pub index: IndexId,
+    /// What is known about it.
+    pub integrity: Integrity,
+    /// The disagreements reported, each once, at most
+    /// [`Self::MAX_EVIDENCE`]; the count of reports goes on in
+    /// `evidence_revision` past that.
+    pub evidence: Vec<Mismatch>,
+    /// Moves with every new report.
+    pub evidence_revision: u64,
+    /// The latest check, if one was admitted.
+    pub check: Option<IndexCheck>,
+}
+
+impl IndexIntegrityRecord {
+    /// Prefix of every integrity record in the schema catalog. Outside the
+    /// definition and name prefixes.
+    pub const PREFIX: &'static [u8] = b"schema:idxcheck:";
+
+    /// The most distinct disagreements a record keeps.
+    pub const MAX_EVIDENCE: usize = 64;
+
+    /// A record of `generation` of `index` with nothing reported.
+    pub fn new(index: IndexId, generation: GenerationId) -> Self {
+        Self {
+            generation,
+            index,
+            integrity: Integrity::Unchecked,
+            evidence: Vec::new(),
+            evidence_revision: 0,
+            check: None,
+        }
+    }
+
+    /// The catalog key of the record of `generation`.
+    pub fn key_of(generation: GenerationId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(Self::PREFIX.len() + 8);
+        key.extend_from_slice(Self::PREFIX);
+        key.extend_from_slice(&generation.as_raw().to_be_bytes());
+        key
+    }
+
+    /// Record `found`: the generation becomes suspect and the revision
+    /// moves, unless the disagreement is one already reported. Returns
+    /// whether it was new.
+    pub fn report(&mut self, found: Mismatch) -> bool {
+        if self.evidence.contains(&found) {
+            return false;
+        }
+        if self.evidence.len() < Self::MAX_EVIDENCE {
+            self.evidence.push(found);
+        }
+        self.integrity = Integrity::Suspect;
+        // A count of reports, bounded by the evidence a deployment can
+        // produce; it never nears the type's range.
+        self.evidence_revision += 1;
+        true
+    }
+
+    /// Whether a check is admitted or running.
+    pub fn check_pending(&self) -> bool {
+        self.check.as_ref().is_some_and(|c| !c.state.is_terminal())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

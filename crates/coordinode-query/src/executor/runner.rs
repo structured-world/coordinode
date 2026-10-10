@@ -1839,7 +1839,16 @@ impl<'a> ExecutionContext<'a> {
         {
             return Ok(false);
         }
-        registry.mark_suspect(index.generation);
+        for tuple in wanted {
+            registry.report_mismatch(
+                &index,
+                crate::index::Mismatch::Extra {
+                    node: node.as_raw(),
+                    valid_from: None,
+                    tuple,
+                },
+            );
+        }
         Ok(true)
     }
 
@@ -18260,11 +18269,13 @@ fn execute_drop_btree_index(
     // Bound to the object the name resolved to: a statement that resolved
     // the name before it was rebound drops nothing of the later index.
     // Its finished build records go with it; a build still running has its
-    // pages fenced by the deleted definition and removes its own record.
+    // pages fenced by the deleted definition and removes its own record. Its
+    // integrity records go too, which ends a check still running on it.
     ctx.commit_catalog_change(|txn| {
         store.expect_definition_txn(txn, def.id, version)?;
         store.delete_definition_txn(txn, &def)?;
         store.delete_finished_builds_txn(txn, def.id)?;
+        store.delete_integrity_txn(txn, def.id)?;
         store.clear_txn(txn, def.generation)
     })?;
     registry.unregister(def.id);
@@ -18755,6 +18766,7 @@ fn execute_drop_constraint(
             indexes.expect_definition_txn(txn, def.id, *version)?;
             indexes.delete_definition_txn(txn, def)?;
             indexes.delete_finished_builds_txn(txn, def.id)?;
+            indexes.delete_integrity_txn(txn, def.id)?;
             indexes.clear_txn(txn, def.generation)?;
         }
         Ok(())

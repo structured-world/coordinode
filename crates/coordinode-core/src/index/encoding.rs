@@ -242,17 +242,35 @@ pub fn entry_scan_prefixes(key: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
 /// ([`encode_version_entry_key`]). `None` for a key that is no entry of that
 /// generation.
 pub fn decode_entry(generation: GenerationId, key: &[u8]) -> Option<(u64, Option<i64>)> {
+    decode_entry_parts(generation, key).map(|(_, node_id, valid_from)| (node_id, valid_from))
+}
+
+/// The tuple (as [`encode_tuple`] returns it) and the owner a non-unique
+/// entry key of `generation` names. `None` for a key that is no entry of
+/// that generation.
+pub fn decode_entry_parts(
+    generation: GenerationId,
+    key: &[u8],
+) -> Option<(&[u8], u64, Option<i64>)> {
     let rest = key.strip_prefix(entries_prefix(generation).as_slice())?;
-    let owner = rest.get(tuple_len(rest)?..)?.strip_prefix(&[TUPLE_END])?;
+    let len = tuple_len(rest)?;
+    let owner = rest.get(len..)?.strip_prefix(&[TUPLE_END])?;
     let node_id = u64::from_be_bytes(owner.get(..8)?.try_into().ok()?);
-    match owner.len() {
-        8 => Some((node_id, None)),
+    let valid_from = match owner.len() {
+        8 => None,
         16 => {
             let raw = u64::from_be_bytes(owner.get(8..)?.try_into().ok()?);
-            Some((node_id, Some((raw ^ (1 << 63)) as i64)))
+            Some((raw ^ (1 << 63)) as i64)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((&rest[..len], node_id, valid_from))
+}
+
+/// The tuple a unique entry key of `generation` holds. `None` for a key that
+/// is no unique entry of that generation.
+pub fn decode_unique_entry_tuple(generation: GenerationId, key: &[u8]) -> Option<&[u8]> {
+    key.strip_prefix(unique_entries_prefix(generation).as_slice())
 }
 
 /// Length of the encoded tuple `bytes` starts with: the elements up to the

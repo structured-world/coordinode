@@ -16,7 +16,9 @@ use coordinode_storage::engine::transaction::Transaction;
 use coordinode_storage::error::StorageError;
 use rustc_hash::FxHashMap;
 
-use super::definition::{GenerationId, IndexDefinition, IndexId, IndexType};
+use super::definition::{
+    GenerationId, IndexDefinition, IndexId, IndexIntegrityRecord, IndexType, Integrity, Mismatch,
+};
 
 /// Registry of active indexes.
 ///
@@ -24,12 +26,48 @@ use super::definition::{GenerationId, IndexDefinition, IndexId, IndexType};
 /// registry through the shared reference the execution context holds.
 pub struct IndexRegistry {
     indexes: parking_lot::RwLock<Catalog>,
-    /// Generations an entry was found disagreeing with the record it names
-    /// in this process: none of them proves a value free or a result
-    /// complete, so lookups answer from the records and every unique value
-    /// taken in them is proved free against the whole label.
-    suspect: parking_lot::RwLock<rustc_hash::FxHashSet<GenerationId>>,
+    /// Generations whose entries were found disagreeing with the records
+    /// they name: none of them proves a value free or a result complete, so
+    /// lookups answer from the records and every unique value taken in them
+    /// is proved free against the whole label.
+    integrity: parking_lot::Mutex<IntegrityView>,
+    /// Whether any generation is suspect: the one check a healthy lookup
+    /// pays.
+    any_suspect: core::sync::atomic::AtomicBool,
+    /// Signalled when a disagreement is found, for the maintenance that
+    /// records it.
+    reported: parking_lot::Condvar,
 }
+
+/// The suspect generations as this process knows them.
+#[derive(Default)]
+struct IntegrityView {
+    /// Suspect per the catalog's integrity records.
+    recorded: rustc_hash::FxHashSet<GenerationId>,
+    /// Found suspect here and not recorded in the catalog yet: a member
+    /// whose report cannot be recorded (one that takes no writes) keeps
+    /// answering from the records.
+    local: rustc_hash::FxHashSet<GenerationId>,
+    /// Disagreements found here, waiting to be recorded.
+    reports: Vec<IntegrityReport>,
+}
+
+/// A disagreement between an entry and a record, found by a read or a write
+/// and waiting to be recorded in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityReport {
+    /// The logical index.
+    pub index: IndexId,
+    /// The generation whose entry disagrees.
+    pub generation: GenerationId,
+    /// What was found.
+    pub found: Mismatch,
+}
+
+/// The most reports waiting to be recorded; past it new ones are dropped,
+/// the generation stays suspect here, and the check its first report
+/// starts finds the rest.
+const MAX_PENDING_REPORTS: usize = 1024;
 
 /// The indexes in force, by identity, and the names that bind them.
 #[derive(Default)]
@@ -223,27 +261,87 @@ impl IndexRegistry {
     pub fn new() -> Self {
         Self {
             indexes: parking_lot::RwLock::new(Catalog::default()),
-            suspect: parking_lot::RwLock::new(rustc_hash::FxHashSet::default()),
+            integrity: parking_lot::Mutex::new(IntegrityView::default()),
+            any_suspect: core::sync::atomic::AtomicBool::new(false),
+            reported: parking_lot::Condvar::new(),
         }
     }
 
-    /// Record that an entry of `generation` was found disagreeing with the
-    /// record it names: from now on the generation proves no lookup
-    /// complete and no unique value free in this process.
-    pub fn mark_suspect(&self, generation: GenerationId) {
-        if self.suspect.write().insert(generation) {
+    /// Record that an entry of `index` was found disagreeing with the record
+    /// it names, as `found` says: from now on its generation proves no
+    /// lookup complete and no unique value free in this process, and the
+    /// report waits for the maintenance that records it in the catalog and
+    /// checks the generation. A read or a write that finds one reports it;
+    /// neither changes an entry or a record for it.
+    pub fn report_mismatch(&self, index: &IndexDefinition, found: Mismatch) {
+        let mut view = self.integrity.lock();
+        if view.local.insert(index.generation) {
             tracing::warn!(
-                generation = generation.as_raw(),
+                index = %index,
+                generation = index.generation.as_raw(),
+                ?found,
                 "an index entry disagrees with the record it names; lookups in this \
-                 index generation answer from the stored records"
+                 index generation answer from the stored records until it is checked"
             );
         }
+        let report = IntegrityReport {
+            index: index.id,
+            generation: index.generation,
+            found,
+        };
+        if view.reports.len() < MAX_PENDING_REPORTS && !view.reports.contains(&report) {
+            view.reports.push(report);
+        }
+        self.any_suspect
+            .store(true, core::sync::atomic::Ordering::Release);
+        self.reported.notify_all();
     }
 
-    /// Whether an entry of `generation` was found disagreeing with its
-    /// record.
+    /// Whether an entry of `generation` is known to disagree with its record,
+    /// here or per the catalog.
     pub fn is_suspect(&self, generation: GenerationId) -> bool {
-        self.suspect.read().contains(&generation)
+        if !self.any_suspect.load(core::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let view = self.integrity.lock();
+        view.recorded.contains(&generation) || view.local.contains(&generation)
+    }
+
+    /// The reports waiting to be recorded, taken from the queue, waiting up
+    /// to `timeout` for one when there is none.
+    pub fn take_reports(&self, timeout: core::time::Duration) -> Vec<IntegrityReport> {
+        let mut view = self.integrity.lock();
+        if view.reports.is_empty() {
+            self.reported.wait_for(&mut view, timeout);
+        }
+        core::mem::take(&mut view.reports)
+    }
+
+    /// Wake whoever waits in [`Self::take_reports`], as a shutdown does.
+    pub fn wake_reporters(&self) {
+        let _view = self.integrity.lock();
+        self.reported.notify_all();
+    }
+
+    /// Bring the suspect set in line with the catalog's integrity
+    /// `records`: a generation recorded suspect stays so until a check
+    /// verifies it, one recorded verified is no longer suspect, and a
+    /// suspicion found here stays until the catalog records the generation
+    /// suspect too (a verified record may predate it).
+    pub fn apply_integrity(&self, records: &[IndexIntegrityRecord]) {
+        let mut view = self.integrity.lock();
+        view.recorded = records
+            .iter()
+            .filter(|r| r.integrity == Integrity::Suspect)
+            .map(|r| r.generation)
+            .collect();
+        let recorded = view.recorded.clone();
+        // From here the catalog governs those.
+        view.local.retain(|g| !recorded.contains(g));
+        self.any_suspect.store(
+            !view.recorded.is_empty() || !view.local.is_empty(),
+            core::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Make `index` active in this process without a stored record to bind
@@ -285,10 +383,19 @@ impl IndexRegistry {
     }
 
     /// Replace the active set with the definitions stored in the schema
-    /// partition. A member that applied another member's CREATE or DROP INDEX
-    /// picks it up here. Every type is listed, so planning and advice see
-    /// every index; only B-tree indexes have entries maintained here.
+    /// partition, and the suspect generations with the catalog's integrity
+    /// records. A member that applied another member's CREATE or DROP INDEX,
+    /// or a check's outcome, picks it up here. Every type is listed, so
+    /// planning and advice see every index; only B-tree indexes have entries
+    /// maintained here.
     pub fn load_all(&self, engine: &StorageEngine) -> Result<(), StorageError> {
+        let records = LocalIndexStore::new(engine)
+            .list_integrity()
+            .map_err(|e| match e {
+                StoreError::Storage(e) => e,
+                other => StorageError::Serialization(other.to_string()),
+            })?;
+        self.apply_integrity(&records);
         let defs = super::ops::list_index_definitions(engine)?;
         let mut loaded = Catalog::default();
         for def in defs {
@@ -622,7 +729,16 @@ fn stage(
                     return Err(UniqueViolation::new(index, values, holder).into());
                 }
                 if let Some(registry) = staging.registry {
-                    registry.mark_suspect(index.generation);
+                    for tuple in held_tuples(&store, txn, index, values, holder)? {
+                        registry.report_mismatch(
+                            index,
+                            Mismatch::Extra {
+                                node: holder.as_raw(),
+                                valid_from: None,
+                                tuple,
+                            },
+                        );
+                    }
                 }
                 needs_source_proof = true;
             }
@@ -647,6 +763,25 @@ fn stage(
         }
     }
     Ok(written)
+}
+
+/// The tuples of `values` whose unique entry in `index` names `holder`, as
+/// `txn` sees them.
+fn held_tuples(
+    store: &LocalIndexStore<'_>,
+    txn: &Transaction,
+    index: &IndexDefinition,
+    values: &[Value],
+    holder: NodeId,
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    use coordinode_core::index::derive::tuples;
+    let mut out = Vec::new();
+    for tuple in tuples(values) {
+        if store.unique_holder(txn, index, &tuple)? == Some(Some(holder)) {
+            out.push(tuple);
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the node `holder` of shard `shard_id` holds one of the entries

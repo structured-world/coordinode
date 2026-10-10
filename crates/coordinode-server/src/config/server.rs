@@ -306,6 +306,15 @@ pub struct ServerConfig {
     /// when it names no bound, in seconds (`None` = 60); past it, it returns
     /// with the build still running and its operation.
     pub index_build_statement_wait_secs: Option<u64>,
+    /// How often every B-tree index is checked against its records even
+    /// when nothing reported it wrong, in seconds (`None` = 86400; `0` checks
+    /// only on reports and requests).
+    pub index_check_interval_secs: Option<u64>,
+    /// Records, or entries, an index check reads per page (`None` = 512).
+    pub index_check_page: Option<std::num::NonZeroUsize>,
+    /// The most disagreements an index check repairs entry by entry before
+    /// it rebuilds the index into a fresh generation (`None` = 10000).
+    pub index_check_max_repairs: Option<u64>,
     /// Open-file-descriptor target (`None` = raise soft limit to hard limit).
     pub nofile: Option<u64>,
     /// Max concurrent connections (`None` = unbounded).
@@ -473,6 +482,9 @@ impl Default for ServerConfig {
             index_build_older_transactions_wait_secs: None,
             index_build_unique_read_limit: None,
             index_build_statement_wait_secs: None,
+            index_check_interval_secs: None,
+            index_check_page: None,
+            index_check_max_repairs: None,
             nofile: None,
             max_connections: None,
             max_request_size_mb: 16,

@@ -9,8 +9,9 @@
 //! [`IndexStore`]: coordinode_modality::IndexStore
 
 pub use coordinode_modality::index_def::{
-    BuildFailure, BuildState, DuplicateRepair, DuplicateRepairRecord, GenerationId,
-    IndexBuildRecord, IndexDefinition, IndexDescriptor, IndexId, IndexMaintenance, IndexProfile,
-    IndexState, IndexType, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
+    BuildFailure, BuildState, CheckPhase, CheckState, DuplicateRepair, DuplicateRepairRecord,
+    GenerationId, IndexBuildRecord, IndexCheck, IndexDefinition, IndexDescriptor, IndexId,
+    IndexIntegrityRecord, IndexMaintenance, IndexProfile, IndexState, IndexType, Integrity,
+    Mismatch, NamespaceIndexPolicy, OnlineDuringBuild, PartialFilter, ProfileSource,
     TextFieldConfig, TextIndexConfig, VectorIndexConfig,
 };

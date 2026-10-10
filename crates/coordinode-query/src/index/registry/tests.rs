@@ -142,6 +142,74 @@ fn btree(name: &str, property: &str, raw: u64) -> IndexDefinition {
     )
 }
 
+fn integrity(index: &IndexDefinition, state: Integrity) -> IndexIntegrityRecord {
+    let mut record = IndexIntegrityRecord::new(index.id, index.generation);
+    record.integrity = state;
+    record
+}
+
+fn stray(node: u64) -> Mismatch {
+    Mismatch::Extra {
+        node,
+        valid_from: None,
+        tuple: vec![1],
+    }
+}
+
+/// A disagreement found here makes the generation suspect at once and waits
+/// to be recorded; nothing else is suspect.
+#[test]
+fn a_reported_generation_is_suspect_and_its_report_waits() {
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    let other = btree("user_name", "name", 2);
+    assert!(!reg.is_suspect(index.generation));
+    reg.report_mismatch(&index, stray(7));
+    reg.report_mismatch(&index, stray(7));
+    assert!(reg.is_suspect(index.generation));
+    assert!(!reg.is_suspect(other.generation));
+    let reports = reg.take_reports(core::time::Duration::ZERO);
+    assert_eq!(reports.len(), 1, "one disagreement, reported twice");
+    assert_eq!(reports[0].generation, index.generation);
+    assert!(reg.take_reports(core::time::Duration::ZERO).is_empty());
+    assert!(
+        reg.is_suspect(index.generation),
+        "taking the report clears nothing"
+    );
+}
+
+/// A verified record older than a suspicion found here does not clear it: a
+/// member whose report could not be recorded keeps answering from records.
+/// Once the catalog records the generation suspect, the catalog governs:
+/// a later verified record clears it.
+#[test]
+fn the_catalog_governs_a_suspicion_once_it_records_it() {
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    reg.report_mismatch(&index, stray(7));
+    reg.apply_integrity(&[integrity(&index, Integrity::Verified)]);
+    assert!(
+        reg.is_suspect(index.generation),
+        "the older verified record"
+    );
+    reg.apply_integrity(&[integrity(&index, Integrity::Suspect)]);
+    assert!(reg.is_suspect(index.generation));
+    reg.apply_integrity(&[integrity(&index, Integrity::Verified)]);
+    assert!(!reg.is_suspect(index.generation), "verified after recorded");
+}
+
+/// A generation the catalog records suspect is suspect on a member that
+/// never saw the disagreement itself (a follower, a restarted process).
+#[test]
+fn a_recorded_suspicion_reaches_a_member_that_found_nothing() {
+    let reg = IndexRegistry::new();
+    let index = btree("user_email", "email", 1);
+    reg.apply_integrity(&[integrity(&index, Integrity::Suspect)]);
+    assert!(reg.is_suspect(index.generation));
+    reg.apply_integrity(&[]);
+    assert!(!reg.is_suspect(index.generation));
+}
+
 #[test]
 fn register_and_lookup() {
     let reg = IndexRegistry::new();

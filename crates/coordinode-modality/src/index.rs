@@ -32,10 +32,11 @@
 
 use coordinode_core::graph::node::NodeId;
 use coordinode_core::graph::types::Value;
-use coordinode_core::index::derive::{EntryOwner, membership_effects, tuples};
+use coordinode_core::index::derive::{EntryOwner, entry, membership_effects, tuples};
 use coordinode_core::index::encoding::{
-    decode_entry, encode_element, encode_tuple, encode_unique_entry_key, entries_prefix,
-    entry_value_prefix, generation_ranges, unique_entries_prefix,
+    decode_entry, decode_entry_parts, decode_unique_entry_tuple, encode_element, encode_tuple,
+    encode_unique_entry_key, entries_prefix, entry_value_prefix, generation_ranges,
+    unique_entries_prefix,
 };
 use coordinode_core::index::identity::IdentityAllocator;
 use coordinode_core::txn::proposal::Mutation;
@@ -48,7 +49,7 @@ use coordinode_storage::error::StorageError;
 use crate::error::{StoreError, StoreResult};
 use crate::index_def::{
     DuplicateRepairRecord, GenerationId, IndexBuildRecord, IndexDefinition, IndexDescriptor,
-    IndexId, IndexProfile, NamespaceIndexPolicy,
+    IndexId, IndexIntegrityRecord, IndexProfile, NamespaceIndexPolicy,
 };
 
 /// One page of an ordered read of index entries
@@ -63,6 +64,42 @@ pub struct EntryPage {
     pub resume: Option<Vec<u8>>,
     /// No entry in the range follows this page.
     pub exhausted: bool,
+}
+
+/// One stored entry of a generation, as a check reads it: the value tuple
+/// and the owner it names. A unique entry whose holder does not decode
+/// names no owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEntry {
+    /// The encoded value tuple.
+    pub tuple: Vec<u8>,
+    /// The node, or temporal version, the entry names; `None` for a unique
+    /// entry whose holder does not decode.
+    pub owner: Option<EntryOwner>,
+}
+
+/// One page of a generation's stored entries in key order
+/// ([`IndexStore::entries_page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEntryPage {
+    /// The entries.
+    pub entries: Vec<StoredEntry>,
+    /// The key of the last entry read, where the next page resumes; `None`
+    /// for an empty page.
+    pub resume: Option<Vec<u8>>,
+    /// No entry of the generation follows this page.
+    pub exhausted: bool,
+}
+
+/// The latest committed state of one entry key, with the version of that
+/// write: what a repair conditions its commit on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatestEntry {
+    /// The holder a unique entry names (`None` when it does not decode);
+    /// always `None` for a non-unique entry.
+    pub holder: Option<NodeId>,
+    /// The version of the write that left it.
+    pub version: u64,
 }
 
 /// Layer 4 store for secondary B-tree entries and the index catalog.
@@ -396,6 +433,124 @@ pub trait IndexStore {
         txn: &mut Transaction,
         generation: GenerationId,
         version: u64,
+    ) -> StoreResult<()>;
+
+    /// The integrity record of `generation` with the version of the same
+    /// write, read together, so a move conditions its commit on exactly the
+    /// record it read.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn load_integrity(
+        &self,
+        generation: GenerationId,
+    ) -> StoreResult<Option<(IndexIntegrityRecord, u64)>>;
+
+    /// Every integrity record in generation order.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn list_integrity(&self) -> StoreResult<Vec<IndexIntegrityRecord>>;
+
+    /// Stage `record` through a statement [`Transaction`], only while the
+    /// stored record of its generation is at `version` when it commits
+    /// (`None`: while there is none).
+    ///
+    /// # Errors
+    ///
+    /// A storage or encoding failure.
+    fn put_integrity_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &IndexIntegrityRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()>;
+
+    /// Stage the removal of the integrity records of the index `index`, in
+    /// the commit that drops it.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure or an undecodable record.
+    fn delete_integrity_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()>;
+
+    /// One page of the stored entries of `index`'s generation after the
+    /// entry key `after`, at most `limit`, in key order, as `txn` sees them.
+    /// Untracked: a check reads, it does not claim.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn entries_page(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<StoredEntryPage>;
+
+    /// The holder the unique entry of `tuple` in `index` names, as `txn`
+    /// sees it: `None` when there is no entry, `Some(None)` when its holder
+    /// does not decode. Untracked.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn unique_holder(
+        &self,
+        txn: &Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+    ) -> StoreResult<Option<Option<NodeId>>>;
+
+    /// Whether the non-unique `index` has the entry of `owner` under
+    /// `tuple`, as `txn` sees it. Untracked.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn has_entry(
+        &self,
+        txn: &Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+    ) -> StoreResult<bool>;
+
+    /// The latest committed state of the entry `owner` holds under `tuple`
+    /// in `index` (for a unique index, the entry of `tuple` whoever it
+    /// names), with the version of its write; `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn latest_entry(
+        &self,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+    ) -> StoreResult<Option<LatestEntry>>;
+
+    /// Stage a repair of one entry of `index` through a statement
+    /// [`Transaction`]: `owner`'s entry under `tuple` put (`present`) or
+    /// removed, only while the entry is still at `version` when the
+    /// transaction commits (`None`: while there is none). The repair is an
+    /// exact entry effect in either profile: every member applies the same
+    /// key.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    fn repair_entry_txn(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+        present: bool,
+        version: Option<u64>,
     ) -> StoreResult<()>;
 }
 
@@ -942,6 +1097,160 @@ impl IndexStore for LocalIndexStore<'_> {
         txn.expect_version(Partition::Schema, &key, Some(version))?;
         txn.delete(Partition::Schema, &key)?;
         self.delete_repairs_txn(txn, generation)
+    }
+
+    fn load_integrity(
+        &self,
+        generation: GenerationId,
+    ) -> StoreResult<Option<(IndexIntegrityRecord, u64)>> {
+        self.engine
+            .get_versioned(Partition::Schema, &IndexIntegrityRecord::key_of(generation))?
+            .map(|(bytes, version)| Ok((decode("index integrity record", &bytes)?, version)))
+            .transpose()
+    }
+
+    fn list_integrity(&self) -> StoreResult<Vec<IndexIntegrityRecord>> {
+        let mut out = Vec::new();
+        for guard in self
+            .engine
+            .prefix_scan(Partition::Schema, IndexIntegrityRecord::PREFIX)?
+        {
+            let (key, value) = guard.into_inner()?;
+            out.push(decode_catalog("index integrity record", &key, &value)?);
+        }
+        Ok(out)
+    }
+
+    fn put_integrity_txn(
+        &self,
+        txn: &mut Transaction,
+        record: &IndexIntegrityRecord,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        let key = IndexIntegrityRecord::key_of(record.generation);
+        txn.expect_version(Partition::Schema, &key, version)?;
+        txn.put(
+            Partition::Schema,
+            &key,
+            &encode("index integrity record", record)?,
+        )?;
+        Ok(())
+    }
+
+    fn delete_integrity_txn(&self, txn: &mut Transaction, index: IndexId) -> StoreResult<()> {
+        for record in self.list_integrity()? {
+            if record.index == index {
+                txn.delete(
+                    Partition::Schema,
+                    &IndexIntegrityRecord::key_of(record.generation),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn entries_page(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<StoredEntryPage> {
+        let [plain, unique] = generation_ranges(index.generation);
+        let (start, end) = if index.unique { unique } else { plain };
+        let page = txn.range_scan_paged(Partition::Idx, &start, &end, after, limit)?;
+        let mut entries = Vec::with_capacity(page.rows.len());
+        for (key, value) in &page.rows {
+            if index.unique {
+                if let Some(tuple) = decode_unique_entry_tuple(index.generation, key) {
+                    entries.push(StoredEntry {
+                        tuple: tuple.to_vec(),
+                        owner: decode_holder(value)
+                            .ok()
+                            .map(|holder| EntryOwner::node(holder.as_raw())),
+                    });
+                }
+            } else if let Some((tuple, node_id, valid_from)) =
+                decode_entry_parts(index.generation, key)
+            {
+                entries.push(StoredEntry {
+                    tuple: tuple.to_vec(),
+                    owner: Some(EntryOwner {
+                        node_id,
+                        valid_from,
+                    }),
+                });
+            }
+        }
+        Ok(StoredEntryPage {
+            entries,
+            resume: page.last_key,
+            exhausted: page.exhausted,
+        })
+    }
+
+    fn unique_holder(
+        &self,
+        txn: &Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+    ) -> StoreResult<Option<Option<NodeId>>> {
+        let key = encode_unique_entry_key(index.generation, tuple);
+        Ok(txn
+            .read_untracked(Partition::Idx, &key)?
+            .map(|bytes| decode_holder(&bytes).ok()))
+    }
+
+    fn has_entry(
+        &self,
+        txn: &Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+    ) -> StoreResult<bool> {
+        let key = entry(index.generation, false, tuple, owner).0;
+        Ok(txn.read_untracked(Partition::Idx, &key)?.is_some())
+    }
+
+    fn latest_entry(
+        &self,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+    ) -> StoreResult<Option<LatestEntry>> {
+        let key = entry(index.generation, index.unique, tuple, owner).0;
+        Ok(self
+            .engine
+            .get_versioned(Partition::Idx, &key)?
+            .map(|(bytes, version)| LatestEntry {
+                holder: if index.unique {
+                    decode_holder(&bytes).ok()
+                } else {
+                    None
+                },
+                version,
+            }))
+    }
+
+    fn repair_entry_txn(
+        &self,
+        txn: &mut Transaction,
+        index: &IndexDefinition,
+        tuple: &[u8],
+        owner: EntryOwner,
+        present: bool,
+        version: Option<u64>,
+    ) -> StoreResult<()> {
+        let (key, value) = entry(index.generation, index.unique, tuple, owner);
+        // The condition before the write it guards: a direct-mode engine
+        // decides a condition when it is stated.
+        txn.expect_version(Partition::Idx, &key, version)?;
+        if present {
+            txn.put(Partition::Idx, &key, &value)?;
+        } else {
+            txn.delete(Partition::Idx, &key)?;
+        }
+        Ok(())
     }
 }
 

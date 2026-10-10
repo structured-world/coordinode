@@ -206,6 +206,9 @@ pub(crate) async fn serve(
         index_build_older_transactions_wait_secs,
         index_build_unique_read_limit,
         index_build_statement_wait_secs,
+        index_check_interval_secs,
+        index_check_page,
+        index_check_max_repairs,
         mode: _,
         // Already consumed above via set_wire_zstd_level before serving.
         wire_compression_level: _,
@@ -738,6 +741,15 @@ pub(crate) async fn serve(
             .unwrap_or(defaults.unique_admission_read_limit),
         statement_wait: index_build_statement_wait_secs
             .map_or(defaults.statement_wait, std::time::Duration::from_secs),
+        check_page: index_check_page.map_or(defaults.check_page, |n| n.get()),
+        check_max_repairs: index_check_max_repairs.unwrap_or(defaults.check_max_repairs),
+        // Zero turns the periodic check off; reports and requests still
+        // check.
+        check_interval: match index_check_interval_secs {
+            None => defaults.check_interval,
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        },
     });
     // What a statement executes under when neither it nor its session names a
     // concern.

@@ -358,6 +358,31 @@ fn index_build_settings_parse_from_the_config_file() {
     assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
 }
 
+/// The index check knobs are config-file settings: unset they leave the
+/// engine defaults; an interval of zero is valid (periodic checks off), a
+/// page of zero records is refused, since a check would never advance.
+#[test]
+fn index_check_settings_parse_from_the_config_file() {
+    let d = ServerConfig::default();
+    assert!(d.index_check_interval_secs.is_none());
+    assert!(d.index_check_page.is_none());
+    assert!(d.index_check_max_repairs.is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    std::fs::write(
+        &path,
+        "index_check_interval_secs: 0\nindex_check_page: 64\nindex_check_max_repairs: 7\n",
+    )
+    .unwrap();
+    let c = ServerConfig::load(Some(path.to_str().unwrap())).unwrap();
+    assert_eq!(c.index_check_interval_secs, Some(0));
+    assert_eq!(c.index_check_page.map(|v| v.get()), Some(64));
+    assert_eq!(c.index_check_max_repairs, Some(7));
+
+    std::fs::write(&path, "index_check_page: 0\n").unwrap();
+    assert!(ServerConfig::load(Some(path.to_str().unwrap())).is_err());
+}
+
 /// The change-stream pacing is a config-file setting; zero is refused at
 /// parse, since a zero batch never reads and a zero heartbeat interval spins.
 #[test]

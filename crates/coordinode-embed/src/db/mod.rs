@@ -1068,6 +1068,12 @@ impl Database {
             }),
             coordinode_query::index::IndexBuildConfig::default(),
         );
+        // Records the disagreements reads and writes find between an index
+        // and its records, checks the generations they name, and checks
+        // every index periodically.
+        index_builds
+            .start_maintenance()
+            .map_err(DatabaseError::Other)?;
 
         // Every NodeId comes from a lease the log granted, taken on the first
         // CREATE and then kept one lease ahead in the background, so a crash
@@ -3363,33 +3369,11 @@ impl Database {
     /// Returns the number of nodes indexed.
     fn build_btree_index(
         &self,
-        mut def: coordinode_query::index::IndexDefinition,
+        def: coordinode_query::index::IndexDefinition,
     ) -> Result<u64, DatabaseError> {
-        use coordinode_modality::{ENTRY_LAYOUT, IndexStore as _, LocalIndexStore};
-        use coordinode_query::index::{BuildFailure, IndexBuildRecord, IndexState};
-        let store = LocalIndexStore::new(&self.engine);
-        def.layout = ENTRY_LAYOUT;
-        def.state = IndexState::Building {
-            written: 0,
-            estimated_total: 0,
-        };
-        let replaced = store.definition_version(def.id)?;
-        let retired = def.generation;
-        self.commit_catalog(|txn| {
-            store.expect_definition_txn(txn, def.id, replaced)?;
-            def.generation = store.allocate_generation_txn(txn)?;
-            store.clear_txn(txn, retired)?;
-            store.put_definition_txn(txn, &def)?;
-            store.put_build_txn(
-                txn,
-                &IndexBuildRecord::accepted(def.id, def.generation, BuildFailure::Keep),
-                None,
-            )
-        })?;
-        self.index_registry
-            .register_published(&self.engine, def.clone())?;
-        self.index_builds
-            .submit(def.generation)
+        let def = self
+            .index_builds
+            .rebuild(def)
             .map_err(DatabaseError::Other)?;
         self.build_outcome(&def)
     }
@@ -3461,6 +3445,11 @@ impl Database {
             }
         }
         self.refresh_btree_indexes()?;
+        // Checks run in the background; a restart takes up the ones left
+        // without an outcome, from where they stopped.
+        self.index_builds
+            .resume_checks()
+            .map_err(DatabaseError::Other)?;
         Ok(out)
     }
 
@@ -3824,6 +3813,7 @@ mod catalog;
 mod fields;
 mod id_lease;
 mod index_builds;
+mod index_maintenance;
 pub use after_commit::{AfterCommitDispatchReport, TriggerDispatchConfig};
 pub use catalog::{ConstraintDeclaration, LabelConstraint};
 pub use fields::FieldDictionary;
