@@ -3377,3 +3377,58 @@ fn search_low_ef_recall_floor() {
         "recall@k={k} at ef_search<k was {recall:.3}, expected ≥ 0.80",
     );
 }
+
+/// Measurement probe, not a check: self-recall of 40 concurrent builds of
+/// each kind on a wide pool, as min / mean / max.
+#[test]
+#[ignore = "measurement probe"]
+fn probe_wide_pool_recall_distribution() {
+    let n = 600usize;
+    let dim = 20usize;
+    let items: Vec<(u64, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v = (0..dim)
+                .map(|d| {
+                    let seed = (i.wrapping_mul(2_654_435_761).wrapping_add(d * 6_700_417)) as u32;
+                    let bits = (seed ^ (seed >> 13)) & 0x00FF_FFFF;
+                    (bits as f32 / 16_777_216.0) - 0.5
+                })
+                .collect();
+            (i as u64, v)
+        })
+        .collect();
+    let cfg = || HnswConfig {
+        ef_search: 64,
+        metric: VectorMetric::L2,
+        max_dimensions: 65_536,
+        ..Default::default()
+    };
+    let self_recall = |index: &HnswIndex| {
+        items
+            .iter()
+            .filter(|(id, v)| index.search(v, 1).first().is_some_and(|r| r.id == *id))
+            .count()
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(128)
+        .build()
+        .unwrap();
+    for bulk in [false, true] {
+        let mut got = Vec::new();
+        for _ in 0..40 {
+            let mut index = HnswIndex::new(cfg());
+            pool.install(|| {
+                if bulk {
+                    index.bulk_build(items.clone());
+                } else {
+                    index.insert_batch(items.clone());
+                }
+            });
+            got.push(self_recall(&index));
+        }
+        let min = got.iter().min().unwrap();
+        let max = got.iter().max().unwrap();
+        let mean = got.iter().sum::<usize>() as f64 / got.len() as f64;
+        eprintln!("PROBE bulk={bulk} min={min} mean={mean:.1} max={max}");
+    }
+}

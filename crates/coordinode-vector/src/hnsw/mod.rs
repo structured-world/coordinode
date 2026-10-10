@@ -1041,6 +1041,8 @@ impl HnswIndex {
     pub fn insert_batch_shared(&self, mut items: Vec<(u64, Vec<f32>)>) -> bool {
         use rayon::prelude::*;
         const SEED_DENSITY: usize = 64;
+        // Largest share of the graph a wave of concurrent inserts may add.
+        const WAVE_SHARE: usize = 4;
         // A batch of at least a quarter of the graph runs the
         // reachability repair after it.
         const CONNECT_SHARE: usize = 4;
@@ -1068,9 +1070,22 @@ impl HnswIndex {
         for (id, vector) in items {
             self.insert_shared(id, &vector);
         }
-        rest.par_iter().for_each(|(id, vector)| {
-            self.insert_shared(*id, vector);
-        });
+        // The rest goes in waves of at most a `WAVE_SHARE`th of the graph
+        // as it stands: an insert links to what is published, and the
+        // inserts running beside it are not yet, so a wave as large as the
+        // graph links half its nodes past their true neighbours, worse the
+        // wider the pool. Bounded so, the waves grow with the graph and their
+        // number grows with its logarithm (batch insertion by prefix
+        // doubling, as parallel graph-index builds do).
+        let mut remaining = rest.as_slice();
+        while !remaining.is_empty() {
+            let wave = (self.len() / WAVE_SHARE).clamp(1, remaining.len());
+            let (now, later) = remaining.split_at(wave);
+            now.par_iter().for_each(|(id, vector)| {
+                self.insert_shared(*id, vector);
+            });
+            remaining = later;
+        }
         // A batch this large is a build: one pass over the graph per node it
         // adds four times over is cheap next to linking them.
         if !rest.is_empty() && rest.len() * CONNECT_SHARE >= self.len() {
@@ -1102,16 +1117,15 @@ impl HnswIndex {
     ///    leader, producing a sparse, well-formed entry topology
     ///    before any follower lands.
     /// 3. Brute-force-assign followers to their nearest leader via
-    ///    rayon, stable-sort followers by cluster id so a cluster's
-    ///    items are contiguous, and hand the reordered batch to
-    ///    [`Self::insert_batch`]. The apply phase then visits adjacent
-    ///    `nodes[]` indices for a whole cluster before moving on,
-    ///    giving the cache a working set that fits between graph
-    ///    pointer chases.
+    ///    rayon, deal them round-robin over the clusters so items
+    ///    inserted side by side come from different clusters, and hand
+    ///    the reordered batch to [`Self::insert_batch`]. An insert
+    ///    cannot link to another still in flight, and a cluster's items
+    ///    are each other's nearest neighbours.
     ///
-    /// Each stage above leaves the graph in the same observable state
-    /// a plain `insert_batch` would; the change is order and locality,
-    /// not topology. A future task may extend this with cluster-
+    /// Each stage above leaves the graph with the same members a plain
+    /// `insert_batch` would; what changes is the order the followers
+    /// are linked in. A future task may extend this with cluster-
     /// restricted plans + parallel per-cluster builds (the full
     /// ParlayANN topology); that work requires threading an
     /// allowed-node bitmap through the search-internals and is

@@ -83,52 +83,24 @@ fn cluster_assignment_picks_nearest_leader_under_l2() {
     assert_eq!(a, vec![0, 1, 1, 0]);
 }
 
+/// Followers are dealt round-robin over the clusters, each cluster in
+/// input order: neighbours of one cluster never sit side by side while
+/// another cluster still has items, so they are not inserted together.
 #[test]
-fn cluster_order_is_stable_and_groups_clusters_together() {
+fn cluster_order_deals_followers_round_robin_over_the_clusters() {
     let leaders = vec![vec![0.0, 0.0], vec![10.0, 0.0]];
     let followers = vec![
         (10u64, vec![1.0, 0.0]), // cluster 0
-        (20u64, vec![9.0, 0.0]), // cluster 1
         (30u64, vec![2.0, 0.0]), // cluster 0
+        (50u64, vec![3.0, 0.0]), // cluster 0
+        (20u64, vec![9.0, 0.0]), // cluster 1
         (40u64, vec![8.0, 0.0]), // cluster 1
     ];
-    let original_ids: Vec<u64> = followers.iter().map(|(id, _)| *id).collect();
     let reordered = cluster_order_followers(followers, &leaders, VectorMetric::L2);
-    // Every original follower must appear exactly once in the output.
-    let reordered_ids: Vec<u64> = reordered.iter().map(|(id, _)| *id).collect();
-    let mut sorted_orig = original_ids.clone();
-    sorted_orig.sort_unstable();
-    let mut sorted_reord = reordered_ids.clone();
-    sorted_reord.sort_unstable();
-    assert_eq!(sorted_orig, sorted_reord);
-
-    // Cluster ids of consecutive followers in the output must be
-    // non-decreasing.
-    let mut last_cluster: i32 = -1;
-    for (_, v) in &reordered {
-        let c = nearest_leader_index(v, &leaders, VectorMetric::L2) as i32;
-        assert!(
-            c >= last_cluster,
-            "cluster ids must be non-decreasing in cluster-ordered output, got {c} after {last_cluster}",
-        );
-        last_cluster = c;
-    }
-
-    // Within each cluster the original input order is preserved
-    // (stable sort). Cluster 0 originals were [10, 30] in that
-    // order; cluster 1 were [20, 40].
-    let cluster0: Vec<u64> = reordered_ids
-        .iter()
-        .copied()
-        .filter(|id| matches!(id, 10 | 30))
-        .collect();
-    assert_eq!(cluster0, vec![10, 30]);
-    let cluster1: Vec<u64> = reordered_ids
-        .iter()
-        .copied()
-        .filter(|id| matches!(id, 20 | 40))
-        .collect();
-    assert_eq!(cluster1, vec![20, 40]);
+    let ids: Vec<u64> = reordered.iter().map(|(id, _)| *id).collect();
+    // Rank 0 of each cluster, then rank 1, then the longer cluster's
+    // tail; each cluster keeps its input order.
+    assert_eq!(ids, vec![10, 20, 30, 40, 50]);
 }
 
 #[test]

@@ -85,12 +85,8 @@ pub(crate) fn bulk_build(index: &mut HnswIndex, items: Vec<(u64, Vec<f32>)>, cac
     }
 
     // Followers ride the parallel insert_batch path against the
-    // seeded graph. Before handing the batch off, reorder the
-    // followers so items of the same cluster are contiguous in the
-    // input vector. The apply phase then visits adjacent
-    // `nodes[]` indices for an entire cluster before moving to the
-    // next, giving the L1 / L2 cache a fighting chance against the
-    // pointer-chasing nature of graph inserts.
+    // seeded graph, dealt round-robin over the clusters so that no
+    // two neighbours of one cluster are inserted side by side.
     if !followers.is_empty() {
         let leader_vecs: Vec<Vec<f32>> = leaders_for_assignment;
         let reordered = cluster_order_followers(followers, &leader_vecs, index.config().metric);
@@ -150,19 +146,34 @@ fn nearest_leader_index(v: &[f32], leaders: &[Vec<f32>], metric: VectorMetric) -
     best_idx
 }
 
-/// Reorder followers so items with the same leader assignment are
-/// contiguous in the output. Within a cluster, original input order
-/// is preserved (the leader-grouping pass is a stable sort by
-/// cluster id).
+/// Reorder followers so consecutive items come from different
+/// clusters: the first of every cluster, then the second of every
+/// cluster, and so on, each cluster in input order.
+///
+/// Consecutive items are the ones inserted side by side, and an
+/// insert cannot link to another still in flight. Items of one
+/// cluster are each other's nearest neighbours, so inserting them
+/// together leaves each without its best links; spreading them over
+/// the batch keeps them in different waves and workers.
 fn cluster_order_followers(
     followers: Vec<(u64, Vec<f32>)>,
     leaders: &[Vec<f32>],
     metric: VectorMetric,
 ) -> Vec<(u64, Vec<f32>)> {
     let assignment = assign_followers_to_leaders(&followers, leaders, metric);
+    // Rank of each follower within its cluster, in input order.
+    let mut seen = vec![0usize; leaders.len().max(1)];
+    let rank: Vec<usize> = assignment
+        .iter()
+        .map(|&cluster| {
+            let r = seen[cluster];
+            seen[cluster] += 1;
+            r
+        })
+        .collect();
     let mut indexed: Vec<(usize, (u64, Vec<f32>))> = followers.into_iter().enumerate().collect();
-    // Stable sort keeps the input order inside each cluster.
-    indexed.sort_by_key(|(i, _)| assignment[*i]);
+    // By rank, then cluster: a round over the clusters per rank.
+    indexed.sort_by_key(|(i, _)| (rank[*i], assignment[*i]));
     indexed.into_iter().map(|(_, item)| item).collect()
 }
 
