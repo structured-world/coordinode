@@ -1505,6 +1505,31 @@ mod derived {
         assert!(!has(&engine, &entry_key("a@x", 1)));
     }
 
+    /// DERIVED work applied while a replacement of its generation is
+    /// prepared reaches the replacement: once published, the entry it
+    /// derived is there and the one it removed is gone, as in the copy it
+    /// replaced.
+    #[test]
+    fn derived_entries_applied_during_a_replacement_reach_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let oracle = Arc::new(TimestampOracle::new());
+        let engine =
+            StorageEngine::open_embedded(&durable_cfg(&dir), oracle.clone()).expect("open");
+        write_batch(&engine, &oracle, &unit(1, "a@x", None));
+        engine.stage_generation(EMAIL_GEN).expect("stage");
+        write_batch(&engine, &oracle, &unit(1, "b@x", Some("a@x")));
+        let history = engine.export_generation_history(EMAIL_GEN).expect("export");
+        engine
+            .import_generation_history(EMAIL_GEN, &history.entries)
+            .expect("import");
+        engine
+            .finish_generation_import(EMAIL_GEN, history.covers_through, history.history_from)
+            .expect("finish");
+        engine.publish_generation(EMAIL_GEN).expect("publish");
+        assert!(has(&engine, &entry_key("b@x", 1)));
+        assert!(!has(&engine, &entry_key("a@x", 1)));
+    }
+
     /// The node partition reaches disk, the index partition does not, and
     /// power is lost. Recovery skips the entry for the node partition, which
     /// holds it, yet still derives the index entry from the journalled node

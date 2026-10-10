@@ -274,16 +274,7 @@ fn entry_of(generation: u64, rest: &[u8]) -> Vec<u8> {
 /// Replace `GENERATION` from its own history and publish it.
 fn replace_locally(engine: &StorageEngine) {
     engine.stage_generation(GENERATION).expect("stage");
-    let history = engine
-        .export_generation_history(GENERATION)
-        .expect("export");
-    engine
-        .import_generation_history(GENERATION, &history.entries)
-        .expect("import");
-    engine
-        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
-        .expect("finish");
-    engine.publish_generation(GENERATION).expect("publish");
+    replace_after_stage(engine);
 }
 
 /// One proposal writing two generations while one of them is replaced: the
@@ -435,6 +426,85 @@ fn entries_left_under_a_retired_copy_are_cleared_at_open() {
     );
     assert_eq!(get(&engine, &entry(b"a")), Some(b"a1".to_vec()));
     assert_eq!(get(&engine, &entry(b"stale")), None);
+}
+
+/// A generation has at most one replacement in preparation: a second
+/// registration is refused and the first stays usable.
+#[test]
+fn a_second_replacement_of_a_generation_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    engine
+        .put(Partition::Idx, &entry(b"a"), b"a1")
+        .expect("put");
+    engine.stage_generation(GENERATION).expect("stage");
+    assert!(matches!(
+        engine.stage_generation(GENERATION),
+        Err(StorageError::InstallationCatalog(_))
+    ));
+    replace_after_stage(&engine);
+    assert_eq!(get(&engine, &entry(b"a")), Some(b"a1".to_vec()));
+}
+
+/// A scan opened before the switch keeps reading the copy it started on to
+/// its end: it sees every entry it would have seen without the switch, and
+/// never a mix of the two copies.
+#[test]
+fn a_scan_opened_before_the_switch_reads_its_copy_to_the_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    for i in 0u8..50 {
+        engine.put(Partition::Idx, &entry(&[i]), &[i]).expect("put");
+    }
+    let scan = engine
+        .prefix_scan(Partition::Idx, &prefix(TAG_ENTRIES, GENERATION.as_raw()))
+        .expect("scan");
+    engine.stage_generation(GENERATION).expect("stage");
+    replace_after_stage(&engine);
+    let seen: Vec<Vec<u8>> = scan
+        .map(|guard| guard.into_owned().expect("pair").1.to_vec())
+        .collect();
+    assert_eq!(seen, (0u8..50).map(|i| vec![i]).collect::<Vec<_>>());
+}
+
+/// Clearing the whole index partition (a partition rebuild) drops a
+/// replacement in preparation, whose contents went with it: it can neither
+/// be filled nor published, and a new one can be registered.
+#[test]
+fn a_cleared_partition_drops_the_replacement_in_preparation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::open(&config(dir.path())).expect("open");
+    engine
+        .put(Partition::Idx, &entry(b"a"), b"a1")
+        .expect("put");
+    engine.stage_generation(GENERATION).expect("stage");
+    engine.clear_partition(Partition::Idx).expect("clear");
+    assert!(matches!(
+        engine.import_generation_history(GENERATION, &[]),
+        Err(StorageError::InstallationCatalog(_))
+    ));
+    assert!(matches!(
+        engine.publish_generation(GENERATION),
+        Err(StorageError::InstallationCatalog(_))
+    ));
+    engine
+        .stage_generation(GENERATION)
+        .expect("a new replacement can be registered");
+}
+
+/// Fill a registered replacement of `GENERATION` from its own history and
+/// publish it.
+fn replace_after_stage(engine: &StorageEngine) {
+    let history = engine
+        .export_generation_history(GENERATION)
+        .expect("export");
+    engine
+        .import_generation_history(GENERATION, &history.entries)
+        .expect("import");
+    engine
+        .finish_generation_import(GENERATION, history.covers_through, history.history_from)
+        .expect("finish");
+    engine.publish_generation(GENERATION).expect("publish");
 }
 
 /// An imported entry outside the generation is refused, so a history meant
