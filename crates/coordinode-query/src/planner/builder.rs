@@ -1312,6 +1312,30 @@ pub fn optimize_index_selection(
                 property_filters,
             }
         }
+        // The pattern MERGE and UPSERT match is found through an index the
+        // same way. It is also the template MERGE creates from, which a point
+        // lookup still carries whole: it is rewritten only from one label and
+        // one equality, the label, property and value it names.
+        LogicalOp::Merge {
+            pattern,
+            on_match,
+            on_create,
+            multi,
+        } => LogicalOp::Merge {
+            pattern: Box::new(optimize_index_selection(*pattern, registry)),
+            on_match,
+            on_create,
+            multi,
+        },
+        LogicalOp::Upsert {
+            pattern,
+            on_match,
+            on_create_patterns,
+        } => LogicalOp::Upsert {
+            pattern: Box::new(optimize_index_selection(*pattern, registry)),
+            on_match,
+            on_create_patterns,
+        },
         // Every other operator: the rewrite applies to each of its inputs,
         // writes included, so a MATCH feeding a SET, REMOVE or DELETE finds
         // its nodes through an index exactly as a read does.

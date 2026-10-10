@@ -292,13 +292,57 @@ fn a_write_finds_its_node_through_the_index() {
         "MATCH (a:Agent {session_id: 's1'}) DETACH DELETE a",
         "MATCH (a:Agent {session_id: 's1'}) SET a += {seen: 1}",
         "MATCH (a:Agent {session_id: 's1'}) FOREACH (x IN [1] | SET a.seen = x)",
+        "MERGE (a:Agent {session_id: 's1'}) ON MATCH SET a.seen = 1",
+        "MERGE (a:Agent {session_id: 's1'})-[:R]->(b:Agent {session_id: 's2'})",
+        "UPSERT MATCH (a:Agent {session_id: 's1'}) ON MATCH SET a.seen = 1 \
+         ON CREATE CREATE (a:Agent {session_id: 's1'})",
     ] {
         let explain = db.explain_cypher(query).expect("EXPLAIN");
         assert!(
             explain.contains("IndexScan(a:Agent ON agent_session(session_id))")
-                && !explain.contains("NodeScan"),
+                && !explain.contains("NodeScan(a"),
             "{query}\nmust find its node through the index, got:\n{explain}"
         );
+    }
+}
+
+/// A MERGE or UPSERT found through the index creates the node it does not
+/// find with its whole pattern, indexed, and finds that node the next time
+/// instead of creating another.
+#[test]
+fn merge_and_upsert_through_the_index_create_once_and_find_after() {
+    let (mut db, _dir) = open_db();
+    db.execute_cypher("CREATE UNIQUE INDEX agent_session ON :Agent(session_id)")
+        .expect("CREATE INDEX");
+    for _ in 0..3 {
+        db.execute_cypher("MERGE (a:Agent {session_id: 's1'}) ON MATCH SET a.seen = 1")
+            .expect("merge");
+        db.execute_cypher(
+            "UPSERT MATCH (a:Agent {session_id: 's2'}) ON MATCH SET a.seen = 1 \
+             ON CREATE CREATE (a:Agent {session_id: 's2', seen: 0})",
+        )
+        .expect("upsert");
+    }
+    for sid in ["s1", "s2"] {
+        assert_eq!(
+            count(
+                &mut db,
+                "MATCH (a:Agent) WHERE a.session_id + '' = $sid RETURN count(a)",
+                &[("sid", Value::String(sid.into()))],
+            ),
+            1,
+            "{sid} is held by one node"
+        );
+        let rows = db
+            .execute_cypher_with_params(
+                "MATCH (a:Agent {session_id: $sid}) RETURN a.seen AS seen",
+                [("sid".to_string(), Value::String(sid.into()))]
+                    .into_iter()
+                    .collect(),
+            )
+            .expect("lookup");
+        assert_eq!(rows.len(), 1, "{sid} is found through the index");
+        assert_eq!(rows[0].get("seen"), Some(&Value::Int(1)), "{sid}");
     }
 }
 

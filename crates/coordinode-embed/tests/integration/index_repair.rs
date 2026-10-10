@@ -806,13 +806,47 @@ fn a_lookup_answered_by_the_records_stays_within_its_memory_limit() {
     assert_eq!(rows[0].get("id"), Some(&Value::Int(owner)));
 }
 
+/// Let the check a lookup through the wrong entry started finish, then make
+/// the entry of 'a@x' in `u_email` name `wrong` again: the next lookup by
+/// the value finds it wrong and answers from the records.
+fn wrong_again(db: &Database, wrong: i64) {
+    check(db, "u_email");
+    misattribute(db, "u_email", "a@x", wrong);
+}
+
+/// Run the write `query` through a wrong entry. Its lookup starts a check
+/// that repairs the entry in the background, conditioned on the holder's
+/// record; a write to that node committing while the repair is in flight is
+/// refused as a conflict, and is run again, as a client retries a conflict,
+/// once the check has finished.
+fn write_through_wrong_entry(
+    db: &mut Database,
+    wrong: i64,
+    query: &str,
+) -> Vec<coordinode_query::executor::Row> {
+    use coordinode_embed::db::DatabaseError;
+    use coordinode_query::executor::runner::ExecutionError;
+    wrong_again(db, wrong);
+    match db.execute_cypher(query) {
+        Ok(rows) => rows,
+        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
+            check(db, "u_email");
+            db.execute_cypher(query)
+                .unwrap_or_else(|e| panic!("{query}: {e:?}"))
+        }
+        Err(e) => panic!("{query}: {e:?}"),
+    }
+}
+
 /// A lookup the index cannot answer is refused before reading the records
 /// when the rest of the statement runs work outside its budget (a procedure
 /// call): it names the index and the operator. Accounted operators over the
 /// same lookup (a traversal, an optional match, a pattern subquery, an
-/// aggregate, a relationship MERGE, a detaching delete) answer from the
-/// records exactly as the sound index would, and the delete removes the
-/// node that holds the value, not the one the wrong entry named.
+/// aggregate, an UPSERT, a relationship MERGE, a detaching delete) answer
+/// from the records exactly as the sound index would; each runs right after
+/// the entry is made wrong again, so each answers from the records. The
+/// writes change the node that holds the value, not the one the wrong entry
+/// named.
 #[test]
 fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
     use coordinode_embed::db::DatabaseError;
@@ -844,48 +878,56 @@ fn a_lookup_answered_by_the_records_into_unaccounted_work_is_refused() {
         ),
         "{refused:?}"
     );
-    for query in [optional, traverse, exists] {
+    for query in [optional, traverse, exists, count] {
+        wrong_again(&db, wrong);
         let rows = db.execute_cypher(query).expect("accounted");
         assert_eq!(rows.len(), 1, "{query}");
         assert_eq!(rows[0].get("n"), Some(&Value::Int(1)), "{query}");
     }
-    let counted = db.execute_cypher(count).expect("an aggregate is accounted");
-    assert_eq!(counted[0].get("n"), Some(&Value::Int(1)));
+
+    // An UPSERT matches through the same lookup: the node holding the value
+    // is updated, the one the wrong entry named is not, nothing is created.
+    let plan = db
+        .explain_cypher("MERGE (u:U {email: 'a@x'}) ON MATCH SET u.seen = 1")
+        .expect("explain");
+    assert!(plan.contains("IndexScan"), "{plan}");
+    let plan = db
+        .explain_cypher(
+            "UPSERT MATCH (u:U {email: 'a@x'}) ON MATCH SET u.seen = 1 \
+             ON CREATE CREATE (u:U {email: 'a@x', seen: 0})",
+        )
+        .expect("explain");
+    assert!(plan.contains("IndexScan"), "{plan}");
+    let upserted = write_through_wrong_entry(
+        &mut db,
+        wrong,
+        "UPSERT MATCH (u:U {email: 'a@x'}) ON MATCH SET u.seen = 1 \
+         ON CREATE CREATE (u:U {email: 'a@x', seen: 0})",
+    );
+    assert_eq!(upserted.len(), 1);
+    let seen = db
+        .execute_cypher("MATCH (u:U) WHERE u.seen = 1 RETURN u.email AS e")
+        .expect("seen");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].get("e"), Some(&Value::String("a@x".into())));
 
     // A relationship MERGE walks the source's edges within the budget: the
     // existing edge is matched, a new one is created once.
     let merge = "MATCH (u:U {email: 'a@x'}), (t:T) MERGE (u)-[:R]->(t) RETURN t.n AS n";
     for _ in 0..2 {
-        let rows = db
-            .execute_cypher(merge)
-            .expect("a relationship merge is accounted");
+        let rows = write_through_wrong_entry(&mut db, wrong, merge);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("n"), Some(&Value::Int(1)));
     }
     db.execute_cypher("CREATE (:T {n: 2})")
         .expect("second target");
-    db.execute_cypher(merge)
-        .expect("merge creates the missing edge");
+    write_through_wrong_entry(&mut db, wrong, merge);
     let edges = db
         .execute_cypher("MATCH (u:U {email: 'a@x'})-[:R]->(t:T) RETURN count(t) AS n")
         .expect("edges");
     assert_eq!(edges[0].get("n"), Some(&Value::Int(2)));
 
-    // The lookups above found the entry wrong, and the check they started
-    // repairs it in the background, conditioned on the holder's record: a
-    // delete of that node committing while the repair is in flight is
-    // refused as a conflict. Retried once the check has finished, it
-    // commits.
-    let delete = "MATCH (u:U {email: 'a@x'}) DETACH DELETE u";
-    match db.execute_cypher(delete) {
-        Ok(_) => {}
-        Err(DatabaseError::Execution(ExecutionError::Conflict(_))) => {
-            check(&db, "u_email");
-            db.execute_cypher(delete)
-                .expect("a detaching delete is accounted");
-        }
-        Err(e) => panic!("a detaching delete is accounted: {e:?}"),
-    }
+    write_through_wrong_entry(&mut db, wrong, "MATCH (u:U {email: 'a@x'}) DETACH DELETE u");
     assert_eq!(
         found(&mut db, "a@x"),
         Vec::<i64>::new(),

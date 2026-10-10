@@ -3862,6 +3862,23 @@ fn first_unaccounted_operator(op: &LogicalOp) -> Option<&'static str> {
                 .or_else(|| set_items_unaccounted(on_create))
                 .or_else(|| first_unaccounted_operator(pattern))
         }
+        // An UPSERT matches through its pattern's operators and creates its
+        // patterns into the transaction.
+        LogicalOp::Upsert {
+            pattern,
+            on_match,
+            on_create_patterns,
+        } => set_items_unaccounted(on_match)
+            .or_else(|| {
+                on_create_patterns
+                    .iter()
+                    .flat_map(|p| &p.elements)
+                    .find_map(|element| match element {
+                        crate::plan::PatternElement::Node(node) => filters(&node.properties),
+                        crate::plan::PatternElement::Relationship(rel) => filters(&rel.properties),
+                    })
+            })
+            .or_else(|| first_unaccounted_operator(pattern)),
         LogicalOp::Traverse {
             input,
             target_filters,
@@ -5070,7 +5087,10 @@ fn execute_op(op: &LogicalOp, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Row>
             pattern,
             on_match,
             on_create_patterns,
-        } => execute_upsert(pattern, on_match, on_create_patterns, ctx),
+        } => {
+            let rows = execute_upsert(pattern, on_match, on_create_patterns, ctx)?;
+            charge_returned(ctx, 1, rows)
+        }
 
         LogicalOp::DetachDocument {
             input,
@@ -11628,6 +11648,22 @@ fn execute_create_from_pattern(
             // If there's a filter wrapping a scan, use the inner scan for creation
             execute_create_from_pattern(input, ctx)
         }
+        // A pattern of one label and one property equality is matched
+        // through its index; the point lookup carries that whole pattern.
+        LogicalOp::IndexScan {
+            variable,
+            label,
+            property,
+            value_expr,
+            ..
+        } => execute_create_from_pattern(
+            &LogicalOp::NodeScan {
+                variable: variable.clone(),
+                labels: vec![label.clone()],
+                property_filters: vec![(property.clone(), value_expr.clone())],
+            },
+            ctx,
+        ),
         _ => Err(ExecutionError::Unsupported(
             "MERGE create from non-NodeScan pattern".into(),
         )),
