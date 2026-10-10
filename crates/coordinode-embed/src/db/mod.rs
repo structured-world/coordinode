@@ -2071,6 +2071,11 @@ impl Database {
             )),
             // Not retryable either: the transaction has to change fewer entries.
             e @ CommitError::IndexFanOut { .. } => DatabaseError::Other(e.to_string()),
+            // A statement of the transaction outgrew its budget: its writes
+            // were cut short, so the transaction cannot commit as staged.
+            CommitError::Budget(stop) => DatabaseError::Execution(
+                coordinode_query::executor::runner::ExecutionError::Budget(stop),
+            ),
             // Retryable from begin, like a conflict, but for a different
             // reason: the condition is re-evaluated against the state the
             // retry reads.

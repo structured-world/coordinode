@@ -68,8 +68,9 @@ impl std::fmt::Display for CatalogObject {
 /// Execution error.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
+    /// A storage failure. A spent budget arrives as [`Self::Budget`] instead.
     #[error("storage error: {0}")]
-    Storage(#[from] coordinode_storage::error::StorageError),
+    Storage(coordinode_storage::error::StorageError),
 
     /// Modality-store error from `coordinode-modality`. Wraps the typed
     /// store error, which itself preserves the underlying `StorageError`
@@ -378,11 +379,24 @@ pub enum IndexUnanswered {
 
 impl From<coordinode_modality::StoreError> for ExecutionError {
     fn from(e: coordinode_modality::StoreError) -> Self {
+        use coordinode_modality::StoreError;
+        use coordinode_storage::error::StorageError;
         match e {
             // The query's own budget, whichever layer spent it: answered as
             // a resource refusal, not as a store failure.
-            coordinode_modality::StoreError::Budget(stop) => Self::Budget(stop),
+            StoreError::Budget(stop) | StoreError::Storage(StorageError::Budget(stop)) => {
+                Self::Budget(stop)
+            }
             other => Self::Modality(other),
+        }
+    }
+}
+
+impl From<coordinode_storage::error::StorageError> for ExecutionError {
+    fn from(e: coordinode_storage::error::StorageError) -> Self {
+        match e {
+            coordinode_storage::error::StorageError::Budget(stop) => Self::Budget(stop),
+            other => Self::Storage(other),
         }
     }
 }
@@ -3685,9 +3699,17 @@ pub fn execute_no_commit(
     // var-length traverse). Collapses O(edges) emitted rows to O(reached nodes).
     ctx.dedup_varlen_targets = plan_allows_varlen_target_dedup(&plan.root);
     ctx.unaccounted_operator = first_unaccounted_operator(&plan.root);
+    // What this statement stages is charged to its budget as it is staged.
+    ctx.txn
+        .charge_writes_to(Some(std::sync::Arc::clone(&ctx.budget)));
 
-    let result = execute_op(&plan.root, ctx)?;
-    Ok(result)
+    let result = execute_op(&plan.root, ctx);
+    // A write cut short by the budget stopped staging and left nothing
+    // after it: the statement fails whatever its operators returned.
+    if let Some(stop) = ctx.txn.budget_refusal() {
+        return Err(ExecutionError::Budget(stop));
+    }
+    result
 }
 
 /// The first operator of `op`'s tree whose work is not charged to the
@@ -19303,6 +19325,7 @@ fn commit_err_to_execution(
         )),
         // Also the same on retry: the statement has to change fewer entries.
         e @ CommitError::IndexFanOut { .. } => ExecutionError::Serialization(e.to_string()),
+        CommitError::Budget(stop) => ExecutionError::Budget(stop),
         CommitError::InvariantRefused { reason } => ExecutionError::InvariantRefused(reason),
         // Named by generation here; an executor that holds the claim names
         // the index and the value before this is reached.

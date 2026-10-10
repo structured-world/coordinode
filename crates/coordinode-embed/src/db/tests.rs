@@ -678,6 +678,83 @@ fn a_statement_memory_limit_past_the_ceiling_is_refused() {
         .expect("within the ceiling");
 }
 
+/// A statement whose writes do not fit its memory limit fails with the
+/// memory refusal and writes nothing: the writes staged before the refusal
+/// are not committed without the rest. The same statement within a larger
+/// limit writes every node.
+#[test]
+fn writes_past_the_statement_memory_limit_are_refused_and_leave_nothing() {
+    use coordinode_core::budget::BudgetStop;
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let create =
+        "UNWIND range(1, 2000) AS i CREATE (:W {i: i, pad: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})";
+    let small = StatementOptions {
+        query_memory_limit: Some(64 << 10),
+        ..StatementOptions::default()
+    };
+    let refused = db.execute_cypher_shared_with(create, None, None, &small);
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(
+                BudgetStop::Memory { .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+    let count = |db: &Database| {
+        db.execute_cypher_shared("MATCH (w:W) RETURN count(w) AS n", None, None, None, None)
+            .expect("count")
+            .rows[0]
+            .get("n")
+            .cloned()
+    };
+    assert_eq!(count(&db), Some(Value::Int(0)), "nothing was written");
+
+    db.execute_cypher_shared_with(create, None, None, &StatementOptions::default())
+        .expect("within the default limit");
+    assert_eq!(count(&db), Some(Value::Int(2000)));
+}
+
+/// In an interactive transaction, a statement whose writes did not fit its
+/// limit fails, and the transaction cannot then commit what was staged
+/// before the refusal: committing would apply part of that statement.
+#[test]
+fn a_transaction_with_writes_cut_short_by_the_budget_cannot_commit() {
+    use coordinode_core::graph::types::Value;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Database::open(dir.path()).expect("open");
+    let txid = db.begin_transaction();
+    let small = StatementOptions {
+        query_memory_limit: Some(64 << 10),
+        ..StatementOptions::default()
+    };
+    let refused = db.execute_in_transaction_with(
+        txid,
+        "UNWIND range(1, 2000) AS i CREATE (:W {i: i, pad: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})",
+        None,
+        &small,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(DatabaseError::Execution(ExecutionError::Budget(_)))
+        ),
+        "{refused:?}"
+    );
+    let committed = db.commit_transaction(txid);
+    assert!(committed.is_err(), "{committed:?}");
+    let n = db
+        .execute_cypher_shared("MATCH (w:W) RETURN count(w) AS n", None, None, None, None)
+        .expect("count")
+        .rows[0]
+        .get("n")
+        .cloned();
+    assert_eq!(n, Some(Value::Int(0)));
+}
+
 #[test]
 fn extension_op_dispatches_through_database() {
     use std::sync::atomic::{AtomicBool, Ordering};

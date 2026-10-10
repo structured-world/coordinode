@@ -141,6 +141,11 @@ pub enum CommitError {
         /// The bound on entry effects per unit.
         limit: usize,
     },
+    /// A write the transaction staged did not fit the budget of the
+    /// statement that staged it, so it and everything after it was not
+    /// staged. Nothing was applied.
+    #[error("{0}; nothing was written")]
+    Budget(coordinode_core::budget::BudgetStop),
     /// A record this attempt wrote on the condition of its version has a
     /// different one. Nothing was applied.
     ///
@@ -307,6 +312,12 @@ pub struct Transaction<'a> {
     /// The first counter key whose staged deltas left `i64`, if any. Held so
     /// that commit refuses instead of writing an operand no fold can apply.
     counter_overflow: Option<Vec<u8>>,
+    /// The budget of the statement staging writes now, which each staged
+    /// write is charged to before it is buffered; `None` charges nothing.
+    write_budget: Option<std::sync::Arc<coordinode_core::budget::QueryBudget>>,
+    /// The refusal that stopped staging: nothing is staged after it, and
+    /// commit refuses.
+    budget_refusal: Option<coordinode_core::budget::BudgetStop>,
     /// What this attempt's result depends on, stated by the writers as they
     /// go. Checked and reserved at commit: the write set alone cannot tell
     /// two attempts apart that each validated a condition the other breaks.
@@ -409,7 +420,21 @@ pub struct TransactionState {
     /// Parked: a node one statement wrote is checked as the last one leaves
     /// it.
     post_state_checks: Vec<Vec<u8>>,
+    /// Parked: a statement whose writes were cut short by its budget leaves
+    /// the attempt unable to commit, whatever statement asks.
+    budget_refusal: Option<coordinode_core::budget::BudgetStop>,
 }
+
+/// Bytes the write buffer holds for one staged key beside the key and value
+/// themselves.
+const STAGED_WRITE: usize =
+    core::mem::size_of::<((Partition, Vec<u8>), Option<Vec<u8>>)>() + core::mem::size_of::<u64>();
+/// Bytes one staged adjacency operand holds beside its key.
+const STAGED_ADJ: usize = core::mem::size_of::<(Vec<u8>, AdjOp)>();
+/// Bytes one staged node delta holds beside its key and operand.
+const STAGED_DELTA: usize = core::mem::size_of::<(Vec<u8>, Vec<u8>)>();
+/// Bytes one staged counter holds beside its key.
+const STAGED_COUNTER: usize = core::mem::size_of::<(Vec<u8>, i64)>() + core::mem::size_of::<u64>();
 
 /// One staged adjacency operand. Kept as a sequence rather than as two sets
 /// because an add and a remove of the same member do not commute.
@@ -551,6 +576,8 @@ impl<'a> Transaction<'a> {
             merge_node_deltas: Vec::new(),
             merge_counter_deltas: HashMap::new(),
             counter_overflow: None,
+            write_budget: None,
+            budget_refusal: None,
             claims: ClaimSet::new(),
             schema_reads: ClaimSet::new(),
             expected_versions: Vec::new(),
@@ -595,6 +622,44 @@ impl<'a> Transaction<'a> {
     /// would keep the bytes the refusal is meant to free.
     pub fn exempt_from_write_pressure(&mut self) {
         self.pressure_exempt = true;
+    }
+
+    /// Charge what this transaction stages from now on to `budget`, the
+    /// running statement's: each staged write reserves its bytes, for the
+    /// rest of the statement, before it is buffered. `None` charges nothing.
+    pub fn charge_writes_to(
+        &mut self,
+        budget: Option<std::sync::Arc<coordinode_core::budget::QueryBudget>>,
+    ) {
+        self.write_budget = budget;
+    }
+
+    /// The refusal that stopped staging, when a write did not fit the
+    /// statement's budget. Nothing was staged after it; commit refuses.
+    pub fn budget_refusal(&self) -> Option<coordinode_core::budget::BudgetStop> {
+        self.budget_refusal
+    }
+
+    /// Reserve `bytes` a write is about to stage. After a refusal every
+    /// later write is refused as well, so nothing past it is staged.
+    fn admit_staged(&mut self, bytes: usize) -> Result<(), coordinode_core::budget::BudgetStop> {
+        if let Some(stop) = self.budget_refusal {
+            return Err(stop);
+        }
+        let Some(budget) = &self.write_budget else {
+            return Ok(());
+        };
+        // The size of memory about to exist fits in u64.
+        match budget.reserve(bytes as u64) {
+            Ok(charge) => {
+                charge.keep_until_query_ends();
+                Ok(())
+            }
+            Err(stop) => {
+                self.budget_refusal = Some(stop);
+                Err(stop)
+            }
+        }
     }
 
     /// The first sequence number a view at `snapshot` may have missed writes
@@ -647,6 +712,7 @@ impl<'a> Transaction<'a> {
             derived: self.derived,
             range_removals: self.range_removals,
             post_state_checks: self.post_state_checks,
+            budget_refusal: self.budget_refusal,
         }
     }
 
@@ -678,6 +744,7 @@ impl<'a> Transaction<'a> {
             derived: std::mem::take(&mut self.derived),
             range_removals: std::mem::take(&mut self.range_removals),
             post_state_checks: std::mem::take(&mut self.post_state_checks),
+            budget_refusal: self.budget_refusal.take(),
         }
     }
 
@@ -701,6 +768,9 @@ impl<'a> Transaction<'a> {
             occ_scope: state.occ_scope,
             merge_adj_ops: state.merge_adj_ops,
             counter_overflow: None,
+            // Charged per statement: the next one names its own budget.
+            write_budget: None,
+            budget_refusal: state.budget_refusal,
             claims: state.claims,
             schema_reads: state.schema_reads,
             expected_versions: state.expected_versions,
@@ -773,6 +843,7 @@ impl<'a> Transaction<'a> {
     /// straight to the engine.
     pub fn put(&mut self, part: Partition, key: &[u8], value: &[u8]) -> StorageResult<()> {
         if self.oracle.is_some() {
+            self.admit_staged(STAGED_WRITE + key.len() + value.len())?;
             self.write_buffer
                 .insert((part, key.to_vec()), Some(value.to_vec()));
             Ok(())
@@ -785,6 +856,7 @@ impl<'a> Transaction<'a> {
     /// deletes straight from the engine.
     pub fn delete(&mut self, part: Partition, key: &[u8]) -> StorageResult<()> {
         if self.oracle.is_some() {
+            self.admit_staged(STAGED_WRITE + key.len())?;
             self.write_buffer.insert((part, key.to_vec()), None);
             Ok(())
         } else {
@@ -1046,12 +1118,19 @@ impl<'a> Transaction<'a> {
     /// Buffer an adjacency add, after everything staged before it. Not
     /// OCC-tracked.
     pub fn merge_adj_add(&mut self, adj_key: &[u8], uid: u64) {
+        // A refused write is recorded and fails the statement and the commit.
+        if self.admit_staged(STAGED_ADJ + adj_key.len()).is_err() {
+            return;
+        }
         self.merge_adj_ops.push((adj_key.to_vec(), AdjOp::Add(uid)));
     }
 
     /// Buffer an adjacency remove, after everything staged before it. Not
     /// OCC-tracked.
     pub fn merge_adj_remove(&mut self, adj_key: &[u8], uid: u64) {
+        if self.admit_staged(STAGED_ADJ + adj_key.len()).is_err() {
+            return;
+        }
         self.merge_adj_ops
             .push((adj_key.to_vec(), AdjOp::Remove(uid)));
     }
@@ -1483,6 +1562,13 @@ impl<'a> Transaction<'a> {
 
     /// Buffer a node merge operand (pre-encoded document delta) at `node_key`.
     pub fn push_node_delta(&mut self, node_key: Vec<u8>, operand: Vec<u8>) {
+        // A refused write is recorded and fails the statement and the commit.
+        if self
+            .admit_staged(STAGED_DELTA + node_key.capacity() + operand.capacity())
+            .is_err()
+        {
+            return;
+        }
         self.merge_node_deltas.push((node_key, operand));
     }
 
@@ -1510,6 +1596,14 @@ impl<'a> Transaction<'a> {
                 }
             }
         } else {
+            // A refused write is recorded and fails the statement and the
+            // commit.
+            if self
+                .admit_staged(STAGED_COUNTER + counter_key.len())
+                .is_err()
+            {
+                return;
+            }
             self.merge_counter_deltas
                 .insert(counter_key.to_vec(), delta);
         }
@@ -1639,6 +1733,11 @@ impl<'a> Transaction<'a> {
             return Err(CommitError::CounterOverflow {
                 key: String::from_utf8_lossy(key).into_owned(),
             });
+        }
+        // Writes past a refusal were never staged: committing the rest would
+        // apply part of what a statement meant to write.
+        if let Some(stop) = self.budget_refusal {
+            return Err(CommitError::Budget(stop));
         }
         // Likewise work every member would refuse to derive.
         self.derived

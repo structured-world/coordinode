@@ -178,6 +178,11 @@ pub enum StorageError {
         /// Why it does not decode.
         detail: String,
     },
+
+    /// The query reading or writing through the engine spent its budget:
+    /// memory, deadline or cancellation. Nothing past the refusal was done.
+    #[error(transparent)]
+    Budget(#[from] coordinode_core::budget::BudgetStop),
 }
 
 /// `key` as text for a message: printable ASCII as it is, every other byte
